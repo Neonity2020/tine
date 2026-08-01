@@ -302,13 +302,50 @@ pub(crate) fn approve_external_assets(
 }
 
 #[tauri::command]
-pub(crate) fn load_graph(
+pub(crate) async fn load_graph(
     path: String,
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<LoadGraphResult, String> {
-    load_graph_for_label(path, &app, window.label(), &state)
+    let label = window.label().to_string();
+    drop((window, state));
+    let worker_app = app.clone();
+    let worker_label = label.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = worker_app.state::<AppState>();
+        load_graph_for_label(path, &worker_app, &worker_label, &state)
+    })
+    .await
+    .map_err(|error| format!("graph-open worker failed: {error}"))??;
+
+    if app.get_webview_window(&label).is_none() {
+        let binding_generation = match &result {
+            LoadGraphResult::Loaded {
+                binding_generation, ..
+            }
+            | LoadGraphResult::AlreadyCurrent {
+                binding_generation, ..
+            } => Some(*binding_generation),
+            LoadGraphResult::FocusedExisting { .. } => None,
+        };
+        if let Some(binding_generation) = binding_generation {
+            let state = app.state::<AppState>();
+            let removed = {
+                let mut graphs = state.graphs.write().unwrap();
+                let owns_generation = graphs
+                    .slot(&label)
+                    .is_some_and(|slot| slot.binding_generation == binding_generation);
+                owns_generation.then(|| graphs.remove(&label)).flatten()
+            };
+            if removed.is_some() {
+                poke_watcher(&state);
+            }
+        }
+        return Err("graph window closed while storage was opening".into());
+    }
+
+    Ok(result)
 }
 
 pub(crate) fn load_graph_for_label(

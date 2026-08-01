@@ -25,7 +25,6 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-#[cfg(test)]
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -130,6 +129,7 @@ use uuid::Uuid;
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
 const ACTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
+const RUNTIME_OPEN_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
 const MAX_WATCHER_OBSERVATIONS: usize = 256;
 const MAX_WATCHER_PATH_BYTES: usize = 64 * 1024;
 const MAX_CLEAN_DRAIN_TURNS: usize = 64;
@@ -1182,6 +1182,35 @@ pub enum SyncRuntimeRecovery {
     TookOverCrashedUnsafe,
 }
 
+/// Ordered startup phases for an existing managed-storage runtime.
+///
+/// These are diagnostics only. They neither authorize a timeout fallback nor
+/// expose a handle before the complete existing recovery path succeeds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncRuntimeOpenPhase {
+    RetainingGraph,
+    DiscoveringEnrollment,
+    OpeningActorGraph,
+    RevalidatingEnrollment,
+    OpeningEnrollment,
+    OpeningProjectionReceipts,
+    OpeningReconciliationBaseline,
+    RecoveringPromotedRuntime,
+    AssemblingActor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncRuntimeOpenProgress {
+    Phase {
+        phase: SyncRuntimeOpenPhase,
+        elapsed: Duration,
+    },
+    Waiting {
+        phase: SyncRuntimeOpenPhase,
+        elapsed: Duration,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeLifecycle {
     Active,
@@ -1976,7 +2005,18 @@ impl SyncRuntimeHandle {
     /// Read-only discovery first; actor construction only for authenticated
     /// existing `LocalActive` evidence.
     pub fn open(request: SyncRuntimeOpenRequest) -> SyncRuntimeOpenResult {
-        Self::open_with_session(request, SessionId::new())
+        Self::open_with_progress(request, |_| {})
+    }
+
+    /// The identical fail-closed existing-runtime open with ordered,
+    /// observational progress. Waiting reports are emitted periodically while
+    /// one phase is still running; they never turn elapsed time into recovery
+    /// authority or a timeout bypass.
+    pub fn open_with_progress(
+        request: SyncRuntimeOpenRequest,
+        progress: impl FnMut(SyncRuntimeOpenProgress),
+    ) -> SyncRuntimeOpenResult {
+        Self::open_with_session(request, SessionId::new(), progress)
     }
 
     /// The existing-only actor open with the handoff identity supplied by the
@@ -1985,6 +2025,7 @@ impl SyncRuntimeHandle {
     fn open_with_session(
         request: SyncRuntimeOpenRequest,
         session_id: SessionId,
+        mut progress: impl FnMut(SyncRuntimeOpenProgress),
     ) -> SyncRuntimeOpenResult {
         if request.profile == SyncStorageProfile::LegacyDefault {
             return SyncRuntimeOpenResult {
@@ -1993,8 +2034,11 @@ impl SyncRuntimeHandle {
             };
         }
 
-        #[cfg(test)]
         let open_started = Instant::now();
+        progress(SyncRuntimeOpenProgress::Phase {
+            phase: SyncRuntimeOpenPhase::RetainingGraph,
+            elapsed: open_started.elapsed(),
+        });
         #[cfg(test)]
         let phase_started = Instant::now();
         let graph = match Graph::open_checked(&request.graph_root) {
@@ -2011,6 +2055,10 @@ impl SyncRuntimeHandle {
             Ok(resource) => resource,
             Err(error) => return refused(format!("cannot identify graph for discovery: {error}")),
         };
+        progress(SyncRuntimeOpenProgress::Phase {
+            phase: SyncRuntimeOpenPhase::DiscoveringEnrollment,
+            elapsed: open_started.elapsed(),
+        });
         #[cfg(test)]
         let handle_graph_resource_identity = phase_started.elapsed();
         #[cfg(test)]
@@ -2088,42 +2136,58 @@ impl SyncRuntimeHandle {
             Err(error) => return refused(format!("cannot start sync actor thread: {error}")),
         };
 
-        match started_receiver.recv() {
-            Ok(Ok(snapshot)) => {
-                *status.write().unwrap() = snapshot;
-                #[cfg(test)]
-                record_runtime_handle_open(
-                    workspace_id,
-                    open_started.elapsed(),
-                    handle_graph_open,
-                    handle_graph_resource_identity,
-                    handle_discovery,
-                    actor_thread_started.elapsed(),
-                );
-                SyncRuntimeOpenResult {
-                    status: SyncRuntimeOpenStatus::Active,
-                    handle: Some(Self {
-                        inner: Arc::new(HandleInner {
-                            enrollment_operation: Mutex::new(()),
-                            operation: Mutex::new(()),
-                            sender: Mutex::new(Some(sender)),
-                            join: Mutex::new(Some(join)),
-                            status,
-                            #[cfg(test)]
-                            workspace_id,
-                        }),
-                    }),
+        let mut phase = SyncRuntimeOpenPhase::OpeningActorGraph;
+        loop {
+            match started_receiver.recv_timeout(RUNTIME_OPEN_PROGRESS_HEARTBEAT) {
+                Ok(ActorStartupEvent::Phase(next)) => {
+                    phase = next;
+                    progress(SyncRuntimeOpenProgress::Phase {
+                        phase,
+                        elapsed: open_started.elapsed(),
+                    });
                 }
-            }
-            Ok(Err(detail)) => {
-                drop(sender);
-                let _ = join.join();
-                refused(detail)
-            }
-            Err(_) => {
-                drop(sender);
-                let _ = join.join();
-                refused("sync actor stopped during startup".into())
+                Ok(ActorStartupEvent::Finished(Ok(snapshot))) => {
+                    *status.write().unwrap() = snapshot;
+                    #[cfg(test)]
+                    record_runtime_handle_open(
+                        workspace_id,
+                        open_started.elapsed(),
+                        handle_graph_open,
+                        handle_graph_resource_identity,
+                        handle_discovery,
+                        actor_thread_started.elapsed(),
+                    );
+                    return SyncRuntimeOpenResult {
+                        status: SyncRuntimeOpenStatus::Active,
+                        handle: Some(Self {
+                            inner: Arc::new(HandleInner {
+                                enrollment_operation: Mutex::new(()),
+                                operation: Mutex::new(()),
+                                sender: Mutex::new(Some(sender)),
+                                join: Mutex::new(Some(join)),
+                                status,
+                                #[cfg(test)]
+                                workspace_id,
+                            }),
+                        }),
+                    };
+                }
+                Ok(ActorStartupEvent::Finished(Err(detail))) => {
+                    drop(sender);
+                    let _ = join.join();
+                    return refused(detail);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    progress(SyncRuntimeOpenProgress::Waiting {
+                        phase,
+                        elapsed: open_started.elapsed(),
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    drop(sender);
+                    let _ = join.join();
+                    return refused("sync actor stopped during startup".into());
+                }
             }
         }
     }
@@ -2189,7 +2253,7 @@ impl SyncRuntimeHandle {
         };
 
         match started_receiver.recv() {
-            Ok(Ok(snapshot)) => {
+            Ok(ActorStartupEvent::Finished(Ok(snapshot))) => {
                 *status.write().unwrap() = snapshot;
                 SyncRuntimeOpenResult {
                     status: SyncRuntimeOpenStatus::Active,
@@ -2206,10 +2270,15 @@ impl SyncRuntimeHandle {
                     }),
                 }
             }
-            Ok(Err(detail)) => {
+            Ok(ActorStartupEvent::Finished(Err(detail))) => {
                 drop(sender);
                 let _ = join.join();
                 refused(detail)
+            }
+            Ok(ActorStartupEvent::Phase(_)) => {
+                drop(sender);
+                let _ = join.join();
+                refused("same-process sync actor reported an unexpected cold-open phase".into())
             }
             Err(_) => {
                 drop(sender);
@@ -3393,6 +3462,7 @@ fn activation_open_runtime(request: SyncLocalActivationRequest) -> SyncLocalActi
             provider_journal_root: request.provider_journal_root,
         },
         session_id,
+        |_| {},
     );
     match opened {
         SyncRuntimeOpenResult {
@@ -4998,6 +5068,11 @@ fn map_component(component: DiscoveryComponent) -> SyncRuntimeComponent {
     }
 }
 
+enum ActorStartupEvent {
+    Phase(SyncRuntimeOpenPhase),
+    Finished(Result<SyncRuntimeStatusSnapshot, String>),
+}
+
 enum ActorRequest {
     Query {
         request: SyncRuntimeQueryRequest,
@@ -5080,13 +5155,16 @@ fn actor_thread(
     advisory: LocalActiveAdvisory,
     session_id: SessionId,
     receiver: Receiver<ActorRequest>,
-    started: SyncSender<Result<SyncRuntimeStatusSnapshot, String>>,
+    started: SyncSender<ActorStartupEvent>,
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
-    let actor = match RuntimeActor::open(request, advisory, session_id) {
+    let phases = started.clone();
+    let actor = match RuntimeActor::open(request, advisory, session_id, |phase| {
+        let _ = phases.send(ActorStartupEvent::Phase(phase));
+    }) {
         Ok(actor) => actor,
         Err(error) => {
-            let _ = started.send(Err(error));
+            let _ = started.send(ActorStartupEvent::Finished(Err(error)));
             return;
         }
     };
@@ -5097,13 +5175,13 @@ fn actor_thread_from_same_process_activation(
     request: SyncRuntimeOpenRequest,
     handoff: SameProcessActivationHandoff,
     receiver: Receiver<ActorRequest>,
-    started: SyncSender<Result<SyncRuntimeStatusSnapshot, String>>,
+    started: SyncSender<ActorStartupEvent>,
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
     let actor = match RuntimeActor::open_from_same_process_activation(request, handoff) {
         Ok(actor) => actor,
         Err(error) => {
-            let _ = started.send(Err(error));
+            let _ = started.send(ActorStartupEvent::Finished(Err(error)));
             return;
         }
     };
@@ -5113,12 +5191,15 @@ fn actor_thread_from_same_process_activation(
 fn run_actor_loop(
     mut actor: RuntimeActor,
     receiver: Receiver<ActorRequest>,
-    started: SyncSender<Result<SyncRuntimeStatusSnapshot, String>>,
+    started: SyncSender<ActorStartupEvent>,
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
     let snapshot = actor.snapshot();
     *shared_status.write().unwrap() = snapshot.clone();
-    if started.send(Ok(snapshot)).is_err() {
+    if started
+        .send(ActorStartupEvent::Finished(Ok(snapshot)))
+        .is_err()
+    {
         return;
     }
 
@@ -5668,7 +5749,9 @@ impl RuntimeActor {
         request: SyncRuntimeOpenRequest,
         advisory: LocalActiveAdvisory,
         session_id: SessionId,
+        mut progress: impl FnMut(SyncRuntimeOpenPhase),
     ) -> Result<Self, String> {
+        progress(SyncRuntimeOpenPhase::OpeningActorGraph);
         #[cfg(test)]
         record_cold_actor_open(advisory.binding.workspace_id());
         #[cfg(test)]
@@ -5689,6 +5772,7 @@ impl RuntimeActor {
         #[cfg(test)]
         let actor_graph_resource_identity = phase_started.elapsed();
 
+        progress(SyncRuntimeOpenPhase::RevalidatingEnrollment);
         #[cfg(test)]
         let phase_started = Instant::now();
         let fresh = discover_startup(&DiscoveryRequest {
@@ -5703,6 +5787,7 @@ impl RuntimeActor {
         #[cfg(test)]
         let actor_discovery_revalidation = phase_started.elapsed();
 
+        progress(SyncRuntimeOpenPhase::OpeningEnrollment);
         #[cfg(test)]
         let phase_started = Instant::now();
         let enrollment_root =
@@ -5714,6 +5799,7 @@ impl RuntimeActor {
             device_id: advisory.binding.device_id(),
             graph_resource_id: advisory.binding.graph_resource_id(),
         };
+        progress(SyncRuntimeOpenPhase::OpeningProjectionReceipts);
         #[cfg(test)]
         let phase_started = Instant::now();
         let receipts = ProjectionReceiptStore::open_existing_for_endpoint(
@@ -5725,6 +5811,7 @@ impl RuntimeActor {
         .map_err(display)?;
         #[cfg(test)]
         let actor_receipt_store_open = phase_started.elapsed();
+        progress(SyncRuntimeOpenPhase::OpeningReconciliationBaseline);
         #[cfg(test)]
         let phase_started = Instant::now();
         let application_runtime_root = ApplicationRuntimeRoot::open_existing_for_runtime_host(
@@ -5763,6 +5850,7 @@ impl RuntimeActor {
             migration_backup_root: &request.migration_backup_root,
         };
         let unsafe_reopen = matches!(&advisory.handoff, EnrollmentDiscoveryHandoff::Unsafe { .. });
+        progress(SyncRuntimeOpenPhase::RecoveringPromotedRuntime);
         #[cfg(test)]
         let phase_started = Instant::now();
         let (authority, runtime) = match advisory.handoff {
@@ -5785,6 +5873,7 @@ impl RuntimeActor {
         #[cfg(test)]
         let actor_promoted_runtime_reopen = phase_started.elapsed();
 
+        progress(SyncRuntimeOpenPhase::AssemblingActor);
         let actor = Self::from_proven_resources(
             request,
             graph,
@@ -16494,7 +16583,31 @@ mod tests {
         assert!(refused.handle.is_none());
 
         fixture.release_held_owner();
-        let handle = active_handle(SyncRuntimeHandle::open(request));
+        let mut progress = Vec::new();
+        let handle = active_handle(SyncRuntimeHandle::open_with_progress(request, |update| {
+            progress.push(update);
+        }));
+        assert_eq!(
+            progress
+                .iter()
+                .filter_map(|update| match update {
+                    SyncRuntimeOpenProgress::Phase { phase, .. } => Some(*phase),
+                    SyncRuntimeOpenProgress::Waiting { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                SyncRuntimeOpenPhase::RetainingGraph,
+                SyncRuntimeOpenPhase::DiscoveringEnrollment,
+                SyncRuntimeOpenPhase::OpeningActorGraph,
+                SyncRuntimeOpenPhase::RevalidatingEnrollment,
+                SyncRuntimeOpenPhase::OpeningEnrollment,
+                SyncRuntimeOpenPhase::OpeningProjectionReceipts,
+                SyncRuntimeOpenPhase::OpeningReconciliationBaseline,
+                SyncRuntimeOpenPhase::RecoveringPromotedRuntime,
+                SyncRuntimeOpenPhase::AssemblingActor,
+            ],
+            "crash takeover diagnostics must expose the ordered recovery boundary without replacing it"
+        );
         assert_eq!(
             handle.status().unwrap().recovery,
             Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
@@ -26153,6 +26266,77 @@ mod tests {
             startup_ms(managed_first_page),
             startup_ms(managed_whole_graph),
         );
+    }
+
+    #[test]
+    #[ignore = "manual crash-reopen receipt for the reported 1,045-file graph scale"]
+    fn managed_startup_crash_reopen_1045_file_manual_receipt() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_startup_crash_reopen_1045_file_manual_receipt -- --ignored --nocapture"
+        );
+        const ADDITIONAL_PAGES: usize = 1_041;
+        const EXPECTED_PAGES: usize = ADDITIONAL_PAGES + 4;
+        let fixture = ActivationFixture::scaled_with_blocks(
+            "managed-startup-crash-reopen-1045-file",
+            0xa0e0,
+            ADDITIONAL_PAGES,
+            10,
+        );
+        let source = user_graph_bytes(&fixture.graph_root);
+        assert_eq!(source.len(), EXPECTED_PAGES);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        drop(activated.handle);
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            source,
+            "activation and an unclean actor stop must preserve exact graph bytes"
+        );
+
+        let workspace_id = fixture.request.identities.workspace_id;
+        reset_runtime_open_instrumentation(workspace_id);
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let elapsed = started.elapsed();
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let handle = reopened
+            .handle
+            .expect("crash takeover returns an active handle");
+        assert_eq!(
+            handle.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+        );
+        let open = take_runtime_open_instrumentation(workspace_id);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        let resume = handle.engine_instrumentation().unwrap().resume;
+        assert!(
+            resume.adopted,
+            "crash reopen did not adopt its retained run"
+        );
+        assert!(!resume.refused, "crash reopen refused its retained run");
+        assert_eq!(
+            resume.replayed_generations, 0,
+            "an exact-current crash reopen replayed graph-sized accepted history"
+        );
+        assert_eq!(
+            promoted.engine.bootstrap_parts_examined, 0,
+            "an exact-current crash reopen replayed bootstrap parts"
+        );
+        eprintln!(
+            "managed_startup_crash_reopen files={EXPECTED_PAGES} elapsed_ms={:.3} open_phases: {} promoted_phases: {} resume={:?}",
+            startup_ms(elapsed),
+            startup_open_phase_receipt(&open),
+            startup_promoted_open_phase_receipt(&promoted),
+            resume,
+        );
+
+        let page = load_application_logical(&handle, "Synthetic 0", SyncPageKind::Page).0;
+        assert_eq!(page.name, "Synthetic 0");
+        assert_eq!(page.blocks.len(), 10);
+        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
+        drop(handle);
     }
 
     fn tree_has_file_named(root: &Path, name: &str) -> bool {

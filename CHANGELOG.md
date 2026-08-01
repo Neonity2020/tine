@@ -15,6 +15,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   query, editor, status, transition, tick, and shutdown commands run actor waits
   on the blocking pool and revalidate their exact graph generation before work,
   so queued commands cannot gain authority over a replacement graph.
+- **Restarting after interrupted managed-storage activation no longer leaves the
+  desktop window hidden behind synchronous native setup.** The themed window now
+  paints before the unchanged fail-closed recovery path runs, while ordered
+  recovery phases and periodic wait diagnostics make legitimate long recovery
+  observable without admitting unvalidated state.
 - **Sparse-v2 now detects sampled interior corruption in its disposable SQLite
   projection during reopen.** Versioned, bounded fingerprints cover up to 1 MiB
   across the interior of each database and WAL file in addition to their edges;

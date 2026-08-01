@@ -19,8 +19,8 @@ use tine_core::sync_runtime::{
     SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationProgress,
     SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
     SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
-    SyncRuntimeLifecycle, SyncRuntimeOpenRequest, SyncRuntimeOpenResult, SyncRuntimeOpenStatus,
-    SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
+    SyncRuntimeLifecycle, SyncRuntimeOpenProgress, SyncRuntimeOpenRequest, SyncRuntimeOpenResult,
+    SyncRuntimeOpenStatus, SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
     SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome,
     SyncStorageProfile,
 };
@@ -728,9 +728,30 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
     ) -> Result<SparseV2Binding, String> {
-        Ok(SparseV2Binding::from_open(SyncRuntimeHandle::open(
-            record.open_request(app)?,
-        )))
+        crate::debug::diag("managed storage open: begin authenticated existing-state recovery");
+        let opened =
+            SyncRuntimeHandle::open_with_progress(
+                record.open_request(app)?,
+                |update| match update {
+                    SyncRuntimeOpenProgress::Phase { phase, elapsed } => {
+                        crate::debug::diag(format!(
+                            "managed storage open: phase {phase:?} at {} ms",
+                            elapsed.as_millis()
+                        ))
+                    }
+                    SyncRuntimeOpenProgress::Waiting { phase, elapsed } => {
+                        crate::debug::diag(format!(
+                            "managed storage open: still waiting in {phase:?} at {} ms",
+                            elapsed.as_millis()
+                        ))
+                    }
+                },
+            );
+        crate::debug::diag(format!(
+            "managed storage open: completed with {:?}",
+            opened.status
+        ));
+        Ok(SparseV2Binding::from_open(opened))
     }
 
     pub(crate) fn activate_record(

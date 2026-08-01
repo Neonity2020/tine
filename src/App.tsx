@@ -934,7 +934,7 @@ export function App(): JSX.Element {
       </Show>
       <Show when={graphTransitioning()}>
         <DrawerBackground class="graph-transition-shield" blockedBy="any" role="status" ariaLive="polite">
-          Finishing graph operation…
+          {firstLoadDone() ? "Finishing graph operation…" : "Opening graph storage…"}
         </DrawerBackground>
       </Show>
       <Show when={sidebarOpen()}>

@@ -42,13 +42,11 @@ use commands::{
     set_timetracking_enabled, stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit,
     trash_asset, trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
 };
-use debug::{
-    debug_enabled, debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger,
-};
+use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
 use graph::{
     app_platform, approve_external_assets, capture_graph_binding, capture_target, create_graph,
-    default_graph_parent, inspect_graph_access, load_graph, open_graph_window, resolve_root,
-    startup_graph_path, warm_done,
+    default_graph_parent, inspect_graph_access, load_graph, open_graph_window, startup_graph_path,
+    warm_done,
 };
 use platform::{clipboard_files, copy_image_to_clipboard, gpu_env, open_external};
 use plugins::{
@@ -651,64 +649,12 @@ pub fn run() {
             }
             #[cfg(desktop)]
             schedule_main_window_reveal_fallback(app.handle());
-            // Eagerly open the graph if one was configured at startup.
-            let startup_root = resolve_root("").or_else(|| settings::last_graph_path(app.handle()));
-            if let Some(root) = startup_root {
-                let state = app.state::<AppState>();
-                graph::load_graph_for_label(root, app.handle(), "main", &state)?;
-                let slot = state::slot_for_window(&state, "main")?;
-                // These diagnostics enumerate dirs AND force a whole-graph cache
-                // build (journals_desc()/list_pages()) — on the cold-cache critical
-                // path to first paint, before warm_cache_async. The format! args
-                // are evaluated regardless of whether diag() ends up writing, so
-                // gate the whole block on debug to keep it off the 99% hot launch.
-                if debug_enabled() && !slot.is_sparse_v2() {
-                    let g = slot.legacy_graph()?;
-                    let meta = g.meta();
-                    let jdir = g.journals_path();
-                    let pdir = g.pages_path();
-                    let count_md = |d: &std::path::Path| {
-                        std::fs::read_dir(d)
-                            .map(|rd| {
-                                rd.flatten()
-                                    .filter(|e| {
-                                        e.path().extension().and_then(|x| x.to_str()) == Some("md")
-                                    })
-                                    .count()
-                            })
-                            .ok()
-                    };
-                    diag(format!("graph root: {}", meta.root));
-                    diag(format!(
-                        "journals dir: {} (exists={}, .md files={:?})",
-                        jdir.display(),
-                        jdir.is_dir(),
-                        count_md(&jdir)
-                    ));
-                    diag(format!(
-                        "pages dir: {} (exists={}, .md files={:?})",
-                        pdir.display(),
-                        pdir.is_dir(),
-                        count_md(&pdir)
-                    ));
-                    diag(format!(
-                        "journals recognized as dates: {} | total page entries: {}",
-                        g.journals_desc().len(),
-                        g.list_pages().len()
-                    ));
-                    if let Ok(rd) = std::fs::read_dir(&jdir) {
-                        let sample: Vec<String> = rd
-                            .flatten()
-                            .filter_map(|e| e.file_name().into_string().ok())
-                            .filter(|n| n.ends_with(".md"))
-                            .take(3)
-                            .collect();
-                        diag(format!("sample journal files: {sample:?}"));
-                    }
-                }
-            } else {
-                diag("NO graph root resolved — set TINE_GRAPH=/path/to/graph");
-            }
+            // The themed WebView owns startup graph loading through the normal
+            // `load_graph` command. In particular, authenticated managed crash
+            // recovery may be legitimate work; running it here would block the
+            // native event loop before either the stable-frame reveal or the
+            // fallback can show a window.
+            diag("setup() defers graph open to the visible webview");
             // Watch for external changes (reads whichever graph is current).
             start_watcher(app.handle().clone());
             diag("setup() done — watcher started, handing off to webview");
