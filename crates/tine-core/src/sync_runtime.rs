@@ -271,13 +271,23 @@ struct ProviderRecoveryCoverageRoot {
 struct ProviderAcceptedManifestAudit {
     next_sequence: u64,
     target_sequence: u64,
+    advances_coverage: bool,
 }
 
 impl ProviderAcceptedManifestAudit {
-    fn new(target_sequence: u64) -> Option<Self> {
-        (target_sequence != 0).then_some(Self {
-            next_sequence: 1,
+    fn after_coverage(covered_sequence: u64, target_sequence: u64) -> Option<Self> {
+        (covered_sequence < target_sequence).then_some(Self {
+            next_sequence: covered_sequence.saturating_add(1),
             target_sequence,
+            advances_coverage: true,
+        })
+    }
+
+    fn revalidation(next_sequence: u64, target_sequence: u64) -> Option<Self> {
+        (target_sequence != 0).then_some(Self {
+            next_sequence: next_sequence.clamp(1, target_sequence),
+            target_sequence,
+            advances_coverage: false,
         })
     }
 }
@@ -512,6 +522,9 @@ struct ProviderTraversalInstrumentation {
     head_scan_chunk_boundaries: usize,
     head_scan_completions: usize,
     present_tip_manifests: usize,
+    accepted_manifest_audit_probes: usize,
+    first_accepted_manifest_audit_sequence: Option<u64>,
+    last_accepted_manifest_audit_sequence: Option<u64>,
     exact_manifests: usize,
     recovery_links: usize,
     recovery_blobs: usize,
@@ -2694,6 +2707,18 @@ impl SyncRuntimeHandle {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::EngineInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn tick_provider_for_test(&self) -> Result<SyncRuntimeTick, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::TickProviderForTest {
             reply: reply_sender,
         })?;
         reply_receiver
@@ -4987,6 +5012,10 @@ enum ActorRequest {
         reply: mpsc::Sender<crate::oplog::hot_engine::EngineInstrumentation>,
     },
     #[cfg(test)]
+    TickProviderForTest {
+        reply: mpsc::Sender<SyncRuntimeTick>,
+    },
+    #[cfg(test)]
     InstallRepeatedOperationalFault {
         point: OperationalFaultPoint,
         failures: u8,
@@ -5139,6 +5168,22 @@ fn run_actor_loop(
                     .engine()
                     .instrumentation();
                 let _ = reply.send(instrumentation);
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::TickProviderForTest { reply } => {
+                if !actor.provider_has_work()
+                    && actor.provider_accepted_manifest_revalidation_ready
+                    && actor.provider_accepted_manifest_audit.is_none()
+                {
+                    if let Err(error) = actor.begin_provider_accepted_manifest_revalidation() {
+                        let _ = reply.send(SyncRuntimeTick::RecoveryBlocked(error.to_string()));
+                        *shared_status.write().unwrap() = actor.snapshot();
+                        continue;
+                    }
+                }
+                let result = actor.tick_provider();
+                let _ = reply.send(result);
                 false
             }
             #[cfg(test)]
@@ -5545,7 +5590,10 @@ struct RuntimeActor {
     provider_incomplete_recheck: VecDeque<BatchId>,
     provider_accepted_archive_loss: BTreeSet<BatchId>,
     provider_accepted_manifest_audit: Option<ProviderAcceptedManifestAudit>,
-    provider_accepted_manifest_audit_root: Option<ProviderRecoveryCoverageRoot>,
+    provider_accepted_manifest_audit_covered_sequence: u64,
+    provider_accepted_manifest_revalidation_next_sequence: u64,
+    provider_accepted_manifest_revalidation_ready: bool,
+    provider_accepted_manifest_revalidation_after_external_tick: bool,
     provider_objects_changed: bool,
     provider_publication_probe: bool,
     provider_publication_cursor: Option<SharedProviderPublicationCursor>,
@@ -5820,14 +5868,14 @@ impl RuntimeActor {
         let actor_shared_phase_inspection = phase_started.elapsed();
         #[cfg(test)]
         let phase_started = Instant::now();
-        let accepted_root = runtime.engine().accepted_frontier_root().map_err(display)?;
-        let accepted_audit_root = ProviderRecoveryCoverageRoot::from_frontier(&accepted_root);
-        let provider_accepted_manifest_audit = (shared_phase == Some(SyncSharedPhase::Active))
-            .then(|| ProviderAcceptedManifestAudit::new(accepted_root.acceptance_sequence()))
-            .flatten();
-        let provider_accepted_manifest_audit_root = (shared_phase == Some(SyncSharedPhase::Active)
-            && provider_accepted_manifest_audit.is_none())
-        .then_some(accepted_audit_root);
+        let _accepted_root = runtime.engine().accepted_frontier_root().map_err(display)?;
+        // A clean shared reopen adopts its authenticated audit watermark from
+        // the matching provider frontier head. Until bounded head discovery
+        // proves that authority, mutation and Safe remain fenced. Legacy or
+        // uncovered heads seed the audit only after discovery completes.
+        let provider_accepted_manifest_audit = None;
+        let provider_accepted_manifest_audit_covered_sequence = 0;
+        let provider_accepted_manifest_revalidation_next_sequence = 1;
         #[cfg(test)]
         let actor_accepted_frontier_open = phase_started.elapsed();
         #[cfg(test)]
@@ -5912,7 +5960,10 @@ impl RuntimeActor {
             provider_incomplete_recheck: VecDeque::new(),
             provider_accepted_archive_loss: BTreeSet::new(),
             provider_accepted_manifest_audit,
-            provider_accepted_manifest_audit_root,
+            provider_accepted_manifest_audit_covered_sequence,
+            provider_accepted_manifest_revalidation_next_sequence,
+            provider_accepted_manifest_revalidation_ready: false,
+            provider_accepted_manifest_revalidation_after_external_tick: false,
             provider_objects_changed: false,
             provider_publication_probe: shared_phase == Some(SyncSharedPhase::Active),
             provider_publication_cursor: None,
@@ -7195,7 +7246,21 @@ impl RuntimeActor {
         if self.shared_phase == Some(SyncSharedPhase::Active) && self.provider_has_work() {
             return self.tick_provider();
         }
-        self.tick_external_feed()
+        if self.shared_phase == Some(SyncSharedPhase::Active)
+            && self.provider_accepted_manifest_revalidation_ready
+            && self.provider_accepted_manifest_audit.is_none()
+        {
+            if let Err(error) = self.begin_provider_accepted_manifest_revalidation() {
+                return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+            }
+            return self.tick_provider();
+        }
+        let tick = self.tick_external_feed();
+        if self.provider_accepted_manifest_revalidation_after_external_tick {
+            self.provider_accepted_manifest_revalidation_after_external_tick = false;
+            self.provider_accepted_manifest_revalidation_ready = true;
+        }
+        tick
     }
 
     fn provider_has_work(&self) -> bool {
@@ -7416,6 +7481,11 @@ impl RuntimeActor {
                 self.provider_observation_full = full;
                 if full {
                     self.provider_recovery_coverage_root = None;
+                    self.provider_accepted_manifest_audit_covered_sequence = 0;
+                    self.provider_accepted_manifest_audit = None;
+                    self.provider_accepted_manifest_revalidation_next_sequence = 1;
+                    self.provider_accepted_manifest_revalidation_ready = false;
+                    self.provider_accepted_manifest_revalidation_after_external_tick = false;
                 }
                 self.provider_scan_valid_heads = 0;
                 self.provider_scan_invalid_head = false;
@@ -7502,15 +7572,17 @@ impl RuntimeActor {
                     self.provider_observation_cursor = None;
                     if self.provider_observation_full {
                         self.provider_discovery_scan_complete = true;
-                        if let Err(error) = self.begin_provider_accepted_manifest_audit() {
-                            return SyncRuntimeTick::RecoveryBlocked(error.to_string());
-                        }
                     } else if self.provider_scan_valid_heads == 0 || self.provider_scan_invalid_head
                     {
                         self.provider_full_scan_requested = true;
                         self.provider_discovery_scan_complete = false;
                     } else {
                         self.provider_discovery_scan_complete = true;
+                    }
+                    if self.provider_discovery_scan_complete {
+                        if let Err(error) = self.begin_provider_accepted_manifest_audit() {
+                            return SyncRuntimeTick::RecoveryBlocked(error.to_string());
+                        }
                     }
                     #[cfg(test)]
                     if !self.provider_observation_full {
@@ -7797,8 +7869,15 @@ impl RuntimeActor {
     ) -> Result<bool, SyncRuntimeRequestError> {
         let current = self.current_provider_recovery_root()?;
         Ok(self.provider_recovery_coverage_root == Some(current)
-            && self.provider_accepted_manifest_audit_root == Some(current)
-            && self.provider_accepted_manifest_audit.is_none())
+            && self.provider_accepted_manifest_audit_matches_current_frontier(&current))
+    }
+
+    fn provider_accepted_manifest_audit_matches_current_frontier(
+        &self,
+        current: &ProviderRecoveryCoverageRoot,
+    ) -> bool {
+        self.provider_accepted_manifest_audit_covered_sequence == current.acceptance_sequence
+            && self.provider_accepted_manifest_audit.is_none()
     }
 
     fn own_provider_frontier_has_durable_authority(&self) -> Result<bool, SyncRuntimeRequestError> {
@@ -7892,7 +7971,6 @@ impl RuntimeActor {
         // read fails, no stale coverage can escape on a later head or Safe
         // path, and the exact batch remains retryable.
         let prior_coverage = self.provider_recovery_coverage_root.take();
-        let prior_audit_root = self.provider_accepted_manifest_audit_root.take();
         self.provider_head_dirty = true;
         let current = match self.current_provider_recovery_root() {
             Ok(current) => current,
@@ -7901,34 +7979,118 @@ impl RuntimeActor {
                 return Err(error);
             }
         };
-        if let Some(audit) = self.provider_accepted_manifest_audit.as_mut() {
+        if self
+            .provider_accepted_manifest_audit
+            .as_ref()
+            .is_some_and(|audit| audit.advances_coverage)
+        {
+            let audit = self
+                .provider_accepted_manifest_audit
+                .as_mut()
+                .expect("coverage audit remains present");
             audit.target_sequence = audit.target_sequence.max(current.acceptance_sequence);
-        } else if prior_audit_root == prior_coverage && prior_audit_root.is_some() {
-            self.provider_accepted_manifest_audit = Some(ProviderAcceptedManifestAudit {
-                next_sequence: current.acceptance_sequence,
-                target_sequence: current.acceptance_sequence,
-            });
         } else {
-            self.provider_accepted_manifest_audit =
-                ProviderAcceptedManifestAudit::new(current.acceptance_sequence);
+            self.provider_accepted_manifest_audit = ProviderAcceptedManifestAudit::after_coverage(
+                self.provider_accepted_manifest_audit_covered_sequence,
+                current.acceptance_sequence,
+            );
         }
         if prior_coverage == Some(current) {
             self.provider_recovery_coverage_root = prior_coverage;
-            self.provider_accepted_manifest_audit_root = prior_audit_root;
             return Ok(());
         }
         self.queue_provider_recovery_exact(batch_id);
         Ok(())
     }
 
+    fn adopt_provider_accepted_manifest_audit_coverage(
+        &mut self,
+        covered_sequence: u64,
+        target_sequence: u64,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        if covered_sequence > target_sequence {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "accepted manifest audit coverage {covered_sequence} outruns frontier {target_sequence}"
+            )));
+        }
+        self.provider_accepted_manifest_audit_covered_sequence = self
+            .provider_accepted_manifest_audit_covered_sequence
+            .max(covered_sequence);
+        Ok(())
+    }
+
     fn begin_provider_accepted_manifest_audit(&mut self) -> Result<(), SyncRuntimeRequestError> {
         let root = self.current_provider_recovery_root()?;
-        self.provider_accepted_manifest_audit =
-            ProviderAcceptedManifestAudit::new(root.acceptance_sequence);
-        self.provider_accepted_manifest_audit_root = self
-            .provider_accepted_manifest_audit
-            .is_none()
-            .then_some(root);
+        self.provider_accepted_manifest_audit = ProviderAcceptedManifestAudit::after_coverage(
+            self.provider_accepted_manifest_audit_covered_sequence,
+            root.acceptance_sequence,
+        );
+        if self.provider_accepted_manifest_audit.is_none() && root.acceptance_sequence != 0 {
+            self.provider_accepted_manifest_revalidation_ready = true;
+        }
+        Ok(())
+    }
+
+    fn begin_provider_accepted_manifest_revalidation(
+        &mut self,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let current = self.current_provider_recovery_root()?;
+        self.provider_accepted_manifest_audit = ProviderAcceptedManifestAudit::revalidation(
+            self.provider_accepted_manifest_revalidation_next_sequence,
+            current.acceptance_sequence,
+        );
+        self.provider_accepted_manifest_revalidation_ready = false;
+        self.provider_accepted_manifest_revalidation_after_external_tick = false;
+        Ok(())
+    }
+
+    fn publish_provider_accepted_manifest_audit_checkpoint(
+        &mut self,
+        descriptor: &SharedEnrollmentDescriptorV1,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        if !self.provider_discovery_scan_complete
+            || self.provider_observation_cursor.is_some()
+            || self.provider_rescan_requested
+            || self.provider_full_scan_requested
+            || self.provider_accepted_manifest_audit_covered_sequence == 0
+        {
+            return Ok(());
+        }
+        if let Some(path) = self.provider_head_retirement.front().cloned() {
+            self.provider
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .retire_frontier_head(&path)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            self.provider_head_retirement.pop_front();
+            self.provider_own_heads.remove(&path);
+            return Ok(());
+        }
+        let durable_head = self
+            .provider_current_head
+            .as_ref()
+            .and_then(|path| self.provider_own_heads.get(path));
+        let durable_coverage = durable_head
+            .and_then(SharedProviderFrontierHeadV1::accepted_manifest_audit_coverage_sequence)
+            .unwrap_or(0);
+        let durable_revalidation = durable_head
+            .and_then(SharedProviderFrontierHeadV1::accepted_manifest_revalidation_next_sequence)
+            .unwrap_or(1);
+        if durable_coverage >= self.provider_accepted_manifest_audit_covered_sequence
+            && durable_revalidation == self.provider_accepted_manifest_revalidation_next_sequence
+        {
+            return Ok(());
+        }
+        self.publish_current_provider_head(descriptor)?;
+        if let Some(path) = self.provider_head_retirement.front().cloned() {
+            self.provider
+                .as_ref()
+                .ok_or(SyncRuntimeRequestError::ActorUnavailable)?
+                .retire_frontier_head(&path)
+                .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))?;
+            self.provider_head_retirement.pop_front();
+            self.provider_own_heads.remove(&path);
+        }
         Ok(())
     }
 
@@ -7971,6 +8133,19 @@ impl RuntimeActor {
                             ));
                         }
                         return Ok(Some(current));
+                    }
+                    #[cfg(test)]
+                    {
+                        let mut instrumentation =
+                            PROVIDER_TRAVERSAL_INSTRUMENTATION.lock().unwrap();
+                        let counters = instrumentation
+                            .entry(self.binding.workspace_id())
+                            .or_default();
+                        counters.accepted_manifest_audit_probes += 1;
+                        counters
+                            .first_accepted_manifest_audit_sequence
+                            .get_or_insert(audit.next_sequence);
+                        counters.last_accepted_manifest_audit_sequence = Some(audit.next_sequence);
                     }
                     let (batch_id, evidence) = self
                         .runtime
@@ -8174,6 +8349,17 @@ impl RuntimeActor {
                             }
                         }
                     }
+                    if audit.advances_coverage {
+                        self.provider_accepted_manifest_audit_covered_sequence =
+                            audit.next_sequence;
+                    } else {
+                        self.provider_accepted_manifest_revalidation_next_sequence =
+                            audit.next_sequence.checked_add(1).ok_or_else(|| {
+                                SyncRuntimeRequestError::ActorRefused(
+                                    "accepted manifest revalidation sequence overflow".into(),
+                                )
+                            })?;
+                    }
                     audit.next_sequence = audit.next_sequence.checked_add(1).ok_or_else(|| {
                         SyncRuntimeRequestError::ActorRefused(
                             "accepted manifest audit sequence overflow".into(),
@@ -8184,11 +8370,27 @@ impl RuntimeActor {
             })();
         match result {
             Ok(Some(current)) => {
-                self.provider_accepted_manifest_audit_root = Some(current);
+                if audit.advances_coverage {
+                    self.provider_accepted_manifest_audit_covered_sequence =
+                        current.acceptance_sequence;
+                    if current.acceptance_sequence != 0 {
+                        self.provider_accepted_manifest_revalidation_ready = true;
+                    }
+                } else {
+                    self.provider_accepted_manifest_revalidation_next_sequence = 1;
+                    self.provider_accepted_manifest_revalidation_after_external_tick = true;
+                }
+                self.provider_head_dirty = true;
                 Ok(true)
             }
             Ok(None) => {
-                self.provider_accepted_manifest_audit = Some(audit);
+                if audit.advances_coverage {
+                    self.provider_accepted_manifest_audit = Some(audit);
+                } else {
+                    self.provider_accepted_manifest_revalidation_after_external_tick = true;
+                    self.provider_head_dirty = true;
+                }
+                self.publish_provider_accepted_manifest_audit_checkpoint(descriptor)?;
                 Ok(true)
             }
             Err(error) => {
@@ -8284,7 +8486,7 @@ impl RuntimeActor {
             .iter()
             .flat_map(|document| document.direct_dependency_heads().iter().copied())
             .collect();
-        SharedProviderFrontierHeadV1::new(
+        SharedProviderFrontierHeadV1::new_with_accepted_manifest_audit_coverage(
             descriptor.workspace_id(),
             descriptor.lineage_digest(),
             descriptor
@@ -8297,6 +8499,12 @@ impl RuntimeActor {
             (self.provider_recovery_coverage_root
                 == Some(ProviderRecoveryCoverageRoot::from_frontier(&root)))
             .then_some(root.state_digest()),
+            (self.provider_accepted_manifest_audit_covered_sequence != 0)
+                .then_some(self.provider_accepted_manifest_audit_covered_sequence),
+            (root.acceptance_sequence() != 0
+                && self.provider_accepted_manifest_audit_covered_sequence
+                    == root.acceptance_sequence())
+            .then_some(self.provider_accepted_manifest_revalidation_next_sequence),
         )
         .map_err(|error| SyncRuntimeRequestError::ActorRefused(error.to_string()))
     }
@@ -8496,6 +8704,17 @@ impl RuntimeActor {
                     self.provider_current_head = Some(path.to_owned());
                 } else if self.provider_current_head.is_none() {
                     self.provider_current_head = Some(path.to_owned());
+                }
+                if let Some(covered_sequence) = head.accepted_manifest_audit_coverage_sequence() {
+                    self.adopt_provider_accepted_manifest_audit_coverage(
+                        covered_sequence,
+                        accepted_root.acceptance_sequence(),
+                    )?;
+                }
+                if head.has_current_accepted_manifest_audit_coverage() {
+                    self.provider_accepted_manifest_revalidation_next_sequence = head
+                        .accepted_manifest_revalidation_next_sequence()
+                        .unwrap_or(1);
                 }
             }
             if self.provider_current_head.as_ref().is_some_and(|current| {
@@ -8757,7 +8976,13 @@ impl RuntimeActor {
             && head.manifest_recovery_coverage_root()
                 == (self.provider_recovery_coverage_root
                     == Some(ProviderRecoveryCoverageRoot::from_frontier(&root)))
-                .then_some(root.state_digest()))
+                .then_some(root.state_digest())
+            && head.accepted_manifest_audit_coverage_sequence()
+                == (self.provider_accepted_manifest_audit_covered_sequence != 0)
+                    .then_some(self.provider_accepted_manifest_audit_covered_sequence)
+            && head.accepted_manifest_revalidation_next_sequence()
+                == (root.acceptance_sequence() != 0)
+                    .then_some(self.provider_accepted_manifest_revalidation_next_sequence))
     }
 
     fn provider_intent_is_covered_by_durable_head(
@@ -9616,6 +9841,65 @@ impl RuntimeActor {
                 .unwrap_or((None, SyncLocalMutationPhase::Bindings));
             return SyncLocalMutationOutcome::Revoked { batch_id, phase };
         }
+        if self.shared_phase == Some(SyncSharedPhase::Active) {
+            for _ in 0..MAX_CLEAN_DRAIN_TURNS {
+                if self.current_provider_recovery_root().is_ok_and(|current| {
+                    self.provider_accepted_manifest_audit_matches_current_frontier(&current)
+                }) {
+                    break;
+                }
+                if matches!(
+                    self.tick_provider(),
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ) {
+                    break;
+                }
+            }
+            if !self.current_provider_recovery_root().is_ok_and(|current| {
+                self.provider_accepted_manifest_audit_matches_current_frontier(&current)
+            }) {
+                return SyncLocalMutationOutcome::Blocked {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::Bindings,
+                    reason: SyncLocalMutationBlock::Prepublication,
+                };
+            }
+        }
+        if self.shared_phase == Some(SyncSharedPhase::Active)
+            && self.provider_accepted_manifest_revalidation_ready
+            && self.provider_accepted_manifest_audit.is_none()
+        {
+            let revalidation = self
+                .begin_provider_accepted_manifest_revalidation()
+                .map(|()| self.tick_provider());
+            if !revalidation.is_ok_and(|tick| {
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                )
+            }) {
+                return SyncLocalMutationOutcome::Blocked {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::Bindings,
+                    reason: SyncLocalMutationBlock::Prepublication,
+                };
+            }
+        }
+        if self.shared_phase == Some(SyncSharedPhase::Active)
+            && !self.provider_accepted_archive_loss.is_empty()
+        {
+            return SyncLocalMutationOutcome::Blocked {
+                batch_id: None,
+                phase: SyncLocalMutationPhase::Bindings,
+                reason: SyncLocalMutationBlock::Prepublication,
+            };
+        }
         if self.local_mutation.is_some() {
             let prior =
                 self.advance_local_mutation_once()
@@ -9935,6 +10219,30 @@ impl RuntimeActor {
         }
 
         self.drain_shared_provider_for_shutdown()?;
+        if self.shared_phase == Some(SyncSharedPhase::Active)
+            && self.provider_accepted_manifest_revalidation_ready
+            && self.provider_accepted_manifest_audit.is_none()
+        {
+            self.begin_provider_accepted_manifest_revalidation()?;
+            match self.tick_provider() {
+                SyncRuntimeTick::Idle | SyncRuntimeTick::Recovering => {}
+                SyncRuntimeTick::RecoveryBlocked(detail)
+                | SyncRuntimeTick::Blocked(detail)
+                | SyncRuntimeTick::Terminal(detail)
+                | SyncRuntimeTick::Failed(detail) => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(detail));
+                }
+                SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. }
+                | SyncRuntimeTick::LocalMutation(_)
+                | SyncRuntimeTick::RetryFull => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(
+                        "accepted manifest revalidation returned an unrelated runtime outcome"
+                            .into(),
+                    ));
+                }
+            }
+        }
         for _ in 0..MAX_CLEAN_DRAIN_TURNS {
             let tick = self.tick_external_feed();
             match tick {
@@ -18380,6 +18688,30 @@ mod tests {
         );
     }
 
+    fn settle_shared_provider_authority(handle: &SyncRuntimeHandle) {
+        for _ in 0..1_024 {
+            let tick = handle.tick_provider_for_test().unwrap();
+            let status = handle.status().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "shared provider authority did not settle: {tick:?}, {status:?}"
+            );
+            if status.provider_pending == 0 {
+                return;
+            }
+        }
+        panic!(
+            "shared provider authority exceeded the bounded test turn budget: {:?}",
+            handle.status().unwrap()
+        );
+    }
+
     fn joined_shared_pair(
         label: &str,
         seed: u128,
@@ -19436,11 +19768,11 @@ mod tests {
             .unwrap()
             .insert(receiver.request.identities.workspace_id, 1);
         let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
-        drive_initial_feed(&restarted);
+        settle_shared_provider_authority(&restarted);
         let mut recovering_pages = 0;
         let mut repaired = false;
         for _ in 0..64 {
-            match restarted.tick().unwrap() {
+            match restarted.tick_provider_for_test().unwrap() {
                 SyncRuntimeTick::Recovering => recovering_pages += 1,
                 SyncRuntimeTick::Idle => {}
                 other => panic!("restart accepted-manifest audit failed unexpectedly: {other:?}"),
@@ -19519,18 +19851,219 @@ mod tests {
         (fixture, first_batch)
     }
 
-    fn tick_until_provider_audit_cut(handle: &SyncRuntimeHandle, expected: &str) {
-        for _ in 0..64 {
-            match handle.tick().unwrap() {
-                SyncRuntimeTick::RecoveryBlocked(detail) if detail.contains(expected) => return,
-                SyncRuntimeTick::RecoveryBlocked(detail) => {
-                    panic!("accepted audit blocked for an unexpected reason: {detail}")
-                }
-                SyncRuntimeTick::Recovering => {}
-                other => panic!("accepted audit cut was not retained as work: {other:?}"),
+    fn replace_own_provider_head_audit_authority(
+        fixture: &ActivationFixture,
+        coverage_sequence: u64,
+        revalidation_next_sequence: Option<u64>,
+    ) -> SharedProviderFrontierHeadV1 {
+        let heads = fixture
+            .request
+            .provider_root
+            .join("outbox")
+            .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE);
+        let entry = fs::read_dir(&heads)
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                let relative = format!(
+                    "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                    entry.file_name().to_string_lossy()
+                );
+                SharedProviderFrontierHeadV1::decode(&relative, &fs::read(entry.path()).unwrap())
+                    .is_ok_and(|head| {
+                        head.author_device_id() == fixture.request.identities.device_id
+                    })
+            })
+            .expect("fixture retained no own frontier head");
+        let relative = format!(
+            "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+            entry.file_name().to_string_lossy()
+        );
+        let prior =
+            SharedProviderFrontierHeadV1::decode(&relative, &fs::read(entry.path()).unwrap())
+                .unwrap();
+        for entry in fs::read_dir(&heads).unwrap().map(Result::unwrap) {
+            fs::remove_file(entry.path()).unwrap();
+        }
+        let replacement = SharedProviderFrontierHeadV1::new_with_accepted_manifest_audit_coverage(
+            prior.workspace_id(),
+            prior.lineage_digest(),
+            prior.descriptor_digest(),
+            prior.author_device_id(),
+            prior.accepted_generation(),
+            prior.accepted_frontier_root(),
+            prior.frontier_tips().to_vec(),
+            prior.manifest_recovery_coverage_root(),
+            Some(coverage_sequence),
+            revalidation_next_sequence,
+        )
+        .unwrap();
+        let mut provider = SharedProviderTransport::open(
+            &fixture.request.provider_root,
+            &fixture.request.provider_journal_root,
+        )
+        .unwrap();
+        provider.publish_frontier_head(&replacement).unwrap();
+        replacement
+    }
+
+    #[test]
+    fn accepted_non_tip_revalidation_repairs_before_following_mutation() {
+        let (fixture, first_batch) =
+            accepted_non_tip_audit_fixture("provider-nontip-audit-before-mutation", 0xbb50);
+        let prior = replace_own_provider_head_audit_authority(&fixture, 1, None);
+        let first_sequence = prior.accepted_generation() - 2;
+        replace_own_provider_head_audit_authority(
+            &fixture,
+            prior.accepted_generation(),
+            Some(first_sequence),
+        );
+        let provider_manifest = fixture
+            .request
+            .provider_root
+            .join(format!("outbox/manifests/{first_batch}.manifest"));
+        let (recovery_link, recovery_blob, ..) =
+            provider_manifest_recovery_paths(&fixture, first_batch);
+        fs::remove_file(&provider_manifest).unwrap();
+        fs::remove_file(&recovery_link).unwrap();
+        fs::remove_file(&recovery_blob).unwrap();
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        settle_shared_provider_authority(&reopened);
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        let transaction = OperationTransaction::new(vec![SemanticOperation::CreatePage {
+            page_id: PageId::from_uuid(Uuid::from_u128(0xbb58)),
+            home_document_id: DocumentId::from_uuid(Uuid::from_u128(0xbb59)),
+            name: LogicalPageName::parse("Audit Before Mutation").unwrap(),
+            path: ManagedPath::parse("notes/audit-before-mutation.md").unwrap(),
+            kind: ManagedTextKind::Page,
+        }])
+        .unwrap();
+        let mutation = reopened.submit_local_mutation(transaction).unwrap();
+        assert!(
+            matches!(
+                mutation,
+                SyncLocalMutationOutcome::Durable { .. }
+                    | SyncLocalMutationOutcome::RetryableRetainedRecovery { .. }
+            ),
+            "mutation remained fenced after its bounded revalidation: {mutation:?}, status={:?}, traversal={:?}",
+            reopened.status().unwrap(),
+            provider_traversal_instrumentation(fixture.request.identities.workspace_id)
+        );
+        if matches!(
+            mutation,
+            SyncLocalMutationOutcome::RetryableRetainedRecovery { .. }
+        ) {
+            let _ = settle_local_mutation(&reopened);
+        }
+        let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert_eq!(
+            traversal.first_accepted_manifest_audit_sequence,
+            Some(first_sequence),
+            "mutation did not begin with the authenticated revalidation cursor: {traversal:?}"
+        );
+        assert!(
+            provider_manifest.is_file() && recovery_link.is_file() && recovery_blob.is_file(),
+            "accepted non-tip loss was not repaired before the following mutation"
+        );
+        settle_shared_provider_authority(&reopened);
+    }
+
+    #[test]
+    fn accepted_manifest_audit_checkpoint_resumes_after_crash_reopen() {
+        let (fixture, _first_batch) =
+            accepted_non_tip_audit_fixture("provider-audit-checkpoint-crash", 0xbb5a);
+        let full = replace_own_provider_head_audit_authority(&fixture, 1, None);
+        let initial_coverage = full.accepted_generation() - 3;
+        replace_own_provider_head_audit_authority(&fixture, initial_coverage, None);
+        PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES
+            .lock()
+            .unwrap()
+            .insert(fixture.request.identities.workspace_id, 1);
+
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        let first = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        for _ in 0..128 {
+            let _ = first.tick_provider_for_test().unwrap();
+            if provider_traversal_instrumentation(fixture.request.identities.workspace_id)
+                .accepted_manifest_audit_probes
+                == 1
+            {
+                break;
             }
         }
-        panic!("accepted audit did not reach the deterministic cut");
+        let before_crash =
+            provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert_eq!(
+            before_crash.first_accepted_manifest_audit_sequence,
+            Some(initial_coverage + 1),
+            "first audit chunk did not start at the uncovered tail: {before_crash:?}"
+        );
+        let durable_coverage = fs::read_dir(
+            fixture
+                .request
+                .provider_root
+                .join("outbox")
+                .join(SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .filter_map(|entry| {
+            let relative = format!(
+                "{SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE}/{}",
+                entry.file_name().to_string_lossy()
+            );
+            SharedProviderFrontierHeadV1::decode(&relative, &fs::read(entry.path()).unwrap())
+                .ok()
+                .and_then(|head| head.accepted_manifest_audit_coverage_sequence())
+        })
+        .max();
+        assert_eq!(
+            durable_coverage,
+            Some(initial_coverage + 1),
+            "audit chunk returned before its frontier-head checkpoint was durable"
+        );
+        drop(first);
+
+        reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        let restarted = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        for _ in 0..4_096 {
+            let tick = restarted.tick_provider_for_test().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                ),
+                "crash-reopened audit failed: {tick:?}"
+            );
+            if provider_traversal_instrumentation(fixture.request.identities.workspace_id)
+                .accepted_manifest_audit_probes
+                != 0
+            {
+                break;
+            }
+        }
+        let after_crash =
+            provider_traversal_instrumentation(fixture.request.identities.workspace_id);
+        assert_eq!(
+            after_crash.first_accepted_manifest_audit_sequence,
+            Some(initial_coverage + 2),
+            "crash reopen replayed the committed audit chunk: {after_crash:?}"
+        );
+        PROVIDER_ACCEPTED_AUDIT_LIMIT_OVERRIDES
+            .lock()
+            .unwrap()
+            .remove(&fixture.request.identities.workspace_id);
+        settle_shared_provider_authority(&restarted);
+    }
+
+    fn tick_until_provider_audit_cut(handle: &SyncRuntimeHandle, expected: &str) {
+        match handle.clean_shutdown() {
+            Err(SyncRuntimeRequestError::ActorRefused(detail)) if detail.contains(expected) => {}
+            other => panic!("accepted audit cut was not retained as work: {other:?}"),
+        }
     }
 
     #[test]
@@ -19539,7 +20072,7 @@ mod tests {
             accepted_non_tip_audit_fixture("provider-nontip-audit-read-retry", 0xbb60);
         reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
-        drive_initial_feed(&reopened);
+        settle_shared_provider_authority(&reopened);
         fail_once_at_provider_accepted_audit_cut(
             fixture.request.identities.workspace_id,
             first_batch,
@@ -19552,7 +20085,7 @@ mod tests {
             "provider read failure discarded accepted-audit work"
         );
 
-        settle_shared_provider(&reopened);
+        settle_shared_provider_authority(&reopened);
         let traversal = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         assert_eq!(traversal.full_scan_entries, 0, "{traversal:?}");
         assert!(matches!(
@@ -19577,7 +20110,7 @@ mod tests {
 
         reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
-        drive_initial_feed(&reopened);
+        settle_shared_provider_authority(&reopened);
         fail_once_at_provider_accepted_audit_cut(
             fixture.request.identities.workspace_id,
             first_batch,
@@ -19594,7 +20127,7 @@ mod tests {
             "the pre-publication cut unexpectedly repaired the canonical manifest"
         );
 
-        settle_shared_provider(&reopened);
+        settle_shared_provider_authority(&reopened);
         assert!(
             provider_manifest.is_file() && recovery_link.is_file() && recovery_blob.is_file(),
             "same-actor retry did not durably repair accepted non-tip authority"
@@ -24138,37 +24671,50 @@ mod tests {
 
         reset_provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
-        let mut idle = false;
+        let mut provider_settled = false;
         let mut turns = 0;
         for _ in 0..16 {
             turns += 1;
-            if matches!(reopened.tick().unwrap(), SyncRuntimeTick::Idle) {
-                idle = true;
+            let tick = reopened.tick_provider_for_test().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "clean reopen provider settlement failed: {tick:?}"
+            );
+            if reopened.status().unwrap().provider_pending == 0 {
+                provider_settled = true;
                 break;
             }
         }
         assert!(
-            idle,
+            provider_settled,
             "clean reopen must not enumerate settled manifest/object history"
         );
         let traversed = provider_traversal_instrumentation(fixture.request.identities.workspace_id);
         assert_eq!(traversed.full_scan_entries, 0, "{traversed:?}");
         assert_eq!(traversed.exact_manifests, 0, "{traversed:?}");
+        assert_eq!(
+            traversed.accepted_manifest_audit_probes, 0,
+            "clean reopen replayed accepted history instead of trusting the Safe frontier audit watermark: {traversed:?}"
+        );
         assert!(traversed.present_tip_manifests > 64, "{traversed:?}");
         assert_eq!(traversed.recovery_links, 0, "{traversed:?}");
         assert_eq!(traversed.recovery_blobs, 0, "{traversed:?}");
         assert_eq!(traversed.exact_objects, 0, "{traversed:?}");
         assert_eq!(traversed.head_entries, 1, "{traversed:?}");
-        let accepted_audit_pages = traversed
-            .present_tip_manifests
-            .div_ceil(MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK);
         assert!(
-            turns <= traversed.head_entries + accepted_audit_pages + 6,
-            "startup work must be bounded by head residue plus accepted-sequence pages: turns={turns}, pages={accepted_audit_pages}, {traversed:?}"
+            turns <= traversed.head_entries + 6,
+            "startup work must be bounded by current frontier residue, not lifetime accepted history: turns={turns}, {traversed:?}"
         );
+        let shutdown = reopened.clean_shutdown();
         assert!(
-            matches!(reopened.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
-            "clean shutdown must not replay all settled provider history"
+            matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))),
+            "clean shutdown must not replay all settled provider history: {shutdown:?}"
         );
     }
 

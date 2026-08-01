@@ -2276,6 +2276,7 @@ pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE: &str =
 pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE: &str =
     "manifest-recovery-blobs-v1";
 pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION: u32 = 1;
+pub(crate) const SHARED_PROVIDER_ACCEPTED_MANIFEST_AUDIT_FORMAT_VERSION: u32 = 1;
 const SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION: u32 = 1;
 const MAX_SHARED_PROVIDER_FRONTIER_HEAD_BYTES: usize = 256 * 1024;
 const MAX_SHARED_PROVIDER_FRONTIER_TIPS: usize = 4_096;
@@ -2285,6 +2286,10 @@ const SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_SCHEMA_VERSION: u32 = 1;
 const MAX_SHARED_PROVIDER_MANIFEST_RECOVERY_LINK_BYTES: usize = 4 * 1024;
 
 const fn zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+const fn zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
@@ -2307,6 +2312,14 @@ pub(crate) struct SharedProviderFrontierHeadV1 {
     manifest_recovery_format_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manifest_recovery_coverage_root: Option<super::ContentDigest>,
+    #[serde(default, skip_serializing_if = "zero_u32")]
+    accepted_manifest_audit_format_version: u32,
+    #[serde(default, skip_serializing_if = "zero_u64")]
+    accepted_manifest_audit_coverage_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_manifest_audit_coverage_root: Option<super::ContentDigest>,
+    #[serde(default, skip_serializing_if = "zero_u64")]
+    accepted_manifest_revalidation_next_sequence: u64,
 }
 
 impl SharedProviderFrontierHeadV1 {
@@ -2317,8 +2330,34 @@ impl SharedProviderFrontierHeadV1 {
         author_device_id: DeviceId,
         accepted_generation: u64,
         accepted_frontier_root: super::ContentDigest,
+        frontier_tips: Vec<BatchId>,
+        manifest_recovery_coverage_root: Option<super::ContentDigest>,
+    ) -> Result<Self, ScenarioError> {
+        Self::new_with_accepted_manifest_audit_coverage(
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            author_device_id,
+            accepted_generation,
+            accepted_frontier_root,
+            frontier_tips,
+            manifest_recovery_coverage_root,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_accepted_manifest_audit_coverage(
+        workspace_id: WorkspaceId,
+        lineage_digest: LineageDigest,
+        descriptor_digest: super::ContentDigest,
+        author_device_id: DeviceId,
+        accepted_generation: u64,
+        accepted_frontier_root: super::ContentDigest,
         mut frontier_tips: Vec<BatchId>,
         manifest_recovery_coverage_root: Option<super::ContentDigest>,
+        accepted_manifest_audit_coverage_sequence: Option<u64>,
+        accepted_manifest_revalidation_next_sequence: Option<u64>,
     ) -> Result<Self, ScenarioError> {
         frontier_tips.sort_unstable();
         frontier_tips.dedup();
@@ -2335,6 +2374,16 @@ impl SharedProviderFrontierHeadV1 {
             manifest_recovery_format_version: manifest_recovery_coverage_root
                 .map_or(0, |_| SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION),
             manifest_recovery_coverage_root,
+            accepted_manifest_audit_format_version: accepted_manifest_audit_coverage_sequence
+                .map_or(0, |_| {
+                    SHARED_PROVIDER_ACCEPTED_MANIFEST_AUDIT_FORMAT_VERSION
+                }),
+            accepted_manifest_audit_coverage_sequence: accepted_manifest_audit_coverage_sequence
+                .unwrap_or(0),
+            accepted_manifest_audit_coverage_root: accepted_manifest_audit_coverage_sequence
+                .map(|_| accepted_frontier_root),
+            accepted_manifest_revalidation_next_sequence:
+                accepted_manifest_revalidation_next_sequence.unwrap_or(0),
         };
         record.validate()?;
         Ok(record)
@@ -2409,6 +2458,29 @@ impl SharedProviderFrontierHeadV1 {
             && self.manifest_recovery_coverage_root == Some(self.accepted_frontier_root)
     }
 
+    pub(crate) fn accepted_manifest_audit_coverage_sequence(&self) -> Option<u64> {
+        if self.accepted_manifest_audit_format_version
+            == SHARED_PROVIDER_ACCEPTED_MANIFEST_AUDIT_FORMAT_VERSION
+            && self.accepted_manifest_audit_coverage_sequence != 0
+            && self.accepted_manifest_audit_coverage_root == Some(self.accepted_frontier_root)
+        {
+            Some(self.accepted_manifest_audit_coverage_sequence)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn has_current_accepted_manifest_audit_coverage(&self) -> bool {
+        self.accepted_manifest_audit_coverage_sequence() == Some(self.accepted_generation)
+    }
+
+    pub(crate) fn accepted_manifest_revalidation_next_sequence(&self) -> Option<u64> {
+        let maximum = self.accepted_generation.checked_add(1)?;
+        (self.accepted_manifest_revalidation_next_sequence != 0
+            && self.accepted_manifest_revalidation_next_sequence <= maximum)
+            .then_some(self.accepted_manifest_revalidation_next_sequence)
+    }
+
     fn validate(&self) -> Result<(), ScenarioError> {
         if self.schema_version != SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION
             || self.oplog_protocol_version != super::OPLOG_PROTOCOL_VERSION
@@ -2423,6 +2495,26 @@ impl SharedProviderFrontierHeadV1 {
             ) && !(self.manifest_recovery_format_version
                 == SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION
                 && self.manifest_recovery_coverage_root == Some(self.accepted_frontier_root))
+            || !matches!(
+                (
+                    self.accepted_manifest_audit_format_version,
+                    self.accepted_manifest_audit_coverage_sequence,
+                    self.accepted_manifest_audit_coverage_root,
+                ),
+                (0, 0, None)
+            ) && !(self.accepted_manifest_audit_format_version
+                == SHARED_PROVIDER_ACCEPTED_MANIFEST_AUDIT_FORMAT_VERSION
+                && self.accepted_manifest_audit_coverage_sequence != 0
+                && self.accepted_manifest_audit_coverage_sequence <= self.accepted_generation
+                && self.accepted_manifest_audit_coverage_root == Some(self.accepted_frontier_root))
+            || (self.accepted_manifest_revalidation_next_sequence != 0
+                && (self.accepted_manifest_audit_coverage_sequence != self.accepted_generation
+                    || self
+                        .accepted_generation
+                        .checked_add(1)
+                        .is_none_or(|maximum| {
+                            self.accepted_manifest_revalidation_next_sequence > maximum
+                        })))
         {
             return Err(ScenarioError::NonCanonical);
         }
@@ -11235,6 +11327,65 @@ mod tests {
         assert_eq!(
             covered.manifest_recovery_coverage_root(),
             Some(accepted_root)
+        );
+
+        let audited = SharedProviderFrontierHeadV1::new_with_accepted_manifest_audit_coverage(
+            workspace_id,
+            lineage_digest,
+            descriptor_digest,
+            device_id,
+            18,
+            accepted_root,
+            vec![second],
+            Some(accepted_root),
+            Some(18),
+            Some(7),
+        )
+        .unwrap();
+        assert!(audited.has_current_accepted_manifest_audit_coverage());
+        assert_eq!(
+            audited.accepted_manifest_audit_coverage_sequence(),
+            Some(18)
+        );
+        assert_eq!(
+            audited.accepted_manifest_revalidation_next_sequence(),
+            Some(7)
+        );
+        let audited_bytes = audited.encode().unwrap();
+        let audited_path = audited.path().unwrap();
+        assert_eq!(
+            SharedProviderFrontierHeadV1::decode(&audited_path, &audited_bytes).unwrap(),
+            audited
+        );
+        assert!(
+            SharedProviderFrontierHeadV1::new_with_accepted_manifest_audit_coverage(
+                workspace_id,
+                lineage_digest,
+                descriptor_digest,
+                device_id,
+                18,
+                accepted_root,
+                vec![second],
+                Some(accepted_root),
+                Some(19),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            SharedProviderFrontierHeadV1::new_with_accepted_manifest_audit_coverage(
+                workspace_id,
+                lineage_digest,
+                descriptor_digest,
+                device_id,
+                18,
+                accepted_root,
+                vec![second],
+                Some(accepted_root),
+                Some(17),
+                Some(7),
+            )
+            .is_err()
         );
     }
 
