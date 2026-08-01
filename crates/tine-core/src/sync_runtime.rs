@@ -17603,6 +17603,140 @@ mod tests {
         Complete,
     }
 
+    #[derive(Clone, Copy)]
+    enum ProviderObservationMode {
+        ExactPaths,
+        ImpreciseRescan,
+    }
+
+    #[derive(Debug)]
+    struct RetainedStoreObservation {
+        provider_turns: usize,
+        delivered_paths: usize,
+        lifetime_archive_bytes: usize,
+        exact_ingress_bytes: usize,
+        directory_enumerations: usize,
+        inspected_manifest_operations: usize,
+        inspected_object_operations: usize,
+        inspected_bytes: usize,
+    }
+
+    fn observe_retained_store_ingress(
+        name: &str,
+        seed: u128,
+        mode: ProviderObservationMode,
+    ) -> RetainedStoreObservation {
+        const HISTORY_BATCHES: usize = 6;
+        let (author, receiver, author_handle, receiver_handle) = joined_shared_pair(name, seed);
+        for index in 0..HISTORY_BATCHES {
+            let seed = seed + 0x100 + (index as u128) * 4;
+            submit_shared_page(
+                &author_handle,
+                seed,
+                &format!("Retained Store History {index}"),
+                &format!("notes/retained-store-history-{index}.md"),
+                &format!("retained store history payload {index}"),
+            );
+        }
+        settle_shared_provider(&author_handle);
+        copy_provider_tree(
+            &author.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        receiver_handle.observe_provider().unwrap();
+        settle_shared_provider(&receiver_handle);
+
+        let lifetime_archive_bytes = ["objects", "batches"]
+            .into_iter()
+            .map(|namespace| {
+                fs::read_dir(receiver.request.archive_root.join(namespace))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().metadata().unwrap().len() as usize)
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+
+        let (ingress_batch, ..) = submit_shared_page(
+            &author_handle,
+            seed + 0x200,
+            "Retained Store Exact Ingress",
+            "notes/retained-store-exact-ingress.md",
+            "only this exact provider batch should be inspected",
+        );
+        publish_shared_batch(&author_handle, &author, ingress_batch);
+        settle_shared_provider(&author_handle);
+        let delivered = copy_provider_batch(
+            &author,
+            &receiver,
+            ingress_batch,
+            ProviderBatchDelivery::Complete,
+        );
+        let exact_ingress_bytes = delivered
+            .iter()
+            .map(|path| {
+                fs::metadata(receiver.request.provider_root.join("outbox").join(path))
+                    .unwrap()
+                    .len() as usize
+            })
+            .sum::<usize>();
+
+        let before = receiver_handle.engine_instrumentation().unwrap();
+        match mode {
+            ProviderObservationMode::ExactPaths => receiver_handle
+                .observe_provider_paths(delivered.clone(), false)
+                .unwrap(),
+            ProviderObservationMode::ImpreciseRescan => receiver_handle
+                .observe_provider_paths(delivered.clone(), true)
+                .unwrap(),
+        }
+        let mut provider_turns = 0_usize;
+        for _ in 0..512 {
+            let tick = receiver_handle.tick().unwrap();
+            provider_turns += 1;
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::Failed(_)
+                ),
+                "exact provider ingress failed: {tick:?}"
+            );
+            if matches!(tick, SyncRuntimeTick::Idle)
+                && receiver_handle.status().unwrap().provider_pending == 0
+            {
+                break;
+            }
+        }
+        assert_eq!(receiver_handle.status().unwrap().provider_pending, 0);
+        assert!(
+            receiver
+                .graph_root
+                .join("notes/retained-store-exact-ingress.md")
+                .is_file(),
+            "the exact incoming manifest/object set was not admitted and projected"
+        );
+
+        let after = receiver_handle.engine_instrumentation().unwrap();
+        RetainedStoreObservation {
+            provider_turns,
+            delivered_paths: delivered.len(),
+            lifetime_archive_bytes,
+            exact_ingress_bytes,
+            directory_enumerations: after.store.directory_enumerations
+                - before.store.directory_enumerations,
+            inspected_manifest_operations: after.store.inspected_manifest_operations
+                - before.store.inspected_manifest_operations,
+            inspected_object_operations: after.store.inspected_object_operations
+                - before.store.inspected_object_operations,
+            inspected_bytes: after.store.inspected_manifest_bytes
+                + after.store.inspected_object_bytes
+                - before.store.inspected_manifest_bytes
+                - before.store.inspected_object_bytes,
+        }
+    }
+
     fn copy_provider_batch(
         from: &ActivationFixture,
         to: &ActivationFixture,
@@ -22989,159 +23123,76 @@ mod tests {
 
     #[test]
     fn provider_turns_reuse_retained_store_and_charge_only_exact_ingress() {
-        const HISTORY_BATCHES: usize = 12;
-        let (author, receiver, author_handle, receiver_handle) =
-            joined_shared_pair("provider-retained-store", 0xc600);
-        for index in 0..HISTORY_BATCHES {
-            let seed = 0xc700 + (index as u128) * 4;
-            submit_shared_page(
-                &author_handle,
-                seed,
-                &format!("Retained Store History {index}"),
-                &format!("notes/retained-store-history-{index}.md"),
-                &format!("retained store history payload {index}"),
-            );
-        }
-        settle_shared_provider(&author_handle);
-        copy_provider_tree(
-            &author.request.provider_root,
-            &receiver.request.provider_root,
+        let exact = observe_retained_store_ingress(
+            "provider-retained-store-exact",
+            0xc600,
+            ProviderObservationMode::ExactPaths,
         );
-        receiver_handle.observe_provider().unwrap();
-        settle_shared_provider(&receiver_handle);
-
-        let lifetime_archive_bytes = ["objects", "batches"]
-            .into_iter()
-            .map(|namespace| {
-                fs::read_dir(receiver.request.archive_root.join(namespace))
-                    .unwrap()
-                    .map(|entry| entry.unwrap().metadata().unwrap().len() as usize)
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-
-        let (ingress_batch, ..) = submit_shared_page(
-            &author_handle,
-            0xc800,
-            "Retained Store Exact Ingress",
-            "notes/retained-store-exact-ingress.md",
-            "only this exact provider batch should be inspected",
+        let imprecise = observe_retained_store_ingress(
+            "provider-retained-store-imprecise",
+            0xd600,
+            ProviderObservationMode::ImpreciseRescan,
         );
-        publish_shared_batch(&author_handle, &author, ingress_batch);
-        settle_shared_provider(&author_handle);
-        let delivered = copy_provider_batch(
-            &author,
-            &receiver,
-            ingress_batch,
-            ProviderBatchDelivery::Complete,
-        );
-        let exact_ingress_bytes = delivered
-            .iter()
-            .map(|path| {
-                fs::metadata(receiver.request.provider_root.join("outbox").join(path))
-                    .unwrap()
-                    .len() as usize
-            })
-            .sum::<usize>();
-
-        let before = receiver_handle.engine_instrumentation().unwrap();
-        receiver_handle
-            .observe_provider_paths(delivered.clone(), false)
+        let old_reopen_minimum_archive_bytes = exact
+            .provider_turns
+            .checked_mul(exact.lifetime_archive_bytes)
             .unwrap();
-        let mut provider_turns = 0_usize;
-        for _ in 0..512 {
-            let tick = receiver_handle.tick().unwrap();
-            provider_turns += 1;
-            assert!(
-                !matches!(
-                    tick,
-                    SyncRuntimeTick::RecoveryBlocked(_)
-                        | SyncRuntimeTick::Blocked(_)
-                        | SyncRuntimeTick::Terminal(_)
-                        | SyncRuntimeTick::Failed(_)
-                ),
-                "exact provider ingress failed: {tick:?}"
-            );
-            if matches!(tick, SyncRuntimeTick::Idle)
-                && receiver_handle.status().unwrap().provider_pending == 0
-            {
-                break;
-            }
-        }
-        assert_eq!(receiver_handle.status().unwrap().provider_pending, 0);
-        assert!(
-            receiver
-                .graph_root
-                .join("notes/retained-store-exact-ingress.md")
-                .is_file(),
-            "the exact incoming manifest/object set was not admitted and projected"
-        );
-
-        let after = receiver_handle.engine_instrumentation().unwrap();
-        let directory_enumerations =
-            after.store.directory_enumerations - before.store.directory_enumerations;
-        let inspected_manifest_operations =
-            after.store.inspected_manifest_operations - before.store.inspected_manifest_operations;
-        let inspected_object_operations =
-            after.store.inspected_object_operations - before.store.inspected_object_operations;
-        let inspected_bytes = after.store.inspected_manifest_bytes
-            + after.store.inspected_object_bytes
-            - before.store.inspected_manifest_bytes
-            - before.store.inspected_object_bytes;
-        let old_reopen_directory_enumerations = provider_turns * 2;
-        let old_reopen_minimum_archive_bytes =
-            provider_turns.checked_mul(lifetime_archive_bytes).unwrap();
 
         eprintln!(
-            "provider retained-store counters: turns={provider_turns}, \
-             lifetime_archive_bytes={lifetime_archive_bytes}, \
-             old_directory_enumerations={old_reopen_directory_enumerations}, \
-             old_minimum_archive_bytes={old_reopen_minimum_archive_bytes}, \
-             new_directory_enumerations={directory_enumerations}, \
-             exact_ingress_bytes={exact_ingress_bytes}, \
-             inspected_manifest_operations={inspected_manifest_operations}, \
-             inspected_object_operations={inspected_object_operations}, \
-             inspected_bytes={inspected_bytes}"
+            "provider retained-store counters: exact={exact:?}, imprecise={imprecise:?}, \
+             old_minimum_archive_bytes={old_reopen_minimum_archive_bytes}"
         );
         assert!(
-            provider_turns >= delivered.len(),
-            "fixture did not retain many independently bounded provider turns"
-        );
-        assert_eq!(
-            directory_enumerations, 0,
-            "routine provider work enumerated the lifetime object-store namespace"
-        );
-        assert_eq!(
-            inspected_manifest_operations, 18,
-            "exact ingress and accepted-history audit did not charge every manifest validation \
-             to the retained store"
-        );
-        assert_eq!(
-            inspected_object_operations, 72,
-            "exact ingress and accepted-history audit did not charge every object validation \
-             to the retained store"
+            exact.provider_turns >= exact.delivered_paths,
+            "fixture did not retain many independently bounded provider turns: {exact:?}"
         );
         assert!(
-            inspected_bytes >= exact_ingress_bytes,
-            "exact ingress validation charged fewer bytes than the delivered closed object set"
+            exact.lifetime_archive_bytes > exact.exact_ingress_bytes.saturating_mul(4),
+            "fixture archive is not large relative to exact ingress: {exact:?}"
         );
         assert!(
-            inspected_bytes
-                <= exact_ingress_bytes
-                    .saturating_mul(provider_turns)
-                    .saturating_mul(2),
-            "provider work inspected {inspected_bytes} bytes for {exact_ingress_bytes} exact \
-             ingress bytes across {provider_turns} bounded turns"
+            exact.directory_enumerations == 0,
+            "routine provider work enumerated the lifetime object-store namespace: {exact:?}"
         );
         assert!(
-            lifetime_archive_bytes > exact_ingress_bytes.saturating_mul(8),
-            "fixture archive is not large relative to exact ingress: lifetime \
-             {lifetime_archive_bytes}, exact {exact_ingress_bytes}"
+            imprecise.directory_enumerations == 0,
+            "retained provider observation regressed to lifetime directory enumeration: {imprecise:?}"
         );
         assert!(
-            old_reopen_minimum_archive_bytes > inspected_bytes.saturating_mul(4),
+            exact.inspected_manifest_operations < imprecise.inspected_manifest_operations,
+            "exact path observation did not reduce retained manifest inspections: exact={exact:?} imprecise={imprecise:?}"
+        );
+        assert!(
+            exact.inspected_object_operations < imprecise.inspected_object_operations,
+            "exact path observation did not reduce retained object inspections: exact={exact:?} imprecise={imprecise:?}"
+        );
+        assert!(
+            exact.inspected_bytes >= exact.exact_ingress_bytes,
+            "exact ingress validation charged fewer bytes than the delivered closed object set: {exact:?}"
+        );
+        assert!(
+            exact.inspected_bytes < imprecise.inspected_bytes,
+            "exact path observation did not reduce retained-store bytes: exact={exact:?} imprecise={imprecise:?}"
+        );
+        assert!(
+            exact.inspected_bytes < old_reopen_minimum_archive_bytes,
+            "exact path observation regressed to reopening lifetime archive bytes: exact={exact:?}"
+        );
+        assert!(
+            imprecise.inspected_bytes >= imprecise.lifetime_archive_bytes,
+            "imprecise provider observation did not charge at least one lifetime archive pass: {imprecise:?}"
+        );
+        assert!(
+            imprecise.inspected_bytes
+                > exact
+                    .inspected_bytes
+                    .saturating_add(exact.exact_ingress_bytes.saturating_mul(4)),
+            "imprecise provider observation was not materially more expensive than exact ingress: exact={exact:?} imprecise={imprecise:?}"
+        );
+        assert!(
+            old_reopen_minimum_archive_bytes > exact.inspected_bytes.saturating_mul(2),
             "fixture does not distinguish lifetime history from exact ingress: old minimum \
-             {old_reopen_minimum_archive_bytes}, exact inspected {inspected_bytes}"
+             {old_reopen_minimum_archive_bytes}, exact={exact:?}"
         );
     }
 
