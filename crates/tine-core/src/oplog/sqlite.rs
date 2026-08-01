@@ -47,7 +47,9 @@ use fs2::FileExt as _;
 #[cfg(test)]
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use tine_storage::sqlite::{self as storage_frontier, PhysicalSqliteDatabase};
+use tine_storage::sqlite::{
+    self as storage_frontier, PhysicalSqliteDatabase, SqliteFileSet, SqliteFileSetError,
+};
 use uuid::Uuid;
 
 use super::hot_engine::{AcceptedFrontierRoot, EngineAuthority};
@@ -69,7 +71,6 @@ pub const SQLITE_SCHEMA_VERSION: u32 = storage_frontier::SQLITE_SCHEMA_VERSION;
 pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
-const FORENSIC_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-auth"];
 const FORENSIC_NAMES: [&str; 4] = ["database", "wal", "shm", "auth"];
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const PROJECTION_FINGERPRINT_CHUNK_BYTES: usize = 64 * 1024;
@@ -2460,12 +2461,13 @@ pub(crate) fn refresh_projection_checkpoint_for_harness(
     let root = read_frontier_root(&physical)?;
     drop(physical);
     write_projection_checkpoint(path, claim, &root)?;
-    let wal_path = sidecar_path(path, "-wal");
+    let files = SqliteFileSet::new(path);
+    let wal_path = files.wal_path();
     if fs::symlink_metadata(&wal_path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
     {
         fs::remove_file(wal_path)?;
-        let shm_path = sidecar_path(path, "-shm");
+        let shm_path = files.shm_path();
         if fs::symlink_metadata(&shm_path).is_ok_and(|metadata| metadata.is_file()) {
             fs::remove_file(shm_path)?;
         }
@@ -2912,8 +2914,8 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
-        let candidate_path = candidate_database_path(path)?;
-        remove_projection_files(&candidate_path)?;
+        let candidate_files = SqliteFileSet::prepare_candidate(path)?;
+        let candidate_path = candidate_files.database_path().to_path_buf();
         let mut candidate = Self::create_new(
             &candidate_path,
             claim,
@@ -2925,30 +2927,13 @@ impl SqliteFrontier {
             Ok(rebuild) => rebuild,
             Err(error) => {
                 drop(candidate);
-                remove_projection_files(&candidate_path)?;
+                candidate_files.remove()?;
                 return Err(error);
             }
         };
         candidate.physical.checkpoint_truncate_and_disable_wal()?;
         drop(candidate);
-        if sidecar_path(&candidate_path, "-wal").exists()
-            || sidecar_path(&candidate_path, "-shm").exists()
-        {
-            remove_projection_files(&candidate_path)?;
-            return Err(ProjectionError::Corrupt(
-                "checkpointed SQLite candidate retained sidecars".into(),
-            ));
-        }
-        match fs::remove_file(sidecar_path(&candidate_path, "-auth")) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        fs::rename(&candidate_path, path)?;
-        sync_directory(
-            path.parent()
-                .ok_or_else(|| ProjectionError::UnsafePath("database has no parent".into()))?,
-        )?;
+        candidate_files.publish_candidate(path)?;
         let physical = PhysicalSqliteDatabase::open_writable(path)?;
         let root = read_frontier_root(&physical)?;
         write_projection_checkpoint(path, claim, &root)?;
@@ -3846,10 +3831,9 @@ fn validate_existing(
 }
 
 fn validate_sidecar_shape(path: &Path) -> Result<(), ProjectionError> {
-    let wal_path = sidecar_path(path, "-wal");
-    let shm_path = sidecar_path(path, "-shm");
-    let wal = read_file_prefix(&wal_path, 32)?;
-    let shm = read_file_prefix(&shm_path, 136)?;
+    let files = SqliteFileSet::new(path);
+    let wal = read_file_prefix(files.wal_path(), 32)?;
+    let shm = read_file_prefix(files.shm_path(), 136)?;
     if shm.is_some() && wal.is_none() {
         return Err(ProjectionError::Corrupt(
             "SQLite SHM exists without its WAL".into(),
@@ -3926,7 +3910,8 @@ fn validate_projection_checkpoint(
     claim: ProjectionClaim,
     expected_root: &AcceptedFrontierRoot,
 ) -> Result<(), ProjectionError> {
-    let checkpoint_path = sidecar_path(path, "-auth");
+    let files = SqliteFileSet::new(path);
+    let checkpoint_path = files.checkpoint_path();
     let metadata = fs::symlink_metadata(&checkpoint_path)?;
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
@@ -3956,7 +3941,7 @@ fn validate_projection_checkpoint(
     let expected_root_bytes = canonical_frontier_root_bytes(expected_root)?;
     if envelope.checkpoint.frontier_root_digest != ContentDigest::of(&expected_root_bytes)
         || envelope.checkpoint.database != bounded_file_checkpoint(path)?
-        || envelope.checkpoint.wal != optional_bounded_file_checkpoint(&sidecar_path(path, "-wal"))?
+        || envelope.checkpoint.wal != optional_bounded_file_checkpoint(files.wal_path())?
     {
         return Err(ProjectionError::Corrupt(
             "SQLite projection files differ from their authenticated checkpoint".into(),
@@ -3971,12 +3956,13 @@ fn write_projection_checkpoint(
     root: &AcceptedFrontierRoot,
 ) -> Result<(), ProjectionError> {
     let root_bytes = canonical_frontier_root_bytes(root)?;
+    let files = SqliteFileSet::new(path);
     let checkpoint = ProjectionCheckpoint {
         schema_version: PROJECTION_CHECKPOINT_SCHEMA_VERSION,
         workspace_id: claim.workspace_id,
         frontier_root_digest: ContentDigest::of(&root_bytes),
         database: bounded_file_checkpoint(path)?,
-        wal: optional_bounded_file_checkpoint(&sidecar_path(path, "-wal"))?,
+        wal: optional_bounded_file_checkpoint(files.wal_path())?,
     };
     let checkpoint_bytes = postcard::to_allocvec(&checkpoint)
         .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
@@ -3986,7 +3972,7 @@ fn write_projection_checkpoint(
     };
     let bytes = postcard::to_allocvec(&envelope)
         .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-    let checkpoint_path = sidecar_path(path, "-auth");
+    let checkpoint_path = files.checkpoint_path();
     let parent = checkpoint_path
         .parent()
         .ok_or_else(|| ProjectionError::UnsafePath("checkpoint has no parent".into()))?;
@@ -4835,33 +4821,12 @@ fn prepare_application_runtime_root(path: &Path) -> Result<PathBuf, ProjectionEr
     Ok(canonical)
 }
 
-fn candidate_database_path(path: &Path) -> Result<PathBuf, ProjectionError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ProjectionError::UnsafePath("database path has no parent".into()))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| ProjectionError::UnsafePath("database file name is not UTF-8".into()))?;
-    Ok(parent.join(format!(".{name}.candidate-{}.sqlite", Uuid::new_v4())))
-}
-
 fn remove_projection_files(path: &Path) -> Result<(), ProjectionError> {
-    for suffix in FORENSIC_SUFFIXES {
-        let candidate = sidecar_path(path, suffix);
-        match fs::remove_file(candidate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
+    SqliteFileSet::new(path).remove().map_err(Into::into)
 }
 
 fn projection_files_exist(path: &Path) -> bool {
-    FORENSIC_SUFFIXES
-        .iter()
-        .any(|suffix| sidecar_path(path, suffix).exists())
+    SqliteFileSet::new(path).any_exists()
 }
 
 #[derive(Default)]
@@ -4893,8 +4858,9 @@ fn preserve_forensics(path: &Path) -> Result<PendingForensics, ProjectionError> 
         directories: vec![directory.clone()],
         evidence: Vec::new(),
     };
-    for (index, suffix) in FORENSIC_SUFFIXES.iter().enumerate() {
-        let original = sidecar_path(path, suffix);
+    let files = SqliteFileSet::new(path);
+    for (index, original) in files.paths().into_iter().enumerate() {
+        let original = original.to_path_buf();
         match fs::symlink_metadata(&original) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -4953,8 +4919,9 @@ fn resume_pending_forensics(path: &Path) -> Result<PendingForensics, ProjectionE
             continue;
         }
         let evidence_complete = directory.join("EVIDENCE_COMPLETE").exists();
-        for (index, suffix) in FORENSIC_SUFFIXES.iter().enumerate() {
-            let original = sidecar_path(path, suffix);
+        let files = SqliteFileSet::new(path);
+        for (index, original) in files.paths().into_iter().enumerate() {
+            let original = original.to_path_buf();
             let preserved = directory.join(FORENSIC_NAMES[index]);
             let original_exists = original.exists();
             let preserved_exists = preserved.exists();
@@ -5047,16 +5014,6 @@ fn maybe_abort_rebuild_test(applied: usize) {
 
 #[cfg(not(test))]
 fn maybe_abort_rebuild_test(_applied: usize) {}
-
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    if suffix.is_empty() {
-        path.to_path_buf()
-    } else {
-        let mut value = path.as_os_str().to_os_string();
-        value.push(suffix);
-        PathBuf::from(value)
-    }
-}
 
 /// Sealed construction site for the archive-rooted workspace runtime lease and
 /// its affine SQLite applier slot.
@@ -6540,6 +6497,18 @@ impl From<rusqlite::Error> for ProjectionError {
 impl From<std::io::Error> for ProjectionError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value.to_string())
+    }
+}
+
+impl From<SqliteFileSetError> for ProjectionError {
+    fn from(value: SqliteFileSetError) -> Self {
+        match value {
+            SqliteFileSetError::Io(error) => Self::from(error),
+            SqliteFileSetError::UnsafePath(error) => Self::UnsafePath(error),
+            SqliteFileSetError::CandidateRetainedSidecars => {
+                Self::Corrupt("checkpointed SQLite candidate retained sidecars".into())
+            }
+        }
     }
 }
 
@@ -11411,7 +11380,7 @@ mod tests {
         let path = database.path().to_path_buf();
         drop(database);
 
-        let checkpoint_path = sidecar_path(&path, "-auth");
+        let checkpoint_path = SqliteFileSet::new(&path).checkpoint_path().to_path_buf();
         let bytes = fs::read(&checkpoint_path).unwrap();
         let mut envelope: ProjectionCheckpointEnvelope = postcard::from_bytes(&bytes).unwrap();
         envelope.checkpoint.schema_version = PROJECTION_CHECKPOINT_SCHEMA_VERSION - 1;
@@ -12149,7 +12118,9 @@ mod tests {
             .authority_rejection_snapshot_for_test()
             .unwrap();
         let total_changes_before = database.physical.total_changes_for_test();
-        let checkpoint_path = sidecar_path(database.path(), "-auth");
+        let checkpoint_path = SqliteFileSet::new(database.path())
+            .checkpoint_path()
+            .to_path_buf();
         let checkpoint_before = fs::read(&checkpoint_path).unwrap();
 
         assert_eq!(
@@ -14027,7 +13998,12 @@ mod tests {
             wait_for_file(&dir.path().join("helper-ready"));
             assert!(!child.wait().unwrap().success());
             if mode == "apply-after" {
-                assert!(fs::metadata(sidecar_path(&path, "-wal")).unwrap().len() >= 32);
+                assert!(
+                    fs::metadata(SqliteFileSet::new(&path).wal_path())
+                        .unwrap()
+                        .len()
+                        >= 32
+                );
             }
             let reopened = open_test_projection(
                 &path,
@@ -14059,10 +14035,11 @@ mod tests {
             let mut child = spawn_test_helper("apply-after", dir.path(), seed, &[]);
             wait_for_file(&dir.path().join("helper-ready"));
             assert!(!child.wait().unwrap().success());
+            let files = SqliteFileSet::new(&path);
             let target = if mutation.starts_with("wal") {
-                sidecar_path(&path, "-wal")
+                files.wal_path()
             } else {
-                sidecar_path(&path, "-shm")
+                files.shm_path()
             };
             assert!(
                 target.exists(),
@@ -14104,8 +14081,9 @@ mod tests {
             let dir = TestDir::new(&format!("forensic-{hook}"));
             let (ids, store, accepted_engine, path) = prepare_crash_case(&dir, seed);
             fs::write(&path, b"corrupt SQLite evidence").unwrap();
-            fs::write(sidecar_path(&path, "-wal"), b"partial wal").unwrap();
-            fs::write(sidecar_path(&path, "-shm"), b"partial shm").unwrap();
+            let files = SqliteFileSet::new(&path);
+            fs::write(files.wal_path(), b"partial wal").unwrap();
+            fs::write(files.shm_path(), b"partial shm").unwrap();
             let mut child = spawn_test_helper(
                 "recover",
                 dir.path(),
@@ -14253,13 +14231,8 @@ mod tests {
     }
 
     fn remove_projection_files(path: &Path) {
-        for suffix in FORENSIC_SUFFIXES {
-            let candidate = sidecar_path(path, suffix);
-            match fs::remove_file(candidate) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => panic!("cannot remove test projection: {error}"),
-            }
-        }
+        SqliteFileSet::new(path)
+            .remove()
+            .unwrap_or_else(|error| panic!("cannot remove test projection: {error}"));
     }
 }
