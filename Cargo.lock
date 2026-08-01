@@ -5583,6 +5583,7 @@ dependencies = [
  "libc",
  "postcard",
  "serde",
+ "serde_json",
  "sha2",
  "uuid",
  "windows-sys 0.61.2",
