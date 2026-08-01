@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Post-activation managed-storage reads and writes no longer freeze the app
+  while the required first reconciliation finishes.** Ordinary page, journal,
+  query, editor, status, transition, tick, and shutdown commands run actor waits
+  on the blocking pool and revalidate their exact graph generation before work,
+  so queued commands cannot gain authority over a replacement graph.
 - **Sparse-v2 now detects sampled interior corruption in its disposable SQLite
   projection during reopen.** Versioned, bounded fingerprints cover up to 1 MiB
   across the interior of each database and WAL file in addition to their edges;

@@ -415,6 +415,16 @@ pub(crate) struct GraphContext<'a, R: Runtime = tauri::Wry> {
     pub(crate) binding_generation: Option<u64>,
 }
 
+pub(crate) fn owned_graph_context(
+    state: GraphContext<'_>,
+) -> Result<(tauri::AppHandle, String, u64), String> {
+    let app = state.window.app_handle().clone();
+    let label = state.window.label().to_string();
+    let binding_generation = state.binding_generation.ok_or("missing-graph-binding")?;
+    drop(state);
+    Ok((app, label, binding_generation))
+}
+
 impl<'r, 'de: 'r, R: Runtime> CommandArg<'de, R> for GraphContext<'r, R> {
     fn from_command(command: CommandItem<'de, R>) -> Result<Self, InvokeError> {
         let binding_generation = match command.message.payload() {
@@ -567,6 +577,30 @@ mod tests {
     }
 
     #[test]
+    fn owned_command_context_drops_borrowed_tauri_state_after_capturing_exact_binding() {
+        let source = include_str!("state.rs");
+        let start = source
+            .find("pub(crate) fn owned_graph_context(")
+            .expect("owned graph context helper");
+        let tail = &source[start..];
+        let end = tail
+            .find("\nimpl<'r, 'de: 'r, R: Runtime> CommandArg")
+            .expect("owned graph context helper boundary");
+        let helper = &tail[..end];
+        for required in [
+            "state.window.app_handle().clone()",
+            "state.window.label().to_string()",
+            "state.binding_generation",
+            "drop(state)",
+        ] {
+            assert!(
+                helper.contains(required),
+                "owned command context must retain `{required}` before await"
+            );
+        }
+    }
+
+    #[test]
     fn normal_slots_are_legacy_only_and_authority_types_are_send_sync() {
         let base =
             std::env::temp_dir().join(format!("tine-slot-authority-{}", uuid::Uuid::new_v4()));
@@ -677,6 +711,47 @@ mod tests {
                 .warm_generation
                 .load(std::sync::atomic::Ordering::Acquire),
             7
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn queued_owned_command_generation_is_rejected_after_graph_replacement() {
+        let base = std::env::temp_dir().join(format!("tine-slot-stale-{}", uuid::Uuid::new_v4()));
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        let state = AppState {
+            graphs: RwLock::new(GraphRegistry::default()),
+            graph_load: Mutex::new(()),
+            watch_ctl: Mutex::new(None),
+            last_focused: Mutex::new(Some("main".into())),
+            capture_graph: Mutex::new(None),
+            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
+            #[cfg(desktop)]
+            next_window: AtomicU64::new(2),
+        };
+        let old = graph(&old_root);
+        let captured_generation = old.binding_generation;
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind("main".into(), old)
+            .unwrap();
+        let replacement = graph(&new_root);
+        assert_ne!(replacement.binding_generation, captured_generation);
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind("main".into(), replacement)
+            .unwrap();
+
+        assert_eq!(
+            slot_for_bound_window(&state, "main", Some(captured_generation))
+                .err()
+                .unwrap(),
+            "stale-graph-binding"
         );
         let _ = std::fs::remove_dir_all(base);
     }

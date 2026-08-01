@@ -1366,7 +1366,7 @@
     },
     {
       "id": "REG-SYNC-SPARSE-V2-ACTIVATION-RESPONSIVENESS-001",
-      "title": "Managed-storage activation stays off the async command thread, reports bounded semantic progress, and completes with near-linear work",
+      "title": "Managed-storage activation and post-activation actor commands stay off the async command thread while preserving exact graph authority",
       "family": "sync-data-safety",
       "sources": {
         "issues": [],
@@ -1380,12 +1380,14 @@
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/commands.rs",
+          "src-tauri/src/state.rs",
           "src-tauri/src/sync_runtime.rs"
         ],
         "scenario": "sync.sparse-v2-activation-responsive-progress-scaled",
         "failBefore": "proven"
       },
-      "notes": "The source-boundary regression requires the complete graph transition, including lock ownership and exact-slot re-resolution, to run behind spawn_blocking without carrying borrowed Tauri state across await. Core fixtures retain exact graph bytes and crash-resume stages while recording ordered semantic phases. Two nested Unicode synthetic scales retain ordinary references, properties, and tasks; instrumentation records source files, bytes, blocks, and per-phase elapsed time and rejects plainly superlinear shared construction."
+      "notes": "The source-boundary regression requires the complete graph transition and every ordinary or explicit command that can wait on the managed actor to run behind spawn_blocking without carrying borrowed Tauri state across await. Each command captures its window label and binding generation, then re-resolves that exact authority inside the blocking operation so a queued command cannot act on a replacement graph. Core fixtures retain exact graph bytes and crash-resume stages while recording ordered semantic phases. Two nested Unicode synthetic scales retain ordinary references, properties, and tasks; instrumentation records source files, bytes, blocks, and per-phase elapsed time and rejects plainly superlinear shared construction."
     },
     {
       "id": "REG-SYNC-SPARSE-V2-COLD-JOIN-DISCOVERY-001",

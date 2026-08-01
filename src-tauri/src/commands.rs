@@ -3,11 +3,12 @@ use crate::debug::diag;
 #[cfg(desktop)]
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
-    capture_quick_switch_slot, refresh_graph, slot_for_context, with_graph, AppState, GraphContext,
+    capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
+    slot_for_context, with_graph, AppState, GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;
-use tauri::{State, WebviewWindow};
+use tauri::{Manager, State, WebviewWindow};
 use tine_core::date::JournalDate;
 use tine_core::model::{
     BacklinkFilterContext, BacklinkFilterTarget, BlockDto, PageDto, PageEntry, PageKind, RefGroup,
@@ -339,12 +340,18 @@ where
 }
 
 #[tauri::command]
-pub(crate) fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>, String> {
-    let slot = slot_for_context(&state)?;
-    match sparse_application_handle(&slot)? {
-        Some(handle) => sparse_page_inventory(handle),
-        None => Ok(slot.legacy_graph()?.list_pages()),
-    }
+pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => sparse_page_inventory(handle),
+            None => Ok(slot.legacy_graph()?.list_pages()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -453,39 +460,46 @@ fn journal_feed_inventory(mut entries: Vec<PageEntry>, as_of_day: i64) -> Vec<Pa
 /// mutable vector offset, so a file disappearing after inventory cannot make a
 /// later day duplicate or disappear from the next request.
 #[tauri::command]
-pub(crate) fn journal_feed_page(
+pub(crate) async fn journal_feed_page(
     limit: usize,
     before_day: Option<i64>,
     state: GraphContext<'_>,
 ) -> Result<JournalFeedPage, String> {
-    let slot = slot_for_context(&state)?;
-    let as_of_day = JournalDate::today().ordinal_key();
-    match sparse_application_handle(&slot)? {
-        Some(handle) => {
-            let entries = journal_feed_inventory(sparse_page_inventory(handle)?, as_of_day);
-            collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
-                match load_sparse_page(
-                    handle,
-                    SyncApplicationPageSelector::ExactPath {
-                        path: entry.rel_path.clone(),
-                    },
-                ) {
-                    Ok(Some(page)) => Ok(page),
-                    Ok(None) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
-                    Err(error) => Err(std::io::Error::other(error)),
-                }
-            })
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let as_of_day = JournalDate::today().ordinal_key();
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let entries = journal_feed_inventory(sparse_page_inventory(handle)?, as_of_day);
+                collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
+                    match load_sparse_page(
+                        handle,
+                        SyncApplicationPageSelector::ExactPath {
+                            path: entry.rel_path.clone(),
+                        },
+                    ) {
+                        Ok(Some(page)) => Ok(page),
+                        Ok(None) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                        Err(error) => Err(std::io::Error::other(error)),
+                    }
+                })
+            }
+            None => {
+                let graph = slot.legacy_graph()?;
+                let entries =
+                    graph.feed_journals_desc_through(JournalDate::from_ordinal(as_of_day));
+                collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
+                    // A journal deleted from disk between inventory and load is skipped,
+                    // but its day still advances the cursor in the helper above.
+                    graph.load_page(entry)
+                })
+            }
         }
-        None => {
-            let graph = slot.legacy_graph()?;
-            let entries = graph.feed_journals_desc_through(JournalDate::from_ordinal(as_of_day));
-            collect_journal_feed_page(entries, limit, before_day, as_of_day, |entry| {
-                // A journal deleted from disk between inventory and load is skipped,
-                // but its day still advances the cursor in the helper above.
-                graph.load_page(entry)
-            })
-        }
-    }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg(test)]
@@ -634,25 +648,31 @@ mod journal_feed_tests {
 }
 
 #[tauri::command]
-pub(crate) fn get_page(
+pub(crate) async fn get_page(
     name: String,
     kind: PageKind,
     state: GraphContext<'_>,
 ) -> Result<Option<PageDto>, String> {
-    let slot = slot_for_context(&state)?;
-    match sparse_application_handle(&slot)? {
-        Some(handle) => load_sparse_page(
-            handle,
-            SyncApplicationPageSelector::Logical {
-                name,
-                page_kind: kind.into(),
-            },
-        ),
-        None => slot
-            .legacy_graph()?
-            .load_named(&name, kind)
-            .map_err(|error| error.to_string()),
-    }
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => load_sparse_page(
+                handle,
+                SyncApplicationPageSelector::Logical {
+                    name,
+                    page_kind: kind.into(),
+                },
+            ),
+            None => slot
+                .legacy_graph()?
+                .load_named(&name, kind)
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// One raw source file of the open graph, for the in-app lsdoc↔mldoc diff panel.
@@ -731,33 +751,41 @@ fn collect_graph_text(
 }
 
 #[tauri::command]
-pub(crate) fn save_page(
+pub(crate) async fn save_page(
     page: PageDto,
     base_rev: Option<String>,
     force: Option<bool>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    let slot = slot_for_context(&state)?;
-    match sparse_application_handle(&slot)? {
-        Some(handle) => save_sparse_page_with(page, base_rev, force.unwrap_or(false), |request| {
-            handle.save_application_page(request)
-        }),
-        None => {
-            let graph = slot.legacy_graph()?;
-            let result = if force.unwrap_or(false) {
-                graph.force_save_page(&page)
-            } else {
-                graph.save_page(&page, base_rev.as_deref())
-            };
-            result.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    "conflict".to_string()
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                save_sparse_page_with(page, base_rev, force.unwrap_or(false), |request| {
+                    handle.save_application_page(request)
+                })
+            }
+            None => {
+                let graph = slot.legacy_graph()?;
+                let result = if force.unwrap_or(false) {
+                    graph.force_save_page(&page)
                 } else {
-                    error.to_string()
-                }
-            })
+                    graph.save_page(&page, base_rev.as_deref())
+                };
+                result.map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        "conflict".to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })
+            }
         }
-    }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -944,6 +972,43 @@ mod graph_wide_command_boundary_tests {
             assert!(
                 tail[..end].contains("tauri::async_runtime::spawn_blocking"),
                 "{name} must not run graph-wide work on the command/UI thread"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_actor_command_boundary_tests {
+    #[test]
+    fn every_ordinary_managed_actor_command_re_resolves_off_the_async_command_thread() {
+        let source = include_str!("commands.rs");
+        for name in [
+            "list_pages",
+            "journal_feed_page",
+            "get_page",
+            "save_page",
+            "journal_content_days",
+            "get_page_by_path",
+        ] {
+            let signature = format!("pub(crate) async fn {name}(");
+            let start = source
+                .find(&signature)
+                .expect("managed command stays async");
+            let tail = &source[start..];
+            let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+            let command = &tail[..end];
+            assert!(
+                command.contains("owned_graph_context(state)?"),
+                "{name} must own the exact window binding before await"
+            );
+            assert!(
+                command.contains("tauri::async_runtime::spawn_blocking(move ||"),
+                "{name} must move every possible managed actor wait to the blocking pool"
+            );
+            assert!(
+                command.contains("slot_for_bound_window")
+                    && command.contains("Some(binding_generation)"),
+                "{name} must re-resolve the captured generation inside the blocking operation"
             );
         }
     }
@@ -1483,12 +1548,18 @@ fn sparse_journal_content_days(handle: &SyncRuntimeHandle) -> Result<Vec<i64>, S
 }
 
 #[tauri::command]
-pub(crate) fn journal_content_days(state: GraphContext<'_>) -> Result<Vec<i64>, String> {
-    let slot = slot_for_context(&state)?;
-    match sparse_application_handle(&slot)? {
-        Some(handle) => sparse_journal_content_days(handle),
-        None => Ok(slot.legacy_graph()?.journal_content_days()),
-    }
+pub(crate) async fn journal_content_days(state: GraphContext<'_>) -> Result<Vec<i64>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => sparse_journal_content_days(handle),
+            None => Ok(slot.legacy_graph()?.journal_content_days()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2390,18 +2461,26 @@ pub(crate) fn read_journal_file(name: String, state: GraphContext<'_>) -> Result
 /// navigate to a duplicate-day stray that shares a (kind,name) with the canonical
 /// file and so is unreachable by name (#21).
 #[tauri::command]
-pub(crate) fn get_page_by_path(
+pub(crate) async fn get_page_by_path(
     path: String,
     state: GraphContext<'_>,
 ) -> Result<Option<PageDto>, String> {
-    let slot = slot_for_context(&state)?;
-    match sparse_application_handle(&slot)? {
-        Some(handle) => load_sparse_page(handle, SyncApplicationPageSelector::ExactPath { path }),
-        None => slot
-            .legacy_graph()?
-            .load_by_path(&path)
-            .map_err(|error| error.to_string()),
-    }
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                load_sparse_page(handle, SyncApplicationPageSelector::ExactPath { path })
+            }
+            None => slot
+                .legacy_graph()?
+                .load_by_path(&path)
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[cfg(test)]
