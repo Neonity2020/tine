@@ -45,9 +45,9 @@ use cap_std::fs::OpenOptions as CapOpenOptions;
 use cap_std::{ambient_authority, fs::Dir as CapDir};
 use fs2::FileExt as _;
 #[cfg(test)]
-use rusqlite::TransactionBehavior;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use tine_storage::sqlite_database::PhysicalSqliteDatabase;
 use tine_storage::sqlite_frontier as storage_frontier;
 use uuid::Uuid;
 
@@ -2336,7 +2336,7 @@ impl TailOverlay {
 pub struct SqliteFrontier {
     path: PathBuf,
     claim: ProjectionClaim,
-    connection: Connection,
+    physical: PhysicalSqliteDatabase,
     runtime_authority: EngineAuthority,
     required_frontier_root: AcceptedFrontierRoot,
     checkpoint_each_apply: bool,
@@ -2457,12 +2457,9 @@ pub(crate) fn refresh_projection_checkpoint_for_harness(
     path: &Path,
     claim: ProjectionClaim,
 ) -> Result<(), ProjectionError> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let root = read_frontier_root(&connection)?;
-    drop(connection);
+    let physical = PhysicalSqliteDatabase::open_read_only(path)?;
+    let root = read_frontier_root(&physical)?;
+    drop(physical);
     write_projection_checkpoint(path, claim, &root)?;
     let wal_path = sidecar_path(path, "-wal");
     if fs::symlink_metadata(&wal_path)
@@ -2784,13 +2781,13 @@ impl SqliteFrontier {
             ));
         }
         validate_existing(&path, claim, &source).map_err(ProjectionError::Corrupt)?;
-        let connection = open_writable(&path)?;
+        let physical = PhysicalSqliteDatabase::open_writable(&path)?;
         Ok(LeasedOpenProjection::bind(
             OpenProjection {
                 database: Self {
                     path,
                     claim,
-                    connection,
+                    physical,
                     runtime_authority: source.runtime_authority.clone(),
                     required_frontier_root: source.exact_frontier_root.clone(),
                     checkpoint_each_apply: true,
@@ -2823,12 +2820,12 @@ impl SqliteFrontier {
                 Ok(()) => {
                     if !pending_forensics.directories.is_empty() {
                         mark_rebuild_complete(&pending_forensics)?;
-                        let connection = open_writable(&path)?;
+                        let physical = PhysicalSqliteDatabase::open_writable(&path)?;
                         return Ok(OpenProjection {
                             database: Self {
                                 path,
                                 claim,
-                                connection,
+                                physical,
                                 runtime_authority: source.runtime_authority.clone(),
                                 required_frontier_root: source.exact_frontier_root.clone(),
                                 checkpoint_each_apply: true,
@@ -2845,12 +2842,12 @@ impl SqliteFrontier {
                             rebuild: RebuildInstrumentation::default(),
                         });
                     }
-                    let connection = open_writable(&path)?;
+                    let physical = PhysicalSqliteDatabase::open_writable(&path)?;
                     return Ok(OpenProjection {
                         database: Self {
                             path,
                             claim,
-                            connection,
+                            physical,
                             runtime_authority: source.runtime_authority.clone(),
                             required_frontier_root: source.exact_frontier_root.clone(),
                             checkpoint_each_apply: true,
@@ -2933,9 +2930,7 @@ impl SqliteFrontier {
                 return Err(error);
             }
         };
-        candidate
-            .connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        candidate.physical.checkpoint_truncate_and_disable_wal()?;
         drop(candidate);
         if sidecar_path(&candidate_path, "-wal").exists()
             || sidecar_path(&candidate_path, "-shm").exists()
@@ -2955,14 +2950,14 @@ impl SqliteFrontier {
             path.parent()
                 .ok_or_else(|| ProjectionError::UnsafePath("database has no parent".into()))?,
         )?;
-        let connection = open_writable(path)?;
-        let root = read_frontier_root(&connection)?;
+        let physical = PhysicalSqliteDatabase::open_writable(path)?;
+        let root = read_frontier_root(&physical)?;
         write_projection_checkpoint(path, claim, &root)?;
         Ok((
             Self {
                 path: path.to_path_buf(),
                 claim,
-                connection,
+                physical,
                 runtime_authority: source.runtime_authority.clone(),
                 required_frontier_root: source.exact_frontier_root.clone(),
                 checkpoint_each_apply: true,
@@ -2980,14 +2975,14 @@ impl SqliteFrontier {
         lease: Arc<HeldApplierLocks>,
         runtime_authority: EngineAuthority,
     ) -> Result<Self, ProjectionError> {
-        let connection = open_writable(path)?;
-        initialize_schema(&connection, claim)?;
-        let root = read_frontier_root(&connection)?;
+        let physical = PhysicalSqliteDatabase::open_writable(path)?;
+        initialize_schema(&physical, claim)?;
+        let root = read_frontier_root(&physical)?;
         write_projection_checkpoint(path, claim, &root)?;
         Ok(Self {
             path: path.to_path_buf(),
             claim,
-            connection,
+            physical,
             runtime_authority,
             required_frontier_root: AcceptedFrontierRoot::empty(),
             checkpoint_each_apply: false,
@@ -3043,9 +3038,8 @@ impl SqliteFrontier {
         current_root: &AcceptedFrontierRoot,
     ) -> Result<(), ProjectionError> {
         self.validate_event_claim(event)?;
-        if let Some(existing) = load_batch(&self.connection, event.batch_id)? {
-            if !storage_frontier::authenticate_batch(
-                &self.connection,
+        if let Some(existing) = load_batch(&self.physical, event.batch_id)? {
+            if !self.physical.authenticate_batch(
                 &lower_physical_frontier_root(current_root)?,
                 event.batch_id.as_uuid().into_bytes(),
                 existing.causal_record_digest()?,
@@ -3076,26 +3070,26 @@ impl SqliteFrontier {
     }
 
     pub fn frontier_root(&self) -> Result<AcceptedFrontierRoot, ProjectionError> {
-        read_frontier_root(&self.connection)
+        read_frontier_root(&self.physical)
     }
 
     /// Explicit whole-frontier materialization for diagnostics and recovery.
     /// Normal apply, startup, and point authorization use `frontier_root` and
     /// `contains_frontier` instead.
     pub fn frontier(&self) -> Result<FrontierV2, ProjectionError> {
-        read_frontier_documents(&self.connection)
+        read_frontier_documents(&self.physical)
     }
 
     pub fn contains_frontier(&self, required: &FrontierV2) -> Result<bool, ProjectionError> {
         canonical_frontier_bytes(required)?;
-        let root = read_frontier_root(&self.connection)?;
+        let root = read_frontier_root(&self.physical)?;
         for needed in required.documents() {
             let Some(have) =
-                authenticated_frontier_document(&self.connection, &root, needed.document_id())?
+                authenticated_frontier_document(&self.physical, &root, needed.document_id())?
             else {
                 return Ok(false);
             };
-            if !document_frontier_contains(&self.connection, &have, needed)? {
+            if !document_frontier_contains(&self.physical, &have, needed)? {
                 return Ok(false);
             }
         }
@@ -3103,40 +3097,39 @@ impl SqliteFrontier {
     }
 
     pub fn applied_batch_count(&self) -> Result<usize, ProjectionError> {
-        usize::try_from(read_frontier_root(&self.connection)?.acceptance_sequence())
+        usize::try_from(read_frontier_root(&self.physical)?.acceptance_sequence())
             .map_err(|_| ProjectionError::Corrupt("applied sequence exceeds usize".into()))
     }
 
     /// Explicit full diagnostic. Normal startup and apply never call this
     /// lifetime-history scan.
     pub fn diagnose_full_integrity(&self) -> Result<(), ProjectionError> {
-        validate_integrity(&self.connection)?;
-        let (applied_rows, document_rows) =
-            storage_frontier::diagnostic_row_counts(&self.connection)?;
-        let root = read_frontier_root(&self.connection)?;
+        self.physical.quick_check()?;
+        let (applied_rows, document_rows) = self.physical.diagnostic_row_counts()?;
+        let root = read_frontier_root(&self.physical)?;
         if applied_rows != root.acceptance_sequence() || document_rows != root.document_count() {
             return Err(ProjectionError::Corrupt(
                 "SQLite diagnostic row counts differ from the authenticated frontier".into(),
             ));
         }
-        let (history_root, history_count) = validate_stored_history(&self.connection)?;
+        let (history_root, history_count) = validate_stored_history(&self.physical)?;
         if history_count != root.acceptance_sequence() || history_root != root {
             return Err(ProjectionError::Corrupt(
                 "SQLite diagnostic history scan differs from the authenticated frontier".into(),
             ));
         }
-        let _ = read_frontier_documents(&self.connection)?;
+        let _ = read_frontier_documents(&self.physical)?;
         Ok(())
     }
 
     pub fn contains_batch(&self, batch_id: BatchId) -> Result<bool, ProjectionError> {
-        let root = read_frontier_root(&self.connection)?;
-        storage_frontier::contains_batch(
-            &self.connection,
-            &lower_physical_frontier_root(&root)?,
-            batch_id.as_uuid().into_bytes(),
-        )
-        .map_err(Into::into)
+        let root = read_frontier_root(&self.physical)?;
+        self.physical
+            .contains_batch(
+                &lower_physical_frontier_root(&root)?,
+                batch_id.as_uuid().into_bytes(),
+            )
+            .map_err(Into::into)
     }
 
     #[cfg(test)]
@@ -3211,7 +3204,7 @@ impl SqliteFrontier {
     }
 
     pub fn materialized_read(&self) -> Result<super::SqliteMaterializedRead<'_>, ProjectionError> {
-        let root = read_frontier_root(&self.connection)?;
+        let root = read_frontier_root(&self.physical)?;
         if root != self.required_frontier_root {
             return Err(ProjectionError::Materialization(format!(
                 "SQLite materialization frontier {} is behind required accepted frontier {}",
@@ -3220,53 +3213,32 @@ impl SqliteFrontier {
             )));
         }
         let root_bytes = canonical_frontier_root_bytes(&root)?;
-        super::SqliteMaterializedRead::new(
-            &self.connection,
-            root.acceptance_sequence(),
-            ContentDigest::of(&root_bytes),
-        )
-        .map_err(Into::into)
+        self.physical
+            .materialized_read(root.acceptance_sequence(), ContentDigest::of(&root_bytes))
+            .map(super::SqliteMaterializedRead::from_storage)
+            .map_err(Into::into)
     }
 
     fn authenticated_reference_catalog_root(
         &self,
     ) -> Result<super::ReferenceCatalogRootV2, ProjectionError> {
-        let frontier = read_frontier_root(&self.connection)?;
+        let frontier = read_frontier_root(&self.physical)?;
         let frontier_bytes = canonical_frontier_root_bytes(&frontier)?;
-        let stamp: (
-            i64,
-            Vec<u8>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-        ) = self.connection.query_row(
-            "SELECT acceptance_sequence, frontier_root_digest, catalog_root,
-                        catalog_root_digest, coverage_digest,
-                        extractor_dependency_stamp_digest
-                 FROM materialization_stamp WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )?;
-        if u64::try_from(stamp.0).ok() != Some(frontier.acceptance_sequence())
-            || stamp.1.as_slice() != ContentDigest::of(&frontier_bytes).as_bytes()
+        let stamp = self.physical.reference_catalog_stamp()?;
+        if u64::try_from(stamp.acceptance_sequence).ok() != Some(frontier.acceptance_sequence())
+            || stamp.frontier_root_digest.as_slice()
+                != ContentDigest::of(&frontier_bytes).as_bytes()
         {
             return Err(ProjectionError::Materialization(
                 "reference materialization stamp is stale against SQLite frontier".into(),
             ));
         }
-        let (Some(root_bytes), Some(root_digest), Some(coverage_digest), Some(stamp_digest)) =
-            (stamp.2, stamp.3, stamp.4, stamp.5)
-        else {
+        let (Some(root_bytes), Some(root_digest), Some(coverage_digest), Some(stamp_digest)) = (
+            stamp.catalog_root,
+            stamp.catalog_root_digest,
+            stamp.coverage_digest,
+            stamp.extractor_dependency_stamp_digest,
+        ) else {
             return Err(ProjectionError::Materialization(
                 "SQLite frontier has no authenticated reference catalog materialization".into(),
             ));
@@ -3293,11 +3265,7 @@ impl SqliteFrontier {
                 "SQLite reference catalog stamp is not bound to its authenticated frontier".into(),
             ));
         }
-        let coverage_count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM reference_source_coverage",
-            [],
-            |row| row.get(0),
-        )?;
+        let coverage_count = self.physical.reference_source_coverage_count()?;
         if u64::try_from(coverage_count).ok() != Some(root.source_count()) {
             return Err(ProjectionError::Materialization(
                 "SQLite reference source coverage is incomplete for its catalog root".into(),
@@ -3350,13 +3318,10 @@ impl SqliteFrontier {
         I: IntoIterator<Item = super::MaterializationChange>,
     {
         let empty_root = canonical_frontier_root_bytes(&AcceptedFrontierRoot::empty())?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::sqlite_materialization::reset(&transaction, ContentDigest::of(&empty_root))?;
-        transaction.commit()?;
+        self.physical
+            .reset_materialization_for_test(ContentDigest::of(&empty_root))?;
 
-        let expected_count = read_frontier_root(&self.connection)?.acceptance_sequence();
+        let expected_count = read_frontier_root(&self.physical)?.acceptance_sequence();
         let mut changes = changes.into_iter();
         let mut applied = 0_u64;
         for sequence in 1..=expected_count {
@@ -3368,7 +3333,7 @@ impl SqliteFrontier {
             let sequence_i64 = i64::try_from(sequence)
                 .map_err(|_| ProjectionError::Corrupt("accepted sequence exceeds SQLite".into()))?;
             let stored =
-                load_batch_at_sequence(&self.connection, sequence_i64)?.ok_or_else(|| {
+                load_batch_at_sequence(&self.physical, sequence_i64)?.ok_or_else(|| {
                     ProjectionError::Corrupt(format!(
                         "accepted history is missing materialization sequence {sequence}"
                     ))
@@ -3398,24 +3363,21 @@ impl SqliteFrontier {
                 .is_some()
                 .then(|| stored.authenticated_reference_materialization())
                 .transpose()?;
-            super::sqlite_materialization::ensure_stamp(
-                &self.connection,
-                sequence - 1,
-                prior_digest,
-            )?;
-            let transaction = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            super::sqlite_materialization::apply_change(
-                &transaction,
-                &change,
-                &stored.semantic_effect,
+            self.physical
+                .ensure_materialization_stamp(sequence - 1, prior_digest)?;
+            let (physical, authenticated_reference) =
+                super::sqlite_materialization::lower_validated_change(
+                    &change,
+                    &stored.semantic_effect,
+                    authenticated_reference.as_ref(),
+                )?;
+            self.physical.apply_materialization_for_test(
+                &physical,
                 sequence,
                 input_digest,
                 post_digest,
                 authenticated_reference.as_ref(),
             )?;
-            transaction.commit()?;
             applied = sequence;
         }
         if let Some(extra) = changes.next() {
@@ -3424,19 +3386,18 @@ impl SqliteFrontier {
                 extra.batch_id()
             )));
         }
-        let root = read_frontier_root(&self.connection)?;
+        let root = read_frontier_root(&self.physical)?;
         let root_bytes = canonical_frontier_root_bytes(&root)?;
-        super::sqlite_materialization::ensure_stamp(
-            &self.connection,
-            expected_count,
-            ContentDigest::of(&root_bytes),
-        )?;
+        self.physical
+            .ensure_materialization_stamp(expected_count, ContentDigest::of(&root_bytes))?;
         usize::try_from(applied)
             .map_err(|_| ProjectionError::Corrupt("materialized sequence exceeds usize".into()))
     }
 
     pub fn semantic_projection_digest(&self) -> Result<ContentDigest, ProjectionError> {
-        storage_frontier::semantic_projection_digest(&self.connection).map_err(Into::into)
+        self.physical
+            .semantic_projection_digest()
+            .map_err(Into::into)
     }
 
     /// Exact materialized-row observation for the deterministic simulator.
@@ -3446,7 +3407,7 @@ impl SqliteFrontier {
         &self,
     ) -> Result<ContentDigest, ProjectionError> {
         let _gate = self.materialized_read()?;
-        super::sqlite_materialization::row_digest(&self.connection).map_err(Into::into)
+        self.physical.materialized_row_digest().map_err(Into::into)
     }
 
     /// Test-only recovery inspection of the exact semantic records rebuilt into
@@ -3456,7 +3417,8 @@ impl SqliteFrontier {
     pub(crate) fn applied_semantic_effects_for_test(
         &self,
     ) -> Result<Vec<SemanticEffect>, ProjectionError> {
-        storage_frontier::stored_semantic_effects(&self.connection)?
+        self.physical
+            .stored_semantic_effects()?
             .into_iter()
             .map(|bytes| {
                 SemanticEffect::decode(&bytes)
@@ -3516,13 +3478,12 @@ impl SqliteFrontier {
         instrumentation.accepted_sequence_page_reads = page_reads;
         instrumentation.accepted_sequence_bytes_read = page_bytes;
         instrumentation.max_accepted_sequence_page_bytes = max_page_bytes;
-        if read_frontier_root(&self.connection)? != source.exact_frontier_root {
+        if read_frontier_root(&self.physical)? != source.exact_frontier_root {
             return Err(ProjectionError::Rebuild(
                 "rebuild did not reach the engine's authenticated frontier root".into(),
             ));
         }
-        if read_frontier_root(&self.connection)?.acceptance_sequence()
-            != source.accepted_batch_count
+        if read_frontier_root(&self.physical)?.acceptance_sequence() != source.accepted_batch_count
         {
             return Err(ProjectionError::Rebuild(
                 "rebuild did not reach the engine's accepted event count".into(),
@@ -3545,9 +3506,11 @@ impl SqliteFrontier {
                 "fresh candidate lost its inductive reference coverage state".into(),
             )
         })?;
-        super::sqlite_materialization::finalize_fresh_bootstrap(
-            &self.connection,
-            source.exact_frontier_root.reference_catalog_root(),
+        self.physical.finalize_fresh_bootstrap(
+            source
+                .exact_frontier_root
+                .reference_catalog_root()
+                .source_count(),
             inductive_coverage_count,
         )?;
         instrumentation.reference_coverage_full_scans += 1;
@@ -3601,7 +3564,7 @@ impl SqliteFrontier {
         let materialization_digest = materialization
             .map(|change| change.validate_for_event(event))
             .transpose()?;
-        let current_root = read_frontier_root(&self.connection)?;
+        let current_root = read_frontier_root(&self.physical)?;
         let current_physical = lower_physical_frontier_root(&current_root)?;
         let batch = lower_physical_accepted_batch(event)?;
         let (physical_materialization, authenticated_reference) = match materialization {
@@ -3629,24 +3592,22 @@ impl SqliteFrontier {
             prior_reference_coverage_count: self.fresh_reference_coverage_count,
             fault: storage_frontier::ApplyFault::None,
         };
-        let preflight =
-            match storage_frontier::preflight(&self.connection, &current_physical, &request) {
-                Ok(disposition) => disposition,
-                Err(storage_frontier::FrontierError::BatchCollision(_)) => {
-                    let existing =
-                        load_batch(&self.connection, event.batch_id)?.ok_or_else(|| {
-                            ProjectionError::Corrupt(format!(
-                                "colliding batch {} disappeared during physical preflight",
-                                event.batch_id
-                            ))
-                        })?;
-                    let _ = existing.matches(event)?;
-                    return Err(ProjectionError::BatchCollision(event.batch_id));
-                }
-                Err(error) => return Err(error.into()),
-            };
+        let preflight = match self.physical.preflight(&current_physical, &request) {
+            Ok(disposition) => disposition,
+            Err(storage_frontier::FrontierError::BatchCollision(_)) => {
+                let existing = load_batch(&self.physical, event.batch_id)?.ok_or_else(|| {
+                    ProjectionError::Corrupt(format!(
+                        "colliding batch {} disappeared during physical preflight",
+                        event.batch_id
+                    ))
+                })?;
+                let _ = existing.matches(event)?;
+                return Err(ProjectionError::BatchCollision(event.batch_id));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if matches!(preflight, storage_frontier::PreflightDisposition::Duplicate) {
-            let existing = load_batch(&self.connection, event.batch_id)?.ok_or_else(|| {
+            let existing = load_batch(&self.physical, event.batch_id)?.ok_or_else(|| {
                 ProjectionError::Corrupt(format!(
                     "duplicate batch {} disappeared during physical preflight",
                     event.batch_id
@@ -3686,8 +3647,7 @@ impl SqliteFrontier {
                 ));
             }
             for document in &event.affected_documents {
-                let _ = storage_frontier::frontier_document(
-                    &self.connection,
+                let _ = self.physical.frontier_document(
                     &current_physical,
                     document.document_id().as_uuid().into_bytes(),
                 )?;
@@ -3720,7 +3680,7 @@ impl SqliteFrontier {
                 request.fault = storage_frontier::ApplyFault::ReturnAfterMaterialization;
             }
         }
-        let result = storage_frontier::apply(&mut self.connection, &current_physical, &request)?;
+        let result = self.physical.apply(&current_physical, &request)?;
         if self.fresh_reference_coverage_count.is_some() {
             if let Some(next_count) = result.materialization.reference_coverage_count {
                 self.fresh_reference_coverage_count = Some(next_count);
@@ -3761,10 +3721,8 @@ impl SqliteFrontier {
 
 impl Drop for SqliteFrontier {
     fn drop(&mut self) {
-        let _ = self
-            .connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
-        if let Ok(root) = read_frontier_root(&self.connection) {
+        let _ = self.physical.checkpoint_truncate();
+        if let Ok(root) = read_frontier_root(&self.physical) {
             let _ = write_projection_checkpoint(&self.path, self.claim, &root);
         }
     }
@@ -3817,17 +3775,17 @@ fn validate_existing(
     validate_sidecar_shape(path).map_err(|error| error.to_string())?;
     validate_projection_checkpoint(path, claim, &source.exact_frontier_root)
         .map_err(|error| error.to_string())?;
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("cannot open SQLite projection read-only: {error}"))?;
-    validate_schema_and_claim(&connection, claim).map_err(|error| error.to_string())?;
-    let found_frontier = read_frontier_root(&connection).map_err(|error| error.to_string())?;
+    let physical = PhysicalSqliteDatabase::open_read_only(path)
+        .map_err(|error| format!("cannot open SQLite projection read-only: {error}"))?;
+    physical
+        .validate_schema_and_claim(lower_physical_claim(claim))
+        .map_err(|error| ProjectionError::from(error).to_string())?;
+    let found_frontier = read_frontier_root(&physical).map_err(|error| error.to_string())?;
     if found_frontier != source.exact_frontier_root {
         return Err("SQLite frontier is stale".into());
     }
-    let count = storage_frontier::read_frontier(&connection)
+    let count = physical
+        .read_frontier()
         .map_err(|error| error.to_string())?
         .applied_batch_count;
     let expected_count = i64::try_from(source.accepted_batch_count)
@@ -3836,19 +3794,20 @@ fn validate_existing(
         return Err("SQLite frontier batch count is stale".into());
     }
     if let Some(root_key) = found_frontier.document_map_root_key() {
-        storage_frontier::frontier_document(
-            &connection,
-            &lower_physical_frontier_root(&found_frontier).map_err(|error| error.to_string())?,
-            root_key,
-        )
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "SQLite authenticated frontier root row is missing".to_string())?;
+        physical
+            .frontier_document(
+                &lower_physical_frontier_root(&found_frontier)
+                    .map_err(|error| error.to_string())?,
+                root_key,
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "SQLite authenticated frontier root row is missing".to_string())?;
     } else if found_frontier.document_count() != 0 {
         return Err("SQLite authenticated frontier root key is missing".into());
     }
     if expected_count > 0 {
-        let final_record = load_batch_at_sequence(&connection, expected_count)
-            .map_err(|error| error.to_string())?;
+        let final_record =
+            load_batch_at_sequence(&physical, expected_count).map_err(|error| error.to_string())?;
         let final_record =
             final_record.ok_or_else(|| "SQLite final accepted row is missing".to_string())?;
         let prior_root = decode_frontier_root(&final_record.prior_frontier_root)
@@ -3862,27 +3821,28 @@ fn validate_existing(
         {
             return Err("SQLite final accepted row is not bound to the frontier root".into());
         }
-        if !storage_frontier::authenticate_batch(
-            &connection,
-            &lower_physical_frontier_root(&found_frontier).map_err(|error| error.to_string())?,
-            final_record.batch_id.as_uuid().into_bytes(),
-            final_record
-                .causal_record_digest()
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?
+        if !physical
+            .authenticate_batch(
+                &lower_physical_frontier_root(&found_frontier)
+                    .map_err(|error| error.to_string())?,
+                final_record.batch_id.as_uuid().into_bytes(),
+                final_record
+                    .causal_record_digest()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?
         {
             return Err("SQLite final accepted row is absent from its authenticated map".into());
         }
     }
     let root_bytes =
         canonical_frontier_root_bytes(&found_frontier).map_err(|error| error.to_string())?;
-    super::sqlite_materialization::ensure_stamp(
-        &connection,
-        found_frontier.acceptance_sequence(),
-        ContentDigest::of(&root_bytes),
-    )
-    .map_err(|error| error.to_string())?;
+    physical
+        .ensure_materialization_stamp(
+            found_frontier.acceptance_sequence(),
+            ContentDigest::of(&root_bytes),
+        )
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -4172,46 +4132,11 @@ fn bounded_file_checkpoint_interior_digest(
 }
 
 fn initialize_schema(
-    connection: &Connection,
+    physical: &PhysicalSqliteDatabase,
     claim: ProjectionClaim,
 ) -> Result<(), ProjectionError> {
     let frontier = canonical_frontier_root_bytes(&AcceptedFrontierRoot::empty())?;
-    storage_frontier::initialize_schema(connection, lower_physical_claim(claim), &frontier)?;
-    return Ok(());
-}
-
-fn open_writable(path: &Path) -> Result<Connection, ProjectionError> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    connection.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;
-         PRAGMA foreign_keys = ON;
-         PRAGMA trusted_schema = OFF;",
-    )?;
-    Ok(connection)
-}
-
-fn validate_integrity(connection: &Connection) -> Result<(), ProjectionError> {
-    let result: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    if result != "ok" {
-        return Err(ProjectionError::Corrupt(format!(
-            "SQLite quick_check failed: {result}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_schema_and_claim(
-    connection: &Connection,
-    claim: ProjectionClaim,
-) -> Result<(), ProjectionError> {
-    storage_frontier::validate_schema_and_claim(connection, lower_physical_claim(claim))?;
+    physical.initialize_schema(lower_physical_claim(claim), &frontier)?;
     return Ok(());
 }
 
@@ -4461,12 +4386,12 @@ impl StoredBatch {
 }
 
 fn validate_stored_history(
-    connection: &Connection,
+    physical: &PhysicalSqliteDatabase,
 ) -> Result<(AcceptedFrontierRoot, u64), ProjectionError> {
     let mut prior = AcceptedFrontierRoot::empty();
     let mut count = 0_u64;
-    for physical in storage_frontier::load_all_batches(connection)? {
-        let record = stored_batch_from_storage(physical)?;
+    for physical_batch in physical.load_all_batches()? {
+        let record = stored_batch_from_storage(physical_batch)?;
         count = count
             .checked_add(1)
             .ok_or_else(|| ProjectionError::Corrupt("stored history count overflowed".into()))?;
@@ -4476,8 +4401,7 @@ fn validate_stored_history(
             ));
         }
         let post = record.validate_canonical_transition(&prior)?;
-        if !storage_frontier::authenticate_batch(
-            connection,
+        if !physical.authenticate_batch(
             &lower_physical_frontier_root(&post)?,
             record.batch_id.as_uuid().into_bytes(),
             record.causal_record_digest()?,
@@ -4493,19 +4417,21 @@ fn validate_stored_history(
 }
 
 fn load_batch(
-    connection: &Connection,
+    physical: &PhysicalSqliteDatabase,
     batch_id: BatchId,
 ) -> Result<Option<StoredBatch>, ProjectionError> {
-    storage_frontier::load_batch(connection, batch_id.as_uuid().into_bytes())?
+    physical
+        .load_batch(batch_id.as_uuid().into_bytes())?
         .map(stored_batch_from_storage)
         .transpose()
 }
 
 fn load_batch_at_sequence(
-    connection: &Connection,
+    physical: &PhysicalSqliteDatabase,
     sequence: i64,
 ) -> Result<Option<StoredBatch>, ProjectionError> {
-    storage_frontier::load_batch_at_sequence(connection, sequence)?
+    physical
+        .load_batch_at_sequence(sequence)?
         .map(stored_batch_from_storage)
         .transpose()
 }
@@ -4537,8 +4463,10 @@ fn stored_batch_from_storage(
     })
 }
 
-fn read_frontier_root(connection: &Connection) -> Result<AcceptedFrontierRoot, ProjectionError> {
-    let stored = storage_frontier::read_frontier(connection)?;
+fn read_frontier_root(
+    physical: &PhysicalSqliteDatabase,
+) -> Result<AcceptedFrontierRoot, ProjectionError> {
+    let stored = physical.read_frontier()?;
     let root = decode_frontier_root(&stored.canonical_bytes)?;
     if stored.applied_batch_count != root.acceptance_sequence() {
         return Err(ProjectionError::Corrupt(
@@ -4653,24 +4581,24 @@ fn decode_frontier_document(
 }
 
 fn authenticated_frontier_document(
-    connection: &Connection,
+    physical: &PhysicalSqliteDatabase,
     root: &AcceptedFrontierRoot,
     document_id: DocumentId,
 ) -> Result<Option<DocumentDependencies>, ProjectionError> {
     let physical_root = lower_physical_frontier_root(root)?;
-    return storage_frontier::frontier_document(
-        connection,
-        &physical_root,
-        document_id.as_uuid().into_bytes(),
-    )?
-    .map(|bytes| decode_frontier_document(document_id, &bytes))
-    .transpose();
+    return physical
+        .frontier_document(&physical_root, document_id.as_uuid().into_bytes())?
+        .map(|bytes| decode_frontier_document(document_id, &bytes))
+        .transpose();
 }
 
-fn read_frontier_documents(connection: &Connection) -> Result<FrontierV2, ProjectionError> {
-    let root = read_frontier_root(connection)?;
+fn read_frontier_documents(
+    physical: &PhysicalSqliteDatabase,
+) -> Result<FrontierV2, ProjectionError> {
+    let root = read_frontier_root(physical)?;
     let physical_root = lower_physical_frontier_root(&root)?;
-    let documents = storage_frontier::read_frontier_documents(connection, &physical_root)?
+    let documents = physical
+        .read_frontier_documents(&physical_root)?
         .into_iter()
         .map(|document| {
             decode_frontier_document(
@@ -4683,7 +4611,7 @@ fn read_frontier_documents(connection: &Connection) -> Result<FrontierV2, Projec
 }
 
 fn document_frontier_contains(
-    connection: &Connection,
+    physical: &PhysicalSqliteDatabase,
     have: &DocumentDependencies,
     required: &DocumentDependencies,
 ) -> Result<bool, ProjectionError> {
@@ -4703,7 +4631,7 @@ fn document_frontier_contains(
     for required_head in required.direct_dependency_heads() {
         let mut contained = false;
         for have_head in have.direct_dependency_heads() {
-            if batch_descends_from_database(connection, *have_head, *required_head)? {
+            if batch_descends_from_database(physical, *have_head, *required_head)? {
                 contained = true;
                 break;
             }
@@ -4716,28 +4644,27 @@ fn document_frontier_contains(
 }
 
 fn batch_descends_from_database(
-    connection: &Connection,
+    physical: &PhysicalSqliteDatabase,
     descendant: BatchId,
     ancestor: BatchId,
 ) -> Result<bool, ProjectionError> {
-    batch_descends_from_database_measured(connection, descendant, ancestor)
+    batch_descends_from_database_measured(physical, descendant, ancestor)
         .map(|(contained, _)| contained)
 }
 
 fn batch_descends_from_database_measured(
-    connection: &Connection,
+    physical_database: &PhysicalSqliteDatabase,
     descendant: BatchId,
     ancestor: BatchId,
 ) -> Result<(bool, usize), ProjectionError> {
-    let root = read_frontier_root(connection)?;
+    let root = read_frontier_root(physical_database)?;
     let physical = lower_physical_frontier_root(&root)?;
-    let descendant_record = load_batch(connection, descendant)?.ok_or_else(|| {
+    let descendant_record = load_batch(physical_database, descendant)?.ok_or_else(|| {
         ProjectionError::Corrupt(format!(
             "descendant batch {descendant} is absent from the authenticated accepted map"
         ))
     })?;
-    if !storage_frontier::authenticate_batch(
-        connection,
+    if !physical_database.authenticate_batch(
         &physical,
         descendant.as_uuid().into_bytes(),
         descendant_record.causal_record_digest()?,
@@ -4746,11 +4673,10 @@ fn batch_descends_from_database_measured(
             "descendant batch {descendant} is absent from the authenticated accepted map"
         )));
     }
-    let Some(ancestor_record) = load_batch(connection, ancestor)? else {
+    let Some(ancestor_record) = load_batch(physical_database, ancestor)? else {
         return Ok((false, 0));
     };
-    if !storage_frontier::authenticate_batch(
-        connection,
+    if !physical_database.authenticate_batch(
         &physical,
         ancestor.as_uuid().into_bytes(),
         ancestor_record.causal_record_digest()?,
@@ -4758,8 +4684,7 @@ fn batch_descends_from_database_measured(
         return Ok((false, 0));
     }
     Ok((
-        storage_frontier::batch_descends_from(
-            connection,
+        physical_database.batch_descends_from(
             &physical,
             descendant.as_uuid().into_bytes(),
             ancestor.as_uuid().into_bytes(),
@@ -6790,30 +6715,22 @@ impl FrontierReferenceQuery<'_> {
         let hard_limit = super::MAX_MATERIALIZATION_QUERY_ROWS;
         let mut candidates = BTreeSet::new();
         for name in names {
-            let mut statement = self.database.connection.prepare(
-                "SELECT DISTINCT source_page_id FROM reference_postings
-                 WHERE normalized_name = ?1 AND reference_kind != 4
-                 ORDER BY source_page_id LIMIT ?2",
+            let physical = self.database.physical.reference_page_candidates_for_name(
+                name,
+                i64::try_from(hard_limit.saturating_add(1)).map_err(|_| {
+                    ProjectionError::Materialization(
+                        "reference query candidate limit overflowed".into(),
+                    )
+                })?,
             )?;
-            let rows = statement.query_map(
-                params![
-                    name,
-                    i64::try_from(hard_limit.saturating_add(1)).map_err(|_| {
-                        ProjectionError::Materialization(
-                            "reference query candidate limit overflowed".into(),
-                        )
-                    })?
-                ],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            let mut sqlite_for_name = BTreeSet::new();
-            for row in rows {
-                sqlite_for_name.insert(decode_reference_page_id(&row?)?);
-                if sqlite_for_name.len() > hard_limit {
-                    return Err(ProjectionError::Materialization(
-                        "reference query candidate source limit exceeded".into(),
-                    ));
-                }
+            let sqlite_for_name = physical
+                .into_iter()
+                .map(|id| Ok(PageId::from_uuid(Uuid::from_bytes(id))))
+                .collect::<Result<BTreeSet<_>, ProjectionError>>()?;
+            if sqlite_for_name.len() > hard_limit {
+                return Err(ProjectionError::Materialization(
+                    "reference query candidate source limit exceeded".into(),
+                ));
             }
             let logical = super::LogicalPageName::parse(name.clone())
                 .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -6848,30 +6765,25 @@ impl FrontierReferenceQuery<'_> {
         logseq_uuid: LogseqUuid,
     ) -> Result<BTreeSet<PageId>, ProjectionError> {
         let hard_limit = super::MAX_MATERIALIZATION_QUERY_ROWS;
-        let mut statement = self.database.connection.prepare(
-            "SELECT DISTINCT source_page_id FROM reference_postings
-             WHERE target_type = 1 AND raw_uuid_claim = ?1
-             ORDER BY source_page_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            params![
-                logseq_uuid.as_uuid().as_bytes().as_slice(),
+        let physical = self
+            .database
+            .physical
+            .reference_page_candidates_for_logseq_uuid(
+                logseq_uuid.as_uuid().into_bytes(),
                 i64::try_from(hard_limit.saturating_add(1)).map_err(|_| {
                     ProjectionError::Materialization(
                         "reference query candidate limit overflowed".into(),
                     )
-                })?
-            ],
-            |row| row.get::<_, Vec<u8>>(0),
-        )?;
-        let mut candidates = BTreeSet::new();
-        for row in rows {
-            candidates.insert(decode_reference_page_id(&row?)?);
-            if candidates.len() > hard_limit {
-                return Err(ProjectionError::Materialization(
-                    "reference query candidate source limit exceeded".into(),
-                ));
-            }
+                })?,
+            )?;
+        let candidates = physical
+            .into_iter()
+            .map(|id| PageId::from_uuid(Uuid::from_bytes(id)))
+            .collect::<BTreeSet<_>>();
+        if candidates.len() > hard_limit {
+            return Err(ProjectionError::Materialization(
+                "reference query candidate source limit exceeded".into(),
+            ));
         }
         let authenticated = self
             .engine
@@ -6894,27 +6806,21 @@ impl FrontierReferenceQuery<'_> {
         &self,
         normalized_alias: &str,
     ) -> Result<BTreeSet<PageId>, ProjectionError> {
-        let mut statement = self.database.connection.prepare(
-            "SELECT DISTINCT resolved_page_id FROM reference_alias_bindings
-             WHERE normalized_alias = ?1 AND resolved_page_id IS NOT NULL
-             ORDER BY resolved_page_id LIMIT ?2",
-        )?;
-        let candidates = statement
-            .query_map(
-                params![
+        let candidates =
+            self.database
+                .physical
+                .reference_page_candidates_for_alias(
                     normalized_alias,
                     i64::try_from(super::MAX_MATERIALIZATION_QUERY_ROWS.saturating_add(1))
-                        .map_err(|_| ProjectionError::Materialization(
-                            "reference alias candidate limit overflowed".into()
-                        ))?,
-                ],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?
-            .map(|row| {
-                row.map_err(ProjectionError::from)
-                    .and_then(|bytes| decode_reference_page_id(&bytes))
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
+                        .map_err(|_| {
+                            ProjectionError::Materialization(
+                                "reference alias candidate limit overflowed".into(),
+                            )
+                        })?,
+                )?
+                .into_iter()
+                .map(|id| PageId::from_uuid(Uuid::from_bytes(id)))
+                .collect::<BTreeSet<_>>();
         if candidates.len() > super::MAX_MATERIALIZATION_QUERY_ROWS {
             return Err(ProjectionError::Materialization(
                 "reference alias candidate source limit exceeded".into(),
@@ -7361,10 +7267,6 @@ fn verify_current_page_facts(
         ));
     }
     Ok(())
-}
-
-fn decode_reference_page_id(bytes: &[u8]) -> Result<PageId, ProjectionError> {
-    Ok(PageId::from_uuid(decode_uuid(bytes)?))
 }
 
 fn rewrite_raw_page_targets(
@@ -7921,15 +7823,17 @@ mod tests {
         }
     }
 
+    fn inspect_connection(database: &SqliteFrontier) -> Connection {
+        Connection::open(database.path()).unwrap()
+    }
+
     fn stored_semantic_effects(database: &SqliteFrontier) -> Vec<SemanticEffect> {
-        let mut statement = database
-            .connection
-            .prepare("SELECT semantic_effect FROM applied_batches ORDER BY sequence")
-            .unwrap();
-        statement
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        database
+            .physical
+            .stored_semantic_effects()
             .unwrap()
-            .map(|bytes| SemanticEffect::decode(&bytes.unwrap()).unwrap())
+            .into_iter()
+            .map(|bytes| SemanticEffect::decode(&bytes).unwrap())
             .collect()
     }
 
@@ -8254,8 +8158,8 @@ mod tests {
         .unwrap()
         .database;
         database
-            .connection
-            .pragma_update(None, "wal_autocheckpoint", 0)
+            .physical
+            .disable_wal_autocheckpoint_for_test()
             .unwrap();
         let event = AcceptedBatchEvent::from_accepted(&accepted_engine, &store, batch_id).unwrap();
         fs::write(&ready, b"ready").unwrap();
@@ -8276,16 +8180,14 @@ mod tests {
         let ids = TestIds::new(1_000);
         let dir = TestDir::new("transaction");
         let (mut database, engine, store) = open_empty(&dir, ids);
-        let application_id: u32 = database
-            .connection
+        let connection = inspect_connection(&database);
+        let application_id: u32 = connection
             .query_row("PRAGMA application_id", [], |row| row.get(0))
             .unwrap();
-        let user_version: u32 = database
-            .connection
+        let user_version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        let journal_mode: String = database
-            .connection
+        let journal_mode: String = connection
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(application_id, SQLITE_APPLICATION_ID);
@@ -8300,6 +8202,7 @@ mod tests {
         assert_eq!(database.applied_batch_count().unwrap(), 0);
         assert_eq!(database.frontier().unwrap(), FrontierV2::default());
         let database_path = database.path().to_path_buf();
+        drop(connection);
         drop(database);
         let reopened = open_test_projection(
             &database_path,
@@ -8398,7 +8301,11 @@ mod tests {
                 "schema mutation {case} was not rebuilt: {:?}",
                 rebuilt.recovery
             );
-            validate_schema_and_claim(&rebuilt.database.connection, ids.claim()).unwrap();
+            rebuilt
+                .database
+                .physical
+                .validate_schema_and_claim(lower_physical_claim(ids.claim()))
+                .unwrap();
         }
     }
 
@@ -8460,8 +8367,7 @@ mod tests {
             Err(ProjectionError::InjectedFailure)
         );
         assert_eq!(database.applied_batch_count().unwrap(), 0);
-        let materialized_rows: i64 = database
-            .connection
+        let materialized_rows: i64 = inspect_connection(&database)
             .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(materialized_rows, 0);
@@ -8818,8 +8724,8 @@ mod tests {
             .unwrap();
         publish_and_stage(&mut engine, &store, &unapplied_tail);
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "UPDATE materialization_stamp SET catalog_root_digest = zeroblob(32) WHERE singleton = 1",
                 [],
             )
@@ -8896,8 +8802,8 @@ mod tests {
         }
 
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "DELETE FROM reference_postings WHERE normalized_name = ?1",
                 params![target_key],
             )
@@ -8915,8 +8821,8 @@ mod tests {
             .unwrap();
 
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "UPDATE reference_postings
                  SET normalized_name = 'tampered'
                  WHERE normalized_name = ?1",
@@ -8934,8 +8840,8 @@ mod tests {
 
         let inserted_source = PageId::from_uuid(uuid(1_799));
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "INSERT INTO reference_postings (
                      source_page_id, source_entity_type, source_entity_id, source_locator,
                      ordinal, reference_kind, target_type, raw_name, normalized_name,
@@ -8958,8 +8864,8 @@ mod tests {
             .unwrap();
 
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "DELETE FROM reference_alias_bindings WHERE normalized_alias = ?1",
                 params![old_owner_key],
             )
@@ -8977,8 +8883,8 @@ mod tests {
             .unwrap();
 
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "UPDATE reference_alias_bindings
                  SET normalized_alias = 'tampered'
                  WHERE normalized_alias = ?1",
@@ -8995,8 +8901,8 @@ mod tests {
             .unwrap();
 
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "INSERT INTO reference_alias_bindings (
                      normalized_alias, candidate_ordinal, resolved_page_id, catalog_root_digest
                  )
@@ -9208,20 +9114,18 @@ mod tests {
                 Err(ProjectionError::Materialization(_))
             ));
             assert_eq!(database.applied_batch_count().unwrap(), 0);
-            let rows: i64 = database
-                .connection
+            let connection = inspect_connection(&database);
+            let rows: i64 = connection
                 .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(rows, 0);
-            let materialized_batches: i64 = database
-                .connection
+            let materialized_batches: i64 = connection
                 .query_row("SELECT COUNT(*) FROM materialization_batches", [], |row| {
                     row.get(0)
                 })
                 .unwrap();
             assert_eq!(materialized_batches, 0);
-            let materialization_sequence: i64 = database
-                .connection
+            let materialization_sequence: i64 = connection
                 .query_row(
                     "SELECT acceptance_sequence FROM materialization_stamp WHERE singleton = 1",
                     [],
@@ -9390,8 +9294,7 @@ mod tests {
                     ),
                     "{case} {field} exposed stale rows after an accepted event failed"
                 );
-                let stamp: i64 = database
-                    .connection
+                let stamp: i64 = inspect_connection(&database)
                     .query_row(
                         "SELECT acceptance_sequence FROM materialization_stamp WHERE singleton = 1",
                         [],
@@ -9498,8 +9401,7 @@ mod tests {
             database.rebuild_materialization(vec![root_change.clone(), contradictory]),
             Err(ProjectionError::Materialization(_))
         ));
-        let persisted: (String, String, String, i64) = database
-            .connection
+        let persisted: (String, String, String, i64) = inspect_connection(&database)
             .query_row(
                 "SELECT name, name_key, path, text_kind FROM pages WHERE page_id = ?1",
                 params![ids.page.as_uuid().as_bytes().as_slice()],
@@ -9582,15 +9484,15 @@ mod tests {
             .apply_materialized_accepted(&event, &current)
             .unwrap();
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "UPDATE pages SET name = 'stale contradictory', name_key = 'stale contradictory'",
                 [],
             )
             .unwrap();
         database
-            .connection
-            .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION - 1)
+            .physical
+            .set_corrupt_user_version_for_test(SQLITE_SCHEMA_VERSION - 1)
             .unwrap();
         let database_path = database.path().to_path_buf();
         drop(database);
@@ -9612,9 +9514,7 @@ mod tests {
             )),
             "unexpected rebuild reason: {reason}"
         );
-        let rebuilt_rows: i64 = reopened
-            .database
-            .connection
+        let rebuilt_rows: i64 = inspect_connection(&reopened.database)
             .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rebuilt_rows, 1);
@@ -10800,12 +10700,12 @@ mod tests {
         let (root, child) = root_and_child_events(&store, ids);
         database.apply_accepted(&root).unwrap();
         database.apply_accepted(&child).unwrap();
-        let root_record = load_batch(&database.connection, root.batch_id())
+        let root_record = load_batch(&database.physical, root.batch_id())
             .unwrap()
             .unwrap();
         database
-            .connection
-            .execute(
+            .physical
+            .execute_corrupting_statement_for_test(
                 "UPDATE applied_batches
                  SET causal_clock_root_key = ?1, causal_clock_root_digest = ?2
                  WHERE batch_id = ?3",
@@ -10832,14 +10732,14 @@ mod tests {
             let (root, child) = root_and_child_events(&store, ids);
             database.apply_accepted(&root).unwrap();
             database.apply_accepted(&child).unwrap();
-            let child_record = load_batch(&database.connection, child.batch_id())
+            let child_record = load_batch(&database.physical, child.batch_id())
                 .unwrap()
                 .unwrap();
             match case {
                 "batch-record" => {
                     database
-                        .connection
-                        .execute(
+                        .physical
+                        .execute_corrupting_statement_for_test(
                             "DELETE FROM applied_batches WHERE batch_id = ?1",
                             [uuid_blob(&child.batch_id().as_uuid())],
                         )
@@ -10847,8 +10747,8 @@ mod tests {
                 }
                 "clock-node" => {
                     database
-                        .connection
-                        .execute(
+                        .physical
+                        .execute_corrupting_statement_for_test(
                             "DELETE FROM causal_clock_nodes WHERE node_digest = ?1",
                             [child_record.causal_clock_root_digest],
                         )
@@ -11259,8 +11159,11 @@ mod tests {
         .database;
         database.apply_accepted(&left).unwrap();
         database
-            .connection
-            .execute("DELETE FROM applied_batches WHERE sequence = 1", [])
+            .physical
+            .execute_corrupting_statement_for_test(
+                "DELETE FROM applied_batches WHERE sequence = 1",
+                [],
+            )
             .unwrap();
         assert_eq!(
             database.apply_accepted(&right).unwrap(),
@@ -11472,9 +11375,8 @@ mod tests {
             .windows(COUNTERFEIT.len())
             .any(|window| window == COUNTERFEIT));
 
-        let mut statement = recovered
-            .database
-            .connection
+        let connection = inspect_connection(&recovered.database);
+        let mut statement = connection
             .prepare(
                 "SELECT content FROM blocks
                  WHERE page_id = ?1
@@ -11608,25 +11510,23 @@ mod tests {
         .unwrap();
         let rebuild_elapsed = started.elapsed();
         assert_eq!(opened.database.applied_batch_count().unwrap(), batch_count);
-        let first = load_batch_at_sequence(&opened.database.connection, 1)
+        let first = load_batch_at_sequence(&opened.database.physical, 1)
             .unwrap()
             .unwrap()
             .batch_id;
-        let last = load_batch_at_sequence(&opened.database.connection, batch_count as i64)
+        let last = load_batch_at_sequence(&opened.database.physical, batch_count as i64)
             .unwrap()
             .unwrap()
             .batch_id;
         let (descends, batch_rows_read) =
-            batch_descends_from_database_measured(&opened.database.connection, last, first)
-                .unwrap();
+            batch_descends_from_database_measured(&opened.database.physical, last, first).unwrap();
         assert!(descends);
         assert!(
             batch_rows_read <= 96,
             "authenticated ancestry point lookup read {batch_rows_read} rows"
         );
-        let (clock_nodes, clock_node_bytes): (i64, i64) = opened
-            .database
-            .connection
+        let connection = inspect_connection(&opened.database);
+        let (clock_nodes, clock_node_bytes): (i64, i64) = connection
             .query_row(
                 "SELECT COUNT(*),
                         COALESCE(SUM(length(node_digest) + length(peer_id) + 8
@@ -11640,9 +11540,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        let (batch_nodes, batch_node_bytes): (i64, i64) = opened
-            .database
-            .connection
+        let (batch_nodes, batch_node_bytes): (i64, i64) = connection
             .query_row(
                 "SELECT COUNT(*),
                         COALESCE(SUM(length(node_digest) + length(batch_id)
@@ -11656,14 +11554,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        let page_count: i64 = opened
-            .database
-            .connection
+        let page_count: i64 = connection
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .unwrap();
-        let page_size: i64 = opened
-            .database
-            .connection
+        let page_size: i64 = connection
             .query_row("PRAGMA page_size", [], |row| row.get(0))
             .unwrap();
         let causal_stats = CausalStorageStats {
@@ -11674,6 +11568,7 @@ mod tests {
             database_bytes: usize::try_from(page_count * page_size).unwrap(),
             ancestry_rows_read: batch_rows_read,
         };
+        drop(connection);
         let rebuild = opened.rebuild;
         drop(opened);
         let started = Instant::now();
@@ -12027,7 +11922,7 @@ mod tests {
         let mut batch_entries = vec![
             (
                 root.batch_id(),
-                load_batch(&database.connection, root.batch_id())
+                load_batch(&database.physical, root.batch_id())
                     .unwrap()
                     .unwrap()
                     .causal_record_digest()
@@ -12035,7 +11930,7 @@ mod tests {
             ),
             (
                 child.batch_id(),
-                load_batch(&database.connection, child.batch_id())
+                load_batch(&database.physical, child.batch_id())
                     .unwrap()
                     .unwrap()
                     .causal_record_digest()
@@ -12243,23 +12138,11 @@ mod tests {
         authenticate_event_for_engine(&substitute_engine, &event).unwrap();
 
         let logical_before = database_logical_state(&database);
-        let rows_before: (i64, i64, i64, i64) = database
-            .connection
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM applied_batches),
-                    (SELECT COUNT(*) FROM pages),
-                    (SELECT COUNT(*) FROM blocks),
-                    (SELECT acceptance_sequence
-                     FROM materialization_stamp WHERE singleton = 1)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+        let rows_before = database
+            .physical
+            .authority_rejection_snapshot_for_test()
             .unwrap();
-        let total_changes_before: i64 = database
-            .connection
-            .query_row("SELECT total_changes()", [], |row| row.get(0))
-            .unwrap();
+        let total_changes_before = database.physical.total_changes_for_test();
         let checkpoint_path = sidecar_path(database.path(), "-auth");
         let checkpoint_before = fs::read(&checkpoint_path).unwrap();
 
@@ -12268,25 +12151,13 @@ mod tests {
             Err(ProjectionError::AuthorityMismatch)
         );
         assert_eq!(database_logical_state(&database), logical_before);
-        let rows_after: (i64, i64, i64, i64) = database
-            .connection
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM applied_batches),
-                    (SELECT COUNT(*) FROM pages),
-                    (SELECT COUNT(*) FROM blocks),
-                    (SELECT acceptance_sequence
-                     FROM materialization_stamp WHERE singleton = 1)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+        let rows_after = database
+            .physical
+            .authority_rejection_snapshot_for_test()
             .unwrap();
         assert_eq!(rows_after, rows_before);
         assert_eq!(
-            database
-                .connection
-                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
+            database.physical.total_changes_for_test(),
             total_changes_before
         );
         assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);

@@ -13284,7 +13284,10 @@ mod tests {
             existing.recovery,
             ProjectionRecovery::RebuiltPreservingEvidence { .. }
         ));
-        assert_eq!(existing_proof.bootstrap_rebuild().bootstrap_part_reads, 1);
+        assert_eq!(
+            existing_proof.bootstrap_rebuild().bootstrap_part_reads,
+            prepared.aggregate().parts().len()
+        );
         drop(existing);
 
         fs::remove_file(&path).unwrap();
@@ -13318,7 +13321,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(retried_proof, expected);
-        assert_eq!(retried_proof.bootstrap_rebuild().bootstrap_part_reads, 1);
+        assert_eq!(
+            retried_proof.bootstrap_rebuild().bootstrap_part_reads,
+            prepared.aggregate().parts().len()
+        );
     }
 
     #[test]

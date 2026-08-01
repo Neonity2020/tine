@@ -41,3 +41,4 @@ windows-sys = { version = "0.61.2", features = [
 
 [dev-dependencies]
 pretty_assertions = "1"
+tine-storage = { path = "../tine-storage", features = ["test-support"] }

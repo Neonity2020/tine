@@ -11,9 +11,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use rusqlite::Connection;
 #[cfg(test)]
-use rusqlite::{params, Transaction};
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tine_storage::sqlite_materialization as storage;
 use uuid::Uuid;
@@ -1482,31 +1481,6 @@ pub(crate) fn initialize_schema(
     storage::initialize_schema(connection, empty_frontier_digest).map_err(Into::into)
 }
 
-pub(crate) fn row_digest(connection: &Connection) -> Result<ContentDigest, MaterializationError> {
-    storage::row_digest(connection).map_err(Into::into)
-}
-
-pub(crate) fn ensure_stamp(
-    connection: &Connection,
-    sequence: u64,
-    frontier_digest: ContentDigest,
-) -> Result<(), MaterializationError> {
-    storage::ensure_stamp(connection, sequence, frontier_digest).map_err(Into::into)
-}
-
-pub(crate) fn finalize_fresh_bootstrap(
-    connection: &Connection,
-    expected_catalog_root: &ReferenceCatalogRootV2,
-    inductive_coverage_count: u64,
-) -> Result<(), MaterializationError> {
-    storage::finalize_fresh_bootstrap(
-        connection,
-        expected_catalog_root.source_count(),
-        inductive_coverage_count,
-    )
-    .map_err(Into::into)
-}
-
 #[cfg(test)]
 pub(crate) fn apply_change(
     transaction: &Transaction<'_>,
@@ -1767,14 +1741,6 @@ fn lower_reference_catalog(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn reset(
-    transaction: &Transaction<'_>,
-    empty_frontier_digest: ContentDigest,
-) -> Result<(), MaterializationError> {
-    storage::reset(transaction, empty_frontier_digest).map_err(Into::into)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPageRow {
     pub page_id: PageId,
@@ -1847,18 +1813,21 @@ pub struct SqliteMaterializedRead<'a> {
 }
 
 impl<'a> SqliteMaterializedRead<'a> {
+    pub(crate) fn from_storage(inner: storage::SqliteMaterializedRead<'a>) -> Self {
+        Self { inner }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         connection: &'a Connection,
         acceptance_sequence: u64,
         frontier_digest: ContentDigest,
     ) -> Result<Self, MaterializationError> {
-        Ok(Self {
-            inner: storage::SqliteMaterializedRead::new(
-                connection,
-                acceptance_sequence,
-                frontier_digest,
-            )?,
-        })
+        Ok(Self::from_storage(storage::SqliteMaterializedRead::new(
+            connection,
+            acceptance_sequence,
+            frontier_digest,
+        )?))
     }
 
     pub const fn acceptance_sequence(&self) -> u64 {
