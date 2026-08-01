@@ -9783,9 +9783,47 @@ mod tests {
             "bootstrap-promoted-heading",
             &[("pages/promoted.md", source)],
         );
-        assert_eq!(prepared.aggregate().parts().len(), 1);
+        let page_id = prepared
+            .aggregate()
+            .import_id()
+            .unmatched_page_id(&ImportLocator::page(
+                ManagedPath::parse("pages/promoted.md").unwrap(),
+            ));
+        let page = prepared
+            .candidate()
+            .accepted_engine()
+            .materialize_page(page_id)
+            .unwrap();
+        let block_indexes = page
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.block_id, index))
+            .collect::<BTreeMap<_, _>>();
+        let block_parents = page
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.content.clone(),
+                    block
+                        .parent
+                        .map(|parent| page.blocks[block_indexes[&parent]].content.clone()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            block_parents,
+            BTreeMap::from([
+                ("# Project".into(), None),
+                ("child one".into(), Some("# Project".into())),
+                ("child two".into(), Some("# Project".into())),
+                ("sibling".into(), None),
+                ("nested sibling child".into(), Some("sibling".into())),
+            ])
+        );
         assert_eq!(prepared.instrumentation().parser_nodes, 5);
-        assert!(prepared.instrumentation().source_spans >= 5);
+        assert!(prepared.instrumentation().source_spans >= page.blocks.len() as u64);
     }
 
     #[test]
