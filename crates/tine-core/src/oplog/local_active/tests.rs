@@ -2729,47 +2729,49 @@ fn promotion_state_residue_fails_closed_and_preserves_evidence() {
 /// and no engine identity. It reconstructs everything from durable state.
 #[test]
 fn a_fresh_process_reopens_the_promoted_runtime_with_no_retained_evidence() {
-    let mut fixture = Fixture::new(
-        "promote-restart",
-        None,
-        vec![("pages/restart.md".into(), b"- restart\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("promote-restart");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "restart");
-    let session = SessionId::new();
+    on_a_deep_stack(move || {
+        let mut fixture = Fixture::new(
+            "promote-restart",
+            None,
+            vec![("pages/restart.md".into(), b"- restart\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("promote-restart");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "restart");
+        let session = SessionId::new();
 
-    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
-    let anchor = runtime.bootstrap_anchor();
-    let frontier = runtime.engine().accepted_frontier_root().unwrap();
-    // The previous process is gone: every process-local value dies with it.
-    drop(runtime);
-    drop(authority);
+        let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+        let anchor = runtime.bootstrap_anchor();
+        let frontier = runtime.engine().accepted_frontier_root().unwrap();
+        // The previous process is gone: every process-local value dies with it.
+        drop(runtime);
+        drop(authority);
 
-    // A competing session is refused before any archive or lease work.
-    assert!(
-        reopen_promoted_local_runtime(&root, &binding, SessionId::new(), &paths.open(&fixture))
-            .is_err(),
-        "a crash resumes Unsafe for exactly the committed session"
-    );
+        // A competing session is refused before any archive or lease work.
+        assert!(
+            reopen_promoted_local_runtime(&root, &binding, SessionId::new(), &paths.open(&fixture))
+                .is_err(),
+            "a crash resumes Unsafe for exactly the committed session"
+        );
 
-    let (reopened_authority, reopened) =
-        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
-    assert_eq!(reopened.bootstrap_anchor(), anchor);
-    assert_eq!(
-        reopened.engine().accepted_frontier_root().unwrap(),
-        frontier
-    );
-    assert_eq!(reopened.database().frontier_root().unwrap(), frontier);
-    assert_eq!(
-        reopened_authority.handoff(),
-        LocalActiveHandoff::Unsafe {
-            session_id: session
-        },
-        "a crash remains Unsafe"
-    );
-    assert_eq!(reopened_authority.session_id(), session);
-    fixture.assert_graph_unchanged();
+        let (reopened_authority, reopened) =
+            reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+        assert_eq!(reopened.bootstrap_anchor(), anchor);
+        assert_eq!(
+            reopened.engine().accepted_frontier_root().unwrap(),
+            frontier
+        );
+        assert_eq!(reopened.database().frontier_root().unwrap(), frontier);
+        assert_eq!(
+            reopened_authority.handoff(),
+            LocalActiveHandoff::Unsafe {
+                session_id: session
+            },
+            "a crash remains Unsafe"
+        );
+        assert_eq!(reopened_authority.session_id(), session);
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// Ordinary local batches extend the bootstrap without ever making it
