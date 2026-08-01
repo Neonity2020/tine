@@ -76,7 +76,6 @@ pub const TAIL_MAX_BATCHES: usize = 10_000;
 
 const FORENSIC_NAMES: [&str; 4] = ["database", "wal", "shm", "auth"];
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
-const MAX_PROJECTION_CHECKPOINT_BYTES: u64 = 64 * 1024;
 const OBJECT_STORE_LEASE_NAMESPACE: &str = ".tine-runtime";
 const SQLITE_WORKSPACE_LEASE_NAMESPACE: &str = "sqlite-workspaces";
 const SQLITE_APPLIER_LEASE_FILE: &str = "sqlite-applier.lock";
@@ -3902,7 +3901,7 @@ fn validate_projection_checkpoint(
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() == 0
-        || metadata.len() > MAX_PROJECTION_CHECKPOINT_BYTES
+        || metadata.len() > storage_frontier::MAX_SQLITE_CHECKPOINT_BYTES as u64
     {
         return Err(ProjectionError::Corrupt(
             "SQLite projection checkpoint is not a bounded regular file".into(),
@@ -3960,23 +3959,7 @@ fn write_projection_checkpoint(
     };
     let bytes = postcard::to_allocvec(&envelope)
         .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-    let checkpoint_path = files.checkpoint_path();
-    let parent = checkpoint_path
-        .parent()
-        .ok_or_else(|| ProjectionError::UnsafePath("checkpoint has no parent".into()))?;
-    let name = checkpoint_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| ProjectionError::UnsafePath("checkpoint name is not UTF-8".into()))?;
-    let temporary = parent.join(format!(".{name}.tmp-{}", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(&temporary, &checkpoint_path)?;
-    sync_directory(parent)
+    files.publish_checkpoint(&bytes).map_err(Into::into)
 }
 
 fn initialize_schema(
@@ -6369,6 +6352,9 @@ impl From<SqliteFileSetError> for ProjectionError {
             SqliteFileSetError::Io(error) => Self::from(error),
             SqliteFileSetError::UnsafePath(error) => Self::UnsafePath(error),
             SqliteFileSetError::Corrupt(error) => Self::Corrupt(error),
+            SqliteFileSetError::CheckpointTooLarge { length, limit } => Self::Corrupt(format!(
+                "SQLite projection checkpoint is too large: {length} bytes exceeds {limit}"
+            )),
             SqliteFileSetError::CandidateRetainedSidecars => {
                 Self::Corrupt("checkpointed SQLite candidate retained sidecars".into())
             }
@@ -11202,6 +11188,37 @@ mod tests {
     }
 
     #[test]
+    fn core_constructs_the_exact_authenticated_bytes_that_storage_replaces() {
+        let ids = TestIds::new(2_389);
+        let dir = TestDir::new("checkpoint-core-bytes-storage-publication");
+        let (database, _engine, _store) = open_empty(&dir, ids);
+        let path = database.path().to_path_buf();
+        let files = SqliteFileSet::new(&path);
+        let root = AcceptedFrontierRoot::empty();
+        let root_bytes = canonical_frontier_root_bytes(&root).unwrap();
+        let physical = files.physical_checkpoint().unwrap();
+        let checkpoint = ProjectionCheckpoint {
+            schema_version: PROJECTION_CHECKPOINT_SCHEMA_VERSION,
+            workspace_id: ids.workspace,
+            frontier_root_digest: ContentDigest::of(&root_bytes),
+            database: physical.database,
+            wal: physical.wal,
+        };
+        let checkpoint_bytes = postcard::to_allocvec(&checkpoint).unwrap();
+        let expected = postcard::to_allocvec(&ProjectionCheckpointEnvelope {
+            digest: ContentDigest::of(&checkpoint_bytes),
+            checkpoint,
+        })
+        .unwrap();
+        fs::write(files.checkpoint_path(), b"predecessor checkpoint").unwrap();
+
+        write_projection_checkpoint(&path, ids.claim(), &root).unwrap();
+
+        assert_eq!(fs::read(files.checkpoint_path()).unwrap(), expected);
+        validate_projection_checkpoint(&path, ids.claim(), &root).unwrap();
+    }
+
+    #[test]
     fn previous_projection_checkpoint_version_is_rebuilt_not_reinterpreted() {
         let ids = TestIds::new(2_387);
         let dir = TestDir::new("old-checkpoint-version");
@@ -11214,7 +11231,8 @@ mod tests {
         let mut envelope: ProjectionCheckpointEnvelope = postcard::from_bytes(&bytes).unwrap();
         envelope.checkpoint.schema_version = PROJECTION_CHECKPOINT_SCHEMA_VERSION - 1;
         envelope.digest = ContentDigest::of(&postcard::to_allocvec(&envelope.checkpoint).unwrap());
-        fs::write(&checkpoint_path, postcard::to_allocvec(&envelope).unwrap()).unwrap();
+        let prior_version_bytes = postcard::to_allocvec(&envelope).unwrap();
+        fs::write(&checkpoint_path, &prior_version_bytes).unwrap();
 
         let recovered = open_test_projection(
             &path,
@@ -11230,6 +11248,17 @@ mod tests {
             recovered.database.frontier().unwrap(),
             FrontierV2::default()
         );
+        let replacement = fs::read(&checkpoint_path).unwrap();
+        assert_ne!(replacement, prior_version_bytes);
+        validate_projection_checkpoint(&path, ids.claim(), &AcceptedFrontierRoot::empty()).unwrap();
+        let temporary_prefix = ".frontier.sqlite-auth.tmp-";
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(temporary_prefix)
+        }));
     }
 
     #[derive(Clone, Copy, Debug)]
