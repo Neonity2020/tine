@@ -4548,6 +4548,7 @@ impl ReplayTimingStats {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EngineInstrumentation {
+    pub catalog_hot_state_loads: usize,
     pub prepare_transactions: usize,
     pub prepare_document_head_visits: usize,
     pub author_snapshot_clones: usize,
@@ -4911,6 +4912,12 @@ struct RunLocalCatalogHotState {
     catalog_document: Option<LoroDoc>,
 }
 
+#[derive(Clone)]
+struct DeferredCatalogCheckpoint {
+    roots: ScratchRoots,
+    binding: ContentDigest,
+}
+
 impl RunLocalCatalogHotState {
     /// Install this state into a freshly rebuilt engine.
     ///
@@ -5183,7 +5190,8 @@ pub struct ShardedHotEngine {
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
     visible_documents: BTreeMap<DocumentId, LoroDoc>,
-    lazy_catalog_document: OnceLock<Result<Option<LoroDoc>, EngineError>>,
+    lazy_catalog_hot_state: OnceLock<Result<RunLocalCatalogHotState, EngineError>>,
+    deferred_catalog_checkpoint: Option<DeferredCatalogCheckpoint>,
     // A second current-state buffer is reused across ordinary authorship.
     // It accumulates the same incremental updates as the visible buffer, so
     // preparing the next bounded edit never snapshots accumulated CRDT history.
@@ -5221,6 +5229,7 @@ pub struct ShardedHotEngine {
     replay_timing: Cell<ReplayTimingStats>,
     #[cfg(test)]
     catalog_checkpoint_loads: Cell<CatalogCheckpointLoadStats>,
+    catalog_hot_state_loads: Cell<usize>,
     #[cfg(test)]
     read_only_catalog_clones: Cell<usize>,
     #[cfg(test)]
@@ -5334,7 +5343,8 @@ impl ShardedHotEngine {
             fatal_evidence: None,
             fatal_handle: None,
             visible_documents: BTreeMap::new(),
-            lazy_catalog_document: OnceLock::new(),
+            lazy_catalog_hot_state: OnceLock::new(),
+            deferred_catalog_checkpoint: None,
             spare_documents: RefCell::new(BTreeMap::new()),
             pending_author_documents: RefCell::new(None),
             visible_document_lru: VecDeque::new(),
@@ -5360,6 +5370,7 @@ impl ShardedHotEngine {
             replay_timing: Cell::new(ReplayTimingStats::default()),
             #[cfg(test)]
             catalog_checkpoint_loads: Cell::new(CatalogCheckpointLoadStats::default()),
+            catalog_hot_state_loads: Cell::new(0),
             #[cfg(test)]
             read_only_catalog_clones: Cell::new(0),
             #[cfg(test)]
@@ -6952,7 +6963,15 @@ impl ShardedHotEngine {
         // `canonical_snapshot` silently returns an empty graph, and the first
         // local authoring round is diverted into external reconciliation
         // against a `None` semantic pre-state.
-        run_local.install(self);
+        match run_local {
+            Some(run_local) => run_local.install(self),
+            None => {
+                self.deferred_catalog_checkpoint = Some(DeferredCatalogCheckpoint {
+                    roots: snapshot.scratch_roots.clone(),
+                    binding: snapshot.catalog_checkpoint_binding,
+                });
+            }
+        }
         self.replay_base_generation = snapshot.history_generation;
         self.validated_run_local_current_authority = exact_current_authority;
         self.adoptable_current_history_head =
@@ -6973,10 +6992,10 @@ impl ShardedHotEngine {
     /// authenticated point reads — it is deliberately *not* a scan, so its cost
     /// does not grow with the graph or with the run's history:
     ///
-    /// * the two external document lanes, through
-    ///   `document_state::load_external_current` for the catalog document, whose
-    ///   record is then anchor-validated against the immutable archive exactly
-    ///   as an ordinary hot read would;
+    /// * for a stale candidate, the two external document lanes through
+    ///   `document_state::load_external_current`; an exact-current candidate
+    ///   defers that authenticated catalog read until an engine operation needs
+    ///   it;
     /// * `accepted_batch_map_root` — cardinality only;
     /// * `batch_status_root`, through `dependency_queue::lookup` of the
     ///   predecessor batch;
@@ -6999,7 +7018,7 @@ impl ShardedHotEngine {
         snapshot: &RuntimeResumeSnapshot,
         record: &ColdHistoryRecord,
         defer_catalog_document: bool,
-    ) -> Result<RunLocalCatalogHotState, EngineError> {
+    ) -> Result<Option<RunLocalCatalogHotState>, EngineError> {
         let scratch = self.scratch.as_ref().ok_or_else(|| {
             EngineError::Archive("runtime resume restore requires a run-local scratch".into())
         })?;
@@ -7022,21 +7041,16 @@ impl ShardedHotEngine {
                 "adopted accepted batch map does not carry the recorded acceptance sequence".into(),
             ));
         }
-        // The catalog document's own authenticated state record, and the
-        // document it addresses. A zeroed or rewritten `pages.index` fails here
-        // first.
-        //
-        // The decoded document is kept, not discarded: it is the run-local hot
-        // state a full replay would have staged, and reading it here is what
-        // lets the restore stay all-or-nothing — the install happens only after
-        // every proof below has succeeded.
+        // Stale candidates retain the complete eager read. Exact-current
+        // candidates already have an independently authenticated SQLite read
+        // projection and defer this graph-sized catalog load. The first engine
+        // operation that needs catalog state repeats this same load and checks
+        // the snapshot binding before exposing or mutating engine state.
         let hot_state = if defer_catalog_document {
-            self.load_run_local_catalog_authority(&snapshot.scratch_roots)?
+            None
         } else {
-            self.load_run_local_catalog_hot_state(&snapshot.scratch_roots)?
+            Some(self.load_run_local_catalog_hot_state(&snapshot.scratch_roots)?)
         };
-        let catalog_heads = hot_state.catalog_heads;
-        let catalog_document = hot_state.catalog_document;
         // The snapshot's own catalog checkpoint binding commits the two external
         // document lanes together with these heads, so reproducing it is one
         // O(1) equality that covers all three at once — and it is what makes the
@@ -7048,14 +7062,17 @@ impl ShardedHotEngine {
         // record published by an earlier run legitimately disagrees with the
         // current one. The cross-run authority is the accepted frontier's
         // content-addressed facts, checked above.
-        let restored_binding = self.catalog_checkpoint_binding_for(
-            &snapshot.scratch_roots,
-            Some(&catalog_heads).filter(|heads| !heads.is_empty()),
-        );
-        if restored_binding != snapshot.catalog_checkpoint_binding {
-            return Err(EngineError::Archive(
-                "adopted run does not reproduce the recorded catalog checkpoint binding".into(),
-            ));
+        if let Some(hot_state) = &hot_state {
+            let restored_binding = self.catalog_checkpoint_binding_for(
+                &snapshot.scratch_roots,
+                Some(&hot_state.catalog_heads).filter(|heads| !heads.is_empty()),
+            );
+            if restored_binding != snapshot.catalog_checkpoint_binding {
+                return Err(EngineError::Archive(
+                    "adopted run does not reproduce the recorded catalog checkpoint binding"
+                        .into(),
+                ));
+            }
         }
         // The adopted run must know the predecessor batch as a final accepted
         // record at exactly the recorded acceptance sequence. Both reads walk
@@ -7109,10 +7126,7 @@ impl ShardedHotEngine {
             })?
             .lookup_many(snapshot.block_claim_root, &[[0_u8; 16]])
             .map_err(|error| EngineError::Archive(error.to_string()))?;
-        Ok(RunLocalCatalogHotState {
-            catalog_heads,
-            catalog_document,
-        })
+        Ok(hot_state)
     }
 
     /// Re-derive the catalog document and its authenticated direct heads from
@@ -7135,6 +7149,8 @@ impl ShardedHotEngine {
         &self,
         roots: &ScratchRoots,
     ) -> Result<RunLocalCatalogHotState, EngineError> {
+        self.catalog_hot_state_loads
+            .set(self.catalog_hot_state_loads.get().saturating_add(1));
         let scratch = self.scratch.as_ref().ok_or_else(|| {
             EngineError::Archive(
                 "run-local catalog hot state requires an authenticated scratch".into(),
@@ -7163,46 +7179,61 @@ impl ShardedHotEngine {
         })
     }
 
-    fn load_run_local_catalog_authority(
-        &self,
-        roots: &ScratchRoots,
-    ) -> Result<RunLocalCatalogHotState, EngineError> {
-        let scratch = self.scratch.as_ref().ok_or_else(|| {
-            EngineError::Archive(
-                "run-local catalog authority requires an authenticated scratch".into(),
-            )
-        })?;
-        let Some(state) = super::document_state::load_external_current_record(
-            scratch,
-            roots,
-            super::document_state::DocumentLane::Visible,
-            self.catalog_document_id,
-        )
-        .map_err(|error| EngineError::Archive(error.to_string()))?
-        else {
-            return Ok(RunLocalCatalogHotState {
-                catalog_heads: BTreeSet::new(),
-                catalog_document: None,
-            });
-        };
-        self.validate_external_record_anchor(self.catalog_document_id, &state)?;
-        Ok(RunLocalCatalogHotState {
-            catalog_heads: state.exact_direct_heads().iter().copied().collect(),
-            catalog_document: None,
-        })
+    fn lazy_catalog_hot_state(&self) -> Result<&RunLocalCatalogHotState, EngineError> {
+        match self.lazy_catalog_hot_state.get_or_init(|| {
+            let roots = self
+                .deferred_catalog_checkpoint
+                .as_ref()
+                .map(|checkpoint| &checkpoint.roots)
+                .unwrap_or(&self.scratch_roots);
+            let state = self.load_run_local_catalog_hot_state(roots)?;
+            if let Some(checkpoint) = &self.deferred_catalog_checkpoint {
+                let actual = self.catalog_checkpoint_binding_for(
+                    &checkpoint.roots,
+                    Some(&state.catalog_heads).filter(|heads| !heads.is_empty()),
+                );
+                if actual != checkpoint.binding {
+                    return Err(EngineError::Archive(
+                        "adopted run does not reproduce the recorded catalog checkpoint binding"
+                            .into(),
+                    ));
+                }
+            }
+            Ok(state)
+        }) {
+            Ok(state) => Ok(state),
+            Err(error) => Err(error.clone()),
+        }
     }
 
     fn current_catalog_document(&self) -> Result<Option<&LoroDoc>, EngineError> {
         if let Some(catalog) = self.visible_documents.get(&self.catalog_document_id) {
             return Ok(Some(catalog));
         }
-        match self.lazy_catalog_document.get_or_init(|| {
-            self.load_run_local_catalog_hot_state(&self.scratch_roots)
-                .map(|state| state.catalog_document)
-        }) {
-            Ok(document) => Ok(document.as_ref()),
-            Err(error) => Err(error.clone()),
+        Ok(self.lazy_catalog_hot_state()?.catalog_document.as_ref())
+    }
+
+    pub(crate) fn authenticate_lazy_catalog_for_mutation(&mut self) -> Result<(), EngineError> {
+        if self.deferred_catalog_checkpoint.is_none() {
+            return Ok(());
         }
+        let state = self.lazy_catalog_hot_state()?;
+        let heads = state.catalog_heads.clone();
+        let document = state
+            .catalog_document
+            .as_ref()
+            .map(|document| clone_doc(document, 1))
+            .transpose()?;
+        if !heads.is_empty() {
+            self.visible_document_heads
+                .insert(self.catalog_document_id, heads);
+        }
+        if let Some(document) = document {
+            self.visible_documents
+                .insert(self.catalog_document_id, document);
+        }
+        self.deferred_catalog_checkpoint = None;
+        Ok(())
     }
 
     /// Rebuild every run-local derived structure from the retained
@@ -7295,10 +7326,12 @@ impl ShardedHotEngine {
         rebuilt.next_acceptance_sequence = self.next_acceptance_sequence;
         rebuilt.current_path_catalog = self.current_path_catalog.clone();
         rebuilt.fatal_evidence = self.fatal_evidence.clone();
-        rebuilt.lazy_catalog_document = std::mem::take(&mut self.lazy_catalog_document);
+        rebuilt.lazy_catalog_hot_state = std::mem::take(&mut self.lazy_catalog_hot_state);
+        rebuilt.deferred_catalog_checkpoint = self.deferred_catalog_checkpoint.take();
         // Telemetry is observational rather than continuation authority; keep
         // cumulative work accounting across the reconstructed journey.
         rebuilt.history_work.set(self.history_work.get());
+        rebuilt.catalog_hot_state_loads.set(self.catalog_hot_state_loads.get());
         rebuilt.resume_observation = self.resume_observation;
         rebuilt.bootstrap_residency = Arc::clone(&self.bootstrap_residency);
         if let Some(catalog_hot_state) = catalog_hot_state {
@@ -7640,6 +7673,7 @@ impl ShardedHotEngine {
             .map(|index| index.stats())
             .unwrap_or_default();
         EngineInstrumentation {
+            catalog_hot_state_loads: self.catalog_hot_state_loads.get(),
             prepare_transactions: work.prepare_transactions,
             prepare_document_head_visits: work.prepare_document_head_visits,
             author_snapshot_clones: work.author_snapshot_clones,

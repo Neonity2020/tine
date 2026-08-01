@@ -2883,6 +2883,14 @@ impl PromotedLocalRuntime {
                 "live authority is not this promoted runtime's session",
             ));
         }
+        // Exact-current adopted startup deliberately leaves the graph-sized
+        // catalog cold while stamped SQLite serves read-only page requests.
+        // A mutation cannot use that projection as authority: authenticate and
+        // install the retained catalog before any admission proof or handoff
+        // transition can authorize engine work.
+        self.engine
+            .authenticate_lazy_catalog_for_mutation()
+            .map_err(RuntimePromotionError::Engine)?;
         // Live graph capability and enrolled engine binding, before any journal
         // state is settled. A foreign graph or engine is refused here.
         authority.authenticate_runtime(graph, &self.engine)?;

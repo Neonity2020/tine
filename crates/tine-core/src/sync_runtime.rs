@@ -115,7 +115,7 @@ use crate::oplog::sqlite::BootstrapSqliteRebuildInstrumentation;
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
     BatchId, BatchOrigin, BlockId, BlockLocation, CanonicalGraphResourceId, ContentDigest,
-    CurrentPageAtPath, DeviceId, DocumentId, EngineError, FrontierReferenceHit, LineageDigest,
+    CurrentPageAtPath, DeviceId, DocumentId, FrontierReferenceHit, LineageDigest,
     LogicalPageName, LogseqUuid, ManagedPath, ManagedTextKind, MaterializedBlock,
     MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
     MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
@@ -6297,7 +6297,7 @@ impl RuntimeActor {
                     .runtime
                     .as_ref()
                     .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                match editor_name_state(runtime, &self.graph, name, page_kind)
+                match projected_editor_name_state(runtime, &self.graph, name, page_kind)
                     .map_err(map_editor_application_error)?
                 {
                     EditorNameState::Missing { name, revision, .. } => {
@@ -6353,19 +6353,19 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let page_id = match runtime
-            .engine()
-            .current_page_at_path(&path)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-        {
-            CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
-            CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {
-                return Ok(ApplicationExactLoad::Missing)
-            }
-            CurrentPageAtPath::PortableCollision(_)
-            | CurrentPageAtPath::ReleasedPortableCollision(_) => {
-                return Ok(ApplicationExactLoad::Ambiguous)
-            }
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        let pages = read
+            .pages_by_path(&path, 2)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        let page_id = match pages.as_slice() {
+            [] => return Ok(ApplicationExactLoad::Missing),
+            [page] => page.page_id,
+            _ => return Ok(ApplicationExactLoad::Ambiguous),
         };
         let current = self.load_application_page_id_ready(page_id)?;
         if current.editor.page.path != path {
@@ -6637,7 +6637,7 @@ impl RuntimeActor {
                 }
             }
             SyncEditorPageSelector::Name { name, page_kind } => {
-                match editor_name_state(runtime, &self.graph, name, page_kind)? {
+                match projected_editor_name_state(runtime, &self.graph, name, page_kind)? {
                     EditorNameState::Exact(page_id) => {
                         let current = load_current_editor_page(runtime, page_id)?
                             .ok_or(SyncEditorRequestError::ActorRefused)?;
@@ -11070,6 +11070,56 @@ fn editor_name_state(
     })
 }
 
+fn projected_editor_name_state(
+    runtime: &PromotedLocalRuntime,
+    graph: &Graph,
+    name: String,
+    page_kind: SyncPageKind,
+) -> Result<EditorNameState, SyncEditorRequestError> {
+    let name = LogicalPageName::parse(name).map_err(|_| {
+        SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
+    })?;
+    let read = runtime
+        .database()
+        .materialized_read()
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    ensure_editor_frontier(runtime, read.acceptance_sequence())?;
+    let owners = read
+        .pages_by_name_key_and_kind(&name.canonical_key(), page_kind.into(), 2)
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    match owners.as_slice() {
+        [owner] => return Ok(EditorNameState::Exact(owner.page_id)),
+        [_, ..] => return Ok(EditorNameState::Ambiguous),
+        [] => {}
+    }
+    let path = graph
+        .new_sparse_page_path(name.as_str(), sync_model_page_kind(page_kind))
+        .map_err(|_| {
+            SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
+        })?;
+    if path.as_str().len() > MAX_LOCAL_MUTATION_PATH_BYTES {
+        return Err(editor_too_large(0, 0, 0, path.as_str().len()));
+    }
+    match runtime
+        .engine()
+        .current_page_at_path(&path)
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?
+    {
+        CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {}
+        CurrentPageAtPath::ExactOwner(_)
+        | CurrentPageAtPath::PortableCollision(_)
+        | CurrentPageAtPath::ReleasedPortableCollision(_) => {
+            return Ok(EditorNameState::PathOccupied)
+        }
+    }
+    let revision = new_editor_revision(&name, &path, page_kind);
+    Ok(EditorNameState::Missing {
+        name,
+        path,
+        revision,
+    })
+}
+
 fn load_current_editor_page(
     runtime: &PromotedLocalRuntime,
     page_id: PageId,
@@ -11079,11 +11129,6 @@ fn load_current_editor_page(
         .materialized_read()
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
     ensure_editor_frontier(runtime, read.acceptance_sequence())?;
-    let authoritative = match runtime.engine().materialize_page(page_id) {
-        Ok(page) => Some(page),
-        Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => None,
-        Err(_) => return Err(SyncEditorRequestError::ActorRefused),
-    };
     let page = read
         .page(page_id)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
@@ -11093,22 +11138,14 @@ fn load_current_editor_page(
     if projected_blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
         return Err(editor_too_large(projected_blocks.len(), 0, 0, 0));
     }
-    let Some(authoritative) = authoritative else {
-        return if page.is_none() && projected_blocks.is_empty() {
+    let Some(projected_page) = page else {
+        return if projected_blocks.is_empty() {
             Ok(None)
         } else {
             Err(SyncEditorRequestError::ActorRefused)
         };
     };
-    if authoritative.blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
-        return Err(editor_too_large(authoritative.blocks.len(), 0, 0, 0));
-    }
-    let Some(projected_page) = page else {
-        return Err(SyncEditorRequestError::ActorRefused);
-    };
-    if !editor_projection_matches(&authoritative, &projected_page, &projected_blocks) {
-        return Err(SyncEditorRequestError::ActorRefused);
-    }
+    let authoritative = materialized_page_from_projection(projected_page, projected_blocks)?;
     let ordered = ordered_editor_blocks(&authoritative.blocks)?;
     let mut dto = SyncEditablePageDto {
         page_id: authoritative.page_id.to_string(),
@@ -11128,33 +11165,38 @@ fn load_current_editor_page(
     }))
 }
 
-fn editor_projection_matches(
-    authoritative: &MaterializedPage,
-    page: &MaterializedPageRow,
-    blocks: &[MaterializedBlockRow],
-) -> bool {
-    page.page_id == authoritative.page_id
-        && page.home_document_id == authoritative.home_document_id
-        && page.name == authoritative.name.as_str()
-        && page.name_key == authoritative.name.canonical_key()
-        && page.path == authoritative.path
-        && page.kind == authoritative.kind
-        && page.preamble == authoritative.preamble
-        && blocks.len() == authoritative.blocks.len()
-        && authoritative
-            .blocks
-            .iter()
-            .zip(blocks)
-            .all(|(authoritative, block)| {
-                block.block_id == authoritative.block_id
-                    && block.page_id == page.page_id
-                    && block.home_document_id == authoritative.home_document_id
-                    && block.parent == authoritative.parent
-                    && block.order == authoritative.order
-                    && block.content == authoritative.content
-                    && block.logseq_uuid == authoritative.logseq_uuid
-                    && block.logseq_identity_origin == authoritative.logseq_identity_origin
+fn materialized_page_from_projection(
+    page: MaterializedPageRow,
+    blocks: Vec<MaterializedBlockRow>,
+) -> Result<MaterializedPage, SyncEditorRequestError> {
+    let name = LogicalPageName::parse(page.name.clone())
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    if name.canonical_key() != page.name_key
+        || blocks.iter().any(|block| block.page_id != page.page_id)
+    {
+        return Err(SyncEditorRequestError::ActorRefused);
+    }
+    Ok(MaterializedPage {
+        page_id: page.page_id,
+        home_document_id: page.home_document_id,
+        name,
+        path: page.path,
+        kind: page.kind,
+        preamble: page.preamble,
+        blocks: blocks
+            .into_iter()
+            .map(|block| MaterializedBlock {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+                parent: block.parent,
+                order: block.order,
+                logseq_uuid: block.logseq_uuid,
+                logseq_identity_origin: block.logseq_identity_origin,
+                content: block.content,
             })
+            .collect(),
+        stats: crate::oplog::MaterializationStats::default(),
+    })
 }
 
 fn ensure_editor_frontier(
@@ -11165,7 +11207,13 @@ fn ensure_editor_frontier(
         .engine()
         .accepted_frontier_root()
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    if frontier.acceptance_sequence() != sqlite_acceptance_sequence {
+    let sqlite_frontier = runtime
+        .database()
+        .frontier_root()
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    if frontier.acceptance_sequence() != sqlite_acceptance_sequence
+        || !frontier.same_accepted_authority(&sqlite_frontier)
+    {
         return Err(SyncEditorRequestError::ActorRefused);
     }
     Ok(())
@@ -13846,112 +13894,6 @@ mod tests {
     }
 
     #[test]
-    fn editor_projection_match_covers_every_existing_mutation_base() {
-        let page_id = PageId::from_uuid(Uuid::new_v4());
-        let home_document_id = DocumentId::from_uuid(Uuid::new_v4());
-        let first = BlockId::from_uuid(Uuid::new_v4());
-        let second = BlockId::from_uuid(Uuid::new_v4());
-        let authoritative = MaterializedPage {
-            page_id,
-            home_document_id,
-            name: LogicalPageName::parse("Authority bases").unwrap(),
-            path: ManagedPath::parse("pages/authority-bases.md").unwrap(),
-            kind: ManagedTextKind::Page,
-            preamble: Some("title:: Authority bases".into()),
-            blocks: vec![
-                MaterializedBlock {
-                    block_id: first,
-                    home_document_id,
-                    parent: None,
-                    order: "a".into(),
-                    logseq_uuid: None,
-                    logseq_identity_origin: None,
-                    content: "first".into(),
-                },
-                MaterializedBlock {
-                    block_id: second,
-                    home_document_id,
-                    parent: Some(first),
-                    order: "b".into(),
-                    logseq_uuid: None,
-                    logseq_identity_origin: None,
-                    content: "second".into(),
-                },
-            ],
-            stats: crate::oplog::MaterializationStats {
-                catalog_documents_loaded: 1,
-                membership_documents_loaded: 1,
-                home_documents_loaded: 1,
-                distinct_home_documents: vec![home_document_id],
-                physical_manifest_reads: 0,
-                physical_object_reads: 0,
-            },
-        };
-        let page = MaterializedPageRow {
-            page_id,
-            home_document_id,
-            name: authoritative.name.as_str().into(),
-            name_key: authoritative.name.canonical_key(),
-            path: authoritative.path.clone(),
-            kind: authoritative.kind,
-            preamble: authoritative.preamble.clone(),
-            searchable_text: "Authority bases".into(),
-        };
-        let blocks = authoritative
-            .blocks
-            .iter()
-            .map(|block| MaterializedBlockRow {
-                block_id: block.block_id,
-                page_id,
-                home_document_id: block.home_document_id,
-                parent: block.parent,
-                order: block.order.clone(),
-                content: block.content.clone(),
-                searchable_text: block.content.clone(),
-                heading_level: None,
-                collapsed: false,
-                logseq_uuid: block.logseq_uuid,
-                logseq_identity_origin: block.logseq_identity_origin,
-            })
-            .collect::<Vec<_>>();
-        assert!(editor_projection_matches(&authoritative, &page, &blocks));
-
-        let mut corrupted_page = page.clone();
-        corrupted_page.preamble = Some("counterfeit preamble".into());
-        assert!(!editor_projection_matches(
-            &authoritative,
-            &corrupted_page,
-            &blocks
-        ));
-        let mut corrupted_blocks = blocks.clone();
-        corrupted_blocks[0].content = "counterfeit content".into();
-        assert!(!editor_projection_matches(
-            &authoritative,
-            &page,
-            &corrupted_blocks
-        ));
-        let mut corrupted_blocks = blocks.clone();
-        corrupted_blocks[1].parent = None;
-        assert!(!editor_projection_matches(
-            &authoritative,
-            &page,
-            &corrupted_blocks
-        ));
-        let mut corrupted_blocks = blocks.clone();
-        corrupted_blocks[1].order = "counterfeit order".into();
-        assert!(!editor_projection_matches(
-            &authoritative,
-            &page,
-            &corrupted_blocks
-        ));
-        assert!(!editor_projection_matches(
-            &authoritative,
-            &page,
-            &blocks[..1]
-        ));
-    }
-
-    #[test]
     fn public_name_lookup_matches_og_names_across_nested_supported_extensions() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-name-query");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
@@ -16046,6 +15988,9 @@ mod tests {
             status.watcher
         );
         assert_eq!(fixture.manifest_count(), manifests_before_reopen);
+        let before_reads = reopened.engine_instrumentation().unwrap();
+        assert!(before_reads.resume.adopted);
+        assert_eq!(before_reads.catalog_hot_state_loads, 0);
         let fast_page = load_application_exact(&reopened, path);
         let (page, _) = &fast_page;
         assert_eq!(page.path, path);
@@ -16059,6 +16004,16 @@ mod tests {
             serde_json::to_value(&fast_page.0).unwrap()
         );
         assert_eq!(logical_fast_page.1, fast_page.1);
+        let editor = load_editor_named(&reopened, "clean restart", SyncPageKind::Page);
+        assert_eq!(load_editor_id(&reopened, parse_editor_page_id(&editor.page_id).unwrap()), editor);
+        assert_eq!(
+            reopened
+                .engine_instrumentation()
+                .unwrap()
+                .catalog_hot_state_loads,
+            0,
+            "exact-path, logical-name, and page-ID reads must stay on the exact-frontier SQLite projection"
+        );
         assert!(
             reopened
                 .status()
@@ -16078,6 +16033,127 @@ mod tests {
         assert!(
             !reopened.status().unwrap().watcher.pending,
             "the first actor drain must settle the exact owed catch-up before Safe"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn clean_reopen_refuses_disk_divergence_without_hiding_it_behind_sqlite() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-clean-reopen-disk-divergence");
+        let request = fixture.request();
+        let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&first);
+        let path = "content/nested pages/divergence.md";
+        let accepted = b"title:: divergence\n\n- accepted before restart\n";
+        admit_external_page(&first, &fixture, path, accepted);
+        assert!(matches!(
+            first.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        assert_eq!(
+            reopened.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::AdoptedSafeHandoff)
+        );
+        fs::write(
+            fixture.graph_root().join(path),
+            b"title:: divergence\n\n- external edit after actor open\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath { path: path.into() },
+            }),
+            Err(SyncApplicationPageRequestError::ActorRefused)
+        ));
+        assert_eq!(
+            reopened
+                .engine_instrumentation()
+                .unwrap()
+                .catalog_hot_state_loads,
+            0,
+            "disk divergence must be detected by the parser/projected-semantic join, not hidden by loading engine state"
+        );
+        fs::write(fixture.graph_root().join(path), accepted).unwrap();
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn projected_restart_revision_remains_a_faithful_save_conflict_base() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-projected-revision-save");
+        let request = fixture.request();
+        let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&first);
+        let path = "content/nested pages/projected revision.md";
+        admit_external_page(&first, &fixture, path, b"- accepted revision base\n");
+        assert!(matches!(
+            first.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        let projected = load_editor_named(
+            &reopened,
+            "projected revision",
+            SyncPageKind::Page,
+        );
+        assert_eq!(
+            reopened
+                .engine_instrumentation()
+                .unwrap()
+                .catalog_hot_state_loads,
+            0
+        );
+        let mut changed = projected.blocks.clone();
+        changed[0].content = "saved from projected identities".into();
+        let saved = reopened
+            .save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::Existing {
+                    page_id: projected.page_id.clone(),
+                    revision: projected.revision.clone(),
+                },
+                preamble: projected.preamble.clone(),
+                blocks: changed,
+            })
+            .unwrap();
+        if matches!(saved, SyncEditorSaveOutcome::Deferred { .. }) {
+            settle_local_mutation(&reopened);
+        } else {
+            assert!(matches!(saved, SyncEditorSaveOutcome::Durable { .. }));
+        }
+        assert!(
+            reopened
+                .engine_instrumentation()
+                .unwrap()
+                .catalog_hot_state_loads
+                > 0,
+            "the first write must authenticate the lazy engine catalog"
+        );
+        assert!(matches!(
+            reopened
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: projected.page_id,
+                        revision: projected.revision,
+                    },
+                    preamble: projected.preamble,
+                    blocks: projected.blocks,
+                })
+                .unwrap(),
+            SyncEditorSaveOutcome::Conflict {
+                reason: SyncEditorConflict::StaleBase
+            }
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path)).unwrap(),
+            b"- saved from projected identities\n"
         );
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
@@ -24335,6 +24411,14 @@ mod tests {
             .engine_instrumentation()
             .expect("managed reopen exposes engine instrumentation")
             .resume;
+        assert_eq!(
+            handle
+                .engine_instrumentation()
+                .expect("managed reopen exposes catalog instrumentation")
+                .catalog_hot_state_loads,
+            0,
+            "exact-current adopted open must leave the engine catalog cold"
+        );
         assert!(
             open.total <= backend_open,
             "internal managed-open receipt cannot outlive its caller: {open:?}, caller={backend_open:?}"
@@ -24368,6 +24452,14 @@ mod tests {
         };
         let first_named_page = started.elapsed();
         let named_page = startup_page_semantics(&page);
+        assert_eq!(
+            handle
+                .engine_instrumentation()
+                .expect("managed named-page load exposes catalog instrumentation")
+                .catalog_hot_state_loads,
+            0,
+            "stamped SQLite plus the parsed file must answer the first named-page load without an engine catalog materialization"
+        );
 
         let started = Instant::now();
         let pages = match handle
