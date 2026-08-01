@@ -5582,6 +5582,7 @@ dependencies = [
  "cap-std",
  "libc",
  "postcard",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

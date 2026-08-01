@@ -11,8 +11,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use rusqlite::{params, types::ValueRef, Connection, OptionalExtension as _, Transaction};
+#[cfg(test)]
+use rusqlite::params;
+use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
+use tine_storage::sqlite_materialization as storage;
 use uuid::Uuid;
 
 use super::{
@@ -22,7 +25,7 @@ use super::{
     REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
 };
 
-pub const MAX_MATERIALIZATION_QUERY_ROWS: usize = 10_000;
+pub const MAX_MATERIALIZATION_QUERY_ROWS: usize = storage::MAX_MATERIALIZATION_QUERY_ROWS;
 /// Largest accepted materialization string other than a page preamble.
 ///
 /// This retains the established semantic block-content capacity while keeping
@@ -35,8 +38,8 @@ pub const MAX_MATERIALIZATION_CHANGE_PAGES: usize = 65_536;
 pub const MAX_MATERIALIZATION_CHANGE_BLOCKS: usize = 262_144;
 pub const MAX_MATERIALIZATION_CHANGE_FACET_VALUES: usize = 1_048_576;
 pub const MAX_MATERIALIZATION_CHANGE_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_MATERIALIZATION_QUERY_BYTES: usize = 64 * 1024;
-pub const MAX_MATERIALIZATION_READ_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_MATERIALIZATION_QUERY_BYTES: usize = storage::MAX_MATERIALIZATION_QUERY_BYTES;
+pub const MAX_MATERIALIZATION_READ_BYTES: usize = storage::MAX_MATERIALIZATION_READ_BYTES;
 
 const MATERIALIZATION_PAGE_OVERHEAD_BYTES: usize = 96;
 const MATERIALIZATION_BLOCK_OVERHEAD_BYTES: usize = 128;
@@ -57,638 +60,13 @@ pub(crate) const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION: u32 = 2;
 const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN: &[u8] =
     b"tine/sqlite-reference-extractor-dependency-stamp/v2";
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ApplyChangeInstrumentation {
-    pub(crate) cleanup_page_attempts: usize,
-    pub(crate) cleanup_existing_pages: usize,
-    pub(crate) cleanup_owned_rows: usize,
-    pub(crate) cleanup_fts_rowids: usize,
-    pub(crate) reference_coverage_count: Option<u64>,
-    pub(crate) reference_coverage_inductive_checks: usize,
-    pub(crate) reference_coverage_full_scans: usize,
-}
-
-#[derive(Clone, Copy)]
-enum CoverageValidation {
-    FullScan,
-    FreshInductive { prior_count: u64 },
-}
-
-pub(crate) const MATERIALIZATION_STAMP_DDL: &str = "CREATE TABLE materialization_stamp (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence >= 0),
-    frontier_root_digest BLOB NOT NULL CHECK (length(frontier_root_digest) = 32),
-    catalog_root BLOB CHECK (
-        catalog_root IS NULL OR length(catalog_root) BETWEEN 1 AND 4096
-    ),
-    catalog_root_digest BLOB CHECK (
-        catalog_root_digest IS NULL OR length(catalog_root_digest) = 32
-    ),
-    coverage_digest BLOB CHECK (
-        coverage_digest IS NULL OR length(coverage_digest) = 32
-    ),
-    extractor_dependency_stamp_digest BLOB CHECK (
-        extractor_dependency_stamp_digest IS NULL
-        OR length(extractor_dependency_stamp_digest) = 32
-    ),
-    CHECK (
-        (catalog_root IS NULL AND catalog_root_digest IS NULL
-         AND coverage_digest IS NULL AND extractor_dependency_stamp_digest IS NULL)
-        OR
-        (catalog_root IS NOT NULL AND catalog_root_digest IS NOT NULL
-         AND coverage_digest IS NOT NULL AND extractor_dependency_stamp_digest IS NOT NULL)
-    )
-) WITHOUT ROWID, STRICT";
-pub(crate) const MATERIALIZATION_BATCHES_DDL: &str = "CREATE TABLE materialization_batches (
-    acceptance_sequence INTEGER PRIMARY KEY CHECK (acceptance_sequence > 0),
-    batch_id BLOB NOT NULL UNIQUE CHECK (length(batch_id) = 16),
-    input_digest BLOB NOT NULL CHECK (length(input_digest) = 32),
-    event_binding_digest BLOB CHECK (
-        event_binding_digest IS NULL OR length(event_binding_digest) = 32
-    ),
-    prior_frontier_root_digest BLOB CHECK (
-        prior_frontier_root_digest IS NULL OR length(prior_frontier_root_digest) = 32
-    ),
-    post_frontier_root_digest BLOB CHECK (
-        post_frontier_root_digest IS NULL OR length(post_frontier_root_digest) = 32
-    ),
-    prior_catalog_root BLOB CHECK (
-        prior_catalog_root IS NULL OR length(prior_catalog_root) BETWEEN 1 AND 4096
-    ),
-    prior_catalog_root_digest BLOB CHECK (
-        prior_catalog_root_digest IS NULL OR length(prior_catalog_root_digest) = 32
-    ),
-    post_catalog_root BLOB CHECK (
-        post_catalog_root IS NULL OR length(post_catalog_root) BETWEEN 1 AND 4096
-    ),
-    post_catalog_root_digest BLOB CHECK (
-        post_catalog_root_digest IS NULL OR length(post_catalog_root_digest) = 32
-    ),
-    catalog_change BLOB CHECK (
-        catalog_change IS NULL OR length(catalog_change) BETWEEN 1 AND 67108864
-    ),
-    catalog_change_digest BLOB CHECK (
-        catalog_change_digest IS NULL OR length(catalog_change_digest) = 32
-    ),
-    canonical_input_digest BLOB CHECK (
-        canonical_input_digest IS NULL OR length(canonical_input_digest) = 32
-    ),
-    CHECK (
-        (event_binding_digest IS NULL AND prior_frontier_root_digest IS NULL
-         AND post_frontier_root_digest IS NULL AND prior_catalog_root IS NULL
-         AND prior_catalog_root_digest IS NULL AND post_catalog_root IS NULL
-         AND post_catalog_root_digest IS NULL AND catalog_change IS NULL
-         AND catalog_change_digest IS NULL AND canonical_input_digest IS NULL)
-        OR
-        (event_binding_digest IS NOT NULL AND prior_frontier_root_digest IS NOT NULL
-         AND post_frontier_root_digest IS NOT NULL AND prior_catalog_root IS NOT NULL
-         AND prior_catalog_root_digest IS NOT NULL AND post_catalog_root IS NOT NULL
-         AND post_catalog_root_digest IS NOT NULL AND catalog_change IS NOT NULL
-         AND catalog_change_digest IS NOT NULL AND canonical_input_digest IS NOT NULL)
-    )
-) WITHOUT ROWID, STRICT";
-// Generic page materialization leaves this authority group NULL.  The packet-3
-// adapter fills it atomically only from an accepted catalog transition; it
-// must never synthesize zero or sentinel authority.
-pub(crate) const REFERENCE_SOURCE_COVERAGE_DDL: &str = "CREATE TABLE reference_source_coverage (
-    source_page_id BLOB PRIMARY KEY CHECK (length(source_page_id) = 16),
-    source_digest BLOB NOT NULL CHECK (length(source_digest) = 32),
-    extractor_dependency_stamp_digest BLOB NOT NULL CHECK (
-        length(extractor_dependency_stamp_digest) = 32
-    )
-) WITHOUT ROWID, STRICT";
-pub(crate) const REFERENCE_POSTINGS_DDL: &str = "CREATE TABLE reference_postings (
-    source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
-    source_entity_type INTEGER NOT NULL CHECK (source_entity_type IN (0, 1)),
-    source_entity_id BLOB NOT NULL CHECK (length(source_entity_id) = 16),
-    source_locator BLOB NOT NULL CHECK (length(source_locator) BETWEEN 1 AND 4194304),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    reference_kind INTEGER NOT NULL CHECK (reference_kind BETWEEN 0 AND 7),
-    target_type INTEGER NOT NULL CHECK (target_type IN (0, 1)),
-    raw_name TEXT CHECK (
-        raw_name IS NULL OR length(CAST(raw_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    normalized_name TEXT CHECK (
-        normalized_name IS NULL OR length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    raw_uuid_claim BLOB CHECK (
-        raw_uuid_claim IS NULL OR length(raw_uuid_claim) = 16
-    ),
-    resolved_page_id BLOB CHECK (
-        resolved_page_id IS NULL OR length(resolved_page_id) = 16
-    ),
-    resolved_block_id BLOB CHECK (
-        resolved_block_id IS NULL OR length(resolved_block_id) = 16
-    ),
-    CHECK (
-        (reference_kind BETWEEN 0 AND 5 AND target_type = 0)
-        OR
-        (reference_kind IN (6, 7) AND target_type = 1)
-    ),
-    CHECK (
-        (target_type = 0 AND raw_name IS NOT NULL AND normalized_name IS NOT NULL
-         AND raw_uuid_claim IS NULL AND resolved_block_id IS NULL)
-        OR
-        (target_type = 1 AND raw_name IS NULL AND normalized_name IS NULL
-         AND raw_uuid_claim IS NOT NULL AND resolved_page_id IS NULL)
-    ),
-    PRIMARY KEY (
-        source_page_id, source_entity_type, source_entity_id, source_locator, ordinal
-    )
-) WITHOUT ROWID, STRICT";
-pub(crate) const REFERENCE_NAME_BINDINGS_DDL: &str = "CREATE TABLE reference_name_bindings (
-    raw_name TEXT NOT NULL CHECK (length(CAST(raw_name AS BLOB)) BETWEEN 1 AND 4194304),
-    normalized_name TEXT NOT NULL CHECK (
-        length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    candidate_ordinal INTEGER NOT NULL CHECK (candidate_ordinal >= 0),
-    resolved_page_id BLOB CHECK (
-        resolved_page_id IS NULL OR length(resolved_page_id) = 16
-    ),
-    PRIMARY KEY (raw_name, candidate_ordinal)
-) WITHOUT ROWID, STRICT";
-pub(crate) const REFERENCE_UUID_BINDINGS_DDL: &str = "CREATE TABLE reference_uuid_bindings (
-    raw_uuid_claim BLOB NOT NULL CHECK (length(raw_uuid_claim) = 16),
-    candidate_ordinal INTEGER NOT NULL CHECK (candidate_ordinal >= 0),
-    resolved_block_id BLOB CHECK (
-        resolved_block_id IS NULL OR length(resolved_block_id) = 16
-    ),
-    PRIMARY KEY (raw_uuid_claim, candidate_ordinal)
-) WITHOUT ROWID, STRICT";
-pub(crate) const REFERENCE_ALIAS_DECLARATIONS_DDL: &str =
-    "CREATE TABLE reference_alias_declarations (
-    source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
-    source_entity_type INTEGER NOT NULL CHECK (source_entity_type IN (0, 1)),
-    source_entity_id BLOB NOT NULL CHECK (length(source_entity_id) = 16),
-    source_locator BLOB NOT NULL CHECK (length(source_locator) BETWEEN 1 AND 4194304),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    raw_alias TEXT NOT NULL CHECK (length(CAST(raw_alias AS BLOB)) BETWEEN 1 AND 4194304),
-    normalized_alias TEXT NOT NULL CHECK (
-        length(CAST(normalized_alias AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    PRIMARY KEY (
-        source_page_id, source_entity_type, source_entity_id, source_locator, ordinal
-    )
-) WITHOUT ROWID, STRICT";
-pub(crate) const REFERENCE_ALIAS_BINDINGS_DDL: &str = "CREATE TABLE reference_alias_bindings (
-    normalized_alias TEXT NOT NULL CHECK (
-        length(CAST(normalized_alias AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    candidate_ordinal INTEGER NOT NULL CHECK (candidate_ordinal >= 0),
-    resolved_page_id BLOB CHECK (
-        resolved_page_id IS NULL OR length(resolved_page_id) = 16
-    ),
-    catalog_root_digest BLOB NOT NULL CHECK (length(catalog_root_digest) = 32),
-    PRIMARY KEY (normalized_alias, candidate_ordinal, catalog_root_digest)
-) WITHOUT ROWID, STRICT";
-pub(crate) const PAGES_DDL: &str = "CREATE TABLE pages (
-    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
-    home_document_id BLOB NOT NULL CHECK (length(home_document_id) = 16),
-    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 4194304),
-    name_key TEXT NOT NULL CHECK (length(CAST(name_key AS BLOB)) BETWEEN 1 AND 4194304),
-    path TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4194304),
-    text_kind INTEGER NOT NULL CHECK (text_kind IN (0, 1)),
-    preamble TEXT CHECK (preamble IS NULL OR length(CAST(preamble AS BLOB)) <= 16777216),
-    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304)
-) STRICT";
-pub(crate) const BLOCKS_DDL: &str = "CREATE TABLE blocks (
-    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16)
-        REFERENCES pages(page_id) ON DELETE CASCADE,
-    home_document_id BLOB NOT NULL CHECK (length(home_document_id) = 16),
-    parent_block_id BLOB CHECK (
-        parent_block_id IS NULL OR length(parent_block_id) = 16
-    ),
-    order_key TEXT NOT NULL CHECK (length(CAST(order_key AS BLOB)) BETWEEN 1 AND 4194304),
-    content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) <= 4194304),
-    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
-    heading_level INTEGER CHECK (
-        heading_level IS NULL OR heading_level BETWEEN 1 AND 6
-    ),
-    collapsed INTEGER NOT NULL CHECK (collapsed IN (0, 1)),
-    logseq_uuid BLOB CHECK (logseq_uuid IS NULL OR length(logseq_uuid) = 16),
-    logseq_identity_origin INTEGER CHECK (
-        logseq_identity_origin IS NULL
-        OR logseq_identity_origin BETWEEN 0 AND 4
-    ),
-    CHECK (
-        (logseq_uuid IS NULL AND logseq_identity_origin IS NULL)
-        OR (logseq_uuid IS NOT NULL AND logseq_identity_origin IS NOT NULL)
-    )
-) STRICT";
-// Retained temporarily for active v2 reads/writes. The authenticated catalog
-// migration-cleanup slice removes this legacy target-ID representation only
-// after every call site has moved to the v10 raw-evidence tables below.
-pub(crate) const REFERENCES_DDL: &str = "CREATE TABLE refs (
-    source_type INTEGER NOT NULL CHECK (source_type IN (0, 1)),
-    source_id BLOB NOT NULL CHECK (length(source_id) = 16),
-    source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
-    target_type INTEGER NOT NULL CHECK (target_type IN (0, 1)),
-    target_id BLOB NOT NULL CHECK (length(target_id) = 16),
-    reference_kind INTEGER NOT NULL CHECK (reference_kind BETWEEN 0 AND 3),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    PRIMARY KEY (source_type, source_id, target_type, target_id, reference_kind, ordinal)
-) WITHOUT ROWID, STRICT";
-pub(crate) const PROPERTIES_DDL: &str = "CREATE TABLE properties (
-    owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
-    owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 4194304),
-    value TEXT NOT NULL CHECK (length(CAST(value AS BLOB)) <= 4194304),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    PRIMARY KEY (owner_type, owner_id, name, ordinal)
-) WITHOUT ROWID, STRICT";
-pub(crate) const TAGS_DDL: &str = "CREATE TABLE tags (
-    owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
-    owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    tag TEXT NOT NULL CHECK (length(CAST(tag AS BLOB)) BETWEEN 1 AND 4194304),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    PRIMARY KEY (owner_type, owner_id, ordinal)
-) WITHOUT ROWID, STRICT";
-pub(crate) const TASKS_DDL: &str = "CREATE TABLE tasks (
-    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    marker TEXT NOT NULL CHECK (length(CAST(marker AS BLOB)) BETWEEN 1 AND 4194304),
-    priority TEXT CHECK (priority IS NULL OR length(CAST(priority AS BLOB)) <= 4194304),
-    scheduled TEXT CHECK (scheduled IS NULL OR length(CAST(scheduled AS BLOB)) <= 4194304),
-    deadline TEXT CHECK (deadline IS NULL OR length(CAST(deadline AS BLOB)) <= 4194304)
-) STRICT";
-pub(crate) const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_fts USING fts5(
-    entity_type UNINDEXED,
-    entity_id UNINDEXED,
-    page_id UNINDEXED,
-    text,
-    tokenize = 'unicode61 remove_diacritics 0'
-)";
-pub(crate) const SEARCH_FTS_OWNERS_DDL: &str = "CREATE TABLE search_fts_owners (
-    rowid INTEGER PRIMARY KEY,
-    entity_type INTEGER NOT NULL CHECK (entity_type IN (0, 1)),
-    entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    UNIQUE (entity_type, entity_id)
-) STRICT";
-
-pub(crate) const PAGES_NAME_INDEX_DDL: &str = "CREATE INDEX pages_name_idx ON pages(name, page_id)";
-pub(crate) const PAGES_NAME_KEY_INDEX_DDL: &str =
-    "CREATE INDEX pages_name_key_idx ON pages(name_key, page_id)";
-pub(crate) const PAGES_PATH_INDEX_DDL: &str = "CREATE INDEX pages_path_idx ON pages(path, page_id)";
-pub(crate) const BLOCKS_PAGE_ORDER_INDEX_DDL: &str =
-    "CREATE INDEX blocks_page_order_idx ON blocks(page_id, order_key, block_id)";
-pub(crate) const SEARCH_FTS_OWNERS_PAGE_INDEX_DDL: &str =
-    "CREATE INDEX search_fts_owners_page_idx ON search_fts_owners(page_id, rowid)";
-pub(crate) const REFERENCES_TARGET_INDEX_DDL: &str = "CREATE INDEX references_target_idx
-    ON refs(target_type, target_id, source_page_id, source_type, source_id)";
-pub(crate) const REFERENCES_SOURCE_INDEX_DDL: &str = "CREATE INDEX references_source_idx
-    ON refs(source_page_id, source_type, source_id)";
-pub(crate) const REFERENCE_SOURCE_COVERAGE_SOURCE_INDEX_DDL: &str =
-    "CREATE INDEX reference_source_coverage_source_idx ON reference_source_coverage(source_page_id)";
-pub(crate) const REFERENCE_POSTINGS_SOURCE_INDEX_DDL: &str =
-    "CREATE INDEX reference_postings_source_idx
-    ON reference_postings(source_page_id, source_entity_type, source_entity_id, ordinal)";
-pub(crate) const REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL: &str =
-    "CREATE INDEX reference_postings_normalized_name_idx
-    ON reference_postings(normalized_name, source_page_id, source_entity_type, source_entity_id, ordinal)
-    WHERE target_type = 0";
-pub(crate) const REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL: &str = "CREATE INDEX reference_postings_raw_uuid_idx
-    ON reference_postings(raw_uuid_claim, source_page_id, source_entity_type, source_entity_id, ordinal)
-    WHERE target_type = 1";
-pub(crate) const REFERENCE_NAME_BINDINGS_RAW_NAME_INDEX_DDL: &str =
-    "CREATE INDEX reference_name_bindings_raw_name_idx
-    ON reference_name_bindings(raw_name, candidate_ordinal)";
-pub(crate) const REFERENCE_NAME_BINDINGS_RESOLVED_PAGE_INDEX_DDL: &str =
-    "CREATE INDEX reference_name_bindings_resolved_page_idx
-    ON reference_name_bindings(resolved_page_id, raw_name, candidate_ordinal)";
-pub(crate) const REFERENCE_UUID_BINDINGS_RAW_UUID_INDEX_DDL: &str =
-    "CREATE INDEX reference_uuid_bindings_raw_uuid_idx
-    ON reference_uuid_bindings(raw_uuid_claim, candidate_ordinal)";
-pub(crate) const REFERENCE_UUID_BINDINGS_RESOLVED_BLOCK_INDEX_DDL: &str =
-    "CREATE INDEX reference_uuid_bindings_resolved_block_idx
-    ON reference_uuid_bindings(resolved_block_id, raw_uuid_claim, candidate_ordinal)";
-pub(crate) const REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL: &str =
-    "CREATE INDEX reference_alias_declarations_source_idx
-    ON reference_alias_declarations(source_page_id, source_entity_type, source_entity_id, ordinal)";
-pub(crate) const REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL: &str =
-    "CREATE INDEX reference_alias_bindings_normalized_alias_idx
-    ON reference_alias_bindings(normalized_alias, catalog_root_digest, candidate_ordinal)";
-pub(crate) const PROPERTIES_LOOKUP_INDEX_DDL: &str = "CREATE INDEX properties_lookup_idx
-    ON properties(name, value, page_id, owner_type, owner_id)";
-pub(crate) const PROPERTIES_PAGE_INDEX_DDL: &str = "CREATE INDEX properties_page_idx
-    ON properties(page_id, owner_type, owner_id, name, ordinal)";
-pub(crate) const TAGS_LOOKUP_INDEX_DDL: &str =
-    "CREATE INDEX tags_lookup_idx ON tags(tag, page_id, owner_type, owner_id)";
-pub(crate) const TAGS_PAGE_INDEX_DDL: &str =
-    "CREATE INDEX tags_page_idx ON tags(page_id, owner_type, owner_id, ordinal)";
-pub(crate) const TASKS_MARKER_INDEX_DDL: &str =
-    "CREATE INDEX tasks_marker_idx ON tasks(marker, page_id, block_id)";
-pub(crate) const TASKS_DEADLINE_INDEX_DDL: &str =
-    "CREATE INDEX tasks_deadline_idx ON tasks(deadline, scheduled, page_id, block_id)";
-pub(crate) const TASKS_PAGE_INDEX_DDL: &str =
-    "CREATE INDEX tasks_page_idx ON tasks(page_id, block_id)";
-
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 15] = [
-    (
-        "materialization_stamp",
-        &[
-            "singleton",
-            "acceptance_sequence",
-            "frontier_root_digest",
-            "catalog_root",
-            "catalog_root_digest",
-            "coverage_digest",
-            "extractor_dependency_stamp_digest",
-        ],
-    ),
-    (
-        "materialization_batches",
-        &[
-            "acceptance_sequence",
-            "batch_id",
-            "input_digest",
-            "event_binding_digest",
-            "prior_frontier_root_digest",
-            "post_frontier_root_digest",
-            "prior_catalog_root",
-            "prior_catalog_root_digest",
-            "post_catalog_root",
-            "post_catalog_root_digest",
-            "catalog_change",
-            "catalog_change_digest",
-            "canonical_input_digest",
-        ],
-    ),
-    (
-        "reference_source_coverage",
-        &[
-            "source_page_id",
-            "source_digest",
-            "extractor_dependency_stamp_digest",
-        ],
-    ),
-    (
-        "reference_postings",
-        &[
-            "source_page_id",
-            "source_entity_type",
-            "source_entity_id",
-            "source_locator",
-            "ordinal",
-            "reference_kind",
-            "target_type",
-            "raw_name",
-            "normalized_name",
-            "raw_uuid_claim",
-            "resolved_page_id",
-            "resolved_block_id",
-        ],
-    ),
-    (
-        "reference_name_bindings",
-        &[
-            "raw_name",
-            "normalized_name",
-            "candidate_ordinal",
-            "resolved_page_id",
-        ],
-    ),
-    (
-        "reference_uuid_bindings",
-        &["raw_uuid_claim", "candidate_ordinal", "resolved_block_id"],
-    ),
-    (
-        "reference_alias_declarations",
-        &[
-            "source_page_id",
-            "source_entity_type",
-            "source_entity_id",
-            "source_locator",
-            "ordinal",
-            "raw_alias",
-            "normalized_alias",
-        ],
-    ),
-    (
-        "reference_alias_bindings",
-        &[
-            "normalized_alias",
-            "candidate_ordinal",
-            "resolved_page_id",
-            "catalog_root_digest",
-        ],
-    ),
-    (
-        "pages",
-        &[
-            "page_id",
-            "home_document_id",
-            "name",
-            "name_key",
-            "path",
-            "text_kind",
-            "preamble",
-            "searchable_text",
-        ],
-    ),
-    (
-        "blocks",
-        &[
-            "block_id",
-            "page_id",
-            "home_document_id",
-            "parent_block_id",
-            "order_key",
-            "content",
-            "searchable_text",
-            "heading_level",
-            "collapsed",
-            "logseq_uuid",
-            "logseq_identity_origin",
-        ],
-    ),
-    (
-        "refs",
-        &[
-            "source_type",
-            "source_id",
-            "source_page_id",
-            "target_type",
-            "target_id",
-            "reference_kind",
-            "ordinal",
-        ],
-    ),
-    (
-        "properties",
-        &[
-            "owner_type",
-            "owner_id",
-            "page_id",
-            "name",
-            "value",
-            "ordinal",
-        ],
-    ),
-    (
-        "tags",
-        &["owner_type", "owner_id", "page_id", "tag", "ordinal"],
-    ),
-    (
-        "tasks",
-        &[
-            "block_id",
-            "page_id",
-            "marker",
-            "priority",
-            "scheduled",
-            "deadline",
-        ],
-    ),
-    (
-        "search_fts_owners",
-        &["rowid", "entity_type", "entity_id", "page_id"],
-    ),
-];
-
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 39] = [
-    ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
-    (
-        "table",
-        "materialization_batches",
-        MATERIALIZATION_BATCHES_DDL,
-    ),
-    (
-        "table",
-        "reference_source_coverage",
-        REFERENCE_SOURCE_COVERAGE_DDL,
-    ),
-    ("table", "reference_postings", REFERENCE_POSTINGS_DDL),
-    (
-        "table",
-        "reference_name_bindings",
-        REFERENCE_NAME_BINDINGS_DDL,
-    ),
-    (
-        "table",
-        "reference_uuid_bindings",
-        REFERENCE_UUID_BINDINGS_DDL,
-    ),
-    (
-        "table",
-        "reference_alias_declarations",
-        REFERENCE_ALIAS_DECLARATIONS_DDL,
-    ),
-    (
-        "table",
-        "reference_alias_bindings",
-        REFERENCE_ALIAS_BINDINGS_DDL,
-    ),
-    ("table", "pages", PAGES_DDL),
-    ("table", "blocks", BLOCKS_DDL),
-    ("table", "refs", REFERENCES_DDL),
-    ("table", "properties", PROPERTIES_DDL),
-    ("table", "tags", TAGS_DDL),
-    ("table", "tasks", TASKS_DDL),
-    ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
-    ("table", "search_fts", SEARCH_FTS_DDL),
-    ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
-    ("index", "pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
-    ("index", "pages_path_idx", PAGES_PATH_INDEX_DDL),
-    (
-        "index",
-        "blocks_page_order_idx",
-        BLOCKS_PAGE_ORDER_INDEX_DDL,
-    ),
-    (
-        "index",
-        "search_fts_owners_page_idx",
-        SEARCH_FTS_OWNERS_PAGE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "references_target_idx",
-        REFERENCES_TARGET_INDEX_DDL,
-    ),
-    (
-        "index",
-        "references_source_idx",
-        REFERENCES_SOURCE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_source_coverage_source_idx",
-        REFERENCE_SOURCE_COVERAGE_SOURCE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_postings_source_idx",
-        REFERENCE_POSTINGS_SOURCE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_postings_normalized_name_idx",
-        REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_postings_raw_uuid_idx",
-        REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_name_bindings_raw_name_idx",
-        REFERENCE_NAME_BINDINGS_RAW_NAME_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_name_bindings_resolved_page_idx",
-        REFERENCE_NAME_BINDINGS_RESOLVED_PAGE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_uuid_bindings_raw_uuid_idx",
-        REFERENCE_UUID_BINDINGS_RAW_UUID_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_uuid_bindings_resolved_block_idx",
-        REFERENCE_UUID_BINDINGS_RESOLVED_BLOCK_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_alias_declarations_source_idx",
-        REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_alias_bindings_normalized_alias_idx",
-        REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL,
-    ),
-    (
-        "index",
-        "properties_lookup_idx",
-        PROPERTIES_LOOKUP_INDEX_DDL,
-    ),
-    ("index", "properties_page_idx", PROPERTIES_PAGE_INDEX_DDL),
-    ("index", "tags_lookup_idx", TAGS_LOOKUP_INDEX_DDL),
-    ("index", "tags_page_idx", TAGS_PAGE_INDEX_DDL),
-    ("index", "tasks_marker_idx", TASKS_MARKER_INDEX_DDL),
-    ("index", "tasks_page_idx", TASKS_PAGE_INDEX_DDL),
-];
+pub(crate) type ApplyChangeInstrumentation = storage::ApplyChangeInstrumentation;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaterializedEntityId {
     Page(PageId),
     Block(BlockId),
-}
-
-impl MaterializedEntityId {
-    fn sql_parts(self) -> (i64, [u8; 16]) {
-        match self {
-            Self::Page(id) => (0, id.as_uuid().into_bytes()),
-            Self::Block(id) => (1, id.as_uuid().into_bytes()),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1003,10 +381,6 @@ impl ReferenceCatalogMaterializationInput {
         };
         input.validate()?;
         Ok(input)
-    }
-
-    pub(crate) fn prior_catalog_root(&self) -> &ReferenceCatalogRootV2 {
-        &self.prior_catalog_root
     }
 
     fn validate(&self) -> Result<(), MaterializationError> {
@@ -1632,64 +1006,6 @@ impl MaterializationChange {
         }
         Ok(())
     }
-
-    /// Preserves page identity metadata when the accepted effect did not
-    /// authoritatively replace it. The existing row is only a previously
-    /// validated value to preserve; it does not become semantic authority.
-    fn validate_preserved_page_metadata(
-        &self,
-        transaction: &Transaction<'_>,
-        effect: &SemanticEffect,
-    ) -> Result<(), MaterializationError> {
-        let pages_with_live_delta = effect
-            .pages()
-            .iter()
-            .filter(|delta| matches!(delta.after.as_ref(), Some(PageState::Live { .. })))
-            .map(|delta| delta.page_id)
-            .collect::<BTreeSet<_>>();
-
-        for page in &self.replacements {
-            if pages_with_live_delta.contains(&page.page_id) {
-                continue;
-            }
-            let metadata_matches: Option<bool> = transaction
-                .query_row(
-                    "SELECT home_document_id = ?2
-                              AND name = ?3
-                              AND name_key = ?4
-                              AND path = ?5
-                              AND text_kind = ?6
-                       FROM pages
-                       WHERE page_id = ?1",
-                    params![
-                        page.page_id.as_uuid().as_bytes().as_slice(),
-                        page.home_document_id.as_uuid().as_bytes().as_slice(),
-                        &page.name,
-                        &page.name_key,
-                        page.path.as_str(),
-                        text_kind_to_sql(page.kind),
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match metadata_matches {
-                Some(true) => {}
-                Some(false) => {
-                    return Err(MaterializationError::Contradiction(format!(
-                        "page {} replacement changes metadata without an accepted live page delta",
-                        page.page_id
-                    )));
-                }
-                None => {
-                    return Err(MaterializationError::Incomplete(format!(
-                        "page {} replacement lacks prior validated metadata",
-                        page.page_id
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Default)]
@@ -2162,196 +1478,15 @@ pub(crate) fn initialize_schema(
     connection: &Connection,
     empty_frontier_digest: ContentDigest,
 ) -> Result<(), MaterializationError> {
-    connection.execute_batch(&format!(
-        "{MATERIALIZATION_STAMP_DDL};
-         {MATERIALIZATION_BATCHES_DDL};
-         {REFERENCE_SOURCE_COVERAGE_DDL};
-         {REFERENCE_POSTINGS_DDL};
-         {REFERENCE_NAME_BINDINGS_DDL};
-         {REFERENCE_UUID_BINDINGS_DDL};
-         {REFERENCE_ALIAS_DECLARATIONS_DDL};
-         {REFERENCE_ALIAS_BINDINGS_DDL};
-         {PAGES_DDL};
-         {BLOCKS_DDL};
-         {REFERENCES_DDL};
-         {PROPERTIES_DDL};
-         {TAGS_DDL};
-         {TASKS_DDL};
-         {SEARCH_FTS_OWNERS_DDL};
-         {SEARCH_FTS_DDL};
-         {PAGES_NAME_INDEX_DDL};
-         {PAGES_NAME_KEY_INDEX_DDL};
-         {PAGES_PATH_INDEX_DDL};
-         {BLOCKS_PAGE_ORDER_INDEX_DDL};
-         {SEARCH_FTS_OWNERS_PAGE_INDEX_DDL};
-         {REFERENCES_TARGET_INDEX_DDL};
-         {REFERENCES_SOURCE_INDEX_DDL};
-         {REFERENCE_SOURCE_COVERAGE_SOURCE_INDEX_DDL};
-         {REFERENCE_POSTINGS_SOURCE_INDEX_DDL};
-         {REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL};
-         {REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL};
-         {REFERENCE_NAME_BINDINGS_RAW_NAME_INDEX_DDL};
-         {REFERENCE_NAME_BINDINGS_RESOLVED_PAGE_INDEX_DDL};
-         {REFERENCE_UUID_BINDINGS_RAW_UUID_INDEX_DDL};
-         {REFERENCE_UUID_BINDINGS_RESOLVED_BLOCK_INDEX_DDL};
-         {REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL};
-         {REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL};
-         {PROPERTIES_LOOKUP_INDEX_DDL};
-         {PROPERTIES_PAGE_INDEX_DDL};
-         {TAGS_LOOKUP_INDEX_DDL};
-         {TAGS_PAGE_INDEX_DDL};
-         {TASKS_MARKER_INDEX_DDL};
-         {TASKS_DEADLINE_INDEX_DDL};
-         {TASKS_PAGE_INDEX_DDL};"
-    ))?;
-    connection.execute(
-        "INSERT INTO materialization_stamp (
-             singleton, acceptance_sequence, frontier_root_digest
-         ) VALUES (1, 0, ?1)",
-        params![empty_frontier_digest.as_bytes().as_slice()],
-    )?;
-    Ok(())
+    storage::initialize_schema(connection, empty_frontier_digest).map_err(Into::into)
 }
 
 pub(crate) fn validate_schema(connection: &Connection) -> Result<(), MaterializationError> {
-    for (table, expected) in MATERIALIZATION_TABLE_COLUMNS {
-        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-        let columns: Vec<String> = statement
-            .query_map([], |row| row.get(1))?
-            .collect::<Result<_, _>>()?;
-        if columns != expected {
-            return Err(MaterializationError::Schema(format!(
-                "{table} columns {columns:?} != {expected:?}"
-            )));
-        }
-    }
-    for (object_type, name, expected) in MATERIALIZATION_SCHEMA_OBJECTS {
-        validate_schema_sql(connection, object_type, name, expected)?;
-    }
-    validate_schema_sql(
-        connection,
-        "index",
-        "tasks_deadline_idx",
-        TASKS_DEADLINE_INDEX_DDL,
-    )?;
-    let stamp_rows: i64 =
-        connection.query_row("SELECT COUNT(*) FROM materialization_stamp", [], |row| {
-            row.get(0)
-        })?;
-    if stamp_rows != 1 {
-        return Err(MaterializationError::Corrupt(
-            "materialization stamp cardinality is invalid".into(),
-        ));
-    }
-    Ok(())
+    storage::validate_schema(connection).map_err(Into::into)
 }
 
-/// Canonical digest of every materialized row, including the FTS search
-/// surface. This is a harness observation only: normal reads stay on their
-/// bounded page/query APIs.
-///
-/// Rows are sorted by their canonical byte encodings rather than SQLite's
-/// comparison rules. That distinction is load-bearing for values that compare
-/// equal but have different exact representations, notably `0.0` and `-0.0`.
 pub(crate) fn row_digest(connection: &Connection) -> Result<ContentDigest, MaterializationError> {
-    let mut bytes = b"tine/sqlite-materialization/rows/v2\0".to_vec();
-    for (table, columns) in MATERIALIZATION_TABLE_COLUMNS
-        .into_iter()
-        .chain(std::iter::once((
-            "search_fts",
-            &["entity_type", "entity_id", "page_id", "text"] as &[&str],
-        )))
-    {
-        encode_len(&mut bytes, table.len());
-        bytes.extend_from_slice(table.as_bytes());
-        encode_len(&mut bytes, columns.len());
-        for column in columns {
-            encode_len(&mut bytes, column.len());
-            bytes.extend_from_slice(column.as_bytes());
-        }
-        let sql = format!("SELECT {} FROM {table}", columns.join(", "));
-        let mut statement = connection.prepare(&sql)?;
-        let mut rows = statement.query([])?;
-        let mut canonical_rows = Vec::new();
-        while let Some(row) = rows.next()? {
-            let mut canonical_row = Vec::new();
-            encode_len(&mut canonical_row, columns.len());
-            for index in 0..columns.len() {
-                let mut value = Vec::new();
-                encode_sqlite_value(&mut value, row.get_ref(index)?)?;
-                encode_len(&mut canonical_row, value.len());
-                canonical_row.extend_from_slice(&value);
-            }
-            canonical_rows.push(canonical_row);
-        }
-        canonical_rows.sort_unstable();
-        encode_len(&mut bytes, canonical_rows.len());
-        for row in canonical_rows {
-            encode_len(&mut bytes, row.len());
-            bytes.extend_from_slice(&row);
-        }
-    }
-    Ok(ContentDigest::of(&bytes))
-}
-
-fn encode_len(bytes: &mut Vec<u8>, len: usize) {
-    bytes.extend_from_slice(&(len as u64).to_be_bytes());
-}
-
-fn encode_sqlite_value(
-    bytes: &mut Vec<u8>,
-    value: ValueRef<'_>,
-) -> Result<(), MaterializationError> {
-    match value {
-        ValueRef::Null => bytes.push(0),
-        ValueRef::Integer(value) => {
-            bytes.push(1);
-            bytes.extend_from_slice(&value.to_be_bytes());
-        }
-        ValueRef::Real(value) => {
-            bytes.push(2);
-            bytes.extend_from_slice(&value.to_bits().to_be_bytes());
-        }
-        ValueRef::Text(value) => {
-            std::str::from_utf8(value).map_err(|error| {
-                MaterializationError::Corrupt(format!(
-                    "materialized TEXT contains invalid UTF-8: {error}"
-                ))
-            })?;
-            bytes.push(3);
-            encode_len(bytes, value.len());
-            bytes.extend_from_slice(value);
-        }
-        ValueRef::Blob(value) => {
-            bytes.push(4);
-            encode_len(bytes, value.len());
-            bytes.extend_from_slice(value);
-        }
-    }
-    Ok(())
-}
-
-fn validate_schema_sql(
-    connection: &Connection,
-    object_type: &str,
-    name: &str,
-    expected: &str,
-) -> Result<(), MaterializationError> {
-    let found: String = connection.query_row(
-        "SELECT sql FROM sqlite_schema WHERE type = ?1 AND name = ?2",
-        params![object_type, name],
-        |row| row.get(0),
-    )?;
-    if canonical_sql(&found) != canonical_sql(expected) {
-        return Err(MaterializationError::Schema(format!(
-            "{object_type} {name} does not match canonical DDL"
-        )));
-    }
-    Ok(())
-}
-
-fn canonical_sql(sql: &str) -> String {
-    sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+    storage::row_digest(connection).map_err(Into::into)
 }
 
 pub(crate) fn ensure_stamp(
@@ -2359,343 +1494,27 @@ pub(crate) fn ensure_stamp(
     sequence: u64,
     frontier_digest: ContentDigest,
 ) -> Result<(), MaterializationError> {
-    let (found_sequence, found_digest): (i64, Vec<u8>) = connection.query_row(
-        "SELECT acceptance_sequence, frontier_root_digest
-         FROM materialization_stamp WHERE singleton = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if u64::try_from(found_sequence).ok() != Some(sequence)
-        || found_digest.as_slice() != frontier_digest.as_bytes()
-    {
-        return Err(MaterializationError::Stale {
-            materialized: u64::try_from(found_sequence).unwrap_or(0),
-            frontier: sequence,
-        });
-    }
-    Ok(())
+    storage::ensure_stamp(connection, sequence, frontier_digest).map_err(Into::into)
 }
 
 pub(crate) fn recorded_digest(
     connection: &Connection,
     sequence: u64,
 ) -> Result<Option<ContentDigest>, MaterializationError> {
-    let bytes: Option<Vec<u8>> = connection
-        .query_row(
-            "SELECT input_digest FROM materialization_batches
-             WHERE acceptance_sequence = ?1",
-            params![i64::try_from(sequence).map_err(|_| {
-                MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into())
-            })?],
-            |row| row.get(0),
-        )
-        .optional()?;
-    bytes.map(decode_digest).transpose()
+    storage::recorded_digest(connection, sequence).map_err(Into::into)
 }
 
-/// One full disposable-candidate proof after all inductive per-part updates
-/// and before publication. Ordinary incremental application continues to use
-/// the per-transaction full coverage check.
 pub(crate) fn finalize_fresh_bootstrap(
     connection: &Connection,
     expected_catalog_root: &ReferenceCatalogRootV2,
     inductive_coverage_count: u64,
 ) -> Result<(), MaterializationError> {
-    let coverage_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM reference_source_coverage",
-        [],
-        |row| row.get(0),
-    )?;
-    let coverage_count = u64::try_from(coverage_count).map_err(|_| {
-        MaterializationError::Corrupt("reference source coverage count is negative".into())
-    })?;
-    if coverage_count != inductive_coverage_count
-        || coverage_count != expected_catalog_root.source_count()
-    {
-        return Err(MaterializationError::Incomplete(format!(
-            "final SQLite reference source coverage {coverage_count} differs from inductive count {inductive_coverage_count} or authenticated catalog count {}",
-            expected_catalog_root.source_count(),
-        )));
-    }
-
-    let owner_count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM search_fts_owners", [], |row| {
-            row.get(0)
-        })?;
-    let fts_count: i64 =
-        connection.query_row("SELECT COUNT(*) FROM search_fts", [], |row| row.get(0))?;
-    let mismatches: i64 = connection.query_row(
-        "SELECT COUNT(*)
-         FROM search_fts_owners AS owner
-         LEFT JOIN search_fts AS fts ON fts.rowid = owner.rowid
-         WHERE fts.rowid IS NULL
-            OR fts.entity_type != CASE owner.entity_type WHEN 0 THEN 'page' ELSE 'block' END
-            OR fts.entity_id != lower(hex(owner.entity_id))
-            OR fts.page_id != lower(hex(owner.page_id))",
-        [],
-        |row| row.get(0),
-    )?;
-    if owner_count != fts_count || mismatches != 0 {
-        return Err(MaterializationError::Corrupt(
-            "FTS rows differ from their authoritative owner mapping".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn apply_reference_catalog_change(
-    transaction: &Transaction<'_>,
-    input: &ReferenceCatalogMaterializationInput,
-    coverage_validation: CoverageValidation,
-) -> Result<(Vec<u8>, ContentDigest, ContentDigest, ContentDigest, u64), MaterializationError> {
-    input.validate()?;
-    let post_root_bytes = input
-        .post_catalog_root
-        .encode()
-        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    let post_root_digest = input
-        .post_catalog_root
-        .external_digest()
-        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    let extractor_stamp = ReferenceExtractorDependencyStamp::new(
-        input.post_catalog_root.extractor_digest(),
-        input.post_catalog_root.policy_digest(),
-    )?;
-    let extractor_stamp_digest = extractor_stamp.digest()?;
-    let coverage_digest = input.post_catalog_root.source_coverage_root();
-    let sources = input
-        .coverage
-        .iter()
-        .map(|facet| facet.source_page_id)
-        .chain(input.removed_sources.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let mut altered_aliases = BTreeSet::new();
-    let mut prior_alias_candidates = BTreeMap::<String, BTreeSet<PageId>>::new();
-    let mut replaced_coverage_rows = 0_u64;
-    for page_id in &sources {
-        let existed: i64 = transaction.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM reference_source_coverage WHERE source_page_id = ?1
-             )",
-            params![page_id.as_uuid().as_bytes().as_slice()],
-            |row| row.get(0),
-        )?;
-        replaced_coverage_rows = replaced_coverage_rows.saturating_add(u64::from(existed != 0));
-        let mut statement = transaction.prepare(
-            "SELECT normalized_alias FROM reference_alias_declarations
-             WHERE source_page_id = ?1",
-        )?;
-        let aliases = statement
-            .query_map(params![page_id.as_uuid().as_bytes().as_slice()], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        altered_aliases.extend(aliases);
-    }
-    altered_aliases.extend(
-        input
-            .aliases
-            .iter()
-            .map(|alias| alias.normalized_alias.clone()),
-    );
-    for alias in &altered_aliases {
-        let mut statement = transaction.prepare(
-            "SELECT DISTINCT resolved_page_id FROM reference_alias_bindings
-             WHERE normalized_alias = ?1 AND resolved_page_id IS NOT NULL",
-        )?;
-        let candidates = statement
-            .query_map(params![alias], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|row| {
-                row.map_err(MaterializationError::from)
-                    .and_then(|bytes| decode_page_id(&bytes))
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        prior_alias_candidates.insert(alias.clone(), candidates);
-    }
-
-    for page_id in &sources {
-        let page_uuid = page_id.as_uuid();
-        let id = page_uuid.as_bytes();
-        transaction.execute(
-            "DELETE FROM reference_postings WHERE source_page_id = ?1",
-            params![id.as_slice()],
-        )?;
-        transaction.execute(
-            "DELETE FROM reference_alias_declarations WHERE source_page_id = ?1",
-            params![id.as_slice()],
-        )?;
-        transaction.execute(
-            "DELETE FROM reference_source_coverage WHERE source_page_id = ?1",
-            params![id.as_slice()],
-        )?;
-    }
-    for facet in &input.coverage {
-        transaction.execute(
-            "INSERT INTO reference_source_coverage (
-                 source_page_id, source_digest, extractor_dependency_stamp_digest
-             ) VALUES (?1, ?2, ?3)",
-            params![
-                facet.source_page_id.as_uuid().as_bytes().as_slice(),
-                facet.source_digest.as_bytes().as_slice(),
-                facet
-                    .extractor_dependency_stamp
-                    .digest()?
-                    .as_bytes()
-                    .as_slice(),
-            ],
-        )?;
-    }
-    for posting in &input.postings {
-        let (source_entity_type, source_entity_id) = posting.source_entity.sql_parts();
-        let locator = canonical_reference_source_locator_bytes(posting.source_locator)?;
-        let (
-            target_type,
-            raw_name,
-            normalized_name,
-            raw_uuid_claim,
-            resolved_page_id,
-            resolved_block_id,
-        ) = match &posting.target {
-            MaterializedReferenceTarget::PageName {
-                raw_name,
-                normalized_name,
-                resolved_page_id,
-            } => (
-                0_i64,
-                Some(raw_name.as_str()),
-                Some(normalized_name.as_str()),
-                None,
-                resolved_page_id.map(|id| id.as_uuid().as_bytes().to_vec()),
-                None,
-            ),
-            MaterializedReferenceTarget::ExternalUuid {
-                raw_claim,
-                resolved_block_id,
-            } => (
-                1_i64,
-                None,
-                None,
-                Some(raw_claim.as_uuid().as_bytes().to_vec()),
-                None,
-                resolved_block_id.map(|id| id.as_uuid().as_bytes().to_vec()),
-            ),
-        };
-        transaction.execute(
-            "INSERT INTO reference_postings (
-                 source_page_id, source_entity_type, source_entity_id, source_locator,
-                 ordinal, reference_kind, target_type, raw_name, normalized_name,
-                 raw_uuid_claim, resolved_page_id, resolved_block_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                posting.source_page_id.as_uuid().as_bytes().as_slice(),
-                source_entity_type,
-                source_entity_id.as_slice(),
-                locator,
-                i64::from(posting.ordinal),
-                posting.kind.sql_value(),
-                target_type,
-                raw_name,
-                normalized_name,
-                raw_uuid_claim,
-                resolved_page_id,
-                resolved_block_id,
-            ],
-        )?;
-    }
-    for alias in &input.aliases {
-        let (source_entity_type, source_entity_id) = alias.source_entity.sql_parts();
-        let locator = canonical_reference_source_locator_bytes(alias.source_locator)?;
-        transaction.execute(
-            "INSERT INTO reference_alias_declarations (
-                 source_page_id, source_entity_type, source_entity_id, source_locator,
-                 ordinal, raw_alias, normalized_alias
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                alias.source_page_id.as_uuid().as_bytes().as_slice(),
-                source_entity_type,
-                source_entity_id.as_slice(),
-                locator,
-                i64::from(alias.ordinal),
-                &alias.raw_alias,
-                &alias.normalized_alias,
-            ],
-        )?;
-    }
-    for alias in altered_aliases {
-        let mut candidates = prior_alias_candidates.remove(&alias).unwrap_or_default();
-        candidates.retain(|page_id| !sources.contains(page_id));
-        candidates.extend(
-            input
-                .aliases
-                .iter()
-                .filter(|declaration| declaration.normalized_alias == alias)
-                .map(|declaration| declaration.source_page_id),
-        );
-        transaction.execute(
-            "DELETE FROM reference_alias_bindings WHERE normalized_alias = ?1",
-            params![&alias],
-        )?;
-        for (ordinal, page_id) in candidates.into_iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO reference_alias_bindings (
-                     normalized_alias, candidate_ordinal, resolved_page_id, catalog_root_digest
-                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    &alias,
-                    i64::try_from(ordinal).map_err(|_| {
-                        MaterializationError::InvalidInput(
-                            "reference alias candidate ordinal overflowed".into(),
-                        )
-                    })?,
-                    page_id.as_uuid().as_bytes().as_slice(),
-                    post_root_digest.as_bytes().as_slice(),
-                ],
-            )?;
-        }
-    }
-    let coverage_count = match coverage_validation {
-        CoverageValidation::FullScan => {
-            let count: i64 = transaction.query_row(
-                "SELECT COUNT(*) FROM reference_source_coverage",
-                [],
-                |row| row.get(0),
-            )?;
-            u64::try_from(count).map_err(|_| {
-                MaterializationError::Corrupt("reference source coverage count is negative".into())
-            })?
-        }
-        CoverageValidation::FreshInductive { prior_count } => {
-            if prior_count != input.prior_catalog_root.source_count() {
-                return Err(MaterializationError::Incomplete(format!(
-                    "inductive SQLite reference source coverage {prior_count} does not match authenticated prior catalog source count {}",
-                    input.prior_catalog_root.source_count(),
-                )));
-            }
-            prior_count
-                .checked_sub(replaced_coverage_rows)
-                .and_then(|count| count.checked_add(input.coverage.len() as u64))
-                .ok_or_else(|| {
-                    MaterializationError::Corrupt(
-                        "inductive reference source coverage count overflowed".into(),
-                    )
-                })?
-        }
-    };
-    if coverage_count != input.post_catalog_root.source_count() {
-        return Err(MaterializationError::Incomplete(
-            format!(
-                "SQLite reference source coverage {coverage_count} does not match authenticated catalog source count {}",
-                input.post_catalog_root.source_count(),
-            ),
-        ));
-    }
-    Ok((
-        post_root_bytes,
-        post_root_digest,
-        coverage_digest,
-        extractor_stamp_digest,
-        coverage_count,
-    ))
+    storage::finalize_fresh_bootstrap(
+        connection,
+        expected_catalog_root.source_count(),
+        inductive_coverage_count,
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn apply_change(
@@ -2707,16 +1526,17 @@ pub(crate) fn apply_change(
     post_frontier_digest: ContentDigest,
     authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-    apply_change_inner(
+    let (physical, authenticated) =
+        lower_validated_change(change, semantic_effect, authenticated_reference)?;
+    storage::apply_change(
         transaction,
-        change,
-        semantic_effect,
+        &physical,
         sequence,
         input_digest,
         post_frontier_digest,
-        authenticated_reference,
-        CoverageValidation::FullScan,
+        authenticated.as_ref(),
     )
+    .map_err(Into::into)
 }
 
 pub(crate) fn apply_change_fresh_bootstrap(
@@ -2729,31 +1549,31 @@ pub(crate) fn apply_change_fresh_bootstrap(
     authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
     prior_reference_coverage_count: u64,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-    apply_change_inner(
+    let (physical, authenticated) =
+        lower_validated_change(change, semantic_effect, authenticated_reference)?;
+    storage::apply_change_fresh_bootstrap(
         transaction,
-        change,
-        semantic_effect,
+        &physical,
         sequence,
         input_digest,
         post_frontier_digest,
-        authenticated_reference,
-        CoverageValidation::FreshInductive {
-            prior_count: prior_reference_coverage_count,
-        },
+        authenticated.as_ref(),
+        prior_reference_coverage_count,
     )
+    .map_err(Into::into)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_change_inner(
-    transaction: &Transaction<'_>,
+fn lower_validated_change(
     change: &MaterializationChange,
     semantic_effect: &[u8],
-    sequence: u64,
-    input_digest: ContentDigest,
-    post_frontier_digest: ContentDigest,
     authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
-    coverage_validation: CoverageValidation,
-) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+) -> Result<
+    (
+        storage::PhysicalMaterializationChange,
+        Option<storage::PhysicalAuthenticatedReference>,
+    ),
+    MaterializationError,
+> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
         .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
@@ -2766,143 +1586,218 @@ fn apply_change_inner(
         })?;
         reference_catalog.validate_for_authenticated_transition(authenticated, &effect)?;
     }
-    change.validate_preserved_page_metadata(transaction, &effect)?;
-    // A block can move between two replacement pages. Keep its inbound refs
-    // through every cleanup pass, then remove every old owner before inserting
-    // any new owner so page-ID sort order cannot collide on the block primary key.
-    let retained_blocks = change
+
+    let pages_with_live_metadata_delta = effect
+        .pages()
+        .iter()
+        .filter(|delta| matches!(delta.after.as_ref(), Some(PageState::Live { .. })))
+        .map(|delta| delta.page_id.as_uuid().into_bytes())
+        .collect();
+    let replacements = change
         .replacements
         .iter()
-        .flat_map(|page| page.blocks.iter().map(|block| block.block_id))
-        .collect::<BTreeSet<_>>();
-    let mut instrumentation = ApplyChangeInstrumentation::default();
-    for page_id in &change.deletions {
-        let cleanup = delete_page(transaction, *page_id, true, &retained_blocks)?;
-        instrumentation.cleanup_page_attempts += 1;
-        instrumentation.cleanup_existing_pages += cleanup.existing_pages;
-        instrumentation.cleanup_owned_rows += cleanup.owned_rows;
-        instrumentation.cleanup_fts_rowids += cleanup.fts_rowids;
-    }
-    for page in &change.replacements {
-        let cleanup = delete_page(transaction, page.page_id, false, &retained_blocks)?;
-        instrumentation.cleanup_page_attempts += 1;
-        instrumentation.cleanup_existing_pages += cleanup.existing_pages;
-        instrumentation.cleanup_owned_rows += cleanup.owned_rows;
-        instrumentation.cleanup_fts_rowids += cleanup.fts_rowids;
-    }
-    for page in &change.replacements {
-        insert_page(transaction, page)?;
-    }
-    let reference_values = change
-        .reference_catalog()
-        .map(|input| apply_reference_catalog_change(transaction, input, coverage_validation))
+        .map(lower_page)
+        .collect::<Result<Vec<_>, _>>()?;
+    let reference_catalog = change
+        .reference_catalog
+        .as_ref()
+        .map(lower_reference_catalog)
         .transpose()?;
-    let sequence = i64::try_from(sequence)
-        .map_err(|_| MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into()))?;
-    if let Some((
-        catalog_root,
-        catalog_root_digest,
-        coverage_digest,
-        extractor_stamp_digest,
-        coverage_count,
-    )) = reference_values
-    {
-        instrumentation.reference_coverage_count = Some(coverage_count);
-        match coverage_validation {
-            CoverageValidation::FullScan => instrumentation.reference_coverage_full_scans = 1,
-            CoverageValidation::FreshInductive { .. } => {
-                instrumentation.reference_coverage_inductive_checks = 1;
-            }
-        }
-        let authenticated = authenticated_reference
-            .expect("reference values require authenticated transition evidence");
-        let catalog_change = postcard::to_allocvec(change.reference_catalog().expect("present"))
-            .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        let catalog_change_digest = ContentDigest::of(&catalog_change);
-        transaction.execute(
-            "INSERT INTO materialization_batches (
-                 acceptance_sequence, batch_id, input_digest, event_binding_digest,
-                 prior_frontier_root_digest, post_frontier_root_digest,
-                 prior_catalog_root, prior_catalog_root_digest,
-                 post_catalog_root, post_catalog_root_digest,
-                 catalog_change, catalog_change_digest, canonical_input_digest
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                sequence,
-                change.batch_id.as_uuid().as_bytes().as_slice(),
-                input_digest.as_bytes().as_slice(),
-                authenticated.event_binding_digest.as_bytes().as_slice(),
-                authenticated
-                    .prior_frontier_root_digest
-                    .as_bytes()
-                    .as_slice(),
-                authenticated
-                    .post_frontier_root_digest
-                    .as_bytes()
-                    .as_slice(),
-                change
-                    .reference_catalog()
-                    .expect("present")
-                    .prior_catalog_root()
-                    .encode()
-                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?,
-                change
-                    .reference_catalog()
-                    .expect("present")
-                    .prior_catalog_root()
-                    .external_digest()
-                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?
-                    .as_bytes()
-                    .as_slice(),
-                catalog_root,
-                catalog_root_digest.as_bytes().as_slice(),
-                catalog_change,
-                catalog_change_digest.as_bytes().as_slice(),
-                input_digest.as_bytes().as_slice(),
-            ],
-        )?;
-        transaction.execute(
-            "UPDATE materialization_stamp
-             SET acceptance_sequence = ?1,
-                 frontier_root_digest = ?2,
-                 catalog_root = ?3,
-                 catalog_root_digest = ?4,
-                 coverage_digest = ?5,
-                 extractor_dependency_stamp_digest = ?6
-             WHERE singleton = 1",
-            params![
-                sequence,
-                post_frontier_digest.as_bytes().as_slice(),
-                catalog_root,
-                catalog_root_digest.as_bytes().as_slice(),
-                coverage_digest.as_bytes().as_slice(),
-                extractor_stamp_digest.as_bytes().as_slice(),
-            ],
-        )?;
-    } else {
-        transaction.execute(
-            "INSERT INTO materialization_batches (
-                 acceptance_sequence, batch_id, input_digest
-             ) VALUES (?1, ?2, ?3)",
-            params![
-                sequence,
-                change.batch_id.as_uuid().as_bytes().as_slice(),
-                input_digest.as_bytes().as_slice(),
-            ],
-        )?;
-        transaction.execute(
-            "UPDATE materialization_stamp
-             SET acceptance_sequence = ?1,
-                 frontier_root_digest = ?2,
-                 catalog_root = NULL,
-                 catalog_root_digest = NULL,
-                 coverage_digest = NULL,
-                 extractor_dependency_stamp_digest = NULL
-             WHERE singleton = 1",
-            params![sequence, post_frontier_digest.as_bytes().as_slice()],
-        )?;
+    let authenticated =
+        authenticated_reference.map(|value| storage::PhysicalAuthenticatedReference {
+            event_binding_digest: value.event_binding_digest,
+            prior_frontier_root_digest: value.prior_frontier_root_digest,
+            post_frontier_root_digest: value.post_frontier_root_digest,
+        });
+    Ok((
+        storage::PhysicalMaterializationChange {
+            batch_id: change.batch_id.as_uuid().into_bytes(),
+            replacements,
+            deletions: change
+                .deletions
+                .iter()
+                .map(|page_id| page_id.as_uuid().into_bytes())
+                .collect(),
+            pages_with_live_metadata_delta,
+            reference_catalog,
+        },
+        authenticated,
+    ))
+}
+
+fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, MaterializationError> {
+    Ok(storage::PhysicalPage {
+        page_id: page.page_id.as_uuid().into_bytes(),
+        home_document_id: page.home_document_id.as_uuid().into_bytes(),
+        name: page.name.clone(),
+        name_key: page.name_key.clone(),
+        path: page.path.as_str().to_owned(),
+        text_kind: text_kind_to_sql(page.kind),
+        preamble: page.preamble.clone(),
+        searchable_text: page.searchable_text.clone(),
+        references: page.references.iter().map(lower_reference).collect(),
+        properties: page.properties.iter().map(lower_property).collect(),
+        tags: page.tags.clone(),
+        blocks: page
+            .blocks
+            .iter()
+            .map(lower_block)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn lower_block(
+    block: &MaterializedBlockInput,
+) -> Result<storage::PhysicalBlock, MaterializationError> {
+    Ok(storage::PhysicalBlock {
+        block_id: block.block_id.as_uuid().into_bytes(),
+        home_document_id: block.home_document_id.as_uuid().into_bytes(),
+        parent: block.parent.map(|id| id.as_uuid().into_bytes()),
+        order: block.order.clone(),
+        content: block.content.clone(),
+        searchable_text: block.searchable_text.clone(),
+        heading_level: block.heading_level,
+        collapsed: block.collapsed,
+        logseq_uuid: block.logseq_uuid.map(|id| id.as_uuid().into_bytes()),
+        logseq_identity_origin: block.logseq_identity_origin.map(identity_origin_to_sql),
+        references: block.references.iter().map(lower_reference).collect(),
+        properties: block.properties.iter().map(lower_property).collect(),
+        tags: block.tags.clone(),
+        task: block.task.as_ref().map(|task| storage::PhysicalTask {
+            marker: task.marker.clone(),
+            priority: task.priority.clone(),
+            scheduled: task.scheduled.clone(),
+            deadline: task.deadline.clone(),
+        }),
+    })
+}
+
+fn lower_reference(reference: &MaterializedReference) -> storage::PhysicalReference {
+    storage::PhysicalReference {
+        target: lower_entity(reference.target),
+        kind: reference.kind.sql_value(),
     }
-    Ok(instrumentation)
+}
+
+fn lower_property(property: &MaterializedProperty) -> storage::PhysicalProperty {
+    storage::PhysicalProperty {
+        name: property.name.clone(),
+        value: property.value.clone(),
+    }
+}
+
+fn lower_entity(entity: MaterializedEntityId) -> storage::PhysicalEntityId {
+    match entity {
+        MaterializedEntityId::Page(id) => {
+            storage::PhysicalEntityId::Page(id.as_uuid().into_bytes())
+        }
+        MaterializedEntityId::Block(id) => {
+            storage::PhysicalEntityId::Block(id.as_uuid().into_bytes())
+        }
+    }
+}
+
+fn lower_reference_catalog(
+    input: &ReferenceCatalogMaterializationInput,
+) -> Result<storage::PhysicalReferenceCatalogChange, MaterializationError> {
+    let prior_catalog_root = input
+        .prior_catalog_root
+        .encode()
+        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+    let prior_catalog_root_digest = input
+        .prior_catalog_root
+        .external_digest()
+        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+    let post_catalog_root = input
+        .post_catalog_root
+        .encode()
+        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+    let post_catalog_root_digest = input
+        .post_catalog_root
+        .external_digest()
+        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+    let extractor_dependency_stamp_digest = ReferenceExtractorDependencyStamp::new(
+        input.post_catalog_root.extractor_digest(),
+        input.post_catalog_root.policy_digest(),
+    )?
+    .digest()?;
+    let canonical_bytes = postcard::to_allocvec(input)
+        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
+    Ok(storage::PhysicalReferenceCatalogChange {
+        prior_catalog_root,
+        prior_catalog_root_digest,
+        prior_source_count: input.prior_catalog_root.source_count(),
+        post_catalog_root,
+        post_catalog_root_digest,
+        post_source_count: input.post_catalog_root.source_count(),
+        coverage_digest: input.post_catalog_root.source_coverage_root(),
+        extractor_dependency_stamp_digest,
+        postings: input
+            .postings
+            .iter()
+            .map(|posting| {
+                Ok(storage::PhysicalReferencePosting {
+                    source_page_id: posting.source_page_id.as_uuid().into_bytes(),
+                    source_entity: lower_entity(posting.source_entity),
+                    source_locator: canonical_reference_source_locator_bytes(
+                        posting.source_locator,
+                    )?,
+                    ordinal: posting.ordinal,
+                    kind: posting.kind.sql_value(),
+                    target: match &posting.target {
+                        MaterializedReferenceTarget::PageName {
+                            raw_name,
+                            normalized_name,
+                            resolved_page_id,
+                        } => storage::PhysicalReferenceTarget::PageName {
+                            raw_name: raw_name.clone(),
+                            normalized_name: normalized_name.clone(),
+                            resolved_page_id: resolved_page_id.map(|id| id.as_uuid().into_bytes()),
+                        },
+                        MaterializedReferenceTarget::ExternalUuid {
+                            raw_claim,
+                            resolved_block_id,
+                        } => storage::PhysicalReferenceTarget::ExternalUuid {
+                            raw_claim: raw_claim.as_uuid().into_bytes(),
+                            resolved_block_id: resolved_block_id
+                                .map(|id| id.as_uuid().into_bytes()),
+                        },
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, MaterializationError>>()?,
+        aliases: input
+            .aliases
+            .iter()
+            .map(|alias| {
+                Ok(storage::PhysicalAliasDeclaration {
+                    source_page_id: alias.source_page_id.as_uuid().into_bytes(),
+                    source_entity: lower_entity(alias.source_entity),
+                    source_locator: canonical_reference_source_locator_bytes(alias.source_locator)?,
+                    ordinal: alias.ordinal,
+                    raw_alias: alias.raw_alias.clone(),
+                    normalized_alias: alias.normalized_alias.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, MaterializationError>>()?,
+        coverage: input
+            .coverage
+            .iter()
+            .map(|facet| {
+                Ok(storage::PhysicalSourceCoverage {
+                    source_page_id: facet.source_page_id.as_uuid().into_bytes(),
+                    source_digest: facet.source_digest,
+                    extractor_dependency_stamp_digest: facet.extractor_dependency_stamp.digest()?,
+                })
+            })
+            .collect::<Result<Vec<_>, MaterializationError>>()?,
+        removed_sources: input
+            .removed_sources
+            .iter()
+            .map(|id| id.as_uuid().into_bytes())
+            .collect(),
+        canonical_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -2910,388 +1805,7 @@ pub(crate) fn reset(
     transaction: &Transaction<'_>,
     empty_frontier_digest: ContentDigest,
 ) -> Result<(), MaterializationError> {
-    transaction.execute_batch(
-        "DELETE FROM search_fts;
-         DELETE FROM search_fts_owners;
-         DELETE FROM tasks;
-         DELETE FROM tags;
-         DELETE FROM properties;
-         DELETE FROM refs;
-         DELETE FROM reference_alias_bindings;
-         DELETE FROM reference_alias_declarations;
-         DELETE FROM reference_uuid_bindings;
-         DELETE FROM reference_name_bindings;
-         DELETE FROM reference_postings;
-         DELETE FROM reference_source_coverage;
-         DELETE FROM blocks;
-         DELETE FROM pages;
-         DELETE FROM materialization_batches;",
-    )?;
-    transaction.execute(
-        "UPDATE materialization_stamp
-         SET acceptance_sequence = 0,
-             frontier_root_digest = ?1,
-             catalog_root = NULL,
-             catalog_root_digest = NULL,
-             coverage_digest = NULL,
-             extractor_dependency_stamp_digest = NULL
-         WHERE singleton = 1",
-        params![empty_frontier_digest.as_bytes().as_slice()],
-    )?;
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct PageCleanupInstrumentation {
-    existing_pages: usize,
-    owned_rows: usize,
-    fts_rowids: usize,
-}
-
-fn delete_page(
-    transaction: &Transaction<'_>,
-    page_id: PageId,
-    remove_incoming_page_references: bool,
-    retained_blocks: &BTreeSet<BlockId>,
-) -> Result<PageCleanupInstrumentation, MaterializationError> {
-    let page_uuid = page_id.as_uuid();
-    let page = page_uuid.as_bytes();
-    let existing: i64 = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pages WHERE page_id = ?1)",
-        params![page.as_slice()],
-        |row| row.get(0),
-    )?;
-    let mut instrumentation = PageCleanupInstrumentation {
-        existing_pages: usize::from(existing != 0),
-        ..PageCleanupInstrumentation::default()
-    };
-    let old_blocks = {
-        let mut statement =
-            transaction.prepare("SELECT block_id FROM blocks WHERE page_id = ?1")?;
-        let block_ids = statement
-            .query_map(params![page.as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|block_id| {
-                block_id
-                    .map_err(MaterializationError::from)
-                    .and_then(|bytes| decode_block_id(&bytes))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        block_ids
-    };
-    let fts_rowids = {
-        let mut statement = transaction
-            .prepare("SELECT rowid FROM search_fts_owners WHERE page_id = ?1 ORDER BY rowid")?;
-        let rowids = statement
-            .query_map(params![page.as_slice()], |row| row.get::<_, i64>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        rowids
-    };
-    instrumentation.fts_rowids = fts_rowids.len();
-    for rowid in fts_rowids {
-        transaction.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
-    }
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM search_fts_owners WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM refs
-         WHERE source_page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    if remove_incoming_page_references {
-        transaction.execute(
-            "DELETE FROM refs WHERE target_type = 0 AND target_id = ?1",
-            params![page.as_slice()],
-        )?;
-    }
-    for block_id in old_blocks {
-        if !retained_blocks.contains(&block_id) {
-            transaction.execute(
-                "DELETE FROM refs WHERE target_type = 1 AND target_id = ?1",
-                params![block_id.as_uuid().as_bytes().as_slice()],
-            )?;
-        }
-    }
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM properties WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM tags WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM tasks WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM blocks WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM pages WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    Ok(instrumentation)
-}
-
-fn insert_page(
-    transaction: &Transaction<'_>,
-    page: &MaterializedPageInput,
-) -> Result<(), MaterializationError> {
-    let page_uuid = page.page_id.as_uuid();
-    let page_id = page_uuid.as_bytes();
-    transaction.execute(
-        "INSERT INTO pages (
-             page_id, home_document_id, name, name_key, path, text_kind,
-             preamble, searchable_text
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            page_id.as_slice(),
-            page.home_document_id.as_uuid().as_bytes().as_slice(),
-            &page.name,
-            &page.name_key,
-            page.path.as_str(),
-            text_kind_to_sql(page.kind),
-            &page.preamble,
-            &page.searchable_text,
-        ],
-    )?;
-    insert_fts(
-        transaction,
-        "page",
-        page.page_id.as_uuid(),
-        page.page_id,
-        &page.searchable_text,
-    )?;
-    insert_references(
-        transaction,
-        MaterializedEntityId::Page(page.page_id),
-        page.page_id,
-        &page.references,
-    )?;
-    insert_properties(
-        transaction,
-        MaterializedEntityId::Page(page.page_id),
-        page.page_id,
-        &page.properties,
-    )?;
-    insert_tags(
-        transaction,
-        MaterializedEntityId::Page(page.page_id),
-        page.page_id,
-        &page.tags,
-    )?;
-    for block in &page.blocks {
-        insert_block(transaction, page.page_id, block)?;
-    }
-    Ok(())
-}
-
-fn insert_block(
-    transaction: &Transaction<'_>,
-    page_id: PageId,
-    block: &MaterializedBlockInput,
-) -> Result<(), MaterializationError> {
-    let (logseq_uuid, origin) = match (block.logseq_uuid, block.logseq_identity_origin) {
-        (Some(uuid), Some(origin)) => (
-            Some(uuid.as_uuid().as_bytes().to_vec()),
-            Some(identity_origin_to_sql(origin)),
-        ),
-        (None, None) => (None, None),
-        _ => {
-            return Err(MaterializationError::InvalidInput(format!(
-                "block {} has incomplete Logseq identity metadata",
-                block.block_id
-            )));
-        }
-    };
-    transaction.execute(
-        "INSERT INTO blocks (
-             block_id, page_id, home_document_id, parent_block_id, order_key,
-             content, searchable_text, heading_level, collapsed, logseq_uuid,
-             logseq_identity_origin
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            block.block_id.as_uuid().as_bytes().as_slice(),
-            page_id.as_uuid().as_bytes().as_slice(),
-            block.home_document_id.as_uuid().as_bytes().as_slice(),
-            block
-                .parent
-                .map(|parent| parent.as_uuid().as_bytes().to_vec()),
-            &block.order,
-            &block.content,
-            &block.searchable_text,
-            block.heading_level.map(i64::from),
-            i64::from(block.collapsed),
-            logseq_uuid,
-            origin,
-        ],
-    )?;
-    insert_fts(
-        transaction,
-        "block",
-        block.block_id.as_uuid(),
-        page_id,
-        &block.searchable_text,
-    )?;
-    let owner = MaterializedEntityId::Block(block.block_id);
-    insert_references(transaction, owner, page_id, &block.references)?;
-    insert_properties(transaction, owner, page_id, &block.properties)?;
-    insert_tags(transaction, owner, page_id, &block.tags)?;
-    if let Some(task) = &block.task {
-        transaction.execute(
-            "INSERT INTO tasks (
-                 block_id, page_id, marker, priority, scheduled, deadline
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                block.block_id.as_uuid().as_bytes().as_slice(),
-                page_id.as_uuid().as_bytes().as_slice(),
-                &task.marker,
-                &task.priority,
-                &task.scheduled,
-                &task.deadline,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn insert_fts(
-    transaction: &Transaction<'_>,
-    entity_type: &str,
-    entity_id: Uuid,
-    page_id: PageId,
-    text: &str,
-) -> Result<(), MaterializationError> {
-    let entity_type_value = match entity_type {
-        "page" => 0_i64,
-        "block" => 1_i64,
-        _ => {
-            return Err(MaterializationError::InvalidInput(
-                "unknown FTS entity type".into(),
-            ));
-        }
-    };
-    transaction.execute(
-        "INSERT INTO search_fts_owners (entity_type, entity_id, page_id)
-         VALUES (?1, ?2, ?3)",
-        params![
-            entity_type_value,
-            entity_id.as_bytes().as_slice(),
-            page_id.as_uuid().as_bytes().as_slice(),
-        ],
-    )?;
-    let rowid = transaction.last_insert_rowid();
-    transaction.execute(
-        "INSERT INTO search_fts (rowid, entity_type, entity_id, page_id, text)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![
-            rowid,
-            entity_type,
-            entity_id.simple().to_string(),
-            page_id.as_uuid().simple().to_string(),
-            text,
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_references(
-    transaction: &Transaction<'_>,
-    source: MaterializedEntityId,
-    source_page_id: PageId,
-    references: &[MaterializedReference],
-) -> Result<(), MaterializationError> {
-    let (source_type, source_id) = source.sql_parts();
-    for (ordinal, reference) in references.iter().enumerate() {
-        let (target_type, target_id) = reference.target.sql_parts();
-        transaction.execute(
-            "INSERT INTO refs (
-                 source_type, source_id, source_page_id, target_type, target_id,
-                 reference_kind, ordinal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                source_type,
-                source_id.as_slice(),
-                source_page_id.as_uuid().as_bytes().as_slice(),
-                target_type,
-                target_id.as_slice(),
-                reference.kind.sql_value(),
-                i64::try_from(ordinal).map_err(|_| {
-                    MaterializationError::InvalidInput("reference ordinal overflowed".into())
-                })?,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn insert_properties(
-    transaction: &Transaction<'_>,
-    owner: MaterializedEntityId,
-    page_id: PageId,
-    properties: &[MaterializedProperty],
-) -> Result<(), MaterializationError> {
-    let (owner_type, owner_id) = owner.sql_parts();
-    for (ordinal, property) in properties.iter().enumerate() {
-        transaction.execute(
-            "INSERT INTO properties (
-                 owner_type, owner_id, page_id, name, value, ordinal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                owner_type,
-                owner_id.as_slice(),
-                page_id.as_uuid().as_bytes().as_slice(),
-                &property.name,
-                &property.value,
-                i64::try_from(ordinal).map_err(|_| {
-                    MaterializationError::InvalidInput("property ordinal overflowed".into())
-                })?,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn insert_tags(
-    transaction: &Transaction<'_>,
-    owner: MaterializedEntityId,
-    page_id: PageId,
-    tags: &[String],
-) -> Result<(), MaterializationError> {
-    let (owner_type, owner_id) = owner.sql_parts();
-    for (ordinal, tag) in tags.iter().enumerate() {
-        transaction.execute(
-            "INSERT INTO tags (owner_type, owner_id, page_id, tag, ordinal)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                owner_type,
-                owner_id.as_slice(),
-                page_id.as_uuid().as_bytes().as_slice(),
-                tag,
-                i64::try_from(ordinal).map_err(|_| {
-                    MaterializationError::InvalidInput("tag ordinal overflowed".into())
-                })?,
-            ],
-        )?;
-    }
-    Ok(())
+    storage::reset(transaction, empty_frontier_digest).map_err(Into::into)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3361,125 +1875,8 @@ pub struct MaterializedSearchHit {
     pub rank: f64,
 }
 
-#[derive(Default)]
-struct MaterializationReadBudget {
-    bytes: usize,
-}
-
-impl MaterializationReadBudget {
-    fn add(&mut self, bytes: usize) -> Result<(), MaterializationError> {
-        self.bytes = checked_budget_add(
-            "materialization read output bytes",
-            self.bytes,
-            bytes,
-            MAX_MATERIALIZATION_READ_BYTES,
-        )?;
-        Ok(())
-    }
-}
-
-fn checked_output_bytes<'a>(
-    fixed_bytes: usize,
-    fields: impl IntoIterator<Item = Option<&'a str>>,
-) -> Result<usize, MaterializationError> {
-    fields.into_iter().try_fold(fixed_bytes, |total, field| {
-        let Some(field) = field else {
-            return Ok(total);
-        };
-        total
-            .checked_add(field.len())
-            .and_then(|total| total.checked_add(MATERIALIZATION_STRING_OVERHEAD_BYTES))
-            .ok_or_else(|| {
-                resource_limit(
-                    "materialization read output bytes",
-                    usize::MAX,
-                    MAX_MATERIALIZATION_READ_BYTES,
-                )
-            })
-    })
-}
-
-fn page_row_output_bytes(row: &MaterializedPageRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(
-        64,
-        [
-            Some(row.name.as_str()),
-            Some(row.name_key.as_str()),
-            Some(row.path.as_str()),
-            row.preamble.as_deref(),
-            Some(row.searchable_text.as_str()),
-        ],
-    )
-}
-
-fn block_row_output_bytes(row: &MaterializedBlockRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(
-        96,
-        [
-            Some(row.order.as_str()),
-            Some(row.content.as_str()),
-            Some(row.searchable_text.as_str()),
-        ],
-    )
-}
-
-fn referrer_row_output_bytes(_: &MaterializedReferrerRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(64, [])
-}
-
-fn property_row_output_bytes(row: &MaterializedPropertyRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(64, [Some(row.name.as_str()), Some(row.value.as_str())])
-}
-
-fn tag_row_output_bytes(row: &MaterializedTagRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(64, [Some(row.tag.as_str())])
-}
-
-fn task_row_output_bytes(row: &MaterializedTaskRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(
-        64,
-        [
-            Some(row.marker.as_str()),
-            row.priority.as_deref(),
-            row.scheduled.as_deref(),
-            row.deadline.as_deref(),
-        ],
-    )
-}
-
-fn search_hit_output_bytes(row: &MaterializedSearchHit) -> Result<usize, MaterializationError> {
-    checked_output_bytes(72, [Some(row.text.as_str())])
-}
-
-fn collect_read_rows<T>(
-    rows: impl IntoIterator<Item = Result<T, MaterializationError>>,
-    row_bytes: impl Fn(&T) -> Result<usize, MaterializationError>,
-) -> Result<Vec<T>, MaterializationError> {
-    let mut output = Vec::new();
-    let mut budget = MaterializationReadBudget::default();
-    for row in rows {
-        let row = row?;
-        budget.add(row_bytes(&row)?)?;
-        output.push(row);
-    }
-    Ok(output)
-}
-
-fn checked_query_text(value: &str) -> Result<(), MaterializationError> {
-    if value.len() > MAX_MATERIALIZATION_QUERY_BYTES {
-        return Err(resource_limit(
-            "materialization query bytes",
-            value.len(),
-            MAX_MATERIALIZATION_QUERY_BYTES,
-        ));
-    }
-    Ok(())
-}
-
-/// A bounded, read-only view at the exact accepted frontier captured on open.
 pub struct SqliteMaterializedRead<'a> {
-    connection: &'a Connection,
-    acceptance_sequence: u64,
+    inner: storage::SqliteMaterializedRead<'a>,
 }
 
 impl<'a> SqliteMaterializedRead<'a> {
@@ -3488,60 +1885,37 @@ impl<'a> SqliteMaterializedRead<'a> {
         acceptance_sequence: u64,
         frontier_digest: ContentDigest,
     ) -> Result<Self, MaterializationError> {
-        ensure_stamp(connection, acceptance_sequence, frontier_digest)?;
         Ok(Self {
-            connection,
-            acceptance_sequence,
+            inner: storage::SqliteMaterializedRead::new(
+                connection,
+                acceptance_sequence,
+                frontier_digest,
+            )?,
         })
     }
 
     pub const fn acceptance_sequence(&self) -> u64 {
-        self.acceptance_sequence
+        self.inner.acceptance_sequence()
     }
 
     pub fn page(
         &self,
         page_id: PageId,
     ) -> Result<Option<MaterializedPageRow>, MaterializationError> {
-        let page = self
-            .connection
-            .query_row(
-                "SELECT page_id, home_document_id, name, name_key, path,
-                        text_kind, preamble, searchable_text
-                 FROM pages WHERE page_id = ?1",
-                params![page_id.as_uuid().as_bytes().as_slice()],
-                page_row,
-            )
-            .optional()
-            .map_err(MaterializationError::from)?;
-        if let Some(row) = &page {
-            let mut budget = MaterializationReadBudget::default();
-            budget.add(page_row_output_bytes(row)?)?;
-        }
-        Ok(page)
+        self.inner
+            .page(page_id.as_uuid().into_bytes())?
+            .map(page_row_from_storage)
+            .transpose()
     }
 
     pub fn block(
         &self,
         block_id: BlockId,
     ) -> Result<Option<MaterializedBlockRow>, MaterializationError> {
-        let block = self
-            .connection
-            .query_row(
-                "SELECT block_id, page_id, home_document_id, parent_block_id,
-                        order_key, content, searchable_text, heading_level,
-                        collapsed, logseq_uuid, logseq_identity_origin
-                 FROM blocks WHERE block_id = ?1",
-                params![block_id.as_uuid().as_bytes().as_slice()],
-                block_row,
-            )
-            .optional()
-            .map_err(MaterializationError::from)?;
-        if let Some(row) = &block {
-            let mut budget = MaterializationReadBudget::default();
-            budget.add(block_row_output_bytes(row)?)?;
-        }
-        Ok(block)
+        self.inner
+            .block(block_id.as_uuid().into_bytes())?
+            .map(block_row_from_storage)
+            .transpose()
     }
 
     pub fn pages_by_name(
@@ -3549,7 +1923,10 @@ impl<'a> SqliteMaterializedRead<'a> {
         name: &str,
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
-        self.pages_by_text_column("name", name, limit)
+        convert_rows(
+            self.inner.pages_by_name(name, limit)?,
+            page_row_from_storage,
+        )
     }
 
     pub fn pages_by_name_key(
@@ -3557,32 +1934,22 @@ impl<'a> SqliteMaterializedRead<'a> {
         name_key: &str,
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
-        self.pages_by_text_column("name_key", name_key, limit)
+        convert_rows(
+            self.inner.pages_by_name_key(name_key, limit)?,
+            page_row_from_storage,
+        )
     }
 
-    /// Exact OG-compatible logical-name lookup scoped by managed text kind.
-    /// Callers use a limit of two to distinguish one owner from ambiguity
-    /// without scanning or retaining an unbounded duplicate set.
     pub fn pages_by_name_key_and_kind(
         &self,
         name_key: &str,
         kind: ManagedTextKind,
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(name_key)?;
-        let mut statement = self.connection.prepare(
-            "SELECT page_id, home_document_id, name, name_key, path,
-                    text_kind, preamble, searchable_text
-             FROM pages
-             WHERE name_key = ?1 AND text_kind = ?2
-             ORDER BY page_id LIMIT ?3",
-        )?;
-        let rows =
-            statement.query_map(params![name_key, text_kind_to_sql(kind), limit], page_row)?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            page_row_output_bytes,
+        convert_rows(
+            self.inner
+                .pages_by_name_key_and_kind(name_key, text_kind_to_sql(kind), limit)?,
+            page_row_from_storage,
         )
     }
 
@@ -3591,58 +1958,20 @@ impl<'a> SqliteMaterializedRead<'a> {
         path: &ManagedPath,
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
-        self.pages_by_text_column("path", path.as_str(), limit)
+        convert_rows(
+            self.inner.pages_by_path(&path.as_str().to_owned(), limit)?,
+            page_row_from_storage,
+        )
     }
 
-    /// Bounded stable page listing for application-facing exact queries. This
-    /// only reads the stamped materialization captured on construction; it is
-    /// intentionally not a filesystem or graph-tree enumeration.
     pub fn pages(
         &self,
         kind: Option<ManagedTextKind>,
         limit: usize,
     ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match kind {
-            Some(kind) => (
-                "SELECT page_id, home_document_id, name, name_key, path,
-                        text_kind, preamble, searchable_text
-                 FROM pages WHERE text_kind = ?1 ORDER BY path, page_id LIMIT ?2",
-                vec![text_kind_to_sql(kind).into(), limit.into()],
-            ),
-            None => (
-                "SELECT page_id, home_document_id, name, name_key, path,
-                        text_kind, preamble, searchable_text
-                 FROM pages ORDER BY path, page_id LIMIT ?1",
-                vec![limit.into()],
-            ),
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(args), page_row)?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            page_row_output_bytes,
-        )
-    }
-
-    fn pages_by_text_column(
-        &self,
-        column: &str,
-        value: &str,
-        limit: usize,
-    ) -> Result<Vec<MaterializedPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(value)?;
-        let sql = format!(
-            "SELECT page_id, home_document_id, name, name_key, path,
-                    text_kind, preamble, searchable_text
-             FROM pages WHERE {column} = ?1 ORDER BY page_id LIMIT ?2"
-        );
-        let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(params![value, limit], page_row)?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            page_row_output_bytes,
+        convert_rows(
+            self.inner.pages(kind.map(text_kind_to_sql), limit)?,
+            page_row_from_storage,
         )
     }
 
@@ -3651,21 +1980,10 @@ impl<'a> SqliteMaterializedRead<'a> {
         page_id: PageId,
         limit: usize,
     ) -> Result<Vec<MaterializedBlockRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT block_id, page_id, home_document_id, parent_block_id,
-                    order_key, content, searchable_text, heading_level,
-                    collapsed, logseq_uuid, logseq_identity_origin
-             FROM blocks WHERE page_id = ?1
-             ORDER BY order_key, block_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            params![page_id.as_uuid().as_bytes().as_slice(), limit],
-            block_row,
-        )?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            block_row_output_bytes,
+        convert_rows(
+            self.inner
+                .blocks_on_page(page_id.as_uuid().into_bytes(), limit)?,
+            block_row_from_storage,
         )
     }
 
@@ -3674,33 +1992,10 @@ impl<'a> SqliteMaterializedRead<'a> {
         target: MaterializedEntityId,
         limit: usize,
     ) -> Result<Vec<MaterializedReferrerRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let (target_type, target_id) = target.sql_parts();
-        let mut statement = self.connection.prepare(
-            "SELECT source_type, source_id, source_page_id, reference_kind
-             FROM refs
-             WHERE target_type = ?1 AND target_id = ?2
-             ORDER BY source_page_id, source_type, source_id, reference_kind, ordinal
-             LIMIT ?3",
-        )?;
-        let rows =
-            statement.query_map(params![target_type, target_id.as_slice(), limit], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?;
-        let rows = rows.map(|row| {
-            let (source_type, source_id, source_page_id, kind) = row?;
-            Ok(MaterializedReferrerRow {
-                source: decode_entity(source_type, &source_id)?,
-                source_page_id: decode_page_id(&source_page_id)?,
-                kind: MaterializedReferenceKind::from_sql(kind)?,
-            })
-        });
-        collect_read_rows(rows, referrer_row_output_bytes)
+        convert_rows(
+            self.inner.referrers_to(lower_entity(target), limit)?,
+            referrer_row_from_storage,
+        )
     }
 
     pub fn properties(
@@ -3708,18 +2003,10 @@ impl<'a> SqliteMaterializedRead<'a> {
         owner: MaterializedEntityId,
         limit: usize,
     ) -> Result<Vec<MaterializedPropertyRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let (owner_type, owner_id) = owner.sql_parts();
-        let mut statement = self.connection.prepare(
-            "SELECT owner_type, owner_id, page_id, name, value
-             FROM properties WHERE owner_type = ?1 AND owner_id = ?2
-             ORDER BY name, ordinal, value LIMIT ?3",
-        )?;
-        let rows = property_rows(statement.query_map(
-            params![owner_type, owner_id.as_slice(), limit],
-            property_tuple,
-        )?);
-        rows
+        convert_rows(
+            self.inner.properties(lower_entity(owner), limit)?,
+            property_row_from_storage,
+        )
     }
 
     pub fn properties_named(
@@ -3728,33 +2015,10 @@ impl<'a> SqliteMaterializedRead<'a> {
         value: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MaterializedPropertyRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(name)?;
-        if let Some(value) = value {
-            checked_query_text(value)?;
-        }
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match value {
-            Some(value) => (
-                "SELECT owner_type, owner_id, page_id, name, value
-                 FROM properties WHERE name = ?1 AND value = ?2
-                 ORDER BY page_id, owner_type, owner_id, ordinal LIMIT ?3",
-                vec![
-                    rusqlite::types::Value::Text(name.to_owned()),
-                    rusqlite::types::Value::Text(value.to_owned()),
-                    limit.into(),
-                ],
-            ),
-            None => (
-                "SELECT owner_type, owner_id, page_id, name, value
-                 FROM properties WHERE name = ?1
-                 ORDER BY page_id, owner_type, owner_id, ordinal LIMIT ?2",
-                vec![rusqlite::types::Value::Text(name.to_owned()), limit.into()],
-            ),
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows =
-            property_rows(statement.query_map(rusqlite::params_from_iter(args), property_tuple)?);
-        rows
+        convert_rows(
+            self.inner.properties_named(name, value, limit)?,
+            property_row_from_storage,
+        )
     }
 
     pub fn tags(
@@ -3762,30 +2026,7 @@ impl<'a> SqliteMaterializedRead<'a> {
         tag: &str,
         limit: usize,
     ) -> Result<Vec<MaterializedTagRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(tag)?;
-        let mut statement = self.connection.prepare(
-            "SELECT owner_type, owner_id, page_id, tag
-             FROM tags WHERE tag = ?1
-             ORDER BY page_id, owner_type, owner_id, ordinal LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![tag, limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let rows = rows.map(|row| {
-            let (owner_type, owner_id, page_id, tag) = row?;
-            Ok(MaterializedTagRow {
-                owner: decode_entity(owner_type, &owner_id)?,
-                page_id: decode_page_id(&page_id)?,
-                tag,
-            })
-        });
-        collect_read_rows(rows, tag_row_output_bytes)
+        convert_rows(self.inner.tags(tag, limit)?, tag_row_from_storage)
     }
 
     pub fn tasks(
@@ -3793,52 +2034,7 @@ impl<'a> SqliteMaterializedRead<'a> {
         marker: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MaterializedTaskRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        if let Some(marker) = marker {
-            checked_query_text(marker)?;
-        }
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match marker {
-            Some(marker) => (
-                "SELECT block_id, page_id, marker, priority, scheduled, deadline
-                 FROM tasks WHERE marker = ?1
-                 ORDER BY deadline IS NULL, deadline, scheduled IS NULL, scheduled,
-                          page_id, block_id LIMIT ?2",
-                vec![
-                    rusqlite::types::Value::Text(marker.to_owned()),
-                    limit.into(),
-                ],
-            ),
-            None => (
-                "SELECT block_id, page_id, marker, priority, scheduled, deadline
-                 FROM tasks
-                 ORDER BY deadline IS NULL, deadline, scheduled IS NULL, scheduled,
-                          page_id, block_id LIMIT ?1",
-                vec![limit.into()],
-            ),
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?;
-        let rows = rows.map(|row| {
-            let (block_id, page_id, marker, priority, scheduled, deadline) = row?;
-            Ok(MaterializedTaskRow {
-                block_id: decode_block_id(&block_id)?,
-                page_id: decode_page_id(&page_id)?,
-                marker,
-                priority,
-                scheduled,
-                deadline,
-            })
-        });
-        collect_read_rows(rows, task_row_output_bytes)
+        convert_rows(self.inner.tasks(marker, limit)?, task_row_from_storage)
     }
 
     pub fn search(
@@ -3846,140 +2042,129 @@ impl<'a> SqliteMaterializedRead<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<MaterializedSearchHit>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(query)?;
-        if query.trim().is_empty() {
-            return Err(MaterializationError::InvalidQuery(
-                "FTS query must be non-empty".into(),
-            ));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT entity_type, entity_id, page_id, text, bm25(search_fts)
-             FROM search_fts WHERE search_fts MATCH ?1
-             ORDER BY bm25(search_fts), entity_type, entity_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![query, limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, f64>(4)?,
-            ))
-        })?;
-        let rows = rows.map(|row| {
-            let (entity_type, entity_id, page_id, text, rank) = row?;
-            let uuid = Uuid::parse_str(&entity_id)
-                .map_err(|error| MaterializationError::Corrupt(error.to_string()))?;
-            let entity = match entity_type.as_str() {
-                "page" => MaterializedEntityId::Page(PageId::from_uuid(uuid)),
-                "block" => MaterializedEntityId::Block(BlockId::from_uuid(uuid)),
-                _ => {
-                    return Err(MaterializationError::Corrupt(format!(
-                        "unknown FTS entity type {entity_type:?}"
-                    )));
-                }
-            };
-            Ok(MaterializedSearchHit {
-                entity,
-                page_id: PageId::from_uuid(
-                    Uuid::parse_str(&page_id)
-                        .map_err(|error| MaterializationError::Corrupt(error.to_string()))?,
-                ),
-                text,
-                rank,
-            })
-        });
-        collect_read_rows(rows, search_hit_output_bytes)
+        convert_rows(self.inner.search(query, limit)?, search_hit_from_storage)
     }
 }
 
-fn page_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedPageRow> {
-    let page_id: Vec<u8> = row.get(0)?;
-    let home_document_id: Vec<u8> = row.get(1)?;
-    let path: String = row.get(4)?;
-    let kind: i64 = row.get(5)?;
+fn convert_rows<T, U>(
+    rows: Vec<T>,
+    convert: impl Fn(T) -> Result<U, MaterializationError>,
+) -> Result<Vec<U>, MaterializationError> {
+    rows.into_iter().map(convert).collect()
+}
+
+fn page_row_from_storage(
+    row: storage::PhysicalPageRow,
+) -> Result<MaterializedPageRow, MaterializationError> {
     Ok(MaterializedPageRow {
-        page_id: decode_page_id_sql(&page_id)?,
-        home_document_id: decode_document_id_sql(&home_document_id)?,
-        name: row.get(2)?,
-        name_key: row.get(3)?,
-        path: ManagedPath::parse(path).map_err(sql_decode_error)?,
-        kind: text_kind_from_sql(kind).map_err(sql_decode_error)?,
-        preamble: row.get(6)?,
-        searchable_text: row.get(7)?,
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        home_document_id: DocumentId::from_uuid(Uuid::from_bytes(row.home_document_id)),
+        name: row.name,
+        name_key: row.name_key,
+        path: ManagedPath::parse(row.path).map_err(typed_sql_decode_error)?,
+        kind: text_kind_from_sql(row.text_kind).map_err(typed_sql_decode_error)?,
+        preamble: row.preamble,
+        searchable_text: row.searchable_text,
     })
 }
 
-fn block_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedBlockRow> {
-    let block_id: Vec<u8> = row.get(0)?;
-    let page_id: Vec<u8> = row.get(1)?;
-    let home_document_id: Vec<u8> = row.get(2)?;
-    let parent: Option<Vec<u8>> = row.get(3)?;
-    let heading_level: Option<i64> = row.get(7)?;
-    let logseq_uuid: Option<Vec<u8>> = row.get(9)?;
-    let origin: Option<i64> = row.get(10)?;
+fn block_row_from_storage(
+    row: storage::PhysicalBlockRow,
+) -> Result<MaterializedBlockRow, MaterializationError> {
     Ok(MaterializedBlockRow {
-        block_id: decode_block_id_sql(&block_id)?,
-        page_id: decode_page_id_sql(&page_id)?,
-        home_document_id: decode_document_id_sql(&home_document_id)?,
-        parent: parent.as_deref().map(decode_block_id_sql).transpose()?,
-        order: row.get(4)?,
-        content: row.get(5)?,
-        searchable_text: row.get(6)?,
-        heading_level: heading_level
-            .map(|value| u8::try_from(value).map_err(sql_decode_error))
-            .transpose()?,
-        collapsed: row.get::<_, i64>(8)? != 0,
-        logseq_uuid: logseq_uuid
-            .as_deref()
-            .map(decode_logseq_uuid_sql)
-            .transpose()?,
-        logseq_identity_origin: origin
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        home_document_id: DocumentId::from_uuid(Uuid::from_bytes(row.home_document_id)),
+        parent: row
+            .parent
+            .map(|id| BlockId::from_uuid(Uuid::from_bytes(id))),
+        order: row.order,
+        content: row.content,
+        searchable_text: row.searchable_text,
+        heading_level: row.heading_level,
+        collapsed: row.collapsed,
+        logseq_uuid: row
+            .logseq_uuid
+            .map(|id| LogseqUuid::from_uuid(Uuid::from_bytes(id))),
+        logseq_identity_origin: row
+            .logseq_identity_origin
             .map(identity_origin_from_sql)
             .transpose()
-            .map_err(sql_decode_error)?,
+            .map_err(typed_sql_decode_error)?,
     })
 }
 
-fn property_tuple(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(i64, Vec<u8>, Vec<u8>, String, String)> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-    ))
-}
-
-fn property_rows(
-    rows: rusqlite::MappedRows<
-        '_,
-        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(i64, Vec<u8>, Vec<u8>, String, String)>,
-    >,
-) -> Result<Vec<MaterializedPropertyRow>, MaterializationError> {
-    let rows = rows.map(|row| {
-        let (owner_type, owner_id, page_id, name, value) = row?;
-        Ok(MaterializedPropertyRow {
-            owner: decode_entity(owner_type, &owner_id)?,
-            page_id: decode_page_id(&page_id)?,
-            name,
-            value,
-        })
-    });
-    collect_read_rows(rows, property_row_output_bytes)
-}
-
-fn checked_limit(limit: usize) -> Result<i64, MaterializationError> {
-    if limit == 0 || limit > MAX_MATERIALIZATION_QUERY_ROWS {
-        return Err(MaterializationError::InvalidQuery(format!(
-            "query limit {limit} is outside 1..={MAX_MATERIALIZATION_QUERY_ROWS}"
-        )));
+fn entity_from_storage(entity: storage::PhysicalEntityId) -> MaterializedEntityId {
+    match entity {
+        storage::PhysicalEntityId::Page(id) => {
+            MaterializedEntityId::Page(PageId::from_uuid(Uuid::from_bytes(id)))
+        }
+        storage::PhysicalEntityId::Block(id) => {
+            MaterializedEntityId::Block(BlockId::from_uuid(Uuid::from_bytes(id)))
+        }
     }
-    i64::try_from(limit)
-        .map_err(|_| MaterializationError::InvalidQuery("query limit overflowed".into()))
+}
+
+fn referrer_row_from_storage(
+    row: storage::PhysicalReferrerRow,
+) -> Result<MaterializedReferrerRow, MaterializationError> {
+    Ok(MaterializedReferrerRow {
+        source: entity_from_storage(row.source),
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        kind: MaterializedReferenceKind::from_sql(row.kind)?,
+    })
+}
+
+fn property_row_from_storage(
+    row: storage::PhysicalPropertyRow,
+) -> Result<MaterializedPropertyRow, MaterializationError> {
+    Ok(MaterializedPropertyRow {
+        owner: entity_from_storage(row.owner),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        name: row.name,
+        value: row.value,
+    })
+}
+
+fn tag_row_from_storage(
+    row: storage::PhysicalTagRow,
+) -> Result<MaterializedTagRow, MaterializationError> {
+    Ok(MaterializedTagRow {
+        owner: entity_from_storage(row.owner),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        tag: row.tag,
+    })
+}
+
+fn task_row_from_storage(
+    row: storage::PhysicalTaskRow,
+) -> Result<MaterializedTaskRow, MaterializationError> {
+    Ok(MaterializedTaskRow {
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        marker: row.marker,
+        priority: row.priority,
+        scheduled: row.scheduled,
+        deadline: row.deadline,
+    })
+}
+
+fn search_hit_from_storage(
+    row: storage::PhysicalSearchHit,
+) -> Result<MaterializedSearchHit, MaterializationError> {
+    Ok(MaterializedSearchHit {
+        entity: entity_from_storage(row.entity),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        text: row.text,
+        rank: row.rank,
+    })
+}
+
+fn typed_sql_decode_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> MaterializationError {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
+        .into()
 }
 
 fn text_kind_to_sql(kind: ManagedTextKind) -> i64 {
@@ -4036,62 +2221,6 @@ fn identity_origin_from_sql(value: i64) -> Result<LogseqIdentityOrigin, Material
             "unknown Logseq identity origin {value}"
         ))),
     }
-}
-
-fn decode_entity(
-    entity_type: i64,
-    bytes: &[u8],
-) -> Result<MaterializedEntityId, MaterializationError> {
-    match entity_type {
-        0 => Ok(MaterializedEntityId::Page(decode_page_id(bytes)?)),
-        1 => Ok(MaterializedEntityId::Block(decode_block_id(bytes)?)),
-        _ => Err(MaterializationError::Corrupt(format!(
-            "unknown entity type {entity_type}"
-        ))),
-    }
-}
-
-fn decode_page_id(bytes: &[u8]) -> Result<PageId, MaterializationError> {
-    decode_uuid(bytes).map(PageId::from_uuid)
-}
-
-fn decode_block_id(bytes: &[u8]) -> Result<BlockId, MaterializationError> {
-    decode_uuid(bytes).map(BlockId::from_uuid)
-}
-
-fn decode_digest(bytes: Vec<u8>) -> Result<ContentDigest, MaterializationError> {
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| MaterializationError::Corrupt("invalid digest length".into()))?;
-    Ok(ContentDigest::from_bytes(bytes))
-}
-
-fn decode_uuid(bytes: &[u8]) -> Result<Uuid, MaterializationError> {
-    Uuid::from_slice(bytes).map_err(|error| MaterializationError::Corrupt(error.to_string()))
-}
-
-fn decode_page_id_sql(bytes: &[u8]) -> rusqlite::Result<PageId> {
-    decode_uuid_sql(bytes).map(PageId::from_uuid)
-}
-
-fn decode_block_id_sql(bytes: &[u8]) -> rusqlite::Result<BlockId> {
-    decode_uuid_sql(bytes).map(BlockId::from_uuid)
-}
-
-fn decode_document_id_sql(bytes: &[u8]) -> rusqlite::Result<DocumentId> {
-    decode_uuid_sql(bytes).map(DocumentId::from_uuid)
-}
-
-fn decode_logseq_uuid_sql(bytes: &[u8]) -> rusqlite::Result<LogseqUuid> {
-    decode_uuid_sql(bytes).map(LogseqUuid::from_uuid)
-}
-
-fn decode_uuid_sql(bytes: &[u8]) -> rusqlite::Result<Uuid> {
-    Uuid::from_slice(bytes).map_err(sql_decode_error)
-}
-
-fn sql_decode_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4170,6 +2299,36 @@ impl From<rusqlite::Error> for MaterializationError {
     }
 }
 
+impl From<storage::MaterializationError> for MaterializationError {
+    fn from(error: storage::MaterializationError) -> Self {
+        match error {
+            storage::MaterializationError::Sqlite(error) => Self::Sqlite(error),
+            storage::MaterializationError::Schema(error) => Self::Schema(error),
+            storage::MaterializationError::Corrupt(error) => Self::Corrupt(error),
+            storage::MaterializationError::ResourceLimit {
+                resource,
+                found,
+                maximum,
+            } => Self::ResourceLimit {
+                resource,
+                found,
+                maximum,
+            },
+            storage::MaterializationError::InvalidInput(error) => Self::InvalidInput(error),
+            storage::MaterializationError::Incomplete(error) => Self::Incomplete(error),
+            storage::MaterializationError::Contradiction(error) => Self::Contradiction(error),
+            storage::MaterializationError::Stale {
+                materialized,
+                frontier,
+            } => Self::Stale {
+                materialized,
+                frontier,
+            },
+            storage::MaterializationError::InvalidQuery(error) => Self::InvalidQuery(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4206,331 +2365,6 @@ mod tests {
             ContentDigest::of(b"external UUID authority"),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn exact_sqlite_value_encoding_separates_type_and_bit_collisions() {
-        fn encoded(value: ValueRef<'_>) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            encode_sqlite_value(&mut bytes, value).unwrap();
-            bytes
-        }
-
-        for (left, right) in [
-            (ValueRef::Integer(1), ValueRef::Text(b"1")),
-            (ValueRef::Null, ValueRef::Text(b"NULL")),
-            (ValueRef::Text(b"bytes"), ValueRef::Blob(b"bytes")),
-            (ValueRef::Text(b""), ValueRef::Blob(b"")),
-            (ValueRef::Null, ValueRef::Text(b"")),
-            (ValueRef::Real(0.0), ValueRef::Real(-0.0)),
-        ] {
-            assert_ne!(encoded(left), encoded(right));
-        }
-        assert_eq!(
-            &encoded(ValueRef::Integer(-1))[1..],
-            &(-1_i64).to_be_bytes()
-        );
-        assert_eq!(
-            &encoded(ValueRef::Real(-0.0))[1..],
-            &(-0.0_f64).to_bits().to_be_bytes()
-        );
-        assert!(matches!(
-            encode_sqlite_value(&mut Vec::new(), ValueRef::Text(&[0xff])),
-            Err(MaterializationError::Corrupt(message)) if message.contains("invalid UTF-8")
-        ));
-    }
-
-    #[test]
-    fn sqlite_v11_materialization_schema_is_exact_strict_and_checked() {
-        let connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, ContentDigest::of(b"empty frontier")).unwrap();
-        validate_schema(&connection).unwrap();
-
-        for (table, ddl) in [
-            ("materialization_stamp", MATERIALIZATION_STAMP_DDL),
-            ("materialization_batches", MATERIALIZATION_BATCHES_DDL),
-            ("reference_source_coverage", REFERENCE_SOURCE_COVERAGE_DDL),
-            ("reference_postings", REFERENCE_POSTINGS_DDL),
-            ("reference_name_bindings", REFERENCE_NAME_BINDINGS_DDL),
-            ("reference_uuid_bindings", REFERENCE_UUID_BINDINGS_DDL),
-            (
-                "reference_alias_declarations",
-                REFERENCE_ALIAS_DECLARATIONS_DDL,
-            ),
-            ("reference_alias_bindings", REFERENCE_ALIAS_BINDINGS_DDL),
-        ] {
-            let found: String = connection
-                .query_row(
-                    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(canonical_sql(&found), canonical_sql(ddl));
-            assert!(found.contains("WITHOUT ROWID"));
-            assert!(found.contains("STRICT"));
-        }
-        for index in [
-            "search_fts_owners_page_idx",
-            "properties_page_idx",
-            "tags_page_idx",
-            "tasks_page_idx",
-            "reference_source_coverage_source_idx",
-            "reference_postings_source_idx",
-            "reference_postings_normalized_name_idx",
-            "reference_postings_raw_uuid_idx",
-            "reference_name_bindings_raw_name_idx",
-            "reference_name_bindings_resolved_page_idx",
-            "reference_uuid_bindings_raw_uuid_idx",
-            "reference_uuid_bindings_resolved_block_idx",
-            "reference_alias_declarations_source_idx",
-            "reference_alias_bindings_normalized_alias_idx",
-        ] {
-            let exists: bool = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'index' AND name = ?1)",
-                    [index],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(exists, "missing required index {index}");
-        }
-        let legacy_refs_retained: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'refs')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            legacy_refs_retained,
-            "v2 refs remain until call sites migrate"
-        );
-        let owner_table: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'search_fts_owners'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            canonical_sql(&owner_table),
-            canonical_sql(SEARCH_FTS_OWNERS_DDL)
-        );
-        assert!(owner_table.contains("STRICT"));
-
-        assert!(connection
-            .execute_batch(
-                "INSERT INTO reference_source_coverage (
-                     source_page_id, source_digest, extractor_dependency_stamp_digest
-                 ) VALUES (X'00', zeroblob(32), zeroblob(32))"
-            )
-            .is_err());
-        assert!(connection
-            .execute_batch(
-                "INSERT INTO reference_uuid_bindings (
-                     raw_uuid_claim, candidate_ordinal, resolved_block_id
-                 ) VALUES (X'00', 0, NULL)"
-            )
-            .is_err());
-        assert!(connection
-            .execute_batch(
-                "INSERT INTO reference_source_coverage (
-                     source_page_id, source_digest, extractor_dependency_stamp_digest
-                 ) VALUES ('not-a-blob', zeroblob(32), zeroblob(32))"
-            )
-            .is_err());
-    }
-
-    #[test]
-    fn page_cleanup_selects_only_exact_owned_fts_rowids_and_page_led_facets() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, ContentDigest::of(b"empty frontier")).unwrap();
-        let changed_page = page_id(0x1100);
-        let untouched_page = page_id(0x1200);
-        let changed = MaterializedPageInput {
-            page_id: changed_page,
-            home_document_id: document_id(0x1101),
-            name: "Changed".into(),
-            name_key: "changed".into(),
-            path: ManagedPath::parse("pages/changed.md").unwrap(),
-            kind: ManagedTextKind::Page,
-            preamble: Some("owner:: page\n#page-tag".into()),
-            searchable_text: "Changed owner page tag".into(),
-            references: Vec::new(),
-            properties: vec![MaterializedProperty {
-                name: "owner".into(),
-                value: "page".into(),
-            }],
-            tags: vec!["page-tag".into()],
-            blocks: vec![MaterializedBlockInput {
-                block_id: block_id(0x1102),
-                home_document_id: document_id(0x1101),
-                parent: None,
-                order: "a".into(),
-                content: "TODO owner:: block #block-tag".into(),
-                searchable_text: "TODO owner block block-tag".into(),
-                heading_level: None,
-                collapsed: false,
-                logseq_uuid: None,
-                logseq_identity_origin: None,
-                references: Vec::new(),
-                properties: vec![MaterializedProperty {
-                    name: "owner".into(),
-                    value: "block".into(),
-                }],
-                tags: vec!["block-tag".into()],
-                task: Some(MaterializedTask {
-                    marker: "TODO".into(),
-                    priority: None,
-                    scheduled: None,
-                    deadline: None,
-                }),
-            }],
-        };
-        let untouched = MaterializedPageInput {
-            page_id: untouched_page,
-            home_document_id: document_id(0x1201),
-            name: "Untouched".into(),
-            name_key: "untouched".into(),
-            path: ManagedPath::parse("pages/untouched.md").unwrap(),
-            kind: ManagedTextKind::Page,
-            preamble: None,
-            searchable_text: "Untouched".into(),
-            references: Vec::new(),
-            properties: Vec::new(),
-            tags: Vec::new(),
-            blocks: Vec::new(),
-        };
-        let transaction = connection.transaction().unwrap();
-        insert_page(&transaction, &changed).unwrap();
-        insert_page(&transaction, &untouched).unwrap();
-        let changed_uuid = changed_page.as_uuid();
-        let changed_blob = changed_uuid.as_bytes().as_slice();
-        let expected_owned_rows: usize = [
-            ("search_fts_owners", "page_id"),
-            ("refs", "source_page_id"),
-            ("properties", "page_id"),
-            ("tags", "page_id"),
-            ("tasks", "page_id"),
-            ("blocks", "page_id"),
-            ("pages", "page_id"),
-        ]
-        .into_iter()
-        .map(|(table, column)| {
-            transaction
-                .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
-                    params![changed_blob],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap()
-        })
-        .sum();
-        let cleanup = delete_page(&transaction, changed_page, true, &BTreeSet::new()).unwrap();
-        assert_eq!(cleanup.existing_pages, 1);
-        assert_eq!(cleanup.fts_rowids, 2);
-        assert_eq!(cleanup.owned_rows, expected_owned_rows);
-        let absent = delete_page(&transaction, page_id(0x1300), true, &BTreeSet::new()).unwrap();
-        assert_eq!(absent, PageCleanupInstrumentation::default());
-        assert_eq!(
-            transaction
-                .query_row("SELECT COUNT(*) FROM search_fts", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            transaction
-                .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        transaction.commit().unwrap();
-    }
-
-    #[test]
-    fn reference_postings_preserve_dangling_raw_evidence_without_target_foreign_keys() {
-        let connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, ContentDigest::of(b"empty frontier")).unwrap();
-        let mut statement = connection
-            .prepare("PRAGMA foreign_key_list(reference_postings)")
-            .unwrap();
-        assert_eq!(statement.query_map([], |_| Ok(())).unwrap().count(), 0);
-
-        connection
-            .execute_batch(
-                "INSERT INTO reference_postings (
-                     source_page_id, source_entity_type, source_entity_id, source_locator,
-                     ordinal, reference_kind, target_type, raw_name, normalized_name,
-                     raw_uuid_claim, resolved_page_id, resolved_block_id
-                 ) VALUES (
-                     zeroblob(16), 0, zeroblob(16), X'00', 0, 5, 0,
-                     'property key', 'property key', NULL, NULL, NULL
-                 )",
-            )
-            .unwrap();
-        let rows: i64 = connection
-            .query_row("SELECT COUNT(*) FROM reference_postings", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(rows, 1);
-
-        connection
-            .execute_batch(
-                "INSERT INTO reference_postings (
-                     source_page_id, source_entity_type, source_entity_id, source_locator,
-                     ordinal, reference_kind, target_type, raw_name, normalized_name,
-                     raw_uuid_claim, resolved_page_id, resolved_block_id
-                 ) VALUES (
-                     zeroblob(16), 0, zeroblob(16), X'00', 1, 6, 1,
-                     NULL, NULL, X'00000000000000000000000000000001', NULL, NULL
-                 )",
-            )
-            .unwrap();
-        let uuid_bytes: Vec<u8> = connection
-            .query_row(
-                "SELECT raw_uuid_claim FROM reference_postings WHERE target_type = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            LogseqUuid::from_uuid(Uuid::from_slice(&uuid_bytes).unwrap()),
-            LogseqUuid::from_uuid(Uuid::from_u128(1)),
-        );
-    }
-
-    #[test]
-    fn reference_postings_reject_cross_kind_target_pairs_in_sql() {
-        let connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, ContentDigest::of(b"empty frontier")).unwrap();
-
-        assert!(connection
-            .execute_batch(
-                "INSERT INTO reference_postings (
-                     source_page_id, source_entity_type, source_entity_id, source_locator,
-                     ordinal, reference_kind, target_type, raw_name, normalized_name,
-                     raw_uuid_claim, resolved_page_id, resolved_block_id
-                 ) VALUES (
-                     zeroblob(16), 0, zeroblob(16), X'00', 0, 0, 1,
-                     NULL, NULL, X'00000000000000000000000000000001', NULL, NULL
-                 )",
-            )
-            .is_err());
-        assert!(connection
-            .execute_batch(
-                "INSERT INTO reference_postings (
-                     source_page_id, source_entity_type, source_entity_id, source_locator,
-                     ordinal, reference_kind, target_type, raw_name, normalized_name,
-                     raw_uuid_claim, resolved_page_id, resolved_block_id
-                 ) VALUES (
-                     zeroblob(16), 0, zeroblob(16), X'00', 1, 6, 0,
-                     'page name', 'page name', NULL, NULL, NULL
-                 )",
-            )
-            .is_err());
     }
 
     #[test]
