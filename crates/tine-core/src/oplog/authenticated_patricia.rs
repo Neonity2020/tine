@@ -38,6 +38,14 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
         };
         result.map_err(tine_storage::PatriciaPublicationError::new)
     }
+
+    fn permits_packed_head_transition(&self) -> bool {
+        // Ordinary archive mutation is serialized by the archive-rooted
+        // workspace writer lease. Detached bootstrap publication is one
+        // unflushed immutable batch and therefore cannot make a mutable head
+        // durable before its prerequisites at this boundary.
+        matches!(self, Self::Ordinary)
+    }
 }
 
 #[derive(Debug)]
