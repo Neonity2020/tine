@@ -74,7 +74,6 @@ pub const SQLITE_SCHEMA_VERSION: u32 = storage_frontier::SQLITE_SCHEMA_VERSION;
 pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
-const FORENSIC_NAMES: [&str; 4] = ["database", "wal", "shm", "auth"];
 const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const OBJECT_STORE_LEASE_NAMESPACE: &str = ".tine-runtime";
 const SQLITE_WORKSPACE_LEASE_NAMESPACE: &str = "sqlite-workspaces";
@@ -4705,30 +4704,15 @@ fn preserve_forensics(path: &Path) -> Result<PendingForensics, ProjectionError> 
         evidence: Vec::new(),
     };
     let files = SqliteFileSet::new(path);
-    for (index, original) in files.paths().into_iter().enumerate() {
-        let original = original.to_path_buf();
-        match fs::symlink_metadata(&original) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(ProjectionError::UnsafePath(format!(
-                        "projection evidence {} is not a regular file",
-                        original.display()
-                    )));
-                }
-                let preserved = directory.join(FORENSIC_NAMES[index]);
-                fs::rename(&original, &preserved)?;
-                sync_directory(&directory)?;
-                sync_directory(parent)?;
-                pending.evidence.push(ForensicEvidence {
-                    original_path: original,
-                    preserved_path: preserved,
-                });
-                maybe_abort_forensic_test("after-move", pending.evidence.len());
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
+    let mappings = files.preserve_forensic_files(&directory, |moved| {
+        maybe_abort_forensic_test("after-move", moved);
+    })?;
+    pending
+        .evidence
+        .extend(mappings.into_iter().map(|mapping| ForensicEvidence {
+            original_path: mapping.original_path,
+            preserved_path: mapping.preserved_path,
+        }));
     write_durable_marker(&directory, "EVIDENCE_COMPLETE")?;
     maybe_abort_forensic_test("after-evidence", pending.evidence.len());
     Ok(pending)
@@ -4766,37 +4750,13 @@ fn resume_pending_forensics(path: &Path) -> Result<PendingForensics, ProjectionE
         }
         let evidence_complete = directory.join("EVIDENCE_COMPLETE").exists();
         let files = SqliteFileSet::new(path);
-        for (index, original) in files.paths().into_iter().enumerate() {
-            let original = original.to_path_buf();
-            let preserved = directory.join(FORENSIC_NAMES[index]);
-            let original_exists = original.exists();
-            let preserved_exists = preserved.exists();
-            if !evidence_complete && original_exists && preserved_exists {
-                return Err(ProjectionError::Corrupt(format!(
-                    "forensic recovery found both {} and {}",
-                    original.display(),
-                    preserved.display()
-                )));
-            }
-            if !evidence_complete && original_exists {
-                let metadata = fs::symlink_metadata(&original)?;
-                if metadata.file_type().is_symlink() || !metadata.is_file() {
-                    return Err(ProjectionError::UnsafePath(format!(
-                        "projection evidence {} is not a regular file",
-                        original.display()
-                    )));
-                }
-                fs::rename(&original, &preserved)?;
-                sync_directory(&directory)?;
-                sync_directory(parent)?;
-            }
-            if preserved.exists() {
-                pending.evidence.push(ForensicEvidence {
-                    original_path: original,
-                    preserved_path: preserved,
-                });
-            }
-        }
+        let mappings = files.resume_forensic_files(&directory, evidence_complete)?;
+        pending
+            .evidence
+            .extend(mappings.into_iter().map(|mapping| ForensicEvidence {
+                original_path: mapping.original_path,
+                preserved_path: mapping.preserved_path,
+            }));
         if !evidence_complete {
             write_durable_marker(&directory, "EVIDENCE_COMPLETE")?;
         }
