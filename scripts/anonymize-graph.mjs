@@ -54,6 +54,11 @@ const ASCII_ALPHABETS = {
   lower: { key: "lower", values: [..."abcdefghijklmnopqrstuvwxyz"], valueSet: new Set("abcdefghijklmnopqrstuvwxyz") },
   digit: { key: "digit", values: [..."0123456789"], valueSet: new Set("0123456789") },
 };
+const ASCII_PORTABLE_WORD_ALPHABET = {
+  key: "ascii-portable-word",
+  values: [..."abcdefghijklmnopqrstuvwxyz0123456789"],
+  valueSet: new Set("abcdefghijklmnopqrstuvwxyz0123456789"),
+};
 const UNICODE_WORD_CHARACTER_RE = /^[\p{L}\p{M}\p{N}]$/u;
 let unicodeAlphabets;
 
@@ -191,6 +196,12 @@ function alphabetFor(ch) {
   return unicodeAlphabets.get(byteLength);
 }
 
+function fallbackAlphabetFor(alphabet) {
+  return alphabet === ASCII_ALPHABETS.upper || alphabet === ASCII_ALPHABETS.lower || alphabet === ASCII_ALPHABETS.digit
+    ? ASCII_PORTABLE_WORD_ALPHABET
+    : alphabet;
+}
+
 function buildUnicodeAlphabets() {
   const valuesByLength = new Map([[2, []], [3, []], [4, []]]);
   // A single representative for each conservative portable identity prevents
@@ -224,6 +235,7 @@ class PseudonymMap {
     this.forbiddenTokens = forbiddenTokens;
     this.forbiddenUuids = forbiddenUuids;
     this.tokens = new Map();
+    this.assignedTokens = new Set();
     this.uuids = new Map();
     this.uuidOwners = new Map();
     this.protectedRangeWork = { comparisons: 0 };
@@ -273,29 +285,27 @@ class PseudonymMap {
       && !GENERATED_PUBLIC_WORDS.has(candidate.toLowerCase());
   }
 
-  assignGroup(shapeKey, alphabets, groupTokens) {
+  tryAssignGroup(shapeKey, candidateKey, alphabets, groupTokens) {
     const owners = this.saltedOrder("shape-owner", shapeKey, groupTokens);
     const absentCandidates = [];
-    for (const candidate of this.shapeCandidates(shapeKey, alphabets)) {
-      if (!this.candidateIsAdmissible(candidate) || this.forbiddenTokens.has(candidate)) continue;
+    for (const candidate of this.shapeCandidates(candidateKey, alphabets)) {
+      if (!this.candidateIsAdmissible(candidate) || this.forbiddenTokens.has(candidate) || this.assignedTokens.has(candidate)) continue;
       absentCandidates.push(candidate);
       if (absentCandidates.length === owners.length) break;
     }
 
     const sourceCandidates = this.saltedOrder(
       "shape-source-candidate",
-      shapeKey,
+      candidateKey,
       groupTokens.filter((token) => [...token].every(
         (character, index) => alphabets[index].valueSet.has(character),
-      ) && this.candidateIsAdmissible(token)),
+      ) && this.candidateIsAdmissible(token) && !this.assignedTokens.has(token)),
     );
     const neededSourceCandidates = owners.length - absentCandidates.length;
-    if (sourceCandidates.length < neededSourceCandidates) {
-      safeError("A same-shape pseudonym could not be represented without a collision.");
-    }
+    if (sourceCandidates.length < neededSourceCandidates) return false;
     const selected = this.saltedOrder(
       "shape-selected-candidate",
-      shapeKey,
+      candidateKey,
       [...absentCandidates, ...sourceCandidates.slice(0, neededSourceCandidates)],
     );
 
@@ -310,13 +320,25 @@ class PseudonymMap {
       }
     } else if (fixed.length === 1) {
       const other = owners.length === 1 ? -1 : (fixed[0] === 0 ? 1 : 0);
-      if (other < 0) safeError("A same-shape pseudonym could not be represented without a collision.");
+      if (other < 0) return false;
       [selected[fixed[0]], selected[other]] = [selected[other], selected[fixed[0]]];
     }
     for (let index = 0; index < owners.length; index += 1) {
-      if (owners[index] === selected[index]) safeError("A same-shape pseudonym could not be represented without a collision.");
+      if (owners[index] === selected[index]) return false;
       this.tokens.set(owners[index], selected[index]);
+      this.assignedTokens.add(selected[index]);
     }
+    return true;
+  }
+
+  assignGroup(shapeKey, alphabets, groupTokens) {
+    if (this.tryAssignGroup(shapeKey, `exact\0${shapeKey}`, alphabets, groupTokens)) return;
+    const fallbackAlphabets = alphabets.map(fallbackAlphabetFor);
+    if (fallbackAlphabets.some((alphabet, index) => alphabet !== alphabets[index])
+      && this.tryAssignGroup(shapeKey, `word-safe\0${fallbackAlphabets.map(({ key }) => key).join("/")}`, fallbackAlphabets, groupTokens)) {
+      return;
+    }
+    safeError("A same-shape pseudonym could not be represented without a collision.");
   }
 
   assignTokens() {

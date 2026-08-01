@@ -66,6 +66,20 @@ function fixedWidthTokens(alphabet, width) {
   return tokens;
 }
 
+function lowercaseDigraphs() {
+  return fixedWidthTokens([..."abcdefghijklmnopqrstuvwxyz"], 2);
+}
+
+function buildTwoLetterCodeGraph(tokens) {
+  return {
+    ...Object.fromEntries(tokens.map((token) => [
+      `pages/${token}.md`,
+      `- [[${token}]]\n  alias:: ${token}\n`,
+    ])),
+    "journals/2026_08_01.org": tokens.map((token) => `* [[${token}]]`).join("\n").concat("\n"),
+  };
+}
+
 function assertDomainPermutation(original, transformed) {
   assert.equal(transformed.length, original.length);
   assert.equal(new Set(transformed).size, original.length);
@@ -258,6 +272,47 @@ test("exports saturated multi-character shape domains by deterministic derangeme
   assert.equal(first, second);
   assertDomainPermutation(digits, outputDigits);
   assertDomainPermutation(lower, outputLower);
+});
+
+test("falls back from saturated lowercase digraphs while keeping page and link structure intact", async (t) => {
+  const root = await fixture(t);
+  const source = join(root, "source");
+  const destination = join(root, "output");
+  const tokens = lowercaseDigraphs();
+  const graph = buildTwoLetterCodeGraph(tokens);
+  const expectedTotalBytes = Object.values(graph).reduce((sum, text) => sum + Buffer.byteLength(text), 0);
+  await writeGraph(source, graph);
+
+  const summary = await anonymizeGraph({ source, destination, salt: Buffer.alloc(32, 22) });
+  const exported = (await listFiles(destination)).filter((file) => file.path !== "anonymization-report.txt");
+  const pages = exported.filter((file) => file.path.startsWith("pages/"));
+  const journal = exported.find((file) => file.path.startsWith("journals/"));
+  const pageStems = new Set();
+  let broadenedStemSeen = false;
+
+  assert.equal(summary.fileCount, tokens.length + 1);
+  assert.equal(summary.totalBytes, expectedTotalBytes);
+  assert.equal(pages.length, tokens.length);
+  assert.equal(exported.reduce((sum, file) => sum + Buffer.byteLength(file.text), 0), expectedTotalBytes);
+
+  for (const page of pages) {
+    const stem = basename(page.path, extname(page.path));
+    const link = page.text.match(/\[\[([^\]]+)\]\]/u)?.[1];
+    const alias = page.text.match(/alias:: ([^\r\n]+)/u)?.[1];
+
+    pageStems.add(stem);
+    broadenedStemSeen ||= !/^[a-z]{2}$/u.test(stem);
+    assert.equal(Buffer.byteLength(stem), 2);
+    assert.equal(link, stem);
+    assert.equal(alias, stem);
+  }
+
+  const journalLinks = [...journal.text.matchAll(/\[\[([^\]]+)\]\]/gu)].map((match) => match[1]);
+  assert.equal(pageStems.size, tokens.length);
+  assert.ok(broadenedStemSeen);
+  assert.equal(journalLinks.length, tokens.length);
+  assert.equal(new Set(journalLinks).size, tokens.length);
+  journalLinks.forEach((link) => assert.ok(pageStems.has(link)));
 });
 
 test("fails closed for symlinks, invalid UTF-8, existing or nested destinations, and portable path collisions", async (t) => {
