@@ -40897,12 +40897,12 @@ mod tests {
         let second = rejected.join("pages/B.md");
         fs::write(&first, content).unwrap();
         fs::write(&second, content).unwrap();
+        let pages_before = regular_file_tree(&rejected.join("pages"));
         set_managed_content_budget_limit(peak - 1);
         let rejected_graph = Graph::open(&rejected);
         let error = rejected_graph.migrate_sync_identities().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(fs::read(&first).unwrap(), content.as_bytes());
-        assert_eq!(fs::read(&second).unwrap(), content.as_bytes());
+        assert_eq!(regular_file_tree(&rejected.join("pages")), pages_before);
         assert!(!rejected.join(".tine-sync").exists());
         assert!(!rejected.join(".tine-sync/v1/genesis").exists());
         set_managed_content_budget_limit(peak);
@@ -41127,6 +41127,7 @@ mod tests {
         let second = rejected.join("pages/B.md");
         fs::write(&first, &first_content).unwrap();
         fs::write(&second, &second_content).unwrap();
+        let pages_before = regular_file_tree(&rejected.join("pages"));
         set_managed_content_budget_limit(peak - 1);
         let rejected_graph = Graph::open(&rejected);
         let error = rejected_graph
@@ -41134,8 +41135,7 @@ mod tests {
             .unwrap_err();
         clear_managed_content_budget_limit();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(fs::read(&first).unwrap(), first_content.as_bytes());
-        assert_eq!(fs::read(&second).unwrap(), second_content.as_bytes());
+        assert_eq!(regular_file_tree(&rejected.join("pages")), pages_before);
         assert!(!rejected.join(".tine-sync").exists());
         assert!(!rejected.join(".tine-sync/v1/genesis").exists());
         assert!(rejected_graph.cache.read().unwrap().is_none());
@@ -41325,14 +41325,14 @@ mod tests {
         let second = rejected.join("pages/B.md");
         fs::write(&first, content).unwrap();
         fs::write(&second, content).unwrap();
+        let pages_before = regular_file_tree(&rejected.join("pages"));
         set_managed_content_budget_limit(peak - 1);
         let graph = Graph::open(&rejected);
         let error = graph
             .enable_managed_sync(Uuid::from_u128(91_047_302), Uuid::from_u128(91_047_303))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(fs::read(&first).unwrap(), content.as_bytes());
-        assert_eq!(fs::read(&second).unwrap(), content.as_bytes());
+        assert_eq!(regular_file_tree(&rejected.join("pages")), pages_before);
         assert!(!rejected.join(".tine-sync").exists());
         assert!(graph.cache.read().unwrap().is_none());
         assert!(graph.recent_writes.lock().unwrap().is_empty());
