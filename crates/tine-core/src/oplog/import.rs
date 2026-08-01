@@ -10198,6 +10198,15 @@ mod tests {
         prepare_streaming_bootstrap_with_config(label, None, files)
     }
 
+    fn bootstrap_preparation_scratch(root: &TestRoot, label: &str) -> (PathBuf, PathBuf) {
+        let nonce = Uuid::new_v4();
+        let capture_scratch = root.path().join(format!("capture-{label}-{nonce}"));
+        let preparation_scratch = root.path().join(format!("preparation-{label}-{nonce}"));
+        fs::create_dir(&capture_scratch).unwrap();
+        fs::create_dir(&preparation_scratch).unwrap();
+        (capture_scratch, preparation_scratch)
+    }
+
     fn prepare_streaming_bootstrap_with_config(
         label: &str,
         config: Option<&str>,
@@ -10215,10 +10224,8 @@ mod tests {
             fs::write(target, contents).unwrap();
         }
         let graph = Graph::open(&graph_root);
-        let capture_scratch = root.path().join("capture-scratch");
-        let preparation_scratch = root.path().join("preparation-scratch");
-        fs::create_dir(&capture_scratch).unwrap();
-        fs::create_dir(&preparation_scratch).unwrap();
+        let (capture_scratch, preparation_scratch) =
+            bootstrap_preparation_scratch(&root, "streaming-bootstrap");
         let capture = graph
             .capture_inactive_bootstrap_sources(&capture_scratch)
             .unwrap();
@@ -10243,10 +10250,7 @@ mod tests {
         workspace: WorkspaceId,
     ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
         let graph = Graph::open(&root.path().join("graph"));
-        let capture_scratch = root.path().join(format!("capture-{suffix}"));
-        let preparation_scratch = root.path().join(format!("preparation-{suffix}"));
-        fs::create_dir(&capture_scratch).unwrap();
-        fs::create_dir(&preparation_scratch).unwrap();
+        let (capture_scratch, preparation_scratch) = bootstrap_preparation_scratch(root, suffix);
         let capture = graph
             .capture_inactive_bootstrap_sources(&capture_scratch)
             .unwrap();
@@ -11468,10 +11472,7 @@ mod tests {
         archive: &Path,
     ) -> InactiveBootstrapPreparedPublication {
         let graph = Graph::open(&root.path().join("graph"));
-        let capture_scratch = root.path().join(format!("capture-{label}"));
-        let preparation_scratch = root.path().join(format!("preparation-{label}"));
-        fs::create_dir(&capture_scratch).unwrap();
-        fs::create_dir(&preparation_scratch).unwrap();
+        let (capture_scratch, preparation_scratch) = bootstrap_preparation_scratch(root, label);
         let capture = graph
             .capture_inactive_bootstrap_sources(&capture_scratch)
             .unwrap();
@@ -13212,8 +13213,15 @@ mod tests {
         // A second archive requires its own preparation: a bootstrap belongs to
         // exactly one archive's durable reference catalog.
         let other_archive = root.path().join("other-archive");
+        let first_other_prepared =
+            prepare_existing_bootstrap(&root, "other-archive", workspace, &other_archive);
+        let other_aggregate = first_other_prepared.aggregate_bytes().unwrap();
+        let other_commit = first_other_prepared.commit_bytes().unwrap();
+        drop(first_other_prepared);
         let other_prepared =
             prepare_existing_bootstrap(&root, "other-archive", workspace, &other_archive);
+        assert_eq!(other_prepared.aggregate_bytes().unwrap(), other_aggregate);
+        assert_eq!(other_prepared.commit_bytes().unwrap(), other_commit);
         let (_, other_verified, other_authority) =
             install_accepted_authority(&root, &other_prepared, workspace, 0x7020, "other-archive");
         drop(other_authority);
