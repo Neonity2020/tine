@@ -4597,6 +4597,94 @@ mod tests {
     }
 
     #[test]
+    fn managed_shadow_projection_admits_mixed_promoted_heading_layout() {
+        let source = concat!(
+            "- # Focus\n",
+            "  - first child\n",
+            "## One\n",
+            "## Two\n",
+            "## Three\n",
+            "## Four\n",
+            "  - final child\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let path = "pages/mixed-headings.md";
+        let fixture = Fixture::new(
+            "mixed-promoted-heading-layout",
+            None,
+            vec![(path.into(), source.clone())],
+        );
+
+        let verified = fixture.verify().unwrap();
+        assert_eq!(
+            fs::read(verified.directory().join("payload").join(path)).unwrap(),
+            source,
+            "the shadow payload must remain the exact bootstrap source"
+        );
+        let binding = PromotedBootstrapProjectionBindingV1::from_verified(&verified).unwrap();
+        let authority = BootstrapProjectionAuthority::reopen(&fixture.roots, &binding).unwrap();
+        let baseline = authority
+            .baseline_at(&ManagedPath::parse(path).unwrap())
+            .unwrap()
+            .unwrap();
+        let description = BlobDescription::of(&source);
+        assert_eq!(baseline.source_bytes(), source);
+        assert_eq!(baseline.intent().target(), description);
+        assert_eq!(
+            baseline.intent().precondition(),
+            &ProjectionPrecondition::Base(description)
+        );
+
+        let mut state = fixture
+            .authority
+            .accepted_engine()
+            .materialize_page_for_projection(baseline.intent().page_id())
+            .unwrap();
+        let ordinary =
+            plan_projection(fixture.authority.binding().workspace_id(), &state, None).unwrap();
+        let ordinary = std::str::from_utf8(ordinary.target()).unwrap();
+        for heading in ["One", "Two", "Three", "Four"] {
+            assert!(ordinary.contains(&format!("- ## {heading}\n")));
+        }
+        assert_ne!(ordinary.as_bytes(), source);
+
+        let replay = plan_projection(
+            fixture.authority.binding().workspace_id(),
+            &state,
+            Some(baseline.source_bytes()),
+        )
+        .unwrap();
+        assert_eq!(replay.intent(), baseline.intent());
+        assert_eq!(replay.target(), baseline.source_bytes());
+
+        state
+            .page
+            .blocks
+            .iter_mut()
+            .find(|block| block.content == "## Three")
+            .unwrap()
+            .content = "## Three revised".into();
+        let edited = crate::oplog::projection::plan_projection_with_layout_annotations(
+            fixture.authority.binding().workspace_id(),
+            &state,
+            Some(baseline.source_bytes()),
+            Some(baseline.intent().annotations()),
+        )
+        .unwrap();
+        assert_ne!(edited.target(), baseline.source_bytes());
+        assert_ne!(edited.intent().target(), description);
+        assert!(std::str::from_utf8(edited.target())
+            .unwrap()
+            .contains("## Three revised"));
+        assert_eq!(
+            edited.intent().precondition(),
+            &ProjectionPrecondition::Base(description)
+        );
+        fixture.assert_graph_unchanged();
+    }
+
+    #[test]
     fn shadow_bytes_and_promotion_binding_are_identical_with_zero_and_cached_sessions() {
         let fixture = rich_fixture("lookup-session-differential");
         let zero = fixture.verify_with_lookup_budget(0).unwrap();
