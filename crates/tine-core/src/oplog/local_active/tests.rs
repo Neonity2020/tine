@@ -8672,6 +8672,73 @@ fn ordinary_admissions_do_no_resume_lifecycle_work() {
     });
 }
 
+/// An exact-current adopted open may serve projected reads while the engine
+/// catalog stays cold, but it must authenticate the retained catalog bytes
+/// before admitting the first mutation.
+#[test]
+fn first_mutation_refuses_when_deferred_catalog_bytes_are_missing() {
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "resume-deferred-catalog-corruption",
+            None,
+            vec![("pages/corrupt.md".into(), b"- corrupt\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("resume-deferred-catalog-corruption");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "resume-deferred-catalog-corruption");
+        let session = SessionId::new();
+        with_promoted_runtime(
+            &mut fixture,
+            &root,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                publish_expecting_success(fixture, authority, runtime);
+            },
+        );
+
+        with_reopened_runtime(
+            &fixture,
+            &root,
+            &binding,
+            &paths,
+            session,
+            |fixture, authority, runtime| {
+                assert!(runtime.resume_open_status().adopted());
+                assert_eq!(
+                    runtime.engine().instrumentation().catalog_hot_state_loads,
+                    0
+                );
+                let runs = retained_run_directories(&fixture.archive_root);
+                assert_eq!(runs.len(), 1);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(
+                        scratch_namespace(&fixture.archive_root)
+                            .join(&runs[0])
+                            .join("pages.index"),
+                    )
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+
+                let Err(error) = runtime.admit_promoted_mutation(authority, &fixture.graph) else {
+                    panic!("missing deferred catalog bytes must refuse the first mutation");
+                };
+                assert!(matches!(
+                    error,
+                    RuntimePromotionError::Engine(EngineError::Archive(_))
+                ));
+                assert_eq!(
+                    runtime.engine().instrumentation().catalog_hot_state_loads,
+                    1
+                );
+            },
+        );
+        fixture.assert_graph_unchanged();
+    });
+}
+
 /// A crash takeover adopts the crashed session's published point.
 ///
 /// This is the common crash-recovery shape, and it is the reason the enrollment

@@ -6692,6 +6692,33 @@ impl ShardedHotEngine {
         {
             return Ok(None);
         }
+        // An exact-current adopted open deliberately keeps the graph-sized
+        // catalog document cold. Its absent hot heads are therefore cache
+        // state, not semantic authority. The automatic post-open publication
+        // can run after replay has advanced the live scratch roots, so first
+        // re-authenticate the deferred snapshot's cheap state record and bind
+        // those exact heads to the successor roots. Using
+        // `visible_document_heads` here would mint an empty-head binding that
+        // the retained catalog bytes correctly refuse on the next open.
+        let catalog_checkpoint_binding = if let Some(checkpoint) = &self.deferred_catalog_checkpoint
+        {
+            let catalog_heads = self.load_run_local_catalog_heads(&checkpoint.roots)?;
+            let adopted_binding = self.catalog_checkpoint_binding_for(
+                &checkpoint.roots,
+                Some(&catalog_heads).filter(|heads| !heads.is_empty()),
+            );
+            if adopted_binding != checkpoint.binding {
+                return Err(EngineError::Archive(
+                    "adopted run does not reproduce the recorded catalog checkpoint binding".into(),
+                ));
+            }
+            self.catalog_checkpoint_binding_for(
+                &self.scratch_roots,
+                Some(&catalog_heads).filter(|heads| !heads.is_empty()),
+            )
+        } else {
+            self.catalog_checkpoint_binding()
+        };
         Ok(Some(RuntimeResumeSnapshot {
             history_generation: generation,
             history_index_root: index_root,
@@ -6705,7 +6732,7 @@ impl ShardedHotEngine {
             current_path_catalog_root: self.current_path_catalog.root.clone(),
             current_path_catalog_available: self.current_path_catalog.available,
             current_path_catalog_frontier: self.current_path_catalog.accepted_frontier_root.clone(),
-            catalog_checkpoint_binding: self.catalog_checkpoint_binding(),
+            catalog_checkpoint_binding,
         }))
     }
 
@@ -7069,8 +7096,7 @@ impl ShardedHotEngine {
             );
             if restored_binding != snapshot.catalog_checkpoint_binding {
                 return Err(EngineError::Archive(
-                    "adopted run does not reproduce the recorded catalog checkpoint binding"
-                        .into(),
+                    "adopted run does not reproduce the recorded catalog checkpoint binding".into(),
                 ));
             }
         }
@@ -7177,6 +7203,33 @@ impl ShardedHotEngine {
             catalog_heads: state.exact_direct_heads().iter().copied().collect(),
             catalog_document: Some(document),
         })
+    }
+
+    /// Re-derive only the authenticated catalog heads, without materializing
+    /// the graph-sized catalog document.
+    ///
+    /// This is the authority needed to publish a successor resume point while
+    /// an exact-current adopted open remains catalog-cold. The full bytes stay
+    /// deferred and are still authenticated before the first mutation.
+    fn load_run_local_catalog_heads(
+        &self,
+        roots: &ScratchRoots,
+    ) -> Result<BTreeSet<BatchId>, EngineError> {
+        let scratch = self.scratch.as_ref().ok_or_else(|| {
+            EngineError::Archive("run-local catalog heads require an authenticated scratch".into())
+        })?;
+        let Some(state) = super::document_state::load_external_current_record(
+            scratch,
+            roots,
+            super::document_state::DocumentLane::Visible,
+            self.catalog_document_id,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?
+        else {
+            return Ok(BTreeSet::new());
+        };
+        self.validate_external_record_anchor(self.catalog_document_id, &state)?;
+        Ok(state.exact_direct_heads().iter().copied().collect())
     }
 
     fn lazy_catalog_hot_state(&self) -> Result<&RunLocalCatalogHotState, EngineError> {
@@ -7331,7 +7384,9 @@ impl ShardedHotEngine {
         // Telemetry is observational rather than continuation authority; keep
         // cumulative work accounting across the reconstructed journey.
         rebuilt.history_work.set(self.history_work.get());
-        rebuilt.catalog_hot_state_loads.set(self.catalog_hot_state_loads.get());
+        rebuilt
+            .catalog_hot_state_loads
+            .set(self.catalog_hot_state_loads.get());
         rebuilt.resume_observation = self.resume_observation;
         rebuilt.bootstrap_residency = Arc::clone(&self.bootstrap_residency);
         if let Some(catalog_hot_state) = catalog_hot_state {
