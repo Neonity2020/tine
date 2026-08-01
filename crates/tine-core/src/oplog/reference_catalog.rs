@@ -1826,6 +1826,7 @@ impl ReferenceCatalogStateV2 {
         let mut facts_root = PatriciaIndexRoot::from_digest(self.root.facts_root);
         let mut coverage_root = PatriciaIndexRoot::from_digest(self.root.source_coverage_root);
         let mut reverse_root = PatriciaIndexRoot::from_digest(self.root.reverse_candidates_root);
+        construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         let mut source_count = self.root.source_count;
         let mut replacements = Vec::with_capacity(sources.len());
         let mut fact_updates = BTreeMap::new();
@@ -1895,22 +1896,27 @@ impl ReferenceCatalogStateV2 {
             .patricia
             .construction_insert_many(construction, facts_root, &fact_updates)
             .map_err(store_error)?;
+        construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         coverage_root = store
             .patricia
             .construction_insert_many(construction, coverage_root, &coverage_updates)
             .map_err(store_error)?;
+        construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         facts_root = store
             .patricia
             .construction_remove_many(construction, facts_root, &removals)
             .map_err(store_error)?;
+        construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         coverage_root = store
             .patricia
             .construction_remove_many(construction, coverage_root, &removals)
             .map_err(store_error)?;
+        construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         reverse_root = store
             .patricia
             .construction_insert_many(construction, reverse_root, &reverse_updates)
             .map_err(store_error)?;
+        construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         reverse_root = store
             .patricia
             .construction_remove_many(
@@ -1919,6 +1925,7 @@ impl ReferenceCatalogStateV2 {
                 &reverse_removals.into_iter().collect::<Vec<_>>(),
             )
             .map_err(store_error)?;
+        construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         construction.checkpoint([facts_root, coverage_root, reverse_root]);
         let post_root = ReferenceCatalogRootV2::new(
             &self.policy,
