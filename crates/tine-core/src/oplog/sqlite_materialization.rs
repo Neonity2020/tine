@@ -14,7 +14,7 @@ use std::fmt;
 #[cfg(test)]
 use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
-use tine_storage::sqlite_materialization as storage;
+use tine_storage::sqlite as storage;
 use uuid::Uuid;
 
 use super::{
@@ -1478,7 +1478,8 @@ pub(crate) fn initialize_schema(
     connection: &Connection,
     empty_frontier_digest: ContentDigest,
 ) -> Result<(), MaterializationError> {
-    storage::initialize_schema(connection, empty_frontier_digest).map_err(Into::into)
+    storage::initialize_materialization_schema_for_test(connection, empty_frontier_digest)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1493,7 +1494,7 @@ pub(crate) fn apply_change(
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     let (physical, authenticated) =
         lower_validated_change(change, semantic_effect, authenticated_reference)?;
-    storage::apply_change(
+    storage::apply_materialization_change_for_test(
         transaction,
         &physical,
         sequence,
@@ -1823,11 +1824,13 @@ impl<'a> SqliteMaterializedRead<'a> {
         acceptance_sequence: u64,
         frontier_digest: ContentDigest,
     ) -> Result<Self, MaterializationError> {
-        Ok(Self::from_storage(storage::SqliteMaterializedRead::new(
-            connection,
-            acceptance_sequence,
-            frontier_digest,
-        )?))
+        Ok(Self::from_storage(
+            storage::SqliteMaterializedRead::from_connection_for_test(
+                connection,
+                acceptance_sequence,
+                frontier_digest,
+            )?,
+        ))
     }
 
     pub const fn acceptance_sequence(&self) -> u64 {

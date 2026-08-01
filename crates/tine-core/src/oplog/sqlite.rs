@@ -47,8 +47,7 @@ use fs2::FileExt as _;
 #[cfg(test)]
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use tine_storage::sqlite_database::PhysicalSqliteDatabase;
-use tine_storage::sqlite_frontier as storage_frontier;
+use tine_storage::sqlite::{self as storage_frontier, PhysicalSqliteDatabase};
 use uuid::Uuid;
 
 use super::hot_engine::{AcceptedFrontierRoot, EngineAuthority};
@@ -8234,59 +8233,66 @@ mod tests {
             let dir = TestDir::new(&format!("schema-{case}"));
             let (database, engine, store) = open_empty(&dir, ids);
             let path = database.path().to_path_buf();
-            drop(database);
-            let connection = Connection::open(&path).unwrap();
             match case {
                 "type" | "primary-key" | "check" | "strict" => {
-                    connection
-                        .execute_batch("DROP TABLE applied_batches")
-                        .unwrap();
-                    let altered = match case {
-                        "type" => storage_frontier::APPLIED_BATCHES_DDL.replacen(
-                            "batch_id BLOB",
-                            "batch_id TEXT",
-                            1,
-                        ),
-                        "primary-key" => storage_frontier::APPLIED_BATCHES_DDL.replacen(
-                            "sequence INTEGER PRIMARY KEY",
-                            "sequence INTEGER NOT NULL",
-                            1,
-                        ),
-                        "check" => storage_frontier::APPLIED_BATCHES_DDL.replacen(
+                    let (expected, corrupted) = match case {
+                        "type" => ("batch_id BLOB", "batch_id TEXT"),
+                        "primary-key" => {
+                            ("sequence INTEGER PRIMARY KEY", "sequence INTEGER NOT NULL")
+                        }
+                        "check" => (
                             "retained_bytes INTEGER NOT NULL CHECK (retained_bytes >= 0)",
                             "retained_bytes INTEGER NOT NULL",
-                            1,
                         ),
-                        "strict" => {
-                            storage_frontier::APPLIED_BATCHES_DDL.replacen(") STRICT", ")", 1)
-                        }
+                        "strict" => (") STRICT", ")"),
                         _ => unreachable!(),
                     };
-                    connection.execute_batch(&altered).unwrap();
-                    connection
-                        .execute_batch(storage_frontier::BATCH_ID_INDEX_DDL)
+                    database
+                        .physical
+                        .execute_corrupting_sql_for_test("PRAGMA writable_schema = ON")
                         .unwrap();
-                    connection
-                        .execute_batch(storage_frontier::ACCEPTANCE_SEQUENCE_INDEX_DDL)
+                    database
+                        .physical
+                        .execute_corrupting_statement_for_test(
+                            "UPDATE sqlite_schema
+                             SET sql = replace(sql, ?1, ?2)
+                             WHERE type = 'table' AND name = 'applied_batches'",
+                            params![expected, corrupted],
+                        )
+                        .unwrap();
+                    database
+                        .physical
+                        .execute_corrupting_sql_for_test("PRAGMA writable_schema = OFF")
                         .unwrap();
                 }
                 "unique-index" => {
-                    connection
-                        .execute_batch(
-                            "DROP INDEX applied_batches_batch_id_uq;
-                             CREATE INDEX applied_batches_batch_id_uq
-                             ON applied_batches(batch_id)",
+                    database
+                        .physical
+                        .execute_corrupting_sql_for_test("PRAGMA writable_schema = ON")
+                        .unwrap();
+                    database
+                        .physical
+                        .execute_corrupting_statement_for_test(
+                            "UPDATE sqlite_schema
+                             SET sql = replace(sql, 'CREATE UNIQUE INDEX', 'CREATE INDEX')
+                             WHERE type = 'index' AND name = 'applied_batches_batch_id_uq'",
+                            [],
                         )
+                        .unwrap();
+                    database
+                        .physical
+                        .execute_corrupting_sql_for_test("PRAGMA writable_schema = OFF")
                         .unwrap();
                 }
                 "user-version" => {
-                    connection
-                        .pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION - 1)
+                    database
+                        .physical
+                        .set_corrupt_user_version_for_test(SQLITE_SCHEMA_VERSION - 1)
                         .unwrap();
                 }
                 _ => unreachable!(),
             }
-            drop(connection);
+            drop(database);
             let rebuilt = open_test_projection(
                 &path,
                 ids.claim(),
