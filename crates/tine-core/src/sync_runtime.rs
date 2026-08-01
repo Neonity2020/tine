@@ -10904,13 +10904,21 @@ fn join_application_page(
     editor: EditorCurrentPage,
 ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
     if parsed.guide
-        || parsed.name != editor.page.name.as_str()
-        || SyncPageKind::from(parsed.kind) != SyncPageKind::from(editor.page.kind)
         || parsed.path != editor.page.path.as_str()
         || parsed.pre_block != editor.page.preamble
     {
         return Err(SyncApplicationPageRequestError::ActorRefused);
     }
+    // Filename and journal formatting policy are parser inputs, not accepted
+    // page identity. Once the exact path and source content authenticate this
+    // materialized page, retain the exact name and kind selected by oplog
+    // authority instead of comparing them with a newly parsed fallback.
+    parsed.name = editor.page.name.as_str().to_owned();
+    parsed.title.clone_from(&parsed.name);
+    parsed.kind = match editor.page.kind {
+        ManagedTextKind::Page => PageKind::Page,
+        ManagedTextKind::Journal => PageKind::Journal,
+    };
     let parsed_blocks = flatten_application_blocks(&parsed.blocks);
     if parsed_blocks.len() != editor.dto.blocks.len() || parsed_blocks.len() != editor.blocks.len()
     {
@@ -17174,6 +17182,18 @@ mod tests {
             }
         }
 
+        fn empty(label: &str, seed: u128) -> Self {
+            let fixture = Self::nested_unicode(label, seed);
+            for path in [
+                "Root.md",
+                "notes/層/žluťoučký/nested/Déjà 計画.md",
+                "diary/nested/25-07-2026.org",
+            ] {
+                fs::remove_file(fixture.graph_root.join(path)).unwrap();
+            }
+            fixture
+        }
+
         fn scaled(label: &str, seed: u128, additional_pages: usize) -> Self {
             Self::scaled_with_blocks(label, seed, additional_pages, 10)
         }
@@ -18369,8 +18389,33 @@ mod tests {
         SyncRuntimeHandle,
         SyncRuntimeHandle,
     ) {
-        let initiator = make_shared_fixture(&format!("{label}-initiator"), seed);
-        let mut receiver = make_shared_fixture(&format!("{label}-receiver"), seed);
+        joined_shared_pair_with_fixture(label, seed, ActivationFixture::nested_unicode)
+    }
+
+    fn joined_empty_shared_pair(
+        label: &str,
+        seed: u128,
+    ) -> (
+        ActivationFixture,
+        ActivationFixture,
+        SyncRuntimeHandle,
+        SyncRuntimeHandle,
+    ) {
+        joined_shared_pair_with_fixture(label, seed, ActivationFixture::empty)
+    }
+
+    fn joined_shared_pair_with_fixture(
+        label: &str,
+        seed: u128,
+        fixture: fn(&str, u128) -> ActivationFixture,
+    ) -> (
+        ActivationFixture,
+        ActivationFixture,
+        SyncRuntimeHandle,
+        SyncRuntimeHandle,
+    ) {
+        let initiator = fixture(&format!("{label}-initiator"), seed);
+        let mut receiver = fixture(&format!("{label}-receiver"), seed);
         receiver.request.identities.endpoint_id =
             ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
         receiver.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
@@ -18430,6 +18475,37 @@ mod tests {
             ],
         );
         (batch_id, page_id, block_id, document_id)
+    }
+
+    fn admit_shared_page(
+        handle: &SyncRuntimeHandle,
+        fixture: &ActivationFixture,
+        path: &str,
+        body: &[u8],
+    ) -> PageId {
+        let file = fixture.graph_root.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, body).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+            .unwrap();
+        settle_exact_feed(handle)
+            .unwrap_or_else(|state| panic!("shared page {path:?} did not settle: {state:?}"));
+        settle_shared_provider(handle);
+        match handle
+            .query(SyncRuntimeQueryRequest::ListPages {
+                page_kind: None,
+                limit: MAX_MATERIALIZATION_QUERY_ROWS,
+            })
+            .unwrap()
+        {
+            SyncRuntimeQueryReply::Pages(pages) => pages
+                .into_iter()
+                .find(|page| page.path == path)
+                .and_then(|page| parse_page_id(&page.page_id).ok())
+                .unwrap_or_else(|| panic!("shared page {path:?} was not materialized")),
+            other => panic!("SQLite page list returned the wrong reply: {other:?}"),
+        }
     }
 
     fn publish_shared_batch(
@@ -21551,17 +21627,10 @@ mod tests {
             "fixture titles must share one canonical identity"
         );
         let (first, second, first_handle, second_handle) =
-            joined_shared_pair("concurrent-editor-title-unicode", 0xe700);
+            joined_empty_shared_pair("concurrent-editor-title-unicode", 0xe700);
         let target_path = "notes/physical-target.markdown";
-        let (target_batch, target_page_id, _, _) = submit_shared_page(
-            &first_handle,
-            0xe720,
-            "Concurrent Original",
-            target_path,
-            "target body",
-        );
-        publish_shared_batch(&first_handle, &first, target_batch);
-        settle_shared_provider(&first_handle);
+        let target_page_id =
+            admit_shared_page(&first_handle, &first, target_path, b"- target body\n");
         copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
         second_handle.observe_provider().unwrap();
         settle_shared_provider(&second_handle);
@@ -21785,29 +21854,15 @@ mod tests {
     #[test]
     fn concurrent_explicit_and_filename_fallback_titles_converge_in_both_winner_directions() {
         fn run_case(label: &str, seed: u128, first_is_explicit: bool) -> bool {
-            let (first, second, first_handle, second_handle) = joined_shared_pair(label, seed);
+            let (first, second, first_handle, second_handle) =
+                joined_empty_shared_pair(label, seed);
             let target_path = "notes/Café Plan.md";
-            let (target_batch, target_page_id, _, _) = submit_shared_page(
+            let target_page_id = admit_shared_page(
                 &first_handle,
-                seed + 0x20,
-                "Concurrent Original",
+                &first,
                 target_path,
-                "explicit versus fallback body",
+                b"title:: Concurrent Original\n\n- explicit versus fallback body\n",
             );
-            publish_shared_batch(&first_handle, &first, target_batch);
-            settle_shared_provider(&first_handle);
-            copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
-            second_handle.observe_provider().unwrap();
-            settle_shared_provider(&second_handle);
-            let common_title_batch = submit_durable(
-                &first_handle,
-                vec![SemanticOperation::SetPagePreamble {
-                    page_id: target_page_id,
-                    preamble: Some("title:: Concurrent Original".into()),
-                }],
-            );
-            publish_shared_batch(&first_handle, &first, common_title_batch);
-            settle_shared_provider(&first_handle);
             copy_provider_tree(&first.request.provider_root, &second.request.provider_root);
             second_handle.observe_provider().unwrap();
             settle_shared_provider(&second_handle);

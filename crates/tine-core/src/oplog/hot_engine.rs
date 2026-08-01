@@ -9100,13 +9100,15 @@ impl ShardedHotEngine {
     /// Preflight the authenticated scratch current-path trie before durable
     /// acceptance publication. The semantic effect bounds the touched page
     /// keys, while the validated prospective catalog supplies their actual
-    /// post-join state. The authored before/after rows are not current-state
-    /// authority when a concurrent old-base update arrives. This never reads
-    /// receipts, projections, or graph files.
+    /// post-join path state and the post-transition page-name root supplies the
+    /// selected exact name. The authored before/after rows are not
+    /// current-state authority when a concurrent old-base update arrives. This
+    /// never reads receipts, projections, or graph files.
     fn prepare_current_path_catalog_transition(
         &self,
         effect: &SemanticEffect,
         prospective_catalog_pages: Option<&BTreeMap<PageId, PageState>>,
+        post_page_name_root: &PageNameOwnershipRootV1,
         accepted_frontier_root: AcceptedFrontierRoot,
     ) -> Result<CurrentPathCatalogTransition, EngineError> {
         if effect.pages().len() > MAX_TRANSACTION_OPERATIONS {
@@ -9146,7 +9148,15 @@ impl ShardedHotEngine {
         for delta in effect.pages() {
             let after = prospective_catalog_pages
                 .and_then(|pages| pages.get(&delta.page_id))
-                .and_then(current_path_catalog_row_from_page_state);
+                .map(|state| {
+                    self.current_path_catalog_row_from_post_transition_authority(
+                        delta.page_id,
+                        state,
+                        post_page_name_root,
+                    )
+                })
+                .transpose()?
+                .flatten();
             if let Some(after) = &after {
                 if after.path.as_str().len() > MAX_CURRENT_PATH_CURSOR_PATH_BYTES {
                     return Err(EngineError::Archive(format!(
@@ -9201,6 +9211,34 @@ impl ShardedHotEngine {
                 accepted_frontier_root,
             },
         })
+    }
+
+    fn current_path_catalog_row_from_post_transition_authority(
+        &self,
+        page_id: PageId,
+        state: &PageState,
+        post_page_name_root: &PageNameOwnershipRootV1,
+    ) -> Result<Option<CurrentPathCatalogStoredRow>, EngineError> {
+        let PageState::Live { name, .. } = state else {
+            return Ok(None);
+        };
+        let key = name.key_digest();
+        let selection = self
+            .authenticated_page_name_exact_state(post_page_name_root, key)?
+            .ok_or_else(|| {
+                EngineError::Archive(
+                    "post-transition current-path row has no exact page-name authority".into(),
+                )
+            })?;
+        if selection.page_id() != page_id || selection.canonical_key() != key {
+            return Err(EngineError::Archive(
+                "post-transition current-path row has contradictory page-name ownership".into(),
+            ));
+        }
+        let mut row = current_path_catalog_row_from_page_state(state)
+            .expect("a live page always produces a current-path row");
+        row.accepted_name_digest = ContentDigest::of(selection.exact_name().as_str().as_bytes());
+        Ok(Some(row))
     }
 
     fn current_effective_path_catalog_row(
@@ -17314,12 +17352,17 @@ impl ShardedHotEngine {
                     SemanticDocumentSnapshot::Shard { .. } => None,
                 })
         });
+        let post_page_name_root = page_names
+            .as_ref()
+            .map(|candidate| &candidate.root)
+            .unwrap_or(&self.page_name_root);
         let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
             effective_view
                 .as_ref()
                 .expect("accepted batch has an effective semantic view")
                 .effect(),
             prospective_catalog_pages,
+            post_page_name_root,
             current_path_catalog_root,
         )?;
         let status_evidence = accepted_evidence.clone();
@@ -18987,9 +19030,14 @@ impl ShardedHotEngine {
                     SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
                     SemanticDocumentSnapshot::Shard { .. } => None,
                 });
+        let post_page_name_root = page_names
+            .as_ref()
+            .map(|candidate| &candidate.root)
+            .unwrap_or(&self.page_name_root);
         let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
             effective_view.effect(),
             prospective_catalog_pages,
+            post_page_name_root,
             current_path_catalog_root,
         )?;
         let status_evidence = accepted_evidence.clone();
