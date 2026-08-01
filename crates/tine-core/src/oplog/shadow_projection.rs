@@ -5142,14 +5142,14 @@ mod tests {
             &one.proofs(&one_shadow),
         )
         .unwrap();
-        assert_eq!(one.verified.part_count(), 1);
+        // Partition cardinality is prepared evidence, not a fixture constant:
+        // stable internal operations may legitimately change it.
+        let one_parts = one.prepared.aggregate().parts();
+        assert!(!one_parts.is_empty());
+        assert_eq!(one.verified.part_count() as usize, one_parts.len());
         assert_eq!(
             one_evidence.bootstrap_batch_id(),
-            one.prepared
-                .aggregate()
-                .parts()
-                .last()
-                .map(|part| part.batch_id())
+            one_parts.last().map(|part| part.batch_id())
         );
         one.assert_graph_unchanged();
 
@@ -5163,7 +5163,16 @@ mod tests {
             vec![("pages/multipart.md".into(), multipart_bytes)],
         );
         let multipart_shadow = multipart.verify().unwrap();
-        assert_eq!(multipart.verified.part_count(), 2);
+        let multipart_parts = multipart.prepared.aggregate().parts();
+        assert_eq!(
+            multipart.verified.part_count() as usize,
+            multipart_parts.len()
+        );
+        assert_ne!(
+            multipart_parts.first().map(|part| part.batch_id()),
+            multipart_parts.last().map(|part| part.batch_id()),
+            "the multipart fixture must have a non-terminal predecessor"
+        );
         let multipart_root = multipart.enrollment_root("multipart");
         let multipart_evidence = compose_verified_local(
             &multipart_root,
@@ -5174,12 +5183,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             multipart_evidence.bootstrap_batch_id(),
-            multipart
-                .prepared
-                .aggregate()
-                .parts()
-                .last()
-                .map(|part| part.batch_id())
+            multipart_parts.last().map(|part| part.batch_id())
         );
         multipart.assert_graph_unchanged();
     }

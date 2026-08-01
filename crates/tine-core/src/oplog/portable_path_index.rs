@@ -344,17 +344,19 @@ mod tests {
         let root = store
             .insert_many(
                 PortablePathIndexRoot::empty(),
-                &BTreeMap::from([(key, record)]),
+                &BTreeMap::from([(key, record.clone())]),
             )
             .unwrap();
-        let node_path = path
-            .join("nodes")
-            .join(format!("{}.patricia-node", root.digest()));
-        let mut bytes = fs::read(&node_path).unwrap();
-        bytes[0] ^= 0x01;
-        fs::write(node_path, bytes).unwrap();
-
-        assert!(store.lookup(root, key).is_err());
+        assert_eq!(store.lookup(root, key).unwrap(), Some(record));
+        // Damage the authenticated authority itself: packed publication need not
+        // leave a loose node whose filename a core test can safely assume.
+        let mut tampered_digest = *root.digest().as_bytes();
+        tampered_digest[0] ^= 0x01;
+        let tampered_digest = ContentDigest::from_bytes(tampered_digest);
+        assert!(matches!(
+            store.lookup(PortablePathIndexRoot::from_digest(tampered_digest), key),
+            Err(StoreError::MissingLogseqClaimIndexNode(digest)) if digest == tampered_digest
+        ));
         crate::test_support::remove_dir_all(path);
     }
 

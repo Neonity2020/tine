@@ -706,6 +706,16 @@ impl ReferenceCatalogStore {
         self.patricia.stats()
     }
 
+    #[cfg(test)]
+    fn corrupt_packed_node_for_test(
+        &self,
+        digest: ContentDigest,
+    ) -> Result<(), ReferenceCatalogError> {
+        self.patricia
+            .corrupt_packed_node_for_test(digest)
+            .map_err(store_error)
+    }
+
     fn publish_posting(
         &self,
         posting: &ReferenceSourcePostingV2,
@@ -3009,50 +3019,72 @@ mod tests {
 
     #[test]
     fn recovery_rejects_missing_and_tampered_reachable_nodes() {
-        for tamper in [false, true] {
-            let (path, catalog) = store(if tamper {
-                "recovery-tampered"
-            } else {
-                "recovery-missing"
-            });
-            let names = PageNameOwnershipRootV1::empty();
-            let uuid_root = ContentDigest::of(b"uuid");
-            let mut state = ReferenceCatalogStateV2::empty(
-                ReferenceCatalogPolicyV1::default(),
-                &names,
-                uuid_root,
-            )
-            .unwrap();
-            state.attach_store(Arc::clone(&catalog)).unwrap();
-            let candidate = state
-                .prepare(
-                    BTreeMap::from([(page(1), Some(source(page(1), "[[Target]]")))]),
-                    &names,
-                    uuid_root,
-                )
+        let names = PageNameOwnershipRootV1::empty();
+        let uuid_root = ContentDigest::of(b"uuid");
+
+        let (missing_path, missing_catalog) = store("recovery-missing");
+        let mut missing_state =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
                 .unwrap();
-            state.commit(candidate);
-            let root = state.root().clone();
-            let node = path
-                .join("reference-catalog-v2")
-                .join("nodes")
-                .join(format!("{}.patricia-node", root.facts_root()));
-            if tamper {
-                std::fs::write(&node, b"tampered").unwrap();
-            } else {
-                std::fs::remove_file(&node).unwrap();
-            }
-            let mut reopened = ReferenceCatalogStateV2::restore_recovery_required(
-                ReferenceCatalogPolicyV1::default(),
-                root,
+        missing_state
+            .attach_store(Arc::clone(&missing_catalog))
+            .unwrap();
+        let candidate = missing_state
+            .prepare(
+                BTreeMap::from([(page(1), Some(source(page(1), "[[Target]]")))]),
                 &names,
                 uuid_root,
-                catalog,
             )
             .unwrap();
-            assert!(reopened.finish_recovery().is_err());
-            let _ = std::fs::remove_dir_all(path);
-        }
+        missing_state.commit(candidate);
+        let mut missing_root = missing_state.root().clone();
+        missing_root.facts_root = ContentDigest::of(b"missing reference catalog facts root");
+        let mut missing_reopened = ReferenceCatalogStateV2::restore_recovery_required(
+            ReferenceCatalogPolicyV1::default(),
+            missing_root,
+            &names,
+            uuid_root,
+            missing_catalog,
+        )
+        .unwrap();
+        assert!(matches!(
+            missing_reopened.finish_recovery(),
+            Err(ReferenceCatalogError::Store(error)) if error.contains("node") && error.contains("is missing")
+        ));
+        let _ = std::fs::remove_dir_all(missing_path);
+
+        let (tampered_path, tampered_catalog) = store("recovery-tampered");
+        let mut tampered_state =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        tampered_state
+            .attach_store(Arc::clone(&tampered_catalog))
+            .unwrap();
+        let candidate = tampered_state
+            .prepare(
+                BTreeMap::from([(page(1), Some(source(page(1), "[[Target]]")))]),
+                &names,
+                uuid_root,
+            )
+            .unwrap();
+        tampered_state.commit(candidate);
+        let tampered_root = tampered_state.root().clone();
+        tampered_catalog
+            .corrupt_packed_node_for_test(tampered_root.facts_root)
+            .unwrap();
+        let mut tampered_reopened = ReferenceCatalogStateV2::restore_recovery_required(
+            ReferenceCatalogPolicyV1::default(),
+            tampered_root,
+            &names,
+            uuid_root,
+            tampered_catalog,
+        )
+        .unwrap();
+        assert!(matches!(
+            tampered_reopened.finish_recovery(),
+            Err(ReferenceCatalogError::Store(error)) if error.contains("bytes do not match path")
+        ));
+        let _ = std::fs::remove_dir_all(tampered_path);
     }
 
     #[test]

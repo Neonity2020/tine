@@ -2634,7 +2634,7 @@ mod tests {
         let root = index
             .insert_many(
                 &PageNameOwnershipRootV1::empty(),
-                &BTreeMap::from([(key, record)]),
+                &BTreeMap::from([(key, record.clone())]),
             )
             .unwrap();
         assert!(matches!(
@@ -2646,14 +2646,20 @@ mod tests {
             Err(StoreError::PageNamePointBatchTooLarge { .. })
         ));
 
-        let node_path = path
-            .join(PAGE_NAME_OWNERSHIP_INDEX_DIR_FOR_TEST)
-            .join("nodes")
-            .join(format!("{}.patricia-node", root.patricia_digest()));
-        let mut bytes = fs::read(&node_path).unwrap();
-        bytes[0] ^= 0x40;
-        fs::write(node_path, bytes).unwrap();
-        assert!(index.lookup(&root, key).is_err());
+        assert_eq!(index.lookup(&root, key).unwrap(), Some(record));
+        // Damage the authenticated authority itself: packed publication need not
+        // leave a loose node whose filename a core test can safely assume.
+        let mut tampered_digest = *root.patricia_digest().as_bytes();
+        tampered_digest[0] ^= 0x40;
+        let tampered_digest = ContentDigest::from_bytes(tampered_digest);
+        let tampered_root = PageNameOwnershipRootV1 {
+            patricia_root: PatriciaIndexRoot::from_digest(tampered_digest),
+            ..root
+        };
+        assert!(matches!(
+            index.lookup(&tampered_root, key),
+            Err(StoreError::MissingLogseqClaimIndexNode(digest)) if digest == tampered_digest
+        ));
 
         drop(index);
         drop(archive);

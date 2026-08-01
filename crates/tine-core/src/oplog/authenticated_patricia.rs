@@ -74,6 +74,16 @@ impl PatriciaIndexStore {
         self.storage.stats()
     }
 
+    #[cfg(test)]
+    pub(crate) fn corrupt_packed_node_for_test(
+        &self,
+        digest: tine_storage::ContentDigest,
+    ) -> Result<(), StoreError> {
+        self.storage
+            .corrupt_packed_node_for_test(digest)
+            .map_err(map_storage_error)
+    }
+
     pub(crate) fn validate_root(&self, root: PatriciaIndexRoot) -> Result<(), StoreError> {
         self.storage.validate_root(root).map_err(map_storage_error)
     }
