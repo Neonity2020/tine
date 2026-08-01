@@ -2663,66 +2663,70 @@ fn a_zero_part_bootstrap_promotes_at_the_empty_anchor() {
 /// Partial, truncated, and foreign residue fails closed and is preserved.
 #[test]
 fn promotion_state_residue_fails_closed_and_preserves_evidence() {
-    let mut fixture = Fixture::new(
-        "promote-residue",
-        None,
-        vec![("pages/residue.md".into(), b"- residue\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("promote-residue");
-    let paths = PromotedPaths::new(&fixture, "residue");
-    let session = SessionId::new();
-    let authority = activate_verified_local(
-        &root,
-        fixture.compose(&root),
-        session,
-        &fixture.proofs(),
-        &fixture.runtime(),
-    )
-    .unwrap();
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "promote-residue",
+            None,
+            vec![("pages/residue.md".into(), b"- residue\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("promote-residue");
+        let paths = PromotedPaths::new(&fixture, "residue");
+        let session = SessionId::new();
+        let authority = activate_verified_local(
+            &root,
+            fixture.compose(&root),
+            session,
+            &fixture.proofs(),
+            &fixture.runtime(),
+        )
+        .unwrap();
 
-    // The pre-publication cut: no state file at all reopens as the unchanged
-    // inactive bootstrap, and a promoted open refuses.
-    let state_path = promotion_state_path(&fixture);
-    assert!(!state_path.exists());
-    let binding = fixture.enrollment_binding();
-    assert!(
-        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).is_err(),
-        "an unpromoted archive must never open a promoted runtime"
-    );
-
-    let sealed =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    let committed = fs::read(&state_path).unwrap();
-
-    // Truncated residue at every prefix fails closed rather than being
-    // repaired or partially believed.
-    for cut in [0, 1, committed.len() / 2, committed.len() - 1] {
-        fs::write(&state_path, &committed[..cut]).unwrap();
+        // The pre-publication cut: no state file at all reopens as the unchanged
+        // inactive bootstrap, and a promoted open refuses.
+        let state_path = promotion_state_path(&fixture);
+        assert!(!state_path.exists());
+        let binding = fixture.enrollment_binding();
         assert!(
             reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).is_err(),
-            "a truncated promotion state must fail closed at cut {cut}"
+            "an unpromoted archive must never open a promoted runtime"
         );
-        assert!(state_path.exists(), "evidence must be preserved");
-    }
 
-    // A byte-flipped, non-canonical, or foreign claim also fails closed.
-    let mut corrupt = committed.clone();
-    let last = corrupt.len() - 1;
-    corrupt[last] ^= 0xff;
-    fs::write(&state_path, &corrupt).unwrap();
-    assert!(
-        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).is_err()
-    );
+        let sealed =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        let committed = fs::read(&state_path).unwrap();
 
-    // Restoring the exact committed bytes resumes the one promoted state.
-    fs::write(&state_path, &committed).unwrap();
-    let bootstrap = fixture.take_bootstrap_session();
-    let runtime = bootstrap
-        .promote(sealed, &authority, &paths.open(&fixture))
-        .map_err(|refusal| refusal.into_parts().1)
-        .unwrap();
-    assert_eq!(runtime.session_id(), session);
-    fixture.assert_graph_unchanged();
+        // Truncated residue at every prefix fails closed rather than being
+        // repaired or partially believed.
+        for cut in [0, 1, committed.len() / 2, committed.len() - 1] {
+            fs::write(&state_path, &committed[..cut]).unwrap();
+            assert!(
+                reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture))
+                    .is_err(),
+                "a truncated promotion state must fail closed at cut {cut}"
+            );
+            assert!(state_path.exists(), "evidence must be preserved");
+        }
+
+        // A byte-flipped, non-canonical, or foreign claim also fails closed.
+        let mut corrupt = committed.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        fs::write(&state_path, &corrupt).unwrap();
+        assert!(
+            reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).is_err()
+        );
+
+        // Restoring the exact committed bytes resumes the one promoted state.
+        fs::write(&state_path, &committed).unwrap();
+        let bootstrap = fixture.take_bootstrap_session();
+        let runtime = bootstrap
+            .promote(sealed, &authority, &paths.open(&fixture))
+            .map_err(|refusal| refusal.into_parts().1)
+            .unwrap();
+        assert_eq!(runtime.session_id(), session);
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// A restarted process holds no evidence, no authority, no sealed promotion,
@@ -2779,90 +2783,92 @@ fn a_fresh_process_reopens_the_promoted_runtime_with_no_retained_evidence() {
 /// the current frontier is reopened, and one more mutation is admitted.
 #[test]
 fn local_batches_extend_the_bootstrap_anchor_and_restart_proves_exact_ancestry() {
-    let mut fixture = Fixture::new(
-        "promote-append",
-        None,
-        vec![("pages/seed.md".into(), b"- seed\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("promote-append");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "append");
-    let session = SessionId::new();
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "promote-append",
+            None,
+            vec![("pages/seed.md".into(), b"- seed\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("promote-append");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "append");
+        let session = SessionId::new();
 
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
-    let anchor = runtime.bootstrap_anchor();
-    let anchor_frontier = runtime.engine().accepted_frontier_root().unwrap();
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+        let anchor = runtime.bootstrap_anchor();
+        let anchor_frontier = runtime.engine().accepted_frontier_root().unwrap();
 
-    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9200);
-    let after_one = runtime.engine().durable_history_authority().unwrap();
-    assert!(
-        after_one.generation > anchor.generation,
-        "an ordinary local batch must extend the durable history"
-    );
-    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9300);
-    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9400);
-    let advanced = runtime.engine().durable_history_authority().unwrap();
-    let advanced_frontier = runtime.engine().accepted_frontier_root().unwrap();
-    assert_eq!(advanced.generation, anchor.generation + 3);
-    assert!(advanced_frontier.acceptance_sequence() > anchor_frontier.acceptance_sequence());
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0x9200);
+        let after_one = runtime.engine().durable_history_authority().unwrap();
+        assert!(
+            after_one.generation > anchor.generation,
+            "an ordinary local batch must extend the durable history"
+        );
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0x9300);
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0x9400);
+        let advanced = runtime.engine().durable_history_authority().unwrap();
+        let advanced_frontier = runtime.engine().accepted_frontier_root().unwrap();
+        assert_eq!(advanced.generation, anchor.generation + 3);
+        assert!(advanced_frontier.acceptance_sequence() > anchor_frontier.acceptance_sequence());
 
-    // The advanced history is still an authenticated descendant of the exact
-    // bootstrap anchor, proved from the shared radix structure.
-    let transition = runtime
-        .engine()
-        .authenticate_history_descends_from(anchor)
-        .unwrap();
-    assert_eq!(transition.before(), anchor);
-    assert_eq!(transition.after(), advanced);
-
-    drop(runtime);
-    drop(authority);
-
-    // Restart: the anchor is reconstructed from durable state alone, the live
-    // history is proved to descend from it, and the current frontier reopens.
-    let (mut authority, mut runtime) =
-        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
-    assert_eq!(
-        runtime.bootstrap_anchor(),
-        anchor,
-        "restart must reconstruct the exact original bootstrap anchor"
-    );
-    assert_eq!(
-        runtime.engine().durable_history_authority().unwrap(),
-        advanced
-    );
-    assert!(
-        runtime
+        // The advanced history is still an authenticated descendant of the exact
+        // bootstrap anchor, proved from the shared radix structure.
+        let transition = runtime
             .engine()
-            .accepted_frontier_root()
-            .unwrap()
-            .same_accepted_authority(&advanced_frontier),
-        "an adopted run may relocate the scratch page but must retain the exact accepted authority"
-    );
-    assert!(
-        runtime
-            .database()
-            .frontier_root()
-            .unwrap()
-            .same_accepted_authority(&advanced_frontier),
-        "SQLite must reopen the exact accepted authority"
-    );
+            .authenticate_history_descends_from(anchor)
+            .unwrap();
+        assert_eq!(transition.before(), anchor);
+        assert_eq!(transition.after(), advanced);
 
-    // One more mutation is admitted after the restart.
-    append_local_batch(&fixture, &mut authority, &mut runtime, 0x9500);
-    assert_eq!(
-        runtime
-            .engine()
-            .durable_history_authority()
-            .unwrap()
-            .generation,
-        anchor.generation + 4
-    );
-    assert_eq!(
-        enrollment_head(&root, &binding),
-        authority.enrollment_head()
-    );
-    fixture.assert_graph_unchanged();
+        drop(runtime);
+        drop(authority);
+
+        // Restart: the anchor is reconstructed from durable state alone, the live
+        // history is proved to descend from it, and the current frontier reopens.
+        let (mut authority, mut runtime) =
+            reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+        assert_eq!(
+            runtime.bootstrap_anchor(),
+            anchor,
+            "restart must reconstruct the exact original bootstrap anchor"
+        );
+        assert_eq!(
+            runtime.engine().durable_history_authority().unwrap(),
+            advanced
+        );
+        assert!(
+            runtime
+                .engine()
+                .accepted_frontier_root()
+                .unwrap()
+                .same_accepted_authority(&advanced_frontier),
+            "an adopted run may relocate the scratch page but must retain the exact accepted authority"
+        );
+        assert!(
+            runtime
+                .database()
+                .frontier_root()
+                .unwrap()
+                .same_accepted_authority(&advanced_frontier),
+            "SQLite must reopen the exact accepted authority"
+        );
+
+        // One more mutation is admitted after the restart.
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0x9500);
+        assert_eq!(
+            runtime
+                .engine()
+                .durable_history_authority()
+                .unwrap()
+                .generation,
+            anchor.generation + 4
+        );
+        assert_eq!(
+            enrollment_head(&root, &binding),
+            authority.enrollment_head()
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// The original `VerifiedLocal` bootstrap proof stays reopenable after the
@@ -2923,79 +2929,81 @@ fn the_original_bootstrap_anchor_stays_reopenable_after_the_history_advances() {
 /// before any durable or graph mutation.
 #[test]
 fn a_promoted_admission_rejects_substituted_runtime_components() {
-    let mut fixture = Fixture::new(
-        "promote-substitute",
-        None,
-        vec![("pages/subject.md".into(), b"- subject\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("promote-substitute");
-    let paths = PromotedPaths::new(&fixture, "substitute");
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
-
-    let mut foreign = Fixture::new(
-        "promote-substitute-foreign",
-        None,
-        vec![("pages/foreign.md".into(), b"- foreign\n".to_vec())],
-    );
-    let foreign_root = foreign.enrollment_root("substitute-foreign");
-    let foreign_paths = PromotedPaths::new(&foreign, "substitute-foreign");
-    let (mut foreign_authority, mut foreign_runtime) = promote(
-        &mut foreign,
-        &foreign_root,
-        SessionId::new(),
-        &foreign_paths,
-    );
-
-    let advanced_before = runtime.engine().durable_history_authority().unwrap();
-    let foreign_before = foreign_runtime
-        .engine()
-        .durable_history_authority()
-        .unwrap();
-
-    // A foreign graph is refused.
-    assert!(runtime
-        .admit_promoted_mutation(&mut authority, &foreign.graph)
-        .is_err());
-    // A foreign authority is refused for this runtime.
-    assert!(runtime
-        .admit_promoted_mutation(&mut foreign_authority, &fixture.graph)
-        .is_err());
-    // A foreign runtime is refused for this authority.
-    assert!(foreign_runtime
-        .admit_promoted_mutation(&mut authority, &foreign.graph)
-        .is_err());
-
-    // A genuine admission refuses a substituted engine, including one built
-    // over the very same enrolled identity.
-    {
-        let session = runtime
-            .admit_promoted_mutation(&mut authority, &fixture.graph)
-            .unwrap();
-        let admission = session.admission();
-        let substitute = fixture.runtime_engine("substitute");
-        assert!(
-            admission.authorize(&fixture.graph, &substitute).is_err(),
-            "a same-identity engine from another history must be refused"
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "promote-substitute",
+            None,
+            vec![("pages/subject.md".into(), b"- subject\n".to_vec())],
         );
-        assert!(admission
-            .authorize(&foreign.graph, foreign_runtime.engine())
-            .is_err());
-    }
+        let root = fixture.enrollment_root("promote-substitute");
+        let paths = PromotedPaths::new(&fixture, "substitute");
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
 
-    assert_eq!(
-        runtime.engine().durable_history_authority().unwrap(),
-        advanced_before,
-        "a refused admission must advance no durable history"
-    );
-    assert_eq!(
-        foreign_runtime
+        let mut foreign = Fixture::new(
+            "promote-substitute-foreign",
+            None,
+            vec![("pages/foreign.md".into(), b"- foreign\n".to_vec())],
+        );
+        let foreign_root = foreign.enrollment_root("substitute-foreign");
+        let foreign_paths = PromotedPaths::new(&foreign, "substitute-foreign");
+        let (mut foreign_authority, mut foreign_runtime) = promote(
+            &mut foreign,
+            &foreign_root,
+            SessionId::new(),
+            &foreign_paths,
+        );
+
+        let advanced_before = runtime.engine().durable_history_authority().unwrap();
+        let foreign_before = foreign_runtime
             .engine()
             .durable_history_authority()
-            .unwrap(),
-        foreign_before
-    );
-    fixture.assert_graph_unchanged();
-    foreign.assert_graph_unchanged();
+            .unwrap();
+
+        // A foreign graph is refused.
+        assert!(runtime
+            .admit_promoted_mutation(&mut authority, &foreign.graph)
+            .is_err());
+        // A foreign authority is refused for this runtime.
+        assert!(runtime
+            .admit_promoted_mutation(&mut foreign_authority, &fixture.graph)
+            .is_err());
+        // A foreign runtime is refused for this authority.
+        assert!(foreign_runtime
+            .admit_promoted_mutation(&mut authority, &foreign.graph)
+            .is_err());
+
+        // A genuine admission refuses a substituted engine, including one built
+        // over the very same enrolled identity.
+        {
+            let session = runtime
+                .admit_promoted_mutation(&mut authority, &fixture.graph)
+                .unwrap();
+            let admission = session.admission();
+            let substitute = fixture.runtime_engine("substitute");
+            assert!(
+                admission.authorize(&fixture.graph, &substitute).is_err(),
+                "a same-identity engine from another history must be refused"
+            );
+            assert!(admission
+                .authorize(&foreign.graph, foreign_runtime.engine())
+                .is_err());
+        }
+
+        assert_eq!(
+            runtime.engine().durable_history_authority().unwrap(),
+            advanced_before,
+            "a refused admission must advance no durable history"
+        );
+        assert_eq!(
+            foreign_runtime
+                .engine()
+                .durable_history_authority()
+                .unwrap(),
+            foreign_before
+        );
+        fixture.assert_graph_unchanged();
+        foreign.assert_graph_unchanged();
+    });
 }
 
 /// The bootstrap-anchor ancestry proof is bounded. An unchanged history costs
@@ -3339,46 +3347,50 @@ fn promotion_publication_binds_the_exact_retained_archive_capability() {
 /// caller that reaches promoted state some other way inherits the same refusal.
 #[test]
 fn a_byte_identical_copy_of_a_promoted_archive_is_refused_at_the_state_boundary() {
-    let mut fixture = Fixture::new(
-        "promote-copied-archive",
-        None,
-        vec![("pages/copied.md".into(), b"- copied\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("promote-copied-archive");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "copied");
-    let session = SessionId::new();
-    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
-    drop(runtime);
-    drop(authority);
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "promote-copied-archive",
+            None,
+            vec![("pages/copied.md".into(), b"- copied\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("promote-copied-archive");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "copied");
+        let session = SessionId::new();
+        let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+        drop(runtime);
+        drop(authority);
 
-    // A byte-identical recursive copy of the whole promoted archive, including
-    // its committed promotion state. Only directory identity differs.
-    let copy = fixture.root.path().join("archive-copy");
-    copy_tree(&fixture.archive_root, &copy);
-    assert_eq!(
-        snapshot_file_digests(&fixture.archive_root),
-        snapshot_file_digests(&copy)
-    );
-    assert!(promotion_state_path_in(&copy, &fixture).exists());
+        // A byte-identical recursive copy of the whole promoted archive, including
+        // its committed promotion state. Only directory identity differs.
+        let copy = fixture.root.path().join("archive-copy");
+        copy_tree(&fixture.archive_root, &copy);
+        assert_eq!(
+            snapshot_file_digests(&fixture.archive_root),
+            snapshot_file_digests(&copy)
+        );
+        assert!(promotion_state_path_in(&copy, &fixture).exists());
 
-    let copied_paths = PromotedPaths::new(&fixture, "copied-target");
-    fixture.archive_root = copy.clone();
-    let error =
-        reopen_promoted_local_runtime(&root, &binding, session, &copied_paths.open(&fixture))
-            .err()
-            .expect("a foreign archive must never adopt another archive's promotion state");
-    assert!(
-        matches!(
-            error,
-            RuntimePromotionError::Store(crate::oplog::StoreError::PromotedRuntimeStateMismatch(_))
-        ),
-        "the refusal must come from the promoted-state boundary, not a later mint: {error}"
-    );
-    // The refusal happened before any promoted runtime existed, so the copy
-    // gained no device-local projection at all.
-    assert!(!copied_paths.database_path.exists());
-    fixture.assert_graph_unchanged();
+        let copied_paths = PromotedPaths::new(&fixture, "copied-target");
+        fixture.archive_root = copy.clone();
+        let error =
+            reopen_promoted_local_runtime(&root, &binding, session, &copied_paths.open(&fixture))
+                .err()
+                .expect("a foreign archive must never adopt another archive's promotion state");
+        assert!(
+            matches!(
+                error,
+                RuntimePromotionError::Store(
+                    crate::oplog::StoreError::PromotedRuntimeStateMismatch(_)
+                )
+            ),
+            "the refusal must come from the promoted-state boundary, not a later mint: {error}"
+        );
+        // The refusal happened before any promoted runtime existed, so the copy
+        // gained no device-local projection at all.
+        assert!(!copied_paths.database_path.exists());
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// The promoted-state boundary authenticates the canonical archive-resource
@@ -3583,140 +3595,142 @@ fn assert_promoted_reopen_refuses_a_tampered_archive_claim(
 /// an instrument that could not see it would fail here.
 #[test]
 fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
-    // Two operations per part over a six-operation graph partitions into
-    // exactly three parts, deterministically and without a four-thousand-block
-    // fixture. Only the partition boundary is forced: every part is authored,
-    // published, installed, and replayed through the ordinary path.
-    force_next_bootstrap_part_operation_limit(2);
-    let mut fixture = Fixture::new(
-        "promote-stream-parts",
-        None,
-        vec![
-            (
-                "pages/anchor.md".into(),
-                b"title:: Streamed anchor\n\n- one\n- two\n- three\n".to_vec(),
-            ),
-            // Real reference evidence, so the promoted open performs the
-            // authenticated recovery replay rather than skipping it.
-            (
-                "pages/referrer.md".into(),
-                "- see [[Streamed anchor]] and #tag\n".as_bytes().to_vec(),
-            ),
-        ],
-    );
-    let part_count = fixture.verified.part_count() as usize;
-    assert!(
-        part_count >= 3,
-        "the streaming regression needs a genuinely multi-part bootstrap: {part_count}"
-    );
+    on_a_deep_stack(|| {
+        // Two operations per part over a six-operation graph partitions into
+        // exactly three parts, deterministically and without a four-thousand-block
+        // fixture. Only the partition boundary is forced: every part is authored,
+        // published, installed, and replayed through the ordinary path.
+        force_next_bootstrap_part_operation_limit(2);
+        let mut fixture = Fixture::new(
+            "promote-stream-parts",
+            None,
+            vec![
+                (
+                    "pages/anchor.md".into(),
+                    b"title:: Streamed anchor\n\n- one\n- two\n- three\n".to_vec(),
+                ),
+                // Real reference evidence, so the promoted open performs the
+                // authenticated recovery replay rather than skipping it.
+                (
+                    "pages/referrer.md".into(),
+                    "- see [[Streamed anchor]] and #tag\n".as_bytes().to_vec(),
+                ),
+            ],
+        );
+        let part_count = fixture.verified.part_count() as usize;
+        assert!(
+            part_count >= 3,
+            "the streaming regression needs a genuinely multi-part bootstrap: {part_count}"
+        );
 
-    let root = fixture.enrollment_root("promote-stream-parts");
-    let binding = fixture.enrollment_binding();
-    let mut paths = PromotedPaths::new(&fixture, "stream-parts");
-    // Production activation promotes the already-verified bootstrap database
-    // in place. Use that exact path so this receipt also proves the successful
-    // one-shot path opens existing SQLite without a rebuild.
-    paths.database_path = fixture.root.path().join("bootstrap.sqlite");
-    let session = SessionId::new();
-    let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
+        let root = fixture.enrollment_root("promote-stream-parts");
+        let binding = fixture.enrollment_binding();
+        let mut paths = PromotedPaths::new(&fixture, "stream-parts");
+        // Production activation promotes the already-verified bootstrap database
+        // in place. Use that exact path so this receipt also proves the successful
+        // one-shot path opens existing SQLite without a rebuild.
+        paths.database_path = fixture.root.path().join("bootstrap.sqlite");
+        let session = SessionId::new();
+        let (authority, runtime) = promote(&mut fixture, &root, session, &paths);
 
-    let same_process = runtime.engine().bootstrap_recovery_instrumentation();
-    assert_eq!(
-        same_process.bootstrap_part_reads,
-        0,
-        "same-process promotion must not reread bootstrap parts: {:?}",
-        runtime.resume_open_status()
-    );
-    assert_eq!(same_process.bootstrap_object_reads, 0);
-    assert_eq!(same_process.max_live_bootstrap_parts, 0);
-    let same_process_resume = runtime.resume_open_status().observation();
-    assert!(same_process_resume.adopted);
-    assert_eq!(
-        same_process_resume.replay_base_generation,
-        part_count as u64
-    );
-    assert_eq!(
-        same_process_resume.live_history_generation,
-        part_count as u64
-    );
-    assert_eq!(same_process_resume.replayed_generations, 0);
-    assert!(matches!(
-        runtime.projection().recovery,
-        crate::oplog::sqlite::ProjectionRecovery::OpenedExisting
-    ));
-    assert_eq!(
-        runtime.projection().rebuild,
-        crate::oplog::sqlite::RebuildInstrumentation::default(),
-        "same-process promotion must use the verified projection without rebuilding"
-    );
+        let same_process = runtime.engine().bootstrap_recovery_instrumentation();
+        assert_eq!(
+            same_process.bootstrap_part_reads,
+            0,
+            "same-process promotion must not reread bootstrap parts: {:?}",
+            runtime.resume_open_status()
+        );
+        assert_eq!(same_process.bootstrap_object_reads, 0);
+        assert_eq!(same_process.max_live_bootstrap_parts, 0);
+        let same_process_resume = runtime.resume_open_status().observation();
+        assert!(same_process_resume.adopted);
+        assert_eq!(
+            same_process_resume.replay_base_generation,
+            part_count as u64
+        );
+        assert_eq!(
+            same_process_resume.live_history_generation,
+            part_count as u64
+        );
+        assert_eq!(same_process_resume.replayed_generations, 0);
+        assert!(matches!(
+            runtime.projection().recovery,
+            crate::oplog::sqlite::ProjectionRecovery::OpenedExisting
+        ));
+        assert_eq!(
+            runtime.projection().rebuild,
+            crate::oplog::sqlite::RebuildInstrumentation::default(),
+            "same-process promotion must use the verified projection without rebuilding"
+        );
 
-    // The instrument itself is exercised against the forbidden shape. Holding
-    // every loaded/prepared part at once reads the exact same parts and the
-    // exact same objects as the streaming replay — only ownership overlaps
-    // differ — so the residency counter is what separates the two, not the
-    // accounting of reads.
-    let (preloaded, live_after_release) = runtime
-        .engine()
-        .probe_preloaded_bootstrap_part_residency()
-        .unwrap();
-    assert_eq!(preloaded.bootstrap_part_reads, part_count);
-    assert!(preloaded.bootstrap_object_reads > 0);
-    assert_eq!(
-        preloaded.max_live_bootstrap_parts, part_count,
-        "holding every prepared part at once must be visible as {part_count} resident parts"
-    );
-    assert!(
-        preloaded.max_live_bootstrap_parts > same_process.max_live_bootstrap_parts,
-        "the streaming replay must own strictly fewer parts at once than a preload"
-    );
-    assert_eq!(
-        live_after_release, 0,
-        "dropping the owned payloads must release every counted residency"
-    );
-    // The probe must not have disturbed the engine's own instrumentation.
-    assert_eq!(
-        runtime.engine().bootstrap_recovery_instrumentation(),
-        same_process
-    );
+        // The instrument itself is exercised against the forbidden shape. Holding
+        // every loaded/prepared part at once reads the exact same parts and the
+        // exact same objects as the streaming replay — only ownership overlaps
+        // differ — so the residency counter is what separates the two, not the
+        // accounting of reads.
+        let (preloaded, live_after_release) = runtime
+            .engine()
+            .probe_preloaded_bootstrap_part_residency()
+            .unwrap();
+        assert_eq!(preloaded.bootstrap_part_reads, part_count);
+        assert!(preloaded.bootstrap_object_reads > 0);
+        assert_eq!(
+            preloaded.max_live_bootstrap_parts, part_count,
+            "holding every prepared part at once must be visible as {part_count} resident parts"
+        );
+        assert!(
+            preloaded.max_live_bootstrap_parts > same_process.max_live_bootstrap_parts,
+            "the streaming replay must own strictly fewer parts at once than a preload"
+        );
+        assert_eq!(
+            live_after_release, 0,
+            "dropping the owned payloads must release every counted residency"
+        );
+        // The probe must not have disturbed the engine's own instrumentation.
+        assert_eq!(
+            runtime.engine().bootstrap_recovery_instrumentation(),
+            same_process
+        );
 
-    let same_process_observation = public_runtime_observation(&runtime);
+        let same_process_observation = public_runtime_observation(&runtime);
 
-    // A restarted process reconstructs everything from durable state; full
-    // replay and its aggregate-backed part validation remain mandatory.
-    drop(runtime);
-    drop(authority);
-    remove_every_resume_point(&fixture.archive_root);
-    let (_reopened_authority, reopened) =
-        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
-    let fresh_process = reopened.engine().bootstrap_recovery_instrumentation();
-    assert_eq!(fresh_process.bootstrap_part_reads, part_count);
-    assert_eq!(
-        fresh_process.bootstrap_object_reads,
-        preloaded.bootstrap_object_reads
-    );
-    assert_eq!(fresh_process.max_live_bootstrap_parts, 1);
-    let fresh_resume = reopened.resume_open_status().observation();
-    assert!(!fresh_resume.adopted);
-    assert_eq!(fresh_resume.replay_base_generation, 0);
-    assert_eq!(fresh_resume.live_history_generation, part_count as u64);
-    assert_eq!(fresh_resume.replayed_generations, part_count as u64);
-    let (fresh_preloaded, fresh_live_after_release) = reopened
-        .engine()
-        .probe_preloaded_bootstrap_part_residency()
-        .unwrap();
-    assert_eq!(fresh_preloaded, preloaded);
-    assert_eq!(fresh_live_after_release, 0);
-    assert_eq!(
-        reopened.engine().bootstrap_recovery_instrumentation(),
-        fresh_process
-    );
-    let fresh_process_observation = public_runtime_observation(&reopened);
-    assert_publicly_indistinguishable(
-        &same_process_observation,
-        &fresh_process_observation,
-        "same-process bootstrap migration versus fresh full replay",
-    );
-    fixture.assert_graph_unchanged();
+        // A restarted process reconstructs everything from durable state; full
+        // replay and its aggregate-backed part validation remain mandatory.
+        drop(runtime);
+        drop(authority);
+        remove_every_resume_point(&fixture.archive_root);
+        let (_reopened_authority, reopened) =
+            reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
+        let fresh_process = reopened.engine().bootstrap_recovery_instrumentation();
+        assert_eq!(fresh_process.bootstrap_part_reads, part_count);
+        assert_eq!(
+            fresh_process.bootstrap_object_reads,
+            preloaded.bootstrap_object_reads
+        );
+        assert_eq!(fresh_process.max_live_bootstrap_parts, 1);
+        let fresh_resume = reopened.resume_open_status().observation();
+        assert!(!fresh_resume.adopted);
+        assert_eq!(fresh_resume.replay_base_generation, 0);
+        assert_eq!(fresh_resume.live_history_generation, part_count as u64);
+        assert_eq!(fresh_resume.replayed_generations, part_count as u64);
+        let (fresh_preloaded, fresh_live_after_release) = reopened
+            .engine()
+            .probe_preloaded_bootstrap_part_residency()
+            .unwrap();
+        assert_eq!(fresh_preloaded, preloaded);
+        assert_eq!(fresh_live_after_release, 0);
+        assert_eq!(
+            reopened.engine().bootstrap_recovery_instrumentation(),
+            fresh_process
+        );
+        let fresh_process_observation = public_runtime_observation(&reopened);
+        assert_publicly_indistinguishable(
+            &same_process_observation,
+            &fresh_process_observation,
+            "same-process bootstrap migration versus fresh full replay",
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// A process token is an accelerator, never authority. If its exact typed
@@ -3724,38 +3738,40 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
 /// held and the unchanged ordinary full replay path constructs the runtime.
 #[test]
 fn a_same_process_promotion_token_mismatch_falls_back_under_the_retained_lease() {
-    force_next_bootstrap_part_operation_limit(1);
-    let mut fixture = Fixture::new(
-        "promotion-token-mismatch",
-        None,
-        vec![(
-            "pages/token.md".into(),
-            b"title:: Token\n\n- one\n- two\n".to_vec(),
-        )],
-    );
-    let part_count = fixture.verified.part_count() as usize;
-    assert!(part_count > 1);
-    let root = fixture.enrollment_root("promotion-token-mismatch");
-    let paths = PromotedPaths::new(&fixture, "promotion-token-mismatch");
-    let session = SessionId::new();
+    on_a_deep_stack(|| {
+        force_next_bootstrap_part_operation_limit(1);
+        let mut fixture = Fixture::new(
+            "promotion-token-mismatch",
+            None,
+            vec![(
+                "pages/token.md".into(),
+                b"title:: Token\n\n- one\n- two\n".to_vec(),
+            )],
+        );
+        let part_count = fixture.verified.part_count() as usize;
+        assert!(part_count > 1);
+        let root = fixture.enrollment_root("promotion-token-mismatch");
+        let paths = PromotedPaths::new(&fixture, "promotion-token-mismatch");
+        let session = SessionId::new();
 
-    mismatch_next_same_process_promotion_token_for_test();
-    let before = PromotedRuntimeInstrumentation::capture();
-    let (_authority, runtime) = promote(&mut fixture, &root, session, &paths);
-    let replay = runtime.engine().bootstrap_recovery_instrumentation();
-    assert_eq!(replay.bootstrap_part_reads, part_count);
-    assert!(replay.bootstrap_object_reads > 0);
-    assert_eq!(replay.max_live_bootstrap_parts, 1);
-    let observation = runtime.resume_open_status().observation();
-    assert!(!observation.adopted);
-    assert_eq!(observation.replay_base_generation, 0);
-    assert_eq!(observation.replayed_generations, part_count as u64);
-    assert_eq!(
-        before.since().workspace_lease_acquisitions,
-        0,
-        "discarding the token must not release and reacquire the workspace lease"
-    );
-    fixture.assert_graph_unchanged();
+        mismatch_next_same_process_promotion_token_for_test();
+        let before = PromotedRuntimeInstrumentation::capture();
+        let (_authority, runtime) = promote(&mut fixture, &root, session, &paths);
+        let replay = runtime.engine().bootstrap_recovery_instrumentation();
+        assert_eq!(replay.bootstrap_part_reads, part_count);
+        assert!(replay.bootstrap_object_reads > 0);
+        assert_eq!(replay.max_live_bootstrap_parts, 1);
+        let observation = runtime.resume_open_status().observation();
+        assert!(!observation.adopted);
+        assert_eq!(observation.replay_base_generation, 0);
+        assert_eq!(observation.replayed_generations, part_count as u64);
+        assert_eq!(
+            before.since().workspace_lease_acquisitions,
+            0,
+            "discarding the token must not release and reacquire the workspace lease"
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// A byte-identical archive substituted after the immutable promotion state
@@ -3764,91 +3780,95 @@ fn a_same_process_promotion_token_mismatch_falls_back_under_the_retained_lease()
 /// with that exact returned lease and candidate.
 #[test]
 fn archive_replacement_after_promotion_publication_refuses_and_retries_under_the_same_lease() {
-    let mut fixture = Fixture::new(
-        "same-process-archive-replacement",
-        None,
-        vec![(
-            "pages/archive.md".into(),
-            b"title:: Archive\n\n- retained lease\n".to_vec(),
-        )],
-    );
-    let root = fixture.enrollment_root("same-process-archive-replacement");
-    let paths = PromotedPaths::new(&fixture, "same-process-archive-replacement");
-    let session = SessionId::new();
-    let authority = activate_verified_local(
-        &root,
-        fixture.compose(&root),
-        session,
-        &fixture.proofs(),
-        &fixture.runtime(),
-    )
-    .unwrap();
-    let refused_seal =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    let retry_seal =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    let bootstrap = fixture.take_bootstrap_session();
-
-    // Keep the live archive and its retained lease open on the renamed inode,
-    // then put a byte-identical but physically distinct archive at the enrolled
-    // pathname. Content alone is deliberately insufficient authority.
-    let enrolled_path = fixture.archive_root.clone();
-    let relocated = fixture
-        .root
-        .path()
-        .join("archive-relocated-after-publication");
-    fs::rename(&enrolled_path, &relocated).unwrap();
-    copy_tree(&relocated, &enrolled_path);
-    let replacement_before = snapshot_file_digests(&enrolled_path);
-
-    let before = PromotedRuntimeInstrumentation::capture();
-    let (lease, error) = bootstrap
-        .promote(refused_seal, &authority, &paths.open(&fixture))
-        .err()
-        .expect("a replacement archive must not receive writable authority")
-        .into_parts();
-    assert!(
-        matches!(
-            error,
-            RuntimePromotionError::Store(crate::oplog::StoreError::Io(_))
-        ),
-        "unexpected archive replacement refusal: {error}"
-    );
-    assert_eq!(before.since().workspace_lease_acquisitions, 0);
-    assert!(
-        !paths.database_path.exists(),
-        "the replacement must be refused before a promoted SQLite writer exists"
-    );
-    assert_eq!(
-        snapshot_file_digests(&enrolled_path),
-        replacement_before,
-        "the refused replacement archive must remain byte-identical"
-    );
-    let relocated_store = ObjectStore::open(&relocated, fixture.workspace).unwrap();
-    assert!(matches!(
-        WorkspaceRuntimeLease::acquire(&relocated_store, fixture.workspace),
-        Err(ProjectionError::LeaseContended(_))
-    ));
-
-    // Put the exact original archive back. The refusal returned the same lease,
-    // so reopening the bootstrap projection and retrying requires no archive
-    // release/reacquire gap and can still use the process-only candidate.
-    fs::remove_dir_all(&enrolled_path).unwrap();
-    fs::rename(&relocated, &enrolled_path).unwrap();
-    let bootstrap = fixture.reopen_bootstrap_session(lease);
-    let runtime = bootstrap
-        .promote(retry_seal, &authority, &paths.open(&fixture))
-        .map_err(|refusal| refusal.into_parts().1)
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "same-process-archive-replacement",
+            None,
+            vec![(
+                "pages/archive.md".into(),
+                b"title:: Archive\n\n- retained lease\n".to_vec(),
+            )],
+        );
+        let root = fixture.enrollment_root("same-process-archive-replacement");
+        let paths = PromotedPaths::new(&fixture, "same-process-archive-replacement");
+        let session = SessionId::new();
+        let authority = activate_verified_local(
+            &root,
+            fixture.compose(&root),
+            session,
+            &fixture.proofs(),
+            &fixture.runtime(),
+        )
         .unwrap();
-    assert_eq!(
-        runtime
-            .engine()
-            .bootstrap_recovery_instrumentation()
-            .bootstrap_part_reads,
-        0
-    );
-    assert_eq!(before.since().workspace_lease_acquisitions, 0);
-    fixture.assert_graph_unchanged();
+        let refused_seal =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        let retry_seal =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        let bootstrap = fixture.take_bootstrap_session();
+
+        // Keep the live archive and its retained lease open on the renamed inode,
+        // then put a byte-identical but physically distinct archive at the enrolled
+        // pathname. Content alone is deliberately insufficient authority.
+        let enrolled_path = fixture.archive_root.clone();
+        let relocated = fixture
+            .root
+            .path()
+            .join("archive-relocated-after-publication");
+        fs::rename(&enrolled_path, &relocated).unwrap();
+        copy_tree(&relocated, &enrolled_path);
+        let replacement_before = snapshot_file_digests(&enrolled_path);
+
+        let before = PromotedRuntimeInstrumentation::capture();
+        let (lease, error) = bootstrap
+            .promote(refused_seal, &authority, &paths.open(&fixture))
+            .err()
+            .expect("a replacement archive must not receive writable authority")
+            .into_parts();
+        assert!(
+            matches!(
+                error,
+                RuntimePromotionError::Store(crate::oplog::StoreError::Io(_))
+            ),
+            "unexpected archive replacement refusal: {error}"
+        );
+        assert_eq!(before.since().workspace_lease_acquisitions, 0);
+        assert!(
+            !paths.database_path.exists(),
+            "the replacement must be refused before a promoted SQLite writer exists"
+        );
+        assert_eq!(
+            snapshot_file_digests(&enrolled_path),
+            replacement_before,
+            "the refused replacement archive must remain byte-identical"
+        );
+        let relocated_store = ObjectStore::open(&relocated, fixture.workspace).unwrap();
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&relocated_store, fixture.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+
+        // Put the exact original archive back. The refusal returned the same lease,
+        // so reopening the bootstrap projection and retrying requires no archive
+        // release/reacquire gap and can still use the process-only candidate.
+        fs::remove_dir_all(&enrolled_path).unwrap();
+        fs::rename(&relocated, &enrolled_path).unwrap();
+        let bootstrap = fixture.reopen_bootstrap_session(lease);
+        let runtime = bootstrap
+            .promote(retry_seal, &authority, &paths.open(&fixture))
+            .map_err(|refusal| refusal.into_parts().1)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .engine()
+                .bootstrap_recovery_instrumentation()
+                .bootstrap_part_reads,
+            0
+        );
+        assert_eq!(before.since().workspace_lease_acquisitions, 0);
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// Damage to reconstructible candidate bytes after the durable promotion state
@@ -4405,107 +4425,109 @@ fn projection_work_fingerprint(runtime: &PromotedLocalRuntime) -> Vec<String> {
 /// workspace lease, a takeover here fails on that lease.
 #[test]
 fn a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write() {
-    let mut fixture = Fixture::new(
-        "takeover-live",
-        None,
-        vec![("pages/live.md".into(), b"- live\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-live");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "live");
-    let owner = SessionId::new();
-    let world = HelperWorld::new(&fixture, &root, &paths, SessionId::new());
-    let mut profile = HelperProcess::spawn(
-        "archive-lease",
-        &world,
-        Some(&fixture.root.path().join("profile-a")),
-    );
-    let verification_digest = {
-        let (mut authority, mut runtime) = promote(&mut fixture, &root, owner, &paths);
-        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC100);
-        let before = authoritative_world(&fixture, &root);
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-live",
+            None,
+            vec![("pages/live.md".into(), b"- live\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("takeover-live");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "live");
+        let owner = SessionId::new();
+        let world = HelperWorld::new(&fixture, &root, &paths, SessionId::new());
+        let mut profile = HelperProcess::spawn(
+            "archive-lease",
+            &world,
+            Some(&fixture.root.path().join("profile-a")),
+        );
+        let verification_digest = {
+            let (mut authority, mut runtime) = promote(&mut fixture, &root, owner, &paths);
+            append_local_batch(&fixture, &mut authority, &mut runtime, 0xC100);
+            let before = authoritative_world(&fixture, &root);
 
-        // A same-profile newcomer: the live runtime retains the exclusive
-        // enrollment lease, so the newcomer cannot even read its way to a
-        // durable write.
+            // A same-profile newcomer: the live runtime retains the exclusive
+            // enrollment lease, so the newcomer cannot even read its way to a
+            // durable write.
+            let error = takeover_error(
+                &root,
+                &binding,
+                SessionId::new(),
+                &paths.open(&fixture),
+                "a live runtime must block a same-profile takeover",
+            );
+            assert!(
+                error.contains("enrollment lease"),
+                "a same-profile newcomer must stop at the retained enrollment lease: {error}"
+            );
+
+            // A separate application-data profile shares nothing device-local with
+            // this process, so only the archive-rooted lease can stop it. It does.
+            assert_eq!(profile.ask("acquire"), "contended");
+            assert_eq!(
+                authoritative_world(&fixture, &root),
+                before,
+                "nothing may move"
+            );
+            authority.verification_digest()
+        };
+
+        // The old process is gone. Its record stays exactly Unsafe { owner }.
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe { session_id: owner }
+        );
+
+        // Now the other profile owns the archive. This process must fail on that
+        // exact lease, after its own enrollment lease was free, and before writing.
+        assert_eq!(profile.ask("acquire"), "acquired");
+        let contended = authoritative_world(&fixture, &root);
+        let before = PromotedRuntimeInstrumentation::capture();
         let error = takeover_error(
             &root,
             &binding,
             SessionId::new(),
             &paths.open(&fixture),
-            "a live runtime must block a same-profile takeover",
+            "another profile's archive lease must block this takeover",
         );
+        let refused = before.since();
         assert!(
-            error.contains("enrollment lease"),
-            "a same-profile newcomer must stop at the retained enrollment lease: {error}"
+            error.contains("sqlite-applier.lock"),
+            "a cross-profile newcomer must stop at the archive-rooted workspace lease: {error}"
         );
-
-        // A separate application-data profile shares nothing device-local with
-        // this process, so only the archive-rooted lease can stop it. It does.
-        assert_eq!(profile.ask("acquire"), "contended");
+        // The lease is taken before anything else this runtime does with the
+        // archive, so the refusal happens before the archive is even authenticated,
+        // let alone before the engine is recovered or SQLite is opened.
         assert_eq!(
-            authoritative_world(&fixture, &root),
-            before,
-            "nothing may move"
+            refused.archive_identity_reads, 0,
+            "a lease-refused takeover must stop before it authenticates the archive"
         );
-        authority.verification_digest()
-    };
+        assert_eq!(refused.sqlite_frontier_reads, 0);
+        assert_eq!(authoritative_world(&fixture, &root), contended);
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe { session_id: owner },
+            "a refused takeover leaves the crashed owner authoritative"
+        );
 
-    // The old process is gone. Its record stays exactly Unsafe { owner }.
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe { session_id: owner }
-    );
-
-    // Now the other profile owns the archive. This process must fail on that
-    // exact lease, after its own enrollment lease was free, and before writing.
-    assert_eq!(profile.ask("acquire"), "acquired");
-    let contended = authoritative_world(&fixture, &root);
-    let before = PromotedRuntimeInstrumentation::capture();
-    let error = takeover_error(
-        &root,
-        &binding,
-        SessionId::new(),
-        &paths.open(&fixture),
-        "another profile's archive lease must block this takeover",
-    );
-    let refused = before.since();
-    assert!(
-        error.contains("sqlite-applier.lock"),
-        "a cross-profile newcomer must stop at the archive-rooted workspace lease: {error}"
-    );
-    // The lease is taken before anything else this runtime does with the
-    // archive, so the refusal happens before the archive is even authenticated,
-    // let alone before the engine is recovered or SQLite is opened.
-    assert_eq!(
-        refused.archive_identity_reads, 0,
-        "a lease-refused takeover must stop before it authenticates the archive"
-    );
-    assert_eq!(refused.sqlite_frontier_reads, 0);
-    assert_eq!(authoritative_world(&fixture, &root), contended);
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe { session_id: owner },
-        "a refused takeover leaves the crashed owner authoritative"
-    );
-
-    // Released, the takeover proceeds.
-    assert_eq!(profile.ask("release"), "released");
-    let successor = SessionId::new();
-    assert_eq!(
-        takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
-        RuntimeRecoveryState::TookOverCrashedUnsafe {
-            previous_session: owner
-        }
-    );
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe {
-            session_id: successor
-        }
-    );
-    profile.finish();
-    fixture.assert_graph_unchanged();
+        // Released, the takeover proceeds.
+        assert_eq!(profile.ask("release"), "released");
+        let successor = SessionId::new();
+        assert_eq!(
+            takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
+            RuntimeRecoveryState::TookOverCrashedUnsafe {
+                previous_session: owner
+            }
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: successor
+            }
+        );
+        profile.finish();
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// Process death releases the archive-rooted lease. A fresh process then
@@ -4515,130 +4537,133 @@ fn a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write() {
 /// second lease acquisition.
 #[test]
 fn process_death_releases_the_lease_and_a_fresh_process_takes_over_and_admits_work() {
-    let mut fixture = Fixture::new(
-        "takeover-death",
-        None,
-        vec![("pages/death.md".into(), b"- death\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-death");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "death");
-    let first = SessionId::new();
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, first, &paths);
-    append_local_batch(&fixture, &mut authority, &mut runtime, 0xC200);
-    let verification_digest = authority.verification_digest();
-    let anchor = runtime.bootstrap_anchor();
-    let frontier = runtime.engine().accepted_frontier_root().unwrap();
-    let sqlite_frontier = runtime.database().frontier_root().unwrap();
-    let work = projection_work_fingerprint(&runtime);
-    drop(runtime);
-    drop(authority);
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-death",
+            None,
+            vec![("pages/death.md".into(), b"- death\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("takeover-death");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "death");
+        let first = SessionId::new();
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, first, &paths);
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC200);
+        let verification_digest = authority.verification_digest();
+        let anchor = runtime.bootstrap_anchor();
+        let frontier = runtime.engine().accepted_frontier_root().unwrap();
+        let sqlite_frontier = runtime.database().frontier_root().unwrap();
+        let work = projection_work_fingerprint(&runtime);
+        drop(runtime);
+        drop(authority);
 
-    // A separate process takes over and holds the runtime.
-    let second = SessionId::new();
-    let world = HelperWorld::new(&fixture, &root, &paths, second);
-    let mut holder = HelperProcess::spawn("takeover-hold", &world, None);
-    assert_eq!(
-        holder.answer(),
-        format!(
-            "took-over:{}:{}",
-            frontier.acceptance_sequence(),
-            sqlite_frontier.state_digest()
-        ),
-        "the takeover must reopen the crashed process's exact frontier"
-    );
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe { session_id: second }
-    );
+        // A separate process takes over and holds the runtime.
+        let second = SessionId::new();
+        let world = HelperWorld::new(&fixture, &root, &paths, second);
+        let mut holder = HelperProcess::spawn("takeover-hold", &world, None);
+        assert_eq!(
+            holder.answer(),
+            format!(
+                "took-over:{}:{}",
+                frontier.acceptance_sequence(),
+                sqlite_frontier.state_digest()
+            ),
+            "the takeover must reopen the crashed process's exact frontier"
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe { session_id: second }
+        );
 
-    // While it lives, nobody else can have the archive — not this process, and
-    // not another profile.
-    let mut profile = HelperProcess::spawn(
-        "archive-lease",
-        &world,
-        Some(&fixture.root.path().join("profile-b")),
-    );
-    assert_eq!(profile.ask("acquire"), "contended");
-    let held = authoritative_world(&fixture, &root);
-    takeover_error(
-        &root,
-        &binding,
-        SessionId::new(),
-        &paths.open(&fixture),
-        "a live takeover holder must block every newcomer",
-    );
-    assert_eq!(authoritative_world(&fixture, &root), held);
+        // While it lives, nobody else can have the archive — not this process, and
+        // not another profile.
+        let mut profile = HelperProcess::spawn(
+            "archive-lease",
+            &world,
+            Some(&fixture.root.path().join("profile-b")),
+        );
+        assert_eq!(profile.ask("acquire"), "contended");
+        let held = authoritative_world(&fixture, &root);
+        takeover_error(
+            &root,
+            &binding,
+            SessionId::new(),
+            &paths.open(&fixture),
+            "a live takeover holder must block every newcomer",
+        );
+        assert_eq!(authoritative_world(&fixture, &root), held);
 
-    // Kill it: no destructor runs, so this is a real crash, and the operating
-    // system is what releases both leases.
-    holder.kill();
-    assert_eq!(profile.ask("acquire"), "acquired");
-    assert_eq!(profile.ask("release"), "released");
-    profile.finish();
+        // Kill it: no destructor runs, so this is a real crash, and the operating
+        // system is what releases both leases.
+        holder.kill();
+        assert_eq!(profile.ask("acquire"), "acquired");
+        assert_eq!(profile.ask("release"), "released");
+        profile.finish();
 
-    let third = SessionId::new();
-    let before = PromotedRuntimeInstrumentation::capture();
-    let (mut authority, mut runtime) =
-        take_over_promoted_local_runtime(&root, &binding, third, &paths.open(&fixture)).unwrap();
-    let opened = before.since();
-    assert_eq!(
-        opened.workspace_lease_acquisitions, 1,
-        "a promoted open takes exactly one archive-rooted workspace lease"
-    );
+        let third = SessionId::new();
+        let before = PromotedRuntimeInstrumentation::capture();
+        let (mut authority, mut runtime) =
+            take_over_promoted_local_runtime(&root, &binding, third, &paths.open(&fixture))
+                .unwrap();
+        let opened = before.since();
+        assert_eq!(
+            opened.workspace_lease_acquisitions, 1,
+            "a promoted open takes exactly one archive-rooted workspace lease"
+        );
 
-    // Exactly the crashed process's data, recovered.
-    assert_eq!(runtime.bootstrap_anchor(), anchor);
-    assert_eq!(runtime.engine().accepted_frontier_root().unwrap(), frontier);
-    assert_eq!(runtime.database().frontier_root().unwrap(), sqlite_frontier);
-    assert_eq!(projection_work_fingerprint(&runtime), work);
-    assert!(!work.is_empty(), "the crashed process owed projection work");
-    assert_eq!(runtime.tail().status().unapplied_batches, 0);
-    assert_eq!(
-        runtime.recovery(),
-        RuntimeRecoveryState::TookOverCrashedUnsafe {
-            previous_session: second
-        }
-    );
-    assert_eq!(
-        runtime.automatic_external_import(),
-        ExternalImportAdmission::Blocked(
-            "this runtime took over a crashed session's Unsafe handoff, whose drain was never \
+        // Exactly the crashed process's data, recovered.
+        assert_eq!(runtime.bootstrap_anchor(), anchor);
+        assert_eq!(runtime.engine().accepted_frontier_root().unwrap(), frontier);
+        assert_eq!(runtime.database().frontier_root().unwrap(), sqlite_frontier);
+        assert_eq!(projection_work_fingerprint(&runtime), work);
+        assert!(!work.is_empty(), "the crashed process owed projection work");
+        assert_eq!(runtime.tail().status().unapplied_batches, 0);
+        assert_eq!(
+            runtime.recovery(),
+            RuntimeRecoveryState::TookOverCrashedUnsafe {
+                previous_session: second
+            }
+        );
+        assert_eq!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Blocked(
+                "this runtime took over a crashed session's Unsafe handoff, whose drain was never \
              proved"
-        ),
-        "a crash must never authorize an automatic external import"
-    );
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe { session_id: third }
-    );
+            ),
+            "a crash must never authorize an automatic external import"
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe { session_id: third }
+        );
 
-    // A new mutation is admitted, and admission stays bounded: no lease is
-    // reacquired, no enrollment chain is rewalked, no SQLite statement is run.
-    let before = PromotedRuntimeInstrumentation::capture();
-    {
-        let _admitted = runtime
-            .admit_promoted_mutation(&mut authority, &fixture.graph)
-            .unwrap();
-    }
-    let admission = before.since();
-    assert_eq!(admission.workspace_lease_acquisitions, 0);
-    assert_eq!(admission.sqlite_frontier_reads, 0);
-    assert_eq!(admission.enrollment.record_reads, 0);
-    assert_eq!(admission.enrollment.lease_acquisitions, 0);
-    assert_eq!(admission.enrollment.namespace_scans, 0);
+        // A new mutation is admitted, and admission stays bounded: no lease is
+        // reacquired, no enrollment chain is rewalked, no SQLite statement is run.
+        let before = PromotedRuntimeInstrumentation::capture();
+        {
+            let _admitted = runtime
+                .admit_promoted_mutation(&mut authority, &fixture.graph)
+                .unwrap();
+        }
+        let admission = before.since();
+        assert_eq!(admission.workspace_lease_acquisitions, 0);
+        assert_eq!(admission.sqlite_frontier_reads, 0);
+        assert_eq!(admission.enrollment.record_reads, 0);
+        assert_eq!(admission.enrollment.lease_acquisitions, 0);
+        assert_eq!(admission.enrollment.namespace_scans, 0);
 
-    append_local_batch(&fixture, &mut authority, &mut runtime, 0xC300);
-    assert!(
-        runtime
-            .engine()
-            .accepted_frontier_root()
-            .unwrap()
-            .acceptance_sequence()
-            > frontier.acceptance_sequence(),
-        "the taken-over runtime accepts new local work"
-    );
-    fixture.assert_graph_unchanged();
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC300);
+        assert!(
+            runtime
+                .engine()
+                .accepted_frontier_root()
+                .unwrap()
+                .acceptance_sequence()
+                > frontier.acceptance_sequence(),
+            "the taken-over runtime accepts new local work"
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// Two newcomers authenticate the same crashed `Unsafe { old }` record. Exactly
@@ -4646,64 +4671,70 @@ fn process_death_releases_the_lease_and_a_fresh_process_takes_over_and_admits_wo
 /// owner, and leaves every durable byte untouched.
 #[test]
 fn two_post_crash_contenders_commit_exactly_one_takeover() {
-    let mut fixture = Fixture::new(
-        "takeover-race",
-        None,
-        vec![("pages/race.md".into(), b"- race\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-race");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "race");
-    let crashed = SessionId::new();
-    let (authority, runtime) = promote(&mut fixture, &root, crashed, &paths);
-    let verification_digest = authority.verification_digest();
-    drop(runtime);
-    drop(authority);
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-race",
+            None,
+            vec![("pages/race.md".into(), b"- race\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("takeover-race");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "race");
+        let crashed = SessionId::new();
+        let (authority, runtime) = promote(&mut fixture, &root, crashed, &paths);
+        let verification_digest = authority.verification_digest();
+        drop(runtime);
+        drop(authority);
 
-    // The loser starts first and is suspended the instant it has authenticated
-    // the crashed predecessor, before it takes a single lease.
-    let loser_session = SessionId::new();
-    // The loser is an ordinary restart of the same profile: same enrollment
-    // journal, same device-local database, same archive.
-    let loser_world = HelperWorld::new(&fixture, &root, &paths, loser_session);
-    let mut loser = HelperProcess::spawn("takeover-loser", &loser_world, None);
-    assert_eq!(loser.answer(), "observed");
+        // The loser starts first and is suspended the instant it has authenticated
+        // the crashed predecessor, before it takes a single lease.
+        let loser_session = SessionId::new();
+        // The loser is an ordinary restart of the same profile: same enrollment
+        // journal, same device-local database, same archive.
+        let loser_world = HelperWorld::new(&fixture, &root, &paths, loser_session);
+        let mut loser = HelperProcess::spawn("takeover-loser", &loser_world, None);
+        assert_eq!(loser.answer(), "observed");
 
-    // The winner completes its takeover and exits, so the loser will find every
-    // lease free and only the record changed.
-    let winner_session = SessionId::new();
-    let (winner_authority, winner_runtime) =
-        take_over_promoted_local_runtime(&root, &binding, winner_session, &paths.open(&fixture))
-            .unwrap();
-    drop(winner_runtime);
-    drop(winner_authority);
-    let after_winner = authoritative_world(&fixture, &root);
+        // The winner completes its takeover and exits, so the loser will find every
+        // lease free and only the record changed.
+        let winner_session = SessionId::new();
+        let (winner_authority, winner_runtime) = take_over_promoted_local_runtime(
+            &root,
+            &binding,
+            winner_session,
+            &paths.open(&fixture),
+        )
+        .unwrap();
+        drop(winner_runtime);
+        drop(winner_authority);
+        let after_winner = authoritative_world(&fixture, &root);
 
-    loser.tell("resume");
-    let outcome = loser.answer();
-    assert!(
-        outcome.starts_with("outcome:failed:"),
-        "the loser must not also win: {outcome}"
-    );
-    assert!(
-        outcome.contains("authenticated unsafe predecessor"),
-        "the loser must fail on its exact compare-and-swap predecessor: {outcome}"
-    );
-    loser.finish();
+        loser.tell("resume");
+        let outcome = loser.answer();
+        assert!(
+            outcome.starts_with("outcome:failed:"),
+            "the loser must not also win: {outcome}"
+        );
+        assert!(
+            outcome.contains("authenticated unsafe predecessor"),
+            "the loser must fail on its exact compare-and-swap predecessor: {outcome}"
+        );
+        loser.finish();
 
-    assert_eq!(
-        authoritative_world(&fixture, &root),
-        after_winner,
-        "a losing takeover writes nothing"
-    );
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe {
-            session_id: winner_session
-        },
-        "the winner stays the owner"
-    );
-    fixture.assert_graph_unchanged();
+        assert_eq!(
+            authoritative_world(&fixture, &root),
+            after_winner,
+            "a losing takeover writes nothing"
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: winner_session
+            },
+            "the winner stays the owner"
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// Every wrong piece of evidence a takeover must authenticate refuses *before*
@@ -4717,171 +4748,173 @@ fn two_post_crash_contenders_commit_exactly_one_takeover() {
 /// authority the recovery must reproduce, and the enrollment lifecycle itself.
 #[test]
 fn a_takeover_refuses_wrong_workspace_archive_anchor_history_and_sqlite_evidence() {
-    let mut fixture = Fixture::new(
-        "takeover-evidence",
-        None,
-        vec![("pages/evidence.md".into(), b"- evidence\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-evidence");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "evidence");
-    let crashed = SessionId::new();
-    let verification_digest = {
-        let (mut authority, mut runtime) = promote(&mut fixture, &root, crashed, &paths);
-        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC400);
-        authority.verification_digest()
-    };
-    let unsafe_owner = LocalActiveHandoff::Unsafe {
-        session_id: crashed,
-    };
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-evidence",
+            None,
+            vec![("pages/evidence.md".into(), b"- evidence\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("takeover-evidence");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "evidence");
+        let crashed = SessionId::new();
+        let verification_digest = {
+            let (mut authority, mut runtime) = promote(&mut fixture, &root, crashed, &paths);
+            append_local_batch(&fixture, &mut authority, &mut runtime, 0xC400);
+            authority.verification_digest()
+        };
+        let unsafe_owner = LocalActiveHandoff::Unsafe {
+            session_id: crashed,
+        };
 
-    let refused = |label: &str, prepare: &mut dyn FnMut() -> Box<dyn FnOnce()>| {
-        let restore = prepare();
+        let refused = |label: &str, prepare: &mut dyn FnMut() -> Box<dyn FnOnce()>| {
+            let restore = prepare();
+            let before = authoritative_world(&fixture, &root);
+            let error = takeover_error(
+                &root,
+                &binding,
+                SessionId::new(),
+                &paths.open(&fixture),
+                &format!("{label} must not authorize a takeover"),
+            );
+            assert_eq!(
+                authoritative_world(&fixture, &root),
+                before,
+                "{label} wrote authoritative bytes before failing: {error}"
+            );
+            assert_eq!(
+                committed_handoff(&root, &binding, verification_digest),
+                unsafe_owner,
+                "{label} moved the crashed owner's record"
+            );
+            restore();
+            // A refused takeover releases the archive-rooted lease it took, so the
+            // next attempt is not blocked by the last failure.
+            drop(
+                WorkspaceRuntimeLease::acquire(&fixture.archive(), fixture.workspace)
+                    .unwrap_or_else(|error| panic!("{label} kept the workspace lease: {error}")),
+            );
+        };
+
+        // A different device: the enrollment binding no longer names this journal.
+        let foreign_binding = EnrollmentBindingV1::new(
+            binding.workspace_id(),
+            binding.lineage_digest(),
+            binding.catalog_document_id(),
+            binding.endpoint_id(),
+            DeviceId::from_uuid(Uuid::from_u128(0xDEAD_BEEF)),
+            binding.graph_resource_id(),
+            binding.receipt_store_id(),
+            binding.archive_resource_id(),
+            fixture.graph.graph_text_scope_binding().unwrap(),
+        )
+        .unwrap();
+        takeover_error(
+            &root,
+            &foreign_binding,
+            SessionId::new(),
+            &paths.open(&fixture),
+            "a foreign device binding must not authorize a takeover",
+        );
+
+        // A byte-identical copy of the archive is a different physical resource.
+        let copied_root = fixture.root.path().join("copied-archive");
+        copy_tree(&fixture.archive_root, &copied_root);
+        let copied_paths = PromotedPaths::new(&fixture, "evidence-copy");
+        let copied_open = PromotedRuntimeOpen {
+            graph: &fixture.graph,
+            receipts: &fixture.receipts,
+            archive_root: &copied_root,
+            database_path: &copied_paths.database_path,
+            application_runtime_root: &copied_paths.runtime_root,
+            graph_root: &fixture.graph_root,
+            migration_backup_root: fixture.roots.canonical_root(),
+        };
         let before = authoritative_world(&fixture, &root);
-        let error = takeover_error(
+        takeover_error(
+            &root,
+            &binding,
+            SessionId::new(),
+            &copied_open,
+            "a look-alike archive must never receive this enrollment's takeover",
+        );
+        assert_eq!(authoritative_world(&fixture, &root), before);
+
+        // The persisted canonical archive-resource claim.
+        let claim_path = fixture.archive_root.join(ARCHIVE_INSTANCE_CLAIM_FILE);
+        refused("a divergent archive instance claim", &mut || {
+            let original = fs::read(&claim_path).unwrap();
+            fs::write(&claim_path, divergent_archive_instance_claim(&original)).unwrap();
+            let path = claim_path.clone();
+            Box::new(move || fs::write(&path, &original).unwrap())
+        });
+
+        // The durable promotion state that binds the immutable activation anchor.
+        let state_path = promotion_state_path(&fixture);
+        refused("a truncated promotion state", &mut || {
+            let original = fs::read(&state_path).unwrap();
+            fs::write(&state_path, &original[..original.len() / 2]).unwrap();
+            let path = state_path.clone();
+            Box::new(move || fs::write(&path, &original).unwrap())
+        });
+        refused("an absent promotion state", &mut || {
+            let original = fs::read(&state_path).unwrap();
+            fs::remove_file(&state_path).unwrap();
+            let path = state_path.clone();
+            Box::new(move || fs::write(&path, &original).unwrap())
+        });
+
+        // The engine's own committed history: one truncated manifest and the
+        // recovery this takeover depends on can no longer be authenticated.
+        let manifest_path = find_file_with_prefix(&fixture.archive_root.join("batches"), "");
+        refused("a truncated committed manifest", &mut || {
+            let original = fs::read(&manifest_path).unwrap();
+            fs::write(&manifest_path, &original[..original.len() / 2]).unwrap();
+            let path = manifest_path.clone();
+            Box::new(move || fs::write(&path, &original).unwrap())
+        });
+
+        // The SQLite authority the recovery must reproduce before it may swap the
+        // handoff. The device-local database is deleted, so recovery must rebuild
+        // it from the authoritative oplog, and that rebuild is interrupted inside
+        // the materialization transaction: an unreproducible SQLite authority is a
+        // failed open, not a takeover.
+        refused("an interrupted SQLite rebuild", &mut || {
+            remove_device_local_database(&paths.database_path);
+            crate::oplog::sqlite::fail_next_apply_during_materialization_for_harness();
+            Box::new(|| ())
+        });
+
+        // With every piece of evidence restored, the takeover commits.
+        let successor = SessionId::new();
+        assert_eq!(
+            takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
+            RuntimeRecoveryState::TookOverCrashedUnsafe {
+                previous_session: crashed
+            }
+        );
+
+        // A blocked enrollment is the last row: it is the one tampering that is
+        // deliberately irreversible.
+        let head = enrollment_head(&root, &binding);
+        crate::oplog::enrollment::block_current_for_test(
+            &root,
+            &binding,
+            head,
+            "takeover-evidence-blocked".into(),
+        )
+        .unwrap();
+        let blocked = authoritative_world(&fixture, &root);
+        takeover_error(
             &root,
             &binding,
             SessionId::new(),
             &paths.open(&fixture),
-            &format!("{label} must not authorize a takeover"),
+            "a blocked enrollment must not authorize a takeover",
         );
-        assert_eq!(
-            authoritative_world(&fixture, &root),
-            before,
-            "{label} wrote authoritative bytes before failing: {error}"
-        );
-        assert_eq!(
-            committed_handoff(&root, &binding, verification_digest),
-            unsafe_owner,
-            "{label} moved the crashed owner's record"
-        );
-        restore();
-        // A refused takeover releases the archive-rooted lease it took, so the
-        // next attempt is not blocked by the last failure.
-        drop(
-            WorkspaceRuntimeLease::acquire(&fixture.archive(), fixture.workspace)
-                .unwrap_or_else(|error| panic!("{label} kept the workspace lease: {error}")),
-        );
-    };
-
-    // A different device: the enrollment binding no longer names this journal.
-    let foreign_binding = EnrollmentBindingV1::new(
-        binding.workspace_id(),
-        binding.lineage_digest(),
-        binding.catalog_document_id(),
-        binding.endpoint_id(),
-        DeviceId::from_uuid(Uuid::from_u128(0xDEAD_BEEF)),
-        binding.graph_resource_id(),
-        binding.receipt_store_id(),
-        binding.archive_resource_id(),
-        fixture.graph.graph_text_scope_binding().unwrap(),
-    )
-    .unwrap();
-    takeover_error(
-        &root,
-        &foreign_binding,
-        SessionId::new(),
-        &paths.open(&fixture),
-        "a foreign device binding must not authorize a takeover",
-    );
-
-    // A byte-identical copy of the archive is a different physical resource.
-    let copied_root = fixture.root.path().join("copied-archive");
-    copy_tree(&fixture.archive_root, &copied_root);
-    let copied_paths = PromotedPaths::new(&fixture, "evidence-copy");
-    let copied_open = PromotedRuntimeOpen {
-        graph: &fixture.graph,
-        receipts: &fixture.receipts,
-        archive_root: &copied_root,
-        database_path: &copied_paths.database_path,
-        application_runtime_root: &copied_paths.runtime_root,
-        graph_root: &fixture.graph_root,
-        migration_backup_root: fixture.roots.canonical_root(),
-    };
-    let before = authoritative_world(&fixture, &root);
-    takeover_error(
-        &root,
-        &binding,
-        SessionId::new(),
-        &copied_open,
-        "a look-alike archive must never receive this enrollment's takeover",
-    );
-    assert_eq!(authoritative_world(&fixture, &root), before);
-
-    // The persisted canonical archive-resource claim.
-    let claim_path = fixture.archive_root.join(ARCHIVE_INSTANCE_CLAIM_FILE);
-    refused("a divergent archive instance claim", &mut || {
-        let original = fs::read(&claim_path).unwrap();
-        fs::write(&claim_path, divergent_archive_instance_claim(&original)).unwrap();
-        let path = claim_path.clone();
-        Box::new(move || fs::write(&path, &original).unwrap())
+        assert_eq!(authoritative_world(&fixture, &root), blocked);
+        fixture.assert_graph_unchanged();
     });
-
-    // The durable promotion state that binds the immutable activation anchor.
-    let state_path = promotion_state_path(&fixture);
-    refused("a truncated promotion state", &mut || {
-        let original = fs::read(&state_path).unwrap();
-        fs::write(&state_path, &original[..original.len() / 2]).unwrap();
-        let path = state_path.clone();
-        Box::new(move || fs::write(&path, &original).unwrap())
-    });
-    refused("an absent promotion state", &mut || {
-        let original = fs::read(&state_path).unwrap();
-        fs::remove_file(&state_path).unwrap();
-        let path = state_path.clone();
-        Box::new(move || fs::write(&path, &original).unwrap())
-    });
-
-    // The engine's own committed history: one truncated manifest and the
-    // recovery this takeover depends on can no longer be authenticated.
-    let manifest_path = find_file_with_prefix(&fixture.archive_root.join("batches"), "");
-    refused("a truncated committed manifest", &mut || {
-        let original = fs::read(&manifest_path).unwrap();
-        fs::write(&manifest_path, &original[..original.len() / 2]).unwrap();
-        let path = manifest_path.clone();
-        Box::new(move || fs::write(&path, &original).unwrap())
-    });
-
-    // The SQLite authority the recovery must reproduce before it may swap the
-    // handoff. The device-local database is deleted, so recovery must rebuild
-    // it from the authoritative oplog, and that rebuild is interrupted inside
-    // the materialization transaction: an unreproducible SQLite authority is a
-    // failed open, not a takeover.
-    refused("an interrupted SQLite rebuild", &mut || {
-        remove_device_local_database(&paths.database_path);
-        crate::oplog::sqlite::fail_next_apply_during_materialization_for_harness();
-        Box::new(|| ())
-    });
-
-    // With every piece of evidence restored, the takeover commits.
-    let successor = SessionId::new();
-    assert_eq!(
-        takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
-        RuntimeRecoveryState::TookOverCrashedUnsafe {
-            previous_session: crashed
-        }
-    );
-
-    // A blocked enrollment is the last row: it is the one tampering that is
-    // deliberately irreversible.
-    let head = enrollment_head(&root, &binding);
-    crate::oplog::enrollment::block_current_for_test(
-        &root,
-        &binding,
-        head,
-        "takeover-evidence-blocked".into(),
-    )
-    .unwrap();
-    let blocked = authoritative_world(&fixture, &root);
-    takeover_error(
-        &root,
-        &binding,
-        SessionId::new(),
-        &paths.open(&fixture),
-        "a blocked enrollment must not authorize a takeover",
-    );
-    assert_eq!(authoritative_world(&fixture, &root), blocked);
-    fixture.assert_graph_unchanged();
 }
 
 /// A crash at every durability cut of the takeover publication recovers to
@@ -4890,82 +4923,85 @@ fn a_takeover_refuses_wrong_workspace_archive_anchor_history_and_sqlite_evidence
 /// stays retryable, so the chain of eleven cuts ends in one exact owner.
 #[test]
 fn takeover_at_every_durability_cut_resumes_exactly_one_unsafe_owner() {
-    let mut fixture = Fixture::new(
-        "takeover-cuts",
-        None,
-        vec![("pages/cuts.md".into(), b"- cuts\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-cuts");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "cuts");
-    let mut owner = SessionId::new();
-    let (verification_digest, frontier) = {
-        let (authority, runtime) = promote(&mut fixture, &root, owner, &paths);
-        (
-            authority.verification_digest(),
-            runtime.engine().accepted_frontier_root().unwrap(),
-        )
-    };
-
-    for cut in [
-        CommitCut::AfterRecordTempCreate,
-        CommitCut::AfterRecordWrite,
-        CommitCut::AfterRecordFileSync,
-        CommitCut::AfterRecordLink,
-        CommitCut::AfterRecordInsert,
-        CommitCut::AfterRecordsDirectorySync,
-        CommitCut::AfterHeadTempCreate,
-        CommitCut::AfterHeadWrite,
-        CommitCut::AfterHeadFileSync,
-        CommitCut::AfterHeadReplace,
-        CommitCut::AfterEnrollmentDirectorySync,
-    ] {
-        let successor = SessionId::new();
-        assert!(
-            super::take_over_promoted_local_runtime_at_cut_for_test(
-                &root,
-                &binding,
-                successor,
-                &paths.open(&fixture),
-                cut,
-            )
-            .is_err(),
-            "{cut:?} must not return a runtime"
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-cuts",
+            None,
+            vec![("pages/cuts.md".into(), b"- cuts\n".to_vec())],
         );
+        let root = fixture.enrollment_root("takeover-cuts");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "cuts");
+        let mut owner = SessionId::new();
+        let (verification_digest, frontier) = {
+            let (authority, runtime) = promote(&mut fixture, &root, owner, &paths);
+            (
+                authority.verification_digest(),
+                runtime.engine().accepted_frontier_root().unwrap(),
+            )
+        };
 
-        // Whatever the cut left behind, the committed record is exactly one of
-        // the two unsafe owners, still Idle, and never a synthesized Safe.
-        match committed_handoff(&root, &binding, verification_digest) {
-            LocalActiveHandoff::Unsafe { session_id } if session_id == owner => {}
-            LocalActiveHandoff::Unsafe { session_id } if session_id == successor => {
-                owner = successor;
+        for cut in [
+            CommitCut::AfterRecordTempCreate,
+            CommitCut::AfterRecordWrite,
+            CommitCut::AfterRecordFileSync,
+            CommitCut::AfterRecordLink,
+            CommitCut::AfterRecordInsert,
+            CommitCut::AfterRecordsDirectorySync,
+            CommitCut::AfterHeadTempCreate,
+            CommitCut::AfterHeadWrite,
+            CommitCut::AfterHeadFileSync,
+            CommitCut::AfterHeadReplace,
+            CommitCut::AfterEnrollmentDirectorySync,
+        ] {
+            let successor = SessionId::new();
+            assert!(
+                super::take_over_promoted_local_runtime_at_cut_for_test(
+                    &root,
+                    &binding,
+                    successor,
+                    &paths.open(&fixture),
+                    cut,
+                )
+                .is_err(),
+                "{cut:?} must not return a runtime"
+            );
+
+            // Whatever the cut left behind, the committed record is exactly one of
+            // the two unsafe owners, still Idle, and never a synthesized Safe.
+            match committed_handoff(&root, &binding, verification_digest) {
+                LocalActiveHandoff::Unsafe { session_id } if session_id == owner => {}
+                LocalActiveHandoff::Unsafe { session_id } if session_id == successor => {
+                    owner = successor;
+                }
+                other => panic!("{cut:?} left an unexpected handoff: {other:?}"),
             }
-            other => panic!("{cut:?} left an unexpected handoff: {other:?}"),
+
+            // And the interrupted transition is retryable: the runtime reopens for
+            // whichever owner the cut actually left committed.
+            let (_authority, resumed) =
+                reopen_promoted_local_runtime(&root, &binding, owner, &paths.open(&fixture))
+                    .unwrap();
+            assert_eq!(resumed.engine().accepted_frontier_root().unwrap(), frontier);
+            assert_eq!(resumed.database().frontier_root().unwrap(), frontier);
         }
 
-        // And the interrupted transition is retryable: the runtime reopens for
-        // whichever owner the cut actually left committed.
-        let (_authority, resumed) =
-            reopen_promoted_local_runtime(&root, &binding, owner, &paths.open(&fixture)).unwrap();
-        assert_eq!(resumed.engine().accepted_frontier_root().unwrap(), frontier);
-        assert_eq!(resumed.database().frontier_root().unwrap(), frontier);
-    }
-
-    // One last uninterrupted takeover still commits from the surviving owner.
-    let final_session = SessionId::new();
-    assert_eq!(
-        takeover_recovery(&root, &binding, final_session, &paths.open(&fixture)),
-        RuntimeRecoveryState::TookOverCrashedUnsafe {
-            previous_session: owner
-        }
-    );
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe {
-            session_id: final_session
-        }
-    );
-    fixture.assert_graph_unchanged();
+        // One last uninterrupted takeover still commits from the surviving owner.
+        let final_session = SessionId::new();
+        assert_eq!(
+            takeover_recovery(&root, &binding, final_session, &paths.open(&fixture)),
+            RuntimeRecoveryState::TookOverCrashedUnsafe {
+                previous_session: owner
+            }
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: final_session
+            }
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// The bootstrap -> promoted database handoff runs under one retained
@@ -4981,109 +5017,114 @@ fn takeover_at_every_durability_cut_resumes_exactly_one_unsafe_owner() {
 /// application startup yet.
 #[test]
 fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease() {
-    let mut fixture = Fixture::new(
-        "takeover-handoff",
-        None,
-        vec![("pages/handoff.md".into(), b"- handoff\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-handoff");
-    let paths = PromotedPaths::new(&fixture, "handoff");
-    let session = SessionId::new();
-    let world = HelperWorld::new(&fixture, &root, &paths, session);
-    let mut profile = HelperProcess::spawn(
-        "archive-lease",
-        &world,
-        Some(&fixture.root.path().join("profile-handoff")),
-    );
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-handoff",
+            None,
+            vec![("pages/handoff.md".into(), b"- handoff\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("takeover-handoff");
+        let paths = PromotedPaths::new(&fixture, "handoff");
+        let session = SessionId::new();
+        let world = HelperWorld::new(&fixture, &root, &paths, session);
+        let mut profile = HelperProcess::spawn(
+            "archive-lease",
+            &world,
+            Some(&fixture.root.path().join("profile-handoff")),
+        );
 
-    // The fixture already holds the lease: its inactive bootstrap database was
-    // opened through that lease's single applier slot.
-    assert_eq!(profile.ask("acquire"), "contended");
+        // The fixture already holds the lease: its inactive bootstrap database was
+        // opened through that lease's single applier slot.
+        assert_eq!(profile.ask("acquire"), "contended");
 
-    let authority = activate_verified_local(
-        &root,
-        fixture.compose(&root),
-        session,
-        &fixture.proofs(),
-        &fixture.runtime(),
-    )
-    .unwrap();
-    // Sealing is idempotent, so two identical sealed promotions exist: one is
-    // spent on the foreign-lease refusal below, the other on the real open.
-    let refused_seal =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    let sealed =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    assert_eq!(profile.ask("acquire"), "contended");
-
-    // A lease for some *other* archive is not this archive's authority, even
-    // though it is a genuine live workspace runtime lease.
-    let foreign_archive = fixture.root.path().join("foreign-archive");
-    let foreign_store = ObjectStore::open(&foreign_archive, fixture.workspace).unwrap();
-    let foreign_lease = WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace).unwrap();
-    let before = PromotedRuntimeInstrumentation::capture();
-    let (returned_foreign_lease, error) = open_promoted_local_runtime(
-        refused_seal,
-        &authority,
-        &paths.open(&fixture),
-        RetainedWorkspaceLease::new(foreign_lease),
-    )
-    .err()
-    .expect("a foreign archive's lease must not authorize this promotion")
-    .into_parts();
-    let refused = before.since();
-    assert!(
-        matches!(
-            error,
-            RuntimePromotionError::Sqlite(ProjectionError::UnsafePath(_))
-        ),
-        "unexpected foreign-lease error: {error}"
-    );
-    assert_eq!(
-        refused.archive_identity_reads, 0,
-        "a foreign retained lease must be refused before any archive work"
-    );
-    // The refusal handed the caller's lease back rather than releasing it: the
-    // foreign archive is still this process's.
-    assert!(matches!(
-        WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace),
-        Err(ProjectionError::LeaseContended(_))
-    ));
-    drop(returned_foreign_lease);
-    drop(WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace).unwrap());
-
-    // The bootstrap database closes and the promoted one opens under the exact
-    // same lease. The workspace lock does not move.
-    //
-    // The helper probes below can only observe the archive at the instants they
-    // are asked, so they cannot by themselves rule out an infinitesimal
-    // release-and-reacquire inside the handoff. The acquisition counter can, and
-    // does: zero new archive-rooted leases across the whole handoff.
-    let across_handoff = PromotedRuntimeInstrumentation::capture();
-    let bootstrap = fixture.take_bootstrap_session();
-    let runtime = bootstrap
-        .promote(sealed, &authority, &paths.open(&fixture))
-        .map_err(|refusal| refusal.into_parts().1)
+        let authority = activate_verified_local(
+            &root,
+            fixture.compose(&root),
+            session,
+            &fixture.proofs(),
+            &fixture.runtime(),
+        )
         .unwrap();
-    assert_eq!(
-        across_handoff.since().workspace_lease_acquisitions,
-        0,
-        "the bootstrap -> promoted handoff must reuse the lease, not reacquire it"
-    );
-    assert_eq!(profile.ask("acquire"), "contended");
-    assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
-    assert!(matches!(
-        runtime.automatic_external_import(),
-        ExternalImportAdmission::Blocked(_)
-    ));
-    drop(runtime);
-    drop(authority);
+        // Sealing is idempotent, so two identical sealed promotions exist: one is
+        // spent on the foreign-lease refusal below, the other on the real open.
+        let refused_seal =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        let sealed =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        assert_eq!(profile.ask("acquire"), "contended");
 
-    // Only now is the archive free.
-    assert_eq!(profile.ask("acquire"), "acquired");
-    assert_eq!(profile.ask("release"), "released");
-    profile.finish();
-    fixture.assert_graph_unchanged();
+        // A lease for some *other* archive is not this archive's authority, even
+        // though it is a genuine live workspace runtime lease.
+        let foreign_archive = fixture.root.path().join("foreign-archive");
+        let foreign_store = ObjectStore::open(&foreign_archive, fixture.workspace).unwrap();
+        let foreign_lease =
+            WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace).unwrap();
+        let before = PromotedRuntimeInstrumentation::capture();
+        let (returned_foreign_lease, error) = open_promoted_local_runtime(
+            refused_seal,
+            &authority,
+            &paths.open(&fixture),
+            RetainedWorkspaceLease::new(foreign_lease),
+        )
+        .err()
+        .expect("a foreign archive's lease must not authorize this promotion")
+        .into_parts();
+        let refused = before.since();
+        assert!(
+            matches!(
+                error,
+                RuntimePromotionError::Sqlite(ProjectionError::UnsafePath(_))
+            ),
+            "unexpected foreign-lease error: {error}"
+        );
+        assert_eq!(
+            refused.archive_identity_reads, 0,
+            "a foreign retained lease must be refused before any archive work"
+        );
+        // The refusal handed the caller's lease back rather than releasing it: the
+        // foreign archive is still this process's.
+        assert!(matches!(
+            WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace),
+            Err(ProjectionError::LeaseContended(_))
+        ));
+        drop(returned_foreign_lease);
+        drop(WorkspaceRuntimeLease::acquire(&foreign_store, fixture.workspace).unwrap());
+
+        // The bootstrap database closes and the promoted one opens under the exact
+        // same lease. The workspace lock does not move.
+        //
+        // The helper probes below can only observe the archive at the instants they
+        // are asked, so they cannot by themselves rule out an infinitesimal
+        // release-and-reacquire inside the handoff. The acquisition counter can, and
+        // does: zero new archive-rooted leases across the whole handoff.
+        let across_handoff = PromotedRuntimeInstrumentation::capture();
+        let bootstrap = fixture.take_bootstrap_session();
+        let runtime = bootstrap
+            .promote(sealed, &authority, &paths.open(&fixture))
+            .map_err(|refusal| refusal.into_parts().1)
+            .unwrap();
+        assert_eq!(
+            across_handoff.since().workspace_lease_acquisitions,
+            0,
+            "the bootstrap -> promoted handoff must reuse the lease, not reacquire it"
+        );
+        assert_eq!(profile.ask("acquire"), "contended");
+        assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+        assert!(matches!(
+            runtime.automatic_external_import(),
+            ExternalImportAdmission::Blocked(_)
+        ));
+        drop(runtime);
+        drop(authority);
+
+        // Only now is the archive free.
+        assert_eq!(profile.ask("acquire"), "acquired");
+        assert_eq!(profile.ask("release"), "released");
+        profile.finish();
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// Every failure boundary of a retained promotion hands the caller's exact
@@ -5098,117 +5139,125 @@ fn the_bootstrap_to_promoted_database_handoff_never_releases_the_workspace_lease
 /// never reacquired.
 #[test]
 fn a_refused_retained_promotion_returns_the_exact_lease_at_every_failure_boundary() {
-    let mut fixture = Fixture::new(
-        "retained-refusal",
-        None,
-        vec![("pages/refuse.md".into(), b"- refuse\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("retained-refusal");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "retained-refusal");
-    let session = SessionId::new();
-    let archive = ObjectStore::open(&fixture.archive_root, fixture.workspace).unwrap();
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "retained-refusal",
+            None,
+            vec![("pages/refuse.md".into(), b"- refuse\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("retained-refusal");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "retained-refusal");
+        let session = SessionId::new();
+        let archive = ObjectStore::open(&fixture.archive_root, fixture.workspace).unwrap();
 
-    let authority = activate_verified_local(
-        &root,
-        fixture.compose(&root),
-        session,
-        &fixture.proofs(),
-        &fixture.runtime(),
-    )
-    .unwrap();
-    // Sealing is idempotent, so one sealed promotion is spent per boundary.
-    let enrollment_boundary =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    let post_open_boundary =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    let sealed =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-
-    let bootstrap = fixture.take_bootstrap_session();
-    let before = PromotedRuntimeInstrumentation::capture();
-
-    // Boundary 1: the very first step, before the lease is even looked at. A
-    // second live enrollment session owns the device-local journal lease.
-    let blocker =
-        RetainedEnrollmentSession::open(&root, &binding, authority.verification_digest()).unwrap();
-    let (lease, error) = bootstrap
-        .promote(enrollment_boundary, &authority, &paths.open(&fixture))
-        .err()
-        .expect("a contended enrollment lease must refuse the promotion")
-        .into_parts();
-    assert!(
-        matches!(error, RuntimePromotionError::Enrollment(_)),
-        "unexpected pre-lease error: {error}"
-    );
-    assert!(
-        matches!(
-            WorkspaceRuntimeLease::acquire(&archive, fixture.workspace),
-            Err(ProjectionError::LeaseContended(_))
-        ),
-        "a pre-lease refusal must hand the archive back, not release it"
-    );
-    drop(blocker);
-
-    // Boundary 2: after the device-local database is open, where the lease can
-    // only be recovered by closing the database it now lives inside.
-    let bootstrap = fixture.reopen_bootstrap_session(lease);
-    fail_next_promotion_after_the_database_opens_for_test();
-    let (lease, error) = bootstrap
-        .promote(post_open_boundary, &authority, &paths.open(&fixture))
-        .err()
-        .expect("the injected post-open fault must refuse the promotion")
-        .into_parts();
-    assert!(
-        matches!(
-            error,
-            RuntimePromotionError::Anchor("injected failure after the promoted database opened")
-        ),
-        "unexpected post-open error: {error}"
-    );
-    // The promoted database really was closed...
-    let promoted_database_lock = paths.database_path.with_file_name(format!(
-        ".{}.database-applier.lock",
-        paths.database_path.file_name().unwrap().to_str().unwrap()
-    ));
-    assert!(
-        !crate::oplog::sqlite::workspace_lock_is_contended(&promoted_database_lock),
-        "the refused promotion must have closed its database"
-    );
-    // ...and the archive really did not move.
-    assert!(
-        matches!(
-            WorkspaceRuntimeLease::acquire(&archive, fixture.workspace),
-            Err(ProjectionError::LeaseContended(_))
-        ),
-        "a post-open refusal must hand the archive back, not release it"
-    );
-
-    // Boundary 3: the retry, on the same lease, succeeds.
-    let bootstrap = fixture.reopen_bootstrap_session(lease);
-    let runtime = bootstrap
-        .promote(sealed, &authority, &paths.open(&fixture))
-        .map_err(|refusal| refusal.into_parts().1)
+        let authority = activate_verified_local(
+            &root,
+            fixture.compose(&root),
+            session,
+            &fixture.proofs(),
+            &fixture.runtime(),
+        )
         .unwrap();
-    assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
-    assert_eq!(
-        runtime
-            .engine()
-            .bootstrap_recovery_instrumentation()
-            .bootstrap_part_reads,
-        0,
-        "retry must safely re-adopt the already migrated candidate rather than replay"
-    );
-    assert_eq!(
-        before.since().workspace_lease_acquisitions,
-        0,
-        "two refusals and a retry must not reacquire the archive even once"
-    );
+        // Sealing is idempotent, so one sealed promotion is spent per boundary.
+        let enrollment_boundary =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        let post_open_boundary =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        let sealed =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
 
-    drop(runtime);
-    drop(authority);
-    drop(WorkspaceRuntimeLease::acquire(&archive, fixture.workspace).unwrap());
-    fixture.assert_graph_unchanged();
+        let bootstrap = fixture.take_bootstrap_session();
+        let before = PromotedRuntimeInstrumentation::capture();
+
+        // Boundary 1: the very first step, before the lease is even looked at. A
+        // second live enrollment session owns the device-local journal lease.
+        let blocker =
+            RetainedEnrollmentSession::open(&root, &binding, authority.verification_digest())
+                .unwrap();
+        let (lease, error) = bootstrap
+            .promote(enrollment_boundary, &authority, &paths.open(&fixture))
+            .err()
+            .expect("a contended enrollment lease must refuse the promotion")
+            .into_parts();
+        assert!(
+            matches!(error, RuntimePromotionError::Enrollment(_)),
+            "unexpected pre-lease error: {error}"
+        );
+        assert!(
+            matches!(
+                WorkspaceRuntimeLease::acquire(&archive, fixture.workspace),
+                Err(ProjectionError::LeaseContended(_))
+            ),
+            "a pre-lease refusal must hand the archive back, not release it"
+        );
+        drop(blocker);
+
+        // Boundary 2: after the device-local database is open, where the lease can
+        // only be recovered by closing the database it now lives inside.
+        let bootstrap = fixture.reopen_bootstrap_session(lease);
+        fail_next_promotion_after_the_database_opens_for_test();
+        let (lease, error) = bootstrap
+            .promote(post_open_boundary, &authority, &paths.open(&fixture))
+            .err()
+            .expect("the injected post-open fault must refuse the promotion")
+            .into_parts();
+        assert!(
+            matches!(
+                error,
+                RuntimePromotionError::Anchor(
+                    "injected failure after the promoted database opened"
+                )
+            ),
+            "unexpected post-open error: {error}"
+        );
+        // The promoted database really was closed...
+        let promoted_database_lock = paths.database_path.with_file_name(format!(
+            ".{}.database-applier.lock",
+            paths.database_path.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(
+            !crate::oplog::sqlite::workspace_lock_is_contended(&promoted_database_lock),
+            "the refused promotion must have closed its database"
+        );
+        // ...and the archive really did not move.
+        assert!(
+            matches!(
+                WorkspaceRuntimeLease::acquire(&archive, fixture.workspace),
+                Err(ProjectionError::LeaseContended(_))
+            ),
+            "a post-open refusal must hand the archive back, not release it"
+        );
+
+        // Boundary 3: the retry, on the same lease, succeeds.
+        let bootstrap = fixture.reopen_bootstrap_session(lease);
+        let runtime = bootstrap
+            .promote(sealed, &authority, &paths.open(&fixture))
+            .map_err(|refusal| refusal.into_parts().1)
+            .unwrap();
+        assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+        assert_eq!(
+            runtime
+                .engine()
+                .bootstrap_recovery_instrumentation()
+                .bootstrap_part_reads,
+            0,
+            "retry must safely re-adopt the already migrated candidate rather than replay"
+        );
+        assert_eq!(
+            before.since().workspace_lease_acquisitions,
+            0,
+            "two refusals and a retry must not reacquire the archive even once"
+        );
+
+        drop(runtime);
+        drop(authority);
+        drop(WorkspaceRuntimeLease::acquire(&archive, fixture.workspace).unwrap());
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// `AcquireWorkspaceLease` is the branch a promotion takes when it retains no
@@ -5218,63 +5267,67 @@ fn a_refused_retained_promotion_returns_the_exact_lease_at_every_failure_boundar
 /// refused as contended; once it is dropped, the same shape opens.
 #[test]
 fn an_acquiring_first_promotion_is_contended_until_the_bootstrap_session_is_released() {
-    let mut fixture = Fixture::new(
-        "acquire-promotion",
-        None,
-        vec![("pages/acquire.md".into(), b"- acquire\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("acquire-promotion");
-    let paths = PromotedPaths::new(&fixture, "acquire-promotion");
-    let session = SessionId::new();
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "acquire-promotion",
+            None,
+            vec![("pages/acquire.md".into(), b"- acquire\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("acquire-promotion");
+        let paths = PromotedPaths::new(&fixture, "acquire-promotion");
+        let session = SessionId::new();
 
-    let authority = activate_verified_local(
-        &root,
-        fixture.compose(&root),
-        session,
-        &fixture.proofs(),
-        &fixture.runtime(),
-    )
-    .unwrap();
-    let contended =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
-    let sealed =
-        seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime()).unwrap();
+        let authority = activate_verified_local(
+            &root,
+            fixture.compose(&root),
+            session,
+            &fixture.proofs(),
+            &fixture.runtime(),
+        )
+        .unwrap();
+        let contended =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
+        let sealed =
+            seal_local_runtime_promotion(&authority, &fixture.proofs(), &fixture.runtime())
+                .unwrap();
 
-    let error = open_promoted_local_runtime(
-        contended,
-        &authority,
-        &paths.open(&fixture),
-        AcquireWorkspaceLease,
-    )
-    .err()
-    .expect("the retained bootstrap session still owns this archive");
-    assert!(
-        matches!(
-            error,
-            RuntimePromotionError::Sqlite(ProjectionError::LeaseContended(_))
-        ),
-        "unexpected acquiring-promotion error: {error}"
-    );
+        let error = open_promoted_local_runtime(
+            contended,
+            &authority,
+            &paths.open(&fixture),
+            AcquireWorkspaceLease,
+        )
+        .err()
+        .expect("the retained bootstrap session still owns this archive");
+        assert!(
+            matches!(
+                error,
+                RuntimePromotionError::Sqlite(ProjectionError::LeaseContended(_))
+            ),
+            "unexpected acquiring-promotion error: {error}"
+        );
 
-    fixture.release_bootstrap_projection();
-    let before = PromotedRuntimeInstrumentation::capture();
-    let runtime = open_promoted_local_runtime(
-        sealed,
-        &authority,
-        &paths.open(&fixture),
-        AcquireWorkspaceLease,
-    )
-    .unwrap();
-    assert_eq!(
-        before.since().workspace_lease_acquisitions,
-        1,
-        "an acquiring promotion takes exactly one archive-rooted lease"
-    );
-    assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
+        fixture.release_bootstrap_projection();
+        let before = PromotedRuntimeInstrumentation::capture();
+        let runtime = open_promoted_local_runtime(
+            sealed,
+            &authority,
+            &paths.open(&fixture),
+            AcquireWorkspaceLease,
+        )
+        .unwrap();
+        assert_eq!(
+            before.since().workspace_lease_acquisitions,
+            1,
+            "an acquiring promotion takes exactly one archive-rooted lease"
+        );
+        assert_eq!(runtime.recovery(), RuntimeRecoveryState::FirstPromotion);
 
-    drop(runtime);
-    drop(authority);
-    fixture.assert_graph_unchanged();
+        drop(runtime);
+        drop(authority);
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// The archive-rooted workspace lock file, as a pathname.
@@ -5766,86 +5819,91 @@ fn a_boundary_that_loses_the_workspace_lease_revokes_the_runtime_terminally() {
 /// which does work.
 #[test]
 fn restoring_the_original_lease_file_never_un_revokes_the_runtime() {
-    let mut fixture = Fixture::new(
-        "sticky-restore",
-        None,
-        vec![("pages/restore.md".into(), b"- restore\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("sticky-restore");
-    let paths = PromotedPaths::new(&fixture, "sticky-restore");
-    let session = SessionId::new();
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
-    append_local_batch(&fixture, &mut authority, &mut runtime, 0xD300);
-
-    let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
-    // A hard link preserves the *inode* the running lease is locked on, so the
-    // restore below puts back the exact file identity — not merely a file with
-    // the same name and bytes. This is the strongest form of the restore.
-    let preserved = lease_path.with_extension("lock.preserved");
-    fs::hard_link(&lease_path, &preserved).unwrap();
-
-    replace_workspace_lease_file(&lease_path);
-
-    // Fail exactly once.
-    let mut window = runtime
-        .admit_promoted_mutation(&mut authority, &fixture.graph)
-        .expect("the carried admission still opens before any boundary observes the loss");
-    assert!(window.drain_projection(16).is_err());
-    drop(window);
-    let revocation = runtime
-        .workspace_authority_revocation()
-        .expect("the drain must latch terminal revocation");
-
-    // Put the original identity back at the original pathname.
-    fs::remove_file(&lease_path).unwrap();
-    fs::rename(&preserved, &lease_path).unwrap();
-    // The raw identity check itself now passes again, which is exactly what
-    // makes this test meaningful: the refusals below are the latch, not the
-    // filesystem.
-    runtime
-        .projection
-        .revalidate_workspace_lease_identity()
-        .expect("the restored file is the exact identity this lease is locked on");
-
-    // Every boundary still refuses, and still names the original loss.
-    for attempt in 0..4 {
-        let Err(error) = runtime.admit_promoted_mutation(&mut authority, &fixture.graph) else {
-            panic!("admission {attempt} self-healed after a restored lease file");
-        };
-        assert!(
-            matches!(
-                &error,
-                RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
-                    if refusal.revocation() == Some(&revocation)
-            ),
-            "admission {attempt} refused for the wrong reason: {error}"
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "sticky-restore",
+            None,
+            vec![("pages/restore.md".into(), b"- restore\n".to_vec())],
         );
-    }
-    assert!(runtime
-        .admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
-        .is_err());
-    assert!(runtime
-        .quiesce_and_mark_safe_without_watcher_dependency_for_test(&mut authority, &fixture.graph)
-        .is_err());
-    assert_eq!(
-        runtime.workspace_authority_revocation().as_ref(),
-        Some(&revocation),
-        "the latched revocation must never be replaced or cleared"
-    );
+        let root = fixture.enrollment_root("sticky-restore");
+        let paths = PromotedPaths::new(&fixture, "sticky-restore");
+        let session = SessionId::new();
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
+        append_local_batch(&fixture, &mut authority, &mut runtime, 0xD300);
 
-    // And the documented recovery: drop this runtime and reopen. A fresh
-    // process contends for the lease honestly and becomes authority again.
-    drop(runtime);
-    drop(authority);
-    let binding = fixture.enrollment_binding();
-    let (mut reopened_authority, mut reopened) =
-        reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture))
-            .expect("a fresh reopen is the recovery path, and it must work");
-    assert_eq!(reopened.workspace_authority_revocation(), None);
-    reopened
-        .admit_promoted_mutation(&mut reopened_authority, &fixture.graph)
-        .expect("the reopened runtime is authority again");
-    fixture.assert_graph_unchanged();
+        let lease_path = workspace_lease_path(&fixture.archive_root, fixture.workspace);
+        // A hard link preserves the *inode* the running lease is locked on, so the
+        // restore below puts back the exact file identity — not merely a file with
+        // the same name and bytes. This is the strongest form of the restore.
+        let preserved = lease_path.with_extension("lock.preserved");
+        fs::hard_link(&lease_path, &preserved).unwrap();
+
+        replace_workspace_lease_file(&lease_path);
+
+        // Fail exactly once.
+        let mut window = runtime
+            .admit_promoted_mutation(&mut authority, &fixture.graph)
+            .expect("the carried admission still opens before any boundary observes the loss");
+        assert!(window.drain_projection(16).is_err());
+        drop(window);
+        let revocation = runtime
+            .workspace_authority_revocation()
+            .expect("the drain must latch terminal revocation");
+
+        // Put the original identity back at the original pathname.
+        fs::remove_file(&lease_path).unwrap();
+        fs::rename(&preserved, &lease_path).unwrap();
+        // The raw identity check itself now passes again, which is exactly what
+        // makes this test meaningful: the refusals below are the latch, not the
+        // filesystem.
+        runtime
+            .projection
+            .revalidate_workspace_lease_identity()
+            .expect("the restored file is the exact identity this lease is locked on");
+
+        // Every boundary still refuses, and still names the original loss.
+        for attempt in 0..4 {
+            let Err(error) = runtime.admit_promoted_mutation(&mut authority, &fixture.graph) else {
+                panic!("admission {attempt} self-healed after a restored lease file");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    RuntimePromotionError::WorkspaceAuthorityRevoked(refusal)
+                        if refusal.revocation() == Some(&revocation)
+                ),
+                "admission {attempt} refused for the wrong reason: {error}"
+            );
+        }
+        assert!(runtime
+            .admit_promoted_mutation_at_full_depth_for_test(&mut authority, &fixture.graph)
+            .is_err());
+        assert!(runtime
+            .quiesce_and_mark_safe_without_watcher_dependency_for_test(
+                &mut authority,
+                &fixture.graph
+            )
+            .is_err());
+        assert_eq!(
+            runtime.workspace_authority_revocation().as_ref(),
+            Some(&revocation),
+            "the latched revocation must never be replaced or cleared"
+        );
+
+        // And the documented recovery: drop this runtime and reopen. A fresh
+        // process contends for the lease honestly and becomes authority again.
+        drop(runtime);
+        drop(authority);
+        let binding = fixture.enrollment_binding();
+        let (mut reopened_authority, mut reopened) =
+            reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture))
+                .expect("a fresh reopen is the recovery path, and it must work");
+        assert_eq!(reopened.workspace_authority_revocation(), None);
+        reopened
+            .admit_promoted_mutation(&mut reopened_authority, &fixture.graph)
+            .expect("the reopened runtime is authority again");
+        fixture.assert_graph_unchanged();
+    });
 }
 
 /// `parts()` is the shape both real consumers take — the operational
@@ -6576,68 +6634,70 @@ fn a_clean_safe_restart_adopts_a_new_session_under_one_retained_lease() {
 /// the very next attempt succeeds.
 #[test]
 fn a_failed_promoted_open_releases_every_authority_and_stays_retryable() {
-    let mut fixture = Fixture::new(
-        "takeover-unwind",
-        None,
-        vec![("pages/unwind.md".into(), b"- unwind\n".to_vec())],
-    );
-    let root = fixture.enrollment_root("takeover-unwind");
-    let binding = fixture.enrollment_binding();
-    let paths = PromotedPaths::new(&fixture, "unwind");
-    let crashed = SessionId::new();
-    let verification_digest = {
-        let (mut authority, mut runtime) = promote(&mut fixture, &root, crashed, &paths);
-        append_local_batch(&fixture, &mut authority, &mut runtime, 0xC600);
-        authority.verification_digest()
-    };
-    let world = HelperWorld::new(&fixture, &root, &paths, SessionId::new());
-    let mut profile = HelperProcess::spawn(
-        "archive-lease",
-        &world,
-        Some(&fixture.root.path().join("profile-unwind")),
-    );
+    on_a_deep_stack(|| {
+        let mut fixture = Fixture::new(
+            "takeover-unwind",
+            None,
+            vec![("pages/unwind.md".into(), b"- unwind\n".to_vec())],
+        );
+        let root = fixture.enrollment_root("takeover-unwind");
+        let binding = fixture.enrollment_binding();
+        let paths = PromotedPaths::new(&fixture, "unwind");
+        let crashed = SessionId::new();
+        let verification_digest = {
+            let (mut authority, mut runtime) = promote(&mut fixture, &root, crashed, &paths);
+            append_local_batch(&fixture, &mut authority, &mut runtime, 0xC600);
+            authority.verification_digest()
+        };
+        let world = HelperWorld::new(&fixture, &root, &paths, SessionId::new());
+        let mut profile = HelperProcess::spawn(
+            "archive-lease",
+            &world,
+            Some(&fixture.root.path().join("profile-unwind")),
+        );
 
-    // Fail the SQLite rebuild, which happens after the workspace lease and its
-    // applier slot have been taken.
-    let before = authoritative_world(&fixture, &root);
-    remove_device_local_database(&paths.database_path);
-    crate::oplog::sqlite::fail_next_apply_during_materialization_for_harness();
-    takeover_error(
-        &root,
-        &binding,
-        SessionId::new(),
-        &paths.open(&fixture),
-        "an interrupted materialization must not authorize a takeover",
-    );
-    assert_eq!(authoritative_world(&fixture, &root), before);
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe {
-            session_id: crashed
-        }
-    );
+        // Fail the SQLite rebuild, which happens after the workspace lease and its
+        // applier slot have been taken.
+        let before = authoritative_world(&fixture, &root);
+        remove_device_local_database(&paths.database_path);
+        crate::oplog::sqlite::fail_next_apply_during_materialization_for_harness();
+        takeover_error(
+            &root,
+            &binding,
+            SessionId::new(),
+            &paths.open(&fixture),
+            "an interrupted materialization must not authorize a takeover",
+        );
+        assert_eq!(authoritative_world(&fixture, &root), before);
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: crashed
+            }
+        );
 
-    // Every authority came back: another profile can take the archive lease...
-    assert_eq!(profile.ask("acquire"), "acquired");
-    assert_eq!(profile.ask("release"), "released");
-    profile.finish();
+        // Every authority came back: another profile can take the archive lease...
+        assert_eq!(profile.ask("acquire"), "acquired");
+        assert_eq!(profile.ask("release"), "released");
+        profile.finish();
 
-    // ...and this process can retry immediately, including its enrollment lease
-    // and the same applier slot.
-    let successor = SessionId::new();
-    assert_eq!(
-        takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
-        RuntimeRecoveryState::TookOverCrashedUnsafe {
-            previous_session: crashed
-        }
-    );
-    assert_eq!(
-        committed_handoff(&root, &binding, verification_digest),
-        LocalActiveHandoff::Unsafe {
-            session_id: successor
-        }
-    );
-    fixture.assert_graph_unchanged();
+        // ...and this process can retry immediately, including its enrollment lease
+        // and the same applier slot.
+        let successor = SessionId::new();
+        assert_eq!(
+            takeover_recovery(&root, &binding, successor, &paths.open(&fixture)),
+            RuntimeRecoveryState::TookOverCrashedUnsafe {
+                previous_session: crashed
+            }
+        );
+        assert_eq!(
+            committed_handoff(&root, &binding, verification_digest),
+            LocalActiveHandoff::Unsafe {
+                session_id: successor
+            }
+        );
+        fixture.assert_graph_unchanged();
+    });
 }
 
 // ---------------------------------------------------------------------------
