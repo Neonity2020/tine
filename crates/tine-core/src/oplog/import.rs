@@ -158,7 +158,7 @@ const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = 768 * 1024;
 /// manifest, payload descriptor list, accepted-evidence document frontier, and
 /// aggregate part descriptor below their existing byte limits. Page content is
 /// packed up to this bound; a single page exceeds it only by being one document.
-const BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART: u32 = 64;
+const BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART: u32 = 512;
 /// Page declarations are small, but authoring adds payload metadata beyond the
 /// declaration operation itself. This cap leaves ample room under the separate
 /// 4,096-payload-object bound while still fitting one million empty pages into
@@ -10860,6 +10860,38 @@ mod tests {
         }
     }
 
+    fn synthetic_page_capsule_spool(directory: &Path, page_count: u64) -> BootstrapOperationSpool {
+        let path = directory.join("synthetic-page-capsules.sorted");
+        let mut writer = BufWriter::new(create_new_file(&path).unwrap());
+        for index in 0..page_count {
+            let mut source_leaf = [0_u8; 32];
+            source_leaf[..8].copy_from_slice(&index.to_be_bytes());
+            let record = BootstrapOperationRecord::new(
+                SemanticOperation::DeletePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(index as u128 + 1)),
+                },
+                SourceLeafDigestV1::from_bytes(source_leaf),
+                None,
+            )
+            .unwrap();
+            write_sort_record(
+                &mut writer,
+                &SortRecord {
+                    key: index.to_be_bytes().to_vec(),
+                    value: record.encode().unwrap(),
+                },
+            )
+            .unwrap();
+        }
+        writer.flush().unwrap();
+        writer.get_ref().sync_all().unwrap();
+        BootstrapOperationSpool {
+            path,
+            operation_count: page_count,
+            declaration_count: 0,
+        }
+    }
+
     fn synthetic_declaration_spool(
         directory: &Path,
         declaration_count: u64,
@@ -10910,6 +10942,52 @@ mod tests {
             );
             assert_eq!(instrumentation.parts, expected_parts);
             assert!(instrumentation.peak_owned_part_operations == 0);
+        }
+    }
+
+    #[test]
+    fn inactive_streaming_bootstrap_partitions_512_and_513_page_capsules_losslessly() {
+        for (page_count, expected_boundaries) in [(512, vec![512]), (513, vec![512, 1])] {
+            let root = TestRoot::new(&format!("streaming-page-capsules-{page_count}"));
+            let working = root.path().join("partition");
+            fs::create_dir(&working).unwrap();
+            let spool = synthetic_page_capsule_spool(&working, page_count);
+            let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+            assert_eq!(
+                partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation)
+                    .unwrap(),
+                expected_boundaries.len() as u32
+            );
+            assert_eq!(instrumentation.page_capsules, page_count);
+            assert_eq!(instrumentation.max_part_documents, page_count.min(512));
+
+            let mut boundaries = FrameReader::open(
+                &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
+                std::mem::size_of::<u32>(),
+            )
+            .unwrap();
+            let mut operations = BootstrapOperationSpoolReader::open(&spool.path).unwrap();
+            let mut observed_boundaries = Vec::new();
+            let mut observed_pages = Vec::new();
+            while let Some(boundary) = boundaries.next().unwrap() {
+                let operation_count = u32::from_be_bytes(boundary.try_into().unwrap());
+                observed_boundaries.push(operation_count);
+                for _ in 0..operation_count {
+                    let record = operations.next().unwrap().unwrap();
+                    let SemanticOperation::DeletePage { page_id } = record.operation else {
+                        panic!("synthetic page capsule changed operation kind");
+                    };
+                    observed_pages.push(page_id);
+                }
+            }
+            assert_eq!(observed_boundaries, expected_boundaries);
+            assert_eq!(
+                observed_pages,
+                (1..=page_count)
+                    .map(|index| PageId::from_uuid(Uuid::from_u128(index as u128)))
+                    .collect::<Vec<_>>()
+            );
+            assert!(operations.next().unwrap().is_none());
         }
     }
 
@@ -11395,6 +11473,18 @@ mod tests {
             fs::create_dir_all(target.parent().unwrap()).unwrap();
             fs::write(target, contents).unwrap();
         }
+        for page in 0..257 {
+            let mut contents = String::new();
+            for block in 0..8 {
+                let identity = Uuid::from_u128(0x5e10_0000 + page * 8 + block);
+                contents.push_str(&format!("- dense {page:03}/{block}\n  id:: {identity}\n"));
+            }
+            fs::write(
+                graph_root.join(format!("notes/dense-{page:03}.md")),
+                contents,
+            )
+            .unwrap();
+        }
         let graph = Graph::open(&graph_root);
         let capture_scratch = root.path().join("capture");
         let working = root.path().join("working");
@@ -11421,6 +11511,34 @@ mod tests {
             &mut source_instrumentation,
         )
         .unwrap();
+        let mut partition_instrumentation = BootstrapStreamingImportInstrumentation::default();
+        assert_eq!(
+            partition_bootstrap_operation_spool(
+                &streaming,
+                &working,
+                &mut partition_instrumentation,
+            )
+            .unwrap(),
+            3
+        );
+        let mut boundaries = FrameReader::open(
+            &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
+            std::mem::size_of::<u32>(),
+        )
+        .unwrap();
+        let mut operation_boundaries = Vec::new();
+        while let Some(boundary) = boundaries.next().unwrap() {
+            operation_boundaries.push(u32::from_be_bytes(boundary.try_into().unwrap()));
+        }
+        assert_eq!(operation_boundaries.len(), 3);
+        assert!(
+            MAX_OPERATIONS_PER_BOOTSTRAP_PART - operation_boundaries[1] < 16,
+            "the next 16-operation dense page capsule must be stopped by the operation limit"
+        );
+        assert!(
+            partition_instrumentation.max_part_documents
+                < u64::from(BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART)
+        );
         let mut streaming_reader = BootstrapOperationSpoolReader::open(&streaming.path).unwrap();
         let mut streaming_operations = Vec::new();
         while let Some(operation) = streaming_reader.next().unwrap() {
@@ -11692,6 +11810,77 @@ mod tests {
         assert!(verified.instrumentation().peak_owned_source_chunks <= 1);
         assert!(verified.instrumentation().peak_owned_parts <= 1);
         assert!(verified.instrumentation().peak_owned_cold_records <= 1);
+    }
+
+    fn assert_prepared_bootstrap_limits(prepared: &InactiveBootstrapPreparedPublication) {
+        assert!(prepared.aggregate().parts().len() <= MAX_BOOTSTRAP_PARTS as usize);
+        assert!(
+            prepared.aggregate_bytes().unwrap().len()
+                <= super::super::bootstrap_import::MAX_BOOTSTRAP_AGGREGATE_MANIFEST_BYTES
+        );
+        assert!(
+            prepared.commit_bytes().unwrap().len()
+                <= super::super::bootstrap_import::MAX_BOOTSTRAP_AGGREGATE_COMMIT_BYTES
+        );
+        assert!(
+            prepared.instrumentation().max_part_manifest_bytes
+                <= BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES as u64
+        );
+        assert!(
+            prepared.instrumentation().max_part_payload_descriptors
+                <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
+        );
+        assert!(
+            prepared.instrumentation().peak_owned_part_operations
+                <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
+        );
+
+        for (ordinal, descriptor) in prepared.aggregate().parts().iter().enumerate() {
+            let evidence = descriptor.evidence();
+            assert!(
+                evidence.operation_root().operation_count() <= MAX_OPERATIONS_PER_BOOTSTRAP_PART
+            );
+            assert!(
+                evidence.operation_root().semantic_effect_bytes()
+                    <= MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART
+            );
+            assert!(
+                evidence.source_span_root().span_count() <= MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART
+            );
+            assert!(
+                evidence.payload_object_root().object_count() <= MAX_OPERATIONS_PER_BOOTSTRAP_PART
+            );
+            assert!(
+                evidence.payload_object_root().total_bytes()
+                    <= MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART
+            );
+            assert!(
+                evidence.encode().unwrap().len()
+                    <= super::super::bootstrap_import::MAX_BOOTSTRAP_PART_EVIDENCE_BYTES
+            );
+
+            let mut part = prepared.open_part(ordinal as u32).unwrap();
+            assert!(part.manifest_bytes().len() <= BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES);
+            assert_eq!(part.evidence().unwrap(), evidence);
+            let spans = part.span_index().unwrap();
+            spans.validate_part(evidence).unwrap();
+            assert!(spans.spans().len() <= MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART as usize);
+            assert!(
+                spans.encode().unwrap().len()
+                    <= super::super::bootstrap_import::MAX_PART_SPAN_INDEX_BYTES
+            );
+            let mut payload_objects = 0_u32;
+            let mut payload_bytes = 0_u64;
+            while let Some(bytes) = part.next_object_bytes().unwrap() {
+                payload_objects += 1;
+                payload_bytes += bytes.len() as u64;
+            }
+            assert_eq!(
+                payload_objects,
+                evidence.payload_object_root().object_count()
+            );
+            assert_eq!(payload_bytes, evidence.payload_object_root().total_bytes());
+        }
     }
 
     fn install_accepted_authority(
@@ -12906,19 +13095,33 @@ mod tests {
             &EngineHistoryBinding::empty()
         );
 
-        let mut source = String::new();
-        for ordinal in 0..MAX_OPERATIONS_PER_BOOTSTRAP_PART {
-            source.push_str(&format!("- multipart {ordinal}\n"));
-        }
-        let (multi_root, multi, workspace) = prepare_streaming_bootstrap(
-            "orchestration-multipart",
-            &[("pages/multipart.md", &source)],
-        );
-        assert!(multi.aggregate().parts().len() > 1);
+        let owned = (0..65)
+            .map(|ordinal| {
+                (
+                    format!("pages/multipart-{ordinal:03}.md"),
+                    format!("- multipart page {ordinal}\n"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let files = owned
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect::<Vec<_>>();
+        let (multi_root, multi, workspace) =
+            prepare_streaming_bootstrap("orchestration-multipart", &files);
+        assert_eq!(multi.instrumentation().page_capsules, 65);
+        assert_eq!(multi.aggregate().parts().len(), 2);
+        assert_prepared_bootstrap_limits(&multi);
+        let expected_snapshot = multi
+            .candidate()
+            .accepted_engine()
+            .canonical_snapshot()
+            .unwrap();
         let multi_binding = orchestration_binding(&multi, 0x6b20);
+        let archive = multi_root.path().join("archive");
         let verified = publish_install_verify_inactive_bootstrap(
             &multi,
-            ObjectStore::open(&multi_root.path().join("archive"), workspace).unwrap(),
+            ObjectStore::open(&archive, workspace).unwrap(),
             multi_binding,
         )
         .unwrap();
@@ -12928,6 +13131,15 @@ mod tests {
             u64::from(verified.part_count())
         );
         assert_eq!(verified.instrumentation().parts, verified.part_count());
+        let reopened = reopen_inactive_bootstrap_accepted_authority(
+            &verified,
+            ObjectStore::open(&archive, workspace).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.accepted_engine().canonical_snapshot().unwrap(),
+            expected_snapshot
+        );
     }
 
     #[test]
