@@ -13216,10 +13216,11 @@ mod tests {
             assert_eq!(proof.bootstrap_rebuild().bootstrap_part_reads, parts);
             assert_materialized_snapshot_matches(&authority, &opened.database);
             eprintln!(
-                "bootstrap_sqlite_candidate_release pages={page_count} parts={parts} fixture_ms={} authority_ms={} sqlite_ms={} candidate_transactions={} candidate_durability_barriers={} semantic_proofs={} row_proofs={}",
+                "bootstrap_sqlite_candidate_release pages={page_count} parts={parts} fixture_ms={} authority_ms={} sqlite_ms={} terminal_row_proof_us={} candidate_transactions={} candidate_durability_barriers={} semantic_proofs={} row_proofs={}",
                 fixture_elapsed.as_millis(),
                 authority_elapsed.as_millis(),
                 sqlite_elapsed.as_millis(),
+                opened.rebuild.final_row_digest_proof_micros,
                 opened.rebuild.physical_candidate_transactions,
                 opened.rebuild.physical_candidate_durability_barriers,
                 opened.rebuild.final_semantic_equivalence_proofs,

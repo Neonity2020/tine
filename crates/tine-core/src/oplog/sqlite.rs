@@ -1183,6 +1183,7 @@ fn materialize_accepted_event_with_stats(
         )));
     }
     let affected_pages = super::reference_catalog::affected_reference_sources(&effect);
+    let effective_transitions = effective_transition_index(event);
     let mut replacements = Vec::new();
     let mut deletions = Vec::new();
     let mut instrumentation = EventMaterializationInstrumentation::default();
@@ -1201,11 +1202,7 @@ fn materialize_accepted_event_with_stats(
             .map_err(|error| ProjectionError::Materialization(error.to_string()))?
         {
             Some(mut page) => {
-                if let Some(transition) = event
-                    .effective_transitions()
-                    .iter()
-                    .find(|transition| transition.page_id() == page_id)
-                {
+                if let Some(transition) = effective_transitions.get(&page_id) {
                     transition
                         .apply_to_materialized(&mut page)
                         .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -1269,6 +1266,7 @@ fn materialize_inactive_bootstrap_event_bulk_with_budget(
     let affected_pages = super::reference_catalog::affected_reference_sources(&effect)
         .into_iter()
         .collect::<Vec<_>>();
+    let effective_transitions = effective_transition_index(event);
     let materializer = (!affected_pages.is_empty())
         .then(|| {
             engine
@@ -1291,11 +1289,7 @@ fn materialize_inactive_bootstrap_event_bulk_with_budget(
         for (page_id, page) in page_ids.iter().copied().zip(pages) {
             match page {
                 Some(mut page) => {
-                    if let Some(transition) = event
-                        .effective_transitions()
-                        .iter()
-                        .find(|transition| transition.page_id() == page_id)
-                    {
+                    if let Some(transition) = effective_transitions.get(&page_id) {
                         transition
                             .apply_to_materialized(&mut page)
                             .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -1350,6 +1344,7 @@ fn materialize_accepted_event_pointwise(
     authenticate_event_for_engine(engine, event)?;
     let effect = SemanticEffect::decode(event.semantic_effect())
         .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    let effective_transitions = effective_transition_index(event);
     let mut replacements = Vec::new();
     let mut deletions = Vec::new();
     for page_id in super::reference_catalog::affected_reference_sources(&effect) {
@@ -1358,11 +1353,7 @@ fn materialize_accepted_event_pointwise(
             .map_err(|error| ProjectionError::Materialization(error.to_string()))?
         {
             Some(mut page) => {
-                if let Some(transition) = event
-                    .effective_transitions()
-                    .iter()
-                    .find(|transition| transition.page_id() == page_id)
-                {
+                if let Some(transition) = effective_transitions.get(&page_id) {
                     transition
                         .apply_to_materialized(&mut page)
                         .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -1373,6 +1364,21 @@ fn materialize_accepted_event_pointwise(
         }
     }
     super::MaterializationChange::new(event.batch_id(), replacements, deletions).map_err(Into::into)
+}
+
+/// Page IDs are canonical map keys. `find` used the first matching transition,
+/// so retaining the first duplicate deliberately keeps malformed-event behavior
+/// unchanged while avoiding a transition scan for every affected page.
+fn effective_transition_index(
+    event: &AcceptedBatchEvent,
+) -> BTreeMap<PageId, &super::hot_engine::AuthenticatedPageLocalEffectiveTransition> {
+    let mut transitions = BTreeMap::new();
+    for transition in event.effective_transitions() {
+        transitions
+            .entry(transition.page_id())
+            .or_insert(transition);
+    }
+    transitions
 }
 
 fn attach_authenticated_reference_catalog(
@@ -1645,6 +1651,8 @@ pub struct RebuildInstrumentation {
     pub reference_coverage_full_scans: usize,
     pub final_semantic_equivalence_proofs: usize,
     pub final_row_digest_equivalence_proofs: usize,
+    #[cfg(test)]
+    pub final_row_digest_proof_micros: u128,
     /// Accepted-event apply transactions only; schema setup and terminal file
     /// checkpoint/publication remain separately durable lifecycle boundaries.
     pub physical_candidate_transactions: u64,
@@ -3499,8 +3507,15 @@ impl SqliteFrontier {
         // unpublished candidate; publication happens only after this returns.
         let _semantic_digest = self.semantic_projection_digest()?;
         instrumentation.final_semantic_equivalence_proofs += 1;
+        #[cfg(test)]
+        let row_digest_started = std::time::Instant::now();
         let _row_digest = self.materialized_row_digest_for_harness()?;
         instrumentation.final_row_digest_equivalence_proofs += 1;
+        #[cfg(test)]
+        {
+            instrumentation.final_row_digest_proof_micros =
+                row_digest_started.elapsed().as_micros();
+        }
         if inactive_bulk {
             self.physical.finish_candidate_build()?;
         }

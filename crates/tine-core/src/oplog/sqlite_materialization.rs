@@ -821,6 +821,21 @@ impl MaterializationChange {
             .iter()
             .map(|page| (page.page_id, page))
             .collect::<BTreeMap<_, _>>();
+        // `validate_shape` above rejects duplicate IDs, so this canonical
+        // per-page index preserves the prior membership/block lookup semantics.
+        let replacement_blocks = self
+            .replacements
+            .iter()
+            .map(|page| {
+                (
+                    page.page_id,
+                    page.blocks
+                        .iter()
+                        .map(|block| (block.block_id, block))
+                        .collect::<BTreeMap<_, _>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let deletions = self.deletions.iter().copied().collect::<BTreeSet<_>>();
         let mut affected = BTreeSet::new();
         let mut required_deletions = BTreeSet::new();
@@ -890,7 +905,7 @@ impl MaterializationChange {
             if required_deletions.contains(&delta.page_id) {
                 continue;
             }
-            let page = replacements.get(&delta.page_id).ok_or_else(|| {
+            let blocks = replacement_blocks.get(&delta.page_id).ok_or_else(|| {
                 MaterializationError::Incomplete(format!(
                     "membership change for page {} has no replacement",
                     delta.page_id
@@ -898,16 +913,12 @@ impl MaterializationChange {
             })?;
             match delta.after.as_ref() {
                 Some(after) => {
-                    let block = page
-                        .blocks
-                        .iter()
-                        .find(|block| block.block_id == delta.block_id)
-                        .ok_or_else(|| {
-                            MaterializationError::Contradiction(format!(
-                                "accepted member {} is absent from page {}",
-                                delta.block_id, delta.page_id
-                            ))
-                        })?;
+                    let block = blocks.get(&delta.block_id).ok_or_else(|| {
+                        MaterializationError::Contradiction(format!(
+                            "accepted member {} is absent from page {}",
+                            delta.block_id, delta.page_id
+                        ))
+                    })?;
                     if block.home_document_id != after.home_document_id
                         || block.parent != after.parent
                         || block.order != after.order
@@ -918,11 +929,7 @@ impl MaterializationChange {
                         )));
                     }
                 }
-                None if page
-                    .blocks
-                    .iter()
-                    .any(|block| block.block_id == delta.block_id) =>
-                {
+                None if blocks.contains_key(&delta.block_id) => {
                     return Err(MaterializationError::Contradiction(format!(
                         "removed member {} remains on page {}",
                         delta.block_id, delta.page_id
@@ -944,7 +951,7 @@ impl MaterializationChange {
             if required_deletions.contains(&page_id) {
                 continue;
             }
-            let page = replacements.get(&page_id).ok_or_else(|| {
+            let blocks = replacement_blocks.get(&page_id).ok_or_else(|| {
                 MaterializationError::Incomplete(format!(
                     "block change for page {page_id} has no replacement"
                 ))
@@ -952,16 +959,12 @@ impl MaterializationChange {
             match delta.after.as_ref() {
                 Some(after) if matches!(after.owner, BlockOwner::Page(owner) if owner == page_id) =>
                 {
-                    let block = page
-                        .blocks
-                        .iter()
-                        .find(|block| block.block_id == delta.block_id)
-                        .ok_or_else(|| {
-                            MaterializationError::Contradiction(format!(
-                                "accepted live block {} is absent from page {page_id}",
-                                delta.block_id
-                            ))
-                        })?;
+                    let block = blocks.get(&delta.block_id).ok_or_else(|| {
+                        MaterializationError::Contradiction(format!(
+                            "accepted live block {} is absent from page {page_id}",
+                            delta.block_id
+                        ))
+                    })?;
                     if block.home_document_id != after.home_document_id
                         || block.content != after.content
                         || block.logseq_uuid != after.logseq_uuid
@@ -973,12 +976,7 @@ impl MaterializationChange {
                         )));
                     }
                 }
-                Some(_) | None
-                    if page
-                        .blocks
-                        .iter()
-                        .any(|block| block.block_id == delta.block_id) =>
-                {
+                Some(_) | None if blocks.contains_key(&delta.block_id) => {
                     return Err(MaterializationError::Contradiction(format!(
                         "non-live block {} remains on page {page_id}",
                         delta.block_id
@@ -2556,6 +2554,70 @@ mod tests {
         .unwrap()
         .encode()
         .unwrap()
+    }
+
+    #[test]
+    fn membership_validation_retains_presence_and_absence_semantics_across_many_blocks() {
+        let page_id = page_id(410_000);
+        let home_document_id = document_id(410_001);
+        let target_block_id = BlockId::from_uuid(Uuid::from_u128(410_020));
+        let mut page = page_input(page_id, "membership index".into());
+        page.blocks = (0..32)
+            .map(|index| {
+                let block_id = if index == 23 {
+                    target_block_id
+                } else {
+                    BlockId::from_uuid(Uuid::from_u128(410_100 + index))
+                };
+                MaterializedBlockInput {
+                    block_id,
+                    home_document_id,
+                    parent: None,
+                    order: format!("{index:02}"),
+                    content: format!("block {index}"),
+                    searchable_text: format!("block {index}"),
+                    heading_level: None,
+                    collapsed: false,
+                    logseq_uuid: None,
+                    logseq_identity_origin: None,
+                    references: Vec::new(),
+                    properties: Vec::new(),
+                    tags: Vec::new(),
+                    task: None,
+                }
+            })
+            .collect();
+        let semantic_effect = SemanticEffect::new(
+            Vec::new(),
+            Vec::new(),
+            vec![super::super::MembershipDelta {
+                page_id,
+                block_id: target_block_id,
+                before: None,
+                after: Some(
+                    super::super::MembershipClaim::new(home_document_id, None, "23").unwrap(),
+                ),
+            }],
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+
+        let accepted =
+            MaterializationChange::new(batch_id(410_002), vec![page.clone()], Vec::new()).unwrap();
+        assert!(accepted
+            .validate_against_stored(batch_id(410_002), &semantic_effect)
+            .is_ok());
+
+        page.blocks
+            .retain(|block| block.block_id != target_block_id);
+        let missing =
+            MaterializationChange::new(batch_id(410_002), vec![page], Vec::new()).unwrap();
+        assert!(matches!(
+            missing.validate_against_stored(batch_id(410_002), &semantic_effect),
+            Err(MaterializationError::Contradiction(message))
+                if message.contains("accepted member") && message.contains("absent")
+        ));
     }
 
     fn resource_limit(error: Result<MaterializationChange, MaterializationError>, resource: &str) {
