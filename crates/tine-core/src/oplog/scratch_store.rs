@@ -33,8 +33,12 @@ pub(crate) const AUTHENTICATED_CATALOG_SCHEMA_VERSION: u32 = 2;
 const AUTHENTICATED_POINT_MAP_SCHEMA_VERSION: u32 = 1;
 const CAUSAL_ACCUMULATOR_SCHEMA_VERSION: u32 = 1;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
-const AUTHENTICATED_BULK_REBUILD_MIN_MUTATIONS: usize = 256;
 const MAX_AUTHENTICATED_CATALOG_VALUE_BYTES: usize = 8 * 1024;
+/// A batch checkpoints its exact current root before the next mutation could
+/// exceed this overlay budget. The per-node charge includes conservative map
+/// and allocator overhead; catalog values add their exact resident bytes.
+const AUTHENTICATED_BATCH_MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+const AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD: usize = 256;
 #[cfg(test)]
 pub(crate) const AUTHENTICATED_CATALOG_MAX_DEPTH: usize = MAX_AUTHENTICATED_MAP_DEPTH;
 pub(crate) const AUTHENTICATED_POINT_MAX_DEPTH: usize = 256;
@@ -487,11 +491,44 @@ struct AuthenticatedMapNode {
     right: Option<AuthenticatedMapChild>,
 }
 
-struct AuthenticatedMapBuildNode {
+#[derive(Clone)]
+struct AuthenticatedBatchChild {
+    key: [u8; 16],
+    persisted: Option<AuthenticatedMapChild>,
+}
+
+impl AuthenticatedBatchChild {
+    fn persisted(child: AuthenticatedMapChild) -> Self {
+        Self {
+            key: child.key,
+            persisted: Some(child),
+        }
+    }
+
+    const fn staged(key: [u8; 16]) -> Self {
+        Self {
+            key,
+            persisted: None,
+        }
+    }
+}
+
+struct AuthenticatedMapBatchNode {
     key: [u8; 16],
     value_digest: ContentDigest,
-    left: Option<usize>,
-    right: Option<usize>,
+    left: Option<AuthenticatedBatchChild>,
+    right: Option<AuthenticatedBatchChild>,
+}
+
+struct AuthenticatedMapBatch<'a> {
+    store: &'a ScratchStore,
+    kind: ScratchPageKind,
+    root: Option<AuthenticatedBatchChild>,
+    count: u64,
+    nodes: BTreeMap<[u8; 16], AuthenticatedMapBatchNode>,
+    resident_keys: BTreeSet<[u8; 16]>,
+    resident_bytes: usize,
+    max_resident_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -505,11 +542,519 @@ struct AuthenticatedCatalogNode {
     right: Option<AuthenticatedMapChild>,
 }
 
-struct AuthenticatedCatalogBuildNode {
+struct AuthenticatedCatalogBatchNode {
     key: [u8; 16],
     value: Vec<u8>,
-    left: Option<usize>,
-    right: Option<usize>,
+    left: Option<AuthenticatedBatchChild>,
+    right: Option<AuthenticatedBatchChild>,
+}
+
+struct AuthenticatedCatalogBatch<'a> {
+    store: &'a ScratchStore,
+    root: Option<AuthenticatedBatchChild>,
+    count: u64,
+    nodes: BTreeMap<[u8; 16], AuthenticatedCatalogBatchNode>,
+    resident_keys: BTreeSet<[u8; 16]>,
+    resident_bytes: usize,
+    max_resident_bytes: usize,
+}
+
+impl<'a> AuthenticatedMapBatch<'a> {
+    fn new(
+        store: &'a ScratchStore,
+        kind: ScratchPageKind,
+        root: &ScratchAuthenticatedMapRoot,
+    ) -> Result<Self, ScratchError> {
+        Self::with_residency_limit(store, kind, root, AUTHENTICATED_BATCH_MAX_RESIDENT_BYTES)
+    }
+
+    fn with_residency_limit(
+        store: &'a ScratchStore,
+        kind: ScratchPageKind,
+        root: &ScratchAuthenticatedMapRoot,
+        max_resident_bytes: usize,
+    ) -> Result<Self, ScratchError> {
+        validate_authenticated_map_root(root)?;
+        Ok(Self {
+            store,
+            kind,
+            root: root.root.as_ref().map(|page_ref| {
+                AuthenticatedBatchChild::persisted(AuthenticatedMapChild {
+                    key: root.root_key.expect("validated nonempty root key"),
+                    digest: root.root_digest,
+                    page_ref: page_ref.clone(),
+                })
+            }),
+            count: root.count,
+            nodes: BTreeMap::new(),
+            resident_keys: BTreeSet::new(),
+            resident_bytes: 0,
+            max_resident_bytes,
+        })
+    }
+
+    fn upsert(&mut self, key: [u8; 16], value_digest: ContentDigest) -> Result<(), ScratchError> {
+        let max_insert_residency = AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD
+            .saturating_mul(MAX_AUTHENTICATED_MAP_DEPTH + 2);
+        if self.resident_bytes > self.max_resident_bytes.saturating_sub(max_insert_residency) {
+            self.checkpoint()?;
+        }
+        let root = self.root.take();
+        let (next, inserted) = self.upsert_child(root, key, value_digest, 0)?;
+        self.root = Some(next);
+        if inserted {
+            self.count = self
+                .count
+                .checked_add(1)
+                .ok_or(ScratchError::IndexCapacity)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_child(
+        &mut self,
+        current: Option<AuthenticatedBatchChild>,
+        key: [u8; 16],
+        value_digest: ContentDigest,
+        depth: usize,
+    ) -> Result<(AuthenticatedBatchChild, bool), ScratchError> {
+        if depth > MAX_AUTHENTICATED_MAP_DEPTH {
+            return Err(ScratchError::IndexCapacity);
+        }
+        let Some(current) = current else {
+            self.charge_node(key, AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD)?;
+            return Ok((
+                self.stage(AuthenticatedMapBatchNode {
+                    key,
+                    value_digest,
+                    left: None,
+                    right: None,
+                }),
+                true,
+            ));
+        };
+        let mut node = self.take_node(current)?;
+        let inserted;
+        match key.cmp(&node.key) {
+            std::cmp::Ordering::Equal => {
+                node.value_digest = value_digest;
+                inserted = false;
+            }
+            std::cmp::Ordering::Less => {
+                let (left, was_inserted) =
+                    self.upsert_child(node.left.take(), key, value_digest, depth + 1)?;
+                node.left = Some(left);
+                inserted = was_inserted;
+                if node.left.as_ref().is_some_and(|left| {
+                    authenticated_map_priority_order(left.key, node.key).is_lt()
+                }) {
+                    return Ok((self.rotate_right(node)?, inserted));
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                let (right, was_inserted) =
+                    self.upsert_child(node.right.take(), key, value_digest, depth + 1)?;
+                node.right = Some(right);
+                inserted = was_inserted;
+                if node.right.as_ref().is_some_and(|right| {
+                    authenticated_map_priority_order(right.key, node.key).is_lt()
+                }) {
+                    return Ok((self.rotate_left(node)?, inserted));
+                }
+            }
+        }
+        Ok((self.stage(node), inserted))
+    }
+
+    fn rotate_right(
+        &mut self,
+        mut node: AuthenticatedMapBatchNode,
+    ) -> Result<AuthenticatedBatchChild, ScratchError> {
+        let left = node.left.take().ok_or(ScratchError::MalformedPage)?;
+        let mut left_node = self.take_node(left)?;
+        node.left = left_node.right.take();
+        left_node.right = Some(self.stage(node));
+        Ok(self.stage(left_node))
+    }
+
+    fn rotate_left(
+        &mut self,
+        mut node: AuthenticatedMapBatchNode,
+    ) -> Result<AuthenticatedBatchChild, ScratchError> {
+        let right = node.right.take().ok_or(ScratchError::MalformedPage)?;
+        let mut right_node = self.take_node(right)?;
+        node.right = right_node.left.take();
+        right_node.left = Some(self.stage(node));
+        Ok(self.stage(right_node))
+    }
+
+    fn take_node(
+        &mut self,
+        child: AuthenticatedBatchChild,
+    ) -> Result<AuthenticatedMapBatchNode, ScratchError> {
+        if let Some(node) = self.nodes.remove(&child.key) {
+            return Ok(node);
+        }
+        let persisted = child.persisted.ok_or(ScratchError::MalformedPage)?;
+        let node = self
+            .store
+            .read_authenticated_map_node(self.kind, &persisted)?;
+        self.charge_node(node.key, AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD)?;
+        Ok(AuthenticatedMapBatchNode {
+            key: node.key,
+            value_digest: node.value_digest,
+            left: node.left.map(AuthenticatedBatchChild::persisted),
+            right: node.right.map(AuthenticatedBatchChild::persisted),
+        })
+    }
+
+    fn charge_node(&mut self, key: [u8; 16], bytes: usize) -> Result<(), ScratchError> {
+        if !self.resident_keys.insert(key) {
+            return Err(ScratchError::MalformedPage);
+        }
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_add(bytes)
+            .ok_or(ScratchError::IndexCapacity)?;
+        if self.resident_bytes > self.max_resident_bytes {
+            return Err(ScratchError::IndexCapacity);
+        }
+        Ok(())
+    }
+
+    fn stage(&mut self, node: AuthenticatedMapBatchNode) -> AuthenticatedBatchChild {
+        let key = node.key;
+        self.nodes.insert(key, node);
+        AuthenticatedBatchChild::staged(key)
+    }
+
+    fn checkpoint(&mut self) -> Result<(), ScratchError> {
+        if let Some(root) = self.root.take() {
+            let persisted = self.publish(root, 0)?;
+            self.root = Some(AuthenticatedBatchChild::persisted(persisted));
+        }
+        if !self.nodes.is_empty() {
+            return Err(ScratchError::MalformedPage);
+        }
+        self.resident_keys.clear();
+        self.resident_bytes = 0;
+        Ok(())
+    }
+
+    fn publish(
+        &mut self,
+        child: AuthenticatedBatchChild,
+        depth: usize,
+    ) -> Result<AuthenticatedMapChild, ScratchError> {
+        if depth > MAX_AUTHENTICATED_MAP_DEPTH {
+            return Err(ScratchError::IndexCapacity);
+        }
+        if let Some(persisted) = child.persisted {
+            return Ok(persisted);
+        }
+        let node = self
+            .nodes
+            .remove(&child.key)
+            .ok_or(ScratchError::MalformedPage)?;
+        let left = node
+            .left
+            .map(|left| self.publish(left, depth + 1))
+            .transpose()?;
+        let right = node
+            .right
+            .map(|right| self.publish(right, depth + 1))
+            .transpose()?;
+        self.store.write_authenticated_map_node(
+            self.kind,
+            &AuthenticatedMapNode {
+                schema_version: AUTHENTICATED_MAP_SCHEMA_VERSION,
+                key: node.key,
+                priority: authenticated_map_priority(node.key),
+                value_digest: node.value_digest,
+                left,
+                right,
+            },
+        )
+    }
+
+    fn finish(mut self) -> Result<ScratchAuthenticatedMapRoot, ScratchError> {
+        self.checkpoint()?;
+        let root = match self.root {
+            Some(root) => {
+                let child = root.persisted.ok_or(ScratchError::MalformedPage)?;
+                ScratchAuthenticatedMapRoot {
+                    schema_version: AUTHENTICATED_MAP_SCHEMA_VERSION,
+                    count: self.count,
+                    root_key: Some(child.key),
+                    root_digest: child.digest,
+                    root: Some(child.page_ref),
+                }
+            }
+            None if self.count == 0 => ScratchAuthenticatedMapRoot::default(),
+            None => return Err(ScratchError::MalformedPage),
+        };
+        validate_authenticated_map_root(&root)?;
+        Ok(root)
+    }
+}
+
+impl<'a> AuthenticatedCatalogBatch<'a> {
+    fn new(
+        store: &'a ScratchStore,
+        root: &ScratchAuthenticatedCatalogRoot,
+    ) -> Result<Self, ScratchError> {
+        Self::with_residency_limit(store, root, AUTHENTICATED_BATCH_MAX_RESIDENT_BYTES)
+    }
+
+    fn with_residency_limit(
+        store: &'a ScratchStore,
+        root: &ScratchAuthenticatedCatalogRoot,
+        max_resident_bytes: usize,
+    ) -> Result<Self, ScratchError> {
+        validate_authenticated_catalog_root(root)?;
+        Ok(Self {
+            store,
+            root: root.root.as_ref().map(|page_ref| {
+                AuthenticatedBatchChild::persisted(AuthenticatedMapChild {
+                    key: root.root_key.expect("validated nonempty catalog root"),
+                    digest: root.root_digest,
+                    page_ref: page_ref.clone(),
+                })
+            }),
+            count: root.count,
+            nodes: BTreeMap::new(),
+            resident_keys: BTreeSet::new(),
+            resident_bytes: 0,
+            max_resident_bytes,
+        })
+    }
+
+    fn upsert(&mut self, key: [u8; 16], value: &[u8]) -> Result<(), ScratchError> {
+        if value.is_empty() || value.len() > MAX_AUTHENTICATED_CATALOG_VALUE_BYTES {
+            return Err(ScratchError::MalformedPage);
+        }
+        let max_insert_residency = (AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD
+            + MAX_AUTHENTICATED_CATALOG_VALUE_BYTES)
+            .saturating_mul(MAX_AUTHENTICATED_MAP_DEPTH + 2);
+        if self.resident_bytes > self.max_resident_bytes.saturating_sub(max_insert_residency) {
+            self.checkpoint()?;
+        }
+        let root = self.root.take();
+        let (next, inserted) = self.upsert_child(root, key, value, 0)?;
+        self.root = Some(next);
+        if inserted {
+            self.count = self
+                .count
+                .checked_add(1)
+                .ok_or(ScratchError::IndexCapacity)?;
+        }
+        Ok(())
+    }
+
+    fn upsert_child(
+        &mut self,
+        current: Option<AuthenticatedBatchChild>,
+        key: [u8; 16],
+        value: &[u8],
+        depth: usize,
+    ) -> Result<(AuthenticatedBatchChild, bool), ScratchError> {
+        if depth > MAX_AUTHENTICATED_MAP_DEPTH {
+            return Err(ScratchError::IndexCapacity);
+        }
+        let Some(current) = current else {
+            self.charge_node(
+                key,
+                AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD + value.len(),
+            )?;
+            return Ok((
+                self.stage(AuthenticatedCatalogBatchNode {
+                    key,
+                    value: value.to_vec(),
+                    left: None,
+                    right: None,
+                }),
+                true,
+            ));
+        };
+        let mut node = self.take_node(current)?;
+        let inserted;
+        match key.cmp(&node.key) {
+            std::cmp::Ordering::Equal => {
+                self.resize_node_value(node.value.len(), value.len())?;
+                node.value = value.to_vec();
+                inserted = false;
+            }
+            std::cmp::Ordering::Less => {
+                let (left, was_inserted) =
+                    self.upsert_child(node.left.take(), key, value, depth + 1)?;
+                node.left = Some(left);
+                inserted = was_inserted;
+                if node.left.as_ref().is_some_and(|left| {
+                    authenticated_map_priority_order(left.key, node.key).is_lt()
+                }) {
+                    return Ok((self.rotate_right(node)?, inserted));
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                let (right, was_inserted) =
+                    self.upsert_child(node.right.take(), key, value, depth + 1)?;
+                node.right = Some(right);
+                inserted = was_inserted;
+                if node.right.as_ref().is_some_and(|right| {
+                    authenticated_map_priority_order(right.key, node.key).is_lt()
+                }) {
+                    return Ok((self.rotate_left(node)?, inserted));
+                }
+            }
+        }
+        Ok((self.stage(node), inserted))
+    }
+
+    fn rotate_right(
+        &mut self,
+        mut node: AuthenticatedCatalogBatchNode,
+    ) -> Result<AuthenticatedBatchChild, ScratchError> {
+        let left = node.left.take().ok_or(ScratchError::MalformedPage)?;
+        let mut left_node = self.take_node(left)?;
+        node.left = left_node.right.take();
+        left_node.right = Some(self.stage(node));
+        Ok(self.stage(left_node))
+    }
+
+    fn rotate_left(
+        &mut self,
+        mut node: AuthenticatedCatalogBatchNode,
+    ) -> Result<AuthenticatedBatchChild, ScratchError> {
+        let right = node.right.take().ok_or(ScratchError::MalformedPage)?;
+        let mut right_node = self.take_node(right)?;
+        node.right = right_node.left.take();
+        right_node.left = Some(self.stage(node));
+        Ok(self.stage(right_node))
+    }
+
+    fn take_node(
+        &mut self,
+        child: AuthenticatedBatchChild,
+    ) -> Result<AuthenticatedCatalogBatchNode, ScratchError> {
+        if let Some(node) = self.nodes.remove(&child.key) {
+            return Ok(node);
+        }
+        let persisted = child.persisted.ok_or(ScratchError::MalformedPage)?;
+        let node = self.store.read_authenticated_catalog_node(&persisted)?;
+        self.charge_node(
+            node.key,
+            AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD + node.value.len(),
+        )?;
+        Ok(AuthenticatedCatalogBatchNode {
+            key: node.key,
+            value: node.value,
+            left: node.left.map(AuthenticatedBatchChild::persisted),
+            right: node.right.map(AuthenticatedBatchChild::persisted),
+        })
+    }
+
+    fn charge_node(&mut self, key: [u8; 16], bytes: usize) -> Result<(), ScratchError> {
+        if !self.resident_keys.insert(key) {
+            return Err(ScratchError::MalformedPage);
+        }
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_add(bytes)
+            .ok_or(ScratchError::IndexCapacity)?;
+        if self.resident_bytes > self.max_resident_bytes {
+            return Err(ScratchError::IndexCapacity);
+        }
+        Ok(())
+    }
+
+    fn resize_node_value(&mut self, prior: usize, next: usize) -> Result<(), ScratchError> {
+        self.resident_bytes = if next >= prior {
+            self.resident_bytes
+                .checked_add(next - prior)
+                .ok_or(ScratchError::IndexCapacity)?
+        } else {
+            self.resident_bytes
+                .checked_sub(prior - next)
+                .ok_or(ScratchError::MalformedPage)?
+        };
+        if self.resident_bytes > self.max_resident_bytes {
+            return Err(ScratchError::IndexCapacity);
+        }
+        Ok(())
+    }
+
+    fn stage(&mut self, node: AuthenticatedCatalogBatchNode) -> AuthenticatedBatchChild {
+        let key = node.key;
+        self.nodes.insert(key, node);
+        AuthenticatedBatchChild::staged(key)
+    }
+
+    fn checkpoint(&mut self) -> Result<(), ScratchError> {
+        if let Some(root) = self.root.take() {
+            let persisted = self.publish(root, 0)?;
+            self.root = Some(AuthenticatedBatchChild::persisted(persisted));
+        }
+        if !self.nodes.is_empty() {
+            return Err(ScratchError::MalformedPage);
+        }
+        self.resident_keys.clear();
+        self.resident_bytes = 0;
+        Ok(())
+    }
+
+    fn publish(
+        &mut self,
+        child: AuthenticatedBatchChild,
+        depth: usize,
+    ) -> Result<AuthenticatedMapChild, ScratchError> {
+        if depth > MAX_AUTHENTICATED_MAP_DEPTH {
+            return Err(ScratchError::IndexCapacity);
+        }
+        if let Some(persisted) = child.persisted {
+            return Ok(persisted);
+        }
+        let node = self
+            .nodes
+            .remove(&child.key)
+            .ok_or(ScratchError::MalformedPage)?;
+        let left = node
+            .left
+            .map(|left| self.publish(left, depth + 1))
+            .transpose()?;
+        let right = node
+            .right
+            .map(|right| self.publish(right, depth + 1))
+            .transpose()?;
+        self.store
+            .write_authenticated_catalog_node(&AuthenticatedCatalogNode {
+                schema_version: AUTHENTICATED_CATALOG_SCHEMA_VERSION,
+                key: node.key,
+                priority: authenticated_map_priority(node.key),
+                value: node.value,
+                left,
+                right,
+            })
+    }
+
+    fn finish(mut self) -> Result<ScratchAuthenticatedCatalogRoot, ScratchError> {
+        self.checkpoint()?;
+        let root = match self.root {
+            Some(root) => {
+                let child = root.persisted.ok_or(ScratchError::MalformedPage)?;
+                ScratchAuthenticatedCatalogRoot {
+                    schema_version: AUTHENTICATED_CATALOG_SCHEMA_VERSION,
+                    count: self.count,
+                    root_key: Some(child.key),
+                    root_digest: child.digest,
+                    root: Some(child.page_ref),
+                }
+            }
+            None if self.count == 0 => ScratchAuthenticatedCatalogRoot::default(),
+            None => return Err(ScratchError::MalformedPage),
+        };
+        validate_authenticated_catalog_root(&root)?;
+        Ok(root)
+    }
 }
 
 /// Bounded in-order traversal over one pinned authenticated catalog root.
@@ -1644,32 +2189,20 @@ impl ScratchStore {
     }
 
     /// Applies one accepted-document batch while retaining newly appended
-    /// immutable nodes in a bounded part-local cache. Large batches rebuild
-    /// only the canonical live tree. Both paths preserve the root and
-    /// authentication digests produced by repeated point upserts.
+    /// immutable nodes in a part-local cache. This preserves the root and
+    /// authentication digests produced by repeated point upserts without
+    /// revisiting every record accepted by prior batches.
     pub(crate) fn authenticated_map_upsert_many(
         &self,
         root: &ScratchAuthenticatedMapRoot,
         records: &BTreeMap<[u8; 16], ContentDigest>,
     ) -> Result<ScratchAuthenticatedMapRoot, ScratchError> {
-        if records.len() >= AUTHENTICATED_BULK_REBUILD_MIN_MUTATIONS {
-            let mut complete =
-                self.authenticated_map_records(root, ScratchPageKind::AcceptedDocumentMap)?;
-            complete.extend(records.iter().map(|(key, value)| (*key, *value)));
-            return self.rebuild_authenticated_map(ScratchPageKind::AcceptedDocumentMap, &complete);
-        }
-        let mut next = root.clone();
-        let mut staged = BTreeMap::new();
+        let mut batch =
+            AuthenticatedMapBatch::new(self, ScratchPageKind::AcceptedDocumentMap, root)?;
         for (key, value_digest) in records {
-            next = self.authenticated_map_upsert_for_kind_cached(
-                ScratchPageKind::AcceptedDocumentMap,
-                &next,
-                *key,
-                *value_digest,
-                &mut staged,
-            )?;
+            batch.upsert(*key, *value_digest)?;
         }
-        Ok(next)
+        batch.finish()
     }
 
     pub(crate) fn accepted_batch_map_upsert(
@@ -1738,17 +2271,46 @@ impl ScratchStore {
         root: &ScratchAuthenticatedCatalogRoot,
         keys: &BTreeSet<[u8; 16]>,
     ) -> Result<BTreeMap<[u8; 16], Vec<u8>>, ScratchError> {
-        let Some(last) = keys.last().copied() else {
-            return Ok(BTreeMap::new());
-        };
+        validate_authenticated_catalog_root(root)?;
+        let requested = keys.iter().copied().collect::<Vec<_>>();
         let mut found = BTreeMap::new();
-        let mut cursor = self.authenticated_catalog_cursor(root, None)?;
-        while let Some((key, value)) = cursor.next_entry()? {
-            if keys.contains(&key) {
-                found.insert(key, value);
+        if requested.is_empty() {
+            return Ok(found);
+        }
+        self.physical.record_point_reads(requested.len());
+        let mut pending = root.root.as_ref().map_or_else(Vec::new, |page_ref| {
+            vec![(
+                AuthenticatedMapChild {
+                    key: root.root_key.expect("validated nonempty catalog root"),
+                    digest: root.root_digest,
+                    page_ref: page_ref.clone(),
+                },
+                0_usize,
+                requested.len(),
+                0_usize,
+            )]
+        });
+        let mut visited = BTreeSet::new();
+        while let Some((child, start, end, depth)) = pending.pop() {
+            if depth > MAX_AUTHENTICATED_MAP_DEPTH || !visited.insert(child.page_ref.offset) {
+                return Err(ScratchError::MalformedPage);
             }
-            if key >= last {
-                break;
+            let node = self.read_authenticated_catalog_node(&child)?;
+            let split = requested[start..end].partition_point(|key| *key < node.key) + start;
+            let matched = split < end && requested[split] == node.key;
+            if matched {
+                found.insert(node.key, node.value.clone());
+            }
+            if start < split {
+                if let Some(left) = node.left {
+                    pending.push((left, start, split, depth + 1));
+                }
+            }
+            let right_start = split + usize::from(matched);
+            if right_start < end {
+                if let Some(right) = node.right {
+                    pending.push((right, right_start, end, depth + 1));
+                }
             }
         }
         Ok(found)
@@ -1759,34 +2321,6 @@ impl ScratchStore {
         root: &ScratchAuthenticatedCatalogRoot,
         key: [u8; 16],
         value: &[u8],
-    ) -> Result<ScratchAuthenticatedCatalogRoot, ScratchError> {
-        self.authenticated_catalog_upsert_cached(root, key, value, &mut BTreeMap::new())
-    }
-
-    pub(crate) fn authenticated_catalog_upsert_many(
-        &self,
-        root: &ScratchAuthenticatedCatalogRoot,
-        records: &BTreeMap<[u8; 16], Vec<u8>>,
-    ) -> Result<ScratchAuthenticatedCatalogRoot, ScratchError> {
-        if records.len() >= AUTHENTICATED_BULK_REBUILD_MIN_MUTATIONS {
-            let mut complete = self.authenticated_catalog_records(root)?;
-            complete.extend(records.iter().map(|(key, value)| (*key, value.clone())));
-            return self.rebuild_authenticated_catalog(&complete);
-        }
-        let mut next = root.clone();
-        let mut staged = BTreeMap::new();
-        for (key, value) in records {
-            next = self.authenticated_catalog_upsert_cached(&next, *key, value, &mut staged)?;
-        }
-        Ok(next)
-    }
-
-    fn authenticated_catalog_upsert_cached(
-        &self,
-        root: &ScratchAuthenticatedCatalogRoot,
-        key: [u8; 16],
-        value: &[u8],
-        staged: &mut BTreeMap<u64, AuthenticatedCatalogNode>,
     ) -> Result<ScratchAuthenticatedCatalogRoot, ScratchError> {
         validate_authenticated_catalog_root(root)?;
         if value.is_empty() || value.len() > MAX_AUTHENTICATED_CATALOG_VALUE_BYTES {
@@ -1801,7 +2335,6 @@ impl ScratchStore {
             key,
             value,
             0,
-            staged,
         )?;
         let next = ScratchAuthenticatedCatalogRoot {
             schema_version: AUTHENTICATED_CATALOG_SCHEMA_VERSION,
@@ -1820,13 +2353,24 @@ impl ScratchStore {
         Ok(next)
     }
 
+    pub(crate) fn authenticated_catalog_upsert_many(
+        &self,
+        root: &ScratchAuthenticatedCatalogRoot,
+        records: &BTreeMap<[u8; 16], Vec<u8>>,
+    ) -> Result<ScratchAuthenticatedCatalogRoot, ScratchError> {
+        let mut batch = AuthenticatedCatalogBatch::new(self, root)?;
+        for (key, value) in records {
+            batch.upsert(*key, value)?;
+        }
+        batch.finish()
+    }
+
     fn authenticated_catalog_upsert_child(
         &self,
         current: Option<AuthenticatedMapChild>,
         key: [u8; 16],
         value: &[u8],
         depth: usize,
-        staged: &mut BTreeMap<u64, AuthenticatedCatalogNode>,
     ) -> Result<(AuthenticatedMapChild, bool), ScratchError> {
         if depth > MAX_AUTHENTICATED_MAP_DEPTH {
             return Err(ScratchError::IndexCapacity);
@@ -1840,12 +2384,9 @@ impl ScratchStore {
                 left: None,
                 right: None,
             };
-            return Ok((
-                self.write_authenticated_catalog_node_cached(&node, staged)?,
-                true,
-            ));
+            return Ok((self.write_authenticated_catalog_node(&node)?, true));
         };
-        let mut node = self.read_authenticated_catalog_node_cached(&current, staged)?;
+        let mut node = self.read_authenticated_catalog_node(&current)?;
         let inserted;
         match key.cmp(&node.key) {
             std::cmp::Ordering::Equal => {
@@ -1858,17 +2399,13 @@ impl ScratchStore {
                     key,
                     value,
                     depth + 1,
-                    staged,
                 )?;
                 node.left = Some(left);
                 inserted = was_inserted;
                 if node.left.as_ref().is_some_and(|left| {
                     authenticated_map_priority_order(left.key, node.key).is_lt()
                 }) {
-                    return Ok((
-                        self.rotate_authenticated_catalog_right_cached(node, staged)?,
-                        inserted,
-                    ));
+                    return Ok((self.rotate_authenticated_catalog_right(node)?, inserted));
                 }
             }
             std::cmp::Ordering::Greater => {
@@ -1877,48 +2414,39 @@ impl ScratchStore {
                     key,
                     value,
                     depth + 1,
-                    staged,
                 )?;
                 node.right = Some(right);
                 inserted = was_inserted;
                 if node.right.as_ref().is_some_and(|right| {
                     authenticated_map_priority_order(right.key, node.key).is_lt()
                 }) {
-                    return Ok((
-                        self.rotate_authenticated_catalog_left_cached(node, staged)?,
-                        inserted,
-                    ));
+                    return Ok((self.rotate_authenticated_catalog_left(node)?, inserted));
                 }
             }
         }
-        Ok((
-            self.write_authenticated_catalog_node_cached(&node, staged)?,
-            inserted,
-        ))
+        Ok((self.write_authenticated_catalog_node(&node)?, inserted))
     }
 
-    fn rotate_authenticated_catalog_right_cached(
+    fn rotate_authenticated_catalog_right(
         &self,
         mut node: AuthenticatedCatalogNode,
-        staged: &mut BTreeMap<u64, AuthenticatedCatalogNode>,
     ) -> Result<AuthenticatedMapChild, ScratchError> {
         let left = node.left.take().ok_or(ScratchError::MalformedPage)?;
-        let mut left_node = self.read_authenticated_catalog_node_cached(&left, staged)?;
+        let mut left_node = self.read_authenticated_catalog_node(&left)?;
         node.left = left_node.right.take();
-        left_node.right = Some(self.write_authenticated_catalog_node_cached(&node, staged)?);
-        self.write_authenticated_catalog_node_cached(&left_node, staged)
+        left_node.right = Some(self.write_authenticated_catalog_node(&node)?);
+        self.write_authenticated_catalog_node(&left_node)
     }
 
-    fn rotate_authenticated_catalog_left_cached(
+    fn rotate_authenticated_catalog_left(
         &self,
         mut node: AuthenticatedCatalogNode,
-        staged: &mut BTreeMap<u64, AuthenticatedCatalogNode>,
     ) -> Result<AuthenticatedMapChild, ScratchError> {
         let right = node.right.take().ok_or(ScratchError::MalformedPage)?;
-        let mut right_node = self.read_authenticated_catalog_node_cached(&right, staged)?;
+        let mut right_node = self.read_authenticated_catalog_node(&right)?;
         node.right = right_node.left.take();
-        right_node.left = Some(self.write_authenticated_catalog_node_cached(&node, staged)?);
-        self.write_authenticated_catalog_node_cached(&right_node, staged)
+        right_node.left = Some(self.write_authenticated_catalog_node(&node)?);
+        self.write_authenticated_catalog_node(&right_node)
     }
 
     pub(crate) fn authenticated_catalog_remove(
@@ -2026,231 +2554,12 @@ impl ScratchStore {
         }
     }
 
-    fn authenticated_map_records(
-        &self,
-        root: &ScratchAuthenticatedMapRoot,
-        kind: ScratchPageKind,
-    ) -> Result<BTreeMap<[u8; 16], ContentDigest>, ScratchError> {
-        validate_authenticated_map_root(root)?;
-        let mut records = BTreeMap::new();
-        let mut pending = root.root.as_ref().map_or_else(Vec::new, |page_ref| {
-            vec![(
-                AuthenticatedMapChild {
-                    key: root.root_key.expect("validated nonempty root key"),
-                    digest: root.root_digest,
-                    page_ref: page_ref.clone(),
-                },
-                0_usize,
-            )]
-        });
-        let mut visited = BTreeSet::new();
-        while let Some((child, depth)) = pending.pop() {
-            if depth > MAX_AUTHENTICATED_MAP_DEPTH || !visited.insert(child.page_ref.offset) {
-                return Err(ScratchError::MalformedPage);
-            }
-            let node = self.read_authenticated_map_node(kind, &child)?;
-            if records.insert(node.key, node.value_digest).is_some() {
-                return Err(ScratchError::MalformedPage);
-            }
-            if let Some(left) = node.left {
-                pending.push((left, depth + 1));
-            }
-            if let Some(right) = node.right {
-                pending.push((right, depth + 1));
-            }
-        }
-        if records.len() as u64 != root.count {
-            return Err(ScratchError::MalformedPage);
-        }
-        Ok(records)
-    }
-
-    fn rebuild_authenticated_map(
-        &self,
-        kind: ScratchPageKind,
-        records: &BTreeMap<[u8; 16], ContentDigest>,
-    ) -> Result<ScratchAuthenticatedMapRoot, ScratchError> {
-        if records.is_empty() {
-            return Ok(ScratchAuthenticatedMapRoot::default());
-        }
-        let mut nodes = records
-            .iter()
-            .map(|(key, value_digest)| AuthenticatedMapBuildNode {
-                key: *key,
-                value_digest: *value_digest,
-                left: None,
-                right: None,
-            })
-            .collect::<Vec<_>>();
-        let mut stack = Vec::<usize>::new();
-        for index in 0..nodes.len() {
-            let mut left = None;
-            while stack.last().is_some_and(|prior| {
-                authenticated_map_priority_order(nodes[*prior].key, nodes[index].key).is_gt()
-            }) {
-                left = stack.pop();
-            }
-            nodes[index].left = left;
-            if let Some(prior) = stack.last().copied() {
-                nodes[prior].right = Some(index);
-            }
-            stack.push(index);
-        }
-        let root_index = stack[0];
-        let child = self.write_authenticated_map_build(kind, &nodes, root_index, 0)?;
-        let root = ScratchAuthenticatedMapRoot {
-            schema_version: AUTHENTICATED_MAP_SCHEMA_VERSION,
-            count: records.len() as u64,
-            root_key: Some(child.key),
-            root_digest: child.digest,
-            root: Some(child.page_ref),
-        };
-        validate_authenticated_map_root(&root)?;
-        Ok(root)
-    }
-
-    fn write_authenticated_map_build(
-        &self,
-        kind: ScratchPageKind,
-        nodes: &[AuthenticatedMapBuildNode],
-        index: usize,
-        depth: usize,
-    ) -> Result<AuthenticatedMapChild, ScratchError> {
-        if depth > MAX_AUTHENTICATED_MAP_DEPTH {
-            return Err(ScratchError::IndexCapacity);
-        }
-        let pending = &nodes[index];
-        let left = pending
-            .left
-            .map(|child| self.write_authenticated_map_build(kind, nodes, child, depth + 1))
-            .transpose()?;
-        let right = pending
-            .right
-            .map(|child| self.write_authenticated_map_build(kind, nodes, child, depth + 1))
-            .transpose()?;
-        self.write_authenticated_map_node(
-            kind,
-            &AuthenticatedMapNode {
-                schema_version: AUTHENTICATED_MAP_SCHEMA_VERSION,
-                key: pending.key,
-                priority: authenticated_map_priority(pending.key),
-                value_digest: pending.value_digest,
-                left,
-                right,
-            },
-        )
-    }
-
-    fn authenticated_catalog_records(
-        &self,
-        root: &ScratchAuthenticatedCatalogRoot,
-    ) -> Result<BTreeMap<[u8; 16], Vec<u8>>, ScratchError> {
-        let mut records = BTreeMap::new();
-        let mut cursor = self.authenticated_catalog_cursor(root, None)?;
-        while let Some((key, value)) = cursor.next_entry()? {
-            if records.insert(key, value).is_some() {
-                return Err(ScratchError::MalformedPage);
-            }
-        }
-        if records.len() as u64 != root.count {
-            return Err(ScratchError::MalformedPage);
-        }
-        Ok(records)
-    }
-
-    fn rebuild_authenticated_catalog(
-        &self,
-        records: &BTreeMap<[u8; 16], Vec<u8>>,
-    ) -> Result<ScratchAuthenticatedCatalogRoot, ScratchError> {
-        if records.is_empty() {
-            return Ok(ScratchAuthenticatedCatalogRoot::default());
-        }
-        let mut nodes = records
-            .iter()
-            .map(|(key, value)| AuthenticatedCatalogBuildNode {
-                key: *key,
-                value: value.clone(),
-                left: None,
-                right: None,
-            })
-            .collect::<Vec<_>>();
-        let mut stack = Vec::<usize>::new();
-        for index in 0..nodes.len() {
-            let mut left = None;
-            while stack.last().is_some_and(|prior| {
-                authenticated_map_priority_order(nodes[*prior].key, nodes[index].key).is_gt()
-            }) {
-                left = stack.pop();
-            }
-            nodes[index].left = left;
-            if let Some(prior) = stack.last().copied() {
-                nodes[prior].right = Some(index);
-            }
-            stack.push(index);
-        }
-        let child = self.write_authenticated_catalog_build(&nodes, stack[0], 0)?;
-        let root = ScratchAuthenticatedCatalogRoot {
-            schema_version: AUTHENTICATED_CATALOG_SCHEMA_VERSION,
-            count: records.len() as u64,
-            root_key: Some(child.key),
-            root_digest: child.digest,
-            root: Some(child.page_ref),
-        };
-        validate_authenticated_catalog_root(&root)?;
-        Ok(root)
-    }
-
-    fn write_authenticated_catalog_build(
-        &self,
-        nodes: &[AuthenticatedCatalogBuildNode],
-        index: usize,
-        depth: usize,
-    ) -> Result<AuthenticatedMapChild, ScratchError> {
-        if depth > MAX_AUTHENTICATED_MAP_DEPTH {
-            return Err(ScratchError::IndexCapacity);
-        }
-        let pending = &nodes[index];
-        let left = pending
-            .left
-            .map(|child| self.write_authenticated_catalog_build(nodes, child, depth + 1))
-            .transpose()?;
-        let right = pending
-            .right
-            .map(|child| self.write_authenticated_catalog_build(nodes, child, depth + 1))
-            .transpose()?;
-        self.write_authenticated_catalog_node(&AuthenticatedCatalogNode {
-            schema_version: AUTHENTICATED_CATALOG_SCHEMA_VERSION,
-            key: pending.key,
-            priority: authenticated_map_priority(pending.key),
-            value: pending.value.clone(),
-            left,
-            right,
-        })
-    }
-
     fn authenticated_map_upsert_for_kind(
         &self,
         kind: ScratchPageKind,
         root: &ScratchAuthenticatedMapRoot,
         key: [u8; 16],
         value_digest: ContentDigest,
-    ) -> Result<ScratchAuthenticatedMapRoot, ScratchError> {
-        self.authenticated_map_upsert_for_kind_cached(
-            kind,
-            root,
-            key,
-            value_digest,
-            &mut BTreeMap::new(),
-        )
-    }
-
-    fn authenticated_map_upsert_for_kind_cached(
-        &self,
-        kind: ScratchPageKind,
-        root: &ScratchAuthenticatedMapRoot,
-        key: [u8; 16],
-        value_digest: ContentDigest,
-        staged: &mut BTreeMap<u64, AuthenticatedMapNode>,
     ) -> Result<ScratchAuthenticatedMapRoot, ScratchError> {
         validate_authenticated_map_root(root)?;
         let (child, inserted) = self.authenticated_map_upsert_child(
@@ -2263,7 +2572,6 @@ impl ScratchStore {
             key,
             value_digest,
             0,
-            staged,
         )?;
         let count = if inserted {
             root.count
@@ -2290,7 +2598,6 @@ impl ScratchStore {
         key: [u8; 16],
         value_digest: ContentDigest,
         depth: usize,
-        staged: &mut BTreeMap<u64, AuthenticatedMapNode>,
     ) -> Result<(AuthenticatedMapChild, bool), ScratchError> {
         if depth > MAX_AUTHENTICATED_MAP_DEPTH {
             return Err(ScratchError::IndexCapacity);
@@ -2304,12 +2611,9 @@ impl ScratchStore {
                 left: None,
                 right: None,
             };
-            return Ok((
-                self.write_authenticated_map_node_cached(kind, &node, staged)?,
-                true,
-            ));
+            return Ok((self.write_authenticated_map_node(kind, &node)?, true));
         };
-        let mut node = self.read_authenticated_map_node_cached(kind, &current, staged)?;
+        let mut node = self.read_authenticated_map_node(kind, &current)?;
         let inserted;
         match key.cmp(&node.key) {
             std::cmp::Ordering::Equal => {
@@ -2323,17 +2627,13 @@ impl ScratchStore {
                     key,
                     value_digest,
                     depth + 1,
-                    staged,
                 )?;
                 node.left = Some(left);
                 inserted = was_inserted;
                 if node.left.as_ref().is_some_and(|left| {
                     authenticated_map_priority_order(left.key, node.key).is_lt()
                 }) {
-                    return Ok((
-                        self.rotate_authenticated_map_right_cached(kind, node, staged)?,
-                        inserted,
-                    ));
+                    return Ok((self.rotate_authenticated_map_right(kind, node)?, inserted));
                 }
             }
             std::cmp::Ordering::Greater => {
@@ -2343,50 +2643,41 @@ impl ScratchStore {
                     key,
                     value_digest,
                     depth + 1,
-                    staged,
                 )?;
                 node.right = Some(right);
                 inserted = was_inserted;
                 if node.right.as_ref().is_some_and(|right| {
                     authenticated_map_priority_order(right.key, node.key).is_lt()
                 }) {
-                    return Ok((
-                        self.rotate_authenticated_map_left_cached(kind, node, staged)?,
-                        inserted,
-                    ));
+                    return Ok((self.rotate_authenticated_map_left(kind, node)?, inserted));
                 }
             }
         }
-        Ok((
-            self.write_authenticated_map_node_cached(kind, &node, staged)?,
-            inserted,
-        ))
+        Ok((self.write_authenticated_map_node(kind, &node)?, inserted))
     }
 
-    fn rotate_authenticated_map_right_cached(
+    fn rotate_authenticated_map_right(
         &self,
         kind: ScratchPageKind,
         mut node: AuthenticatedMapNode,
-        staged: &mut BTreeMap<u64, AuthenticatedMapNode>,
     ) -> Result<AuthenticatedMapChild, ScratchError> {
         let left = node.left.take().ok_or(ScratchError::MalformedPage)?;
-        let mut left_node = self.read_authenticated_map_node_cached(kind, &left, staged)?;
+        let mut left_node = self.read_authenticated_map_node(kind, &left)?;
         node.left = left_node.right.take();
-        left_node.right = Some(self.write_authenticated_map_node_cached(kind, &node, staged)?);
-        self.write_authenticated_map_node_cached(kind, &left_node, staged)
+        left_node.right = Some(self.write_authenticated_map_node(kind, &node)?);
+        self.write_authenticated_map_node(kind, &left_node)
     }
 
-    fn rotate_authenticated_map_left_cached(
+    fn rotate_authenticated_map_left(
         &self,
         kind: ScratchPageKind,
         mut node: AuthenticatedMapNode,
-        staged: &mut BTreeMap<u64, AuthenticatedMapNode>,
     ) -> Result<AuthenticatedMapChild, ScratchError> {
         let right = node.right.take().ok_or(ScratchError::MalformedPage)?;
-        let mut right_node = self.read_authenticated_map_node_cached(kind, &right, staged)?;
+        let mut right_node = self.read_authenticated_map_node(kind, &right)?;
         node.right = right_node.left.take();
-        right_node.left = Some(self.write_authenticated_map_node_cached(kind, &node, staged)?);
-        self.write_authenticated_map_node_cached(kind, &right_node, staged)
+        right_node.left = Some(self.write_authenticated_map_node(kind, &node)?);
+        self.write_authenticated_map_node(kind, &right_node)
     }
 
     pub(crate) fn causal_accumulator_upsert_max(
@@ -2806,17 +3097,6 @@ impl ScratchStore {
         })
     }
 
-    fn write_authenticated_map_node_cached(
-        &self,
-        kind: ScratchPageKind,
-        node: &AuthenticatedMapNode,
-        staged: &mut BTreeMap<u64, AuthenticatedMapNode>,
-    ) -> Result<AuthenticatedMapChild, ScratchError> {
-        let child = self.write_authenticated_map_node(kind, node)?;
-        staged.insert(child.page_ref.offset, node.clone());
-        Ok(child)
-    }
-
     fn read_authenticated_map_node(
         &self,
         kind: ScratchPageKind,
@@ -2843,35 +3123,6 @@ impl ScratchStore {
         Ok(node)
     }
 
-    fn read_authenticated_map_node_cached(
-        &self,
-        kind: ScratchPageKind,
-        child: &AuthenticatedMapChild,
-        staged: &BTreeMap<u64, AuthenticatedMapNode>,
-    ) -> Result<AuthenticatedMapNode, ScratchError> {
-        match staged.get(&child.page_ref.offset) {
-            Some(node) => {
-                validate_authenticated_map_node(node)?;
-                if node.key != child.key
-                    || authenticated_map_node_digest(
-                        node.key,
-                        node.value_digest,
-                        node.left
-                            .as_ref()
-                            .map(|candidate| (candidate.key, candidate.digest)),
-                        node.right
-                            .as_ref()
-                            .map(|candidate| (candidate.key, candidate.digest)),
-                    ) != child.digest
-                {
-                    return Err(ScratchError::PageBindingMismatch);
-                }
-                Ok(node.clone())
-            }
-            None => self.read_authenticated_map_node(kind, child),
-        }
-    }
-
     fn write_authenticated_catalog_node(
         &self,
         node: &AuthenticatedCatalogNode,
@@ -2886,16 +3137,6 @@ impl ScratchStore {
             digest,
             page_ref,
         })
-    }
-
-    fn write_authenticated_catalog_node_cached(
-        &self,
-        node: &AuthenticatedCatalogNode,
-        staged: &mut BTreeMap<u64, AuthenticatedCatalogNode>,
-    ) -> Result<AuthenticatedMapChild, ScratchError> {
-        let child = self.write_authenticated_catalog_node(node)?;
-        staged.insert(child.page_ref.offset, node.clone());
-        Ok(child)
     }
 
     fn read_authenticated_catalog_node(
@@ -2913,24 +3154,6 @@ impl ScratchStore {
             return Err(ScratchError::PageBindingMismatch);
         }
         Ok(node)
-    }
-
-    fn read_authenticated_catalog_node_cached(
-        &self,
-        child: &AuthenticatedMapChild,
-        staged: &BTreeMap<u64, AuthenticatedCatalogNode>,
-    ) -> Result<AuthenticatedCatalogNode, ScratchError> {
-        match staged.get(&child.page_ref.offset) {
-            Some(node) => {
-                validate_authenticated_catalog_node(node)?;
-                if node.key != child.key || authenticated_catalog_node_digest(node) != child.digest
-                {
-                    return Err(ScratchError::PageBindingMismatch);
-                }
-                Ok(node.clone())
-            }
-            None => self.read_authenticated_catalog_node(child),
-        }
     }
 
     fn write_authenticated_point_node(
@@ -4158,50 +4381,66 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_map_batch_matches_point_roots_without_rereading_new_pages() {
-        const RECORDS: u128 = 512;
-        let records = (0..RECORDS)
-            .map(|index| {
-                let key = Uuid::from_u128(20_000 + index).into_bytes();
-                let value = ContentDigest::of(format!("accepted-{index}").as_bytes());
-                (key, value)
-            })
-            .collect::<BTreeMap<_, _>>();
-
+    fn authenticated_map_batches_match_point_roots_without_cumulative_rebuilds() {
+        const PARTS: u128 = 3;
+        const RECORDS_PER_PART: u128 = 256;
         let point_path =
             std::env::temp_dir().join(format!("tine-scratch-map-point-{}", Uuid::new_v4()));
         let point_archive = archive(&point_path);
         let point_store = ScratchStore::open(&point_archive, workspace(12)).unwrap();
         let mut point_root = ScratchAuthenticatedMapRoot::default();
-        for (key, value) in &records {
-            point_root = point_store
-                .authenticated_map_upsert(&point_root, *key, *value)
-                .unwrap();
-        }
-
         let batch_path =
             std::env::temp_dir().join(format!("tine-scratch-map-batch-{}", Uuid::new_v4()));
         let batch_archive = archive(&batch_path);
         let batch_store = ScratchStore::open(&batch_archive, workspace(12)).unwrap();
+        let mut batch_root = ScratchAuthenticatedMapRoot::default();
         let before = batch_store.stats();
-        let batch_root = batch_store
-            .authenticated_map_upsert_many(&ScratchAuthenticatedMapRoot::default(), &records)
-            .unwrap();
+        for part in 0..PARTS {
+            let records = (0..RECORDS_PER_PART)
+                .map(|offset| {
+                    let index = part * RECORDS_PER_PART + offset;
+                    let key = Uuid::from_u128(20_000 + index).into_bytes();
+                    let value = ContentDigest::of(format!("accepted-{index}").as_bytes());
+                    (key, value)
+                })
+                .collect::<BTreeMap<_, _>>();
+            for (key, value) in &records {
+                point_root = point_store
+                    .authenticated_map_upsert(&point_root, *key, *value)
+                    .unwrap();
+            }
+            batch_root = batch_store
+                .authenticated_map_upsert_many(&batch_root, &records)
+                .unwrap();
+            assert_eq!(batch_root.count(), point_root.count());
+            assert_eq!(batch_root.root_key(), point_root.root_key());
+            assert_eq!(batch_root.root_digest(), point_root.root_digest());
+        }
         let after = batch_store.stats();
-
-        assert_eq!(batch_root.count(), point_root.count());
-        assert_eq!(batch_root.root_key(), point_root.root_key());
-        assert_eq!(batch_root.root_digest(), point_root.root_digest());
-        assert_eq!(
-            after.page_reads - before.page_reads,
-            0,
-            "one empty-root batch must resolve every newly appended node from its bounded cache"
+        let record_count = (PARTS * RECORDS_PER_PART) as usize;
+        assert!(
+            after.page_reads - before.page_reads < record_count,
+            "multipart batches reread their cumulative authenticated map: {before:?} -> {after:?}"
         );
-        assert_eq!(
-            after.page_writes - before.page_writes,
-            records.len(),
-            "bulk construction must publish only the final reachable authenticated map"
-        );
+        let mut checkpointed = AuthenticatedMapBatch::with_residency_limit(
+            &batch_store,
+            ScratchPageKind::AcceptedDocumentMap,
+            &ScratchAuthenticatedMapRoot::default(),
+            64 * 1024,
+        )
+        .unwrap();
+        for index in 0..PARTS * RECORDS_PER_PART {
+            checkpointed
+                .upsert(
+                    Uuid::from_u128(20_000 + index).into_bytes(),
+                    ContentDigest::of(format!("accepted-{index}").as_bytes()),
+                )
+                .unwrap();
+        }
+        let checkpointed = checkpointed.finish().unwrap();
+        assert_eq!(checkpointed.count(), batch_root.count());
+        assert_eq!(checkpointed.root_key(), batch_root.root_key());
+        assert_eq!(checkpointed.root_digest(), batch_root.root_digest());
 
         drop(point_store);
         drop(batch_store);
@@ -4210,9 +4449,10 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_catalog_batch_matches_remove_then_upsert_semantics() {
-        const RECORDS: u128 = 256;
-        let records = (0..RECORDS)
+    fn authenticated_catalog_batches_are_targeted_and_match_point_semantics() {
+        const PARTS: u128 = 3;
+        const RECORDS_PER_PART: u128 = 256;
+        let records = (0..PARTS * RECORDS_PER_PART)
             .map(|index| {
                 (
                     Uuid::from_u128(30_000 + index).into_bytes(),
@@ -4232,45 +4472,61 @@ mod tests {
         let point_archive = archive(&point_path);
         let point_store = ScratchStore::open(&point_archive, workspace(13)).unwrap();
         let mut point_root = ScratchAuthenticatedCatalogRoot::default();
-        for (key, value) in &records {
-            point_root = point_store
-                .authenticated_catalog_upsert(&point_root, *key, value)
-                .unwrap();
-        }
-
         let batch_path =
             std::env::temp_dir().join(format!("tine-scratch-catalog-batch-{}", Uuid::new_v4()));
         let batch_archive = archive(&batch_path);
         let batch_store = ScratchStore::open(&batch_archive, workspace(13)).unwrap();
         let before = batch_store.stats();
-        let mut batch_root = batch_store
-            .authenticated_catalog_upsert_many(
-                &ScratchAuthenticatedCatalogRoot::default(),
-                &records,
-            )
-            .unwrap();
+        let mut batch_root = ScratchAuthenticatedCatalogRoot::default();
+        for part in 0..PARTS {
+            let start = (part * RECORDS_PER_PART) as usize;
+            let end = start + RECORDS_PER_PART as usize;
+            let part_records = records
+                .iter()
+                .skip(start)
+                .take(end - start)
+                .map(|(key, value)| (*key, value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for (key, value) in &part_records {
+                point_root = point_store
+                    .authenticated_catalog_upsert(&point_root, *key, value)
+                    .unwrap();
+            }
+            batch_root = batch_store
+                .authenticated_catalog_upsert_many(&batch_root, &part_records)
+                .unwrap();
+            assert_eq!(batch_root.count, point_root.count);
+            assert_eq!(batch_root.root_key, point_root.root_key);
+            assert_eq!(batch_root.root_digest, point_root.root_digest);
+        }
         let after = batch_store.stats();
-        assert_eq!(batch_root.count, point_root.count);
-        assert_eq!(batch_root.root_key, point_root.root_key);
-        assert_eq!(batch_root.root_digest, point_root.root_digest);
-        assert_eq!(after.page_reads - before.page_reads, 0);
         assert_eq!(
-            after.page_writes - before.page_writes,
-            records.len(),
-            "bulk construction must publish only the final reachable authenticated catalog"
+            after.range_reads - before.range_reads,
+            0,
+            "multipart catalog batches must not scan prior catalog ranges"
         );
-        let keys = records.keys().copied().collect::<BTreeSet<_>>();
+        let keys = records
+            .keys()
+            .rev()
+            .take(RECORDS_PER_PART as usize)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let expected = records
+            .iter()
+            .filter(|(key, _)| keys.contains(*key))
+            .map(|(key, value)| (*key, value.clone()))
+            .collect::<BTreeMap<_, _>>();
         let lookup_before = batch_store.stats();
         assert_eq!(
             batch_store
                 .authenticated_catalog_lookup_many(&batch_root, &keys)
                 .unwrap(),
-            records
+            expected
         );
         let lookup_after = batch_store.stats();
         assert!(
-            lookup_after.page_reads - lookup_before.page_reads <= records.len(),
-            "one multi-point proof must visit each authenticated catalog node at most once"
+            lookup_after.page_reads - lookup_before.page_reads <= keys.len() * 2,
+            "one part lookup traversed the cumulative catalog: {lookup_before:?} -> {lookup_after:?}"
         );
 
         for (key, value) in &updates {
@@ -4287,6 +4543,23 @@ mod tests {
         assert_eq!(batch_root.count, point_root.count);
         assert_eq!(batch_root.root_key, point_root.root_key);
         assert_eq!(batch_root.root_digest, point_root.root_digest);
+
+        let mut checkpointed = AuthenticatedCatalogBatch::with_residency_limit(
+            &batch_store,
+            &ScratchAuthenticatedCatalogRoot::default(),
+            64 * 1024,
+        )
+        .unwrap();
+        for (key, value) in &records {
+            checkpointed.upsert(*key, value).unwrap();
+        }
+        for (key, value) in &updates {
+            checkpointed.upsert(*key, value).unwrap();
+        }
+        let checkpointed = checkpointed.finish().unwrap();
+        assert_eq!(checkpointed.count, batch_root.count);
+        assert_eq!(checkpointed.root_key, batch_root.root_key);
+        assert_eq!(checkpointed.root_digest, batch_root.root_digest);
 
         drop(point_store);
         drop(batch_store);

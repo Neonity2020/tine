@@ -25918,8 +25918,8 @@ mod validation_tests {
 
     #[test]
     fn detached_bootstrap_index_reads_stay_bounded_across_declaration_parts() {
-        const PART_COUNT: u32 = 4;
-        const PAGES_PER_PART: usize = 16;
+        const PART_COUNT: u32 = 3;
+        const PAGES_PER_PART: usize = 256;
 
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_040));
         let lineage = LineageDigest::of(b"detached-bootstrap-index-construction");
@@ -25961,9 +25961,14 @@ mod validation_tests {
             "detached construction reread prior Patricia nodes: {work:?}"
         );
         let io = completed.engine.instrumentation();
+        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
         let page_count = PART_COUNT as usize * PAGES_PER_PART;
+        assert_eq!(
+            scratch.range_reads, 0,
+            "declaration parts must not range-scan cumulative authenticated trees: {scratch:?}"
+        );
         assert!(
-            io.scratch_page_reads <= page_count * 12,
+            io.scratch_page_reads <= page_count,
             "detached authoring reread cumulative scratch graphs: {io:?}"
         );
         assert!(
@@ -25974,6 +25979,87 @@ mod validation_tests {
             let page = completed.engine.materialize_page(page_id).unwrap();
             assert_eq!(page.blocks[0].content, expected_content);
         }
+    }
+
+    #[test]
+    #[ignore = "manual detached-bootstrap authoring scale receipt"]
+    fn detached_bootstrap_authoring_scale_receipt() {
+        let total_pages = std::env::var("TINE_BOOTSTRAP_SCALE_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2_000);
+        let pages_per_part = std::env::var("TINE_BOOTSTRAP_SCALE_PART_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000);
+        assert!(total_pages > 0);
+        assert!((256..=2_048).contains(&pages_per_part));
+        let part_count = total_pages.div_ceil(pages_per_part) as u32;
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_050));
+        let lineage = LineageDigest::of(b"detached-bootstrap-scale-receipt");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_051));
+        let import_id = ImportId::from_digest([0x44; 32]);
+        let durable = TemporaryBootstrapCatalog::create(workspace, "scale-receipt");
+        let mut session = DetachedBootstrapAuthoringSession::new(
+            workspace,
+            lineage,
+            catalog,
+            ReferenceCatalogPolicyV1::default(),
+            durable.capability(),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let mut predecessor = None;
+        let mut authored_pages = 0;
+        let mut sample = None;
+        let mut part_author_ms = Vec::with_capacity(part_count as usize);
+        for ordinal in 0..part_count {
+            let count = (total_pages - authored_pages).min(pages_per_part);
+            let (transaction, pages) = create_page_batch(
+                92_000 + u128::from(ordinal) * pages_per_part as u128 * 3,
+                count,
+            );
+            sample = pages.last().cloned();
+            let evidence = detached_evidence(
+                import_id,
+                ordinal,
+                part_count,
+                predecessor,
+                transaction.operations.len() as u32,
+            );
+            session
+                .author_part(detached_author(evidence, 91_052), &transaction, evidence)
+                .unwrap();
+            predecessor = Some(evidence.part_id());
+            authored_pages += count;
+            part_author_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let authored = started.elapsed();
+        let finish_started = std::time::Instant::now();
+        let completed = session.finish().unwrap();
+        let finished = finish_started.elapsed();
+        let work = completed.bootstrap_catalog_work_stats();
+        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
+        let (sample_page, sample_content) = sample.unwrap();
+        assert_eq!(
+            completed
+                .engine
+                .materialize_page(sample_page)
+                .unwrap()
+                .blocks[0]
+                .content,
+            sample_content
+        );
+        eprintln!(
+            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} catalog_work={work:?}",
+            authored.as_secs_f64() * 1_000.0,
+            finished.as_secs_f64() * 1_000.0,
+            scratch.page_reads,
+            scratch.page_writes,
+            scratch.range_reads,
+            scratch.page_bytes_read,
+            scratch.page_bytes_written,
+        );
     }
 
     #[test]

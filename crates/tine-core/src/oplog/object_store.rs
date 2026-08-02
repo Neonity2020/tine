@@ -11079,6 +11079,10 @@ mod bootstrap_store_tests {
                 &BTreeMap::from([(b"detached key".to_vec(), b"detached value".to_vec())]),
             )
             .unwrap();
+        indexes
+            .logseq_claim_index()
+            .finish_detached_construction(detached_root)
+            .unwrap();
         let completed = publication.finish().unwrap();
         assert_eq!(completed.publication_count(), 1);
         assert_eq!(completed.existing_publication_count(), 0);
