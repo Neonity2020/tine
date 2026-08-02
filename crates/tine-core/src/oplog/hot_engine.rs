@@ -3759,6 +3759,20 @@ struct BootstrapBulkPage {
     dependencies: Vec<DocumentDependencies>,
 }
 
+/// Decoded exact-root documents retained only while one bounded materialization
+/// chunk is completed.
+#[derive(Debug)]
+struct BootstrapBulkChunk {
+    pages: Vec<Option<BootstrapBulkPage>>,
+    documents: BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BootstrapProjectionClaimResolutionStats {
+    pub(crate) exact_root_resolutions: usize,
+    pub(crate) fallback_resolutions: usize,
+}
+
 /// Process-local materializer for one already-authenticated accepted root.
 ///
 /// This capability is deliberately private to bootstrap construction. It
@@ -3768,9 +3782,14 @@ struct BootstrapBulkPage {
 pub(crate) struct BootstrapBulkMaterializer<'engine> {
     engine: &'engine ShardedHotEngine,
     root: AcceptedFrontierRoot,
+    /// Construction-time proof that this exact accepted root is still the
+    /// engine's current claim authority. Historical roots can reuse document
+    /// loading, but must resolve claims through the current fallback.
+    current_claim_root_proven: bool,
     catalog: LoroDoc,
     catalog_dependencies: DocumentDependencies,
     exact_document_loads: Cell<usize>,
+    projection_claim_resolutions: Cell<BootstrapProjectionClaimResolutionStats>,
     accepted_frontier_session: Option<RefCell<ScratchLookupSession>>,
     external_exact_session: Option<RefCell<ScratchLookupSession>>,
 }
@@ -3778,6 +3797,12 @@ pub(crate) struct BootstrapBulkMaterializer<'engine> {
 impl BootstrapBulkMaterializer<'_> {
     pub(crate) fn exact_document_loads(&self) -> usize {
         self.exact_document_loads.get()
+    }
+
+    pub(crate) fn projection_claim_resolution_stats(
+        &self,
+    ) -> BootstrapProjectionClaimResolutionStats {
+        self.projection_claim_resolutions.get()
     }
 
     pub(crate) fn lookup_session_stats(
@@ -3797,10 +3822,7 @@ impl BootstrapBulkMaterializer<'_> {
         )
     }
 
-    fn materialize_chunk(
-        &self,
-        page_ids: &[PageId],
-    ) -> Result<Vec<Option<BootstrapBulkPage>>, EngineError> {
+    fn materialize_chunk(&self, page_ids: &[PageId]) -> Result<BootstrapBulkChunk, EngineError> {
         if page_ids.len() > BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES {
             return Err(EngineError::Archive(format!(
                 "bootstrap materialization chunk has {} pages, bound {}",
@@ -3834,7 +3856,10 @@ impl BootstrapBulkMaterializer<'_> {
             })
             .collect::<Result<Vec<Option<BootstrapBulkPage>>, EngineError>>()?;
         if page_documents.is_empty() {
-            return Ok(results);
+            return Ok(BootstrapBulkChunk {
+                pages: results,
+                documents: BTreeMap::new(),
+            });
         }
 
         let membership_ids = page_documents
@@ -3948,15 +3973,19 @@ impl BootstrapBulkMaterializer<'_> {
                     })?;
             results[index] = Some(BootstrapBulkPage { page, dependencies });
         }
-        Ok(results)
+        Ok(BootstrapBulkChunk {
+            pages: results,
+            documents,
+        })
     }
 
     pub(crate) fn materialize_pages(
         &self,
         page_ids: &[PageId],
     ) -> Result<Vec<Option<MaterializedPage>>, EngineError> {
-        self.materialize_chunk(page_ids).map(|pages| {
-            pages
+        self.materialize_chunk(page_ids).map(|chunk| {
+            chunk
+                .pages
                 .into_iter()
                 .map(|page| page.map(|page| page.page))
                 .collect()
@@ -3967,18 +3996,111 @@ impl BootstrapBulkMaterializer<'_> {
         &self,
         page_ids: &[PageId],
     ) -> Result<Vec<Option<ProjectionPageState>>, EngineError> {
-        self.materialize_chunk(page_ids)?
+        let BootstrapBulkChunk { pages, documents } = self.materialize_chunk(page_ids)?;
+        pages
             .into_iter()
             .map(|page| {
-                page.map(|page| self.finish_projection_page(page))
+                page.map(|page| self.finish_projection_page(page, &documents))
                     .transpose()
             })
             .collect()
     }
 
+    fn resolve_logseq_uuid_for_projection(
+        &self,
+        logseq_uuid: LogseqUuid,
+        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, DocumentDependencies>,
+        ),
+        EngineError,
+    > {
+        if !self.current_claim_root_proven {
+            return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
+        }
+        let record = self
+            .engine
+            .logseq_claim_record(self.engine.logseq_claim_root, logseq_uuid)?;
+        let participants: Vec<_> = record
+            .introductions
+            .iter()
+            .map(|claim| ProjectionClaimParticipant::new(claim.block_id, claim.home_document_id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if participants.is_empty() {
+            return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
+        }
+
+        if participants
+            .iter()
+            .any(|participant| !documents.contains_key(&participant.home_document_id()))
+        {
+            return self.resolve_logseq_uuid_for_projection_current(logseq_uuid);
+        }
+
+        let evidence = ProjectionClaimEvidence::new(logseq_uuid, participants)?;
+        let resolution = self.engine.resolve_logseq_uuid_from_document_lookup(
+            logseq_uuid,
+            &evidence,
+            |document_id| {
+                if document_id == self.engine.catalog_document_id {
+                    Some(&self.catalog)
+                } else {
+                    documents.get(&document_id).map(|(_, document)| document)
+                }
+            },
+        )?;
+        let dependencies = evidence
+            .participants()
+            .iter()
+            .map(|participant| {
+                let home_document_id = participant.home_document_id();
+                documents
+                    .get(&home_document_id)
+                    .map(|(dependency, _)| (home_document_id, dependency.clone()))
+                    .ok_or(EngineError::MissingDocument(home_document_id))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut stats = self.projection_claim_resolutions.get();
+        stats.exact_root_resolutions = stats.exact_root_resolutions.saturating_add(1);
+        self.projection_claim_resolutions.set(stats);
+        Ok((resolution, Some(evidence), dependencies))
+    }
+
+    fn resolve_logseq_uuid_for_projection_current(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<
+        (
+            LogseqUuidResolution,
+            Option<ProjectionClaimEvidence>,
+            BTreeMap<DocumentId, DocumentDependencies>,
+        ),
+        EngineError,
+    > {
+        let (resolution, evidence, homes) = self.engine.resolve_logseq_uuid_current(logseq_uuid)?;
+        let dependencies = homes
+            .into_iter()
+            .map(|(home_document_id, home)| {
+                self.engine
+                    .current_document_dependencies(home_document_id, &home)
+                    .map(|dependency| (home_document_id, dependency))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let mut stats = self.projection_claim_resolutions.get();
+        stats.fallback_resolutions = stats.fallback_resolutions.saturating_add(1);
+        self.projection_claim_resolutions.set(stats);
+        Ok((resolution, evidence, dependencies))
+    }
+
     fn finish_projection_page(
         &self,
         mut bulk: BootstrapBulkPage,
+        documents: &BTreeMap<DocumentId, (DocumentDependencies, LoroDoc)>,
     ) -> Result<ProjectionPageState, EngineError> {
         let mut frontier_documents = bulk
             .dependencies
@@ -4010,8 +4132,8 @@ impl BootstrapBulkMaterializer<'_> {
         referenced.extend(block_claims.keys().copied());
         let mut claim_evidence = Vec::new();
         for logseq_uuid in referenced {
-            let (resolution, evidence, homes) =
-                self.engine.resolve_logseq_uuid_current(logseq_uuid)?;
+            let (resolution, evidence, dependencies) =
+                self.resolve_logseq_uuid_for_projection(logseq_uuid, documents)?;
             if let Some((block_id, home_document_id, origin)) =
                 block_claims.get(&logseq_uuid).copied()
             {
@@ -4040,11 +4162,10 @@ impl BootstrapBulkMaterializer<'_> {
                     claim_count,
                 });
             }
-            for (home_document_id, home) in homes {
-                frontier_documents.entry(home_document_id).or_insert(
-                    self.engine
-                        .current_document_dependencies(home_document_id, &home)?,
-                );
+            for dependency in dependencies.into_values() {
+                frontier_documents
+                    .entry(dependency.document_id())
+                    .or_insert(dependency);
             }
             if let Some(evidence) = evidence {
                 claim_evidence.push(evidence);
@@ -8885,6 +9006,7 @@ impl ShardedHotEngine {
     ) -> Result<BootstrapBulkMaterializer<'_>, EngineError> {
         self.begin_point_operation();
         self.authenticate_accepted_frontier_root(root)?;
+        let current_claim_root_proven = root == &self.accepted_frontier_root;
         let mut accepted_frontier_session = match (&self.scratch, &root.scratch_root) {
             (Some(store), Some(scratch_root)) => Some(
                 store
@@ -8922,9 +9044,13 @@ impl ShardedHotEngine {
         Ok(BootstrapBulkMaterializer {
             engine: self,
             root: root.clone(),
+            current_claim_root_proven,
             catalog,
             catalog_dependencies,
             exact_document_loads: Cell::new(1),
+            projection_claim_resolutions: Cell::new(
+                BootstrapProjectionClaimResolutionStats::default(),
+            ),
             accepted_frontier_session: accepted_frontier_session.map(RefCell::new),
             external_exact_session: external_exact_session.map(RefCell::new),
         })
@@ -14594,15 +14720,24 @@ impl ShardedHotEngine {
         evidence: &ProjectionClaimEvidence,
         documents: &BTreeMap<DocumentId, LoroDoc>,
     ) -> Result<LogseqUuidResolution, EngineError> {
-        let catalog = documents
-            .get(&self.catalog_document_id)
+        self.resolve_logseq_uuid_from_document_lookup(logseq_uuid, evidence, |document_id| {
+            documents.get(&document_id)
+        })
+    }
+
+    fn resolve_logseq_uuid_from_document_lookup<'document>(
+        &self,
+        logseq_uuid: LogseqUuid,
+        evidence: &ProjectionClaimEvidence,
+        document: impl Fn(DocumentId) -> Option<&'document LoroDoc>,
+    ) -> Result<LogseqUuidResolution, EngineError> {
+        let catalog = document(self.catalog_document_id)
             .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
         let mut live = BTreeMap::<BlockId, LogseqUuidClaim>::new();
         for participant in evidence.participants() {
             let home_document_id = participant.home_document_id();
-            let home = documents
-                .get(&home_document_id)
-                .ok_or(EngineError::MissingDocument(home_document_id))?;
+            let home =
+                document(home_document_id).ok_or(EngineError::MissingDocument(home_document_id))?;
             validate_shard(self.catalog_document_id, home_document_id, home)?;
             let Some(state) = read_block_state(home_document_id, home, participant.block_id())?
             else {
@@ -27062,6 +27197,397 @@ mod validation_tests {
             pages.push((page_id, format!("{name} identity")));
         }
         (OperationTransaction::new(operations).unwrap(), pages)
+    }
+
+    #[test]
+    fn bulk_projection_reuses_chunk_homes_for_uuid_claims_and_falls_back_off_chunk() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(93_000));
+        let lineage = LineageDigest::of(b"bulk-projection-uuid-home-reuse");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(93_001));
+        let local_page = PageId::from_uuid(Uuid::from_u128(93_002));
+        let local_home = DocumentId::from_uuid(Uuid::from_u128(93_003));
+        let local_first = BlockId::from_uuid(Uuid::from_u128(93_004));
+        let local_second = BlockId::from_uuid(Uuid::from_u128(93_005));
+        let remote_page = PageId::from_uuid(Uuid::from_u128(93_006));
+        let remote_home = DocumentId::from_uuid(Uuid::from_u128(93_007));
+        let remote_block = BlockId::from_uuid(Uuid::from_u128(93_008));
+        let first_uuid = LogseqUuid::from_uuid(Uuid::from_u128(93_009));
+        let second_uuid = LogseqUuid::from_uuid(Uuid::from_u128(93_010));
+        let remote_uuid = LogseqUuid::from_uuid(Uuid::from_u128(93_011));
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        let mut operations = create_page_with_block(
+            local_page,
+            local_home,
+            local_first,
+            "Local UUID claims",
+            "pages/local-uuid-claims.md",
+        )
+        .operations;
+        operations.extend(
+            create_page_with_block(
+                remote_page,
+                remote_home,
+                remote_block,
+                "Remote UUID claim",
+                "pages/remote-uuid-claim.md",
+            )
+            .operations,
+        );
+        operations.extend([
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: local_second,
+                    home_document_id: local_home,
+                },
+                page_id: local_page,
+                parent: None,
+                order: "b".into(),
+                content: format!("remote reference (({remote_uuid}))"),
+            },
+            SemanticOperation::MutateBlockLogseqIdentity {
+                block: BlockLocation {
+                    block_id: local_first,
+                    home_document_id: local_home,
+                },
+                mutation: LogseqIdentityMutation::AssignExternal {
+                    logseq_uuid: first_uuid,
+                },
+            },
+            SemanticOperation::MutateBlockLogseqIdentity {
+                block: BlockLocation {
+                    block_id: local_second,
+                    home_document_id: local_home,
+                },
+                mutation: LogseqIdentityMutation::AssignExternal {
+                    logseq_uuid: second_uuid,
+                },
+            },
+            SemanticOperation::MutateBlockLogseqIdentity {
+                block: BlockLocation {
+                    block_id: remote_block,
+                    home_document_id: remote_home,
+                },
+                mutation: LogseqIdentityMutation::AssignExternal {
+                    logseq_uuid: remote_uuid,
+                },
+            },
+        ]);
+        let prepared = engine
+            .prepare_bootstrap_transaction(
+                test_author(93_012, 93_012),
+                &OperationTransaction::new(operations).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine
+                .stage_ready(ValidatedBatch::new(prepared))
+                .disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        let root = engine.accepted_frontier_root().unwrap();
+        let materializer = engine.bootstrap_bulk_materializer(&root).unwrap();
+        let mut bulk = materializer
+            .materialize_pages_for_projection(&[local_page])
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        let mut point = engine.materialize_page_for_projection(local_page).unwrap();
+        bulk.page.stats = MaterializationStats::default();
+        point.page.stats = MaterializationStats::default();
+        assert_eq!(bulk, point);
+        assert_eq!(materializer.exact_document_loads(), 2);
+        assert_eq!(
+            materializer.projection_claim_resolution_stats(),
+            BootstrapProjectionClaimResolutionStats {
+                exact_root_resolutions: 2,
+                fallback_resolutions: 1,
+            }
+        );
+
+        let mut repeated = materializer
+            .materialize_pages_for_projection(&[local_page])
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        repeated.page.stats = MaterializationStats::default();
+        assert_eq!(materializer.exact_document_loads(), 3);
+        assert_eq!(
+            materializer.projection_claim_resolution_stats(),
+            BootstrapProjectionClaimResolutionStats {
+                exact_root_resolutions: 4,
+                fallback_resolutions: 2,
+            }
+        );
+        assert_eq!(repeated, point);
+    }
+
+    #[test]
+    fn bulk_projection_historical_root_uses_current_uuid_fallback_after_same_home_removal() {
+        let lineage = LineageDigest::of(b"bulk-projection-historical-uuid-home-removal");
+        let (root, writer, mut engine, catalog) = enrolled_test_engine(93_050, lineage);
+        let source_page = PageId::from_uuid(Uuid::from_u128(93_051));
+        let source_membership = DocumentId::from_uuid(Uuid::from_u128(93_052));
+        let reference_page = PageId::from_uuid(Uuid::from_u128(93_053));
+        let reference_membership = DocumentId::from_uuid(Uuid::from_u128(93_054));
+        let source_block = BlockId::from_uuid(Uuid::from_u128(93_056));
+        let reference_block = BlockId::from_uuid(Uuid::from_u128(93_057));
+        let stale_uuid = LogseqUuid::from_uuid(Uuid::from_u128(93_058));
+        stage_cursor_transaction(
+            &mut engine,
+            93_059,
+            OperationTransaction::new(vec![
+                SemanticOperation::CreatePage {
+                    page_id: source_page,
+                    home_document_id: source_membership,
+                    name: LogicalPageName::parse("UUID Source").unwrap(),
+                    path: ManagedPath::parse("pages/uuid-source.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreatePage {
+                    page_id: reference_page,
+                    home_document_id: reference_membership,
+                    name: LogicalPageName::parse("UUID Reference").unwrap(),
+                    path: ManagedPath::parse("pages/uuid-reference.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: source_block,
+                        home_document_id: source_membership,
+                    },
+                    page_id: source_page,
+                    parent: None,
+                    order: "a".into(),
+                    content: "UUID source".into(),
+                },
+                SemanticOperation::CreateBlock {
+                    block: BlockLocation {
+                        block_id: reference_block,
+                        home_document_id: reference_membership,
+                    },
+                    page_id: reference_page,
+                    parent: None,
+                    order: "a".into(),
+                    content: format!("same-home reference (({stale_uuid}))"),
+                },
+                SemanticOperation::MutateBlockLogseqIdentity {
+                    block: BlockLocation {
+                        block_id: source_block,
+                        home_document_id: source_membership,
+                    },
+                    mutation: LogseqIdentityMutation::AssignExternal {
+                        logseq_uuid: stale_uuid,
+                    },
+                },
+            ])
+            .unwrap(),
+        );
+        let r1 = engine.accepted_frontier_root().unwrap();
+
+        stage_cursor_transaction(
+            &mut engine,
+            93_060,
+            OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
+                block: BlockLocation {
+                    block_id: source_block,
+                    home_document_id: source_membership,
+                },
+                mutation: LogseqIdentityMutation::RemoveExternal,
+            }])
+            .unwrap(),
+        );
+        let r2 = engine.accepted_frontier_root().unwrap();
+        assert_ne!(r1, r2);
+        assert!(engine.archive_store.is_some());
+        assert!(engine.history_store.is_some());
+
+        let (fallback_resolution, fallback_evidence, fallback_homes) =
+            engine.resolve_logseq_uuid_current(stale_uuid).unwrap();
+        assert_eq!(fallback_resolution, LogseqUuidResolution::Unclaimed);
+        let fallback_evidence = fallback_evidence.expect("the removal retains claim evidence");
+        assert!(fallback_homes.contains_key(&source_membership));
+        let current_source_dependency = engine
+            .current_document_dependencies(
+                source_membership,
+                fallback_homes.get(&source_membership).unwrap(),
+            )
+            .unwrap();
+
+        let materializer = engine.bootstrap_bulk_materializer(&r1).unwrap();
+        assert!(!materializer.current_claim_root_proven);
+        let mut historical_page = materializer
+            .materialize_pages(&[reference_page])
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        let current = engine.materialize_page_for_projection(reference_page);
+        let mut historical = materializer
+            .materialize_pages_for_projection(&[reference_page])
+            .unwrap()
+            .into_iter()
+            .next()
+            .flatten()
+            .unwrap();
+        assert!(
+            current.is_ok(),
+            "the unchanged current fallback must not error"
+        );
+        historical_page.stats = MaterializationStats::default();
+        historical.page.stats = MaterializationStats::default();
+        assert_eq!(historical.page, historical_page);
+        assert_eq!(historical.claim_evidence, vec![fallback_evidence.clone()]);
+        assert_eq!(
+            current.unwrap().claim_evidence,
+            vec![fallback_evidence],
+            "the historical materializer must retain current fallback evidence"
+        );
+        assert_eq!(
+            historical.frontier,
+            FrontierV2::new(vec![
+                engine
+                    .accepted_frontier_document(&r1, catalog)
+                    .unwrap()
+                    .unwrap(),
+                engine
+                    .accepted_frontier_document(&r1, reference_membership)
+                    .unwrap()
+                    .unwrap(),
+                current_source_dependency,
+            ])
+            .unwrap(),
+            "the historical page frontier keeps its R1 page dependencies while claim resolution records the current fallback home"
+        );
+        assert_eq!(
+            materializer.projection_claim_resolution_stats(),
+            BootstrapProjectionClaimResolutionStats {
+                exact_root_resolutions: 0,
+                fallback_resolutions: 1,
+            }
+        );
+
+        drop(materializer);
+        drop(engine);
+        drop(writer);
+        crate::test_support::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bulk_projection_preserves_ambiguous_uuid_rejection_from_chunk_documents() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(93_100));
+        let lineage = LineageDigest::of(b"bulk-projection-uuid-ambiguity");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(93_101));
+        let page_a = PageId::from_uuid(Uuid::from_u128(93_102));
+        let home_a = DocumentId::from_uuid(Uuid::from_u128(93_103));
+        let block_a = BlockId::from_uuid(Uuid::from_u128(93_104));
+        let page_b = PageId::from_uuid(Uuid::from_u128(93_105));
+        let home_b = DocumentId::from_uuid(Uuid::from_u128(93_106));
+        let block_b = BlockId::from_uuid(Uuid::from_u128(93_107));
+        let duplicate = LogseqUuid::from_uuid(Uuid::from_u128(93_108));
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        let mut operations = create_page_with_block(
+            page_a,
+            home_a,
+            block_a,
+            "Ambiguous A",
+            "pages/ambiguous-a.md",
+        )
+        .operations;
+        operations.extend(
+            create_page_with_block(
+                page_b,
+                home_b,
+                block_b,
+                "Ambiguous B",
+                "pages/ambiguous-b.md",
+            )
+            .operations,
+        );
+        let genesis = ValidatedBatch::new(
+            engine
+                .prepare_bootstrap_transaction(
+                    test_author(93_109, 93_109),
+                    &OperationTransaction::new(operations).unwrap(),
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            engine.stage_ready(genesis.clone()).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let mut concurrent = ShardedHotEngine::new(workspace, lineage, catalog);
+        assert!(matches!(
+            concurrent.stage_ready(genesis).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        let left = engine
+            .prepare_bootstrap_transaction(
+                test_author(93_110, 93_110),
+                &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
+                    block: BlockLocation {
+                        block_id: block_a,
+                        home_document_id: home_a,
+                    },
+                    mutation: LogseqIdentityMutation::AssignExternal {
+                        logseq_uuid: duplicate,
+                    },
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        let right = concurrent
+            .prepare_bootstrap_transaction(
+                test_author(93_111, 93_111),
+                &OperationTransaction::new(vec![SemanticOperation::MutateBlockLogseqIdentity {
+                    block: BlockLocation {
+                        block_id: block_b,
+                        home_document_id: home_b,
+                    },
+                    mutation: LogseqIdentityMutation::AssignExternal {
+                        logseq_uuid: duplicate,
+                    },
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine.stage_ready(ValidatedBatch::new(left)).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+        assert!(matches!(
+            engine.stage_ready(ValidatedBatch::new(right)).disposition(),
+            BatchDisposition::Accepted { .. }
+        ));
+
+        assert!(matches!(
+            engine.materialize_page_for_projection(page_a),
+            Err(EngineError::AmbiguousLogseqUuid {
+                logseq_uuid,
+                claim_count: 2,
+            }) if logseq_uuid == duplicate
+        ));
+        let root = engine.accepted_frontier_root().unwrap();
+        let materializer = engine.bootstrap_bulk_materializer(&root).unwrap();
+        assert!(matches!(
+            materializer.materialize_pages_for_projection(&[page_a, page_b]),
+            Err(EngineError::AmbiguousLogseqUuid {
+                logseq_uuid,
+                claim_count: 2,
+            }) if logseq_uuid == duplicate
+        ));
+        assert_eq!(
+            materializer.projection_claim_resolution_stats(),
+            BootstrapProjectionClaimResolutionStats {
+                exact_root_resolutions: 1,
+                fallback_resolutions: 0,
+            }
+        );
     }
 
     struct PreauthorGateFixture {

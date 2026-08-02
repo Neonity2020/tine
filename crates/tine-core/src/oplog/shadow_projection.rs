@@ -404,6 +404,8 @@ pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) bulk_materialization_chunks: u64,
     pub(crate) bulk_pages_materialized: u64,
     pub(crate) peak_bulk_pages: u64,
+    pub(crate) exact_root_claim_resolutions: u64,
+    pub(crate) fallback_claim_resolutions: u64,
     pub(crate) accepted_frontier_session_hits: u64,
     pub(crate) accepted_frontier_session_misses: u64,
     pub(crate) accepted_frontier_session_evictions: u64,
@@ -2507,6 +2509,23 @@ fn record_bulk_lookup_session_stats(
     let Some(materializer) = materializer else {
         return Ok(());
     };
+    let claim_resolutions = materializer.projection_claim_resolution_stats();
+    instrumentation.exact_root_claim_resolutions = checked_add(
+        instrumentation.exact_root_claim_resolutions,
+        session_stat_u64(
+            claim_resolutions.exact_root_resolutions,
+            "exact-root claim resolutions",
+        )?,
+        "exact-root claim resolutions",
+    )?;
+    instrumentation.fallback_claim_resolutions = checked_add(
+        instrumentation.fallback_claim_resolutions,
+        session_stat_u64(
+            claim_resolutions.fallback_resolutions,
+            "fallback claim resolutions",
+        )?,
+        "fallback claim resolutions",
+    )?;
     let (accepted, external) = materializer.lookup_session_stats();
     instrumentation.accepted_frontier_session_hits = checked_add(
         instrumentation.accepted_frontier_session_hits,
