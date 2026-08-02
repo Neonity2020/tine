@@ -2,7 +2,7 @@
 //!
 //! This module owns no graph writer or enrollment capability. A returned
 //! [`VerifiedSourceBackup`] can only be minted after exact staged publication,
-//! fresh committed-byte readback, and an isolated restore proof.
+//! fresh committed-byte readback, and a proof of the verified inventory.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -46,7 +46,6 @@ const BACKUP_SCHEMA_VERSION: u32 = 1;
 const RESTORE_PROOF_SCHEMA_VERSION: u32 = 1;
 const COMMIT_MARKER_SCHEMA_VERSION: u32 = 1;
 const BACKUP_ROOT_DIRECTORY: &str = "migration-source-backups-v1";
-const RESTORE_ROOT_DIRECTORY: &str = "migration-source-restore-scratch-v1";
 const PAYLOAD_DIRECTORY: &str = "payload";
 const MANIFEST_FILE: &str = "manifest.bin";
 const RESTORE_PROOF_FILE: &str = "restore-proof.bin";
@@ -81,10 +80,6 @@ pub(crate) enum MigrationBackupCrashCut {
     AfterStagingSync,
     AfterStagingRename,
     AfterCommittedBackupReopen,
-    AfterRestoreCreation,
-    AfterRestoreWrite,
-    AfterRestoreSync,
-    AfterRestoreVerification,
     AfterProofPublication,
     AfterCommitMarkerPublication,
 }
@@ -141,10 +136,6 @@ impl MigrationBackupCrashCut {
             Self::AfterStagingSync => "after_staging_sync",
             Self::AfterStagingRename => "after_staging_rename",
             Self::AfterCommittedBackupReopen => "after_committed_backup_reopen",
-            Self::AfterRestoreCreation => "after_restore_creation",
-            Self::AfterRestoreWrite => "after_restore_write",
-            Self::AfterRestoreSync => "after_restore_sync",
-            Self::AfterRestoreVerification => "after_restore_verification",
             Self::AfterProofPublication => "after_proof_publication",
             Self::AfterCommitMarkerPublication => "after_commit_marker_publication",
         }
@@ -433,12 +424,11 @@ struct PublicationPaths {
     publication_parent: PathBuf,
     stage: PathBuf,
     final_directory: PathBuf,
-    restore: PathBuf,
 }
 
-/// Publish, reopen, restore, and verify one immutable pre-activation source
-/// backup. Proof digests are always derived internally from bytes freshly read
-/// from the committed backup.
+/// Publish, reopen, and verify one immutable pre-activation source backup.
+/// Proof digests are always derived internally from bytes freshly read from the
+/// committed backup.
 pub(crate) fn verify_migration_source_backup(
     roots: &MigrationBackupRoot,
     prepared: &InactiveBootstrapPreparedPublication,
@@ -447,7 +437,7 @@ pub(crate) fn verify_migration_source_backup(
     validate_bindings(roots, prepared, verified)?;
     let summary = summarize_source(prepared.source_capture())?;
     let paths = publication_paths(roots, verified)?;
-    ensure_publication_parents(roots, verified, &paths)?;
+    ensure_publication_parents(roots, &paths)?;
     let mut instrumentation = MigrationBackupInstrumentation::default();
 
     let final_exists = path_exists(&paths.final_directory)?;
@@ -478,7 +468,7 @@ pub(crate) fn verify_migration_source_backup(
         )?;
         sync_file_and_parent(&paths.stage.join(MANIFEST_FILE))?;
         inject_crash_cut(MigrationBackupCrashCut::AfterManifestPublication)?;
-        verify_backup_directory(
+        let _ = verify_backup_directory(
             &paths.stage,
             prepared,
             verified,
@@ -510,7 +500,7 @@ pub(crate) fn verify_migration_source_backup(
         summary,
         roots.backup_root_identity,
     )?;
-    verify_backup_directory(
+    let verified_inventory = verify_backup_directory(
         &paths.final_directory,
         prepared,
         verified,
@@ -522,39 +512,13 @@ pub(crate) fn verify_migration_source_backup(
     )?;
     inject_crash_cut(MigrationBackupCrashCut::AfterCommittedBackupReopen)?;
 
-    ensure_real_directory_created(&paths.restore)?;
-    inject_crash_cut(MigrationBackupCrashCut::AfterRestoreCreation)?;
-    restore_from_manifest(
-        &paths.final_directory,
-        &paths.restore,
-        prepared,
-        verified,
-        summary,
-        roots.backup_root_identity,
-        &mut instrumentation,
-    )?;
-    inject_crash_cut(MigrationBackupCrashCut::AfterRestoreWrite)?;
-    sync_tree(&paths.restore, summary)?;
-    inject_crash_cut(MigrationBackupCrashCut::AfterRestoreSync)?;
-    let restored = verify_tree_from_manifest(
-        &paths.final_directory.join(MANIFEST_FILE),
-        &paths.restore,
-        prepared,
-        verified,
-        summary,
-        roots.backup_root_identity,
-        &mut instrumentation,
-        TreeReadKind::Restore,
-    )?;
-    inject_crash_cut(MigrationBackupCrashCut::AfterRestoreVerification)?;
-
     let proof_bytes = restore_proof_bytes(
         prepared,
         verified,
         summary,
         roots.backup_root_identity,
         manifest,
-        restored,
+        verified_inventory,
     );
     let restore_proof = publish_small_file_atomic(
         &paths.final_directory,
@@ -591,10 +555,10 @@ pub(crate) fn verify_migration_source_backup(
     )?;
     if final_manifest != manifest {
         return Err(MigrationBackupError::CorruptOrConflicting(
-            "manifest changed after restore verification",
+            "manifest changed after proof derivation",
         ));
     }
-    verify_backup_directory(
+    let _ = verify_backup_directory(
         &paths.final_directory,
         prepared,
         verified,
@@ -768,15 +732,10 @@ fn publication_paths(
         .join(workspace.clone());
     let stage = publication_parent.join(format!(".{publication}.staging"));
     let final_directory = publication_parent.join(&publication);
-    let restore = roots
-        .canonical_root
-        .join(RESTORE_ROOT_DIRECTORY)
-        .join(workspace)
-        .join(publication);
-    for path in [&stage, &final_directory, &restore] {
+    for path in [&stage, &final_directory] {
         if path == &roots.canonical_graph_root || path.starts_with(&roots.canonical_graph_root) {
             return Err(MigrationBackupError::InvalidRoot(
-                "backup publication or restore tree would be inside the graph",
+                "backup publication would be inside the graph",
             ));
         }
     }
@@ -784,22 +743,16 @@ fn publication_paths(
         publication_parent,
         stage,
         final_directory,
-        restore,
     })
 }
 
 fn ensure_publication_parents(
     roots: &MigrationBackupRoot,
-    verified: &InactiveBootstrapVerifiedPublication,
     paths: &PublicationPaths,
 ) -> Result<(), MigrationBackupError> {
     let backup_base = roots.canonical_root.join(BACKUP_ROOT_DIRECTORY);
     ensure_real_directory_created(&backup_base)?;
-    ensure_real_directory_created(&paths.publication_parent)?;
-    let restore_base = roots.canonical_root.join(RESTORE_ROOT_DIRECTORY);
-    ensure_real_directory_created(&restore_base)?;
-    let restore_workspace = restore_base.join(verified.workspace_id().to_string());
-    ensure_real_directory_created(&restore_workspace)
+    ensure_real_directory_created(&paths.publication_parent)
 }
 
 fn validate_entry_bounds(entry: &BootstrapSourceEntry) -> Result<(), MigrationBackupError> {
@@ -1565,7 +1518,7 @@ fn verify_backup_directory(
     expected_manifest: BlobDescription,
     instrumentation: &mut MigrationBackupInstrumentation,
     final_directory: bool,
-) -> Result<(), MigrationBackupError> {
+) -> Result<InventoryProof, MigrationBackupError> {
     let actual_manifest = compare_expected_manifest(
         &directory.join(MANIFEST_FILE),
         prepared,
@@ -1594,16 +1547,17 @@ fn verify_backup_directory(
             "backup payload summary differs from the manifest",
         ));
     }
-    Ok(())
+    Ok(observed)
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum TreeReadKind {
     Backup,
     Restore,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InventoryProof {
     digest: ContentDigest,
     file_count: u64,
@@ -1741,6 +1695,7 @@ fn verify_file_against_entry(
     ))
 }
 
+#[allow(dead_code)]
 fn restore_from_manifest(
     backup: &Path,
     restore: &Path,
@@ -1885,7 +1840,7 @@ fn restore_proof_bytes(
     summary: SourceSummary,
     backup_root_identity: ContentDigest,
     manifest: BlobDescription,
-    restored: InventoryProof,
+    verified_inventory: InventoryProof,
 ) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(256);
     bytes.extend_from_slice(RESTORE_PROOF_MAGIC);
@@ -1904,9 +1859,9 @@ fn restore_proof_bytes(
     put_description(&mut bytes, manifest);
     put_u64(&mut bytes, summary.file_count);
     put_u64(&mut bytes, summary.total_bytes);
-    bytes.extend_from_slice(restored.digest.as_bytes());
-    put_u64(&mut bytes, restored.file_count);
-    put_u64(&mut bytes, restored.total_bytes);
+    bytes.extend_from_slice(verified_inventory.digest.as_bytes());
+    put_u64(&mut bytes, verified_inventory.file_count);
+    put_u64(&mut bytes, verified_inventory.total_bytes);
     bytes
 }
 
@@ -2639,11 +2594,9 @@ mod tests {
     }
 
     fn reset_packet(roots: &MigrationBackupRoot) {
-        for directory in [BACKUP_ROOT_DIRECTORY, RESTORE_ROOT_DIRECTORY] {
-            let path = roots.canonical_root.join(directory);
-            if path.exists() {
-                crate::test_support::remove_dir_all(path);
-            }
+        let path = roots.canonical_root.join(BACKUP_ROOT_DIRECTORY);
+        if path.exists() {
+            crate::test_support::remove_dir_all(path);
         }
     }
 
@@ -2673,7 +2626,6 @@ mod tests {
             }
             MigrationBackupCrashCut::PartialManifestHeaderWrite
             | MigrationBackupCrashCut::PartialManifestEntryWrite => paths.stage.join(MANIFEST_FILE),
-            MigrationBackupCrashCut::PartialRestoreWrite => first_file_below(&paths.restore),
             MigrationBackupCrashCut::PartialRestoreProofStageWrite => {
                 paths.final_directory.join(RESTORE_PROOF_STAGE_FILE)
             }
@@ -2714,15 +2666,6 @@ mod tests {
                 .unwrap();
                 expected
             }
-            MigrationBackupCrashCut::PartialRestoreWrite => {
-                let path = partial_artifact_path(paths, cut);
-                let relative = path
-                    .strip_prefix(&paths.restore)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                fixture.original_files[&relative].clone()
-            }
             MigrationBackupCrashCut::PartialRestoreProofStageWrite => {
                 let manifest = compare_expected_manifest(
                     &paths.final_directory.join(MANIFEST_FILE),
@@ -2735,13 +2678,13 @@ mod tests {
                 let mut instrumentation = MigrationBackupInstrumentation::default();
                 let restored = verify_tree_from_manifest(
                     &paths.final_directory.join(MANIFEST_FILE),
-                    &paths.restore,
+                    &paths.final_directory.join(PAYLOAD_DIRECTORY),
                     &fixture.prepared,
                     &fixture.verified,
                     summary,
                     roots.backup_root_identity,
                     &mut instrumentation,
-                    TreeReadKind::Restore,
+                    TreeReadKind::Backup,
                 )
                 .unwrap();
                 restore_proof_bytes(
@@ -2780,11 +2723,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_nested_unicode_crlf_empty_and_multichunk_roundtrip_is_bounded() {
+    fn healthy_backup_verification_avoids_restore_rehearsal_and_is_bounded() {
         let fixture = Fixture::rich("roundtrip", 0x7100);
         let before = snapshot_tree(&fixture.graph_root);
         let roots = fixture.roots("backups");
-        let paths = publication_paths(&roots, &fixture.verified).unwrap();
         let backup =
             verify_migration_source_backup(&roots, &fixture.prepared, &fixture.verified).unwrap();
         assert_eq!(backup.file_count(), fixture.original_files.len() as u64);
@@ -2810,11 +2752,156 @@ mod tests {
             ContentDigest::of(b"caller-supplied-proof")
         );
         assert!(backup.instrumentation().peak_owned_payload_buffer_bytes <= IO_BUFFER_BYTES as u64);
+        assert_eq!(backup.instrumentation().restored_bytes_written, 0);
+        assert_eq!(backup.instrumentation().restored_bytes_read, 0);
         assert_roundtrip_files(
             &backup.directory().join(PAYLOAD_DIRECTORY),
             &fixture.original_files,
         );
-        assert_roundtrip_files(&paths.restore, &fixture.original_files);
+        let summary = summarize_source(fixture.prepared.source_capture()).unwrap();
+        let mut proof_instrumentation = MigrationBackupInstrumentation::default();
+        let verified_inventory = verify_tree_from_manifest(
+            &backup.directory().join(MANIFEST_FILE),
+            &backup.directory().join(PAYLOAD_DIRECTORY),
+            &fixture.prepared,
+            &fixture.verified,
+            summary,
+            roots.backup_root_identity,
+            &mut proof_instrumentation,
+            TreeReadKind::Backup,
+        )
+        .unwrap();
+        let expected_proof = restore_proof_bytes(
+            &fixture.prepared,
+            &fixture.verified,
+            summary,
+            roots.backup_root_identity,
+            backup.manifest(),
+            verified_inventory,
+        );
+        assert_eq!(
+            fs::read(backup.directory().join(RESTORE_PROOF_FILE)).unwrap(),
+            expected_proof
+        );
+        assert!(!roots
+            .canonical_root
+            .join("migration-source-restore-scratch-v1")
+            .exists());
+        assert_eq!(snapshot_tree(&fixture.graph_root), before);
+    }
+
+    #[test]
+    fn retained_recovery_resumes_and_restores_valid_backup_exactly() {
+        let fixture = Fixture::rich("requested-recovery", 0x7150);
+        let before = snapshot_tree(&fixture.graph_root);
+        let roots = fixture.roots("backups");
+        let backup =
+            verify_migration_source_backup(&roots, &fixture.prepared, &fixture.verified).unwrap();
+        let summary = summarize_source(fixture.prepared.source_capture()).unwrap();
+        let restore = fixture.root.path().join("requested-recovery");
+        fs::create_dir(&restore).unwrap();
+
+        let mut partial_instrumentation = MigrationBackupInstrumentation::default();
+        MIGRATION_BACKUP_CRASH_CUT
+            .with(|pending| pending.set(Some(MigrationBackupCrashCut::PartialRestoreWrite)));
+        assert!(matches!(
+            restore_from_manifest(
+                backup.directory(),
+                &restore,
+                &fixture.prepared,
+                &fixture.verified,
+                summary,
+                roots.backup_root_identity,
+                &mut partial_instrumentation,
+            ),
+            Err(MigrationBackupError::InjectedCrashCut(
+                "partial_restore_write"
+            ))
+        ));
+        let partial = first_file_below(&restore);
+        let relative = partial
+            .strip_prefix(&restore)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let prefix = fs::read(&partial).unwrap();
+        assert!(!prefix.is_empty());
+        assert!(prefix.len() < fixture.original_files[&relative].len());
+        assert_eq!(prefix, fixture.original_files[&relative][..prefix.len()]);
+
+        let mut recovery_instrumentation = MigrationBackupInstrumentation::default();
+        restore_from_manifest(
+            backup.directory(),
+            &restore,
+            &fixture.prepared,
+            &fixture.verified,
+            summary,
+            roots.backup_root_identity,
+            &mut recovery_instrumentation,
+        )
+        .unwrap();
+        sync_tree(&restore, summary).unwrap();
+        let mut backup_instrumentation = MigrationBackupInstrumentation::default();
+        let expected_inventory = verify_tree_from_manifest(
+            &backup.directory().join(MANIFEST_FILE),
+            &backup.directory().join(PAYLOAD_DIRECTORY),
+            &fixture.prepared,
+            &fixture.verified,
+            summary,
+            roots.backup_root_identity,
+            &mut backup_instrumentation,
+            TreeReadKind::Backup,
+        )
+        .unwrap();
+        let recovered_inventory = verify_tree_from_manifest(
+            &backup.directory().join(MANIFEST_FILE),
+            &restore,
+            &fixture.prepared,
+            &fixture.verified,
+            summary,
+            roots.backup_root_identity,
+            &mut recovery_instrumentation,
+            TreeReadKind::Restore,
+        )
+        .unwrap();
+        assert_eq!(recovered_inventory, expected_inventory);
+        assert_roundtrip_files(&restore, &fixture.original_files);
+
+        let payload = backup.directory().join(PAYLOAD_DIRECTORY);
+        let source = payload.join("Root.md");
+        let source_bytes = fs::read(&source).unwrap();
+        let mut corrupt_bytes = source_bytes.clone();
+        corrupt_bytes[0] ^= 0x01;
+        fs::write(&source, corrupt_bytes).unwrap();
+        let corrupt_restore = fixture.root.path().join("corrupt-recovery");
+        fs::create_dir(&corrupt_restore).unwrap();
+        assert!(restore_from_manifest(
+            backup.directory(),
+            &corrupt_restore,
+            &fixture.prepared,
+            &fixture.verified,
+            summary,
+            roots.backup_root_identity,
+            &mut MigrationBackupInstrumentation::default(),
+        )
+        .is_err());
+        fs::write(&source, &source_bytes).unwrap();
+
+        let missing = payload.join("Root.missing");
+        fs::rename(&source, &missing).unwrap();
+        let incomplete_restore = fixture.root.path().join("incomplete-recovery");
+        fs::create_dir(&incomplete_restore).unwrap();
+        assert!(restore_from_manifest(
+            backup.directory(),
+            &incomplete_restore,
+            &fixture.prepared,
+            &fixture.verified,
+            summary,
+            roots.backup_root_identity,
+            &mut MigrationBackupInstrumentation::default(),
+        )
+        .is_err());
+        fs::rename(&missing, &source).unwrap();
         assert_eq!(snapshot_tree(&fixture.graph_root), before);
     }
 
@@ -2987,10 +3074,6 @@ mod tests {
             MigrationBackupCrashCut::AfterStagingSync,
             MigrationBackupCrashCut::AfterStagingRename,
             MigrationBackupCrashCut::AfterCommittedBackupReopen,
-            MigrationBackupCrashCut::AfterRestoreCreation,
-            MigrationBackupCrashCut::AfterRestoreWrite,
-            MigrationBackupCrashCut::AfterRestoreSync,
-            MigrationBackupCrashCut::AfterRestoreVerification,
             MigrationBackupCrashCut::AfterProofPublication,
             MigrationBackupCrashCut::AfterCommitMarkerPublication,
         ];
@@ -3028,7 +3111,6 @@ mod tests {
             MigrationBackupCrashCut::PartialPayloadWrite,
             MigrationBackupCrashCut::PartialManifestHeaderWrite,
             MigrationBackupCrashCut::PartialManifestEntryWrite,
-            MigrationBackupCrashCut::PartialRestoreWrite,
             MigrationBackupCrashCut::PartialRestoreProofStageWrite,
             MigrationBackupCrashCut::PartialCommitMarkerStageWrite,
         ];
@@ -3070,7 +3152,6 @@ mod tests {
             MigrationBackupCrashCut::PartialPayloadWrite,
             MigrationBackupCrashCut::PartialManifestHeaderWrite,
             MigrationBackupCrashCut::PartialManifestEntryWrite,
-            MigrationBackupCrashCut::PartialRestoreWrite,
             MigrationBackupCrashCut::PartialRestoreProofStageWrite,
             MigrationBackupCrashCut::PartialCommitMarkerStageWrite,
         ];
