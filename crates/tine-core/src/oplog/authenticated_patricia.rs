@@ -362,6 +362,17 @@ impl PatriciaIndexStore {
             .map_err(map_storage_error)
     }
 
+    pub(crate) fn construction_insert_many_bulk(
+        &self,
+        construction: &mut PatriciaIndexConstruction,
+        root: PatriciaIndexRoot,
+        records: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<PatriciaIndexRoot, StoreError> {
+        self.storage
+            .construction_insert_many_bulk(construction, root, records)
+            .map_err(map_storage_error)
+    }
+
     pub(crate) fn construction_remove_many(
         &self,
         construction: &mut PatriciaIndexConstruction,

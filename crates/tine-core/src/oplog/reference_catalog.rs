@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
+use std::time::Instant;
 
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
@@ -1298,6 +1300,8 @@ pub(crate) struct ReferenceCatalogStateV2 {
     full_delta_validations: Cell<usize>,
     #[cfg(test)]
     final_catalog_validations: Cell<usize>,
+    #[cfg(test)]
+    prepare_attribution: Cell<ReferenceCatalogPrepareAttributionStats>,
 }
 
 /// Move-only proof that the authenticated root node of every tree named by one
@@ -1320,6 +1324,31 @@ pub(crate) struct ReferenceCatalogConstructionWorkStats {
     pub(crate) prepared_candidate_validations: usize,
     pub(crate) full_delta_validations: usize,
     pub(crate) final_catalog_validations: usize,
+    pub(crate) extraction_nanos: u128,
+    pub(crate) posting_transition_publication_nanos: u128,
+    pub(crate) facts_coverage_patricia_nanos: u128,
+    pub(crate) reverse_patricia_nanos: u128,
+    pub(crate) facts_coverage_patricia_reads: usize,
+    pub(crate) reverse_patricia_reads: usize,
+    pub(crate) prepared_sources: usize,
+    pub(crate) fact_updates: usize,
+    pub(crate) reverse_updates: usize,
+    pub(crate) persistent_node_reads: usize,
+    pub(crate) persistent_node_writes: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ReferenceCatalogPrepareAttributionStats {
+    extraction_nanos: u128,
+    posting_transition_publication_nanos: u128,
+    facts_coverage_patricia_nanos: u128,
+    reverse_patricia_nanos: u128,
+    facts_coverage_patricia_reads: usize,
+    reverse_patricia_reads: usize,
+    prepared_sources: usize,
+    fact_updates: usize,
+    reverse_updates: usize,
 }
 
 impl ReferenceCatalogStateV2 {
@@ -1342,6 +1371,8 @@ impl ReferenceCatalogStateV2 {
             full_delta_validations: Cell::new(0),
             #[cfg(test)]
             final_catalog_validations: Cell::new(0),
+            #[cfg(test)]
+            prepare_attribution: Cell::new(ReferenceCatalogPrepareAttributionStats::default()),
         })
     }
 
@@ -1391,6 +1422,8 @@ impl ReferenceCatalogStateV2 {
             full_delta_validations: Cell::new(0),
             #[cfg(test)]
             final_catalog_validations: Cell::new(0),
+            #[cfg(test)]
+            prepare_attribution: Cell::new(ReferenceCatalogPrepareAttributionStats::default()),
         })
     }
 
@@ -1606,12 +1639,25 @@ impl ReferenceCatalogStateV2 {
             ReferenceCatalogBackend::Construction { patricia, .. } => patricia.borrow().stats(),
             _ => self.completed_construction_stats.unwrap_or_default(),
         };
+        let attribution = self.prepare_attribution.get();
+        let persistent = self.store_stats();
         ReferenceCatalogConstructionWorkStats {
             peak_resident_bytes: patricia.peak_resident_bytes,
             buffer_flushes: patricia.flushes,
             prepared_candidate_validations: self.prepared_candidate_validations.get(),
             full_delta_validations: self.full_delta_validations.get(),
             final_catalog_validations: self.final_catalog_validations.get(),
+            extraction_nanos: attribution.extraction_nanos,
+            posting_transition_publication_nanos: attribution.posting_transition_publication_nanos,
+            facts_coverage_patricia_nanos: attribution.facts_coverage_patricia_nanos,
+            reverse_patricia_nanos: attribution.reverse_patricia_nanos,
+            facts_coverage_patricia_reads: attribution.facts_coverage_patricia_reads,
+            reverse_patricia_reads: attribution.reverse_patricia_reads,
+            prepared_sources: attribution.prepared_sources,
+            fact_updates: attribution.fact_updates,
+            reverse_updates: attribution.reverse_updates,
+            persistent_node_reads: persistent.reads,
+            persistent_node_writes: persistent.writes,
         }
     }
 
@@ -1898,6 +1944,11 @@ impl ReferenceCatalogStateV2 {
         page_names: &PageNameOwnershipRootV1,
         external_uuid_claim_authority_root: ContentDigest,
     ) -> Result<ReferenceCatalogCandidateV2, ReferenceCatalogError> {
+        #[cfg(test)]
+        let mut attribution = ReferenceCatalogPrepareAttributionStats {
+            prepared_sources: sources.len(),
+            ..ReferenceCatalogPrepareAttributionStats::default()
+        };
         let mut facts_root = PatriciaIndexRoot::from_digest(self.root.facts_root);
         let mut coverage_root = PatriciaIndexRoot::from_digest(self.root.source_coverage_root);
         let mut reverse_root = PatriciaIndexRoot::from_digest(self.root.reverse_candidates_root);
@@ -1926,9 +1977,17 @@ impl ReferenceCatalogStateV2 {
                 })
                 .transpose()?
                 .unwrap_or_default();
+            #[cfg(test)]
+            let extraction_started = Instant::now();
             let posting = source
                 .map(|source| extract_source_posting(&self.policy, source))
                 .transpose()?;
+            #[cfg(test)]
+            {
+                attribution.extraction_nanos = attribution
+                    .extraction_nanos
+                    .saturating_add(extraction_started.elapsed().as_nanos());
+            }
             let post_reverse_keys = posting
                 .as_ref()
                 .map(reverse_candidate_keys)
@@ -1941,7 +2000,15 @@ impl ReferenceCatalogStateV2 {
             );
             let post_posting = match posting {
                 Some(posting) => {
+                    #[cfg(test)]
+                    let publication_started = Instant::now();
                     let reference = store.publish_posting(&posting)?;
+                    #[cfg(test)]
+                    {
+                        attribution.posting_transition_publication_nanos = attribution
+                            .posting_transition_publication_nanos
+                            .saturating_add(publication_started.elapsed().as_nanos());
+                    }
                     fact_updates.insert(key.clone(), reference.digest.as_bytes().to_vec());
                     coverage_updates.insert(key.clone(), COVERAGE_VALUE.to_vec());
                     if prior_posting_digest.is_none() {
@@ -1967,6 +2034,15 @@ impl ReferenceCatalogStateV2 {
                 post_posting,
             });
         }
+        #[cfg(test)]
+        {
+            attribution.fact_updates = fact_updates.len();
+            attribution.reverse_updates = reverse_updates.len();
+        }
+        #[cfg(test)]
+        let facts_coverage_started = Instant::now();
+        #[cfg(test)]
+        let facts_coverage_reads_before = store.stats().reads;
         facts_root = store
             .patricia
             .construction_insert_many(construction, facts_root, &fact_updates)
@@ -1987,9 +2063,21 @@ impl ReferenceCatalogStateV2 {
             .construction_remove_many(construction, coverage_root, &removals)
             .map_err(store_error)?;
         construction.set_live_roots([facts_root, coverage_root, reverse_root]);
+        #[cfg(test)]
+        {
+            attribution.facts_coverage_patricia_nanos = facts_coverage_started.elapsed().as_nanos();
+            attribution.facts_coverage_patricia_reads = store
+                .stats()
+                .reads
+                .saturating_sub(facts_coverage_reads_before);
+        }
+        #[cfg(test)]
+        let reverse_started = Instant::now();
+        #[cfg(test)]
+        let reverse_reads_before = store.stats().reads;
         reverse_root = store
             .patricia
-            .construction_insert_many(construction, reverse_root, &reverse_updates)
+            .construction_insert_many_bulk(construction, reverse_root, &reverse_updates)
             .map_err(store_error)?;
         construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         reverse_root = store
@@ -2001,6 +2089,12 @@ impl ReferenceCatalogStateV2 {
             )
             .map_err(store_error)?;
         construction.set_live_roots([facts_root, coverage_root, reverse_root]);
+        #[cfg(test)]
+        {
+            attribution.reverse_patricia_nanos = reverse_started.elapsed().as_nanos();
+            attribution.reverse_patricia_reads =
+                store.stats().reads.saturating_sub(reverse_reads_before);
+        }
         construction.checkpoint([facts_root, coverage_root, reverse_root]);
         let post_root = ReferenceCatalogRootV2::new(
             &self.policy,
@@ -2014,7 +2108,16 @@ impl ReferenceCatalogStateV2 {
         let transition = if replacements.is_empty() {
             ReferenceTransitionBindingV2::Empty
         } else {
-            ReferenceTransitionBindingV2::Stored(store.publish_transition(&replacements)?)
+            #[cfg(test)]
+            let publication_started = Instant::now();
+            let transition = store.publish_transition(&replacements)?;
+            #[cfg(test)]
+            {
+                attribution.posting_transition_publication_nanos = attribution
+                    .posting_transition_publication_nanos
+                    .saturating_add(publication_started.elapsed().as_nanos());
+            }
+            ReferenceTransitionBindingV2::Stored(transition)
         };
         let delta = ReferenceCatalogDeltaV2 {
             schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
@@ -2023,6 +2126,38 @@ impl ReferenceCatalogStateV2 {
             transition,
         };
         delta.encode()?;
+        #[cfg(test)]
+        {
+            let prior = self.prepare_attribution.get();
+            self.prepare_attribution
+                .set(ReferenceCatalogPrepareAttributionStats {
+                    extraction_nanos: prior
+                        .extraction_nanos
+                        .saturating_add(attribution.extraction_nanos),
+                    posting_transition_publication_nanos: prior
+                        .posting_transition_publication_nanos
+                        .saturating_add(attribution.posting_transition_publication_nanos),
+                    facts_coverage_patricia_nanos: prior
+                        .facts_coverage_patricia_nanos
+                        .saturating_add(attribution.facts_coverage_patricia_nanos),
+                    reverse_patricia_nanos: prior
+                        .reverse_patricia_nanos
+                        .saturating_add(attribution.reverse_patricia_nanos),
+                    facts_coverage_patricia_reads: prior
+                        .facts_coverage_patricia_reads
+                        .saturating_add(attribution.facts_coverage_patricia_reads),
+                    reverse_patricia_reads: prior
+                        .reverse_patricia_reads
+                        .saturating_add(attribution.reverse_patricia_reads),
+                    prepared_sources: prior
+                        .prepared_sources
+                        .saturating_add(attribution.prepared_sources),
+                    fact_updates: prior.fact_updates.saturating_add(attribution.fact_updates),
+                    reverse_updates: prior
+                        .reverse_updates
+                        .saturating_add(attribution.reverse_updates),
+                });
+        }
         Ok(ReferenceCatalogCandidateV2 {
             delta,
             memory: None,
@@ -2589,6 +2724,45 @@ mod tests {
         (path, catalog)
     }
 
+    fn dense_source(
+        page_index: usize,
+        blocks_per_page: usize,
+        targets_per_block: usize,
+    ) -> ReferenceSourcePageV1 {
+        let page_id = page(100_000 + page_index as u128 * 100);
+        let blocks = (0..blocks_per_page)
+            .map(|block_index| ReferenceSourceBlockV1 {
+                block_id: block(page_id.as_uuid().as_u128() + block_index as u128 + 1),
+                home_document_id: document(page_id.as_uuid().as_u128() + 50),
+                content: (0..targets_per_block)
+                    .map(|target_index| {
+                        format!("[[Target {page_index:06} {block_index:02} {target_index:02}]]")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            })
+            .collect();
+        ReferenceSourcePageV1 {
+            page_id,
+            is_org: false,
+            preamble: None,
+            blocks,
+        }
+    }
+
+    fn dense_sources(
+        page_range: std::ops::Range<usize>,
+        blocks_per_page: usize,
+        targets_per_block: usize,
+    ) -> BTreeMap<PageId, Option<ReferenceSourcePageV1>> {
+        page_range
+            .map(|page_index| {
+                let source = dense_source(page_index, blocks_per_page, targets_per_block);
+                (source.page_id, Some(source))
+            })
+            .collect()
+    }
+
     #[test]
     fn exact_markdown_org_unicode_and_opaque_evidence_share_one_projection() {
         let uuid = "6a55b643-1234-5678-9abc-def012345678";
@@ -2837,6 +3011,125 @@ mod tests {
         state.commit(candidate);
         state.finish_construction().unwrap();
         assert_eq!(state.root(), &post_root);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn construction_bulk_matches_legacy_multi_part_roots_and_deltas() {
+        let names = PageNameOwnershipRootV1::empty();
+        let uuid_root = ContentDigest::of(b"construction-bulk-multipart-differential");
+        let (legacy_path, legacy_store) = store("construction-bulk-multipart-legacy");
+        let (bulk_path, bulk_store) = store("construction-bulk-multipart-bulk");
+        let mut legacy =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        legacy.attach_store(legacy_store).unwrap();
+        let mut bulk =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        bulk.attach_construction_store(Arc::clone(&bulk_store))
+            .unwrap();
+
+        let mut second = dense_sources(48..96, 3, 4);
+        second.extend(dense_sources(24..40, 2, 3));
+        let mut third = dense_sources(80..112, 2, 5);
+        for page_index in [3_usize, 31, 70, 90] {
+            third.insert(page(100_000 + page_index as u128 * 100), None);
+        }
+        let parts = [dense_sources(0..64, 3, 4), second, third];
+        let mut historical_roots = Vec::new();
+        for sources in parts {
+            let legacy_candidate = legacy.prepare(sources.clone(), &names, uuid_root).unwrap();
+            let bulk_candidate = bulk.prepare(sources, &names, uuid_root).unwrap();
+            assert_eq!(legacy_candidate.root(), bulk_candidate.root());
+            assert_eq!(
+                legacy_candidate.delta().encode().unwrap(),
+                bulk_candidate.delta().encode().unwrap()
+            );
+            bulk.validate_prepared_candidate(
+                bulk_candidate.prepared_candidate().unwrap(),
+                bulk_candidate.delta(),
+                bulk_candidate.root(),
+            )
+            .unwrap();
+            historical_roots.push(bulk_candidate.root().clone());
+            legacy.commit(legacy_candidate);
+            bulk.commit(bulk_candidate);
+        }
+        bulk.finish_construction().unwrap();
+        assert_eq!(legacy.root(), bulk.root());
+        for root in &historical_roots {
+            bulk_store.validate_catalog_root(root).unwrap();
+        }
+
+        std::fs::remove_dir_all(legacy_path).unwrap();
+        std::fs::remove_dir_all(bulk_path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual construction reference-catalog attribution receipt"]
+    fn construction_reverse_dense_scale_receipt() {
+        let total_pages = std::env::var("TINE_REFERENCE_CATALOG_SCALE_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(128);
+        let pages_per_part = std::env::var("TINE_REFERENCE_CATALOG_SCALE_PART_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64);
+        assert!(total_pages > 0 && pages_per_part > 0);
+        let names = PageNameOwnershipRootV1::empty();
+        let uuid_root = ContentDigest::of(b"construction-reverse-dense-scale-receipt");
+        let (path, durable) = store("construction-reverse-dense-scale");
+        let mut state =
+            ReferenceCatalogStateV2::empty(ReferenceCatalogPolicyV1::default(), &names, uuid_root)
+                .unwrap();
+        state
+            .attach_construction_store(Arc::clone(&durable))
+            .unwrap();
+        let started = Instant::now();
+        let mut checkpoints = Vec::new();
+        for part_start in (0..total_pages).step_by(pages_per_part) {
+            let part_end = (part_start + pages_per_part).min(total_pages);
+            let sources = dense_sources(part_start..part_end, 11, 32);
+            let candidate = state.prepare(sources, &names, uuid_root).unwrap();
+            state
+                .validate_prepared_candidate(
+                    candidate.prepared_candidate().unwrap(),
+                    candidate.delta(),
+                    candidate.root(),
+                )
+                .unwrap();
+            checkpoints.push(candidate.root().clone());
+            state.commit(candidate);
+        }
+        let prepare_elapsed = started.elapsed();
+        let finish_started = Instant::now();
+        state.finish_construction().unwrap();
+        let finish_elapsed = finish_started.elapsed();
+        for root in &checkpoints {
+            durable.validate_catalog_root(root).unwrap();
+        }
+        let work = state.construction_work_stats();
+        eprintln!(
+            "construction_reverse_dense_scale pages={total_pages} pages_per_part={pages_per_part} parts={} prepare_ms={:.3} finish_ms={:.3} extraction_ms={:.3} posting_transition_publication_ms={:.3} facts_coverage_patricia_ms={:.3} reverse_patricia_ms={:.3} facts_coverage_reads={} reverse_reads={} prepared_sources={} fact_updates={} reverse_updates={} persistent_reads={} persistent_writes={} peak_resident_bytes={} buffer_flushes={}",
+            checkpoints.len(),
+            prepare_elapsed.as_secs_f64() * 1_000.0,
+            finish_elapsed.as_secs_f64() * 1_000.0,
+            work.extraction_nanos as f64 / 1_000_000.0,
+            work.posting_transition_publication_nanos as f64 / 1_000_000.0,
+            work.facts_coverage_patricia_nanos as f64 / 1_000_000.0,
+            work.reverse_patricia_nanos as f64 / 1_000_000.0,
+            work.facts_coverage_patricia_reads,
+            work.reverse_patricia_reads,
+            work.prepared_sources,
+            work.fact_updates,
+            work.reverse_updates,
+            work.persistent_node_reads,
+            work.persistent_node_writes,
+            work.peak_resident_bytes,
+            work.buffer_flushes,
+        );
         std::fs::remove_dir_all(path).unwrap();
     }
 

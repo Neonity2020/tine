@@ -4505,12 +4505,13 @@ mod tests {
             0,
             "multipart catalog batches must not scan prior catalog ranges"
         );
-        let keys = records
+        let mut keys = records
             .keys()
             .rev()
             .take(RECORDS_PER_PART as usize)
             .copied()
             .collect::<BTreeSet<_>>();
+        keys.insert([0xff; 16]);
         let expected = records
             .iter()
             .filter(|(key, _)| keys.contains(*key))
@@ -4527,6 +4528,29 @@ mod tests {
         assert!(
             lookup_after.page_reads - lookup_before.page_reads <= keys.len() * 2,
             "one part lookup traversed the cumulative catalog: {lookup_before:?} -> {lookup_after:?}"
+        );
+        let point_lookup_before = point_store.stats();
+        let point_found = keys
+            .iter()
+            .map(|key| {
+                point_store
+                    .authenticated_catalog_lookup(&point_root, *key)
+                    .map(|value| (*key, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .unwrap();
+        let point_lookup_after = point_store.stats();
+        assert_eq!(
+            point_found
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .collect::<BTreeMap<_, _>>(),
+            expected
+        );
+        assert!(
+            lookup_after.page_reads - lookup_before.page_reads
+                <= point_lookup_after.page_reads - point_lookup_before.page_reads,
+            "batched authenticated lookup must do fewer-or-equal scratch reads than exact point lookups"
         );
 
         for (key, value) in &updates {
@@ -4560,6 +4584,13 @@ mod tests {
         assert_eq!(checkpointed.count, batch_root.count);
         assert_eq!(checkpointed.root_key, batch_root.root_key);
         assert_eq!(checkpointed.root_digest, batch_root.root_digest);
+        batch_store.tamper_authenticated_catalog_root_for_test(&batch_root);
+        assert!(matches!(
+            batch_store.authenticated_catalog_lookup_many(&batch_root, &keys),
+            Err(ScratchError::MalformedPage)
+                | Err(ScratchError::PageDigestMismatch(_))
+                | Err(ScratchError::Io(_))
+        ));
 
         drop(point_store);
         drop(batch_store);

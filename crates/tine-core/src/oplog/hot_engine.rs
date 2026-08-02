@@ -1976,6 +1976,62 @@ pub(crate) struct BootstrapCatalogWorkStats {
     pub(crate) reference_catalog_prepared_validations: usize,
     pub(crate) reference_catalog_full_delta_validations: usize,
     pub(crate) reference_catalog_final_validations: usize,
+    pub(crate) reference_catalog_extraction_nanos: u128,
+    pub(crate) reference_catalog_posting_transition_publication_nanos: u128,
+    pub(crate) reference_catalog_facts_coverage_patricia_nanos: u128,
+    pub(crate) reference_catalog_reverse_patricia_nanos: u128,
+    pub(crate) reference_catalog_facts_coverage_patricia_reads: usize,
+    pub(crate) reference_catalog_reverse_patricia_reads: usize,
+    pub(crate) reference_catalog_prepared_sources: usize,
+    pub(crate) reference_catalog_fact_updates: usize,
+    pub(crate) reference_catalog_reverse_updates: usize,
+    pub(crate) reference_catalog_persistent_node_reads: usize,
+    pub(crate) reference_catalog_persistent_node_writes: usize,
+}
+
+#[cfg(test)]
+fn bootstrap_catalog_work_stats(engine: &ShardedHotEngine) -> BootstrapCatalogWorkStats {
+    let reference = engine.reference_source_observations.get();
+    let construction = engine.reference_catalog.construction_work_stats();
+    let detached_index_persistent_node_reads = engine
+        .portable_path_index
+        .as_ref()
+        .map_or(0, |index| index.stats().reads)
+        .saturating_add(
+            engine
+                .logseq_claim_index
+                .as_ref()
+                .map_or(0, |index| index.stats().reads),
+        )
+        .saturating_add(
+            engine
+                .page_name_index
+                .as_ref()
+                .map_or(0, |index| index.stats().reads),
+        );
+    BootstrapCatalogWorkStats {
+        authenticated_page_identity_lookups: reference.authenticated_page_identity_lookups,
+        full_catalog_author_clones: engine.read_only_catalog_clones.get(),
+        detached_index_persistent_node_reads,
+        reference_fallback_document_reconstructions: reference.fallback_document_reconstructions,
+        reference_catalog_peak_resident_bytes: construction.peak_resident_bytes,
+        reference_catalog_buffer_flushes: construction.buffer_flushes,
+        reference_catalog_prepared_validations: construction.prepared_candidate_validations,
+        reference_catalog_full_delta_validations: construction.full_delta_validations,
+        reference_catalog_final_validations: construction.final_catalog_validations,
+        reference_catalog_extraction_nanos: construction.extraction_nanos,
+        reference_catalog_posting_transition_publication_nanos: construction
+            .posting_transition_publication_nanos,
+        reference_catalog_facts_coverage_patricia_nanos: construction.facts_coverage_patricia_nanos,
+        reference_catalog_reverse_patricia_nanos: construction.reverse_patricia_nanos,
+        reference_catalog_facts_coverage_patricia_reads: construction.facts_coverage_patricia_reads,
+        reference_catalog_reverse_patricia_reads: construction.reverse_patricia_reads,
+        reference_catalog_prepared_sources: construction.prepared_sources,
+        reference_catalog_fact_updates: construction.fact_updates,
+        reference_catalog_reverse_updates: construction.reverse_updates,
+        reference_catalog_persistent_node_reads: construction.persistent_node_reads,
+        reference_catalog_persistent_node_writes: construction.persistent_node_writes,
+    }
 }
 
 #[cfg(test)]
@@ -2038,37 +2094,7 @@ impl DetachedBootstrapCandidate {
 
     #[cfg(test)]
     pub(crate) fn bootstrap_catalog_work_stats(&self) -> BootstrapCatalogWorkStats {
-        let reference = self.engine.reference_source_observations.get();
-        let construction = self.engine.reference_catalog.construction_work_stats();
-        let detached_index_persistent_node_reads = self
-            .engine
-            .portable_path_index
-            .as_ref()
-            .map_or(0, |index| index.stats().reads)
-            .saturating_add(
-                self.engine
-                    .logseq_claim_index
-                    .as_ref()
-                    .map_or(0, |index| index.stats().reads),
-            )
-            .saturating_add(
-                self.engine
-                    .page_name_index
-                    .as_ref()
-                    .map_or(0, |index| index.stats().reads),
-            );
-        BootstrapCatalogWorkStats {
-            authenticated_page_identity_lookups: reference.authenticated_page_identity_lookups,
-            full_catalog_author_clones: self.engine.read_only_catalog_clones.get(),
-            detached_index_persistent_node_reads,
-            reference_fallback_document_reconstructions: reference
-                .fallback_document_reconstructions,
-            reference_catalog_peak_resident_bytes: construction.peak_resident_bytes,
-            reference_catalog_buffer_flushes: construction.buffer_flushes,
-            reference_catalog_prepared_validations: construction.prepared_candidate_validations,
-            reference_catalog_full_delta_validations: construction.full_delta_validations,
-            reference_catalog_final_validations: construction.final_catalog_validations,
-        }
+        bootstrap_catalog_work_stats(&self.engine)
     }
 
     #[cfg(test)]
@@ -4498,18 +4524,7 @@ impl BootstrapAuthoringTraceSnapshot {
             accepted_documents: engine.accepted_frontier_root.document_count(),
             visible_document_heads: engine.visible_document_heads.len(),
             detached_manifests: engine.detached_accepted_manifests.len(),
-            catalog_work: BootstrapCatalogWorkStats {
-                authenticated_page_identity_lookups: engine
-                    .reference_source_observations
-                    .get()
-                    .authenticated_page_identity_lookups,
-                full_catalog_author_clones: engine.read_only_catalog_clones.get(),
-                reference_fallback_document_reconstructions: engine
-                    .reference_source_observations
-                    .get()
-                    .fallback_document_reconstructions,
-                ..BootstrapCatalogWorkStats::default()
-            },
+            catalog_work: bootstrap_catalog_work_stats(engine),
         }
     }
 
@@ -4523,7 +4538,7 @@ impl BootstrapAuthoringTraceSnapshot {
         let after = self.instrumentation;
         let before_instrumentation = before.instrumentation;
         format!(
-            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} block_claim_validation_us={} block_claim_lookup_us={} block_claim_encode_us={} block_claim_insert_us={} page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
+            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} block_claim_validation_us={} block_claim_lookup_us={} block_claim_encode_us={} block_claim_insert_us={} page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} reference_extraction_us={} reference_posting_transition_publication_us={} reference_facts_coverage_patricia_us={} reference_reverse_patricia_us={} reference_facts_coverage_reads={} reference_reverse_reads={} reference_sources={} reference_fact_updates={} reference_reverse_updates={} reference_persistent_node_reads={} reference_persistent_node_writes={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
             after.prepare_transactions.saturating_sub(before_instrumentation.prepare_transactions),
             after.prepare_document_head_visits.saturating_sub(before_instrumentation.prepare_document_head_visits),
             after.author_snapshot_clones.saturating_sub(before_instrumentation.author_snapshot_clones),
@@ -4567,6 +4582,49 @@ impl BootstrapAuthoringTraceSnapshot {
                 .saturating_sub(
                     before_catalog_work.reference_fallback_document_reconstructions,
                 ),
+            self.catalog_work
+                .reference_catalog_extraction_nanos
+                .saturating_sub(before_catalog_work.reference_catalog_extraction_nanos)
+                / 1_000,
+            self.catalog_work
+                .reference_catalog_posting_transition_publication_nanos
+                .saturating_sub(
+                    before_catalog_work.reference_catalog_posting_transition_publication_nanos,
+                )
+                / 1_000,
+            self.catalog_work
+                .reference_catalog_facts_coverage_patricia_nanos
+                .saturating_sub(
+                    before_catalog_work.reference_catalog_facts_coverage_patricia_nanos,
+                )
+                / 1_000,
+            self.catalog_work
+                .reference_catalog_reverse_patricia_nanos
+                .saturating_sub(before_catalog_work.reference_catalog_reverse_patricia_nanos)
+                / 1_000,
+            self.catalog_work
+                .reference_catalog_facts_coverage_patricia_reads
+                .saturating_sub(
+                    before_catalog_work.reference_catalog_facts_coverage_patricia_reads,
+                ),
+            self.catalog_work
+                .reference_catalog_reverse_patricia_reads
+                .saturating_sub(before_catalog_work.reference_catalog_reverse_patricia_reads),
+            self.catalog_work
+                .reference_catalog_prepared_sources
+                .saturating_sub(before_catalog_work.reference_catalog_prepared_sources),
+            self.catalog_work
+                .reference_catalog_fact_updates
+                .saturating_sub(before_catalog_work.reference_catalog_fact_updates),
+            self.catalog_work
+                .reference_catalog_reverse_updates
+                .saturating_sub(before_catalog_work.reference_catalog_reverse_updates),
+            self.catalog_work
+                .reference_catalog_persistent_node_reads
+                .saturating_sub(before_catalog_work.reference_catalog_persistent_node_reads),
+            self.catalog_work
+                .reference_catalog_persistent_node_writes
+                .saturating_sub(before_catalog_work.reference_catalog_persistent_node_writes),
             self.acceptance_sequence,
             self.accepted_documents,
             self.visible_document_heads,
@@ -8345,6 +8403,39 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::Archive(error.to_string()))?
             .map(|encoded| decode_current_path_catalog_row(&encoded))
             .transpose()
+    }
+
+    fn authenticated_current_page_catalog_rows(
+        &self,
+        page_ids: &BTreeSet<PageId>,
+    ) -> Result<BTreeMap<PageId, CurrentPathCatalogStoredRow>, EngineError> {
+        let Some(store) = self.scratch.as_ref() else {
+            return Ok(BTreeMap::new());
+        };
+        if !self.current_path_catalog.available
+            || self.current_path_catalog.accepted_frontier_root != self.accepted_frontier_root
+        {
+            return Err(EngineError::Archive(
+                "authenticated current-page catalog authority is unavailable or stale".into(),
+            ));
+        }
+        #[cfg(test)]
+        for _ in page_ids {
+            self.record_authenticated_page_identity_lookup();
+        }
+        let keys = page_ids
+            .iter()
+            .map(|page_id| page_id.as_uuid().into_bytes())
+            .collect();
+        store
+            .authenticated_catalog_lookup_many(&self.current_path_catalog.root, &keys)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .into_iter()
+            .map(|(key, encoded)| {
+                let page_id = PageId::from_uuid(Uuid::from_bytes(key));
+                decode_current_path_catalog_row(&encoded).map(|row| (page_id, row))
+            })
+            .collect()
     }
 
     /// Authenticated exact-path point lookup against the same current catalog
@@ -18604,6 +18695,14 @@ impl ShardedHotEngine {
         #[cfg(test)]
         let source_started = Instant::now();
         let affected = affected_reference_sources(effect);
+        let authenticated_catalog_rows = if observations.catalog_pages.is_none()
+            && self.scratch.is_some()
+            && !affected.is_empty()
+        {
+            Some(self.authenticated_current_page_catalog_rows(&affected)?)
+        } else {
+            None
+        };
         let mut sources = BTreeMap::new();
         for page_id in affected {
             let page_identity = if let Some(catalog_pages) = observations.catalog_pages {
@@ -18617,9 +18716,9 @@ impl ShardedHotEngine {
                     } => Some((path.clone(), *home_document_id)),
                     PageState::Tombstone { .. } => None,
                 })
-            } else if self.scratch.is_some() {
-                self.authenticated_current_page_catalog_row(page_id)?
-                    .map(|row| (row.path, row.home_document_id))
+            } else if let Some(rows) = &authenticated_catalog_rows {
+                rows.get(&page_id)
+                    .map(|row| (row.path.clone(), row.home_document_id))
             } else {
                 let catalog =
                     self.reference_candidate_document(self.catalog_document_id, replacements)?;
