@@ -10305,6 +10305,23 @@ mod tests {
         )
     }
 
+    fn count_packed_patricia_heads(path: &Path) -> usize {
+        std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| {
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                            count_packed_patricia_heads(&entry.path())
+                        } else {
+                            usize::from(entry.file_name() == "patricia-pack-head-v1")
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
     #[test]
     #[ignore = "calibrated bootstrap-authoring trace"]
     fn inactive_streaming_bootstrap_authoring_trace_calibrated() {
@@ -10610,6 +10627,41 @@ mod tests {
             retried.candidate().index_archive_identity(),
             target_catalog(&root.path().join("archive"), workspace).archive_identity()
         );
+    }
+
+    #[test]
+    fn detached_bootstrap_partial_packed_heads_cannot_yield_a_candidate_and_retry() {
+        let root = TestRoot::new("detached-packed-partial-heads");
+        let graph_root = root.path().join("graph/pages");
+        fs::create_dir_all(&graph_root).unwrap();
+        fs::write(
+            graph_root.join("partial.md"),
+            "title:: Partial\n\n- partial [[Partial]]\n  id:: 00000000-0000-0000-0000-000000005a25\n",
+        )
+        .unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a24));
+
+        tine_storage::fail_head_transition_after_for_test(
+            1,
+            tine_storage::HeadTransitionFailureForTest::Before,
+        );
+        let interrupted = prepare_streaming_bootstrap_attempt(&root, "interrupted", workspace);
+        assert!(
+            interrupted.is_err(),
+            "a partial physical head set yielded a candidate"
+        );
+        let partial_heads = count_packed_patricia_heads(&root.path().join("archive"));
+        assert_eq!(
+            partial_heads, 1,
+            "fixture did not stop after one physical head"
+        );
+
+        let retried = prepare_streaming_bootstrap_attempt(&root, "retry", workspace).unwrap();
+        let publication = retried.candidate().detached_publication_stats().unwrap();
+        assert_eq!(publication.successful_batch_completions, 1);
+        assert_eq!(publication.packed_capacity_fallbacks, 0);
+        assert!(publication.packed_immutable_publications > 0);
+        assert_eq!(count_packed_patricia_heads(&root.path().join("archive")), 4);
     }
 
     #[test]

@@ -66,10 +66,10 @@ pub mod sqlite {
 }
 
 pub use authenticated_patricia::{
-    PatriciaError, PatriciaIndexConstruction, PatriciaIndexConstructionStats,
-    PatriciaIndexReclamationError, PatriciaIndexReclamationReport, PatriciaIndexRoot,
-    PatriciaIndexStats, PatriciaIndexStore, PatriciaNodePublisher, PatriciaPublicationError,
-    MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    CompletedPatriciaIndexConstruction, PatriciaError, PatriciaIndexConstruction,
+    PatriciaIndexConstructionStats, PatriciaIndexReclamationError, PatriciaIndexReclamationReport,
+    PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore, PatriciaNodePublisher,
+    PatriciaPublicationError, MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
 };
 pub use content_digest::ContentDigest;
 pub use digest_sealed::{DigestSealedError, DigestSealedPayload};
@@ -83,7 +83,12 @@ pub use filesystem::{
     ensure_directory_nofollow, open_dir_nofollow, open_existing_dir_nofollow, open_file_nofollow,
     publish_immutable_exact, read_optional_regular, read_required_regular, require_regular_entry,
     sync_dir_required, CompletedExactImmutablePublicationBatch, ExactImmutablePublicationBatch,
-    FilesystemError, ValidatedDirectorySync,
+    FilesystemError, StagedExactImmutablePublication, ValidatedDirectorySync,
+};
+#[cfg(feature = "test-support")]
+pub use packed_patricia::{
+    fail_head_transition_after_for_test, fail_next_head_transition_for_test,
+    HeadTransitionFailureForTest,
 };
 pub use scratch::{
     census_retained_runs, reclaim_unreachable_retained_runs, RetainedRunCensus,

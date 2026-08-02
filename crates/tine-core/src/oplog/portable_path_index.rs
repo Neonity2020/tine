@@ -215,9 +215,9 @@ impl PortablePathIndexStore {
     pub(crate) fn finish_detached_construction(
         &self,
         root: PortablePathIndexRoot,
-    ) -> Result<(), StoreError> {
-        self.patricia.finish_detached_construction(root.0)?;
-        Ok(())
+    ) -> Result<Option<super::authenticated_patricia::CompletedPatriciaConstruction>, StoreError>
+    {
+        self.patricia.finish_detached_construction(root.0)
     }
 
     pub(crate) fn stats(&self) -> PatriciaIndexStats {

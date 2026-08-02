@@ -14,10 +14,12 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 
 use super::authenticated_patricia::{
-    PatriciaIndexConstruction, PatriciaIndexRoot, PatriciaIndexStore,
+    CompletedPatriciaConstruction, PatriciaIndexConstruction, PatriciaIndexRoot, PatriciaIndexStore,
 };
 #[cfg(test)]
-use super::authenticated_patricia::{PatriciaIndexConstructionStats, PatriciaIndexStats};
+use super::authenticated_patricia::{
+    PatriciaIndexConstructionStats, PatriciaIndexStats, MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+};
 use super::object_store::{
     publish_immutable_exact, read_optional_regular, DetachedBootstrapImmutablePublisher, StoreError,
 };
@@ -1335,6 +1337,15 @@ pub(crate) struct ReferenceCatalogConstructionWorkStats {
     pub(crate) reverse_updates: usize,
     pub(crate) persistent_node_reads: usize,
     pub(crate) persistent_node_writes: usize,
+    pub(crate) logical_node_writes: usize,
+    pub(crate) loose_publication_calls: usize,
+    pub(crate) pack_publication_calls: usize,
+    pub(crate) catalog_publication_calls: usize,
+    pub(crate) immutable_publication_calls: usize,
+    pub(crate) head_transitions: usize,
+    pub(crate) durability_barriers: usize,
+    pub(crate) packed_bytes: usize,
+    pub(crate) capacity_fallbacks: usize,
 }
 
 #[cfg(test)]
@@ -1658,6 +1669,15 @@ impl ReferenceCatalogStateV2 {
             reverse_updates: attribution.reverse_updates,
             persistent_node_reads: persistent.reads,
             persistent_node_writes: persistent.writes,
+            logical_node_writes: patricia.logical_node_writes,
+            loose_publication_calls: patricia.loose_publication_calls,
+            pack_publication_calls: patricia.pack_publication_calls,
+            catalog_publication_calls: patricia.catalog_publication_calls,
+            immutable_publication_calls: patricia.immutable_publication_calls,
+            head_transitions: patricia.head_transitions,
+            durability_barriers: patricia.durability_barriers,
+            packed_bytes: patricia.packed_bytes,
+            capacity_fallbacks: patricia.capacity_fallbacks,
         }
     }
 
@@ -2200,12 +2220,14 @@ impl ReferenceCatalogStateV2 {
         Ok(())
     }
 
-    pub(crate) fn finish_construction(&mut self) -> Result<(), ReferenceCatalogError> {
-        let store = match &mut self.backend {
+    pub(crate) fn finish_construction(
+        &mut self,
+    ) -> Result<Option<CompletedPatriciaConstruction>, ReferenceCatalogError> {
+        let (store, completion) = match &mut self.backend {
             ReferenceCatalogBackend::Construction {
                 store, patricia, ..
             } => {
-                store
+                let completion = store
                     .patricia
                     .finish_construction(patricia.get_mut())
                     .map_err(store_error)?;
@@ -2213,11 +2235,11 @@ impl ReferenceCatalogStateV2 {
                 {
                     self.completed_construction_stats = Some(patricia.get_mut().stats());
                 }
-                Arc::clone(store)
+                (Arc::clone(store), completion)
             }
             ReferenceCatalogBackend::Memory(_)
             | ReferenceCatalogBackend::Store(_)
-            | ReferenceCatalogBackend::RecoveryRequired(_) => return Ok(()),
+            | ReferenceCatalogBackend::RecoveryRequired(_) => return Ok(None),
         };
         // This is the sole construction-time full-catalog proof. It runs only
         // after every staged node and posting is immutable-published, before
@@ -2227,7 +2249,7 @@ impl ReferenceCatalogStateV2 {
         self.final_catalog_validations
             .set(self.final_catalog_validations.get().saturating_add(1));
         self.backend = ReferenceCatalogBackend::Store(store);
-        Ok(())
+        Ok(Some(completion))
     }
 
     pub(crate) fn commit(&mut self, candidate: ReferenceCatalogCandidateV2) {
@@ -3111,8 +3133,41 @@ mod tests {
             durable.validate_catalog_root(root).unwrap();
         }
         let work = state.construction_work_stats();
+        let nodes_path = path.join("reference-catalog-v2").join("nodes");
+        let mut loose_node_files = 0_usize;
+        let mut pack_files = 0_usize;
+        let mut catalog_files = 0_usize;
+        let mut head_files = 0_usize;
+        let mut current_packed_bytes = 0_u64;
+        for entry in std::fs::read_dir(&nodes_path).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".patricia-node") {
+                loose_node_files = loose_node_files.saturating_add(1);
+            } else if name.ends_with(".patricia-pack-v1") {
+                pack_files = pack_files.saturating_add(1);
+                current_packed_bytes =
+                    current_packed_bytes.saturating_add(entry.metadata().unwrap().len());
+            } else if name.ends_with(".patricia-catalog-v1") {
+                catalog_files = catalog_files.saturating_add(1);
+                current_packed_bytes =
+                    current_packed_bytes.saturating_add(entry.metadata().unwrap().len());
+            } else if name == "patricia-pack-head-v1" {
+                head_files = head_files.saturating_add(1);
+                current_packed_bytes =
+                    current_packed_bytes.saturating_add(entry.metadata().unwrap().len());
+            }
+        }
+        let patricia_filesystem_entries = loose_node_files
+            .saturating_add(pack_files)
+            .saturating_add(catalog_files)
+            .saturating_add(head_files);
         eprintln!(
-            "construction_reverse_dense_scale pages={total_pages} pages_per_part={pages_per_part} parts={} prepare_ms={:.3} finish_ms={:.3} extraction_ms={:.3} posting_transition_publication_ms={:.3} facts_coverage_patricia_ms={:.3} reverse_patricia_ms={:.3} facts_coverage_reads={} reverse_reads={} prepared_sources={} fact_updates={} reverse_updates={} persistent_reads={} persistent_writes={} peak_resident_bytes={} buffer_flushes={}",
+            "construction_reverse_dense_scale pages={total_pages} pages_per_part={pages_per_part} parts={} prepare_ms={:.3} finish_ms={:.3} extraction_ms={:.3} posting_transition_publication_ms={:.3} facts_coverage_patricia_ms={:.3} reverse_patricia_ms={:.3} facts_coverage_reads={} reverse_reads={} prepared_sources={} fact_updates={} reverse_updates={} persistent_reads={} persistent_writes={} logical_node_writes={} loose_node_files={loose_node_files} pack_files={pack_files} catalog_files={catalog_files} head_files={head_files} immutable_publication_calls={} head_transitions={} durability_barriers={} packed_bytes={} current_packed_bytes={current_packed_bytes} capacity_fallbacks={} combined_peak_resident_bytes={} buffer_flushes={}",
             checkpoints.len(),
             prepare_elapsed.as_secs_f64() * 1_000.0,
             finish_elapsed.as_secs_f64() * 1_000.0,
@@ -3127,8 +3182,24 @@ mod tests {
             work.reverse_updates,
             work.persistent_node_reads,
             work.persistent_node_writes,
+            work.logical_node_writes,
+            work.immutable_publication_calls,
+            work.head_transitions,
+            work.durability_barriers,
+            work.packed_bytes,
+            work.capacity_fallbacks,
             work.peak_resident_bytes,
             work.buffer_flushes,
+        );
+        assert!(
+            patricia_filesystem_entries.saturating_mul(10) <= work.logical_node_writes,
+            "packed construction must reduce Patricia filesystem entries by at least 90%: physical={patricia_filesystem_entries}, logical={}",
+            work.logical_node_writes,
+        );
+        assert!(
+            work.peak_resident_bytes <= MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+            "complete conservative construction peak must remain within 64 MiB: peak={} ceiling={MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES}",
+            work.peak_resident_bytes,
         );
         std::fs::remove_dir_all(path).unwrap();
     }

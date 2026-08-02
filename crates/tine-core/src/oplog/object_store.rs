@@ -1581,6 +1581,7 @@ pub(crate) struct DetachedBootstrapPublicationSession {
 /// authored by one detached session is beneath its archive durability barrier.
 pub(crate) struct CompletedDetachedBootstrapPublication {
     physical: tine_storage::CompletedExactImmutablePublicationBatch,
+    packed_constructions: Option<[super::authenticated_patricia::CompletedPatriciaConstruction; 4]>,
     workspace_id: WorkspaceId,
     archive_identity: ControlDirectoryIdentity,
 }
@@ -1602,6 +1603,17 @@ impl CompletedDetachedBootstrapPublication {
     #[cfg(test)]
     pub(crate) const fn existing_publication_count(&self) -> usize {
         self.physical.existing_publication_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn packed_construction_stats(
+        &self,
+    ) -> Option<[tine_storage::PatriciaIndexConstructionStats; 4]> {
+        self.packed_constructions.as_ref().map(|constructions| {
+            constructions
+                .each_ref()
+                .map(super::authenticated_patricia::CompletedPatriciaConstruction::stats)
+        })
     }
 }
 
@@ -1628,7 +1640,26 @@ impl DetachedBootstrapPublicationSession {
         self.publisher.clone()
     }
 
-    pub(crate) fn finish(self) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
+    pub(crate) fn finish(
+        self,
+        packed_constructions: [super::authenticated_patricia::CompletedPatriciaConstruction; 4],
+    ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
+        self.finish_inner(Some(packed_constructions))
+    }
+
+    #[cfg(test)]
+    fn finish_without_patricia_for_test(
+        self,
+    ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
+        self.finish_inner(None)
+    }
+
+    fn finish_inner(
+        self,
+        packed_constructions: Option<
+            [super::authenticated_patricia::CompletedPatriciaConstruction; 4],
+        >,
+    ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
         let mut state = self.publisher.shared.state.lock().map_err(|_| {
             StoreError::Bootstrap(
                 "detached bootstrap immutable publication batch mutex is poisoned".into(),
@@ -1654,6 +1685,7 @@ impl DetachedBootstrapPublicationSession {
         *state = DetachedBootstrapPublicationState::Finished;
         Ok(CompletedDetachedBootstrapPublication {
             physical,
+            packed_constructions,
             workspace_id: self.workspace_id,
             archive_identity: self.archive_identity,
         })
@@ -11083,7 +11115,7 @@ mod bootstrap_store_tests {
             .logseq_claim_index()
             .finish_detached_construction(detached_root)
             .unwrap();
-        let completed = publication.finish().unwrap();
+        let completed = publication.finish_without_patricia_for_test().unwrap();
         assert_eq!(completed.publication_count(), 1);
         assert_eq!(completed.existing_publication_count(), 0);
         DETACHED_BOOTSTRAP_BATCH_FINISH_COUNT.with(|count| assert_eq!(count.get(), 1));

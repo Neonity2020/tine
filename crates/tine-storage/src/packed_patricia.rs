@@ -35,9 +35,10 @@
 //! non-canonical indexes, entry tampering, and path/content mismatch before
 //! exposing any node bytes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 #[cfg(windows)]
 use std::thread;
@@ -46,13 +47,14 @@ use std::time::Duration;
 
 use cap_std::fs::{Dir, OpenOptions};
 use fs2::FileExt as _;
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::authenticated_patricia::{PatriciaNodePublisher, PatriciaPublicationError};
 use super::content_digest::parse_digest;
 use super::filesystem::{
     read_optional_regular, read_required_regular, transition_regular_exact, FilesystemError,
-    ValidatedDirectorySync,
+    StagedExactImmutablePublication, ValidatedDirectorySync,
 };
 use super::ContentDigest;
 
@@ -73,7 +75,7 @@ const CATALOG_ENTRY_BYTES: usize = 32 + 32 + 32 + 4 + 4;
 const CATALOG_SUFFIX: &str = ".patricia-catalog-v1";
 const HEAD_MAGIC: &[u8; 8] = b"TINEPHD\0";
 const HEAD_SCHEMA_VERSION: u32 = 1;
-const HEAD_BYTES: usize = 8 + 4 + 32 + 4;
+pub(crate) const HEAD_BYTES: usize = 8 + 4 + 32 + 4;
 pub(crate) const HEAD_FILENAME: &str = "patricia-pack-head-v1";
 pub(crate) const OPERATION_LOCK_FILENAME: &str = "patricia-pack-operation-lock-v1";
 
@@ -101,11 +103,44 @@ const PACK_SIZE_TIER_COUNT: usize = (MAX_PACK_BYTES.ilog2() - MIN_PACK_BYTES.ilo
 const AMORTIZED_SELECTED_BYTE_FACTOR: usize = 2 * MAX_PACKS_PER_SIZE_TIER * PACK_SIZE_TIER_COUNT;
 pub(crate) const MAX_CATALOG_PACKS: usize = 256;
 pub(crate) const MAX_CATALOG_PACK_BYTES: usize = 64 * 1024 * 1024;
-const MAX_CATALOG_BYTES: usize = CATALOG_HEADER_BYTES + MAX_CATALOG_PACKS * CATALOG_ENTRY_BYTES;
+pub(crate) const MAX_CATALOG_BYTES: usize =
+    CATALOG_HEADER_BYTES + MAX_CATALOG_PACKS * CATALOG_ENTRY_BYTES;
 
-#[cfg(test)]
+// Conservative allocator ownership charged for every BTreeMap entry retained
+// by construction packing. The largest inline pair is digest (32 bytes) plus
+// Vec (24 bytes); payload capacity is charged separately. On the pinned 64-bit
+// target, a B-tree node at minimum occupancy plus allocator metadata remains
+// below 128 bytes per pair. The 256-byte charge also covers digest/Range maps
+// with more than 2x layout headroom.
+const PACKED_MAP_ENTRY_OWNERSHIP_BYTES: usize = 256;
+const CONSTRUCTION_STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const CONSTRUCTION_STREAM_BUFFER_COUNT: usize = 4;
+
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static RECLAMATION_DIRECTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NEXT_HEAD_TRANSITION_FAILURE: std::cell::Cell<Option<(usize, HeadTransitionFailureForTest)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy)]
+pub enum HeadTransitionFailureForTest {
+    Before,
+    After,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_next_head_transition_for_test(failure: HeadTransitionFailureForTest) {
+    fail_head_transition_after_for_test(0, failure);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn fail_head_transition_after_for_test(
+    successful_transitions: usize,
+    failure: HeadTransitionFailureForTest,
+) {
+    NEXT_HEAD_TRANSITION_FAILURE.with(|next| next.set(Some((successful_transitions, failure))));
 }
 
 #[cfg(test)]
@@ -334,11 +369,7 @@ impl PackedPatriciaPublication {
     }
 
     fn into_opened(self) -> Result<PackedPatriciaPack, PackedPatriciaError> {
-        Ok(PackedPatriciaPack {
-            digest: self.digest,
-            bytes: self.bytes,
-            entries: self.ranges,
-        })
+        PackedPatriciaPack::decode(self.digest, self.bytes)
     }
 
     fn descriptor(&self) -> PackDescriptor {
@@ -382,7 +413,8 @@ impl PublishedPatriciaPack {
 pub(crate) struct PackedPatriciaPack {
     digest: ContentDigest,
     bytes: Vec<u8>,
-    entries: BTreeMap<ContentDigest, Range<usize>>,
+    entry_count: usize,
+    payload_start: usize,
 }
 
 impl PackedPatriciaPack {
@@ -434,7 +466,6 @@ impl PackedPatriciaPack {
             return Err(PackedPatriciaError::Malformed);
         }
 
-        let mut entries = BTreeMap::new();
         let mut expected_offset = 0_usize;
         let mut prior_digest = None;
         for index in 0..entry_count {
@@ -461,7 +492,6 @@ impl PackedPatriciaPack {
             if ContentDigest::of(&bytes[range.clone()]) != digest {
                 return Err(PackedPatriciaError::PathMismatch(digest));
             }
-            entries.insert(digest, range);
             prior_digest = Some(digest);
             expected_offset = end;
         }
@@ -472,35 +502,61 @@ impl PackedPatriciaPack {
         Ok(Self {
             digest: expected_digest,
             bytes,
-            entries,
+            entry_count,
+            payload_start,
         })
     }
 
     pub(crate) fn get(&self, digest: ContentDigest) -> Option<&[u8]> {
-        self.entries
-            .get(&digest)
-            .map(|range| &self.bytes[range.clone()])
+        let mut low = 0_usize;
+        let mut high = self.entry_count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let (found, range) = self.entry(middle);
+            match found.cmp(&digest) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => return Some(&self.bytes[range]),
+            }
+        }
+        None
+    }
+
+    fn entry(&self, index: usize) -> (ContentDigest, Range<usize>) {
+        let start = PACK_HEADER_BYTES + index * PACK_INDEX_ENTRY_BYTES;
+        let mut digest_bytes = [0_u8; 32];
+        digest_bytes.copy_from_slice(&self.bytes[start..start + 32]);
+        let offset = u32::from_le_bytes(
+            self.bytes[start + 32..start + 36]
+                .try_into()
+                .expect("validated pack offset"),
+        ) as usize;
+        let length = u32::from_le_bytes(
+            self.bytes[start + 36..start + 40]
+                .try_into()
+                .expect("validated pack length"),
+        ) as usize;
+        (
+            ContentDigest::from_bytes(digest_bytes),
+            self.payload_start + offset..self.payload_start + offset + length,
+        )
+    }
+
+    fn iter_entries(&self) -> impl Iterator<Item = (ContentDigest, Range<usize>)> + '_ {
+        (0..self.entry_count).map(|index| self.entry(index))
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.entries.len()
+        self.entry_count
     }
 
     fn descriptor(&self) -> PackDescriptor {
         PackDescriptor {
             digest: self.digest,
-            first: *self
-                .entries
-                .first_key_value()
-                .expect("validated non-empty")
-                .0,
-            last: *self
-                .entries
-                .last_key_value()
-                .expect("validated non-empty")
-                .0,
-            entries: self.entries.len() as u32,
+            first: self.entry(0).0,
+            last: self.entry(self.entry_count - 1).0,
+            entries: self.entry_count as u32,
             bytes: self.bytes.len() as u32,
         }
     }
@@ -656,12 +712,342 @@ pub(crate) struct PackedPatriciaPublicationWork {
     pub(crate) catalog_metadata_bytes_encoded: usize,
     pub(crate) catalog_metadata_bytes_published: usize,
     pub(crate) packs_published: usize,
+    /// Complete conservative construction residency observed by the bounded
+    /// planner, including ownership retained by its caller and resolver.
+    pub(crate) peak_resident_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PackedPatriciaResidencyBudget {
+    /// Ownership which remains live in the construction caller while the
+    /// packed planner runs: staged nodes, record/traversal state, and sink.
+    pub(crate) retained_bytes: usize,
+    pub(crate) maximum_bytes: usize,
+}
+
+struct PackedPatriciaResidencyTracker {
+    retained_bytes: usize,
+    maximum_bytes: usize,
+    peak_bytes: usize,
+}
+
+impl PackedPatriciaResidencyTracker {
+    fn new(
+        budget: PackedPatriciaResidencyBudget,
+        resolver_bytes: usize,
+    ) -> Result<Self, PackedPatriciaError> {
+        let retained_bytes = budget
+            .retained_bytes
+            .checked_add(resolver_bytes)
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if retained_bytes > budget.maximum_bytes {
+            return Err(PackedPatriciaError::PackTooLarge);
+        }
+        Ok(Self {
+            retained_bytes,
+            maximum_bytes: budget.maximum_bytes,
+            peak_bytes: retained_bytes,
+        })
+    }
+
+    fn observe(&mut self, planner_bytes: usize) -> Result<(), PackedPatriciaError> {
+        let resident_bytes = self
+            .retained_bytes
+            .checked_add(planner_bytes)
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        self.peak_bytes = self.peak_bytes.max(resident_bytes);
+        if resident_bytes > self.maximum_bytes {
+            return Err(PackedPatriciaError::PackTooLarge);
+        }
+        Ok(())
+    }
+}
+
+fn exact_entries_owned_bytes(entries: &BTreeMap<ContentDigest, Vec<u8>>) -> usize {
+    entries
+        .values()
+        .fold(0_usize, |total, bytes| {
+            total.saturating_add(bytes.capacity())
+        })
+        .saturating_add(
+            entries
+                .len()
+                .saturating_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES),
+        )
+}
+
+fn publication_owned_bytes(publication: &PackedPatriciaPublication) -> usize {
+    publication.bytes.capacity().saturating_add(
+        publication
+            .ranges
+            .len()
+            .saturating_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES),
+    )
+}
+
+fn planned_owned_bytes(planned: &Vec<PlannedPatriciaPack>) -> usize {
+    planned
+        .capacity()
+        .saturating_mul(std::mem::size_of::<PlannedPatriciaPack>())
+        .saturating_add(planned.iter().fold(0_usize, |total, pack| {
+            total.saturating_add(match pack {
+                PlannedPatriciaPack::Existing { .. } => 0,
+                PlannedPatriciaPack::Publication(publication) => {
+                    publication_owned_bytes(publication)
+                }
+            })
+        }))
+}
+
+fn partition_conservative_scratch_bytes(
+    entries: &BTreeMap<ContentDigest, Vec<u8>>,
+) -> Result<usize, PackedPatriciaError> {
+    let mut completed_publication_bytes = 0_usize;
+    let mut chunk_entries = 0_usize;
+    let mut chunk_payload_bytes = 0_usize;
+    let mut peak_bytes = 0_usize;
+    let mut publication_count = 0_usize;
+    for bytes in entries.values() {
+        let candidate_entries = chunk_entries
+            .checked_add(1)
+            .ok_or(PackedPatriciaError::TooManyEntries)?;
+        let candidate_bytes = PACK_HEADER_BYTES
+            .checked_add(
+                candidate_entries
+                    .checked_mul(PACK_INDEX_ENTRY_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .and_then(|total| total.checked_add(chunk_payload_bytes))
+            .and_then(|total| total.checked_add(bytes.len()))
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if chunk_entries != 0
+            && (candidate_entries > MAX_PACK_ENTRIES || candidate_bytes > MAX_PACK_BYTES)
+        {
+            let completed_chunk_owned = chunk_payload_bytes
+                .checked_add(
+                    chunk_entries
+                        .checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)
+                        .ok_or(PackedPatriciaError::PackTooLarge)?,
+                )
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            let encoded = PACK_HEADER_BYTES
+                .checked_add(chunk_entries * PACK_INDEX_ENTRY_BYTES)
+                .and_then(|total| total.checked_add(chunk_payload_bytes))
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            completed_publication_bytes = completed_publication_bytes
+                .checked_add(encoded)
+                .and_then(|total| {
+                    total.checked_add(chunk_entries.checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)?)
+                })
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            publication_count = publication_count
+                .checked_add(1)
+                .ok_or(PackedPatriciaError::TooManyEntries)?;
+            peak_bytes = peak_bytes.max(
+                completed_publication_bytes
+                    .checked_add(completed_chunk_owned)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            );
+            chunk_entries = 0;
+            chunk_payload_bytes = 0;
+        }
+        chunk_entries = chunk_entries
+            .checked_add(1)
+            .ok_or(PackedPatriciaError::TooManyEntries)?;
+        chunk_payload_bytes = chunk_payload_bytes
+            .checked_add(bytes.len())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        let chunk_owned = chunk_payload_bytes
+            .checked_add(
+                chunk_entries
+                    .checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        peak_bytes = peak_bytes.max(
+            completed_publication_bytes
+                .checked_add(chunk_owned)
+                .ok_or(PackedPatriciaError::PackTooLarge)?,
+        );
+    }
+    if chunk_entries != 0 {
+        let encoded = PACK_HEADER_BYTES
+            .checked_add(chunk_entries * PACK_INDEX_ENTRY_BYTES)
+            .and_then(|total| total.checked_add(chunk_payload_bytes))
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        completed_publication_bytes = completed_publication_bytes
+            .checked_add(encoded)
+            .and_then(|total| {
+                total.checked_add(chunk_entries.checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)?)
+            })
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        publication_count = publication_count
+            .checked_add(1)
+            .ok_or(PackedPatriciaError::TooManyEntries)?;
+        let chunk_owned = chunk_payload_bytes
+            .checked_add(
+                chunk_entries
+                    .checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        peak_bytes = peak_bytes.max(
+            completed_publication_bytes
+                .checked_add(chunk_owned)
+                .ok_or(PackedPatriciaError::PackTooLarge)?,
+        );
+    }
+    peak_bytes
+        .checked_add(
+            publication_count
+                .checked_mul(std::mem::size_of::<PackedPatriciaPublication>())
+                .ok_or(PackedPatriciaError::PackTooLarge)?,
+        )
+        .ok_or(PackedPatriciaError::PackTooLarge)
+}
+
+/// Mutation-bounded exact-node input for construction publication.
+///
+/// Patricia construction produces records child-before-parent, while the
+/// existing pack schema is canonical in digest order. The sink retains that
+/// arrival order only for a pre-publication loose fallback and owns at most one
+/// catalog-bounded canonical delta. No pack, catalog, or head is touched while
+/// records are accepted.
+pub(crate) struct PackedPatriciaConstructionSink {
+    entries: BTreeMap<ContentDigest, Vec<u8>>,
+    child_before_parent: Vec<ContentDigest>,
+    payload_bytes: usize,
+    payload_capacity_bytes: usize,
+    owned_byte_limit: usize,
+}
+
+impl PackedPatriciaConstructionSink {
+    pub(crate) fn new(owned_byte_limit: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            child_before_parent: Vec::new(),
+            payload_bytes: 0,
+            payload_capacity_bytes: 0,
+            owned_byte_limit,
+        }
+    }
+
+    /// Accept one exact node without performing physical publication.
+    /// `Ok(false)` is a capacity refusal, not malformed input.
+    pub(crate) fn accept(
+        &mut self,
+        digest: ContentDigest,
+        bytes: Vec<u8>,
+    ) -> Result<bool, PackedPatriciaError> {
+        if bytes.is_empty() || bytes.len() > MAX_PACK_ENTRY_BYTES {
+            return Err(PackedPatriciaError::EntryTooLarge(digest));
+        }
+        if ContentDigest::of(&bytes) != digest {
+            return Err(PackedPatriciaError::PathMismatch(digest));
+        }
+        if let Some(existing) = self.entries.get(&digest) {
+            if existing != &bytes {
+                return Err(PackedPatriciaError::PathMismatch(digest));
+            }
+            return Ok(true);
+        }
+        let next_entries = self
+            .entries
+            .len()
+            .checked_add(1)
+            .ok_or(PackedPatriciaError::TooManyEntries)?;
+        let next_payload = self
+            .payload_bytes
+            .checked_add(bytes.len())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        let next_payload_capacity = self
+            .payload_capacity_bytes
+            .checked_add(bytes.capacity())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        let encoded_bytes = PACK_HEADER_BYTES
+            .checked_add(
+                next_entries
+                    .checked_mul(PACK_INDEX_ENTRY_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .and_then(|total| total.checked_add(next_payload))
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if encoded_bytes > MAX_CATALOG_PACK_BYTES {
+            return Ok(false);
+        }
+        let projected_owned_bytes = next_payload_capacity
+            .checked_add(
+                next_entries
+                    .checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .and_then(|owned| {
+                self.child_before_parent
+                    .capacity()
+                    .max(next_entries.saturating_mul(2))
+                    .checked_mul(std::mem::size_of::<ContentDigest>())
+                    .and_then(|order| owned.checked_add(order))
+            })
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if projected_owned_bytes > self.owned_byte_limit {
+            return Ok(false);
+        }
+        self.payload_bytes = next_payload;
+        self.payload_capacity_bytes = next_payload_capacity;
+        self.child_before_parent.push(digest);
+        self.entries.insert(digest, bytes);
+        Ok(true)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn entries(&self) -> &BTreeMap<ContentDigest, Vec<u8>> {
+        &self.entries
+    }
+
+    pub(crate) fn child_before_parent(&self) -> &[ContentDigest] {
+        &self.child_before_parent
+    }
+
+    /// Conservative owned residency including map/vector allocation slack.
+    pub(crate) fn owned_bytes(&self) -> usize {
+        self.payload_capacity_bytes
+            .saturating_add(
+                self.entries
+                    .len()
+                    .saturating_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES),
+            )
+            .saturating_add(
+                self.child_before_parent
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ContentDigest>()),
+            )
+    }
 }
 
 pub(crate) struct PendingPackedPatriciaCatalog {
     catalog: PublishedPatriciaCatalog,
     descriptors: Vec<PackDescriptor>,
     packs: Vec<PendingPatriciaPack>,
+}
+
+/// Construction publication needs only the published catalog authority. A
+/// successful head CAS invalidates the old resident resolver and later reads
+/// reopen the authenticated catalog instead of retaining replacement packs.
+pub(crate) struct PendingStreamingPackedPatriciaCatalog {
+    catalog: PublishedPatriciaCatalog,
+}
+
+impl PendingStreamingPackedPatriciaCatalog {
+    pub(crate) fn published_catalog(&self) -> &PublishedPatriciaCatalog {
+        &self.catalog
+    }
 }
 
 enum PendingPatriciaPack {
@@ -711,6 +1097,25 @@ enum PlannedPatriciaPack {
     Publication(PackedPatriciaPublication),
 }
 
+enum PlannedStreamingPatriciaPack {
+    Existing {
+        resolver_index: usize,
+        descriptor: PackDescriptor,
+    },
+    Staged {
+        publication: StagedExactImmutablePublication,
+        descriptor: PackDescriptor,
+    },
+}
+
+impl PlannedStreamingPatriciaPack {
+    fn descriptor(&self) -> PackDescriptor {
+        match self {
+            Self::Existing { descriptor, .. } | Self::Staged { descriptor, .. } => *descriptor,
+        }
+    }
+}
+
 impl PlannedPatriciaPack {
     fn descriptor(&self) -> PackDescriptor {
         match self {
@@ -756,6 +1161,21 @@ pub(crate) fn transition_catalog_head(
     expected: Option<PackedPatriciaHeadAuthority>,
     catalog: &PublishedPatriciaCatalog,
 ) -> Result<(), PackedPatriciaError> {
+    #[cfg(any(test, feature = "test-support"))]
+    let injected = NEXT_HEAD_TRANSITION_FAILURE.with(|next| match next.take() {
+        Some((0, failure)) => Some(failure),
+        Some((remaining, failure)) => {
+            next.set(Some((remaining - 1, failure)));
+            None
+        }
+        None => None,
+    });
+    #[cfg(any(test, feature = "test-support"))]
+    if matches!(injected, Some(HeadTransitionFailureForTest::Before)) {
+        return Err(PackedPatriciaError::Filesystem(FilesystemError::Io(
+            io::Error::other("injected failure before packed head transition"),
+        )));
+    }
     let expected = expected.map(PackedPatriciaHeadAuthority::encode);
     let replacement = encode_catalog_head(catalog.digest, catalog.bytes);
     transition_regular_exact(dir, HEAD_FILENAME, expected.as_deref(), &replacement).map_err(
@@ -763,7 +1183,14 @@ pub(crate) fn transition_catalog_head(
             FilesystemError::ByteCollision => PackedPatriciaError::UnexpectedHead,
             error => PackedPatriciaError::Filesystem(error),
         },
-    )
+    )?;
+    #[cfg(any(test, feature = "test-support"))]
+    if matches!(injected, Some(HeadTransitionFailureForTest::After)) {
+        return Err(PackedPatriciaError::Filesystem(FilesystemError::Io(
+            io::Error::other("injected failure after packed head transition"),
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn reclaim_unreachable_packed_files(
@@ -950,6 +1377,80 @@ impl PackedPatriciaCatalog {
         Self::open_catalog(dir, authority, bytes).map(Some)
     }
 
+    /// Discover an existing resolver only when its complete conservative open
+    /// peak fits the caller's remaining construction residency. Refusal occurs
+    /// after bounded head/catalog authentication but before the first pack is
+    /// opened and before any immutable publication.
+    pub(crate) fn discover_under_guard_bounded(
+        dir: &Dir,
+        maximum_resolver_bytes: usize,
+    ) -> Result<(Option<Self>, usize), PackedPatriciaError> {
+        let Some(head) = read_optional_regular(
+            dir,
+            HEAD_FILENAME,
+            HEAD_BYTES as u64,
+            Some(HEAD_BYTES as u64),
+        )?
+        else {
+            return Ok((None, 0));
+        };
+        if &head[..8] != HEAD_MAGIC || read_u32(&head, 8)? != HEAD_SCHEMA_VERSION {
+            return Err(PackedPatriciaError::Malformed);
+        }
+        let authority = PackedPatriciaHeadAuthority {
+            catalog_digest: read_digest(&head, 12)?,
+            catalog_bytes: read_u32(&head, 44)?,
+        };
+        let catalog_digest = authority.catalog_digest;
+        let catalog_bytes = authority.catalog_bytes as usize;
+        if !(CATALOG_HEADER_BYTES..=MAX_CATALOG_BYTES).contains(&catalog_bytes) {
+            return Err(PackedPatriciaError::Malformed);
+        }
+        let bytes = read_required_regular(
+            dir,
+            &catalog_filename(catalog_digest),
+            MAX_CATALOG_BYTES as u64,
+            Some(catalog_bytes as u64),
+        )?;
+        if ContentDigest::of(&bytes) != catalog_digest {
+            return Err(PackedPatriciaError::PathMismatch(catalog_digest));
+        }
+        let descriptors = decode_catalog(&bytes)?;
+        let resolver_open_peak = head
+            .len()
+            .checked_mul(2)
+            .and_then(|total| total.checked_add(bytes.len().checked_mul(2)?))
+            .and_then(|total| {
+                total.checked_add(
+                    descriptors
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<PackDescriptor>())?,
+                )
+            })
+            .and_then(|total| {
+                total.checked_add(
+                    descriptors
+                        .len()
+                        .checked_mul(std::mem::size_of::<PackedPatriciaPack>())?,
+                )
+            })
+            .and_then(|total| {
+                descriptors.iter().try_fold(total, |resident, descriptor| {
+                    resident.checked_add((descriptor.bytes as usize).checked_mul(2)?)
+                })
+            })
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if resolver_open_peak > maximum_resolver_bytes {
+            return Err(PackedPatriciaError::PackTooLarge);
+        }
+        drop(descriptors);
+        let catalog = Self::open_catalog(dir, authority, bytes)?;
+        if catalog.resident_bytes() > maximum_resolver_bytes {
+            return Err(PackedPatriciaError::Malformed);
+        }
+        Ok((Some(catalog), resolver_open_peak))
+    }
+
     #[cfg(test)]
     pub(crate) fn open_published(
         dir: &Dir,
@@ -1024,6 +1525,21 @@ impl PackedPatriciaCatalog {
         None
     }
 
+    /// Conservative owned bytes retained by the authenticated resolver.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.descriptors
+            .capacity()
+            .saturating_mul(std::mem::size_of::<PackDescriptor>())
+            .saturating_add(
+                self.packs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PackedPatriciaPack>()),
+            )
+            .saturating_add(self.packs.iter().fold(0_usize, |total, pack| {
+                total.saturating_add(pack.bytes.capacity())
+            }))
+    }
+
     #[cfg(test)]
     fn pack_count(&self) -> usize {
         self.packs.len()
@@ -1046,10 +1562,10 @@ pub(crate) fn corrupt_packed_node_for_test(
         .iter()
         .zip(&catalog.packs)
         .find_map(|(descriptor, pack)| {
-            pack.entries
-                .get(&node_digest)
-                .cloned()
-                .map(|range| (descriptor, pack, range))
+            pack.get(node_digest).map(|bytes| {
+                let start = bytes.as_ptr() as usize - pack.bytes.as_ptr() as usize;
+                (descriptor, pack, start..start + bytes.len())
+            })
         })
         .ok_or(PackedPatriciaError::Malformed)?;
     let mut corrupted = pack.bytes.clone();
@@ -1107,11 +1623,43 @@ pub(crate) fn publish_appended_catalog(
     ),
     PackedPatriciaError,
 > {
+    publish_appended_catalog_with_residency(
+        dir,
+        publisher,
+        current,
+        entries,
+        catalog_pack_byte_limit,
+        None,
+    )
+}
+
+fn publish_appended_catalog_with_residency(
+    dir: &Dir,
+    publisher: &dyn PatriciaNodePublisher,
+    current: Option<&PackedPatriciaCatalog>,
+    entries: &BTreeMap<ContentDigest, Vec<u8>>,
+    catalog_pack_byte_limit: usize,
+    residency_budget: Option<PackedPatriciaResidencyBudget>,
+) -> Result<
+    (
+        Option<PendingPackedPatriciaCatalog>,
+        PackedPatriciaPublicationWork,
+    ),
+    PackedPatriciaError,
+> {
     if entries.is_empty() {
         return Err(PackedPatriciaError::Empty);
     }
 
     let mut work = PackedPatriciaPublicationWork::default();
+    let mut residency = residency_budget
+        .map(|budget| {
+            PackedPatriciaResidencyTracker::new(
+                budget,
+                current.map_or(0, PackedPatriciaCatalog::resident_bytes),
+            )
+        })
+        .transpose()?;
     let mut delta = BTreeMap::new();
     for (digest, bytes) in entries {
         if bytes.is_empty() || bytes.len() > MAX_PACK_ENTRY_BYTES {
@@ -1133,13 +1681,31 @@ pub(crate) fn publish_appended_catalog(
                 .new_payload_bytes
                 .checked_add(bytes.len())
                 .ok_or(PackedPatriciaError::PackTooLarge)?;
+            if let Some(residency) = residency.as_mut() {
+                let projected_delta_bytes = exact_entries_owned_bytes(&delta)
+                    .checked_add(bytes.len())
+                    .and_then(|total| total.checked_add(PACKED_MAP_ENTRY_OWNERSHIP_BYTES))
+                    .ok_or(PackedPatriciaError::PackTooLarge)?;
+                residency.observe(projected_delta_bytes)?;
+            }
             delta.insert(*digest, bytes.clone());
         }
     }
     if delta.is_empty() {
+        if let Some(residency) = residency {
+            work.peak_resident_bytes = residency.peak_bytes;
+        }
         return Ok((None, work));
     }
 
+    let delta_owned_bytes = exact_entries_owned_bytes(&delta);
+    if let Some(residency) = residency.as_mut() {
+        residency.observe(
+            delta_owned_bytes
+                .checked_add(partition_conservative_scratch_bytes(&delta)?)
+                .ok_or(PackedPatriciaError::PackTooLarge)?,
+        )?;
+    }
     let publications = partition_publications(&delta)?;
     let new_pack_bytes = publications
         .iter()
@@ -1167,7 +1733,20 @@ pub(crate) fn publish_appended_catalog(
             .into_iter()
             .map(PlannedPatriciaPack::Publication),
     );
-    compact_size_tiers(current, &mut planned, &mut work)?;
+    if let Some(residency) = residency.as_mut() {
+        residency.observe(
+            delta_owned_bytes
+                .checked_add(planned_owned_bytes(&planned))
+                .ok_or(PackedPatriciaError::PackTooLarge)?,
+        )?;
+    }
+    compact_size_tiers(
+        current,
+        &mut planned,
+        &mut work,
+        residency.as_mut(),
+        delta_owned_bytes,
+    )?;
 
     let descriptors = planned
         .iter()
@@ -1199,6 +1778,29 @@ pub(crate) fn publish_appended_catalog(
     };
     work.catalog_metadata_bytes_encoded = catalog_publication.bytes.len();
 
+    if let Some(residency) = residency.as_mut() {
+        let descriptor_bytes = descriptors
+            .capacity()
+            .checked_mul(std::mem::size_of::<PackDescriptor>())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        let pending_pack_vector_bytes = planned
+            .len()
+            .checked_mul(std::mem::size_of::<PendingPatriciaPack>())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        // This is checked before the first pack publication and covers both
+        // the current planning phase and the later pending-catalog/head phase.
+        // Publication bytes move into opened replacement packs; they are not
+        // counted twice, while the old and replacement Vec allocations are.
+        let prepublication_bytes = delta_owned_bytes
+            .checked_add(planned_owned_bytes(&planned))
+            .and_then(|total| total.checked_add(descriptor_bytes))
+            .and_then(|total| total.checked_add(catalog_publication.bytes.capacity()))
+            .and_then(|total| total.checked_add(pending_pack_vector_bytes))
+            .and_then(|total| total.checked_add(2 * HEAD_BYTES))
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        residency.observe(prepublication_bytes)?;
+    }
+
     for pack in &planned {
         if let PlannedPatriciaPack::Publication(publication) = pack {
             let published = publication.publish(dir, publisher)?;
@@ -1223,6 +1825,9 @@ pub(crate) fn publish_appended_catalog(
                 .map(PendingPatriciaPack::Published),
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Some(residency) = residency {
+        work.peak_resident_bytes = residency.peak_bytes;
+    }
     Ok((
         Some(PendingPackedPatriciaCatalog {
             catalog,
@@ -1233,10 +1838,1058 @@ pub(crate) fn publish_appended_catalog(
     ))
 }
 
+#[derive(Clone, Copy)]
+struct StreamPartitionShape {
+    start_ordinal: usize,
+    entries: usize,
+    payload_bytes: usize,
+    first: ContentDigest,
+    last: ContentDigest,
+}
+
+impl StreamPartitionShape {
+    fn total_bytes(self) -> Result<usize, PackedPatriciaError> {
+        PACK_HEADER_BYTES
+            .checked_add(
+                self.entries
+                    .checked_mul(PACK_INDEX_ENTRY_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .and_then(|total| total.checked_add(self.payload_bytes))
+            .ok_or(PackedPatriciaError::PackTooLarge)
+    }
+}
+
+fn push_stream_shape(
+    shapes: &mut Vec<StreamPartitionShape>,
+    start_ordinal: usize,
+    entries: usize,
+    payload_bytes: usize,
+    first: Option<ContentDigest>,
+    last: Option<ContentDigest>,
+) {
+    if entries != 0 {
+        shapes.push(StreamPartitionShape {
+            start_ordinal,
+            entries,
+            payload_bytes,
+            first: first.expect("non-empty stream partition has a first digest"),
+            last: last.expect("non-empty stream partition has a last digest"),
+        });
+    }
+}
+
+fn plan_delta_stream(
+    current: Option<&PackedPatriciaCatalog>,
+    entries: &BTreeMap<ContentDigest, Vec<u8>>,
+    work: &mut PackedPatriciaPublicationWork,
+) -> Result<Vec<StreamPartitionShape>, PackedPatriciaError> {
+    let mut shapes = Vec::new();
+    let mut start_ordinal = 0_usize;
+    let mut unique_ordinal = 0_usize;
+    let mut chunk_entries = 0_usize;
+    let mut chunk_payload = 0_usize;
+    let mut first = None;
+    let mut last = None;
+    for (digest, bytes) in entries {
+        if bytes.is_empty() || bytes.len() > MAX_PACK_ENTRY_BYTES {
+            return Err(PackedPatriciaError::EntryTooLarge(*digest));
+        }
+        if ContentDigest::of(bytes) != *digest {
+            return Err(PackedPatriciaError::PathMismatch(*digest));
+        }
+        if let Some(existing) = current.and_then(|catalog| catalog.get(*digest)) {
+            work.existing_payload_bytes_compared = work
+                .existing_payload_bytes_compared
+                .checked_add(existing.len())
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            if existing != bytes {
+                return Err(PackedPatriciaError::PathMismatch(*digest));
+            }
+            continue;
+        }
+        work.new_payload_bytes = work
+            .new_payload_bytes
+            .checked_add(bytes.len())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        let candidate_entries = chunk_entries
+            .checked_add(1)
+            .ok_or(PackedPatriciaError::TooManyEntries)?;
+        let candidate_total = PACK_HEADER_BYTES
+            .checked_add(
+                candidate_entries
+                    .checked_mul(PACK_INDEX_ENTRY_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .and_then(|total| total.checked_add(chunk_payload))
+            .and_then(|total| total.checked_add(bytes.len()))
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if chunk_entries != 0
+            && (candidate_entries > MAX_PACK_ENTRIES || candidate_total > MAX_PACK_BYTES)
+        {
+            push_stream_shape(
+                &mut shapes,
+                start_ordinal,
+                chunk_entries,
+                chunk_payload,
+                first,
+                last,
+            );
+            start_ordinal = unique_ordinal;
+            chunk_entries = 0;
+            chunk_payload = 0;
+            first = None;
+        }
+        chunk_entries = chunk_entries
+            .checked_add(1)
+            .ok_or(PackedPatriciaError::TooManyEntries)?;
+        chunk_payload = chunk_payload
+            .checked_add(bytes.len())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        first.get_or_insert(*digest);
+        last = Some(*digest);
+        unique_ordinal = unique_ordinal
+            .checked_add(1)
+            .ok_or(PackedPatriciaError::TooManyEntries)?;
+    }
+    push_stream_shape(
+        &mut shapes,
+        start_ordinal,
+        chunk_entries,
+        chunk_payload,
+        first,
+        last,
+    );
+    Ok(shapes)
+}
+
+fn write_stream_header(
+    file: &mut fs::File,
+    shape: StreamPartitionShape,
+) -> Result<(), PackedPatriciaError> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(PACK_MAGIC)?;
+    file.write_all(&PACK_SCHEMA_VERSION.to_le_bytes())?;
+    file.write_all(
+        &u32::try_from(shape.entries)
+            .map_err(|_| PackedPatriciaError::TooManyEntries)?
+            .to_le_bytes(),
+    )?;
+    file.write_all(
+        &u32::try_from(shape.payload_bytes)
+            .map_err(|_| PackedPatriciaError::PackTooLarge)?
+            .to_le_bytes(),
+    )?;
+    Ok(())
+}
+
+fn hash_stream_prefix(
+    file: &mut fs::File,
+    prefix_bytes: usize,
+    hasher: &mut Sha256,
+) -> Result<(), PackedPatriciaError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = prefix_bytes;
+    let mut buffer = [0_u8; CONSTRUCTION_STREAM_BUFFER_BYTES];
+    while remaining != 0 {
+        let chunk = remaining.min(buffer.len());
+        file.read_exact(&mut buffer[..chunk])?;
+        hasher.update(&buffer[..chunk]);
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+fn stage_delta_partition(
+    dir: &Dir,
+    current: Option<&PackedPatriciaCatalog>,
+    entries: &BTreeMap<ContentDigest, Vec<u8>>,
+    shape: StreamPartitionShape,
+) -> Result<PlannedStreamingPatriciaPack, PackedPatriciaError> {
+    let total_bytes = shape.total_bytes()?;
+    let end_ordinal = shape
+        .start_ordinal
+        .checked_add(shape.entries)
+        .ok_or(PackedPatriciaError::TooManyEntries)?;
+    let mut staged_digest = None;
+    let publication = StagedExactImmutablePublication::construct(dir, |file| {
+        write_stream_header(file, shape).map_err(packed_io_error)?;
+        let mut ordinal = 0_usize;
+        let mut payload_offset = 0_usize;
+        for (digest, bytes) in entries {
+            if current.and_then(|catalog| catalog.get(*digest)).is_some() {
+                continue;
+            }
+            if (shape.start_ordinal..end_ordinal).contains(&ordinal) {
+                file.write_all(digest.as_bytes())?;
+                file.write_all(
+                    &u32::try_from(payload_offset)
+                        .map_err(|_| io::Error::from(ErrorKind::InvalidData))?
+                        .to_le_bytes(),
+                )?;
+                file.write_all(
+                    &u32::try_from(bytes.len())
+                        .map_err(|_| io::Error::from(ErrorKind::InvalidData))?
+                        .to_le_bytes(),
+                )?;
+                payload_offset += bytes.len();
+            }
+            ordinal += 1;
+        }
+        if payload_offset != shape.payload_bytes {
+            return Err(io::Error::from(ErrorKind::InvalidData));
+        }
+        let payload_start = PACK_HEADER_BYTES + shape.entries * PACK_INDEX_ENTRY_BYTES;
+        let mut hasher = Sha256::new();
+        hash_stream_prefix(file, payload_start, &mut hasher).map_err(packed_io_error)?;
+        file.seek(SeekFrom::Start(payload_start as u64))?;
+        ordinal = 0;
+        for (digest, bytes) in entries {
+            if current.and_then(|catalog| catalog.get(*digest)).is_some() {
+                continue;
+            }
+            if (shape.start_ordinal..end_ordinal).contains(&ordinal) {
+                if ContentDigest::of(bytes) != *digest {
+                    return Err(io::Error::from(ErrorKind::InvalidData));
+                }
+                file.write_all(bytes)?;
+                hasher.update(bytes);
+            }
+            ordinal += 1;
+        }
+        let digest = ContentDigest::from_bytes(hasher.finalize().into());
+        staged_digest = Some(digest);
+        Ok((pack_filename(digest), total_bytes as u64))
+    })?;
+    let digest = staged_digest.ok_or(PackedPatriciaError::Malformed)?;
+    Ok(PlannedStreamingPatriciaPack::Staged {
+        publication,
+        descriptor: PackDescriptor {
+            digest,
+            first: shape.first,
+            last: shape.last,
+            entries: shape.entries as u32,
+            bytes: total_bytes as u32,
+        },
+    })
+}
+
+fn packed_io_error(error: PackedPatriciaError) -> io::Error {
+    match error {
+        PackedPatriciaError::Filesystem(FilesystemError::Io(error)) => error,
+        _ => io::Error::from(ErrorKind::InvalidData),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StreamCursorEntry {
+    digest: ContentDigest,
+    payload_offset: usize,
+    length: usize,
+}
+
+fn validate_staged_stream_pack(
+    publication: &StagedExactImmutablePublication,
+    descriptor: PackDescriptor,
+) -> Result<(), PackedPatriciaError> {
+    let mut file = publication.open_staged()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; CONSTRUCTION_STREAM_BUFFER_BYTES];
+    let mut total = 0_usize;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read)
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        hasher.update(&buffer[..read]);
+    }
+    if total != descriptor.bytes as usize
+        || ContentDigest::from_bytes(hasher.finalize().into()) != descriptor.digest
+    {
+        return Err(PackedPatriciaError::PathMismatch(descriptor.digest));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; PACK_HEADER_BYTES];
+    file.read_exact(&mut header)?;
+    if &header[..8] != PACK_MAGIC
+        || u32::from_le_bytes(header[8..12].try_into().expect("fixed schema"))
+            != PACK_SCHEMA_VERSION
+        || u32::from_le_bytes(header[12..16].try_into().expect("fixed entries"))
+            != descriptor.entries
+    {
+        return Err(PackedPatriciaError::Malformed);
+    }
+    let payload_bytes =
+        u32::from_le_bytes(header[16..20].try_into().expect("fixed payload")) as usize;
+    let payload_start = PACK_HEADER_BYTES
+        .checked_add(
+            (descriptor.entries as usize)
+                .checked_mul(PACK_INDEX_ENTRY_BYTES)
+                .ok_or(PackedPatriciaError::Malformed)?,
+        )
+        .ok_or(PackedPatriciaError::Malformed)?;
+    if payload_start
+        .checked_add(payload_bytes)
+        .is_none_or(|length| length != descriptor.bytes as usize)
+    {
+        return Err(PackedPatriciaError::Malformed);
+    }
+    let mut prior = None;
+    let mut expected_offset = 0_usize;
+    for index in 0..descriptor.entries as usize {
+        let mut encoded = [0_u8; PACK_INDEX_ENTRY_BYTES];
+        file.seek(SeekFrom::Start(
+            (PACK_HEADER_BYTES + index * PACK_INDEX_ENTRY_BYTES) as u64,
+        ))?;
+        file.read_exact(&mut encoded)?;
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&encoded[..32]);
+        let digest = ContentDigest::from_bytes(digest);
+        let offset = u32::from_le_bytes(encoded[32..36].try_into().expect("fixed offset")) as usize;
+        let length = u32::from_le_bytes(encoded[36..40].try_into().expect("fixed length")) as usize;
+        if prior.is_some_and(|prior| prior >= digest)
+            || offset != expected_offset
+            || length == 0
+            || length > MAX_PACK_ENTRY_BYTES
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > payload_bytes)
+        {
+            return Err(PackedPatriciaError::Malformed);
+        }
+        let mut payload_hasher = Sha256::new();
+        let mut remaining = length;
+        let mut payload_offset = payload_start + offset;
+        while remaining != 0 {
+            let chunk = remaining.min(buffer.len());
+            file.seek(SeekFrom::Start(payload_offset as u64))?;
+            file.read_exact(&mut buffer[..chunk])?;
+            payload_hasher.update(&buffer[..chunk]);
+            remaining -= chunk;
+            payload_offset += chunk;
+        }
+        if ContentDigest::from_bytes(payload_hasher.finalize().into()) != digest {
+            return Err(PackedPatriciaError::PathMismatch(digest));
+        }
+        prior = Some(digest);
+        expected_offset += length;
+    }
+    if expected_offset != payload_bytes
+        || prior.is_none()
+        || descriptor.first != {
+            file.seek(SeekFrom::Start(PACK_HEADER_BYTES as u64))?;
+            let mut digest = [0_u8; 32];
+            file.read_exact(&mut digest)?;
+            ContentDigest::from_bytes(digest)
+        }
+        || descriptor.last != prior.expect("validated non-empty pack")
+    {
+        return Err(PackedPatriciaError::Malformed);
+    }
+    Ok(())
+}
+
+enum StreamCursorSource<'a> {
+    Resident(&'a [u8]),
+    Staged(fs::File),
+}
+
+impl StreamCursorSource<'_> {
+    fn read_exact_at(
+        &mut self,
+        offset: usize,
+        target: &mut [u8],
+    ) -> Result<(), PackedPatriciaError> {
+        match self {
+            Self::Resident(bytes) => target.copy_from_slice(
+                bytes
+                    .get(offset..offset + target.len())
+                    .ok_or(PackedPatriciaError::Malformed)?,
+            ),
+            Self::Staged(file) => {
+                file.seek(SeekFrom::Start(offset as u64))?;
+                file.read_exact(target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct StreamPackCursor<'a> {
+    source: StreamCursorSource<'a>,
+    entry_count: usize,
+    payload_start: usize,
+    next_index: usize,
+    current: StreamCursorEntry,
+}
+
+impl<'a> StreamPackCursor<'a> {
+    fn open(
+        planned: &'a PlannedStreamingPatriciaPack,
+        current: Option<&'a PackedPatriciaCatalog>,
+    ) -> Result<Self, PackedPatriciaError> {
+        let descriptor = planned.descriptor();
+        let source = match planned {
+            PlannedStreamingPatriciaPack::Existing { resolver_index, .. } => {
+                let pack = current
+                    .and_then(|catalog| catalog.packs.get(*resolver_index))
+                    .ok_or(PackedPatriciaError::Malformed)?;
+                StreamCursorSource::Resident(&pack.bytes)
+            }
+            PlannedStreamingPatriciaPack::Staged { publication, .. } => {
+                StreamCursorSource::Staged(publication.open_staged()?)
+            }
+        };
+        let entry_count = descriptor.entries as usize;
+        let payload_start = PACK_HEADER_BYTES
+            .checked_add(
+                entry_count
+                    .checked_mul(PACK_INDEX_ENTRY_BYTES)
+                    .ok_or(PackedPatriciaError::Malformed)?,
+            )
+            .ok_or(PackedPatriciaError::Malformed)?;
+        let mut cursor = Self {
+            source,
+            entry_count,
+            payload_start,
+            next_index: 1,
+            current: StreamCursorEntry {
+                digest: descriptor.first,
+                payload_offset: 0,
+                length: 0,
+            },
+        };
+        cursor.current = cursor.read_entry(0)?;
+        Ok(cursor)
+    }
+
+    fn read_entry(&mut self, index: usize) -> Result<StreamCursorEntry, PackedPatriciaError> {
+        let mut encoded = [0_u8; PACK_INDEX_ENTRY_BYTES];
+        self.source.read_exact_at(
+            PACK_HEADER_BYTES + index * PACK_INDEX_ENTRY_BYTES,
+            &mut encoded,
+        )?;
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&encoded[..32]);
+        let offset = u32::from_le_bytes(encoded[32..36].try_into().expect("fixed offset")) as usize;
+        let length = u32::from_le_bytes(encoded[36..40].try_into().expect("fixed length")) as usize;
+        Ok(StreamCursorEntry {
+            digest: ContentDigest::from_bytes(digest),
+            payload_offset: self
+                .payload_start
+                .checked_add(offset)
+                .ok_or(PackedPatriciaError::Malformed)?,
+            length,
+        })
+    }
+
+    fn advance(&mut self) -> Result<Option<ContentDigest>, PackedPatriciaError> {
+        if self.next_index >= self.entry_count {
+            return Ok(None);
+        }
+        self.current = self.read_entry(self.next_index)?;
+        self.next_index += 1;
+        Ok(Some(self.current.digest))
+    }
+
+    fn read_payload(
+        &mut self,
+        entry: StreamCursorEntry,
+        relative_offset: usize,
+        target: &mut [u8],
+    ) -> Result<(), PackedPatriciaError> {
+        if relative_offset
+            .checked_add(target.len())
+            .is_none_or(|end| end > entry.length)
+        {
+            return Err(PackedPatriciaError::Malformed);
+        }
+        self.source.read_exact_at(
+            entry
+                .payload_offset
+                .checked_add(relative_offset)
+                .ok_or(PackedPatriciaError::Malformed)?,
+            target,
+        )
+    }
+}
+
+struct MergedStreamEntry {
+    source_index: usize,
+    entry: StreamCursorEntry,
+}
+
+struct FiveWayMerge<'a> {
+    cursors: Vec<StreamPackCursor<'a>>,
+    pending: BinaryHeap<Reverse<(ContentDigest, usize)>>,
+    left_buffer: [u8; CONSTRUCTION_STREAM_BUFFER_BYTES],
+    right_buffer: [u8; CONSTRUCTION_STREAM_BUFFER_BYTES],
+}
+
+impl<'a> FiveWayMerge<'a> {
+    fn open(
+        planned: &'a [PlannedStreamingPatriciaPack],
+        current: Option<&'a PackedPatriciaCatalog>,
+        selected: &[usize],
+    ) -> Result<Self, PackedPatriciaError> {
+        if selected.is_empty() || selected.len() > MAX_PACKS_PER_SIZE_TIER + 1 {
+            return Err(PackedPatriciaError::Malformed);
+        }
+        let mut cursors = Vec::with_capacity(selected.len());
+        let mut pending = BinaryHeap::with_capacity(selected.len());
+        for index in selected {
+            let cursor = StreamPackCursor::open(
+                planned.get(*index).ok_or(PackedPatriciaError::Malformed)?,
+                current,
+            )?;
+            let cursor_index = cursors.len();
+            pending.push(Reverse((cursor.current.digest, cursor_index)));
+            cursors.push(cursor);
+        }
+        Ok(Self {
+            cursors,
+            pending,
+            left_buffer: [0; CONSTRUCTION_STREAM_BUFFER_BYTES],
+            right_buffer: [0; CONSTRUCTION_STREAM_BUFFER_BYTES],
+        })
+    }
+
+    fn entries_equal(
+        &mut self,
+        left_source: usize,
+        left: StreamCursorEntry,
+        right_source: usize,
+        right: StreamCursorEntry,
+    ) -> Result<bool, PackedPatriciaError> {
+        if left.length != right.length {
+            return Ok(false);
+        }
+        let mut offset = 0_usize;
+        while offset != left.length {
+            let chunk = (left.length - offset).min(CONSTRUCTION_STREAM_BUFFER_BYTES);
+            self.cursors[left_source].read_payload(left, offset, &mut self.left_buffer[..chunk])?;
+            self.cursors[right_source].read_payload(
+                right,
+                offset,
+                &mut self.right_buffer[..chunk],
+            )?;
+            if self.left_buffer[..chunk] != self.right_buffer[..chunk] {
+                return Ok(false);
+            }
+            offset += chunk;
+        }
+        Ok(true)
+    }
+
+    fn next_unique(&mut self) -> Result<Option<MergedStreamEntry>, PackedPatriciaError> {
+        let Some(Reverse((digest, first_source))) = self.pending.pop() else {
+            return Ok(None);
+        };
+        let mut duplicates = Vec::with_capacity(MAX_PACKS_PER_SIZE_TIER + 1);
+        duplicates.push(first_source);
+        while self
+            .pending
+            .peek()
+            .is_some_and(|Reverse((next, _))| *next == digest)
+        {
+            let Reverse((_, source)) = self.pending.pop().expect("peeked duplicate");
+            duplicates.push(source);
+        }
+        let first = self.cursors[first_source].current;
+        for source in duplicates.iter().copied().skip(1) {
+            let candidate = self.cursors[source].current;
+            if !self.entries_equal(first_source, first, source, candidate)? {
+                return Err(PackedPatriciaError::PathMismatch(digest));
+            }
+        }
+        for source in duplicates {
+            if let Some(next) = self.cursors[source].advance()? {
+                self.pending.push(Reverse((next, source)));
+            }
+        }
+        Ok(Some(MergedStreamEntry {
+            source_index: first_source,
+            entry: first,
+        }))
+    }
+
+    fn read_payload(
+        &mut self,
+        entry: &MergedStreamEntry,
+        offset: usize,
+        target: &mut [u8],
+    ) -> Result<(), PackedPatriciaError> {
+        self.cursors[entry.source_index].read_payload(entry.entry, offset, target)
+    }
+}
+
+fn plan_merged_stream(
+    current: Option<&PackedPatriciaCatalog>,
+    planned: &[PlannedStreamingPatriciaPack],
+    selected: &[usize],
+    work: &mut PackedPatriciaPublicationWork,
+) -> Result<Vec<StreamPartitionShape>, PackedPatriciaError> {
+    for index in selected {
+        if let PlannedStreamingPatriciaPack::Staged {
+            publication,
+            descriptor,
+        } = planned.get(*index).ok_or(PackedPatriciaError::Malformed)?
+        {
+            validate_staged_stream_pack(publication, *descriptor)?;
+        }
+    }
+    let mut merge = FiveWayMerge::open(planned, current, selected)?;
+    let mut shapes = Vec::new();
+    let mut start_ordinal = 0_usize;
+    let mut ordinal = 0_usize;
+    let mut chunk_entries = 0_usize;
+    let mut chunk_payload = 0_usize;
+    let mut first = None;
+    let mut last = None;
+    while let Some(merged) = merge.next_unique()? {
+        let candidate_entries = chunk_entries + 1;
+        let candidate_total = PACK_HEADER_BYTES
+            .checked_add(
+                candidate_entries
+                    .checked_mul(PACK_INDEX_ENTRY_BYTES)
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )
+            .and_then(|total| total.checked_add(chunk_payload))
+            .and_then(|total| total.checked_add(merged.entry.length))
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if chunk_entries != 0
+            && (candidate_entries > MAX_PACK_ENTRIES || candidate_total > MAX_PACK_BYTES)
+        {
+            push_stream_shape(
+                &mut shapes,
+                start_ordinal,
+                chunk_entries,
+                chunk_payload,
+                first,
+                last,
+            );
+            start_ordinal = ordinal;
+            chunk_entries = 0;
+            chunk_payload = 0;
+            first = None;
+        }
+        chunk_entries += 1;
+        chunk_payload = chunk_payload
+            .checked_add(merged.entry.length)
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        work.compaction_payload_bytes_reencoded = work
+            .compaction_payload_bytes_reencoded
+            .checked_add(merged.entry.length)
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        first.get_or_insert(merged.entry.digest);
+        last = Some(merged.entry.digest);
+        ordinal += 1;
+    }
+    push_stream_shape(
+        &mut shapes,
+        start_ordinal,
+        chunk_entries,
+        chunk_payload,
+        first,
+        last,
+    );
+    Ok(shapes)
+}
+
+fn stage_merged_partition(
+    dir: &Dir,
+    current: Option<&PackedPatriciaCatalog>,
+    planned: &[PlannedStreamingPatriciaPack],
+    selected: &[usize],
+    shape: StreamPartitionShape,
+) -> Result<PlannedStreamingPatriciaPack, PackedPatriciaError> {
+    let total_bytes = shape.total_bytes()?;
+    let end_ordinal = shape.start_ordinal + shape.entries;
+    let mut staged_digest = None;
+    let publication = StagedExactImmutablePublication::construct(dir, |file| {
+        write_stream_header(file, shape).map_err(packed_io_error)?;
+        let mut merge = FiveWayMerge::open(planned, current, selected).map_err(packed_io_error)?;
+        let mut ordinal = 0_usize;
+        let mut payload_offset = 0_usize;
+        while let Some(merged) = merge.next_unique().map_err(packed_io_error)? {
+            if (shape.start_ordinal..end_ordinal).contains(&ordinal) {
+                file.write_all(merged.entry.digest.as_bytes())?;
+                file.write_all(
+                    &u32::try_from(payload_offset)
+                        .map_err(|_| io::Error::from(ErrorKind::InvalidData))?
+                        .to_le_bytes(),
+                )?;
+                file.write_all(
+                    &u32::try_from(merged.entry.length)
+                        .map_err(|_| io::Error::from(ErrorKind::InvalidData))?
+                        .to_le_bytes(),
+                )?;
+                payload_offset += merged.entry.length;
+            }
+            ordinal += 1;
+        }
+        if payload_offset != shape.payload_bytes {
+            return Err(io::Error::from(ErrorKind::InvalidData));
+        }
+        drop(merge);
+        let payload_start = PACK_HEADER_BYTES + shape.entries * PACK_INDEX_ENTRY_BYTES;
+        let mut hasher = Sha256::new();
+        hash_stream_prefix(file, payload_start, &mut hasher).map_err(packed_io_error)?;
+        file.seek(SeekFrom::Start(payload_start as u64))?;
+        let mut merge = FiveWayMerge::open(planned, current, selected).map_err(packed_io_error)?;
+        let mut payload_buffer = [0_u8; CONSTRUCTION_STREAM_BUFFER_BYTES];
+        ordinal = 0;
+        while let Some(merged) = merge.next_unique().map_err(packed_io_error)? {
+            if (shape.start_ordinal..end_ordinal).contains(&ordinal) {
+                let mut offset = 0_usize;
+                while offset != merged.entry.length {
+                    let chunk = (merged.entry.length - offset).min(payload_buffer.len());
+                    merge
+                        .read_payload(&merged, offset, &mut payload_buffer[..chunk])
+                        .map_err(packed_io_error)?;
+                    file.write_all(&payload_buffer[..chunk])?;
+                    hasher.update(&payload_buffer[..chunk]);
+                    offset += chunk;
+                }
+            }
+            ordinal += 1;
+        }
+        let digest = ContentDigest::from_bytes(hasher.finalize().into());
+        staged_digest = Some(digest);
+        Ok((pack_filename(digest), total_bytes as u64))
+    })?;
+    let digest = staged_digest.ok_or(PackedPatriciaError::Malformed)?;
+    Ok(PlannedStreamingPatriciaPack::Staged {
+        publication,
+        descriptor: PackDescriptor {
+            digest,
+            first: shape.first,
+            last: shape.last,
+            entries: shape.entries as u32,
+            bytes: total_bytes as u32,
+        },
+    })
+}
+
+fn streaming_plan_owned_bytes(
+    planned: &Vec<PlannedStreamingPatriciaPack>,
+) -> Result<usize, PackedPatriciaError> {
+    let inline = planned
+        .capacity()
+        .checked_mul(std::mem::size_of::<PlannedStreamingPatriciaPack>())
+        .ok_or(PackedPatriciaError::PackTooLarge)?;
+    planned.iter().try_fold(inline, |total, pack| match pack {
+        PlannedStreamingPatriciaPack::Existing { .. } => Ok(total),
+        PlannedStreamingPatriciaPack::Staged { publication, .. } => total
+            .checked_add(publication.owned_name_bytes())
+            .ok_or(PackedPatriciaError::PackTooLarge),
+    })
+}
+
+fn streaming_fixed_bytes() -> Result<usize, PackedPatriciaError> {
+    let cursors = (MAX_PACKS_PER_SIZE_TIER + 1)
+        .checked_mul(
+            std::mem::size_of::<StreamPackCursor<'static>>()
+                + std::mem::size_of::<Reverse<(ContentDigest, usize)>>()
+                + std::mem::size_of::<usize>(),
+        )
+        .ok_or(PackedPatriciaError::PackTooLarge)?;
+    cursors
+        .checked_add(
+            CONSTRUCTION_STREAM_BUFFER_COUNT
+                .checked_mul(CONSTRUCTION_STREAM_BUFFER_BYTES)
+                .ok_or(PackedPatriciaError::PackTooLarge)?,
+        )
+        .and_then(|total| total.checked_add(2 * HEAD_BYTES))
+        .ok_or(PackedPatriciaError::PackTooLarge)
+}
+
+fn observe_streaming_plan(
+    residency: &mut PackedPatriciaResidencyTracker,
+    planned: &Vec<PlannedStreamingPatriciaPack>,
+    transient_shape_capacity: usize,
+    additional_plan_owned_bytes: usize,
+    additional_pack_count: usize,
+) -> Result<(), PackedPatriciaError> {
+    let descriptors = planned
+        .len()
+        .checked_add(additional_pack_count)
+        .ok_or(PackedPatriciaError::TooManyEntries)?
+        .checked_mul(std::mem::size_of::<PackDescriptor>())
+        .ok_or(PackedPatriciaError::PackTooLarge)?;
+    let shapes = transient_shape_capacity
+        .checked_mul(std::mem::size_of::<StreamPartitionShape>())
+        .ok_or(PackedPatriciaError::PackTooLarge)?;
+    let catalog_capacity = CATALOG_HEADER_BYTES
+        .checked_add(
+            planned
+                .len()
+                .checked_add(additional_pack_count)
+                .ok_or(PackedPatriciaError::TooManyEntries)?
+                .checked_mul(CATALOG_ENTRY_BYTES)
+                .ok_or(PackedPatriciaError::PackTooLarge)?,
+        )
+        .ok_or(PackedPatriciaError::PackTooLarge)?;
+    residency.observe(
+        streaming_plan_owned_bytes(planned)?
+            .checked_add(additional_plan_owned_bytes)
+            .and_then(|total| total.checked_add(descriptors))
+            .and_then(|total| total.checked_add(shapes))
+            .and_then(|total| total.checked_add(catalog_capacity))
+            .and_then(|total| total.checked_add(streaming_fixed_bytes().ok()?))
+            .ok_or(PackedPatriciaError::PackTooLarge)?,
+    )
+}
+
+fn observe_tier_replacement_plan(
+    residency: &mut PackedPatriciaResidencyTracker,
+    planned: &Vec<PlannedStreamingPatriciaPack>,
+    replacements: &Vec<PlannedStreamingPatriciaPack>,
+    transient_shape_capacity: usize,
+    next_capacity: usize,
+) -> Result<(), PackedPatriciaError> {
+    let next_vector_bytes = next_capacity
+        .checked_mul(std::mem::size_of::<PlannedStreamingPatriciaPack>())
+        .ok_or(PackedPatriciaError::PackTooLarge)?;
+    observe_streaming_plan(
+        residency,
+        planned,
+        transient_shape_capacity,
+        streaming_plan_owned_bytes(replacements)?
+            .checked_add(next_vector_bytes)
+            .ok_or(PackedPatriciaError::PackTooLarge)?,
+        replacements.len(),
+    )
+}
+
+fn compact_size_tiers_streaming(
+    dir: &Dir,
+    current: Option<&PackedPatriciaCatalog>,
+    planned: &mut Vec<PlannedStreamingPatriciaPack>,
+    work: &mut PackedPatriciaPublicationWork,
+    residency: &mut PackedPatriciaResidencyTracker,
+) -> Result<(), PackedPatriciaError> {
+    let mut carried_tiers = [false; PACK_SIZE_TIER_COUNT];
+    loop {
+        let mut tier_counts = [0_usize; PACK_SIZE_TIER_COUNT];
+        for pack in planned.iter() {
+            tier_counts[pack_size_tier(pack.descriptor().bytes)] += 1;
+        }
+        let Some(tier) = tier_counts.iter().enumerate().find_map(|(tier, count)| {
+            (*count > MAX_PACKS_PER_SIZE_TIER && !carried_tiers[tier]).then_some(tier)
+        }) else {
+            return Ok(());
+        };
+        carried_tiers[tier] = true;
+        let selected = planned
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pack)| {
+                (pack_size_tier(pack.descriptor().bytes) == tier).then_some(index)
+            })
+            .take(MAX_PACKS_PER_SIZE_TIER + 1)
+            .collect::<Vec<_>>();
+        let insert_after = *selected.last().ok_or(PackedPatriciaError::Malformed)?;
+        for index in &selected {
+            let descriptor = planned[*index].descriptor();
+            work.compaction_packs_selected = work
+                .compaction_packs_selected
+                .checked_add(1)
+                .ok_or(PackedPatriciaError::TooManyEntries)?;
+            work.compaction_pack_bytes_selected = work
+                .compaction_pack_bytes_selected
+                .checked_add(descriptor.bytes as usize)
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+        }
+        let shapes = plan_merged_stream(current, planned, &selected, work)?;
+        if shapes.len() >= selected.len()
+            && shapes.iter().all(|shape| {
+                pack_size_tier(shape.total_bytes().unwrap_or(u32::MAX as usize) as u32) == tier
+            })
+        {
+            return Err(PackedPatriciaError::PackTooLarge);
+        }
+        observe_streaming_plan(residency, planned, shapes.capacity(), 0, 0)?;
+        let mut replacements = Vec::with_capacity(shapes.len());
+        for shape in shapes.iter().copied() {
+            let staged = stage_merged_partition(dir, current, planned, &selected, shape)?;
+            work.pack_bytes_encoded = work
+                .pack_bytes_encoded
+                .checked_add(staged.descriptor().bytes as usize)
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            replacements.push(staged);
+            observe_streaming_plan(
+                residency,
+                planned,
+                shapes.capacity(),
+                streaming_plan_owned_bytes(&replacements)?,
+                replacements.len(),
+            )?;
+        }
+        let next_capacity = planned.len() - selected.len() + replacements.len();
+        observe_tier_replacement_plan(
+            residency,
+            planned,
+            &replacements,
+            shapes.capacity(),
+            next_capacity,
+        )?;
+        let mut replacements = replacements.into_iter();
+        let mut next = Vec::with_capacity(next_capacity);
+        for (index, pack) in planned.drain(..).enumerate() {
+            if !selected.contains(&index) {
+                next.push(pack);
+            }
+            if index == insert_after {
+                next.extend(replacements.by_ref());
+            }
+        }
+        *planned = next;
+        observe_streaming_plan(residency, planned, shapes.capacity(), 0, 0)?;
+    }
+}
+
+/// Construction-only append which never clones delta or historical payloads
+/// and never owns a complete replacement pack buffer or replacement range map.
+pub(crate) fn publish_appended_catalog_bounded_streaming(
+    dir: &Dir,
+    publisher: &dyn PatriciaNodePublisher,
+    current: Option<&PackedPatriciaCatalog>,
+    entries: &BTreeMap<ContentDigest, Vec<u8>>,
+    catalog_pack_byte_limit: usize,
+    residency_budget: PackedPatriciaResidencyBudget,
+) -> Result<
+    (
+        Option<PendingStreamingPackedPatriciaCatalog>,
+        PackedPatriciaPublicationWork,
+    ),
+    PackedPatriciaError,
+> {
+    if entries.is_empty() {
+        return Err(PackedPatriciaError::Empty);
+    }
+    let mut work = PackedPatriciaPublicationWork::default();
+    let mut residency = PackedPatriciaResidencyTracker::new(
+        residency_budget,
+        current.map_or(0, PackedPatriciaCatalog::resident_bytes),
+    )?;
+    let shapes = plan_delta_stream(current, entries, &mut work)?;
+    if shapes.is_empty() {
+        work.peak_resident_bytes = residency.peak_bytes;
+        return Ok((None, work));
+    }
+    let mut planned = current
+        .map(|catalog| {
+            catalog
+                .descriptors
+                .iter()
+                .copied()
+                .enumerate()
+                .map(
+                    |(resolver_index, descriptor)| PlannedStreamingPatriciaPack::Existing {
+                        resolver_index,
+                        descriptor,
+                    },
+                )
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    observe_streaming_plan(&mut residency, &planned, shapes.capacity(), 0, 0)?;
+    for shape in shapes.iter().copied() {
+        let staged = stage_delta_partition(dir, current, entries, shape)?;
+        let bytes = staged.descriptor().bytes as usize;
+        work.delta_pack_bytes_encoded = work
+            .delta_pack_bytes_encoded
+            .checked_add(bytes)
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        work.pack_bytes_encoded = work
+            .pack_bytes_encoded
+            .checked_add(bytes)
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        planned.push(staged);
+        observe_streaming_plan(&mut residency, &planned, shapes.capacity(), 0, 0)?;
+    }
+    drop(shapes);
+    compact_size_tiers_streaming(dir, current, &mut planned, &mut work, &mut residency)?;
+    let descriptors = planned
+        .iter()
+        .map(PlannedStreamingPatriciaPack::descriptor)
+        .collect::<Vec<_>>();
+    let final_pack_bytes = descriptors.iter().try_fold(0_usize, |total, descriptor| {
+        total
+            .checked_add(descriptor.bytes as usize)
+            .ok_or(PackedPatriciaError::PackTooLarge)
+    })?;
+    if descriptors.len() > MAX_CATALOG_PACKS
+        || final_pack_bytes > catalog_pack_byte_limit.min(MAX_CATALOG_PACK_BYTES)
+    {
+        return Err(PackedPatriciaError::PackTooLarge);
+    }
+    let input_was_tier_bounded = current
+        .map(|catalog| size_tiers_are_bounded(&catalog.descriptors))
+        .unwrap_or(true);
+    if input_was_tier_bounded && !size_tiers_are_bounded(&descriptors) {
+        return Err(PackedPatriciaError::PackTooLarge);
+    }
+    let catalog_publication = if input_was_tier_bounded {
+        PackedPatriciaCatalogPublication::build_descriptors_for_schema(
+            &descriptors,
+            CATALOG_SCHEMA_VERSION,
+        )?
+    } else {
+        PackedPatriciaCatalogPublication::build_descriptors(&descriptors)?
+    };
+    work.catalog_metadata_bytes_encoded = catalog_publication.bytes.len();
+    let descriptor_capacity = descriptors
+        .capacity()
+        .checked_mul(std::mem::size_of::<PackDescriptor>())
+        .ok_or(PackedPatriciaError::PackTooLarge)?;
+    residency.observe(
+        streaming_plan_owned_bytes(&planned)?
+            .checked_add(descriptor_capacity)
+            .and_then(|total| total.checked_add(catalog_publication.bytes.capacity()))
+            .and_then(|total| total.checked_add(streaming_fixed_bytes().ok()?))
+            .ok_or(PackedPatriciaError::PackTooLarge)?,
+    )?;
+
+    for pack in planned {
+        if let PlannedStreamingPatriciaPack::Staged {
+            publication,
+            descriptor,
+        } = pack
+        {
+            validate_staged_stream_pack(&publication, descriptor)?;
+            publisher
+                .publish_staged_construction_exact(publication)
+                .map_err(PackedPatriciaError::Publication)?;
+            work.pack_bytes_published = work
+                .pack_bytes_published
+                .checked_add(descriptor.bytes as usize)
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            work.packs_published = work
+                .packs_published
+                .checked_add(1)
+                .ok_or(PackedPatriciaError::TooManyEntries)?;
+        }
+    }
+    let catalog = catalog_publication.publish(dir, publisher)?;
+    work.catalog_metadata_bytes_published = catalog.bytes as usize;
+    work.peak_resident_bytes = residency.peak_bytes;
+    Ok((
+        Some(PendingStreamingPackedPatriciaCatalog { catalog }),
+        work,
+    ))
+}
+
 fn compact_size_tiers(
     current: Option<&PackedPatriciaCatalog>,
     planned: &mut Vec<PlannedPatriciaPack>,
     work: &mut PackedPatriciaPublicationWork,
+    mut residency: Option<&mut PackedPatriciaResidencyTracker>,
+    retained_planner_bytes: usize,
 ) -> Result<(), PackedPatriciaError> {
     // A schema-2 input may begin arbitrarily overfull. Carrying a tier at most
     // once bounds one routine mutation independently of that historical
@@ -1266,6 +2919,55 @@ fn compact_size_tiers(
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
         let insert_after = *selected.last().expect("overflowing tier is non-empty");
+        if let Some(residency) = residency.as_deref_mut() {
+            let (selected_pack_bytes, selected_entries) =
+                selected
+                    .iter()
+                    .try_fold((0_usize, 0_usize), |(bytes, entries), index| {
+                        let descriptor = planned[*index].descriptor();
+                        Ok::<_, PackedPatriciaError>((
+                            bytes
+                                .checked_add(descriptor.bytes as usize)
+                                .ok_or(PackedPatriciaError::PackTooLarge)?,
+                            entries
+                                .checked_add(descriptor.entries as usize)
+                                .ok_or(PackedPatriciaError::TooManyEntries)?,
+                        ))
+                    })?;
+            let cloned_entries_bytes = selected_pack_bytes
+                .checked_add(
+                    selected_entries
+                        .checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)
+                        .ok_or(PackedPatriciaError::PackTooLarge)?,
+                )
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            let selected_metadata_bytes = selected
+                .len()
+                .checked_mul(PACKED_MAP_ENTRY_OWNERSHIP_BYTES)
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            let replacement_vector_bytes = planned
+                .len()
+                .checked_mul(std::mem::size_of::<PlannedPatriciaPack>())
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            // `entries` clones the selected historical payload while the
+            // resolver and selected planned publications remain live. Pack
+            // partitioning then owns a cloned chunk and encoded replacement
+            // publications concurrently. Three clone-sized charges cover the
+            // target map, the largest partition chunk, and all replacement
+            // encoded/range-map ownership before the selected plans are
+            // drained into their replacement vector.
+            let carry_scratch_bytes = cloned_entries_bytes
+                .checked_mul(3)
+                .and_then(|total| total.checked_add(selected_metadata_bytes))
+                .and_then(|total| total.checked_add(replacement_vector_bytes))
+                .ok_or(PackedPatriciaError::PackTooLarge)?;
+            residency.observe(
+                retained_planner_bytes
+                    .checked_add(planned_owned_bytes(planned))
+                    .and_then(|total| total.checked_add(carry_scratch_bytes))
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )?;
+        }
         let mut entries = BTreeMap::new();
         for index in &selected {
             let pack = &planned[*index];
@@ -1282,7 +2984,7 @@ fn compact_size_tiers(
                     let historical = current
                         .and_then(|catalog| catalog.packs.get(*index))
                         .ok_or(PackedPatriciaError::Malformed)?;
-                    copy_exact_entries(&historical.bytes, &historical.entries, &mut entries, work)?;
+                    copy_opened_entries(historical, &mut entries, work)?;
                 }
                 PlannedPatriciaPack::Publication(publication) => {
                     copy_exact_entries(&publication.bytes, &publication.ranges, &mut entries, work)?
@@ -1318,6 +3020,13 @@ fn compact_size_tiers(
         }
         debug_assert!(publications.next().is_none());
         *planned = next;
+        if let Some(residency) = residency.as_deref_mut() {
+            residency.observe(
+                retained_planner_bytes
+                    .checked_add(planned_owned_bytes(planned))
+                    .ok_or(PackedPatriciaError::PackTooLarge)?,
+            )?;
+        }
     }
 }
 
@@ -1341,6 +3050,31 @@ fn copy_exact_entries(
             }
         } else {
             target.insert(*digest, bytes.to_vec());
+        }
+    }
+    Ok(())
+}
+
+fn copy_opened_entries(
+    source: &PackedPatriciaPack,
+    target: &mut BTreeMap<ContentDigest, Vec<u8>>,
+    work: &mut PackedPatriciaPublicationWork,
+) -> Result<(), PackedPatriciaError> {
+    for (digest, range) in source.iter_entries() {
+        let bytes = source
+            .bytes
+            .get(range)
+            .ok_or(PackedPatriciaError::Malformed)?;
+        work.compaction_payload_bytes_reencoded = work
+            .compaction_payload_bytes_reencoded
+            .checked_add(bytes.len())
+            .ok_or(PackedPatriciaError::PackTooLarge)?;
+        if let Some(existing) = target.get(&digest) {
+            if existing.as_slice() != bytes {
+                return Err(PackedPatriciaError::PathMismatch(digest));
+            }
+        } else {
+            target.insert(digest, bytes.to_vec());
         }
     }
     Ok(())
@@ -1491,17 +3225,32 @@ fn size_tiers_are_bounded(descriptors: &[PackDescriptor]) -> bool {
 }
 
 fn validate_duplicate_nodes(packs: &[PackedPatriciaPack]) -> Result<(), PackedPatriciaError> {
-    let mut seen = BTreeMap::<ContentDigest, (usize, Range<usize>)>::new();
+    let mut pending = BinaryHeap::new();
     for (pack_index, pack) in packs.iter().enumerate() {
-        for (digest, range) in &pack.entries {
-            if let Some((prior_pack_index, prior_range)) = seen.get(digest) {
-                if packs[*prior_pack_index].bytes[prior_range.clone()] != pack.bytes[range.clone()]
-                {
-                    return Err(PackedPatriciaError::PathMismatch(*digest));
-                }
-            } else {
-                seen.insert(*digest, (pack_index, range.clone()));
+        if pack.entry_count != 0 {
+            pending.push(Reverse((pack.entry(0).0, pack_index, 0_usize)));
+        }
+    }
+    let mut prior: Option<(ContentDigest, usize, Range<usize>)> = None;
+    while let Some(Reverse((digest, pack_index, entry_index))) = pending.pop() {
+        let pack = &packs[pack_index];
+        let (_, range) = pack.entry(entry_index);
+        if let Some((prior_digest, prior_pack_index, prior_range)) = &prior {
+            if *prior_digest == digest
+                && packs[*prior_pack_index].bytes[prior_range.clone()] != pack.bytes[range.clone()]
+            {
+                return Err(PackedPatriciaError::PathMismatch(digest));
             }
+        }
+        if prior
+            .as_ref()
+            .is_none_or(|(prior_digest, _, _)| *prior_digest != digest)
+        {
+            prior = Some((digest, pack_index, range));
+        }
+        let next_index = entry_index + 1;
+        if next_index < pack.entry_count {
+            pending.push(Reverse((pack.entry(next_index).0, pack_index, next_index)));
         }
     }
     Ok(())
@@ -1706,6 +3455,106 @@ mod tests {
         Ok((pending.finish(current), work))
     }
 
+    fn append_catalog_streaming(
+        fixture: &Fixture,
+        current: Option<PackedPatriciaCatalog>,
+        entries: &BTreeMap<ContentDigest, Vec<u8>>,
+    ) -> Result<(PackedPatriciaCatalog, PackedPatriciaPublicationWork), PackedPatriciaError> {
+        let expected = current.as_ref().map(PackedPatriciaCatalog::authority);
+        let (pending, work) = publish_appended_catalog_bounded_streaming(
+            &fixture.dir,
+            &ExactPublisher,
+            current.as_ref(),
+            entries,
+            MAX_CATALOG_PACK_BYTES,
+            PackedPatriciaResidencyBudget {
+                retained_bytes: 0,
+                maximum_bytes: 64 * 1024 * 1024,
+            },
+        )?;
+        let pending = pending.expect("fixture appends one previously absent digest");
+        transition_catalog_head(&fixture.dir, expected, pending.published_catalog())?;
+        drop(current);
+        PackedPatriciaCatalog::discover(&fixture.dir)?
+            .ok_or(PackedPatriciaError::Malformed)
+            .map(|catalog| (catalog, work))
+    }
+
+    fn publish_legacy_layered_catalog(
+        fixture: &Fixture,
+        packs: &[BTreeMap<ContentDigest, Vec<u8>>],
+    ) -> PackedPatriciaCatalog {
+        let descriptors = packs
+            .iter()
+            .map(|entries| {
+                let publication = publication_with_schema(entries, LEGACY_PACK_SCHEMA_VERSION);
+                publication
+                    .publish(&fixture.dir, &ExactPublisher)
+                    .unwrap()
+                    .descriptor()
+            })
+            .collect::<Vec<_>>();
+        let catalog = PackedPatriciaCatalogPublication::build_descriptors_for_schema(
+            &descriptors,
+            LAYERED_CATALOG_SCHEMA_VERSION,
+        )
+        .unwrap()
+        .publish(&fixture.dir, &ExactPublisher)
+        .unwrap();
+        publish_catalog_head(&fixture.dir, &catalog, &ExactPublisher).unwrap();
+        PackedPatriciaCatalog::discover(&fixture.dir)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn live_catalog_bytes(
+        fixture: &Fixture,
+        catalog: &PackedPatriciaCatalog,
+    ) -> BTreeMap<String, Vec<u8>> {
+        catalog
+            .live_filenames()
+            .into_iter()
+            .filter(|name| name != OPERATION_LOCK_FILENAME)
+            .map(|name| {
+                let bytes = fixture.dir.read(&name).unwrap();
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    fn staged_test_plan(
+        fixture: &Fixture,
+        indexed_digest: ContentDigest,
+        payload: &[u8],
+    ) -> PlannedStreamingPatriciaPack {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(PACK_MAGIC);
+        bytes.extend_from_slice(&PACK_SCHEMA_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(indexed_digest.as_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        let pack_digest = ContentDigest::of(&bytes);
+        let exact_length = bytes.len() as u64;
+        let publication = StagedExactImmutablePublication::construct(&fixture.dir, |file| {
+            file.write_all(&bytes)?;
+            Ok((pack_filename(pack_digest), exact_length))
+        })
+        .unwrap();
+        PlannedStreamingPatriciaPack::Staged {
+            publication,
+            descriptor: PackDescriptor {
+                digest: pack_digest,
+                first: indexed_digest,
+                last: indexed_digest,
+                entries: 1,
+                bytes: exact_length as u32,
+            },
+        }
+    }
+
     fn catalog_schema_version(fixture: &Fixture, catalog: &PackedPatriciaCatalog) -> u32 {
         let bytes = fs::read(
             fixture
@@ -1714,6 +3563,262 @@ mod tests {
         )
         .unwrap();
         read_u32(&bytes, 8).unwrap()
+    }
+
+    #[test]
+    fn tier_replacement_preflight_accounts_all_live_vector_capacities() {
+        let digest = ContentDigest::of(b"tier replacement capacity");
+        let descriptor = PackDescriptor {
+            digest,
+            first: digest,
+            last: digest,
+            entries: 1,
+            bytes: MIN_PACK_BYTES as u32,
+        };
+        let mut planned = Vec::with_capacity(5);
+        for resolver_index in 0..5 {
+            planned.push(PlannedStreamingPatriciaPack::Existing {
+                resolver_index,
+                descriptor,
+            });
+        }
+        let mut replacements = Vec::with_capacity(1);
+        replacements.push(PlannedStreamingPatriciaPack::Existing {
+            resolver_index: 5,
+            descriptor,
+        });
+        let shape_capacity = 2;
+        let next_capacity = 1;
+        let simultaneous_vector_bytes = (planned.capacity()
+            + replacements.capacity()
+            + next_capacity)
+            * std::mem::size_of::<PlannedStreamingPatriciaPack>();
+        let pending_pack_count = planned.len() + replacements.len();
+        let expected_peak = simultaneous_vector_bytes
+            + pending_pack_count * std::mem::size_of::<PackDescriptor>()
+            + shape_capacity * std::mem::size_of::<StreamPartitionShape>()
+            + CATALOG_HEADER_BYTES
+            + pending_pack_count * CATALOG_ENTRY_BYTES
+            + streaming_fixed_bytes().unwrap();
+        let mut residency = PackedPatriciaResidencyTracker::new(
+            PackedPatriciaResidencyBudget {
+                retained_bytes: 0,
+                maximum_bytes: expected_peak - 1,
+            },
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            observe_tier_replacement_plan(
+                &mut residency,
+                &planned,
+                &replacements,
+                shape_capacity,
+                next_capacity,
+            ),
+            Err(PackedPatriciaError::PackTooLarge)
+        ));
+        assert_eq!(residency.peak_bytes, expected_peak);
+    }
+
+    #[test]
+    fn construction_streamed_delta_and_schema_one_five_way_carry_are_byte_identical() {
+        let canonical_delta_fixture = Fixture::new("stream-delta-canonical");
+        let streamed_delta_fixture = Fixture::new("stream-delta-streamed");
+        let delta = representative_nodes_in_family("streamed-delta", 257);
+        let (canonical_delta, _) =
+            append_catalog(&canonical_delta_fixture, None, &delta, &ExactPublisher).unwrap();
+        let (streamed_delta, delta_work) =
+            append_catalog_streaming(&streamed_delta_fixture, None, &delta).unwrap();
+        assert_eq!(
+            live_catalog_bytes(&canonical_delta_fixture, &canonical_delta),
+            live_catalog_bytes(&streamed_delta_fixture, &streamed_delta),
+        );
+        assert!(delta_work.peak_resident_bytes <= 64 * 1024 * 1024);
+
+        let shared = b"exact duplicate shared by legacy packs".to_vec();
+        let shared_digest = ContentDigest::of(&shared);
+        let legacy_packs = (0..4)
+            .map(|index| {
+                let unique = format!("legacy schema one unique {index}").into_bytes();
+                let mut entries = BTreeMap::from([(ContentDigest::of(&unique), unique)]);
+                if index < 2 {
+                    entries.insert(shared_digest, shared.clone());
+                } else {
+                    let peer = format!("legacy schema one peer   {index}").into_bytes();
+                    entries.insert(ContentDigest::of(&peer), peer);
+                }
+                entries
+            })
+            .collect::<Vec<_>>();
+        let carry_bytes = b"schema two arriving carry".to_vec();
+        let carry_peer = b"schema two arriving peer ".to_vec();
+        let carry = BTreeMap::from([
+            (ContentDigest::of(&carry_bytes), carry_bytes),
+            (ContentDigest::of(&carry_peer), carry_peer),
+        ]);
+        let canonical_fixture = Fixture::new("stream-carry-canonical");
+        let streamed_fixture = Fixture::new("stream-carry-streamed");
+        let canonical_current = publish_legacy_layered_catalog(&canonical_fixture, &legacy_packs);
+        let streamed_current = publish_legacy_layered_catalog(&streamed_fixture, &legacy_packs);
+        let (canonical, canonical_work) = append_catalog(
+            &canonical_fixture,
+            Some(canonical_current),
+            &carry,
+            &ExactPublisher,
+        )
+        .unwrap();
+        let (streamed, streamed_work) =
+            append_catalog_streaming(&streamed_fixture, Some(streamed_current), &carry).unwrap();
+        assert_eq!(canonical_work.compaction_packs_selected, 5);
+        assert_eq!(streamed_work.compaction_packs_selected, 5);
+        assert_eq!(
+            live_catalog_bytes(&canonical_fixture, &canonical),
+            live_catalog_bytes(&streamed_fixture, &streamed),
+        );
+        assert_eq!(streamed.get(shared_digest), Some(shared.as_slice()));
+        for pack in &streamed.packs {
+            assert_eq!(read_u32(&pack.bytes, 8).unwrap(), PACK_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn five_way_stream_deduplicates_exact_bytes_and_refuses_conflicting_duplicates() {
+        let exact_fixture = Fixture::new("stream-duplicate-exact");
+        let indexed_digest = ContentDigest::of(b"claimed duplicate digest");
+        let exact = vec![
+            staged_test_plan(&exact_fixture, indexed_digest, b"exact shared bytes"),
+            staged_test_plan(&exact_fixture, indexed_digest, b"exact shared bytes"),
+            staged_test_plan(
+                &exact_fixture,
+                ContentDigest::of(b"third digest"),
+                b"third bytes",
+            ),
+            staged_test_plan(
+                &exact_fixture,
+                ContentDigest::of(b"fourth digest"),
+                b"fourth bytes",
+            ),
+            staged_test_plan(
+                &exact_fixture,
+                ContentDigest::of(b"fifth digest"),
+                b"fifth bytes",
+            ),
+        ];
+        let mut merge = FiveWayMerge::open(&exact, None, &[0, 1, 2, 3, 4]).unwrap();
+        let mut duplicate_emissions = 0;
+        while let Some(entry) = merge.next_unique().unwrap() {
+            duplicate_emissions += usize::from(entry.entry.digest == indexed_digest);
+        }
+        assert_eq!(duplicate_emissions, 1);
+
+        let conflicting_fixture = Fixture::new("stream-duplicate-conflict");
+        let conflicting = vec![
+            staged_test_plan(&conflicting_fixture, indexed_digest, b"first bytes"),
+            staged_test_plan(&conflicting_fixture, indexed_digest, b"conflicting bytes"),
+            staged_test_plan(
+                &conflicting_fixture,
+                ContentDigest::of(b"third digest"),
+                b"third bytes",
+            ),
+            staged_test_plan(
+                &conflicting_fixture,
+                ContentDigest::of(b"fourth digest"),
+                b"fourth bytes",
+            ),
+            staged_test_plan(
+                &conflicting_fixture,
+                ContentDigest::of(b"fifth digest"),
+                b"fifth bytes",
+            ),
+        ];
+        let mut merge = FiveWayMerge::open(&conflicting, None, &[0, 1, 2, 3, 4]).unwrap();
+        let mut refused = false;
+        loop {
+            match merge.next_unique() {
+                Err(PackedPatriciaError::PathMismatch(digest)) if digest == indexed_digest => {
+                    refused = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => panic!("unexpected five-way merge error: {error:?}"),
+            }
+        }
+        assert!(refused, "conflicting duplicate reached no refusal");
+    }
+
+    #[test]
+    fn staged_stream_pack_truncation_and_tamper_fail_before_publication() {
+        fn staged(fixture: &Fixture) -> PlannedStreamingPatriciaPack {
+            let entries = representative_nodes_in_family("staged-damage", 8);
+            let mut work = PackedPatriciaPublicationWork::default();
+            let shape = plan_delta_stream(None, &entries, &mut work)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            stage_delta_partition(&fixture.dir, None, &entries, shape).unwrap()
+        }
+
+        let truncated_fixture = Fixture::new("stream-staged-truncated");
+        let truncated = staged(&truncated_fixture);
+        let truncated_path = fs::read_dir(&truncated_fixture.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".tmp-")
+            })
+            .unwrap();
+        let descriptor = truncated.descriptor();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&truncated_path)
+            .unwrap()
+            .set_len(u64::from(descriptor.bytes) - 1)
+            .unwrap();
+        let PlannedStreamingPatriciaPack::Staged { publication, .. } = truncated else {
+            unreachable!()
+        };
+        assert!(matches!(
+            validate_staged_stream_pack(&publication, descriptor),
+            Err(PackedPatriciaError::Filesystem(
+                FilesystemError::StoredLengthMismatch { .. }
+            ))
+        ));
+
+        let tampered_fixture = Fixture::new("stream-staged-tampered");
+        let tampered = staged(&tampered_fixture);
+        let tampered_path = fs::read_dir(&tampered_fixture.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".tmp-")
+            })
+            .unwrap();
+        let descriptor = tampered.descriptor();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&tampered_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(u64::from(descriptor.bytes) - 1))
+            .unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.sync_all().unwrap();
+        let PlannedStreamingPatriciaPack::Staged { publication, .. } = tampered else {
+            unreachable!()
+        };
+        assert!(matches!(
+            validate_staged_stream_pack(&publication, descriptor),
+            Err(PackedPatriciaError::PathMismatch(digest)) if digest == descriptor.digest
+        ));
     }
 
     #[test]
@@ -2016,17 +4121,24 @@ mod tests {
         );
 
         let collision_digest = ContentDigest::of(b"synthetic collision");
+        let synthetic_pack = |pack_digest, payload: u8| {
+            let payload_start = PACK_HEADER_BYTES + PACK_INDEX_ENTRY_BYTES;
+            let mut bytes = vec![0_u8; payload_start];
+            bytes[PACK_HEADER_BYTES..PACK_HEADER_BYTES + 32]
+                .copy_from_slice(collision_digest.as_bytes());
+            bytes[PACK_HEADER_BYTES + 36..PACK_HEADER_BYTES + 40]
+                .copy_from_slice(&1_u32.to_le_bytes());
+            bytes.push(payload);
+            PackedPatriciaPack {
+                digest: pack_digest,
+                bytes,
+                entry_count: 1,
+                payload_start,
+            }
+        };
         let conflicting = [
-            PackedPatriciaPack {
-                digest: ContentDigest::of(b"pack one"),
-                bytes: b"a".to_vec(),
-                entries: BTreeMap::from([(collision_digest, 0..1)]),
-            },
-            PackedPatriciaPack {
-                digest: ContentDigest::of(b"pack two"),
-                bytes: b"b".to_vec(),
-                entries: BTreeMap::from([(collision_digest, 0..1)]),
-            },
+            synthetic_pack(ContentDigest::of(b"pack one"), b'a'),
+            synthetic_pack(ContentDigest::of(b"pack two"), b'b'),
         ];
         assert!(matches!(
             validate_duplicate_nodes(&conflicting),
@@ -2288,7 +4400,7 @@ mod tests {
             work.delta_pack_bytes_encoded += publication.bytes.len();
             work.pack_bytes_encoded += publication.bytes.len();
             planned.push(PlannedPatriciaPack::Publication(publication));
-            compact_size_tiers(None, &mut planned, &mut work).unwrap();
+            compact_size_tiers(None, &mut planned, &mut work, None, 0).unwrap();
         }
 
         let mut tiers = [0_usize; PACK_SIZE_TIER_COUNT];

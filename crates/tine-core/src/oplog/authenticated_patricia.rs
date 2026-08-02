@@ -17,6 +17,19 @@ pub(crate) use tine_storage::{
     MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
 };
 
+/// Move-only core evidence that one archive-bound Patricia construction has
+/// completed all packed heads or its loose fallback.
+pub(crate) struct CompletedPatriciaConstruction {
+    physical: tine_storage::CompletedPatriciaIndexConstruction,
+}
+
+impl CompletedPatriciaConstruction {
+    #[cfg(test)]
+    pub(crate) const fn stats(&self) -> PatriciaIndexConstructionStats {
+        self.physical.stats()
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static NEXT_RECLAMATION_FAILURE: std::cell::Cell<Option<PatriciaReclamationFailureForTest>> =
@@ -65,6 +78,43 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
         // unflushed immutable batch and therefore cannot make a mutable head
         // durable before its prerequisites at this boundary.
         matches!(self, Self::Ordinary)
+    }
+
+    fn publish_construction_exact(
+        &self,
+        dir: &Dir,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<(), tine_storage::PatriciaPublicationError> {
+        // Construction packs and catalogs use an independently durable exact
+        // lane. Detached loose fallback remains in the session-wide immutable
+        // batch, but no mutable packed head can name those unflushed bytes.
+        publish_immutable_exact(
+            dir,
+            filename,
+            bytes,
+            "authenticated Patricia construction prerequisite",
+        )
+        .map_err(tine_storage::PatriciaPublicationError::new)
+    }
+
+    fn publish_staged_construction_exact(
+        &self,
+        publication: tine_storage::StagedExactImmutablePublication,
+    ) -> Result<(), tine_storage::PatriciaPublicationError> {
+        publication.commit().map_err(|error| {
+            let error = match error {
+                tine_storage::FilesystemError::ByteCollision => StoreError::ImmutableCollision(
+                    "authenticated Patricia construction prerequisite",
+                ),
+                error => filesystem_error_without_collision(error),
+            };
+            tine_storage::PatriciaPublicationError::new(error)
+        })
+    }
+
+    fn permits_construction_packed_head_transition(&self) -> bool {
+        true
     }
 }
 
@@ -387,9 +437,10 @@ impl PatriciaIndexStore {
     pub(crate) fn finish_construction(
         &self,
         construction: &mut PatriciaIndexConstruction,
-    ) -> Result<(), StoreError> {
+    ) -> Result<CompletedPatriciaConstruction, StoreError> {
         self.storage
             .finish_construction(construction)
+            .map(|physical| CompletedPatriciaConstruction { physical })
             .map_err(map_storage_error)
     }
 
@@ -425,7 +476,7 @@ impl PatriciaIndexStore {
     pub(crate) fn finish_detached_construction(
         &self,
         root: PatriciaIndexRoot,
-    ) -> Result<Option<PatriciaIndexConstructionStats>, StoreError> {
+    ) -> Result<Option<CompletedPatriciaConstruction>, StoreError> {
         let Some(mut construction) = self.construction_guard()? else {
             return Ok(None);
         };
@@ -434,14 +485,14 @@ impl PatriciaIndexStore {
         };
         pending.set_live_roots([root]);
         pending.checkpoint([root]);
-        self.storage
+        let physical = self
+            .storage
             .finish_construction(&mut pending)
             .map_err(map_storage_error)?;
-        let stats = pending.stats();
         self.storage
             .validate_root(root)
             .map_err(map_storage_error)?;
-        Ok(Some(stats))
+        Ok(Some(CompletedPatriciaConstruction { physical }))
     }
 }
 

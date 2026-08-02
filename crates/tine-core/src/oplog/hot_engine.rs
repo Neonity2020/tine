@@ -2040,6 +2040,10 @@ pub(crate) struct DetachedBootstrapPublicationStats {
     pub(crate) immutable_publications: usize,
     pub(crate) verified_existing_publications: usize,
     pub(crate) successful_batch_completions: usize,
+    pub(crate) packed_immutable_publications: usize,
+    pub(crate) packed_head_transitions: usize,
+    pub(crate) packed_capacity_fallbacks: usize,
+    pub(crate) packed_peak_resident_bytes: usize,
 }
 
 #[allow(dead_code)]
@@ -2057,15 +2061,28 @@ impl DetachedBootstrapCandidate {
     }
 
     #[cfg(test)]
-    pub(crate) const fn detached_publication_stats(
-        &self,
-    ) -> Option<DetachedBootstrapPublicationStats> {
+    pub(crate) fn detached_publication_stats(&self) -> Option<DetachedBootstrapPublicationStats> {
         match &self.index_durability {
             DetachedBootstrapIndexDurability::Authored(completed) => {
+                let packed = completed
+                    .packed_construction_stats()
+                    .expect("authored candidates retain four Patricia completions");
                 Some(DetachedBootstrapPublicationStats {
                     immutable_publications: completed.publication_count(),
                     verified_existing_publications: completed.existing_publication_count(),
                     successful_batch_completions: 1,
+                    packed_immutable_publications: packed.iter().fold(0_usize, |total, stats| {
+                        total.saturating_add(stats.immutable_publication_calls)
+                    }),
+                    packed_head_transitions: packed.iter().fold(0_usize, |total, stats| {
+                        total.saturating_add(stats.head_transitions)
+                    }),
+                    packed_capacity_fallbacks: packed.iter().fold(0_usize, |total, stats| {
+                        total.saturating_add(stats.capacity_fallbacks)
+                    }),
+                    packed_peak_resident_bytes: packed.iter().fold(0_usize, |total, stats| {
+                        total.saturating_add(stats.peak_resident_bytes)
+                    }),
                 })
             }
             DetachedBootstrapIndexDurability::ReplayedArchive { .. } => None,
@@ -2524,31 +2541,55 @@ impl DetachedBootstrapAuthoringSession {
                 "detached bootstrap authoring session is incomplete".into(),
             ));
         }
-        candidate
+        let reference_construction = candidate
             .reference_catalog
             .finish_construction()
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        if let Some(index) = candidate.portable_path_index.as_ref() {
+        let portable_path_construction = if let Some(index) = candidate.portable_path_index.as_ref()
+        {
             index
                 .finish_detached_construction(candidate.portable_path_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        }
-        if let Some(index) = candidate.logseq_claim_index.as_ref() {
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+        } else {
+            None
+        };
+        let logseq_claim_construction = if let Some(index) = candidate.logseq_claim_index.as_ref() {
             index
                 .finish_detached_construction(candidate.logseq_claim_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        }
-        if let Some(index) = candidate.page_name_index.as_ref() {
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+        } else {
+            None
+        };
+        let page_name_construction = if let Some(index) = candidate.page_name_index.as_ref() {
             index
                 .finish_detached_construction(&candidate.page_name_root)
-                .map_err(|error| EngineError::Archive(error.to_string()))?;
-        }
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+        } else {
+            None
+        };
         let index_durability = match self.publication {
-            Some(publication) => DetachedBootstrapIndexDurability::Authored(
-                publication
-                    .finish()
-                    .map_err(|error| EngineError::Archive(error.to_string()))?,
-            ),
+            Some(publication) => {
+                let require_completion = |completion: Option<
+                    super::authenticated_patricia::CompletedPatriciaConstruction,
+                >| {
+                    completion.ok_or_else(|| {
+                        EngineError::Archive(
+                            "detached bootstrap Patricia construction is incomplete".into(),
+                        )
+                    })
+                };
+                let packed_constructions = [
+                    require_completion(reference_construction)?,
+                    require_completion(portable_path_construction)?,
+                    require_completion(logseq_claim_construction)?,
+                    require_completion(page_name_construction)?,
+                ];
+                DetachedBootstrapIndexDurability::Authored(
+                    publication
+                        .finish(packed_constructions)
+                        .map_err(|error| EngineError::Archive(error.to_string()))?,
+                )
+            }
             None => DetachedBootstrapIndexDurability::ReplayedArchive {
                 workspace_id: candidate.workspace_id,
                 archive_identity: self.archive_identity,
