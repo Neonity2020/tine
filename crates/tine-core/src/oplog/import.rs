@@ -7925,6 +7925,7 @@ pub fn classify_conflict_copy(
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
 
     use rusqlite::Connection;
     use uuid::Uuid;
@@ -13021,6 +13022,12 @@ mod tests {
             zero_authority.binding().accepted_frontier()
         );
         assert_eq!(zero_proof.bootstrap_rebuild().bootstrap_part_reads, 0);
+        assert_eq!(zero_opened.rebuild.physical_candidate_transactions, 1);
+        assert_eq!(
+            zero_opened.rebuild.physical_candidate_durability_barriers,
+            1
+        );
+        assert_eq!(zero_opened.rebuild.physical_ordinary_transactions, 0);
         assert_materialized_snapshot_matches(&zero_authority, &zero_opened.database);
         assert!(!zero_archive.join("projection-work").exists());
 
@@ -13131,6 +13138,16 @@ mod tests {
         assert_eq!(multi_opened.rebuild.reference_coverage_full_scans, 1);
         assert_eq!(multi_opened.rebuild.final_semantic_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.final_row_digest_equivalence_proofs, 1);
+        assert_eq!(multi_opened.rebuild.physical_candidate_transactions, 1);
+        assert_eq!(
+            multi_opened.rebuild.physical_candidate_durability_barriers,
+            1
+        );
+        assert_eq!(multi_opened.rebuild.physical_ordinary_transactions, 0);
+        assert_eq!(
+            multi_opened.rebuild.physical_ordinary_durability_barriers,
+            0
+        );
         assert!(multi_opened.rebuild.cleanup_fts_rowids <= multi_opened.rebuild.cleanup_owned_rows);
         assert_eq!(multi_proof.bootstrap_rebuild().max_live_bootstrap_parts, 1);
         assert_materialized_snapshot_matches(&multi_authority, &multi_opened.database);
@@ -13144,6 +13161,71 @@ mod tests {
         drop(multi_authority);
         drop(multi);
         assert!(!multi_archive.join("projection-work").exists());
+    }
+
+    #[test]
+    #[ignore = "release-only 1k/2k inactive-bootstrap SQLite phase receipt"]
+    fn inactive_bootstrap_sqlite_candidate_1k_2k_release_phase_receipt() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run this receipt with cargo test -p tine-core --release inactive_bootstrap_sqlite_candidate_1k_2k_release_phase_receipt -- --ignored --nocapture"
+        );
+        for page_count in [1_000_usize, 2_000] {
+            let fixture_started = Instant::now();
+            let owned = (0..page_count)
+                .map(|index| {
+                    (
+                        format!("pages/sqlite-candidate-{index:04}.md"),
+                        format!("- candidate receipt {index:04}\n"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let files = owned
+                .iter()
+                .map(|(path, contents)| (path.as_str(), contents.as_str()))
+                .collect::<Vec<_>>();
+            let label = format!("bootstrap-sqlite-candidate-{page_count}");
+            let (root, prepared, workspace) = prepare_streaming_bootstrap(&label, &files);
+            let fixture_elapsed = fixture_started.elapsed();
+
+            let authority_started = Instant::now();
+            let (_, _, authority) = install_accepted_authority(
+                &root,
+                &prepared,
+                workspace,
+                0x6e40 + page_count as u128,
+                "archive",
+            );
+            let authority_elapsed = authority_started.elapsed();
+            let runtime =
+                ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
+
+            let sqlite_started = Instant::now();
+            let (opened, proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+                &root.path().join("candidate.sqlite"),
+                &runtime,
+                &authority,
+            )
+            .unwrap();
+            let sqlite_elapsed = sqlite_started.elapsed();
+            let parts = prepared.aggregate().parts().len();
+            assert_eq!(opened.rebuild.accepted_events_applied, parts);
+            assert_eq!(opened.rebuild.physical_candidate_transactions, 1);
+            assert_eq!(opened.rebuild.physical_candidate_durability_barriers, 1);
+            assert_eq!(opened.rebuild.physical_ordinary_transactions, 0);
+            assert_eq!(proof.bootstrap_rebuild().bootstrap_part_reads, parts);
+            assert_materialized_snapshot_matches(&authority, &opened.database);
+            eprintln!(
+                "bootstrap_sqlite_candidate_release pages={page_count} parts={parts} fixture_ms={} authority_ms={} sqlite_ms={} candidate_transactions={} candidate_durability_barriers={} semantic_proofs={} row_proofs={}",
+                fixture_elapsed.as_millis(),
+                authority_elapsed.as_millis(),
+                sqlite_elapsed.as_millis(),
+                opened.rebuild.physical_candidate_transactions,
+                opened.rebuild.physical_candidate_durability_barriers,
+                opened.rebuild.final_semantic_equivalence_proofs,
+                opened.rebuild.final_row_digest_equivalence_proofs,
+            );
+        }
     }
 
     #[test]
@@ -13412,6 +13494,8 @@ mod tests {
             &authority,
         )
         .is_err());
+        assert!(!interrupted_path.exists());
+        assert!(!PathBuf::from(format!("{}-auth", interrupted_path.display())).exists());
         let (_retried, retried_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
             &interrupted_path,
             &runtime,

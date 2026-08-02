@@ -1645,6 +1645,12 @@ pub struct RebuildInstrumentation {
     pub reference_coverage_full_scans: usize,
     pub final_semantic_equivalence_proofs: usize,
     pub final_row_digest_equivalence_proofs: usize,
+    /// Accepted-event apply transactions only; schema setup and terminal file
+    /// checkpoint/publication remain separately durable lifecycle boundaries.
+    pub physical_candidate_transactions: u64,
+    pub physical_candidate_durability_barriers: u64,
+    pub physical_ordinary_transactions: u64,
+    pub physical_ordinary_durability_barriers: u64,
 }
 
 impl RebuildInstrumentation {
@@ -3407,6 +3413,10 @@ impl SqliteFrontier {
     > {
         let mut instrumentation = RebuildInstrumentation::default();
         let inactive_bulk = matches!(source.loader, RebuildLoader::InactiveBootstrap { .. });
+        let writes_before = self.physical.write_instrumentation();
+        if inactive_bulk {
+            self.physical.begin_candidate_build()?;
+        }
         let mut cursor = source.cursor()?;
         while let Some(event) = cursor.next_event()? {
             instrumentation.accepted_events_validated += 1;
@@ -3419,7 +3429,7 @@ impl SqliteFrontier {
                 let materialization =
                     attach_authenticated_reference_catalog(source.engine, &event, materialization)?;
                 instrumentation.record_materialization(materialization_stats);
-                self.apply_internal_with_materialization_and_stats(
+                self.apply_candidate_with_materialization_and_stats(
                     &event,
                     ApplyFault::None,
                     Some(&materialization),
@@ -3491,6 +3501,22 @@ impl SqliteFrontier {
         instrumentation.final_semantic_equivalence_proofs += 1;
         let _row_digest = self.materialized_row_digest_for_harness()?;
         instrumentation.final_row_digest_equivalence_proofs += 1;
+        if inactive_bulk {
+            self.physical.finish_candidate_build()?;
+        }
+        let writes_after = self.physical.write_instrumentation();
+        instrumentation.physical_candidate_transactions = writes_after
+            .candidate_transactions
+            .saturating_sub(writes_before.candidate_transactions);
+        instrumentation.physical_candidate_durability_barriers = writes_after
+            .candidate_durability_barriers
+            .saturating_sub(writes_before.candidate_durability_barriers);
+        instrumentation.physical_ordinary_transactions = writes_after
+            .ordinary_transactions
+            .saturating_sub(writes_before.ordinary_transactions);
+        instrumentation.physical_ordinary_durability_barriers = writes_after
+            .ordinary_durability_barriers
+            .saturating_sub(writes_before.ordinary_durability_barriers);
         Ok((instrumentation, cursor.bootstrap_instrumentation()))
     }
 
@@ -3518,6 +3544,37 @@ impl SqliteFrontier {
         event: &AcceptedBatchEvent,
         fault: ApplyFault,
         materialization: Option<&super::MaterializationChange>,
+    ) -> Result<
+        (
+            ApplyDisposition,
+            super::sqlite_materialization::ApplyChangeInstrumentation,
+        ),
+        ProjectionError,
+    > {
+        self.apply_with_materialization_transaction_policy(event, fault, materialization, false)
+    }
+
+    fn apply_candidate_with_materialization_and_stats(
+        &mut self,
+        event: &AcceptedBatchEvent,
+        fault: ApplyFault,
+        materialization: Option<&super::MaterializationChange>,
+    ) -> Result<
+        (
+            ApplyDisposition,
+            super::sqlite_materialization::ApplyChangeInstrumentation,
+        ),
+        ProjectionError,
+    > {
+        self.apply_with_materialization_transaction_policy(event, fault, materialization, true)
+    }
+
+    fn apply_with_materialization_transaction_policy(
+        &mut self,
+        event: &AcceptedBatchEvent,
+        fault: ApplyFault,
+        materialization: Option<&super::MaterializationChange>,
+        candidate_build: bool,
     ) -> Result<
         (
             ApplyDisposition,
@@ -3648,7 +3705,11 @@ impl SqliteFrontier {
                 request.fault = storage_frontier::ApplyFault::ReturnAfterMaterialization;
             }
         }
-        let result = self.physical.apply(&current_physical, &request)?;
+        let result = if candidate_build {
+            self.physical.apply_candidate(&current_physical, &request)?
+        } else {
+            self.physical.apply(&current_physical, &request)?
+        };
         if self.fresh_reference_coverage_count.is_some() {
             if let Some(next_count) = result.materialization.reference_coverage_count {
                 self.fresh_reference_coverage_count = Some(next_count);
@@ -11384,6 +11445,12 @@ mod tests {
         assert_eq!(small.accepted_events_applied, 24);
         assert_eq!(large.accepted_events_validated, 48);
         assert_eq!(large.accepted_events_applied, 48);
+        assert_eq!(small.physical_ordinary_transactions, 24);
+        assert_eq!(small.physical_ordinary_durability_barriers, 24);
+        assert_eq!(large.physical_ordinary_transactions, 48);
+        assert_eq!(large.physical_ordinary_durability_barriers, 48);
+        assert_eq!(small.physical_candidate_transactions, 0);
+        assert_eq!(large.physical_candidate_transactions, 0);
         assert_eq!(small.max_live_events, 1);
         assert_eq!(large.max_live_events, 1);
         assert_eq!(small.max_live_evidence_records, 1);
