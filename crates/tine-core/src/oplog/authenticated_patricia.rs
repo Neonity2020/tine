@@ -98,6 +98,21 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
         .map_err(tine_storage::PatriciaPublicationError::new)
     }
 
+    fn publish_staged_construction_exact(
+        &self,
+        publication: tine_storage::StagedExactImmutablePublication,
+    ) -> Result<(), tine_storage::PatriciaPublicationError> {
+        publication.commit().map_err(|error| {
+            let error = match error {
+                tine_storage::FilesystemError::ByteCollision => StoreError::ImmutableCollision(
+                    "authenticated Patricia construction prerequisite",
+                ),
+                error => filesystem_error_without_collision(error),
+            };
+            tine_storage::PatriciaPublicationError::new(error)
+        })
+    }
+
     fn permits_construction_packed_head_transition(&self) -> bool {
         true
     }
