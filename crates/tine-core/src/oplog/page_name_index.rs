@@ -1602,11 +1602,11 @@ impl PageNameOwnershipStore {
     pub(crate) fn finish_detached_construction(
         &self,
         root: &PageNameOwnershipRootV1,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Option<super::authenticated_patricia::CompletedPatriciaConstruction>, StoreError>
+    {
         root.validate_version_and_shape()?;
         self.patricia
-            .finish_detached_construction(root.patricia_root)?;
-        Ok(())
+            .finish_detached_construction(root.patricia_root)
     }
 
     pub(crate) fn stats(&self) -> PatriciaIndexStats {
