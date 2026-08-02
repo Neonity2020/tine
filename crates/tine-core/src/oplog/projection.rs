@@ -45,6 +45,18 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    // Counts only test builds, so the exact-source reuse proof adds no
+    // production instrumentation or hot-path work.
+    static PAGE_DOCUMENT_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn page_document_build_count_for_test() -> usize {
+    PAGE_DOCUMENT_BUILD_COUNT.with(std::cell::Cell::get)
+}
+
 /// Operation-scoped capability for the deterministic manifested-projection
 /// fault. Dropping it restores the thread's prior hook state, including during
 /// unwinding, so a simulator failure before graph execution cannot fault a
@@ -492,7 +504,13 @@ fn plan_exact_source_projection(
     metadata
         .generated_anchors
         .sort_unstable_by_key(PolicyGeneratedAnchor::block_id);
-    let rendered = render_projection(state, Some(source), expected_base_annotations)?;
+    let rendered = render_projection_document(
+        format,
+        &accepted,
+        Some(source_text),
+        expected_base_annotations,
+        metadata,
+    )?;
     let rendered_annotations_match = expected_base_annotations
         .is_none_or(|expected| expected == rendered.annotations.as_slice());
     if rendered.target == source && rendered_annotations_match {
@@ -520,7 +538,7 @@ fn plan_exact_source_projection(
             expected_base_annotations.or(Some(&annotations)),
             &annotations,
         ),
-        generated_anchors: metadata.generated_anchors,
+        generated_anchors: rendered.generated_anchors,
     })
 }
 
@@ -658,17 +676,36 @@ fn render_projection_page(
         ProjectionRenderMode::Sparse,
         Some(&mut metadata),
     )?;
-    let layout_identities = projection_layout_identities(
+    render_projection_document(
         format,
         &document,
         base_text,
         expected_base_annotations,
+        metadata,
+    )
+}
+
+/// Render a document and its projection metadata that were built together.
+/// Exact-source planning uses this to retain the accepted document it already
+/// validated; ordinary callers continue through `render_projection_page`.
+fn render_projection_document(
+    format: ProjectionFormat,
+    document: &Document,
+    base_text: Option<&str>,
+    expected_base_annotations: Option<&[AnnotatedIdentity]>,
+    mut metadata: ProjectionMetadata,
+) -> Result<RenderedProjection, ProjectionError> {
+    let layout_identities = projection_layout_identities(
+        format,
+        document,
+        base_text,
+        expected_base_annotations,
         &metadata.pending_annotations,
     );
-    let target = serialize_document(format, &document, base_text, &layout_identities).into_bytes();
+    let target = serialize_document(format, document, base_text, &layout_identities).into_bytes();
     let annotations = annotate_serialized_blocks(
         format,
-        &document,
+        document,
         base_text,
         &layout_identities,
         &target,
@@ -729,6 +766,9 @@ fn build_page_document(
     mode: ProjectionRenderMode,
     mut metadata: Option<&mut ProjectionMetadata>,
 ) -> Result<Document, ProjectionError> {
+    #[cfg(test)]
+    PAGE_DOCUMENT_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+
     let forest = ValidatedForest::new(&page.blocks)?;
     let raw_ids = collect_raw_logseq_ids(&page.blocks, format);
     validate_logseq_state(&page.blocks, &raw_ids)?;
@@ -2898,7 +2938,13 @@ mod tests {
         .as_bytes();
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
 
+        let document_builds_before = page_document_build_count_for_test();
         let adopted = plan_projection_adopting_exact_source(workspace, &state, source).unwrap();
+        assert_eq!(
+            page_document_build_count_for_test(),
+            document_builds_before + 1,
+            "exact-source planning must build its accepted document once before rendering the shadow source"
+        );
         assert_eq!(adopted.target(), source);
         assert_eq!(adopted.intent().target(), BlobDescription::of(source));
         assert_eq!(
