@@ -2070,14 +2070,14 @@ impl ReferenceCatalogStateV2 {
             ReferenceCatalogBackend::Construction {
                 store, patricia, ..
             } => {
-                #[cfg(test)]
-                {
-                    self.completed_construction_stats = Some(patricia.get_mut().stats());
-                }
                 store
                     .patricia
                     .finish_construction(patricia.get_mut())
                     .map_err(store_error)?;
+                #[cfg(test)]
+                {
+                    self.completed_construction_stats = Some(patricia.get_mut().stats());
+                }
                 Arc::clone(store)
             }
             ReferenceCatalogBackend::Memory(_)
