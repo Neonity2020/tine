@@ -449,6 +449,10 @@ pub(crate) struct SparseV2RuntimeStatusDto {
     shared_role: Option<String>,
     shared_phase: Option<String>,
     provider_pending: usize,
+    managed_local_pending: usize,
+    managed_local_checkpointed_sequence: u64,
+    managed_local_next_sequence: u64,
+    managed_local_stage: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -582,6 +586,10 @@ pub(crate) fn runtime_status(snapshot: SyncRuntimeStatusSnapshot) -> SparseV2Run
             SyncSharedPhase::Active => "active".into(),
         }),
         provider_pending,
+        managed_local_pending: snapshot.managed_local_pending,
+        managed_local_checkpointed_sequence: snapshot.managed_local_checkpointed_sequence,
+        managed_local_next_sequence: snapshot.managed_local_next_sequence,
+        managed_local_stage: snapshot.managed_local_stage,
     }
 }
 

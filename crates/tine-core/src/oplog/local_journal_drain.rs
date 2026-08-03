@@ -450,11 +450,38 @@ pub(crate) fn resume_managed_local_journal_drain(
     continuation: Option<&ManagedLocalDrainContinuation>,
     publisher: &mut impl ManagedLocalDerivativePublisher,
 ) -> ManagedLocalDrainOutcome {
+    resume_managed_local_journal_drain_with_superseding_projection(
+        session,
+        graph,
+        receipts,
+        frame,
+        None,
+        checkpoint,
+        continuation,
+        publisher,
+    )
+}
+
+/// Runtime integration seam for an older journal record whose guarded graph
+/// target has been replaced by a later committed record for the same page.
+/// The later frame is decoded and reauthenticated against the hot prefix and
+/// exact current graph bytes before the older derivative may advance.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resume_managed_local_journal_drain_with_superseding_projection(
+    session: &mut PromotedRuntimeSession<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    checkpoint: &ManagedLocalDrainCheckpoint,
+    continuation: Option<&ManagedLocalDrainContinuation>,
+    publisher: &mut impl ManagedLocalDerivativePublisher,
+) -> ManagedLocalDrainOutcome {
     let (admission, engine, database, tail) = match session.parts() {
         Ok(parts) => parts,
         Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
     };
-    resume_managed_local_journal_drain_with_parts(
+    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
         &admission,
         graph,
         receipts,
@@ -462,6 +489,7 @@ pub(crate) fn resume_managed_local_journal_drain(
         database,
         tail,
         frame,
+        superseding_projection,
         checkpoint,
         continuation,
         publisher,
@@ -479,6 +507,35 @@ pub(crate) fn resume_managed_local_journal_drain_with_parts(
     database: &mut SqliteFrontier,
     tail: &mut TailOverlay,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    checkpoint: &ManagedLocalDrainCheckpoint,
+    continuation: Option<&ManagedLocalDrainContinuation>,
+    publisher: &mut impl ManagedLocalDerivativePublisher,
+) -> ManagedLocalDrainOutcome {
+    resume_managed_local_journal_drain_with_parts_and_superseding_projection(
+        admission,
+        graph,
+        receipts,
+        engine,
+        database,
+        tail,
+        frame,
+        None,
+        checkpoint,
+        continuation,
+        publisher,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_managed_local_journal_drain_with_parts_and_superseding_projection(
+    admission: &LocalRuntimeAdmission<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    database: &mut SqliteFrontier,
+    tail: &mut TailOverlay,
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    superseding_projection: Option<&LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     checkpoint: &ManagedLocalDrainCheckpoint,
     continuation: Option<&ManagedLocalDrainContinuation>,
     publisher: &mut impl ManagedLocalDerivativePublisher,
@@ -571,16 +628,61 @@ pub(crate) fn resume_managed_local_journal_drain_with_parts(
             )
         }
     };
-    match graph.read_projection_input(intent.path()) {
-        Ok(Some(current)) if current == exact_target => {}
-        Ok(_) => {
+    let projection_superseded = match graph.read_projection_input(intent.path()) {
+        Ok(Some(current)) if current == exact_target => false,
+        Ok(Some(current)) => {
+            let Some(successor_frame) = superseding_projection else {
+                return conflict(
+                    ManagedLocalDrainStage::Authenticate,
+                    "graph target is not the exact journal-authorized bytes",
+                );
+            };
+            let successor = match decode_managed_local_record(successor_frame) {
+                Ok(successor) => successor,
+                Err(error) => {
+                    return conflict(
+                        ManagedLocalDrainStage::Authenticate,
+                        format!("superseding journal frame is invalid: {error}"),
+                    )
+                }
+            };
+            let successor_manifest = successor.prepared_batch().manifest();
+            let successor_intent = successor.projection().intent();
+            let successor_target = match successor_intent.target().bytes() {
+                Some(bytes) => bytes,
+                None => {
+                    return conflict(
+                        ManagedLocalDrainStage::Authenticate,
+                        "superseding journal frame is not a present-page projection",
+                    )
+                }
+            };
+            let successor_is_authoritative = successor_frame.device_id() == frame.device_id()
+                && successor_frame.sequence() > frame.sequence()
+                && successor.sequence() == successor_frame.sequence()
+                && engine.managed_local_prefix_state().next_sequence > successor_frame.sequence()
+                && successor_manifest.workspace_id() == manifest.workspace_id()
+                && successor_manifest.lineage_digest() == manifest.lineage_digest()
+                && successor_manifest.author_device_id() == manifest.author_device_id()
+                && successor_intent.path() == intent.path()
+                && successor_intent.page_id() == intent.page_id()
+                && current == successor_target;
+            if !successor_is_authoritative {
+                return conflict(
+                    ManagedLocalDrainStage::Authenticate,
+                    "graph target is not the exact current journal-authorized successor",
+                );
+            }
+            true
+        }
+        Ok(None) => {
             return conflict(
                 ManagedLocalDrainStage::Authenticate,
                 "graph target is not the exact journal-authorized bytes",
             )
         }
         Err(error) => return recovery(ManagedLocalDrainStage::Authenticate, error.to_string()),
-    }
+    };
 
     let archive = match engine
         .archive_store()
@@ -645,13 +747,15 @@ pub(crate) fn resume_managed_local_journal_drain_with_parts(
         {
             return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string());
         }
-        let staged =
-            match engine.stage_archive_batch_bounded(batch_id, ENGINE_STAGE_WORK_PER_RESUME) {
-                Ok(staged) => staged,
-                Err(error) => {
-                    return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
-                }
-            };
+        let staged = match engine.stage_archive_batch_bounded_below_managed_local_overlay(
+            batch_id,
+            ENGINE_STAGE_WORK_PER_RESUME,
+        ) {
+            Ok(staged) => staged,
+            Err(error) => {
+                return recovery(ManagedLocalDrainStage::EngineAcceptance, error.to_string())
+            }
+        };
         work_done.engine_stage_work = staged.work();
         match staged.outcome().disposition() {
             BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => {}
@@ -792,6 +896,7 @@ pub(crate) fn resume_managed_local_journal_drain_with_parts(
     work_done.projection_work_point_reads = 1;
     match work_index.status(work.work_id()) {
         Ok(Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)) => {}
+        Ok(Some(ProjectionWorkStatus::Superseded { .. })) if projection_superseded => {}
         Ok(Some(ProjectionWorkStatus::Blocked | ProjectionWorkStatus::Superseded { .. })) => {
             return conflict(
                 ManagedLocalDrainStage::ProjectionAdoption,
@@ -811,23 +916,25 @@ pub(crate) fn resume_managed_local_journal_drain_with_parts(
             )
         }
     }
-    if let Err(error) =
-        crate::oplog::projection::execute_manifested_projection_work(graph, receipts, engine, &work)
-    {
-        let current = graph.read_projection_input(intent.path());
-        return if matches!(current, Ok(Some(bytes)) if bytes != exact_target) {
-            conflict(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                error.to_string(),
-            )
-        } else {
-            pending_with_detail(
-                ManagedLocalDrainStage::ProjectionAdoption,
-                frame,
-                &record,
-                error.to_string(),
-            )
-        };
+    if !projection_superseded {
+        if let Err(error) = crate::oplog::projection::execute_manifested_projection_work(
+            graph, receipts, engine, &work,
+        ) {
+            let current = graph.read_projection_input(intent.path());
+            return if matches!(current, Ok(Some(bytes)) if bytes != exact_target) {
+                conflict(
+                    ManagedLocalDrainStage::ProjectionAdoption,
+                    error.to_string(),
+                )
+            } else {
+                pending_with_detail(
+                    ManagedLocalDrainStage::ProjectionAdoption,
+                    frame,
+                    &record,
+                    error.to_string(),
+                )
+            };
+        }
     }
     if drain_fault!(AfterProjectionAdoption) {
         return pending(ManagedLocalDrainStage::AuthorshipReceipt, frame, &record);

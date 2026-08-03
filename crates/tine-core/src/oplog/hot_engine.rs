@@ -11157,6 +11157,25 @@ impl ShardedHotEngine {
         })
     }
 
+    /// Expand one archived derivative beneath the journal-committed overlay.
+    ///
+    /// Managed-local records are already visible in `local_overlay`, often
+    /// several records ahead of accepted history. Ordinary archive staging
+    /// must derive this batch's projection work from accepted state, not from
+    /// those later foreground records. Detaching only the in-memory overlay
+    /// for the serialized staging call preserves the user's current hot view
+    /// while advancing the durable accepted base in journal order.
+    pub(crate) fn stage_archive_batch_bounded_below_managed_local_overlay(
+        &mut self,
+        batch_id: BatchId,
+        max_work: usize,
+    ) -> Result<BoundedStageOutcome, EngineError> {
+        let overlay = std::mem::take(&mut self.local_overlay);
+        let outcome = self.stage_archive_batch_bounded(batch_id, max_work);
+        self.local_overlay = overlay;
+        outcome
+    }
+
     pub(crate) fn stage_archive_batch_for_recovery(
         &mut self,
         batch_id: BatchId,
@@ -12590,6 +12609,133 @@ impl ShardedHotEngine {
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
         let record = decode_managed_local_record(frame)?;
         self.apply_managed_local_record(record, frame.payload())
+    }
+
+    /// Restore one journal-prefix position after the accepted engine base has
+    /// reopened. A derivative drain may have accepted the exact batch before a
+    /// crash without reaching its final checkpoint. In that state replaying
+    /// the CRDT update again would correctly report a stale base, but the
+    /// runtime still has to restore the journal sequence, causal predecessor,
+    /// projection predecessor, and rolling commitment before serving another
+    /// local edit.
+    ///
+    /// Exact unaccepted records continue through the ordinary replay
+    /// transition above. An already-accepted record is adopted only after its
+    /// authenticated accepted-history manifest fingerprint matches the
+    /// canonical journal manifest and the record still satisfies the strict
+    /// managed-local shape. No document or graph mutation occurs in the
+    /// accepted branch.
+    pub fn restore_managed_local_record(
+        &mut self,
+        frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    ) -> Result<(), ManagedLocalRecordError> {
+        let record = decode_managed_local_record(frame)?;
+        let batch_id = record.prepared_batch.manifest().batch_id();
+        if self.accepted_batch_is_active(batch_id)? {
+            self.adopt_accepted_managed_local_record(record, frame.payload())
+        } else {
+            self.apply_managed_local_record(record, frame.payload())?;
+            Ok(())
+        }
+    }
+
+    fn adopt_accepted_managed_local_record(
+        &mut self,
+        record: ManagedLocalRecord,
+        bytes: &[u8],
+    ) -> Result<(), ManagedLocalRecordError> {
+        let manifest = record.prepared_batch.manifest();
+        if manifest.workspace_id() != self.workspace_id {
+            return Err(EngineError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            }
+            .into());
+        }
+        if manifest.lineage_digest() != self.lineage_digest {
+            return Err(EngineError::LineageMismatch {
+                expected: self.lineage_digest,
+                found: manifest.lineage_digest(),
+            }
+            .into());
+        }
+        if record.sequence != self.local_overlay.next_sequence {
+            return Err(ManagedLocalRecordError::OutOfOrder {
+                expected: self.local_overlay.next_sequence,
+                found: record.sequence,
+            });
+        }
+        if manifest.origin() != BatchOrigin::LocalMutation
+            || !record.semantic_effect.pages().is_empty()
+            || record.semantic_effect.blocks().iter().any(|delta| {
+                match (&delta.before, &delta.after) {
+                    (Some(before), Some(after)) => {
+                        before.logseq_uuid != after.logseq_uuid
+                            || before.logseq_identity_origin != after.logseq_identity_origin
+                    }
+                    (None, Some(after)) => {
+                        after.logseq_uuid.is_some() || after.logseq_identity_origin.is_some()
+                    }
+                    (Some(_), None) | (None, None) => false,
+                }
+            })
+        {
+            return Err(ManagedLocalRecordError::Unsupported(
+                "accepted journal record is not an ordinary existing-page managed-local edit"
+                    .into(),
+            ));
+        }
+        let affected = affected_projection_pages(&record.semantic_effect);
+        if affected.len() != 1 || !affected.contains(&record.projection.intent.page_id()) {
+            return Err(ManagedLocalRecordError::Unsupported(
+                "accepted journal record does not affect exactly its one projected page".into(),
+            ));
+        }
+        let evidence = self.accepted_batch_evidence(manifest.batch_id())?;
+        if evidence.manifest_fingerprint() != batch_fingerprint_from_manifest(manifest) {
+            return Err(ManagedLocalRecordError::CorruptPayload(
+                "accepted history differs from the canonical journal manifest".into(),
+            ));
+        }
+        if let Some(prior) = self.local_overlay.entries.last() {
+            let dot = manifest.causal_dot();
+            let expected_counter = prior.causal_dot.counter().checked_add(1).ok_or_else(|| {
+                ManagedLocalRecordError::CorruptPayload(
+                    "accepted journal causal counter overflow".into(),
+                )
+            })?;
+            if dot.peer_id() != prior.causal_dot.peer_id()
+                || dot.counter() != expected_counter
+                || !manifest.causal_dependency_heads().contains(&prior.batch_id)
+            {
+                return Err(ManagedLocalRecordError::CorruptPayload(
+                    "accepted journal prefix lost its exact causal predecessor".into(),
+                ));
+            }
+        }
+        let next_sequence = self
+            .local_overlay
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| ManagedLocalRecordError::CorruptPayload("sequence overflow".into()))?;
+        let payload_digest = ContentDigest::of(bytes);
+        let mut commitment = Vec::with_capacity(96);
+        commitment.extend_from_slice(b"tine/managed-local-prefix/v1\0");
+        commitment.extend_from_slice(self.local_overlay.commitment.as_bytes());
+        commitment.extend_from_slice(payload_digest.as_bytes());
+        commitment.extend_from_slice(&record.sequence.to_be_bytes());
+        self.local_overlay.commitment = ContentDigest::of(&commitment);
+        self.local_overlay.entries.push(CommittedLocalOverlayEntry {
+            sequence: record.sequence,
+            batch_id: manifest.batch_id(),
+            causal_dot: manifest.causal_dot(),
+            projection: record.projection,
+        });
+        self.local_overlay.next_sequence = next_sequence;
+        let mut work = self.local_overlay.work.get();
+        work.commits_applied = work.commits_applied.saturating_add(1);
+        self.local_overlay.work.set(work);
+        Ok(())
     }
 
     fn validate_managed_local_candidate(
@@ -15960,14 +16106,41 @@ impl ShardedHotEngine {
                     return Ok(false);
                 }
             }
-            let ancestry = self.collect_batch_ancestry(
-                &new.direct_dependency_heads().iter().copied().collect(),
-                self.is_blocked(),
-            )?;
+            let direct_heads = new
+                .direct_dependency_heads()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let ancestry = match self.collect_batch_ancestry(&direct_heads, self.is_blocked()) {
+                Ok(ancestry) => ancestry,
+                Err(EngineError::MissingDependency(candidate))
+                    if direct_heads.contains(&candidate)
+                        && matches!(self.statuses.get(&candidate), Some(ArchiveStatus::Staged)) =>
+                {
+                    // Projection work is prepared after the candidate's
+                    // accepted status is durable but before its in-memory
+                    // status transition is committed. Its post-frontier
+                    // therefore names the candidate itself. Authenticate the
+                    // candidate through the retained staged manifest, then
+                    // prove older heads through its already-accepted causal
+                    // dependencies.
+                    let dependencies = self
+                        .archive
+                        .get(&candidate)
+                        .ok_or(EngineError::MissingDependency(candidate))?
+                        .manifest()
+                        .causal_dependency_heads()
+                        .iter()
+                        .copied()
+                        .collect();
+                    self.collect_batch_ancestry(&dependencies, self.is_blocked())?
+                }
+                Err(error) => return Err(error),
+            };
             if old
                 .direct_dependency_heads()
                 .iter()
-                .any(|head| !ancestry.contains_key(head))
+                .any(|head| !direct_heads.contains(head) && !ancestry.contains_key(head))
             {
                 return Ok(false);
             }

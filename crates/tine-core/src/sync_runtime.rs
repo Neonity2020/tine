@@ -28,8 +28,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tine_storage::{
+    publish_immutable_exact, read_optional_regular, LocalJournalFrame, LocalJournalSegment,
+};
 
 use crate::model::{
     sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, Graph, PageDto, PageEntry,
@@ -74,18 +79,25 @@ use crate::oplog::local_active::{
     reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
     PromotedRuntimeOpenInstrumentation,
 };
+use crate::oplog::local_journal_drain::{
+    resume_managed_local_journal_drain_with_superseding_projection,
+    ManagedLocalDerivativeAuthority, ManagedLocalDerivativePublisher, ManagedLocalDrainCheckpoint,
+    ManagedLocalDrainContinuation, ManagedLocalDrainOutcome, ManagedLocalDrainStage,
+    ManagedLocalPublicationState,
+};
 #[cfg(test)]
 use crate::oplog::migration_backup::MigrationBackupInstrumentation;
 use crate::oplog::migration_backup::{verify_migration_source_backup, MigrationBackupRoot};
 use crate::oplog::object_store::{
-    prepare_object_store_parent_nofollow, ObjectStore, ObjectStoreManifestCursor,
+    ensure_directory_nofollow, open_dir_nofollow, prepare_object_store_parent_nofollow,
+    ObjectStore, ObjectStoreManifestCursor,
 };
 #[cfg(test)]
 use crate::oplog::operational_coordinator::{fail_repeatedly_at, OperationalFaultPoint};
 use crate::oplog::operational_coordinator::{
     LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
     LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
-    ProviderArchiveContinuation, ProviderArchiveIngress,
+    PreparedLocalMutationState, ProviderArchiveContinuation, ProviderArchiveIngress,
 };
 use crate::oplog::projection::render_requested_page_document;
 use crate::oplog::projection_store::ProjectionReceiptStore;
@@ -114,22 +126,34 @@ use crate::oplog::simulator::{
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 #[cfg(test)]
 use crate::oplog::sqlite::BootstrapSqliteRebuildInstrumentation;
+use crate::oplog::trusted_local_commit::{
+    TrustedLocalCommitCoordinator, TrustedLocalCommitOutcome, TrustedLocalCommitted,
+    TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
+    TrustedLocalRestartProjectionOutcome,
+};
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
-    BatchId, BatchOrigin, BlockId, BlockLocation, CanonicalGraphResourceId, ContentDigest,
-    CurrentPageAtPath, DeviceId, DocumentId, FrontierReferenceHit, LineageDigest, LogicalPageName,
-    LogseqUuid, ManagedPath, ManagedTextKind, MaterializedBlock, MaterializedBlockRow,
-    MaterializedEntityId, MaterializedPage, MaterializedPageRow, MaterializedPropertyRow,
-    MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow, OperationBatch,
-    OperationObject, OperationTransaction, PageId, ProjectionEndpointId, ReferenceCatalogPolicyV1,
-    ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation, SessionId, WorkspaceId,
-    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    decode_managed_local_record, BatchId, BatchOrigin, BlockId, BlockLocation,
+    CanonicalGraphResourceId, ContentDigest, CurrentPageAtPath, DeviceId, DocumentId,
+    FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqUuid,
+    ManagedLocalJournalPayloadKind, ManagedPath, ManagedTextKind, MaterializedBlock,
+    MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
+    MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
+    OperationBatch, OperationObject, OperationTransaction, PageId, ProjectionEndpointId,
+    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
+    SessionId, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 use uuid::Uuid;
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
 const ACTOR_STACK_BYTES: usize = 16 * 1024 * 1024;
 const RUNTIME_OPEN_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);
+#[cfg(test)]
+const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_secs(30);
+const MANAGED_LOCAL_JOURNAL_NAMESPACE: &str = "managed-local-journal-v1";
+const MANAGED_LOCAL_CHECKPOINT_BYTES: u64 = 4096;
 const MAX_WATCHER_OBSERVATIONS: usize = 256;
 const MAX_WATCHER_PATH_BYTES: usize = 64 * 1024;
 const MAX_CLEAN_DRAIN_TURNS: usize = 64;
@@ -1255,6 +1279,10 @@ pub struct SyncRuntimeStatusSnapshot {
     pub shared_role: Option<SyncSharedRole>,
     pub shared_phase: Option<SyncSharedPhase>,
     pub provider_pending: usize,
+    pub managed_local_pending: usize,
+    pub managed_local_checkpointed_sequence: u64,
+    pub managed_local_next_sequence: u64,
+    pub managed_local_stage: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2093,6 +2121,10 @@ impl SyncRuntimeHandle {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            managed_local_pending: 0,
+            managed_local_checkpointed_sequence: 0,
+            managed_local_next_sequence: 0,
+            managed_local_stage: None,
         };
         let status = Arc::new(RwLock::new(initial));
         let (sender, receiver) = mpsc::sync_channel(ACTOR_CHANNEL_CAPACITY);
@@ -2127,6 +2159,10 @@ impl SyncRuntimeHandle {
                         shared_role: None,
                         shared_phase: None,
                         provider_pending: 0,
+                        managed_local_pending: 0,
+                        managed_local_checkpointed_sequence: 0,
+                        managed_local_next_sequence: 0,
+                        managed_local_stage: None,
                     };
                 }
                 #[cfg(test)]
@@ -2212,6 +2248,10 @@ impl SyncRuntimeHandle {
             shared_role: None,
             shared_phase: None,
             provider_pending: 0,
+            managed_local_pending: 0,
+            managed_local_checkpointed_sequence: 0,
+            managed_local_next_sequence: 0,
+            managed_local_stage: None,
         };
         let status = Arc::new(RwLock::new(initial));
         let (sender, receiver) = mpsc::sync_channel(ACTOR_CHANNEL_CAPACITY);
@@ -2243,6 +2283,10 @@ impl SyncRuntimeHandle {
                         shared_role: None,
                         shared_phase: None,
                         provider_pending: 0,
+                        managed_local_pending: 0,
+                        managed_local_checkpointed_sequence: 0,
+                        managed_local_next_sequence: 0,
+                        managed_local_stage: None,
                     };
                 }
                 #[cfg(test)]
@@ -5208,7 +5252,23 @@ fn run_actor_loop(
         return;
     }
 
-    while let Ok(request) = receiver.recv() {
+    loop {
+        let request = match receiver.recv_timeout(MANAGED_LOCAL_IDLE_TICK) {
+            Ok(request) => request,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if actor
+                    .managed_local
+                    .as_ref()
+                    .is_some_and(|managed| managed.pending_count() != 0)
+                {
+                    let tick = actor.tick();
+                    actor.last_tick = Some(tick);
+                    *shared_status.write().unwrap() = actor.snapshot();
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let should_stop = match request {
             ActorRequest::Query { request, reply } => {
                 let result = actor.query(request);
@@ -5365,6 +5425,141 @@ fn run_actor_loop(
 enum PendingLocalMutation {
     Reconciliation { transaction: OperationTransaction },
     Published(LocalPublishedContinuation),
+}
+
+enum PendingManagedLocalCommit {
+    Projection(TrustedLocalCommittedPendingProjection),
+    Overlay(TrustedLocalCommittedRecovery),
+    Response(TrustedLocalCommitted),
+}
+
+struct ManagedLocalRuntimeState {
+    directory: Dir,
+    journal: LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+    frames: VecDeque<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    latest_projection_frames: BTreeMap<String, LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    checkpoint: ManagedLocalDrainCheckpoint,
+    continuation: Option<ManagedLocalDrainContinuation>,
+    pending_commit: Option<PendingManagedLocalCommit>,
+    authorship_complete: BTreeSet<BatchId>,
+    last_failure: Option<String>,
+}
+
+impl ManagedLocalRuntimeState {
+    fn pending_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn stage(&self) -> Option<String> {
+        if self.pending_commit.is_some() {
+            return Some("committed_foreground_recovery".into());
+        }
+        self.continuation
+            .as_ref()
+            .map(|continuation| format!("{:?}", continuation.stage()).to_ascii_lowercase())
+            .or_else(|| (!self.frames.is_empty()).then(|| "authenticate".into()))
+    }
+}
+
+struct ManagedLocalPublisherAttempt {
+    batch_id: BatchId,
+    authorship_complete: bool,
+    provider_complete: bool,
+    requested_authorship: Option<ManagedLocalDerivativeAuthority>,
+    requested_provider: Option<ManagedLocalDerivativeAuthority>,
+}
+
+impl ManagedLocalDerivativePublisher for ManagedLocalPublisherAttempt {
+    fn ensure_local_authorship(
+        &mut self,
+        authority: &ManagedLocalDerivativeAuthority,
+    ) -> ManagedLocalPublicationState {
+        if authority.batch_id != self.batch_id {
+            return ManagedLocalPublicationState::Conflict(
+                "derivative authorship authority names another journal batch".into(),
+            );
+        }
+        if self.authorship_complete {
+            ManagedLocalPublicationState::Complete
+        } else {
+            self.requested_authorship = Some(authority.clone());
+            ManagedLocalPublicationState::Pending(
+                "runtime authorship owner will adopt the accepted record".into(),
+            )
+        }
+    }
+
+    fn ensure_provider_publication(
+        &mut self,
+        authority: &ManagedLocalDerivativeAuthority,
+    ) -> ManagedLocalPublicationState {
+        if authority.batch_id != self.batch_id {
+            return ManagedLocalPublicationState::Conflict(
+                "derivative provider authority names another journal batch".into(),
+            );
+        }
+        if self.provider_complete {
+            ManagedLocalPublicationState::Complete
+        } else {
+            self.requested_provider = Some(authority.clone());
+            ManagedLocalPublicationState::Pending(
+                "runtime provider owner will publish the accepted frontier".into(),
+            )
+        }
+    }
+}
+
+enum TrustedLocalRuntimeAttempt {
+    Declined,
+    Reconciliation(Vec<ManagedPath>),
+    Committed(TrustedLocalCommitOutcome),
+}
+
+enum EditorCoordinatorExecution {
+    Trusted(TrustedLocalCommitOutcome),
+    Reconciliation(Vec<ManagedPath>),
+    Declined,
+}
+
+fn prepare_trusted_local_runtime_commit(
+    session: &mut crate::oplog::local_active::PromotedRuntimeSession<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+    target_page: &PageDto,
+    transaction: &OperationTransaction,
+) -> Result<TrustedLocalRuntimeAttempt, String> {
+    let base_revision = target_page
+        .rev
+        .as_deref()
+        .ok_or_else(|| "existing managed page has no exact graph revision".to_owned())?;
+    let prepared =
+        OperationalCoordinator::prepare_trusted_local(session, graph, receipts, transaction)
+            .map_err(|error| format!("trusted-local preparation failed before append: {error}"))?;
+    let prepared = match prepared {
+        PreparedLocalMutationState::Prepared(prepared) => prepared,
+        PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
+            return Ok(TrustedLocalRuntimeAttempt::Reconciliation(
+                reconciliation.paths().to_vec(),
+            ));
+        }
+    };
+    let engine = session
+        .engine()
+        .map_err(|error| format!("trusted-local engine authority was refused: {error}"))?;
+    let outcome = TrustedLocalCommitCoordinator::commit(
+        graph,
+        journal,
+        engine,
+        target_page,
+        base_revision,
+        prepared,
+    )
+    .map_err(|error| format!("trusted-local commit failed before append: {error}"))?;
+    Ok(match outcome {
+        TrustedLocalCommitOutcome::Declined { .. } => TrustedLocalRuntimeAttempt::Declined,
+        committed => TrustedLocalRuntimeAttempt::Committed(committed),
+    })
 }
 
 enum EditorTurnReadiness {
@@ -5680,6 +5875,8 @@ struct RuntimeActor {
     runtime: Option<PromotedLocalRuntime>,
     feed: Option<ExactExternalFeedState>,
     local_mutation: Option<PendingLocalMutation>,
+    managed_local: Option<ManagedLocalRuntimeState>,
+    prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
@@ -5747,6 +5944,193 @@ struct RuntimeActor {
     provider_recovery_backfill_cursor: Option<ObjectStoreManifestCursor>,
     pending_join: Option<PendingSharedJoin>,
     _not_send_or_sync: PhantomData<Rc<()>>,
+}
+
+fn managed_local_checkpoint_filename(next_sequence: u64) -> String {
+    format!("checkpoint-{next_sequence:020}.bin")
+}
+
+fn open_managed_local_runtime(
+    application_runtime_root: &Path,
+    binding: &EnrollmentBindingV1,
+    graph: &Graph,
+    authority: &mut LocalActiveAuthority,
+    runtime: &mut PromotedLocalRuntime,
+) -> Result<ManagedLocalRuntimeState, String> {
+    let root = Dir::open_ambient_dir(application_runtime_root, ambient_authority())
+        .map_err(|error| format!("cannot retain private managed-local runtime root: {error}"))?;
+    ensure_directory_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
+    let namespace = open_dir_nofollow(&root, MANAGED_LOCAL_JOURNAL_NAMESPACE).map_err(display)?;
+    let workspace_name = format!(
+        "workspace-{}-{}",
+        binding.workspace_id(),
+        binding.lineage_digest()
+    );
+    ensure_directory_nofollow(&namespace, &workspace_name).map_err(display)?;
+    let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(display)?;
+    let segment_name = format!("device-{}.segment", binding.device_id().as_uuid().simple());
+    let (journal, _recovery) =
+        LocalJournalSegment::open(&directory, &segment_name, binding.device_id().as_uuid())
+            .map_err(|error| format!("cannot open enrolled managed-local journal: {error}"))?;
+    let mut recovered_frames = Vec::new();
+    journal
+        .replay(|frame| recovered_frames.push(frame))
+        .map_err(|error| format!("cannot scan enrolled managed-local journal: {error}"))?;
+    if recovered_frames.len() as u64 != journal.next_sequence() {
+        return Err("managed-local journal sequence/count binding is inconsistent".into());
+    }
+
+    let mut checkpoint = ManagedLocalDrainCheckpoint::initial(
+        binding.device_id().as_uuid(),
+        binding.workspace_id(),
+        binding.lineage_digest(),
+    );
+    let mut missing_checkpoint = false;
+    let checkpoint_probe_end = journal
+        .next_sequence()
+        .checked_add(1)
+        .ok_or_else(|| "managed-local checkpoint sequence overflow".to_owned())?;
+    for next_sequence in 1..=checkpoint_probe_end {
+        let filename = managed_local_checkpoint_filename(next_sequence);
+        let bytes =
+            read_optional_regular(&directory, &filename, MANAGED_LOCAL_CHECKPOINT_BYTES, None)
+                .map_err(|error| {
+                    format!("cannot read managed-local checkpoint {filename}: {error}")
+                })?;
+        let Some(bytes) = bytes else {
+            missing_checkpoint = true;
+            continue;
+        };
+        if missing_checkpoint || next_sequence > journal.next_sequence() {
+            return Err(format!(
+                "managed-local checkpoint {filename} is divergent from the journal prefix"
+            ));
+        }
+        let decoded = ManagedLocalDrainCheckpoint::decode(
+            &bytes,
+            binding.device_id().as_uuid(),
+            binding.workspace_id(),
+            binding.lineage_digest(),
+        )
+        .map_err(|error| format!("managed-local checkpoint {filename} is invalid: {error}"))?;
+        if decoded.next_sequence() != next_sequence {
+            return Err(format!(
+                "managed-local checkpoint {filename} names sequence {}",
+                decoded.next_sequence()
+            ));
+        }
+        checkpoint = decoded;
+    }
+
+    let checkpointed = usize::try_from(checkpoint.next_sequence())
+        .map_err(|_| "managed-local checkpoint exceeds addressable memory".to_owned())?;
+    if checkpointed > recovered_frames.len() {
+        return Err("managed-local checkpoint is ahead of the authenticated journal".into());
+    }
+    let mut session = runtime
+        .admit_promoted_mutation(authority, graph)
+        .map_err(|error| format!("cannot authorize managed-local startup recovery: {error}"))?;
+    let engine = session
+        .engine()
+        .map_err(|error| format!("cannot retain managed-local startup engine: {error}"))?;
+
+    for frame in &recovered_frames[..checkpointed] {
+        let record = decode_managed_local_record(frame).map_err(|error| {
+            format!(
+                "managed-local journal record {}:{} is invalid: {error}",
+                frame.device_id(),
+                frame.sequence()
+            )
+        })?;
+        let batch_id = record.prepared_batch().manifest().batch_id();
+        if !engine.accepted_batch_is_active(batch_id).map_err(display)? {
+            return Err(format!(
+                "checkpointed managed-local record {}:{}, batch {batch_id}, is not accepted",
+                frame.device_id(),
+                frame.sequence()
+            ));
+        }
+        engine
+            .restore_managed_local_record(frame)
+            .map_err(|error| {
+                format!(
+                    "cannot restore checkpointed managed-local record {}:{}: {error}",
+                    frame.device_id(),
+                    frame.sequence()
+                )
+            })?;
+    }
+    if checkpointed != 0 {
+        let accepted = engine.accepted_frontier_root().map_err(display)?;
+        engine
+            .collapse_managed_local_prefix(&accepted)
+            .map_err(|error| {
+                format!("cannot collapse checkpointed managed-local prefix: {error}")
+            })?;
+    }
+
+    let mut frames = VecDeque::new();
+    let mut latest_projection_frames = BTreeMap::new();
+    for frame in recovered_frames.into_iter().skip(checkpointed) {
+        let record = decode_managed_local_record(&frame).map_err(|error| {
+            format!(
+                "managed-local journal record {}:{} is invalid: {error}",
+                frame.device_id(),
+                frame.sequence()
+            )
+        })?;
+        let input = TrustedLocalCommitCoordinator::restart_projection_input(&record).map_err(
+            |error| {
+                format!(
+                    "managed-local journal record {}:{} has invalid projection recovery input: {error}",
+                    frame.device_id(),
+                    frame.sequence()
+                )
+            },
+        )?;
+        match TrustedLocalCommitCoordinator::recover_projection_after_restart(
+            graph,
+            frame.clone(),
+            input,
+        ) {
+            TrustedLocalRestartProjectionOutcome::Durable(_) => {}
+            TrustedLocalRestartProjectionOutcome::CommittedPending(pending) => {
+                return Err(format!(
+                    "managed-local journal record {}:{} cannot finish exact graph target {}: {}",
+                    frame.device_id(),
+                    frame.sequence(),
+                    pending.relative_path(),
+                    pending.last_error()
+                ));
+            }
+        }
+        engine
+            .restore_managed_local_record(&frame)
+            .map_err(|error| {
+                format!(
+                    "cannot restore managed-local journal record {}:{}: {error}",
+                    frame.device_id(),
+                    frame.sequence()
+                )
+            })?;
+        latest_projection_frames.insert(
+            record.projection().intent().path().as_str().to_owned(),
+            frame.clone(),
+        );
+        frames.push_back(frame);
+    }
+
+    Ok(ManagedLocalRuntimeState {
+        directory,
+        journal,
+        frames,
+        latest_projection_frames,
+        checkpoint,
+        continuation: None,
+        pending_commit: None,
+        authorship_complete: BTreeSet::new(),
+        last_failure: None,
+    })
 }
 
 impl RuntimeActor {
@@ -5969,8 +6353,8 @@ impl RuntimeActor {
         request: SyncRuntimeOpenRequest,
         graph: Graph,
         receipts: ProjectionReceiptStore,
-        authority: LocalActiveAuthority,
-        runtime: PromotedLocalRuntime,
+        mut authority: LocalActiveAuthority,
+        mut runtime: PromotedLocalRuntime,
         baseline: ReconciliationBaseline,
         enrollment_root: EnrollmentApplicationRoot,
         binding: EnrollmentBindingV1,
@@ -5982,6 +6366,13 @@ impl RuntimeActor {
         #[cfg(test)]
         let workspace_id = binding.workspace_id();
         let recovery = map_recovery(runtime.recovery());
+        let managed_local = open_managed_local_runtime(
+            &request.application_runtime_root,
+            &binding,
+            &graph,
+            &mut authority,
+            &mut runtime,
+        )?;
         #[cfg(test)]
         let phase_started = Instant::now();
         let feed =
@@ -6064,6 +6455,8 @@ impl RuntimeActor {
             runtime: Some(runtime),
             feed: Some(feed),
             local_mutation: None,
+            managed_local: Some(managed_local),
+            prepared_application_reply: None,
             recovery,
             last_watcher,
             last_tick: None,
@@ -6152,6 +6545,29 @@ impl RuntimeActor {
         if let Some(detail) = &self.terminal {
             return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
         }
+        let mut retained = Vec::with_capacity(observations.len());
+        for observation in observations {
+            let is_echo = match &observation {
+                SyncWatcherObservation::ManagedPath(path) => {
+                    match self.pending_managed_local_projection_is_exact(path) {
+                        Ok(is_echo) => is_echo,
+                        Err(detail) => {
+                            self.latch_terminal(detail.clone());
+                            return Err(SyncRuntimeRequestError::ActorRefused(detail));
+                        }
+                    }
+                }
+                SyncWatcherObservation::UnknownPath
+                | SyncWatcherObservation::NotifyError
+                | SyncWatcherObservation::RescanRequired => false,
+            };
+            if !is_echo {
+                retained.push(observation);
+            }
+        }
+        if retained.is_empty() {
+            return Ok(());
+        }
         let runtime = self
             .runtime
             .as_ref()
@@ -6163,9 +6579,7 @@ impl RuntimeActor {
             .observe(
                 &self.graph,
                 runtime,
-                observations
-                    .into_iter()
-                    .map(SyncWatcherObservation::into_core),
+                retained.into_iter().map(SyncWatcherObservation::into_core),
             );
         self.refresh_watcher();
         match result {
@@ -6182,6 +6596,53 @@ impl RuntimeActor {
             }
             Err(error) => Err(SyncRuntimeRequestError::ActorRefused(error.to_string())),
         }
+    }
+
+    fn pending_managed_local_projection_is_exact(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<bool, String> {
+        let Some(managed) = self.managed_local.as_ref() else {
+            return Ok(false);
+        };
+        let mut expected = None;
+        for frame in managed.frames.iter().rev() {
+            let record = decode_managed_local_record(frame).map_err(|error| {
+                format!(
+                    "managed-local watcher authentication failed for {}:{}: {error}",
+                    frame.device_id(),
+                    frame.sequence()
+                )
+            })?;
+            if record.projection().intent().path() == path {
+                expected = record
+                    .projection()
+                    .intent()
+                    .target()
+                    .bytes()
+                    .map(|bytes| (frame.sequence(), bytes.to_vec()));
+                break;
+            }
+        }
+        let Some((sequence, expected)) = expected else {
+            return Ok(false);
+        };
+        let prefix = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "managed-local watcher authentication has no runtime".to_owned())?
+            .engine()
+            .managed_local_prefix_state();
+        if prefix.next_sequence <= sequence {
+            return Err(format!(
+                "managed-local watcher frame {sequence} is not applied to the hot prefix"
+            ));
+        }
+        let current = self
+            .graph
+            .read_projection_input(path)
+            .map_err(|error| format!("cannot authenticate watcher echo at {path}: {error}"))?;
+        Ok(current.as_deref() == Some(expected.as_slice()))
     }
 
     fn observe_provider(
@@ -6563,19 +7024,19 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
-        let pages = read
-            .pages_by_path(&path, 2)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        let page_id = match pages.as_slice() {
-            [] => return Ok(ApplicationExactLoad::Missing),
-            [page] => page.page_id,
-            _ => return Ok(ApplicationExactLoad::Ambiguous),
+        let page_id = match runtime
+            .engine()
+            .current_page_at_path(&path)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+        {
+            CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
+            CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {
+                return Ok(ApplicationExactLoad::Missing)
+            }
+            CurrentPageAtPath::PortableCollision(_)
+            | CurrentPageAtPath::ReleasedPortableCollision(_) => {
+                return Ok(ApplicationExactLoad::Ambiguous)
+            }
         };
         let current = self.load_application_page_id_ready(page_id)?;
         if current.editor.page.path != path {
@@ -6592,7 +7053,7 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        load_source_authenticated_application_page(runtime, &self.graph, page_id)
+        load_hot_source_authenticated_application_page(runtime, &self.graph, page_id)
             .map_err(map_editor_application_error)?
             .ok_or(SyncApplicationPageRequestError::ActorRefused)
     }
@@ -6693,7 +7154,11 @@ impl RuntimeActor {
             .map_err(map_editor_application_error)?
         {
             SyncEditorSaveOutcome::Durable { batch_id, page, .. } => {
-                let accepted = self.reload_application_page(&page.path)?;
+                let accepted = match self.prepared_application_reply.take() {
+                    Some((prepared_batch, accepted)) if prepared_batch == batch_id => accepted,
+                    Some(_) => return Err(SyncApplicationPageRequestError::ActorRefused),
+                    None => self.reload_application_page(&page.path)?,
+                };
                 Ok(SyncApplicationPageSaveOutcome::Saved {
                     batch_id,
                     page: accepted.page,
@@ -6701,7 +7166,9 @@ impl RuntimeActor {
                 })
             }
             SyncEditorSaveOutcome::Unchanged { page, .. } => {
-                let accepted = self.reload_application_page(&page.path)?;
+                let accepted = self.load_application_page_id_ready(
+                    parse_editor_page_id(&page.page_id).map_err(map_editor_application_error)?,
+                )?;
                 Ok(SyncApplicationPageSaveOutcome::Unchanged {
                     page: accepted.page,
                     revision: accepted.revision,
@@ -6835,7 +7302,7 @@ impl RuntimeActor {
                         .runtime
                         .as_ref()
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    load_source_authenticated_editor_page(runtime, &self.graph, page_id)?
+                    load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?
                 };
                 if current.is_none() && self.clean_startup_projection_read_available() {
                     if let EditorTurnReadiness::Deferred(state) =
@@ -6847,7 +7314,8 @@ impl RuntimeActor {
                         .runtime
                         .as_ref()
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    current = load_source_authenticated_editor_page(runtime, &self.graph, page_id)?;
+                    current =
+                        load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?;
                 }
                 match current {
                     Some(current) => Ok(SyncEditorLoadOutcome::Loaded { page: current.dto }),
@@ -6882,9 +7350,12 @@ impl RuntimeActor {
                             .runtime
                             .as_ref()
                             .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                        let current =
-                            load_source_authenticated_editor_page(runtime, &self.graph, page_id)?
-                                .ok_or(SyncEditorRequestError::ActorRefused)?;
+                        let current = load_hot_source_authenticated_editor_page(
+                            runtime,
+                            &self.graph,
+                            page_id,
+                        )?
+                        .ok_or(SyncEditorRequestError::ActorRefused)?;
                         Ok(SyncEditorLoadOutcome::Loaded { page: current.dto })
                     }
                     EditorNameState::Missing { name, revision, .. } => {
@@ -6908,6 +7379,7 @@ impl RuntimeActor {
         &mut self,
         request: SyncEditorSaveRequest,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+        self.prepared_application_reply = None;
         if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncEditorSaveOutcome::Deferred {
                 state,
@@ -6915,213 +7387,260 @@ impl RuntimeActor {
             });
         }
 
-        let (page_id, transaction, affected_page_ids) = match &request.target {
-            SyncEditorSaveTarget::Existing { page_id, revision } => {
-                let page_id = parse_editor_page_id(page_id)?;
-                let runtime = self
-                    .runtime
-                    .as_ref()
-                    .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                let Some(current) =
-                    load_source_authenticated_editor_page(runtime, &self.graph, page_id)?
-                else {
-                    return Ok(SyncEditorSaveOutcome::Conflict {
-                        reason: SyncEditorConflict::MissingPage,
-                    });
-                };
-                let authoritative = runtime
-                    .engine()
-                    .materialize_page(page_id)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                if !editor_materialization_matches(&authoritative, &current.page) {
-                    return Err(SyncEditorRequestError::ActorRefused);
-                }
-                if current.dto.revision != *revision {
-                    return Ok(SyncEditorSaveOutcome::Conflict {
-                        reason: SyncEditorConflict::StaleBase,
-                    });
-                }
-                let resolved = resolve_editor_block_ids(&request.blocks)?;
-                let requested_page = requested_existing_editor_page(&current, &request, &resolved)?;
-                let base = self
-                    .graph
-                    .read_projection_input(&current.page.path)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?
-                    .ok_or(SyncEditorRequestError::ActorRefused)?;
-                let target = render_requested_page_document(&requested_page, Some(&base))
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                let accepted_target = render_requested_page_document(&current.page, Some(&base))
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                let accepted_source = self
-                    .graph
-                    .parse_external_document(&current.page.path, &accepted_target, false)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                let parsed = self
-                    .graph
-                    .parse_external_document(&current.page.path, &target, false)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                let identity = parsed.resolve_identity(Some(AcceptedExternalDocumentIdentity {
-                    name: current.page.name.as_str(),
-                    kind: match current.page.kind {
+        let (page_id, transaction, affected_page_ids, existing_application, trusted_target_page) =
+            match &request.target {
+                SyncEditorSaveTarget::Existing { page_id, revision } => {
+                    let page_id = parse_editor_page_id(page_id)?;
+                    let runtime = self
+                        .runtime
+                        .as_ref()
+                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+                    let Some(current_application) = load_hot_source_authenticated_application_page(
+                        runtime,
+                        &self.graph,
+                        page_id,
+                    )?
+                    else {
+                        return Ok(SyncEditorSaveOutcome::Conflict {
+                            reason: SyncEditorConflict::MissingPage,
+                        });
+                    };
+                    let current = &current_application.editor;
+                    let authoritative = runtime
+                        .engine()
+                        .materialize_page(page_id)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    if !editor_materialization_matches(&authoritative, &current.page) {
+                        return Err(SyncEditorRequestError::ActorRefused);
+                    }
+                    if current.dto.revision != *revision {
+                        return Ok(SyncEditorSaveOutcome::Conflict {
+                            reason: SyncEditorConflict::StaleBase,
+                        });
+                    }
+                    let resolved = resolve_editor_block_ids(&request.blocks)?;
+                    let requested_page =
+                        requested_existing_editor_page(&current, &request, &resolved)?;
+                    let base = self
+                        .graph
+                        .read_projection_input(&current.page.path)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                        .ok_or(SyncEditorRequestError::ActorRefused)?;
+                    let target = render_requested_page_document(&requested_page, Some(&base))
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let accepted_target =
+                        render_requested_page_document(&current.page, Some(&base))
+                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let accepted_source = self
+                        .graph
+                        .parse_external_document(&current.page.path, &accepted_target, false)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let parsed = self
+                        .graph
+                        .parse_external_document(&current.page.path, &target, false)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let identity =
+                        parsed.resolve_identity(Some(AcceptedExternalDocumentIdentity {
+                            name: current.page.name.as_str(),
+                            kind: match current.page.kind {
+                                ManagedTextKind::Page => PageKind::Page,
+                                ManagedTextKind::Journal => PageKind::Journal,
+                            },
+                            explicit_title: accepted_source.explicit_title.as_deref(),
+                        }));
+                    let final_name = LogicalPageName::parse(identity.name).map_err(|_| {
+                        SyncEditorRequestError::InvalidRequest(
+                            SyncEditorInvalidRequest::InvalidName,
+                        )
+                    })?;
+                    let final_kind = model_sync_page_kind(identity.kind);
+                    let mut trusted_target_page = self
+                        .graph
+                        .parse_exact_page_dto(&current.page.path, &target)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    trusted_target_page.name = final_name.as_str().to_owned();
+                    trusted_target_page
+                        .title
+                        .clone_from(&trusted_target_page.name);
+                    trusted_target_page.kind = match final_kind {
                         ManagedTextKind::Page => PageKind::Page,
                         ManagedTextKind::Journal => PageKind::Journal,
-                    },
-                    explicit_title: accepted_source.explicit_title.as_deref(),
-                }));
-                let final_name = LogicalPageName::parse(identity.name).map_err(|_| {
-                    SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
-                })?;
-                let final_kind = model_sync_page_kind(identity.kind);
-                match runtime
-                    .engine()
-                    .current_page_for_logical_name(&final_name)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?
-                {
-                    Some(owner) if owner != page_id => {
-                        return Ok(SyncEditorSaveOutcome::Conflict {
-                            reason: SyncEditorConflict::PageAlreadyExists,
-                        })
-                    }
-                    Some(_) => {}
-                    None if final_name == current.page.name => {
-                        return Err(SyncEditorRequestError::ActorRefused)
-                    }
-                    None => {}
-                }
-
-                let mut operations = Vec::new();
-                let mut affected = BTreeSet::from([page_id]);
-                if final_name != current.page.name {
-                    let store = runtime
+                    };
+                    trusted_target_page.rev = current_application.page.rev.clone();
+                    match runtime
                         .engine()
-                        .archive_store()
-                        .ok_or(SyncEditorRequestError::ActorRefused)?;
-                    let mut query = runtime
-                        .database()
-                        .frontier_reference_query(runtime.engine(), store)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                    let plan = query
-                        .plan_page_rename(&current.page.name, final_name, current.page.path.clone())
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                    affected.extend(plan.touched_sources().iter().copied());
-                    operations.extend(plan.transaction().operations.iter().cloned());
-                }
-                if final_kind != current.page.kind {
-                    operations.push(SemanticOperation::SetPageKind {
-                        page_id,
-                        kind: final_kind,
-                    });
-                }
-                if let Some(content) =
-                    build_existing_editor_transaction(&current, &request, &resolved)?
-                {
-                    // Requested page bytes are authoritative over any stale
-                    // target-page snapshot carried by the rename planner.
-                    operations.extend(content.operations);
-                }
-                let transaction = finish_editor_transaction(operations)?;
-                (
-                    page_id,
-                    transaction,
-                    affected.into_iter().map(|id| id.to_string()).collect(),
-                )
-            }
-            SyncEditorSaveTarget::New {
-                name,
-                page_kind,
-                revision,
-            } => {
-                let runtime = self
-                    .runtime
-                    .as_ref()
-                    .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                let (logical_name, path, current_revision) =
-                    match editor_name_state(runtime, &self.graph, name.clone(), *page_kind)? {
-                        EditorNameState::Missing {
-                            name,
-                            path,
-                            revision,
-                        } => (name, path, revision),
-                        EditorNameState::Exact(_) => {
+                        .current_page_for_logical_name(&final_name)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                    {
+                        Some(owner) if owner != page_id => {
                             return Ok(SyncEditorSaveOutcome::Conflict {
                                 reason: SyncEditorConflict::PageAlreadyExists,
                             })
                         }
-                        EditorNameState::Ambiguous => {
-                            return Ok(SyncEditorSaveOutcome::Conflict {
-                                reason: SyncEditorConflict::AmbiguousPageName,
-                            })
+                        Some(_) => {}
+                        None if final_name == current.page.name => {
+                            return Err(SyncEditorRequestError::ActorRefused)
                         }
-                        EditorNameState::PathOccupied => {
-                            return Ok(SyncEditorSaveOutcome::Conflict {
-                                reason: SyncEditorConflict::DerivedPathOccupied,
-                            })
-                        }
-                    };
-                if current_revision != *revision {
-                    return Ok(SyncEditorSaveOutcome::Conflict {
-                        reason: SyncEditorConflict::StaleBase,
-                    });
+                        None => {}
+                    }
+
+                    let mut operations = Vec::new();
+                    let mut affected = BTreeSet::from([page_id]);
+                    if final_name != current.page.name {
+                        let store = runtime
+                            .engine()
+                            .archive_store()
+                            .ok_or(SyncEditorRequestError::ActorRefused)?;
+                        let mut query = runtime
+                            .database()
+                            .frontier_reference_query(runtime.engine(), store)
+                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        let plan = query
+                            .plan_page_rename(
+                                &current.page.name,
+                                final_name,
+                                current.page.path.clone(),
+                            )
+                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        affected.extend(plan.touched_sources().iter().copied());
+                        operations.extend(plan.transaction().operations.iter().cloned());
+                    }
+                    if final_kind != current.page.kind {
+                        operations.push(SemanticOperation::SetPageKind {
+                            page_id,
+                            kind: final_kind,
+                        });
+                    }
+                    if let Some(content) =
+                        build_existing_editor_transaction(&current, &request, &resolved)?
+                    {
+                        // Requested page bytes are authoritative over any stale
+                        // target-page snapshot carried by the rename planner.
+                        operations.extend(content.operations);
+                    }
+                    let transaction = finish_editor_transaction(operations)?;
+                    (
+                        page_id,
+                        transaction,
+                        affected.into_iter().map(|id| id.to_string()).collect(),
+                        Some(current_application),
+                        Some(trusted_target_page),
+                    )
                 }
-                let page_id = PageId::new();
-                let home_document_id = DocumentId::new();
-                let resolved = resolve_editor_block_ids(&request.blocks)?;
-                let requested_page = requested_new_editor_page(
-                    page_id,
-                    home_document_id,
-                    logical_name,
-                    path.clone(),
-                    (*page_kind).into(),
-                    &request,
-                    &resolved,
-                )?;
-                let target = render_requested_page_document(&requested_page, None)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                let parsed = self
-                    .graph
-                    .parse_external_document(&path, &target, false)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                let identity = parsed.resolve_identity(None);
-                let final_name = LogicalPageName::parse(identity.name).map_err(|_| {
-                    SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
-                })?;
-                let final_kind = model_sync_page_kind(identity.kind);
-                if runtime
-                    .engine()
-                    .current_page_for_logical_name(&final_name)
-                    .map_err(|_| SyncEditorRequestError::ActorRefused)?
-                    .is_some()
-                {
-                    return Ok(SyncEditorSaveOutcome::Conflict {
-                        reason: SyncEditorConflict::PageAlreadyExists,
-                    });
+                SyncEditorSaveTarget::New {
+                    name,
+                    page_kind,
+                    revision,
+                } => {
+                    let runtime = self
+                        .runtime
+                        .as_ref()
+                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+                    let (logical_name, path, current_revision) =
+                        match editor_name_state(runtime, &self.graph, name.clone(), *page_kind)? {
+                            EditorNameState::Missing {
+                                name,
+                                path,
+                                revision,
+                            } => (name, path, revision),
+                            EditorNameState::Exact(_) => {
+                                return Ok(SyncEditorSaveOutcome::Conflict {
+                                    reason: SyncEditorConflict::PageAlreadyExists,
+                                })
+                            }
+                            EditorNameState::Ambiguous => {
+                                return Ok(SyncEditorSaveOutcome::Conflict {
+                                    reason: SyncEditorConflict::AmbiguousPageName,
+                                })
+                            }
+                            EditorNameState::PathOccupied => {
+                                return Ok(SyncEditorSaveOutcome::Conflict {
+                                    reason: SyncEditorConflict::DerivedPathOccupied,
+                                })
+                            }
+                        };
+                    if current_revision != *revision {
+                        return Ok(SyncEditorSaveOutcome::Conflict {
+                            reason: SyncEditorConflict::StaleBase,
+                        });
+                    }
+                    let page_id = PageId::new();
+                    let home_document_id = DocumentId::new();
+                    let resolved = resolve_editor_block_ids(&request.blocks)?;
+                    let requested_page = requested_new_editor_page(
+                        page_id,
+                        home_document_id,
+                        logical_name,
+                        path.clone(),
+                        (*page_kind).into(),
+                        &request,
+                        &resolved,
+                    )?;
+                    let target = render_requested_page_document(&requested_page, None)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let parsed = self
+                        .graph
+                        .parse_external_document(&path, &target, false)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    let identity = parsed.resolve_identity(None);
+                    let final_name = LogicalPageName::parse(identity.name).map_err(|_| {
+                        SyncEditorRequestError::InvalidRequest(
+                            SyncEditorInvalidRequest::InvalidName,
+                        )
+                    })?;
+                    let final_kind = model_sync_page_kind(identity.kind);
+                    if runtime
+                        .engine()
+                        .current_page_for_logical_name(&final_name)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                        .is_some()
+                    {
+                        return Ok(SyncEditorSaveOutcome::Conflict {
+                            reason: SyncEditorConflict::PageAlreadyExists,
+                        });
+                    }
+                    let transaction = build_new_editor_transaction(
+                        page_id,
+                        home_document_id,
+                        final_name,
+                        path,
+                        final_kind.into(),
+                        &request,
+                        &resolved,
+                    )?;
+                    (
+                        page_id,
+                        Some(transaction),
+                        vec![page_id.to_string()],
+                        None,
+                        None,
+                    )
                 }
-                let transaction = build_new_editor_transaction(
-                    page_id,
-                    home_document_id,
-                    final_name,
-                    path,
-                    final_kind.into(),
-                    &request,
-                    &resolved,
-                )?;
-                (page_id, Some(transaction), vec![page_id.to_string()])
-            }
-        };
+            };
 
         let Some(transaction) = transaction else {
-            let runtime = self
-                .runtime
-                .as_ref()
-                .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-            let current = load_current_editor_page(runtime, page_id)?
-                .ok_or(SyncEditorRequestError::ActorRefused)?;
+            let current = match existing_application {
+                Some(current) => current.editor,
+                None => {
+                    let runtime = self
+                        .runtime
+                        .as_ref()
+                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+                    load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?
+                        .ok_or(SyncEditorRequestError::ActorRefused)?
+                }
+            };
             return Ok(SyncEditorSaveOutcome::Unchanged {
                 page: current.dto,
                 affected_page_ids,
             });
         };
-        self.execute_editor_transaction(transaction, page_id, affected_page_ids)
+        self.execute_editor_transaction(
+            transaction,
+            page_id,
+            affected_page_ids,
+            trusted_target_page,
+        )
     }
 
     fn prepare_editor_turn(&mut self) -> EditorTurnReadiness {
@@ -7135,6 +7654,22 @@ impl RuntimeActor {
                 batch_id: batch_id.map(|id| id.to_string()),
                 phase,
             });
+        }
+        if self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| managed.pending_commit.is_some())
+        {
+            let batch_id = self
+                .managed_local_pending_commit_batch_id()
+                .map(|batch_id| batch_id.to_string());
+            if !self.advance_pending_managed_local_commit().unwrap_or(false) {
+                return EditorTurnReadiness::Deferred(SyncEditorDeferred::BlockedRecovery {
+                    batch_id,
+                    phase: SyncLocalMutationPhase::ProjectionDrain,
+                    retained_publication: true,
+                });
+            }
         }
         if self.local_mutation.is_some() {
             let outcome = self.advance_local_mutation_once();
@@ -7184,6 +7719,87 @@ impl RuntimeActor {
         }
     }
 
+    fn managed_local_pending_commit_batch_id(&self) -> Option<BatchId> {
+        match self.managed_local.as_ref()?.pending_commit.as_ref()? {
+            PendingManagedLocalCommit::Projection(pending) => Some(pending.batch_id()),
+            PendingManagedLocalCommit::Overlay(recovery) => Some(recovery.batch_id()),
+            PendingManagedLocalCommit::Response(committed) => Some(committed.batch_id()),
+        }
+    }
+
+    fn advance_pending_managed_local_commit(&mut self) -> Result<bool, String> {
+        let Some(pending) = self
+            .managed_local
+            .as_mut()
+            .and_then(|managed| managed.pending_commit.take())
+        else {
+            return Ok(true);
+        };
+        let outcome = match pending {
+            PendingManagedLocalCommit::Projection(pending) => {
+                TrustedLocalCommitCoordinator::retry_pending_projection(&self.graph, pending)
+            }
+            PendingManagedLocalCommit::Overlay(recovery) => {
+                match self.retry_managed_local_overlay(recovery) {
+                    Ok(outcome) => outcome,
+                    Err((recovery, error)) => {
+                        self.managed_local
+                            .as_mut()
+                            .expect("managed-local runtime remains installed")
+                            .pending_commit = Some(PendingManagedLocalCommit::Overlay(recovery));
+                        return Err(error);
+                    }
+                }
+            }
+            PendingManagedLocalCommit::Response(committed) => {
+                if self
+                    .application_from_trusted_local_commit(&committed)
+                    .is_ok()
+                {
+                    return Ok(true);
+                }
+                self.managed_local
+                    .as_mut()
+                    .expect("managed-local runtime remains installed")
+                    .pending_commit = Some(PendingManagedLocalCommit::Response(committed));
+                return Ok(false);
+            }
+        };
+        match outcome {
+            TrustedLocalCommitOutcome::Committed(committed) => {
+                if self
+                    .application_from_trusted_local_commit(&committed)
+                    .is_ok()
+                {
+                    Ok(true)
+                } else {
+                    self.managed_local
+                        .as_mut()
+                        .expect("managed-local runtime remains installed")
+                        .pending_commit = Some(PendingManagedLocalCommit::Response(committed));
+                    Ok(false)
+                }
+            }
+            TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
+                self.managed_local
+                    .as_mut()
+                    .expect("managed-local runtime remains installed")
+                    .pending_commit = Some(PendingManagedLocalCommit::Projection(pending));
+                Ok(false)
+            }
+            TrustedLocalCommitOutcome::CommittedRecoveryRequired(recovery) => {
+                self.managed_local
+                    .as_mut()
+                    .expect("managed-local runtime remains installed")
+                    .pending_commit = Some(PendingManagedLocalCommit::Overlay(recovery));
+                Ok(false)
+            }
+            TrustedLocalCommitOutcome::Declined { .. } => {
+                Err("committed managed-local recovery declined after append".into())
+            }
+        }
+    }
+
     fn prepare_page_read_turn(&mut self) -> EditorTurnReadiness {
         if self.clean_startup_projection_read_available() {
             return EditorTurnReadiness::Ready;
@@ -7215,8 +7831,9 @@ impl RuntimeActor {
         transaction: OperationTransaction,
         page_id: PageId,
         affected_page_ids: Vec<String>,
+        trusted_target_page: Option<PageDto>,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
-        let state = {
+        let execution = {
             let authority = self
                 .authority
                 .as_mut()
@@ -7248,12 +7865,123 @@ impl RuntimeActor {
                     });
                 }
             };
-            OperationalCoordinator::execute_local(
-                &mut session,
-                &self.graph,
-                &self.receipts,
-                &transaction,
-            )
+            let attempt = match trusted_target_page.as_ref() {
+                Some(target_page) => {
+                    let managed = self
+                        .managed_local
+                        .as_mut()
+                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+                    prepare_trusted_local_runtime_commit(
+                        &mut session,
+                        &self.graph,
+                        &self.receipts,
+                        &mut managed.journal,
+                        target_page,
+                        &transaction,
+                    )
+                    .map_err(|error| {
+                        #[cfg(test)]
+                        eprintln!("trusted-local runtime preparation refused: {error}");
+                        SyncEditorRequestError::ActorRefused
+                    })?
+                }
+                None => TrustedLocalRuntimeAttempt::Declined,
+            };
+            match attempt {
+                TrustedLocalRuntimeAttempt::Committed(outcome) => {
+                    EditorCoordinatorExecution::Trusted(outcome)
+                }
+                TrustedLocalRuntimeAttempt::Reconciliation(paths) => {
+                    EditorCoordinatorExecution::Reconciliation(paths)
+                }
+                TrustedLocalRuntimeAttempt::Declined => EditorCoordinatorExecution::Declined,
+            }
+        };
+        let state = match execution {
+            EditorCoordinatorExecution::Trusted(outcome) => {
+                return self.finish_trusted_local_editor_outcome(outcome, affected_page_ids)
+            }
+            EditorCoordinatorExecution::Reconciliation(paths) => {
+                let observations = paths.into_iter().map(WatcherObservation::ManagedPath);
+                let observed = match (self.feed.as_mut(), self.runtime.as_ref()) {
+                    (Some(feed), Some(runtime)) => feed.observe(&self.graph, runtime, observations),
+                    _ => Err(ExactExternalFeedObserveError::Terminal),
+                };
+                self.refresh_watcher();
+                if observed.is_err() {
+                    self.latch_terminal(
+                        "editor reconciliation could not enter the exact feed".into(),
+                    );
+                    return Ok(SyncEditorSaveOutcome::Deferred {
+                        state: SyncEditorDeferred::Revoked {
+                            batch_id: None,
+                            phase: SyncLocalMutationPhase::Capture,
+                        },
+                        affected_page_ids,
+                    });
+                }
+                return Ok(SyncEditorSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::RetryableExternalWork,
+                    affected_page_ids,
+                });
+            }
+            EditorCoordinatorExecution::Declined => {
+                for _ in 0..MAX_CLEAN_DRAIN_TURNS {
+                    if self
+                        .managed_local
+                        .as_ref()
+                        .is_none_or(|managed| managed.pending_count() == 0)
+                    {
+                        break;
+                    }
+                    match self.tick() {
+                        SyncRuntimeTick::Recovering
+                        | SyncRuntimeTick::Idle
+                        | SyncRuntimeTick::RetryFull
+                        | SyncRuntimeTick::AdmittedNoop { .. }
+                        | SyncRuntimeTick::AdmittedComplete { .. } => {}
+                        SyncRuntimeTick::RecoveryBlocked(_)
+                        | SyncRuntimeTick::Blocked(_)
+                        | SyncRuntimeTick::Failed(_)
+                        | SyncRuntimeTick::Terminal(_)
+                        | SyncRuntimeTick::LocalMutation(_) => break,
+                    }
+                }
+                if self
+                    .managed_local
+                    .as_ref()
+                    .is_some_and(|managed| managed.pending_count() != 0)
+                {
+                    return Ok(SyncEditorSaveOutcome::Deferred {
+                        state: SyncEditorDeferred::BlockedRecovery {
+                            batch_id: None,
+                            phase: SyncLocalMutationPhase::Bindings,
+                            retained_publication: false,
+                        },
+                        affected_page_ids,
+                    });
+                }
+                let state = {
+                    let authority = self
+                        .authority
+                        .as_mut()
+                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+                    let runtime = self
+                        .runtime
+                        .as_mut()
+                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+                    let mut session = runtime
+                        .admit_promoted_mutation(authority, &self.graph)
+                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                    OperationalCoordinator::execute_local(
+                        &mut session,
+                        &self.graph,
+                        &self.receipts,
+                        &transaction,
+                    )
+                };
+                state
+            }
         };
         match state {
             LocalMutationCoordinatorState::Active(completion) => {
@@ -7380,6 +8108,468 @@ impl RuntimeActor {
         }
     }
 
+    fn finish_trusted_local_editor_outcome(
+        &mut self,
+        mut outcome: TrustedLocalCommitOutcome,
+        affected_page_ids: Vec<String>,
+    ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+        let (batch_id, sequence, payload_kind, payload) = match &outcome {
+            TrustedLocalCommitOutcome::Committed(committed) => (
+                committed.batch_id(),
+                committed.sequence(),
+                committed.prepared_record().payload_kind(),
+                committed.prepared_record().journal_payload().to_vec(),
+            ),
+            TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => (
+                pending.batch_id(),
+                pending.sequence(),
+                pending.prepared_record().payload_kind(),
+                pending.prepared_record().journal_payload().to_vec(),
+            ),
+            TrustedLocalCommitOutcome::CommittedRecoveryRequired(recovery) => (
+                recovery.batch_id(),
+                recovery.sequence(),
+                recovery.prepared_record().payload_kind(),
+                recovery.prepared_record().journal_payload().to_vec(),
+            ),
+            TrustedLocalCommitOutcome::Declined { .. } => {
+                return Err(SyncEditorRequestError::ActorRefused)
+            }
+        };
+        let managed = self
+            .managed_local
+            .as_mut()
+            .ok_or(SyncEditorRequestError::ActorUnavailable)?;
+        let expected_next = sequence
+            .checked_add(1)
+            .ok_or(SyncEditorRequestError::ActorRefused)?;
+        if managed.journal.next_sequence() != expected_next
+            || managed
+                .frames
+                .back()
+                .is_some_and(|frame| frame.sequence() >= sequence)
+        {
+            return Err(SyncEditorRequestError::ActorRefused);
+        }
+        let queued_frame =
+            LocalJournalFrame::new(managed.journal.device_id(), sequence, payload_kind, payload);
+        let queued_record = decode_managed_local_record(&queued_frame)
+            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        managed.latest_projection_frames.insert(
+            queued_record
+                .projection()
+                .intent()
+                .path()
+                .as_str()
+                .to_owned(),
+            queued_frame.clone(),
+        );
+        managed.frames.push_back(queued_frame);
+
+        for _ in 0..3 {
+            outcome = match outcome {
+                TrustedLocalCommitOutcome::Committed(committed) => {
+                    match self.application_from_trusted_local_commit(&committed) {
+                        Ok(application) => {
+                            let page = application.editor.dto.clone();
+                            self.prepared_application_reply =
+                                Some((batch_id.to_string(), application));
+                            return Ok(SyncEditorSaveOutcome::Durable {
+                                batch_id: batch_id.to_string(),
+                                page,
+                                affected_page_ids,
+                            });
+                        }
+                        Err(_) => {
+                            self.managed_local
+                                .as_mut()
+                                .expect("managed-local runtime remains installed")
+                                .pending_commit =
+                                Some(PendingManagedLocalCommit::Response(committed));
+                            return Ok(SyncEditorSaveOutcome::Deferred {
+                                state: SyncEditorDeferred::BlockedRecovery {
+                                    batch_id: Some(batch_id.to_string()),
+                                    phase: SyncLocalMutationPhase::ProjectionDrain,
+                                    retained_publication: true,
+                                },
+                                affected_page_ids,
+                            });
+                        }
+                    }
+                }
+                TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
+                    TrustedLocalCommitCoordinator::retry_pending_projection(&self.graph, pending)
+                }
+                TrustedLocalCommitOutcome::CommittedRecoveryRequired(recovery) => {
+                    match self.retry_managed_local_overlay(recovery) {
+                        Ok(outcome) => outcome,
+                        Err((recovery, _)) => {
+                            self.managed_local
+                                .as_mut()
+                                .expect("managed-local runtime remains installed")
+                                .pending_commit =
+                                Some(PendingManagedLocalCommit::Overlay(recovery));
+                            return Ok(SyncEditorSaveOutcome::Deferred {
+                                state: SyncEditorDeferred::BlockedRecovery {
+                                    batch_id: Some(batch_id.to_string()),
+                                    phase: SyncLocalMutationPhase::ProjectionDrain,
+                                    retained_publication: true,
+                                },
+                                affected_page_ids,
+                            });
+                        }
+                    }
+                }
+                TrustedLocalCommitOutcome::Declined { .. } => {
+                    return Err(SyncEditorRequestError::ActorRefused)
+                }
+            };
+        }
+
+        let pending = match outcome {
+            TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
+                PendingManagedLocalCommit::Projection(pending)
+            }
+            TrustedLocalCommitOutcome::CommittedRecoveryRequired(recovery) => {
+                PendingManagedLocalCommit::Overlay(recovery)
+            }
+            TrustedLocalCommitOutcome::Committed(committed) => {
+                PendingManagedLocalCommit::Response(committed)
+            }
+            TrustedLocalCommitOutcome::Declined { .. } => {
+                return Err(SyncEditorRequestError::ActorRefused)
+            }
+        };
+        self.managed_local
+            .as_mut()
+            .expect("managed-local runtime remains installed")
+            .pending_commit = Some(pending);
+        Ok(SyncEditorSaveOutcome::Deferred {
+            state: SyncEditorDeferred::BlockedRecovery {
+                batch_id: Some(batch_id.to_string()),
+                phase: SyncLocalMutationPhase::ProjectionDrain,
+                retained_publication: true,
+            },
+            affected_page_ids,
+        })
+    }
+
+    fn retry_managed_local_overlay(
+        &mut self,
+        recovery: TrustedLocalCommittedRecovery,
+    ) -> Result<TrustedLocalCommitOutcome, (TrustedLocalCommittedRecovery, String)> {
+        let Some(authority) = self.authority.as_mut() else {
+            return Err((
+                recovery,
+                "managed-local overlay recovery has no authority".into(),
+            ));
+        };
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Err((
+                recovery,
+                "managed-local overlay recovery has no runtime".into(),
+            ));
+        };
+        let mut session = match runtime.admit_promoted_mutation(authority, &self.graph) {
+            Ok(session) => session,
+            Err(error) => {
+                return Err((
+                    recovery,
+                    format!("managed-local overlay recovery was refused: {error}"),
+                ))
+            }
+        };
+        let engine = match session.engine() {
+            Ok(engine) => engine,
+            Err(error) => {
+                return Err((
+                    recovery,
+                    format!("managed-local overlay recovery lost engine authority: {error}"),
+                ))
+            }
+        };
+        Ok(TrustedLocalCommitCoordinator::retry_committed_recovery(
+            engine, recovery,
+        ))
+    }
+
+    fn application_from_trusted_local_commit(
+        &self,
+        committed: &TrustedLocalCommitted,
+    ) -> Result<ApplicationCurrentPage, SyncEditorRequestError> {
+        let path = ManagedPath::parse(committed.relative_path().to_owned())
+            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        let parsed = self
+            .graph
+            .parse_exact_page_dto(&path, committed.exact_target())
+            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        if parsed.rev.as_deref() != Some(committed.revision()) {
+            return Err(SyncEditorRequestError::ActorRefused);
+        }
+        let editor = editor_current_page_from_materialized(committed.post_page().clone())?;
+        join_application_page(parsed, editor).map_err(|_| SyncEditorRequestError::ActorRefused)
+    }
+
+    fn tick_managed_local_derivative(&mut self) -> Option<SyncRuntimeTick> {
+        if self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| managed.pending_commit.is_some())
+        {
+            return Some(match self.advance_pending_managed_local_commit() {
+                Ok(true) => SyncRuntimeTick::Recovering,
+                Ok(false) => SyncRuntimeTick::RecoveryBlocked(
+                    "journal-committed foreground recovery remains pending".into(),
+                ),
+                Err(error) => SyncRuntimeTick::RecoveryBlocked(error),
+            });
+        }
+        let (frame, checkpoint, continuation, authorship_complete) = {
+            let managed = self.managed_local.as_ref()?;
+            let frame = managed.frames.front()?.clone();
+            (
+                frame,
+                managed.checkpoint.clone(),
+                managed.continuation.clone(),
+                managed.authorship_complete.clone(),
+            )
+        };
+        let record = match decode_managed_local_record(&frame) {
+            Ok(record) => record,
+            Err(error) => {
+                let detail = format!(
+                    "managed-local derivative record {}:{} is invalid: {error}",
+                    frame.device_id(),
+                    frame.sequence()
+                );
+                self.latch_terminal(detail.clone());
+                return Some(SyncRuntimeTick::Terminal(detail));
+            }
+        };
+        let superseding_projection = self
+            .managed_local
+            .as_ref()
+            .and_then(|managed| {
+                managed
+                    .latest_projection_frames
+                    .get(record.projection().intent().path().as_str())
+            })
+            .filter(|successor| successor.sequence() > frame.sequence())
+            .cloned();
+        let batch_id = record.prepared_batch().manifest().batch_id();
+        let provider_complete = if self.shared_phase != Some(SyncSharedPhase::Active) {
+            true
+        } else {
+            let descriptor = match self.shared_descriptor.as_ref() {
+                Some(descriptor) => descriptor.clone(),
+                None => {
+                    return Some(SyncRuntimeTick::RecoveryBlocked(
+                        "managed-local provider publication has no shared descriptor".into(),
+                    ))
+                }
+            };
+            match self.durable_current_provider_head_matches_frontier(&descriptor) {
+                Ok(complete) => complete,
+                Err(error) => return Some(SyncRuntimeTick::RecoveryBlocked(error.to_string())),
+            }
+        };
+        let mut publisher = ManagedLocalPublisherAttempt {
+            batch_id,
+            authorship_complete: authorship_complete.contains(&batch_id),
+            provider_complete,
+            requested_authorship: None,
+            requested_provider: None,
+        };
+        let outcome = {
+            let authority = match self.authority.as_mut() {
+                Some(authority) => authority,
+                None => {
+                    return Some(SyncRuntimeTick::RecoveryBlocked(
+                        "managed-local derivative has no active authority".into(),
+                    ))
+                }
+            };
+            let runtime = match self.runtime.as_mut() {
+                Some(runtime) => runtime,
+                None => {
+                    return Some(SyncRuntimeTick::RecoveryBlocked(
+                        "managed-local derivative has no active runtime".into(),
+                    ))
+                }
+            };
+            let mut session = match runtime.admit_promoted_mutation(authority, &self.graph) {
+                Ok(session) => session,
+                Err(error) => {
+                    return Some(SyncRuntimeTick::RecoveryBlocked(format!(
+                        "managed-local derivative admission failed: {error}"
+                    )))
+                }
+            };
+            resume_managed_local_journal_drain_with_superseding_projection(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                &frame,
+                superseding_projection.as_ref(),
+                &checkpoint,
+                continuation.as_ref(),
+                &mut publisher,
+            )
+        };
+
+        if let Some(authority) = publisher.requested_authorship {
+            match self.record_local_authorship_receipt(authority.batch_id) {
+                Ok(()) => {
+                    self.managed_local
+                        .as_mut()
+                        .expect("managed-local runtime remains installed")
+                        .authorship_complete
+                        .insert(authority.batch_id);
+                }
+                Err(error) => {
+                    if let ManagedLocalDrainOutcome::Pending(continuation) = &outcome {
+                        self.managed_local
+                            .as_mut()
+                            .expect("managed-local runtime remains installed")
+                            .continuation = Some(continuation.clone());
+                    }
+                    return Some(SyncRuntimeTick::RecoveryBlocked(error.to_string()));
+                }
+            }
+        }
+        if let Some(authority) = publisher.requested_provider {
+            if let Err(error) = self.record_provider_publication(authority.batch_id) {
+                if let ManagedLocalDrainOutcome::Pending(continuation) = &outcome {
+                    self.managed_local
+                        .as_mut()
+                        .expect("managed-local runtime remains installed")
+                        .continuation = Some(continuation.clone());
+                }
+                return Some(SyncRuntimeTick::RecoveryBlocked(error.to_string()));
+            }
+        }
+
+        match outcome {
+            ManagedLocalDrainOutcome::Complete(completion) => {
+                let encoded = match completion.checkpoint.encode() {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        return Some(SyncRuntimeTick::RecoveryBlocked(format!(
+                            "cannot encode managed-local checkpoint: {error}"
+                        )))
+                    }
+                };
+                let filename =
+                    managed_local_checkpoint_filename(completion.checkpoint.next_sequence());
+                let managed = self
+                    .managed_local
+                    .as_mut()
+                    .expect("managed-local runtime remains installed");
+                if let Err(error) = publish_immutable_exact(&managed.directory, &filename, &encoded)
+                {
+                    return Some(SyncRuntimeTick::RecoveryBlocked(format!(
+                        "cannot persist managed-local checkpoint {filename}: {error}"
+                    )));
+                }
+                if managed.frames.front().map(LocalJournalFrame::sequence)
+                    != Some(completion.sequence)
+                {
+                    let detail =
+                        "managed-local completion does not name the queue front".to_owned();
+                    self.latch_terminal(detail.clone());
+                    return Some(SyncRuntimeTick::Terminal(detail));
+                }
+                managed.checkpoint = completion.checkpoint;
+                managed.frames.pop_front();
+                if managed
+                    .latest_projection_frames
+                    .get(record.projection().intent().path().as_str())
+                    .is_some_and(|latest| latest.sequence() == completion.sequence)
+                {
+                    managed
+                        .latest_projection_frames
+                        .remove(record.projection().intent().path().as_str());
+                }
+                managed.continuation = None;
+                managed.authorship_complete.remove(&completion.batch_id);
+                managed.last_failure = None;
+                if managed.frames.is_empty() {
+                    if let Err(error) = self.collapse_drained_managed_local_overlay() {
+                        return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                    }
+                }
+                Some(SyncRuntimeTick::Recovering)
+            }
+            ManagedLocalDrainOutcome::Pending(continuation) => {
+                self.managed_local
+                    .as_mut()
+                    .expect("managed-local runtime remains installed")
+                    .continuation = Some(continuation);
+                Some(SyncRuntimeTick::Recovering)
+            }
+            ManagedLocalDrainOutcome::Blocked(blocked) => {
+                let detail = format!(
+                    "managed-local {:?} blocked: {}",
+                    blocked.stage, blocked.detail
+                );
+                let managed = self
+                    .managed_local
+                    .as_mut()
+                    .expect("managed-local runtime remains installed");
+                managed.continuation = None;
+                managed.last_failure = Some(detail.clone());
+                Some(SyncRuntimeTick::RecoveryBlocked(detail))
+            }
+            ManagedLocalDrainOutcome::Conflict(failure) => {
+                let detail = format!(
+                    "managed-local record {} {:?} conflict: {}",
+                    frame.sequence(),
+                    failure.stage,
+                    failure.detail
+                );
+                self.latch_terminal(detail.clone());
+                Some(SyncRuntimeTick::Terminal(detail))
+            }
+            ManagedLocalDrainOutcome::RecoveryRequired(failure) => {
+                let detail = format!(
+                    "managed-local record {} {:?} recovery required: {}",
+                    frame.sequence(),
+                    failure.stage,
+                    failure.detail
+                );
+                let managed = self
+                    .managed_local
+                    .as_mut()
+                    .expect("managed-local runtime remains installed");
+                managed.continuation = None;
+                managed.last_failure = Some(detail.clone());
+                Some(SyncRuntimeTick::RecoveryBlocked(detail))
+            }
+        }
+    }
+
+    fn collapse_drained_managed_local_overlay(&mut self) -> Result<(), String> {
+        let authority = self
+            .authority
+            .as_mut()
+            .ok_or_else(|| "managed-local collapse has no active authority".to_owned())?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| "managed-local collapse has no active runtime".to_owned())?;
+        let mut session = runtime
+            .admit_promoted_mutation(authority, &self.graph)
+            .map_err(|error| format!("managed-local collapse was refused: {error}"))?;
+        let engine = session
+            .engine()
+            .map_err(|error| format!("managed-local collapse lost engine authority: {error}"))?;
+        let accepted = engine.accepted_frontier_root().map_err(display)?;
+        engine
+            .collapse_managed_local_prefix(&accepted)
+            .map(|_| ())
+            .map_err(|error| format!("managed-local collapse failed: {error}"))
+    }
+
     fn tick(&mut self) -> SyncRuntimeTick {
         if let Some(outcome) = self.advance_local_mutation_once() {
             return SyncRuntimeTick::LocalMutation(outcome);
@@ -7387,8 +8577,33 @@ impl RuntimeActor {
         // Once the watcher callback is admitted, its on-disk bytes are the
         // authoritative local observation. Capture them before provider
         // projection can use or replace the same file as a remote base.
-        if self.last_watcher.pending {
+        let startup_feed_waits_for_journal_recovery = self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| managed.pending_count() != 0)
+            && self
+                .feed
+                .as_ref()
+                .zip(self.runtime.as_ref())
+                .is_some_and(|(feed, runtime)| feed.only_startup_catch_up_pending(runtime));
+        if self.last_watcher.pending && !startup_feed_waits_for_journal_recovery {
             return self.tick_external_feed();
+        }
+        let managed_waits_for_provider = self
+            .managed_local
+            .as_ref()
+            .and_then(|managed| managed.continuation.as_ref())
+            .is_some_and(|continuation| {
+                continuation.stage() == ManagedLocalDrainStage::ProviderPublication
+            });
+        if managed_waits_for_provider
+            && self.shared_phase == Some(SyncSharedPhase::Active)
+            && self.provider_has_work()
+        {
+            return self.tick_provider();
+        }
+        if let Some(tick) = self.tick_managed_local_derivative() {
+            return tick;
         }
         if self.shared_phase == Some(SyncSharedPhase::Active) && self.provider_has_work() {
             return self.tick_provider();
@@ -8562,7 +9777,6 @@ impl RuntimeActor {
             || manifest.workspace_id() != self.binding.workspace_id()
             || manifest.lineage_digest() != self.binding.lineage_digest()
             || manifest.author_device_id() != self.binding.device_id()
-            || manifest.author_session_id() != self.session_id
         {
             return Err(SyncRuntimeRequestError::ActorRefused(format!(
                 "accepted local mutation {batch_id} is not bound to this LocalActive author"
@@ -8587,7 +9801,7 @@ impl RuntimeActor {
             graph_resource_id: self.binding.graph_resource_id(),
             promotion_session_id: self.promotion_session_id,
             promoted_state_digest: self.promoted_state_digest,
-            author_session_id: self.session_id,
+            author_session_id: manifest.author_session_id(),
             batch_id,
             manifest_fingerprint: ContentDigest::of(&manifest_bytes),
             accepted_event_binding_digest: evidence.event_binding_digest(),
@@ -10355,6 +11569,44 @@ impl RuntimeActor {
                 return Err(SyncRuntimeRequestError::ActorRefused(detail.into()));
             }
         }
+        for _ in 0..MAX_CLEAN_DRAIN_TURNS {
+            if self
+                .managed_local
+                .as_ref()
+                .is_none_or(|managed| managed.pending_count() == 0)
+            {
+                break;
+            }
+            match self.tick() {
+                SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::Idle
+                | SyncRuntimeTick::RetryFull
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. } => {}
+                SyncRuntimeTick::RecoveryBlocked(detail)
+                | SyncRuntimeTick::Blocked(detail)
+                | SyncRuntimeTick::Failed(detail) => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(detail));
+                }
+                SyncRuntimeTick::Terminal(_) => break,
+                SyncRuntimeTick::LocalMutation(_) => {
+                    return Err(SyncRuntimeRequestError::ActorRefused(
+                        "managed-local shutdown drain returned unrelated local work".into(),
+                    ))
+                }
+            }
+        }
+        if let Some(managed) = self
+            .managed_local
+            .as_ref()
+            .filter(|managed| managed.pending_count() != 0)
+        {
+            return Err(SyncRuntimeRequestError::ActorRefused(
+                managed.last_failure.clone().unwrap_or_else(|| {
+                    "clean shutdown awaits the journal-committed derivative prefix".into()
+                }),
+            ));
+        }
         if self.terminal.is_some() {
             return Ok(SyncShutdownOutcome::Terminal(self.snapshot()));
         }
@@ -11280,6 +12532,22 @@ impl RuntimeActor {
                 + self.provider_intent_retirement.len()
                 + usize::from(self.provider_intent_retirement_scan_active)
                 + self.provider_intents.len(),
+            managed_local_pending: self
+                .managed_local
+                .as_ref()
+                .map_or(0, ManagedLocalRuntimeState::pending_count),
+            managed_local_checkpointed_sequence: self
+                .managed_local
+                .as_ref()
+                .map_or(0, |managed| managed.checkpoint.next_sequence()),
+            managed_local_next_sequence: self
+                .managed_local
+                .as_ref()
+                .map_or(0, |managed| managed.journal.next_sequence()),
+            managed_local_stage: self
+                .managed_local
+                .as_ref()
+                .and_then(ManagedLocalRuntimeState::stage),
         }
     }
 }
@@ -11713,32 +12981,55 @@ fn load_current_editor_page(
     Ok(Some(current))
 }
 
-fn load_source_authenticated_application_page(
+fn editor_current_page_from_materialized(
+    page: MaterializedPage,
+) -> Result<EditorCurrentPage, SyncEditorRequestError> {
+    if page.blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
+        return Err(editor_too_large(page.blocks.len(), 0, 0, 0));
+    }
+    let blocks = page.blocks.clone();
+    let mut dto = SyncEditablePageDto {
+        page_id: page.page_id.to_string(),
+        name: page.name.as_str().to_owned(),
+        path: page.path.to_string(),
+        page_kind: page.kind.into(),
+        preamble: page.preamble.clone(),
+        blocks: ordered_editor_blocks(&blocks)?,
+        revision: String::new(),
+    };
+    dto.revision = existing_editor_revision(&page, &dto)?;
+    Ok(EditorCurrentPage { page, blocks, dto })
+}
+
+fn load_hot_source_authenticated_application_page(
     runtime: &PromotedLocalRuntime,
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    let Some(current) = load_projected_editor_page(runtime, page_id)? else {
-        return Ok(None);
+    let page = match runtime.engine().materialize_page(page_id) {
+        Ok(page) => page,
+        Err(
+            crate::oplog::hot_engine::EngineError::PageNotFound(_)
+            | crate::oplog::hot_engine::EngineError::PageDeleted(_),
+        ) => return Ok(None),
+        Err(_) => return Err(SyncEditorRequestError::ActorRefused),
     };
+    let current = editor_current_page_from_materialized(page)?;
     let parsed = graph
         .load_by_path(current.page.path.as_str())
         .map_err(|_| SyncEditorRequestError::ActorRefused)?
         .ok_or(SyncEditorRequestError::ActorRefused)?;
-    let mut joined =
-        join_application_page(parsed, current).map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    let revision = existing_editor_revision(&joined.editor.page, &joined.editor.dto)?;
-    joined.editor.dto.revision.clone_from(&revision);
-    joined.revision = revision;
-    Ok(Some(joined))
+    join_application_page(parsed, current)
+        .map(Some)
+        .map_err(|_| SyncEditorRequestError::ActorRefused)
 }
 
-fn load_source_authenticated_editor_page(
+fn load_hot_source_authenticated_editor_page(
     runtime: &PromotedLocalRuntime,
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_source_authenticated_application_page(runtime, graph, page_id)
+    load_hot_source_authenticated_application_page(runtime, graph, page_id)
         .map(|current| current.map(|current| current.editor))
 }
 
@@ -13499,6 +14790,60 @@ mod tests {
         }
     }
 
+    fn managed_local_journal_frames(
+        request: &SyncRuntimeOpenRequest,
+    ) -> Vec<LocalJournalFrame<ManagedLocalJournalPayloadKind>> {
+        let namespace = request
+            .application_runtime_root
+            .join(MANAGED_LOCAL_JOURNAL_NAMESPACE);
+        let workspace_directories = fs::read_dir(&namespace)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(workspace_directories.len(), 1);
+        let workspace_directory = &workspace_directories[0];
+        let segment_names = fs::read_dir(workspace_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("device-") && name.ends_with(".segment"))
+            .collect::<Vec<_>>();
+        assert_eq!(segment_names.len(), 1);
+        let segment_name = &segment_names[0];
+        let device = segment_name
+            .strip_prefix("device-")
+            .and_then(|name| name.strip_suffix(".segment"))
+            .and_then(|device| Uuid::parse_str(device).ok())
+            .expect("managed-local segment has a canonical device UUID");
+        let directory = Dir::open_ambient_dir(workspace_directory, ambient_authority()).unwrap();
+        let (journal, _) = LocalJournalSegment::open(&directory, segment_name, device).unwrap();
+        let mut frames = Vec::new();
+        journal.replay(|frame| frames.push(frame)).unwrap();
+        frames
+    }
+
+    fn save_application_block_text(
+        handle: &SyncRuntimeHandle,
+        mut page: PageDto,
+        revision: String,
+        text: &str,
+    ) -> (PageDto, String) {
+        page.blocks[0].raw = text.into();
+        match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("managed-local application save was not direct: {other:?}"),
+        }
+    }
+
     fn load_application_logical(
         handle: &SyncRuntimeHandle,
         name: &str,
@@ -14028,6 +15373,225 @@ mod tests {
     }
 
     #[test]
+    fn managed_local_application_saves_are_one_frame_direct_and_drain_after_twelve_hot_revisions() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-direct-sequence");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let markdown_path = "content/nested pages/Fast Markdown.md";
+        let org_path = "content/nested pages/Fast Org.org";
+        admit_external_page(
+            &handle,
+            &fixture,
+            markdown_path,
+            b"title:: Fast Markdown\n\n- markdown zero\n",
+        );
+        admit_external_page(&handle, &fixture, org_path, b"* org zero\n");
+
+        let manifests_before = fixture.manifest_count();
+        let applied_before = fixture.applied_batch_count();
+        let mut expected_targets = Vec::new();
+        let (markdown, markdown_revision) = load_application_exact(&handle, markdown_path);
+        let (mut markdown, mut markdown_revision) =
+            save_application_block_text(&handle, markdown, markdown_revision, "markdown one");
+        expected_targets.push((
+            markdown_path.to_owned(),
+            fs::read(fixture.graph_root().join(markdown_path)).unwrap(),
+        ));
+        assert_eq!(markdown.pre_block.as_deref(), Some("title:: Fast Markdown"));
+        assert_eq!(markdown.path, markdown_path);
+        assert_eq!(markdown.kind, PageKind::Page);
+
+        let (org, org_revision) = load_application_exact(&handle, org_path);
+        let (org, org_revision) =
+            save_application_block_text(&handle, org, org_revision, "org one");
+        expected_targets.push((
+            org_path.to_owned(),
+            fs::read(fixture.graph_root().join(org_path)).unwrap(),
+        ));
+        assert_eq!(org.format, Format::Org);
+        assert_eq!(org.path, org_path);
+        assert_eq!(load_application_exact(&handle, org_path).1, org_revision);
+
+        for revision_number in 2..=13 {
+            (markdown, markdown_revision) = save_application_block_text(
+                &handle,
+                markdown,
+                markdown_revision,
+                &format!("markdown {revision_number}"),
+            );
+            expected_targets.push((
+                markdown_path.to_owned(),
+                fs::read(fixture.graph_root().join(markdown_path)).unwrap(),
+            ));
+        }
+        assert_eq!(
+            load_application_exact(&handle, markdown_path).1,
+            markdown_revision
+        );
+
+        let foreground = handle.status().unwrap();
+        assert_eq!(foreground.managed_local_next_sequence, 14);
+        assert_eq!(foreground.managed_local_checkpointed_sequence, 0);
+        assert_eq!(foreground.managed_local_pending, 14);
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        assert_eq!(fixture.applied_batch_count(), applied_before);
+
+        handle
+            .observe_watcher(vec![
+                SyncWatcherObservation::managed_path(markdown_path).unwrap()
+            ])
+            .unwrap();
+        let echoed = handle.status().unwrap();
+        assert!(!echoed.watcher.pending);
+        assert_eq!(echoed.managed_local_pending, 14);
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        assert_eq!(fixture.applied_batch_count(), applied_before);
+
+        for _ in 0..512 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        let drained = handle.status().unwrap();
+        assert_eq!(drained.managed_local_pending, 0);
+        assert_eq!(drained.managed_local_checkpointed_sequence, 14);
+        assert_eq!(fixture.manifest_count(), manifests_before + 14);
+        assert_eq!(fixture.applied_batch_count(), applied_before + 14);
+
+        let expected_markdown = load_application_exact(&handle, markdown_path);
+        let expected_org = load_application_exact(&handle, org_path);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        let frames = managed_local_journal_frames(&request);
+        assert_eq!(frames.len(), expected_targets.len());
+        for (sequence, (frame, (expected_path, expected_target))) in
+            frames.iter().zip(&expected_targets).enumerate()
+        {
+            assert_eq!(frame.sequence(), sequence as u64);
+            let record = decode_managed_local_record(frame).unwrap();
+            assert_eq!(record.sequence(), sequence as u64);
+            assert_eq!(record.projection().intent().path().as_str(), expected_path);
+            assert_eq!(
+                record.projection().intent().target().bytes(),
+                Some(expected_target.as_slice())
+            );
+        }
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&reopened);
+        let cold_markdown = load_application_exact(&reopened, markdown_path);
+        let cold_org = load_application_exact(&reopened, org_path);
+        assert_parser_dto_semantics(&expected_markdown.0, &cold_markdown.0);
+        assert_eq!(expected_markdown.1, cold_markdown.1);
+        assert_parser_dto_semantics(&expected_org.0, &cold_org.0);
+        assert_eq!(expected_org.1, cold_org.1);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_local_unsafe_reopen_restores_committed_overlay_before_feed_and_accepts_next_save() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-unsafe-reopen");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Crash Restored.md";
+        admit_external_page(&handle, &fixture, path, b"- before crash\n");
+        let manifests_before = fixture.manifest_count();
+        let applied_before = fixture.applied_batch_count();
+        let (page, revision) = load_application_exact(&handle, path);
+        let (first, first_revision) =
+            save_application_block_text(&handle, page, revision, "committed before crash");
+        assert_eq!(handle.status().unwrap().managed_local_next_sequence, 1);
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        assert_eq!(fixture.applied_batch_count(), applied_before);
+
+        drop(handle);
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&reopened);
+        let recovered_status = reopened.status().unwrap();
+        assert_eq!(
+            recovered_status.recovery,
+            Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+        );
+        assert_eq!(recovered_status.managed_local_pending, 0);
+        assert_eq!(recovered_status.managed_local_next_sequence, 1);
+        assert_eq!(recovered_status.managed_local_checkpointed_sequence, 1);
+        assert_eq!(fixture.manifest_count(), manifests_before + 1);
+        assert_eq!(fixture.applied_batch_count(), applied_before + 1);
+        let recovered = load_application_exact(&reopened, path);
+        assert_parser_dto_semantics(&first, &recovered.0);
+        assert_eq!(first_revision, recovered.1);
+
+        let (second, second_revision) = save_application_block_text(
+            &reopened,
+            recovered.0,
+            recovered.1,
+            "committed after crash",
+        );
+        assert_eq!(reopened.status().unwrap().managed_local_pending, 1);
+        assert_eq!(reopened.status().unwrap().managed_local_next_sequence, 2);
+        assert_eq!(fixture.manifest_count(), manifests_before + 1);
+        assert_eq!(fixture.applied_batch_count(), applied_before + 1);
+
+        for _ in 0..128 {
+            if reopened.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            reopened.tick().unwrap();
+        }
+        assert_eq!(reopened.status().unwrap().managed_local_pending, 0);
+        let cold_expected = load_application_exact(&reopened, path);
+        assert_parser_dto_semantics(&second, &cold_expected.0);
+        assert_eq!(second_revision, cold_expected.1);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_local_watcher_preserves_divergent_external_bytes_and_blocks_clean_handoff() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-divergent-watcher");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Divergent Watcher.md";
+        admit_external_page(&handle, &fixture, path, b"- original\n");
+        let (page, revision) = load_application_exact(&handle, path);
+        save_application_block_text(&handle, page, revision, "journal projection");
+        assert_eq!(handle.status().unwrap().managed_local_next_sequence, 1);
+
+        let divergent = b"- externally divergent\n";
+        fs::write(fixture.graph_root().join(path), divergent).unwrap();
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
+            .unwrap();
+        assert!(handle.status().unwrap().watcher.pending);
+        let tick = handle.tick().unwrap();
+        assert!(matches!(
+            tick,
+            SyncRuntimeTick::Blocked(_)
+                | SyncRuntimeTick::RecoveryBlocked(_)
+                | SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::RetryFull
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path)).unwrap(),
+            divergent
+        );
+        assert_eq!(handle.status().unwrap().managed_local_next_sequence, 1);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
+        ));
+    }
+
+    #[test]
     fn application_gateway_settles_current_retained_publication_before_returning_saved() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-application-save-settlement");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
@@ -14062,6 +15626,13 @@ mod tests {
         let existing_reload = load_application_exact(&handle, existing_path);
         assert_parser_dto_semantics(&existing.0, &existing_reload.0);
         assert_eq!(existing.1, existing_reload.1);
+        for _ in 0..64 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
 
         let manifests_before_new = fixture.manifest_count();
         handle
@@ -14118,27 +15689,24 @@ mod tests {
             b"- before prior publication\n",
         );
         let prior = load_editor_named(&handle, "Prior Editor Publication", SyncPageKind::Page);
-        let mut prior_blocks = prior.blocks.clone();
-        prior_blocks[0].content = "settled prior publication".into();
+        let prior_page_id = parse_editor_page_id(&prior.page_id).unwrap();
         handle
             .install_repeated_operational_fault(OperationalFaultPoint::AfterStage, 2)
             .unwrap();
         let prior_batch = match handle
-            .save_editor_page(SyncEditorSaveRequest {
-                target: SyncEditorSaveTarget::Existing {
-                    page_id: prior.page_id,
-                    revision: prior.revision,
-                },
-                preamble: prior.preamble,
-                blocks: prior_blocks,
-            })
+            .submit_local_mutation(
+                OperationTransaction::new(vec![SemanticOperation::DeletePage {
+                    page_id: prior_page_id,
+                }])
+                .unwrap(),
+            )
             .unwrap()
         {
-            SyncEditorSaveOutcome::Deferred {
-                state: SyncEditorDeferred::RetryableRetainedPublication { batch_id, .. },
+            SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                batch_id: Some(batch_id),
                 ..
-            } => batch_id,
-            other => panic!("low-level editor save did not retain publication: {other:?}"),
+            } => batch_id.to_string(),
+            other => panic!("slow local mutation did not retain publication: {other:?}"),
         };
 
         let manifests_after_prior = fixture.manifest_count();
@@ -14173,10 +15741,7 @@ mod tests {
         assert!(!fixture.graph_root().join(requested_path.as_str()).exists());
 
         settle_local_mutation(&handle);
-        assert_eq!(
-            fs::read(fixture.graph_root().join(prior_path)).unwrap(),
-            b"- settled prior publication\n"
-        );
+        assert!(!fixture.graph_root().join(prior_path).exists());
         let created = match handle
             .save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::New {
@@ -16134,6 +17699,49 @@ mod tests {
         assert!(!query.contains(".save_page("));
         assert!(!query.contains(".force_save_page("));
         assert!(!query.contains("Graph::write_page"));
+    }
+
+    #[test]
+    fn managed_local_foreground_source_excludes_legacy_and_derivative_work() {
+        let source = include_str!("sync_runtime.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the runtime source has its test boundary");
+        let prepare = production
+            .split_once("fn prepare_trusted_local_runtime_commit(")
+            .and_then(|(_, tail)| tail.split_once("\nenum EditorTurnReadiness"))
+            .map(|(body, _)| body)
+            .expect("trusted-local preparation has a narrow source boundary");
+        let finish = production
+            .split_once("    fn finish_trusted_local_editor_outcome(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn retry_managed_local_overlay("))
+            .map(|(body, _)| body)
+            .expect("trusted-local response has a narrow source boundary");
+        let response = production
+            .split_once("    fn application_from_trusted_local_commit(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn tick_managed_local_derivative("))
+            .map(|(body, _)| body)
+            .expect("trusted-local response construction has a narrow source boundary");
+        let foreground = format!("{prepare}\n{finish}\n{response}");
+        for forbidden in [
+            "OperationalCoordinator::execute_local",
+            "OperationalCoordinator::retry_local",
+            "resume_managed_local_journal_drain",
+            ".archive_store()",
+            ".database()",
+            "record_local_authorship_receipt",
+            "record_provider_publication",
+            "settle_local",
+            "reload",
+        ] {
+            assert!(
+                !foreground.contains(forbidden),
+                "managed-local foreground contains forbidden derivative call {forbidden}"
+            );
+        }
+        assert!(production.contains("OperationalCoordinator::execute_local"));
+        assert!(production.contains("tick_external_feed"));
     }
 
     /// Drive the actor until the exact feed settles the epoch it owes, or give

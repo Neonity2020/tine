@@ -6003,6 +6003,29 @@ impl Graph {
         parse_external_document(self, fallback, content, require_round_trip)
     }
 
+    /// Parse exact caller-retained managed-text bytes into the ordinary
+    /// application DTO without reopening the graph file or consulting a page
+    /// cache. Journal-committed foreground replies use this after the guarded
+    /// writer has proved the same target bytes durable.
+    pub(crate) fn parse_exact_page_dto(
+        &self,
+        path: &ManagedPath,
+        bytes: &[u8],
+    ) -> io::Result<PageDto> {
+        let content = std::str::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("graph text is not UTF-8: {path}"),
+            )
+        })?;
+        let parsed = self.parse_external_document(path, bytes, false)?;
+        let mut dto = page_dto_checked(&parsed.effective, &parsed.parsed.document)?;
+        dto.read_only = read_only_org(Path::new(path.as_str()), content);
+        dto.rev = Some(parsed.revision);
+        dto.path = path.as_str().to_owned();
+        Ok(dto)
+    }
+
     fn decode_present_graph_text(
         &self,
         path: &ManagedPath,
@@ -12920,6 +12943,16 @@ impl Graph {
         let _ = self.warm_cache_cancellable(|| false);
     }
 
+    /// Prime the complete retained identity generation for focused coordinator
+    /// benchmarks that bypass normal managed-runtime catch-up.
+    #[cfg(test)]
+    pub(crate) fn prime_managed_journal_projection_authority(&self) -> io::Result<()> {
+        self.warm_cache();
+        let _write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        self.guarded_graph_text_identity_index().map(|_| ())
+    }
+
     /// Build graph-open caches while allowing a revoked window binding to stop
     /// between files and derived-map phases. Returns false when cancelled.
     pub fn warm_cache_cancellable(&self, cancelled: impl Fn() -> bool) -> bool {
@@ -18611,6 +18644,26 @@ impl Graph {
         Ok((path, true))
     }
 
+    fn existing_journal_projection_target(
+        &self,
+        write: &ManagedTextWritePermit,
+        page: &PageDto,
+    ) -> io::Result<(PathBuf, bool)> {
+        if page.path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal projection requires one path-pinned existing page",
+            ));
+        }
+        let path = self
+            .resolve_graph_rel_with_permit(write, &page.path)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid page path"))?;
+        // Managed runtime reads are served from the accepted engine plus its
+        // journal overlay. Publishing an exact pinned target must not warm or
+        // maintain the legacy parsed-Graph cache on the foreground save path.
+        Ok((path, false))
+    }
+
     fn require_pinned_save_owner(
         &self,
         page: &PageDto,
@@ -18683,7 +18736,7 @@ impl Graph {
         }
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
-        let (path, cache) = self.save_target(&write, page)?;
+        let (path, cache) = self.existing_journal_projection_target(&write, page)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
         let verified = self.verify_existing_journal_page_projection(
