@@ -4858,6 +4858,7 @@ impl Graph {
             vec![("", 0)],
             true,
         )?;
+        crate::fast_commit::note_graph_text_inventory(entries.len());
         Ok((entries, identities))
     }
 

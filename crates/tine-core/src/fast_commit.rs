@@ -35,6 +35,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -154,6 +155,55 @@ pub(crate) fn note_application_page_load() {
     });
 }
 
+/// Whole-graph work an ordinary edit performs but has no latency budget for.
+///
+/// The fast commit's own spine performs none of it. The audited guarded
+/// replacement it is contractually required to reuse re-derives the graph's
+/// text inventory on every save, to prove that no other path shares the
+/// target's portable case/NFC identity and that no other path aliases the same
+/// physical resource. Counting the entries that inventory visits turns a timing
+/// inference into an exact structural fact, at every graph size.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GraphWideCommitWork {
+    /// Whole-graph text inventories derived.
+    pub text_inventory_scans: usize,
+    /// Graph text entries those inventories visited.
+    pub text_inventory_entries: usize,
+}
+
+impl GraphWideCommitWork {
+    /// Work performed between two observations.
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            text_inventory_scans: self.text_inventory_scans - earlier.text_inventory_scans,
+            text_inventory_entries: self.text_inventory_entries - earlier.text_inventory_entries,
+        }
+    }
+}
+
+thread_local! {
+    static GRAPH_WIDE_COMMIT_WORK: Cell<GraphWideCommitWork> = const {
+        Cell::new(GraphWideCommitWork {
+            text_inventory_scans: 0,
+            text_inventory_entries: 0,
+        })
+    };
+}
+
+/// This thread's running count of whole-graph work performed on the edit path.
+pub fn graph_wide_commit_work() -> GraphWideCommitWork {
+    GRAPH_WIDE_COMMIT_WORK.with(Cell::get)
+}
+
+pub(crate) fn note_graph_text_inventory(entries: usize) {
+    GRAPH_WIDE_COMMIT_WORK.with(|counters| {
+        let mut current = counters.get();
+        current.text_inventory_scans = current.text_inventory_scans.saturating_add(1);
+        current.text_inventory_entries = current.text_inventory_entries.saturating_add(entries);
+        counters.set(current);
+    });
+}
+
 /// The already-derived effect of one edit, in an existing encoding.
 #[derive(Clone, Copy, Debug)]
 pub enum FastCommitIntent<'a> {
@@ -196,6 +246,33 @@ pub fn recover_commit_intent(
     }
 }
 
+/// Where one fast commit spent its time, by contract step.
+///
+/// This is permanent, always-on accounting rather than a temporary probe. Four
+/// clock reads cost tens of nanoseconds against a millisecond-scale durable
+/// operation, and a latency-contracted path that cannot say which of its own
+/// steps regressed is not one anybody can defend later.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FastCommitTimings {
+    /// Stale/base validation.
+    pub validation: Duration,
+    /// Payload encode, frame encode, append, and the durability barrier.
+    pub journal: Duration,
+    /// The existing audited guarded Markdown/Org replacement.
+    pub replacement: Duration,
+    /// Retaining the new base and attaching it to the returned page.
+    pub publish: Duration,
+}
+
+impl FastCommitTimings {
+    pub const fn total(self) -> Duration {
+        self.validation
+            .saturating_add(self.journal)
+            .saturating_add(self.replacement)
+            .saturating_add(self.publish)
+    }
+}
+
 /// The post-edit state a fast commit returns to its caller.
 ///
 /// The page is the caller's own already-computed post-edit page with its new
@@ -204,6 +281,7 @@ pub fn recover_commit_intent(
 pub struct FastCommitOutcome {
     pub page: PageDto,
     pub journal: LocalJournalAppend,
+    pub timings: FastCommitTimings,
 }
 
 /// A failure at the fast trusted-local commit boundary.
@@ -360,6 +438,7 @@ impl FastLocalCommitter {
         intent: FastCommitIntent<'_>,
     ) -> Result<FastCommitOutcome, FastCommitError> {
         // 1. Stale/base validation, before anything durable happens.
+        let started = Instant::now();
         if page.path.is_empty() {
             return Err(FastCommitError::UnpinnedPage);
         }
@@ -374,20 +453,32 @@ impl FastLocalCommitter {
             }
             None => return Err(FastCommitError::UntrackedPage(page.path.clone())),
         }
+        let validated = Instant::now();
 
         // 2. One canonical journal append plus its single durability barrier.
         let (kind, payload) = intent.journal_payload()?;
         let journal = self.segment.append(kind, payload.as_ref())?;
+        let journalled = Instant::now();
 
         // 3. The existing audited guarded Markdown/Org replacement.
         let revision = self.graph.save_page(&page, Some(base_rev))?;
+        let replaced = Instant::now();
 
         // 4. Direct return of the already-computed post-edit state.
         self.base_revisions
             .insert(page.path.clone(), revision.clone());
         let mut page = page;
         page.rev = Some(revision);
-        Ok(FastCommitOutcome { page, journal })
+        Ok(FastCommitOutcome {
+            page,
+            journal,
+            timings: FastCommitTimings {
+                validation: validated.duration_since(started),
+                journal: journalled.duration_since(validated),
+                replacement: replaced.duration_since(journalled),
+                publish: replaced.elapsed(),
+            },
+        })
     }
 }
 
@@ -807,6 +898,90 @@ mod tests {
         }
     }
 
+    /// The spine's own work must not depend on how big the graph is, and the
+    /// work that *does* depend on graph size must be attributable to exactly one
+    /// place. Both halves are asserted as identities at two graph sizes.
+    ///
+    /// The second half pins today's measured boundary: the audited guarded
+    /// replacement re-derives the whole graph's text inventory on every save, to
+    /// prove no other path shares the target's portable identity and no other
+    /// path aliases the same physical resource. That is the cost the release
+    /// benchmark measures and the ordinary-edit latency contract cannot absorb.
+    /// When that changes, this test must change with it — deliberately, and with
+    /// the reason recorded.
+    /// Whole-graph text inventories one audited guarded replacement derives.
+    /// Measured, not assumed; see the test below.
+    const INVENTORIES_PER_AUDITED_REPLACEMENT: usize = 4;
+
+    #[test]
+    fn the_spine_costs_the_same_at_every_graph_size_and_the_audited_replacement_does_not() {
+        let mut observations = Vec::new();
+        for pages in [4_usize, 400] {
+            let fixture = GraphFixture::build(
+                &overlay_base(),
+                "spine-scaling",
+                pages,
+                DEFAULT_BLOCKS_PER_PAGE,
+                FixtureFormat::Markdown,
+            );
+            let mut committer = fixture.committer(Uuid::from_u128(0x_5747_0006));
+            // The same page index at both sizes, so the journalled payload is
+            // byte-identical and any difference is a scaling effect.
+            let mut current = fixture.load(1);
+            committer.adopt_loaded_page(&current).unwrap();
+
+            let mut forbidden = ForbiddenCommitWork::default();
+            let mut graph_wide = GraphWideCommitWork::default();
+            for generation in 1..=3 {
+                let base_rev = current.rev.clone().unwrap();
+                let (edited, effect) = content_edit(&current, 1, 0, generation);
+                let before = forbidden_commit_work();
+                let graph_wide_before = graph_wide_commit_work();
+                current = committer
+                    .commit(edited, &base_rev, FastCommitIntent::SemanticEffect(&effect))
+                    .unwrap()
+                    .page;
+                forbidden = forbidden_commit_work().since(before);
+                graph_wide = graph_wide_commit_work().since(graph_wide_before);
+            }
+            observations.push((pages, committer.journal_stats(), forbidden, graph_wide));
+        }
+
+        let [(_, small_journal, small_forbidden, small_graph_wide), (_, large_journal, large_forbidden, large_graph_wide)] =
+            observations.as_slice()
+        else {
+            unreachable!("two observations")
+        };
+
+        // The spine: identical at both graph sizes.
+        assert_eq!(small_journal.frames_appended, 3);
+        assert_eq!(small_journal, large_journal, "the journal spine must do identical work at every graph size");
+        assert!(small_forbidden.is_none() && large_forbidden.is_none());
+
+        // The audited replacement: a fixed number of whole-graph inventories per
+        // commit, each visiting the whole graph. Both terms are pinned, because
+        // both are what the ordinary-edit latency contract cannot absorb.
+        assert_eq!(
+            (
+                small_graph_wide.text_inventory_scans,
+                large_graph_wide.text_inventory_scans
+            ),
+            (INVENTORIES_PER_AUDITED_REPLACEMENT, INVENTORIES_PER_AUDITED_REPLACEMENT),
+            "the audited replacement re-derives the whole-graph text inventory a fixed \
+             number of times per save"
+        );
+        // Four inventories minus the one entry the target-excluding pass skips.
+        let expected = |pages: usize| pages * INVENTORIES_PER_AUDITED_REPLACEMENT - 1;
+        assert_eq!(
+            (
+                small_graph_wide.text_inventory_entries,
+                large_graph_wide.text_inventory_entries
+            ),
+            (expected(4), expected(400)),
+            "the entries one commit visits are proportional to total graph pages"
+        );
+    }
+
     #[test]
     fn the_projected_page_reparses_and_a_fresh_reopen_sees_the_last_committed_edit() {
         for format in every_format() {
@@ -1081,9 +1256,21 @@ mod benchmark {
         format: FixtureFormat,
         pages: usize,
         samples: Vec<Duration>,
+        /// Per-step samples, so a missed gate names the step that missed it.
+        validation: Vec<Duration>,
+        journal_phase: Vec<Duration>,
+        replacement: Vec<Duration>,
         journal: LocalJournalStats,
         forbidden: ForbiddenCommitWork,
+        graph_wide: GraphWideCommitWork,
         journal_bytes_per_commit: f64,
+    }
+
+    fn percentile_of(samples: &[Duration], fraction: f64) -> Duration {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let index = ((sorted.len() as f64 - 1.0) * fraction).round() as usize;
+        sorted[index.min(sorted.len() - 1)]
     }
 
     impl Receipt {
@@ -1224,7 +1411,11 @@ mod benchmark {
 
         let before_digests = fixture.text_digests();
         let mut samples = Vec::with_capacity(configuration.edits);
+        let mut validation = Vec::with_capacity(configuration.edits);
+        let mut journal_phase = Vec::with_capacity(configuration.edits);
+        let mut replacement = Vec::with_capacity(configuration.edits);
         let mut forbidden = ForbiddenCommitWork::default();
+        let mut graph_wide = GraphWideCommitWork::default();
         let total = configuration.warmups + configuration.edits;
         for generation in 1..=total {
             let base_rev = current.rev.clone().unwrap();
@@ -1238,10 +1429,12 @@ mod benchmark {
             let intent = FastCommitIntent::SemanticEffect(&effect);
 
             let observed_before = forbidden_commit_work();
+            let graph_wide_before = graph_wide_commit_work();
             let started = Instant::now();
             let outcome = committer.commit(edited, &base_rev, intent).unwrap();
             let elapsed = started.elapsed();
             let performed = forbidden_commit_work().since(observed_before);
+            let performed_graph_wide = graph_wide_commit_work().since(graph_wide_before);
 
             assert_eq!(
                 outcome.journal.data_durability_syncs, 1,
@@ -1255,6 +1448,9 @@ mod benchmark {
             assert!(outcome.page.rev.is_some());
             if generation > configuration.warmups {
                 samples.push(elapsed);
+                validation.push(outcome.timings.validation);
+                journal_phase.push(outcome.timings.journal);
+                replacement.push(outcome.timings.replacement);
                 forbidden = ForbiddenCommitWork {
                     sqlite_drains: forbidden.sqlite_drains + performed.sqlite_drains,
                     archive_object_reads: forbidden.archive_object_reads
@@ -1265,6 +1461,12 @@ mod benchmark {
                         + performed.graph_wide_catalog_decodes,
                     application_page_loads: forbidden.application_page_loads
                         + performed.application_page_loads,
+                };
+                graph_wide = GraphWideCommitWork {
+                    text_inventory_scans: graph_wide.text_inventory_scans
+                        + performed_graph_wide.text_inventory_scans,
+                    text_inventory_entries: graph_wide.text_inventory_entries
+                        + performed_graph_wide.text_inventory_entries,
                 };
             }
             current = outcome.page;
@@ -1313,8 +1515,12 @@ mod benchmark {
             pages: configuration.pages,
             journal_bytes_per_commit: journal.bytes_appended as f64 / total as f64,
             samples,
+            validation,
+            journal_phase,
+            replacement,
             journal,
             forbidden,
+            graph_wide,
         }
     }
 
@@ -1367,6 +1573,27 @@ mod benchmark {
                         receipt.journal.directory_durability_syncs,
                         receipt.journal_bytes_per_commit,
                         receipt.forbidden,
+                    );
+                    // Per-step attribution, so a missed gate names the step that
+                    // missed it instead of leaving the cause to be guessed.
+                    eprintln!(
+                        "fast_commit_steps surface={} format={} pages={} \
+                         validation_p50_ms={:.4} journal_p50_ms={:.4} replacement_p50_ms={:.4} \
+                         journal_p95_ms={:.4} replacement_p95_ms={:.4} \
+                         graph_text_inventories_per_commit={:.3} \
+                         graph_text_entries_visited_per_commit={:.1}",
+                        receipt.surface.label(),
+                        receipt.format.label(),
+                        receipt.pages,
+                        milliseconds(percentile_of(&receipt.validation, 0.50)),
+                        milliseconds(percentile_of(&receipt.journal_phase, 0.50)),
+                        milliseconds(percentile_of(&receipt.replacement, 0.50)),
+                        milliseconds(percentile_of(&receipt.journal_phase, 0.95)),
+                        milliseconds(percentile_of(&receipt.replacement, 0.95)),
+                        receipt.graph_wide.text_inventory_scans as f64
+                            / receipt.samples.len() as f64,
+                        receipt.graph_wide.text_inventory_entries as f64
+                            / receipt.samples.len() as f64,
                     );
                     // Raw samples, so the receipt can be re-derived rather than
                     // trusted.
