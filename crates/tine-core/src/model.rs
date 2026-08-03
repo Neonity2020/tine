@@ -12943,16 +12943,6 @@ impl Graph {
         let _ = self.warm_cache_cancellable(|| false);
     }
 
-    /// Prime the complete retained identity generation for focused coordinator
-    /// benchmarks that bypass normal managed-runtime catch-up.
-    #[cfg(test)]
-    pub(crate) fn prime_managed_journal_projection_authority(&self) -> io::Result<()> {
-        self.warm_cache();
-        let _write = self.admit_managed_text_writer()?;
-        let _identity = self.lock_graph_text_identity_mutation()?;
-        self.guarded_graph_text_identity_index().map(|_| ())
-    }
-
     /// Build graph-open caches while allowing a revoked window binding to stop
     /// between files and derived-map phases. Returns false when cancelled.
     pub fn warm_cache_cancellable(&self, cancelled: impl Fn() -> bool) -> bool {

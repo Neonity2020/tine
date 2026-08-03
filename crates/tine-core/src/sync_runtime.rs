@@ -7879,9 +7879,9 @@ impl RuntimeActor {
                         target_page,
                         &transaction,
                     )
-                    .map_err(|error| {
+                    .map_err(|_error| {
                         #[cfg(test)]
-                        eprintln!("trusted-local runtime preparation refused: {error}");
+                        eprintln!("trusted-local runtime preparation refused: {_error}");
                         SyncEditorRequestError::ActorRefused
                     })?
                 }
