@@ -1,0 +1,1022 @@
+//! Prototype spine of a fast trusted-local commit.
+//!
+//! An ordinary edit on a trusted local device does not need consensus, a
+//! receipt, or a projection round trip before the user may keep typing. It
+//! needs its base to still be current, one durable record of what it is about
+//! to do, and the audited graph-text replacement that does it. This module is
+//! that spine and nothing else:
+//!
+//! 1. stale/base validation against the committer's own trusted-local state;
+//! 2. one canonical [`tine_storage::LocalJournalFrame`] append plus its single
+//!    durability barrier;
+//! 3. the existing audited guarded Markdown/Org replacement
+//!    ([`Graph::save_page`]);
+//! 4. direct return of the already-computed post-edit state.
+//!
+//! Nothing else is synchronous. SQLite, archive publication, receipt
+//! construction, remote validation, and page reload are all absent, and
+//! [`ForbiddenCommitWork`] makes that a measured fact rather than a claim.
+//!
+//! The journal payload is an *existing* encoding. A semantic effect is carried
+//! in the canonical [`SemanticEffect`] encoding and a CRDT update is carried in
+//! the engine's own exported update bytes; the frame's payload kind is the
+//! existing [`ObjectKind`] vocabulary. This module introduces no second parser
+//! and no second digest.
+//!
+//! This is a narrowly scoped internal API. It is deliberately not wired into
+//! the shipping save route yet: the runtime integration is a later lane's work,
+//! and this lane's contract is to prove the spine can meet the ordinary-edit
+//! latency budget first.
+
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
+
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+use uuid::Uuid;
+
+use tine_storage::{
+    LocalJournalAppend, LocalJournalError, LocalJournalFrame, LocalJournalRecovery,
+    LocalJournalSegment, LocalJournalStats, ObjectKind,
+};
+
+use crate::oplog::semantic::{SemanticEffect, SemanticError};
+use crate::{Graph, PageDto};
+
+/// Directory, relative to a committer's journal root, that holds per-device
+/// segments. Versioned so a future frame layout can coexist during migration.
+pub const FAST_COMMIT_JOURNAL_DIR: &str = "fast-commit-journal-v1";
+
+/// Structural work an ordinary fast commit must never perform.
+///
+/// Each field is incremented at the *real* boundary — the SQLite tail drain, an
+/// archive object read, a projection receipt load, a graph-wide catalog decode,
+/// and an application page load — so asserting that a commit leaves them at
+/// zero is a statement about reachable code, not about this module's own
+/// bookkeeping.
+///
+/// The counters are thread-scoped, matching the rest of the oplog's
+/// instrumentation: each of those boundaries is reached on the thread that
+/// requested the work, and a fast commit is entirely synchronous on its
+/// caller's thread.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ForbiddenCommitWork {
+    /// Accepted events drained from the tail overlay into SQLite.
+    pub sqlite_drains: usize,
+    /// Accepted archive objects read out of the object store.
+    pub archive_object_reads: usize,
+    /// Completed projection receipts loaded from the projection store.
+    pub projection_receipt_loads: usize,
+    /// Whole page-catalog CRDT documents decoded out of scratch.
+    pub graph_wide_catalog_decodes: usize,
+    /// Application page DTOs rebuilt from graph text.
+    pub application_page_loads: usize,
+}
+
+impl ForbiddenCommitWork {
+    /// Work performed between two observations.
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            sqlite_drains: self.sqlite_drains - earlier.sqlite_drains,
+            archive_object_reads: self.archive_object_reads - earlier.archive_object_reads,
+            projection_receipt_loads: self.projection_receipt_loads
+                - earlier.projection_receipt_loads,
+            graph_wide_catalog_decodes: self.graph_wide_catalog_decodes
+                - earlier.graph_wide_catalog_decodes,
+            application_page_loads: self.application_page_loads - earlier.application_page_loads,
+        }
+    }
+
+    pub const fn is_none(self) -> bool {
+        self.sqlite_drains == 0
+            && self.archive_object_reads == 0
+            && self.projection_receipt_loads == 0
+            && self.graph_wide_catalog_decodes == 0
+            && self.application_page_loads == 0
+    }
+}
+
+thread_local! {
+    static FORBIDDEN_COMMIT_WORK: Cell<ForbiddenCommitWork> = const {
+        Cell::new(ForbiddenCommitWork {
+            sqlite_drains: 0,
+            archive_object_reads: 0,
+            projection_receipt_loads: 0,
+            graph_wide_catalog_decodes: 0,
+            application_page_loads: 0,
+        })
+    };
+}
+
+/// This thread's running count of structural work a fast commit forbids.
+pub fn forbidden_commit_work() -> ForbiddenCommitWork {
+    FORBIDDEN_COMMIT_WORK.with(Cell::get)
+}
+
+fn note_forbidden(select: impl FnOnce(&mut ForbiddenCommitWork)) {
+    FORBIDDEN_COMMIT_WORK.with(|counters| {
+        let mut current = counters.get();
+        select(&mut current);
+        counters.set(current);
+    });
+}
+
+pub(crate) fn note_sqlite_drain() {
+    note_forbidden(|counters| counters.sqlite_drains = counters.sqlite_drains.saturating_add(1));
+}
+
+pub(crate) fn note_archive_object_read() {
+    note_forbidden(|counters| {
+        counters.archive_object_reads = counters.archive_object_reads.saturating_add(1);
+    });
+}
+
+pub(crate) fn note_projection_receipt_load() {
+    note_forbidden(|counters| {
+        counters.projection_receipt_loads = counters.projection_receipt_loads.saturating_add(1);
+    });
+}
+
+pub(crate) fn note_graph_wide_catalog_decode() {
+    note_forbidden(|counters| {
+        counters.graph_wide_catalog_decodes = counters.graph_wide_catalog_decodes.saturating_add(1);
+    });
+}
+
+pub(crate) fn note_application_page_load() {
+    note_forbidden(|counters| {
+        counters.application_page_loads = counters.application_page_loads.saturating_add(1);
+    });
+}
+
+/// The already-derived effect of one edit, in an existing encoding.
+#[derive(Clone, Copy, Debug)]
+pub enum FastCommitIntent<'a> {
+    /// The canonical semantic-effect encoding.
+    SemanticEffect(&'a SemanticEffect),
+    /// Engine-exported CRDT update bytes.
+    CrdtUpdate(&'a [u8]),
+}
+
+impl FastCommitIntent<'_> {
+    /// The frame's payload kind and bytes. A CRDT update is already encoded, so
+    /// it is journalled without a copy.
+    fn journal_payload(&self) -> Result<(ObjectKind, Cow<'_, [u8]>), FastCommitError> {
+        match self {
+            Self::SemanticEffect(effect) => {
+                Ok((ObjectKind::SemanticEffect, Cow::Owned(effect.encode()?)))
+            }
+            Self::CrdtUpdate(bytes) => Ok((ObjectKind::CrdtUpdate, Cow::Borrowed(bytes))),
+        }
+    }
+}
+
+/// A journalled intent recovered from a frame, decoded back to its typed form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecoveredCommitIntent {
+    SemanticEffect(SemanticEffect),
+    CrdtUpdate(Vec<u8>),
+}
+
+/// Decode one recovered frame back into the typed payload that was journalled.
+pub fn recover_commit_intent(
+    frame: &LocalJournalFrame<ObjectKind>,
+) -> Result<RecoveredCommitIntent, FastCommitError> {
+    match frame.payload_kind() {
+        ObjectKind::SemanticEffect => Ok(RecoveredCommitIntent::SemanticEffect(
+            SemanticEffect::decode(frame.payload())?,
+        )),
+        ObjectKind::CrdtUpdate => Ok(RecoveredCommitIntent::CrdtUpdate(frame.payload().to_vec())),
+        kind => Err(FastCommitError::UnsupportedPayloadKind(kind)),
+    }
+}
+
+/// The post-edit state a fast commit returns to its caller.
+///
+/// The page is the caller's own already-computed post-edit page with its new
+/// revision attached. Nothing is re-read to produce it.
+#[derive(Clone, Debug)]
+pub struct FastCommitOutcome {
+    pub page: PageDto,
+    pub journal: LocalJournalAppend,
+}
+
+/// A failure at the fast trusted-local commit boundary.
+#[derive(Debug)]
+pub enum FastCommitError {
+    /// A fast commit replaces a specific known file; a page with no path would
+    /// have to be resolved by name, which is not a trusted-local fast path.
+    UnpinnedPage,
+    /// The committer has no trusted-local base for this page, so it cannot
+    /// decide staleness without reading the graph.
+    UntrackedPage(String),
+    StaleBase {
+        path: String,
+        expected: String,
+        offered: String,
+    },
+    UnsupportedPayloadKind(ObjectKind),
+    Journal(LocalJournalError),
+    Semantic(SemanticError),
+    Io(io::Error),
+}
+
+impl fmt::Display for FastCommitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnpinnedPage => {
+                formatter.write_str("a fast commit requires a path-pinned page")
+            }
+            Self::UntrackedPage(path) => {
+                write!(formatter, "no trusted-local base is retained for {path}")
+            }
+            Self::StaleBase {
+                path,
+                expected,
+                offered,
+            } => write!(
+                formatter,
+                "stale base for {path}: expected {expected}, offered {offered}"
+            ),
+            Self::UnsupportedPayloadKind(kind) => {
+                write!(formatter, "unsupported fast commit payload kind: {kind:?}")
+            }
+            Self::Journal(error) => error.fmt(formatter),
+            Self::Semantic(error) => error.fmt(formatter),
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for FastCommitError {}
+
+impl From<LocalJournalError> for FastCommitError {
+    fn from(error: LocalJournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+impl From<SemanticError> for FastCommitError {
+    fn from(error: SemanticError) -> Self {
+        Self::Semantic(error)
+    }
+}
+
+impl From<io::Error> for FastCommitError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// A device-local fast committer over one graph and one journal segment.
+pub struct FastLocalCommitter {
+    graph: Arc<Graph>,
+    segment: LocalJournalSegment<ObjectKind>,
+    /// Graph-relative page path to the revision this device last committed.
+    /// This is the trusted-local base; the audited replacement still proves the
+    /// same revision against the file itself.
+    base_revisions: HashMap<String, String>,
+}
+
+impl FastLocalCommitter {
+    /// Open the committer's journal segment under `journal_root`, adopting any
+    /// frames a previous process left behind.
+    pub fn open(
+        graph: Arc<Graph>,
+        journal_root: &Path,
+        device_id: Uuid,
+    ) -> Result<(Self, LocalJournalRecovery<ObjectKind>), FastCommitError> {
+        let directory = journal_root.join(FAST_COMMIT_JOURNAL_DIR);
+        std::fs::create_dir_all(&directory)?;
+        let directory = Dir::open_ambient_dir(&directory, ambient_authority())?;
+        let name = format!("{}.journal", device_id.simple());
+        let (segment, recovery) = LocalJournalSegment::open(&directory, &name, device_id)?;
+        Ok((
+            Self {
+                graph,
+                segment,
+                base_revisions: HashMap::new(),
+            },
+            recovery,
+        ))
+    }
+
+    pub fn graph(&self) -> &Arc<Graph> {
+        &self.graph
+    }
+
+    pub const fn journal_stats(&self) -> LocalJournalStats {
+        self.segment.stats()
+    }
+
+    pub const fn next_sequence(&self) -> u64 {
+        self.segment.next_sequence()
+    }
+
+    /// Stream every committed journal frame in append order.
+    pub fn replay_journal(
+        &self,
+        visit: impl FnMut(LocalJournalFrame<ObjectKind>),
+    ) -> Result<u64, FastCommitError> {
+        Ok(self.segment.replay(visit)?)
+    }
+
+    /// Adopt a freshly loaded page as this device's trusted-local base.
+    ///
+    /// The page must carry the path and revision it was loaded with; that pair
+    /// is exactly what the audited replacement will re-prove against the file.
+    pub fn adopt_loaded_page(&mut self, page: &PageDto) -> Result<(), FastCommitError> {
+        if page.path.is_empty() {
+            return Err(FastCommitError::UnpinnedPage);
+        }
+        let revision = page
+            .rev
+            .clone()
+            .ok_or_else(|| FastCommitError::UntrackedPage(page.path.clone()))?;
+        self.base_revisions.insert(page.path.clone(), revision);
+        Ok(())
+    }
+
+    /// This device's trusted-local base revision for `path`, if any.
+    pub fn base_revision(&self, path: &str) -> Option<&str> {
+        self.base_revisions.get(path).map(String::as_str)
+    }
+
+    /// Commit one ordinary edit.
+    ///
+    /// `page` is the caller's already-computed post-edit page; it is returned
+    /// with its new revision rather than reloaded. `base_rev` is the revision
+    /// the edit was derived from. `intent` is the edit's already-derived effect
+    /// in an existing encoding, which is what the journal frame carries.
+    pub fn commit(
+        &mut self,
+        page: PageDto,
+        base_rev: &str,
+        intent: FastCommitIntent<'_>,
+    ) -> Result<FastCommitOutcome, FastCommitError> {
+        // 1. Stale/base validation, before anything durable happens.
+        if page.path.is_empty() {
+            return Err(FastCommitError::UnpinnedPage);
+        }
+        match self.base_revisions.get(&page.path) {
+            Some(retained) if retained == base_rev => {}
+            Some(retained) => {
+                return Err(FastCommitError::StaleBase {
+                    path: page.path.clone(),
+                    expected: retained.clone(),
+                    offered: base_rev.to_owned(),
+                })
+            }
+            None => return Err(FastCommitError::UntrackedPage(page.path.clone())),
+        }
+
+        // 2. One canonical journal append plus its single durability barrier.
+        let (kind, payload) = intent.journal_payload()?;
+        let journal = self.segment.append(kind, payload.as_ref())?;
+
+        // 3. The existing audited guarded Markdown/Org replacement.
+        let revision = self.graph.save_page(&page, Some(base_rev))?;
+
+        // 4. Direct return of the already-computed post-edit state.
+        self.base_revisions
+            .insert(page.path.clone(), revision.clone());
+        let mut page = page;
+        page.rev = Some(revision);
+        Ok(FastCommitOutcome { page, journal })
+    }
+}
+
+
+#[cfg(test)]
+mod fixtures {
+    //! Shared synthetic-graph builders for the fast-commit proofs and the
+    //! release benchmark. Both surfaces use exactly these builders so a
+    //! correctness proof and a latency receipt describe the same graph.
+
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use tine_storage::ContentDigest;
+    use uuid::Uuid;
+
+    use super::{FastCommitError, FastLocalCommitter};
+    use crate::oplog::semantic::{BlockDelta, BlockOwner, BlockState, SemanticEffect};
+    use crate::oplog::{BlockId, DocumentId, PageId};
+    use crate::{Graph, PageDto, PageKind};
+
+    pub(super) const DEFAULT_BLOCKS_PER_PAGE: usize = 10;
+    pub(super) const PAGE_STEM: &str = "Fast-Commit";
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum FixtureFormat {
+        Markdown,
+        Org,
+    }
+
+    impl FixtureFormat {
+        pub(super) const fn extension(self) -> &'static str {
+            match self {
+                Self::Markdown => "md",
+                Self::Org => "org",
+            }
+        }
+
+        pub(super) const fn label(self) -> &'static str {
+            match self {
+                Self::Markdown => "markdown",
+                Self::Org => "org",
+            }
+        }
+
+        /// One page's on-disk source. Both formats carry the same semantic
+        /// shape — a task marker, a page reference, and a tag — so a
+        /// differential between them is about the format, not the content.
+        pub(super) fn page_source(self, page: usize, blocks_per_page: usize) -> String {
+            let neighbour = page.saturating_sub(1);
+            let mut source = String::new();
+            for block in 0..blocks_per_page {
+                let marker = if block % 2 == 0 { "TODO " } else { "" };
+                let text = format!(
+                    "{marker}block {page}-{block} references [[{PAGE_STEM}-{neighbour}]] and #fast-tag"
+                );
+                match self {
+                    Self::Markdown => source.push_str(&format!("- {text}\n")),
+                    Self::Org => source.push_str(&format!("* {text}\n")),
+                }
+            }
+            source
+        }
+    }
+
+    /// One synthetic graph on disk plus its opened Direct Files backend.
+    pub(super) struct GraphFixture {
+        pub(super) root: PathBuf,
+        pub(super) graph_root: PathBuf,
+        pub(super) journal_root: PathBuf,
+        pub(super) graph: Arc<Graph>,
+        pub(super) format: FixtureFormat,
+        pub(super) blocks_per_page: usize,
+        remove_on_drop: bool,
+    }
+
+    impl GraphFixture {
+        /// Build a `pages`-page graph of `blocks_per_page` blocks each under
+        /// `base`, then open it. `base` selects the filesystem under test.
+        pub(super) fn build(
+            base: &Path,
+            label: &str,
+            pages: usize,
+            blocks_per_page: usize,
+            format: FixtureFormat,
+        ) -> Self {
+            assert!(pages > 0 && blocks_per_page > 0);
+            let root = base.join(format!(
+                "tine-fast-commit-{label}-{}",
+                Uuid::new_v4().simple()
+            ));
+            let graph_root = root.join("graph");
+            let pages_dir = graph_root.join("pages");
+            fs::create_dir_all(&pages_dir).unwrap();
+            fs::create_dir_all(graph_root.join("journals")).unwrap();
+            for page in 0..pages {
+                fs::write(
+                    pages_dir.join(format!("{PAGE_STEM}-{page}.{}", format.extension())),
+                    format.page_source(page, blocks_per_page),
+                )
+                .unwrap();
+            }
+            let journal_root = root.join("private");
+            fs::create_dir_all(&journal_root).unwrap();
+            let graph = Arc::new(Graph::open_checked(&graph_root).expect("the synthetic graph opens"));
+            Self {
+                root,
+                graph_root,
+                journal_root,
+                graph,
+                format,
+                blocks_per_page,
+                remove_on_drop: true,
+            }
+        }
+
+        pub(super) fn page_name(&self, page: usize) -> String {
+            format!("{PAGE_STEM}-{page}")
+        }
+
+        pub(super) fn load(&self, page: usize) -> PageDto {
+            self.graph
+                .load_named(&self.page_name(page), PageKind::Page)
+                .expect("a synthetic page loads")
+                .expect("the synthetic page exists")
+        }
+
+        /// Reopen the same graph bytes through a brand new backend.
+        pub(super) fn reopen(&self) -> Arc<Graph> {
+            Arc::new(Graph::open_checked(&self.graph_root).expect("the synthetic graph reopens"))
+        }
+
+        pub(super) fn committer(&self, device: Uuid) -> FastLocalCommitter {
+            let (committer, recovery) =
+                FastLocalCommitter::open(Arc::clone(&self.graph), &self.journal_root, device)
+                    .expect("the fast committer opens");
+            assert_eq!(recovery.discarded_tail_bytes, 0);
+            committer
+        }
+
+        pub(super) fn committer_over(
+            &self,
+            graph: Arc<Graph>,
+            device: Uuid,
+        ) -> Result<
+            (
+                FastLocalCommitter,
+                tine_storage::LocalJournalRecovery<tine_storage::ObjectKind>,
+            ),
+            FastCommitError,
+        > {
+            FastLocalCommitter::open(graph, &self.journal_root, device)
+        }
+
+        /// Content digest of every graph text file, keyed by graph-relative path.
+        pub(super) fn text_digests(&self) -> BTreeMap<String, ContentDigest> {
+            let mut digests = BTreeMap::new();
+            collect_text_digests(&self.graph_root, &self.graph_root, &mut digests);
+            digests
+        }
+
+        pub(super) fn journal_segment_path(&self, device: Uuid) -> PathBuf {
+            self.journal_root
+                .join(super::FAST_COMMIT_JOURNAL_DIR)
+                .join(format!("{}.journal", device.simple()))
+        }
+
+        pub(super) fn keep(&mut self) {
+            self.remove_on_drop = false;
+        }
+    }
+
+    impl Drop for GraphFixture {
+        fn drop(&mut self) {
+            if self.remove_on_drop {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    fn collect_text_digests(
+        root: &Path,
+        directory: &Path,
+        into: &mut BTreeMap<String, ContentDigest>,
+    ) {
+        let mut entries: Vec<_> = fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                collect_text_digests(root, &path, into);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                into.insert(relative, ContentDigest::of(&fs::read(&path).unwrap()));
+            }
+        }
+    }
+
+    /// The post-edit page for one ordinary content edit, plus the semantic
+    /// effect that describes it in the existing canonical encoding.
+    pub(super) fn content_edit(
+        page: &PageDto,
+        page_index: usize,
+        block_index: usize,
+        generation: usize,
+    ) -> (PageDto, SemanticEffect) {
+        let mut edited = page.clone();
+        let block = edited
+            .blocks
+            .get_mut(block_index)
+            .expect("the synthetic page has this block");
+        let before = block.raw.clone();
+        let after = format!("{before} revision {generation}");
+        block.raw = after.clone();
+
+        let page_id = PageId::from_uuid(Uuid::from_u128(0x_fa57_0000 + page_index as u128));
+        let home_document_id =
+            DocumentId::from_uuid(Uuid::from_u128(0x_d0c0_0000 + page_index as u128));
+        let block_id = BlockId::from_uuid(Uuid::from_u128(
+            0x_b10c_0000 + (page_index * 1024 + block_index) as u128,
+        ));
+        let state = |content: &str| BlockState {
+            block_id,
+            home_document_id,
+            owner: BlockOwner::Page(page_id),
+            logseq_uuid: None,
+            logseq_identity_origin: None,
+            content: content.to_owned(),
+        };
+        let effect = SemanticEffect::new(
+            Vec::new(),
+            vec![BlockDelta {
+                block_id,
+                home_document_id,
+                before: Some(state(&before)),
+                after: Some(state(&after)),
+            }],
+            Vec::new(),
+        )
+        .expect("a one-block content edit is a valid semantic effect");
+        (edited, effect)
+    }
+
+    /// The semantics a proof compares: what the page says, not how it is stored.
+    pub(super) fn page_semantics(page: &PageDto) -> (String, PageKind, Option<String>, Vec<String>) {
+        fn flatten(blocks: &[crate::BlockDto], into: &mut Vec<String>) {
+            for block in blocks {
+                into.push(block.raw.clone());
+                flatten(&block.children, into);
+            }
+        }
+        let mut blocks = Vec::new();
+        flatten(&page.blocks, &mut blocks);
+        (
+            page.name.clone(),
+            page.kind,
+            page.pre_block.clone(),
+            blocks,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{content_edit, page_semantics, FixtureFormat, GraphFixture, DEFAULT_BLOCKS_PER_PAGE};
+    use super::*;
+
+    use std::fs;
+
+    use tine_storage::ObjectKind;
+
+    use crate::model::content_rev;
+    use crate::PageKind;
+
+    fn every_format() -> [FixtureFormat; 2] {
+        [FixtureFormat::Markdown, FixtureFormat::Org]
+    }
+
+    fn overlay_base() -> std::path::PathBuf {
+        std::env::temp_dir()
+    }
+
+    fn journal_frames(
+        committer: &FastLocalCommitter,
+    ) -> Vec<LocalJournalFrame<ObjectKind>> {
+        let mut frames = Vec::new();
+        committer.replay_journal(|frame| frames.push(frame)).unwrap();
+        frames
+    }
+
+    #[test]
+    fn a_fast_commit_journals_one_frame_and_replaces_exactly_one_file() {
+        for format in every_format() {
+            let fixture = GraphFixture::build(
+                &overlay_base(),
+                "one-file",
+                6,
+                DEFAULT_BLOCKS_PER_PAGE,
+                format,
+            );
+            let device = Uuid::from_u128(0x_fa57_c0de);
+            let mut committer = fixture.committer(device);
+            let loaded = fixture.load(2);
+            assert!(
+                !loaded.read_only,
+                "the {} fixture must be editable, so the audited replacement can run",
+                format.label()
+            );
+            committer.adopt_loaded_page(&loaded).unwrap();
+
+            let before_digests = fixture.text_digests();
+            let base_rev = loaded.rev.clone().unwrap();
+            let (edited, effect) = content_edit(&loaded, 2, 3, 1);
+            let before_syncs = committer.journal_stats().data_durability_syncs;
+            let outcome = committer
+                .commit(edited.clone(), &base_rev, FastCommitIntent::SemanticEffect(&effect))
+                .unwrap();
+
+            // One durable journal record, one durability barrier.
+            assert_eq!(outcome.journal.sequence, 0);
+            assert_eq!(outcome.journal.data_durability_syncs, 1);
+            assert_eq!(
+                committer.journal_stats().data_durability_syncs - before_syncs,
+                1,
+                "an ordinary commit performs exactly one durability barrier"
+            );
+
+            // Exactly one graph file changed.
+            let after_digests = fixture.text_digests();
+            let changed: Vec<_> = after_digests
+                .iter()
+                .filter(|(path, digest)| before_digests.get(*path) != Some(*digest))
+                .map(|(path, _)| path.clone())
+                .collect();
+            assert_eq!(
+                changed,
+                vec![format!("pages/Fast-Commit-2.{}", format.extension())],
+                "exactly the edited page's file may change"
+            );
+            assert_eq!(
+                before_digests.keys().collect::<Vec<_>>(),
+                after_digests.keys().collect::<Vec<_>>(),
+                "no graph file may be created or removed"
+            );
+
+            // The returned state is the caller's post-edit page with its new
+            // revision, and that revision is the file's actual content.
+            assert_eq!(page_semantics(&outcome.page), page_semantics(&edited));
+            let on_disk = fs::read_to_string(
+                fixture
+                    .graph_root
+                    .join(format!("pages/Fast-Commit-2.{}", format.extension())),
+            )
+            .unwrap();
+            assert_eq!(outcome.page.rev, Some(content_rev(&on_disk)));
+            assert_ne!(outcome.page.rev, loaded.rev);
+
+            // The frame decodes to exactly the typed payload that was committed.
+            let frames = journal_frames(&committer);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].sequence(), 0);
+            assert_eq!(frames[0].device_id(), device);
+            assert_eq!(frames[0].payload_kind(), ObjectKind::SemanticEffect);
+            assert_eq!(
+                recover_commit_intent(&frames[0]).unwrap(),
+                RecoveredCommitIntent::SemanticEffect(effect)
+            );
+        }
+    }
+
+    #[test]
+    fn a_fast_commit_performs_no_sqlite_archive_receipt_catalog_or_page_reload_work() {
+        for format in every_format() {
+            let fixture = GraphFixture::build(
+                &overlay_base(),
+                "structural",
+                8,
+                DEFAULT_BLOCKS_PER_PAGE,
+                format,
+            );
+            let mut committer = fixture.committer(Uuid::from_u128(0x_5747_0001));
+            let mut current = fixture.load(1);
+            committer.adopt_loaded_page(&current).unwrap();
+
+            for generation in 1..=5 {
+                let base_rev = current.rev.clone().unwrap();
+                let (edited, effect) =
+                    content_edit(&current, 1, generation % DEFAULT_BLOCKS_PER_PAGE, generation);
+                let before = forbidden_commit_work();
+                let outcome = committer
+                    .commit(edited, &base_rev, FastCommitIntent::SemanticEffect(&effect))
+                    .unwrap();
+                let performed = forbidden_commit_work().since(before);
+                assert!(
+                    performed.is_none(),
+                    "a fast commit must perform no SQLite drain, archive read, projection \
+                     receipt load, graph-wide catalog decode, or application page reload, \
+                     but generation {generation} on {} performed {performed:?}",
+                    format.label()
+                );
+                current = outcome.page;
+            }
+
+            // The counters are live, not dead code: the same thread's ordinary
+            // application page load is counted.
+            let before = forbidden_commit_work();
+            let reloaded = fixture.load(1);
+            let performed = forbidden_commit_work().since(before);
+            assert_eq!(
+                performed.application_page_loads, 1,
+                "the structural counters must observe a real application page load"
+            );
+            assert_eq!(
+                page_semantics(&reloaded),
+                page_semantics(&current),
+                "the projected {} page must reparse to the intended semantic page",
+                format.label()
+            );
+        }
+    }
+
+    #[test]
+    fn the_projected_page_reparses_and_a_fresh_reopen_sees_the_last_committed_edit() {
+        for format in every_format() {
+            let fixture = GraphFixture::build(
+                &overlay_base(),
+                "reopen",
+                5,
+                DEFAULT_BLOCKS_PER_PAGE,
+                format,
+            );
+            let mut committer = fixture.committer(Uuid::from_u128(0x_5747_0002));
+            let mut current = fixture.load(4);
+            committer.adopt_loaded_page(&current).unwrap();
+            for generation in 1..=3 {
+                let base_rev = current.rev.clone().unwrap();
+                let (edited, effect) = content_edit(&current, 4, 0, generation);
+                current = committer
+                    .commit(edited, &base_rev, FastCommitIntent::SemanticEffect(&effect))
+                    .unwrap()
+                    .page;
+            }
+
+            let reopened = fixture.reopen();
+            let seen = reopened
+                .load_named(&fixture.page_name(4), PageKind::Page)
+                .unwrap()
+                .expect("the committed page exists after a fresh reopen");
+            assert_eq!(
+                page_semantics(&seen),
+                page_semantics(&current),
+                "a fresh {} reopen must see the last committed edit",
+                format.label()
+            );
+            assert_eq!(seen.rev, current.rev);
+            assert!(seen.blocks[0].raw.ends_with("revision 3"));
+        }
+    }
+
+    #[test]
+    fn a_stale_or_untracked_base_is_refused_before_anything_durable_happens() {
+        let fixture = GraphFixture::build(
+            &overlay_base(),
+            "stale",
+            4,
+            DEFAULT_BLOCKS_PER_PAGE,
+            FixtureFormat::Markdown,
+        );
+        let mut committer = fixture.committer(Uuid::from_u128(0x_5747_0003));
+        let loaded = fixture.load(0);
+        let before_digests = fixture.text_digests();
+
+        // Untracked: the committer holds no trusted-local base for this page.
+        let (edited, effect) = content_edit(&loaded, 0, 0, 1);
+        let base_rev = loaded.rev.clone().unwrap();
+        assert!(matches!(
+            committer.commit(
+                edited.clone(),
+                &base_rev,
+                FastCommitIntent::SemanticEffect(&effect)
+            ),
+            Err(FastCommitError::UntrackedPage(_))
+        ));
+
+        committer.adopt_loaded_page(&loaded).unwrap();
+        // Stale: the offered base is not the base this device last committed.
+        assert!(matches!(
+            committer.commit(
+                edited,
+                "0".repeat(64).as_str(),
+                FastCommitIntent::SemanticEffect(&effect)
+            ),
+            Err(FastCommitError::StaleBase { .. })
+        ));
+
+        assert_eq!(committer.next_sequence(), 0, "no frame may be journalled");
+        assert_eq!(committer.journal_stats().frames_appended, 0);
+        assert_eq!(committer.journal_stats().data_durability_syncs, 0);
+        assert_eq!(
+            fixture.text_digests(),
+            before_digests,
+            "a refused commit may not change any graph file"
+        );
+    }
+
+    #[test]
+    fn a_crdt_update_intent_round_trips_through_the_journal() {
+        let fixture = GraphFixture::build(
+            &overlay_base(),
+            "crdt-update",
+            4,
+            DEFAULT_BLOCKS_PER_PAGE,
+            FixtureFormat::Markdown,
+        );
+        let device = Uuid::from_u128(0x_5747_0004);
+        let mut committer = fixture.committer(device);
+        let loaded = fixture.load(1);
+        committer.adopt_loaded_page(&loaded).unwrap();
+
+        // An engine-exported update is opaque bytes to the journal; it must come
+        // back byte-identical and typed as a CRDT update. This is the engine's
+        // own update encoding, not a second one invented here.
+        let document = loro::LoroDoc::new();
+        document
+            .get_text("content")
+            .insert(0, "fast commit crdt update")
+            .unwrap();
+        document.commit();
+        let update_bytes = document.export(loro::ExportMode::all_updates()).unwrap();
+        assert!(!update_bytes.is_empty());
+
+        let base_rev = loaded.rev.clone().unwrap();
+        let (edited, _) = content_edit(&loaded, 1, 2, 1);
+        committer
+            .commit(
+                edited,
+                &base_rev,
+                FastCommitIntent::CrdtUpdate(&update_bytes),
+            )
+            .unwrap();
+
+        let frames = journal_frames(&committer);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload_kind(), ObjectKind::CrdtUpdate);
+        assert_eq!(
+            recover_commit_intent(&frames[0]).unwrap(),
+            RecoveredCommitIntent::CrdtUpdate(update_bytes)
+        );
+    }
+
+    #[test]
+    fn a_torn_final_append_is_recovered_without_losing_earlier_commits() {
+        let fixture = GraphFixture::build(
+            &overlay_base(),
+            "torn",
+            4,
+            DEFAULT_BLOCKS_PER_PAGE,
+            FixtureFormat::Org,
+        );
+        let device = Uuid::from_u128(0x_5747_0005);
+        let (segment_bytes, kept_bytes, final_len, committed_page) = {
+            let mut committer = fixture.committer(device);
+            let mut current = fixture.load(3);
+            committer.adopt_loaded_page(&current).unwrap();
+            for generation in 1..=3 {
+                let base_rev = current.rev.clone().unwrap();
+                let (edited, effect) = content_edit(&current, 3, 0, generation);
+                current = committer
+                    .commit(edited, &base_rev, FastCommitIntent::SemanticEffect(&effect))
+                    .unwrap()
+                    .page;
+            }
+            let kept_bytes = committer.journal_stats().bytes_appended;
+            let base_rev = current.rev.clone().unwrap();
+            let (edited, effect) = content_edit(&current, 3, 0, 4);
+            let outcome = committer
+                .commit(edited, &base_rev, FastCommitIntent::SemanticEffect(&effect))
+                .unwrap();
+            (
+                fs::read(fixture.journal_segment_path(device)).unwrap(),
+                kept_bytes,
+                outcome.journal.frame_bytes,
+                outcome.page,
+            )
+        };
+        assert_eq!(segment_bytes.len() as u64, kept_bytes + final_len);
+
+        // Tear the final append at every byte boundary: the three earlier
+        // commits and their typed payloads must all survive, and the graph text
+        // the completed commits published is untouched by journal recovery.
+        for torn in 0..final_len as usize {
+            fs::write(
+                fixture.journal_segment_path(device),
+                &segment_bytes[..kept_bytes as usize + torn],
+            )
+            .unwrap();
+            let reopened = fixture.reopen();
+            let (committer, recovery) = fixture
+                .committer_over(Arc::clone(&reopened), device)
+                .expect("a torn tail must not stop the journal from opening");
+            assert_eq!(
+                recovery.frames_recovered, 3,
+                "tearing the fourth append at {torn} bytes must keep the first three"
+            );
+            assert_eq!(recovery.discarded_tail_bytes, torn as u64);
+            let frames = journal_frames(&committer);
+            assert_eq!(frames.len(), 3);
+            for (index, frame) in frames.iter().enumerate() {
+                assert_eq!(frame.sequence(), index as u64);
+                assert!(matches!(
+                    recover_commit_intent(frame).unwrap(),
+                    RecoveredCommitIntent::SemanticEffect(_)
+                ));
+            }
+            drop(committer);
+            let seen = reopened
+                .load_named(&fixture.page_name(3), PageKind::Page)
+                .unwrap()
+                .expect("the page survives journal recovery");
+            assert_eq!(page_semantics(&seen), page_semantics(&committed_page));
+        }
+    }
+}

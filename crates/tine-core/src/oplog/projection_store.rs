@@ -1445,6 +1445,7 @@ impl ProjectionReceiptStore {
         &self,
         completed: &ProjectionCompletedReceipt,
     ) -> Result<(ProjectionIntent, ProjectionCompletion), ProjectionStoreError> {
+        crate::fast_commit::note_projection_receipt_load();
         let intent =
             self.load_intent_by_id(completed.intent_id())
                 .map_err(|error| match error {

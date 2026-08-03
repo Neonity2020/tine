@@ -2588,6 +2588,7 @@ impl ObjectStore {
         self.counters
             .accepted_object_reads
             .fetch_add(1, Ordering::Relaxed);
+        crate::fast_commit::note_archive_object_read();
         let bytes = read_required_regular(
             &objects_dir,
             &filename,

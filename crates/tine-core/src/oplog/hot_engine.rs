@@ -4512,6 +4512,7 @@ impl AcceptedRootMaterializer<'_> {
         if is_catalog {
             self.exact_catalog_loads = self.exact_catalog_loads.saturating_add(1);
             self.exact_catalog_decodes = self.exact_catalog_decodes.saturating_add(1);
+            crate::fast_commit::note_graph_wide_catalog_decode();
         }
         Ok(Some(key))
     }

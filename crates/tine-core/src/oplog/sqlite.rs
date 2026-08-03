@@ -2556,6 +2556,7 @@ impl TailOverlay {
         source: &RebuildSource<'_>,
         max_batches: usize,
     ) -> Result<usize, TailOverlayError> {
+        crate::fast_commit::note_sqlite_drain();
         if !self.runtime_authority.matches(&database.runtime_authority)
             || !self.runtime_authority.matches(&source.runtime_authority)
             || !source
