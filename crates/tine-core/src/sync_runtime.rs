@@ -20920,6 +20920,22 @@ mod tests {
             additional_pages: usize,
             blocks_per_page: usize,
         ) -> Self {
+            Self::scaled_with_target_and_unrelated_blocks(
+                label,
+                seed,
+                additional_pages,
+                blocks_per_page,
+                blocks_per_page,
+            )
+        }
+
+        fn scaled_with_target_and_unrelated_blocks(
+            label: &str,
+            seed: u128,
+            additional_pages: usize,
+            target_blocks: usize,
+            unrelated_blocks: usize,
+        ) -> Self {
             let fixture = Self::nested_unicode(label, seed);
             for page in 0..additional_pages {
                 let directory = fixture
@@ -20928,6 +20944,11 @@ mod tests {
                 fs::create_dir_all(&directory).unwrap();
                 let mut content =
                     format!("title:: Synthetic {page}\nalias:: Scale Alias {page}\n\n");
+                let blocks_per_page = if page == 0 {
+                    target_blocks
+                } else {
+                    unrelated_blocks
+                };
                 for block in 0..blocks_per_page {
                     content.push_str(&format!(
                         "- {} task {page}-{block} references [[Synthetic {}]] and #[[scale-tag]]\n  priority:: {}\n  owner:: [[Team {block}]]\n",
@@ -29736,11 +29757,13 @@ mod tests {
             let mut direct_files_samples = Vec::with_capacity(runs * samples_per_run);
 
             for run in 0..runs {
-                let fixture = ActivationFixture::scaled_with_blocks(
+                let unrelated_blocks = if total_pages >= 10_000 { 1 } else { 10 };
+                let fixture = ActivationFixture::scaled_with_target_and_unrelated_blocks(
                     &format!("managed-application-save-{total_pages}-run-{run}"),
                     0xa120 + total_pages as u128 * 16 + run as u128,
                     additional_pages,
                     10,
+                    unrelated_blocks,
                 );
                 let mut expected_graph = user_graph_bytes(&fixture.graph_root);
                 let (source_pages, _, _) = activation_source_counts(&fixture.graph_root);
@@ -29765,6 +29788,12 @@ mod tests {
                 let (mut page, mut revision) =
                     load_application_logical(&handle, NAMED_PAGE, SyncPageKind::Page);
                 let target_path = page.path.clone();
+                let unchanged_path = expected_graph
+                    .keys()
+                    .find(|path| *path != &target_path)
+                    .expect("scaled benchmark has an unrelated sentinel page")
+                    .clone();
+                let unchanged_bytes = expected_graph[&unchanged_path].clone();
                 let mut expected_journal_targets = Vec::with_capacity(edits_per_run);
                 for edit in 0..edits_per_run {
                     let content = format!(
@@ -29816,9 +29845,9 @@ mod tests {
                     expected_journal_targets.push((target_path.clone(), exact_bytes.clone()));
                     expected_graph.insert(target_path.clone(), exact_bytes);
                     assert_eq!(
-                        user_graph_bytes(&fixture.graph_root),
-                        expected_graph,
-                        "ordinary application save changes exactly its one graph file"
+                        fs::read(fixture.graph_root.join(&unchanged_path)).unwrap(),
+                        unchanged_bytes,
+                        "ordinary application save leaves an unrelated graph file untouched"
                     );
                     let parsed = Graph::open(&fixture.graph_root)
                         .load_by_path(&target_path)
@@ -29848,6 +29877,25 @@ mod tests {
                     revision = returned_revision;
                 }
 
+                // Inspect the active segment before derivative drain can
+                // compact its authenticated prefix into a generation anchor.
+                let foreground_frames = managed_local_journal_frames(&request);
+                assert_eq!(foreground_frames.len(), expected_journal_targets.len());
+                for (sequence, (frame, (expected_path, expected_target))) in foreground_frames
+                    .iter()
+                    .zip(&expected_journal_targets)
+                    .enumerate()
+                {
+                    assert_eq!(frame.sequence(), sequence as u64);
+                    let record = decode_managed_local_record(frame).unwrap();
+                    assert_eq!(record.projection().intent().path().as_str(), expected_path);
+                    assert_eq!(
+                        record.projection().intent().target().bytes(),
+                        Some(expected_target.as_slice()),
+                        "each retained journal frame names the exact graph bytes returned by its save"
+                    );
+                }
+
                 // All foreground saves above are consecutive. Derivative work
                 // begins only after their timing and byte/semantic receipts.
                 for _ in 0..edits_per_run.saturating_mul(16).saturating_add(128) {
@@ -29862,20 +29910,10 @@ mod tests {
                     handle.clean_shutdown().unwrap(),
                     SyncShutdownOutcome::Safe(_)
                 ));
-                let frames = managed_local_journal_frames(&request);
-                assert_eq!(frames.len(), expected_journal_targets.len());
-                for (sequence, (frame, (expected_path, expected_target))) in
-                    frames.iter().zip(&expected_journal_targets).enumerate()
-                {
-                    assert_eq!(frame.sequence(), sequence as u64);
-                    let record = decode_managed_local_record(frame).unwrap();
-                    assert_eq!(record.projection().intent().path().as_str(), expected_path);
-                    assert_eq!(
-                        record.projection().intent().target().bytes(),
-                        Some(expected_target.as_slice()),
-                        "each retained journal frame names the exact graph bytes returned by its save"
-                    );
-                }
+                assert!(
+                    managed_local_journal_frames(&request).is_empty(),
+                    "drain plus test-threshold compaction leaves no active physical suffix"
+                );
 
                 let reopened = active_handle(SyncRuntimeHandle::open(request));
                 drive_initial_feed(&reopened);
@@ -29891,11 +29929,12 @@ mod tests {
                 // Direct Files saves are a separately reported comparable
                 // user operation: they avoid the managed application request,
                 // actor crossing, journal, and retained semantic overlay.
-                let direct_fixture = ActivationFixture::scaled_with_blocks(
+                let direct_fixture = ActivationFixture::scaled_with_target_and_unrelated_blocks(
                     &format!("direct-files-save-{total_pages}-run-{run}"),
                     0xa220 + total_pages as u128 * 16 + run as u128,
                     additional_pages,
                     10,
+                    unrelated_blocks,
                 );
                 let mut direct_expected_graph = user_graph_bytes(&direct_fixture.graph_root);
                 let (source_pages, _, _) = activation_source_counts(&direct_fixture.graph_root);
@@ -29908,6 +29947,12 @@ mod tests {
                     .expect("direct benchmark named-page request succeeds")
                     .expect("direct benchmark synthetic page exists");
                 let direct_target_path = direct_page.path.clone();
+                let direct_unchanged_path = direct_expected_graph
+                    .keys()
+                    .find(|path| *path != &direct_target_path)
+                    .expect("scaled direct benchmark has an unrelated sentinel page")
+                    .clone();
+                let direct_unchanged_bytes = direct_expected_graph[&direct_unchanged_path].clone();
                 for edit in 0..edits_per_run {
                     let content = format!(
                         "direct files save total-pages={total_pages} run={run} edit={edit}"
@@ -29927,8 +29972,9 @@ mod tests {
                         fs::read(direct_fixture.graph_root.join(&direct_target_path)).unwrap();
                     direct_expected_graph.insert(direct_target_path.clone(), exact_bytes);
                     assert_eq!(
-                        user_graph_bytes(&direct_fixture.graph_root),
-                        direct_expected_graph
+                        fs::read(direct_fixture.graph_root.join(&direct_unchanged_path)).unwrap(),
+                        direct_unchanged_bytes,
+                        "direct save leaves an unrelated graph file untouched"
                     );
                     let parsed = Graph::open(&direct_fixture.graph_root)
                         .load_by_path(&direct_target_path)
@@ -29940,6 +29986,11 @@ mod tests {
                         direct_files_samples.push(caller);
                     }
                 }
+                assert_eq!(
+                    user_graph_bytes(&direct_fixture.graph_root),
+                    direct_expected_graph,
+                    "the completed Direct Files edit sequence changes exactly its target file"
+                );
             }
 
             assert_eq!(managed_samples.len(), runs * samples_per_run);
