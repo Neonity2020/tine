@@ -358,58 +358,59 @@ impl OverlayFixture {
 
 #[derive(Default)]
 struct DrainPublisher {
-    authorship: BTreeMap<BatchId, crate::local_journal_drain_test::ManagedLocalDerivativeAuthority>,
-    provider: BTreeMap<BatchId, crate::local_journal_drain_test::ManagedLocalDerivativeAuthority>,
+    authorship:
+        BTreeMap<BatchId, crate::oplog::local_journal_drain::ManagedLocalDerivativeAuthority>,
+    provider: BTreeMap<BatchId, crate::oplog::local_journal_drain::ManagedLocalDerivativeAuthority>,
     pending_authorship_once: bool,
     pending_provider_once: bool,
 }
 
-impl crate::local_journal_drain_test::ManagedLocalDerivativePublisher for DrainPublisher {
+impl crate::oplog::local_journal_drain::ManagedLocalDerivativePublisher for DrainPublisher {
     fn ensure_local_authorship(
         &mut self,
-        authority: &crate::local_journal_drain_test::ManagedLocalDerivativeAuthority,
-    ) -> crate::local_journal_drain_test::ManagedLocalPublicationState {
+        authority: &crate::oplog::local_journal_drain::ManagedLocalDerivativeAuthority,
+    ) -> crate::oplog::local_journal_drain::ManagedLocalPublicationState {
         if self.pending_authorship_once {
             self.pending_authorship_once = false;
-            return crate::local_journal_drain_test::ManagedLocalPublicationState::Pending(
+            return crate::oplog::local_journal_drain::ManagedLocalPublicationState::Pending(
                 "synthetic authorship cut".into(),
             );
         }
         match self.authorship.get(&authority.batch_id) {
             Some(existing) if existing == authority => {
-                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+                crate::oplog::local_journal_drain::ManagedLocalPublicationState::Complete
             }
-            Some(_) => crate::local_journal_drain_test::ManagedLocalPublicationState::Conflict(
+            Some(_) => crate::oplog::local_journal_drain::ManagedLocalPublicationState::Conflict(
                 "divergent authorship winner".into(),
             ),
             None => {
                 self.authorship
                     .insert(authority.batch_id, authority.clone());
-                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+                crate::oplog::local_journal_drain::ManagedLocalPublicationState::Complete
             }
         }
     }
 
     fn ensure_provider_publication(
         &mut self,
-        authority: &crate::local_journal_drain_test::ManagedLocalDerivativeAuthority,
-    ) -> crate::local_journal_drain_test::ManagedLocalPublicationState {
+        authority: &crate::oplog::local_journal_drain::ManagedLocalDerivativeAuthority,
+    ) -> crate::oplog::local_journal_drain::ManagedLocalPublicationState {
         if self.pending_provider_once {
             self.pending_provider_once = false;
-            return crate::local_journal_drain_test::ManagedLocalPublicationState::Pending(
+            return crate::oplog::local_journal_drain::ManagedLocalPublicationState::Pending(
                 "synthetic provider cut".into(),
             );
         }
         match self.provider.get(&authority.batch_id) {
             Some(existing) if existing == authority => {
-                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+                crate::oplog::local_journal_drain::ManagedLocalPublicationState::Complete
             }
-            Some(_) => crate::local_journal_drain_test::ManagedLocalPublicationState::Conflict(
+            Some(_) => crate::oplog::local_journal_drain::ManagedLocalPublicationState::Conflict(
                 "divergent provider winner".into(),
             ),
             None => {
                 self.provider.insert(authority.batch_id, authority.clone());
-                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+                crate::oplog::local_journal_drain::ManagedLocalPublicationState::Complete
             }
         }
     }
@@ -420,14 +421,14 @@ fn drain_frame_to_completion(
     database: &mut SqliteFrontier,
     tail: &mut crate::oplog::TailOverlay,
     frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
-    checkpoint: &crate::local_journal_drain_test::ManagedLocalDrainCheckpoint,
+    checkpoint: &crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint,
     publisher: &mut DrainPublisher,
-) -> crate::local_journal_drain_test::ManagedLocalDrainCompletion {
+) -> crate::oplog::local_journal_drain::ManagedLocalDrainCompletion {
     let admission = crate::oplog::local_active::LocalRuntimeAdmission::unenrolled_pre_activation();
     let mut continuation = None;
     for _ in 0..64 {
         let outcome =
-            crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+            crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
                 &admission,
                 &fixture.graph,
                 &fixture.receipts,
@@ -440,10 +441,10 @@ fn drain_frame_to_completion(
                 publisher,
             );
         match outcome {
-            crate::local_journal_drain_test::ManagedLocalDrainOutcome::Complete(completion) => {
+            crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Complete(completion) => {
                 return completion
             }
-            crate::local_journal_drain_test::ManagedLocalDrainOutcome::Pending(next) => {
+            crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Pending(next) => {
                 continuation = Some(next);
             }
             other => panic!("managed-local drain did not converge: {other:?}"),
@@ -967,7 +968,7 @@ fn managed_local_drain_converges_markdown_and_org_without_rewriting_exact_graph_
             use std::os::unix::fs::MetadataExt as _;
             fs::metadata(&target_path).unwrap().ino()
         };
-        let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+        let checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
             uuid(DEVICE),
             fixture.ids.workspace,
             fixture.ids.lineage,
@@ -991,7 +992,7 @@ fn managed_local_drain_converges_markdown_and_org_without_rewriting_exact_graph_
         assert_eq!(completion.reclaimable_through_after_checkpoint, 0);
         let checkpoint_bytes = completion.checkpoint.encode().unwrap();
         assert_eq!(
-            crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::decode(
+            crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::decode(
                 &checkpoint_bytes,
                 uuid(DEVICE),
                 fixture.ids.workspace,
@@ -1044,7 +1045,7 @@ fn managed_local_drain_converges_markdown_and_org_without_rewriting_exact_graph_
 
 #[test]
 fn managed_local_drain_restarts_at_every_derivative_boundary_without_duplication() {
-    use crate::local_journal_drain_test::ManagedLocalDrainFaultPoint as Cut;
+    use crate::oplog::local_journal_drain::ManagedLocalDrainFaultPoint as Cut;
 
     let (_, batches) = finalized_edit_chain("managed-drain-cuts-source", "md", 8, 1);
     let mut fixture = OverlayFixture::new("managed-drain-cuts-local", "md", 8);
@@ -1068,7 +1069,7 @@ fn managed_local_drain_restarts_at_every_derivative_boundary_without_duplication
         use std::os::unix::fs::MetadataExt as _;
         fs::metadata(&target_path).unwrap().ino()
     };
-    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+    let checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
         uuid(DEVICE),
         fixture.ids.workspace,
         fixture.ids.lineage,
@@ -1091,9 +1092,9 @@ fn managed_local_drain_restarts_at_every_derivative_boundary_without_duplication
         Cut::BeforeProvider,
         Cut::AfterProvider,
     ] {
-        crate::local_journal_drain_test::fail_managed_local_drain_once_at(cut);
+        crate::oplog::local_journal_drain::fail_managed_local_drain_once_at(cut);
         let outcome =
-            crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+            crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
                 &admission,
                 &fixture.graph,
                 &fixture.receipts,
@@ -1108,7 +1109,7 @@ fn managed_local_drain_restarts_at_every_derivative_boundary_without_duplication
         assert!(
             matches!(
                 outcome,
-                crate::local_journal_drain_test::ManagedLocalDrainOutcome::Pending(_)
+                crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Pending(_)
             ),
             "cut {cut:?} did not retain the exact record: {outcome:?}"
         );
@@ -1139,7 +1140,7 @@ fn managed_local_drain_expands_twelve_records_in_order_and_restarts_from_durable
     let expected = accepted.engine.materialize_page(accepted.page_id).unwrap();
     let mut fixture = OverlayFixture::new("managed-drain-chain-local", "org", 16);
     let (mut database, mut tail) = fixture.database_and_tail("chain");
-    let mut checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+    let mut checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
         uuid(DEVICE),
         fixture.ids.workspace,
         fixture.ids.lineage,
@@ -1168,7 +1169,7 @@ fn managed_local_drain_expands_twelve_records_in_order_and_restarts_from_durable
         // Persist/redecode at representative boundaries and intentionally lose
         // every live continuation before the next sequence.
         let bytes = completion.checkpoint.encode().unwrap();
-        checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::decode(
+        checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::decode(
             &bytes,
             uuid(DEVICE),
             fixture.ids.workspace,
@@ -1202,14 +1203,14 @@ fn managed_local_drain_refuses_gap_duplicate_and_wrong_graph_before_checkpoint_a
         .engine
         .replay_managed_local_record(&first_frame)
         .unwrap();
-    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+    let checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
         uuid(DEVICE),
         fixture.ids.workspace,
         fixture.ids.lineage,
     );
     let admission = crate::oplog::local_active::LocalRuntimeAdmission::unenrolled_pre_activation();
     let mut publisher = DrainPublisher::default();
-    let outcome = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+    let outcome = crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
         &admission,
         &fixture.graph,
         &fixture.receipts,
@@ -1223,7 +1224,7 @@ fn managed_local_drain_refuses_gap_duplicate_and_wrong_graph_before_checkpoint_a
     );
     assert!(matches!(
         outcome,
-        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+        crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Conflict(_)
     ));
     assert_eq!(checkpoint.next_sequence(), 0);
     assert_eq!(
@@ -1249,21 +1250,22 @@ fn managed_local_drain_refuses_gap_duplicate_and_wrong_graph_before_checkpoint_a
         &checkpoint,
         &mut publisher,
     );
-    let duplicate = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
-        &admission,
-        &fixture.graph,
-        &fixture.receipts,
-        &mut fixture.engine,
-        &mut database,
-        &mut tail,
-        &first_frame,
-        &completion.checkpoint,
-        None,
-        &mut publisher,
-    );
+    let duplicate =
+        crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
+            &admission,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut fixture.engine,
+            &mut database,
+            &mut tail,
+            &first_frame,
+            &completion.checkpoint,
+            None,
+            &mut publisher,
+        );
     assert!(matches!(
         duplicate,
-        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+        crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Conflict(_)
     ));
 
     let second = fixture.prepare_record(&batches[1]);
@@ -1272,12 +1274,12 @@ fn managed_local_drain_refuses_gap_duplicate_and_wrong_graph_before_checkpoint_a
         .engine
         .replay_managed_local_record(&second_frame)
         .unwrap();
-    let gap_checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+    let gap_checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
         uuid(DEVICE),
         fixture.ids.workspace,
         fixture.ids.lineage,
     );
-    let gap = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+    let gap = crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
         &admission,
         &fixture.graph,
         &fixture.receipts,
@@ -1291,7 +1293,7 @@ fn managed_local_drain_refuses_gap_duplicate_and_wrong_graph_before_checkpoint_a
     );
     assert!(matches!(
         gap,
-        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Blocked(_)
+        crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Blocked(_)
     ));
     assert_eq!(gap_checkpoint.next_sequence(), 0);
 }
@@ -1336,14 +1338,14 @@ fn managed_local_drain_adopts_exact_winners_and_rejects_divergent_archive_or_pro
     )
     .unwrap();
     archive_conflict.graph = Graph::open(&archive_conflict.graph_path);
-    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+    let checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
         uuid(DEVICE),
         archive_conflict.ids.workspace,
         archive_conflict.ids.lineage,
     );
     let admission = crate::oplog::local_active::LocalRuntimeAdmission::unenrolled_pre_activation();
     let mut publisher = DrainPublisher::default();
-    let outcome = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+    let outcome = crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
         &admission,
         &archive_conflict.graph,
         &archive_conflict.receipts,
@@ -1357,7 +1359,7 @@ fn managed_local_drain_adopts_exact_winners_and_rejects_divergent_archive_or_pro
     );
     assert!(matches!(
         outcome,
-        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+        crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Conflict(_)
     ));
     assert_eq!(checkpoint.next_sequence(), 0);
     let BatchInspection::Ready(stored_divergent) = archive_conflict
@@ -1396,7 +1398,7 @@ fn managed_local_drain_adopts_exact_winners_and_rejects_divergent_archive_or_pro
     )
     .unwrap();
     provider_conflict.graph = Graph::open(&provider_conflict.graph_path);
-    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+    let checkpoint = crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
         uuid(DEVICE),
         provider_conflict.ids.workspace,
         provider_conflict.ids.lineage,
@@ -1405,7 +1407,7 @@ fn managed_local_drain_adopts_exact_winners_and_rejects_divergent_archive_or_pro
         pending_provider_once: true,
         ..DrainPublisher::default()
     };
-    let pending = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+    let pending = crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
         &admission,
         &provider_conflict.graph,
         &provider_conflict.receipts,
@@ -1419,14 +1421,14 @@ fn managed_local_drain_adopts_exact_winners_and_rejects_divergent_archive_or_pro
     );
     assert!(matches!(
         pending,
-        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Pending(_)
+        crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Pending(_)
     ));
     let mut divergent_authority = publisher.authorship[&prepared.batch_id()].clone();
     divergent_authority.accepted_frontier_digest = ContentDigest::of(b"divergent provider");
     publisher
         .provider
         .insert(prepared.batch_id(), divergent_authority.clone());
-    let conflict = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+    let conflict = crate::oplog::local_journal_drain::resume_managed_local_journal_drain_with_parts(
         &admission,
         &provider_conflict.graph,
         &provider_conflict.receipts,
@@ -1440,7 +1442,7 @@ fn managed_local_drain_adopts_exact_winners_and_rejects_divergent_archive_or_pro
     );
     assert!(matches!(
         conflict,
-        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+        crate::oplog::local_journal_drain::ManagedLocalDrainOutcome::Conflict(_)
     ));
     assert_eq!(
         publisher.provider[&prepared.batch_id()],
@@ -1559,11 +1561,12 @@ fn managed_local_drain_manual_release_benchmark() {
             page_count,
         );
         let (mut database, mut tail) = fixture.database_and_tail("bench");
-        let mut checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
-            uuid(DEVICE),
-            fixture.ids.workspace,
-            fixture.ids.lineage,
-        );
+        let mut checkpoint =
+            crate::oplog::local_journal_drain::ManagedLocalDrainCheckpoint::initial(
+                uuid(DEVICE),
+                fixture.ids.workspace,
+                fixture.ids.lineage,
+            );
         let mut publisher = DrainPublisher::default();
         let mut samples = Vec::new();
         let mut observed_work = Vec::new();

@@ -34,6 +34,8 @@ pub mod import;
 // is deliberately not reachable from startup, Tauri, or a watcher yet.
 #[allow(dead_code)]
 pub(crate) mod local_active;
+#[allow(dead_code)] // routed by the later sync-runtime lane
+pub(crate) mod local_journal_drain;
 pub(crate) mod loro_store;
 #[allow(dead_code)]
 pub(crate) mod migration_backup;
