@@ -36,6 +36,10 @@ use tine_storage::{
     publish_immutable_exact, read_optional_regular, LocalJournalFrame, LocalJournalSegment,
 };
 
+#[cfg(test)]
+use crate::fast_commit::{
+    forbidden_commit_work, graph_wide_commit_work, ForbiddenCommitWork, GraphWideCommitWork,
+};
 use crate::model::{
     sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, Graph, PageDto, PageEntry,
     PageKind,
@@ -126,6 +130,10 @@ use crate::oplog::simulator::{
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 #[cfg(test)]
 use crate::oplog::sqlite::BootstrapSqliteRebuildInstrumentation;
+#[cfg(test)]
+use crate::oplog::trusted_local_commit::{
+    last_commit_stage_timings, TrustedLocalCommitStageTimings,
+};
 use crate::oplog::trusted_local_commit::{
     TrustedLocalCommitCoordinator, TrustedLocalCommitOutcome, TrustedLocalCommitted,
     TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
@@ -255,6 +263,18 @@ struct RuntimeOpenInstrumentation {
     actor_assembly: Duration,
     actor_total: Duration,
     coordination_remainder: Duration,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct ManagedApplicationSaveInstrumentation {
+    commit_stages: TrustedLocalCommitStageTimings,
+    forbidden: ForbiddenCommitWork,
+    graph_wide: GraphWideCommitWork,
+    engine: crate::oplog::hot_engine::EngineInstrumentation,
+    provider_pending: usize,
+    managed_local_pending: usize,
+    managed_local_next_sequence: u64,
 }
 
 #[cfg(test)]
@@ -2838,6 +2858,20 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn managed_application_save_instrumentation(
+        &self,
+    ) -> Result<ManagedApplicationSaveInstrumentation, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ManagedApplicationSaveInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn tick_provider_for_test(&self) -> Result<SyncRuntimeTick, SyncRuntimeRequestError> {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
@@ -5181,6 +5215,10 @@ enum ActorRequest {
         reply: mpsc::Sender<crate::oplog::hot_engine::EngineInstrumentation>,
     },
     #[cfg(test)]
+    ManagedApplicationSaveInstrumentation {
+        reply: mpsc::Sender<ManagedApplicationSaveInstrumentation>,
+    },
+    #[cfg(test)]
     TickProviderForTest {
         reply: mpsc::Sender<SyncRuntimeTick>,
     },
@@ -5361,6 +5399,31 @@ fn run_actor_loop(
                     .engine()
                     .instrumentation();
                 let _ = reply.send(instrumentation);
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ManagedApplicationSaveInstrumentation { reply } => {
+                let engine = actor
+                    .runtime
+                    .as_ref()
+                    .expect("active test actor retains its promoted runtime")
+                    .engine()
+                    .instrumentation();
+                let _ = reply.send(ManagedApplicationSaveInstrumentation {
+                    commit_stages: last_commit_stage_timings(),
+                    forbidden: forbidden_commit_work(),
+                    graph_wide: graph_wide_commit_work(),
+                    engine,
+                    provider_pending: actor.provider_pending.len(),
+                    managed_local_pending: actor
+                        .managed_local
+                        .as_ref()
+                        .map_or(0, ManagedLocalRuntimeState::pending_count),
+                    managed_local_next_sequence: actor
+                        .managed_local
+                        .as_ref()
+                        .map_or(0, |managed| managed.journal.next_sequence()),
+                });
                 false
             }
             #[cfg(test)]
@@ -6026,6 +6089,19 @@ fn open_managed_local_runtime(
         .map_err(|_| "managed-local checkpoint exceeds addressable memory".to_owned())?;
     if checkpointed > recovered_frames.len() {
         return Err("managed-local checkpoint is ahead of the authenticated journal".into());
+    }
+    if recovered_frames.is_empty() {
+        return Ok(ManagedLocalRuntimeState {
+            directory,
+            journal,
+            frames: VecDeque::new(),
+            latest_projection_frames: BTreeMap::new(),
+            checkpoint,
+            continuation: None,
+            pending_commit: None,
+            authorship_complete: BTreeSet::new(),
+            last_failure: None,
+        });
     }
     let mut session = runtime
         .admit_promoted_mutation(authority, graph)
@@ -15488,6 +15564,66 @@ mod tests {
         assert_eq!(expected_markdown.1, cold_markdown.1);
         assert_parser_dto_semantics(&expected_org.0, &cold_org.0);
         assert_eq!(expected_org.1, cold_org.1);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn clean_empty_managed_local_journal_keeps_catalog_cold_and_accepts_application_save() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-empty-managed-local-journal");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+
+        let startup_journal = handle
+            .managed_application_save_instrumentation()
+            .expect("managed reopen exposes local-journal instrumentation");
+        assert_eq!(startup_journal.managed_local_next_sequence, 0);
+        assert_eq!(startup_journal.managed_local_pending, 0);
+        assert_eq!(
+            handle
+                .engine_instrumentation()
+                .expect("managed reopen exposes catalog instrumentation")
+                .catalog_hot_state_loads,
+            0,
+            "an empty managed-local journal must not materialize the hot catalog at open"
+        );
+
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Empty Journal Save.md";
+        admit_external_page(&handle, &fixture, path, b"- before empty-journal save\n");
+        let (page, revision) = load_application_exact(&handle, path);
+        let (saved, saved_revision) =
+            save_application_block_text(&handle, page, revision, "saved after empty-journal open");
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path)).unwrap(),
+            b"- saved after empty-journal open\n"
+        );
+        let saved_journal = handle
+            .managed_application_save_instrumentation()
+            .expect("managed save exposes local-journal instrumentation");
+        assert_eq!(saved_journal.managed_local_next_sequence, 1);
+        assert_eq!(saved_journal.managed_local_pending, 1);
+
+        for _ in 0..128 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert_eq!(managed_local_journal_frames(&request).len(), 1);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&reopened);
+        let restored = load_application_exact(&reopened, path);
+        assert_parser_dto_semantics(&saved, &restored.0);
+        assert_eq!(saved_revision, restored.1);
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -27707,6 +27843,153 @@ mod tests {
         ordered[ordered.len() / 2]
     }
 
+    fn startup_p95(samples: &[Duration]) -> Duration {
+        assert!(
+            !samples.is_empty(),
+            "benchmark receipt has at least one sample"
+        );
+        let mut ordered = samples.to_vec();
+        ordered.sort_unstable();
+        let index = (ordered.len() * 95).div_ceil(100).saturating_sub(1);
+        ordered[index]
+    }
+
+    #[derive(Clone, Copy)]
+    struct ManagedApplicationSaveBenchmarkSample {
+        caller: Duration,
+        stages: TrustedLocalCommitStageTimings,
+    }
+
+    fn managed_application_save_quantiles(
+        samples: &[ManagedApplicationSaveBenchmarkSample],
+        select: impl Fn(&ManagedApplicationSaveBenchmarkSample) -> Duration,
+    ) -> (Duration, Duration) {
+        let values = samples.iter().map(select).collect::<Vec<_>>();
+        (startup_median(&values), startup_p95(&values))
+    }
+
+    fn managed_application_save_phase_receipt(
+        samples: &[ManagedApplicationSaveBenchmarkSample],
+    ) -> String {
+        let (caller_p50, caller_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.caller);
+        let (prepared_p50, prepared_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.stages.prepared_record);
+        let (graph_p50, graph_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.stages.graph_total);
+        let (graph_validation_p50, graph_validation_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.stages.graph_validation);
+        let (journal_p50, journal_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.stages.journal_append);
+        let (graph_publication_p50, graph_publication_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.stages.graph_publication);
+        let (graph_cache_p50, graph_cache_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.stages.graph_cache_publication
+            });
+        let (overlay_p50, overlay_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.stages.hot_overlay_apply);
+        let (response_p50, response_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.stages.direct_response);
+        format!(
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3}",
+            startup_ms(caller_p50),
+            startup_ms(caller_p95),
+            startup_ms(prepared_p50),
+            startup_ms(prepared_p95),
+            startup_ms(graph_p50),
+            startup_ms(graph_p95),
+            startup_ms(graph_validation_p50),
+            startup_ms(graph_validation_p95),
+            startup_ms(journal_p50),
+            startup_ms(journal_p95),
+            startup_ms(graph_publication_p50),
+            startup_ms(graph_publication_p95),
+            startup_ms(graph_cache_p50),
+            startup_ms(graph_cache_p95),
+            startup_ms(overlay_p50),
+            startup_ms(overlay_p95),
+            startup_ms(response_p50),
+            startup_ms(response_p95),
+        )
+    }
+
+    fn assert_managed_application_save_foreground_counters(
+        before: ManagedApplicationSaveInstrumentation,
+        after: ManagedApplicationSaveInstrumentation,
+    ) {
+        let forbidden = after.forbidden.since(before.forbidden);
+        assert!(
+            forbidden.is_none(),
+            "ordinary application save performed forbidden foreground work: {forbidden:?}"
+        );
+        assert_eq!(
+            after.graph_wide.since(before.graph_wide),
+            GraphWideCommitWork::default(),
+            "ordinary application save performed graph-wide foreground work"
+        );
+        assert_eq!(
+            after.provider_pending, before.provider_pending,
+            "ordinary application save must not enqueue provider work"
+        );
+        assert_eq!(
+            after.provider_pending, 0,
+            "the benchmark starts each timed save with settled provider work"
+        );
+
+        let before_engine = before.engine;
+        let after_engine = after.engine;
+        assert_eq!(
+            after_engine.catalog_hot_state_loads, before_engine.catalog_hot_state_loads,
+            "warm ordinary save must not materialize the catalog"
+        );
+        assert_eq!(
+            after_engine.drain_candidate_visits, before_engine.drain_candidate_visits,
+            "ordinary application save must not visit tail-drain candidates"
+        );
+        assert_eq!(
+            after_engine.external_flushes, before_engine.external_flushes,
+            "ordinary application save must not flush external archive state"
+        );
+        assert_eq!(
+            after_engine.external_point_reads, before_engine.external_point_reads,
+            "ordinary application save must not read external archive state"
+        );
+        assert_eq!(
+            after_engine.external_range_scans, before_engine.external_range_scans,
+            "ordinary application save must not scan external archive state"
+        );
+        assert_eq!(
+            (
+                after_engine.store.directory_enumerations,
+                after_engine.store.accepted_manifest_reads,
+                after_engine.store.accepted_object_reads,
+                after_engine.store.dag_manifest_reads,
+                after_engine.store.history_record_reads,
+                after_engine.store.history_index_reads,
+                after_engine.store.history_decodes,
+                after_engine.store.inspected_manifest_operations,
+                after_engine.store.inspected_manifest_bytes,
+                after_engine.store.inspected_object_operations,
+                after_engine.store.inspected_object_bytes,
+            ),
+            (
+                before_engine.store.directory_enumerations,
+                before_engine.store.accepted_manifest_reads,
+                before_engine.store.accepted_object_reads,
+                before_engine.store.dag_manifest_reads,
+                before_engine.store.history_record_reads,
+                before_engine.store.history_index_reads,
+                before_engine.store.history_decodes,
+                before_engine.store.inspected_manifest_operations,
+                before_engine.store.inspected_manifest_bytes,
+                before_engine.store.inspected_object_operations,
+                before_engine.store.inspected_object_bytes,
+            ),
+            "ordinary application save must not read or inspect archive state"
+        );
+    }
+
     fn startup_open_phase_receipt(open: &RuntimeOpenInstrumentation) -> String {
         format!(
             "total_ms={:.3} handle_graph_open_ms={:.3} handle_identity_ms={:.3} handle_discovery_ms={:.3} actor_thread_overhead_ms={:.3} actor_graph_open_ms={:.3} actor_identity_ms={:.3} actor_discovery_revalidation_ms={:.3} enrollment_open_ms={:.3} receipt_store_open_ms={:.3} application_runtime_open_ms={:.3} baseline_binding_ms={:.3} baseline_open_ms={:.3} promoted_runtime_reopen_ms={:.3} exact_feed_open_ms={:.3} shared_descriptor_ms={:.3} shared_phase_ms={:.3} accepted_frontier_ms={:.3} provider_transport_ms={:.3} provider_descriptor_probe_ms={:.3} actor_assembly_ms={:.3} coordination_remainder_ms={:.3}",
@@ -27923,6 +28206,273 @@ mod tests {
             startup_ms(managed_first_page),
             startup_ms(managed_whole_graph),
         );
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: managed application saves at 100 and 10,000 pages"]
+    fn managed_application_save_100_and_10000_page_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_application_save_100_and_10000_page_manual_benchmark -- --ignored --nocapture"
+        );
+        const NAMED_PAGE: &str = "Synthetic 0";
+        let page_counts = std::env::var("TINE_MANAGED_APPLICATION_SAVE_BENCH_PAGES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| {
+                        part.trim().parse::<usize>().unwrap_or_else(|error| {
+                            panic!(
+                                "TINE_MANAGED_APPLICATION_SAVE_BENCH_PAGES contains {part:?}: {error}"
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![100, 10_000]);
+        assert!(
+            !page_counts.is_empty() && page_counts.iter().all(|pages| *pages >= 4),
+            "managed application-save benchmark needs nonempty total page counts of at least four: {page_counts:?}"
+        );
+        let runs = std::env::var("TINE_MANAGED_APPLICATION_SAVE_BENCH_RUNS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|runs| *runs > 0)
+            .unwrap_or(1);
+        let warmups = std::env::var("TINE_MANAGED_APPLICATION_SAVE_BENCH_WARMUPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2);
+        let samples_per_run = std::env::var("TINE_MANAGED_APPLICATION_SAVE_BENCH_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|samples| *samples > 0)
+            .unwrap_or(5);
+        let edits_per_run = warmups
+            .checked_add(samples_per_run)
+            .expect("managed application-save edit count must fit usize");
+
+        for total_pages in page_counts {
+            let additional_pages = total_pages - 3;
+            let mut managed_samples = Vec::with_capacity(runs * samples_per_run);
+            let mut direct_files_samples = Vec::with_capacity(runs * samples_per_run);
+
+            for run in 0..runs {
+                let fixture = ActivationFixture::scaled_with_blocks(
+                    &format!("managed-application-save-{total_pages}-run-{run}"),
+                    0xa120 + total_pages as u128 * 16 + run as u128,
+                    additional_pages,
+                    10,
+                );
+                let mut expected_graph = user_graph_bytes(&fixture.graph_root);
+                assert_eq!(expected_graph.len(), total_pages);
+                let request = reopen_request(&fixture.request);
+
+                // Activation/import and its startup catch-up are intentionally
+                // outside the caller-observed save interval.
+                let activated =
+                    SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+                assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+                let handle = activated
+                    .handle
+                    .expect("managed application benchmark activation retains a runtime handle");
+                drive_initial_feed(&handle);
+                let initial_journal = handle
+                    .managed_application_save_instrumentation()
+                    .expect("benchmark activation exposes local-journal instrumentation");
+                assert_eq!(initial_journal.managed_local_next_sequence, 0);
+                assert_eq!(initial_journal.managed_local_pending, 0);
+
+                let (mut page, mut revision) =
+                    load_application_logical(&handle, NAMED_PAGE, SyncPageKind::Page);
+                let target_path = page.path.clone();
+                let mut expected_journal_targets = Vec::with_capacity(edits_per_run);
+                for edit in 0..edits_per_run {
+                    let content = format!(
+                        "managed application save total-pages={total_pages} run={run} edit={edit}"
+                    );
+                    page.blocks[0].raw = content.clone();
+                    let timed = edit >= warmups;
+                    let counters_before = handle
+                        .managed_application_save_instrumentation()
+                        .expect("benchmark save obtains actor foreground instrumentation");
+                    let started = Instant::now();
+                    let outcome = handle
+                        .save_application_page(SyncApplicationPageSaveRequest {
+                            target: SyncApplicationPageSaveTarget::Existing {
+                                path: target_path.clone(),
+                                revision: revision.clone(),
+                            },
+                            page,
+                        })
+                        .expect("ordinary managed application save succeeds");
+                    let caller = started.elapsed();
+                    let counters_after = handle
+                        .managed_application_save_instrumentation()
+                        .expect("benchmark save obtains post-save foreground instrumentation");
+                    let (returned, returned_revision) = match outcome {
+                        SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => {
+                            (page, revision)
+                        }
+                        other => {
+                            panic!("ordinary managed application save was not direct: {other:?}")
+                        }
+                    };
+                    assert_eq!(returned.path, target_path);
+                    assert_eq!(returned.blocks[0].raw, content);
+                    assert_ne!(returned_revision, revision);
+                    assert_eq!(
+                        returned.rev.as_deref(),
+                        Some(returned_revision.as_str()),
+                        "the caller receives the exact revision it just saved"
+                    );
+
+                    let exact_bytes = fs::read(fixture.graph_root.join(&target_path)).unwrap();
+                    assert_eq!(
+                        counters_after.managed_local_next_sequence,
+                        counters_before.managed_local_next_sequence + 1,
+                        "each ordinary save appends exactly one managed-local journal frame"
+                    );
+                    assert_eq!(
+                        counters_after.managed_local_pending,
+                        counters_before.managed_local_pending + 1,
+                        "the benchmark keeps each accepted frame pending until the post-measurement drain"
+                    );
+                    expected_journal_targets.push((target_path.clone(), exact_bytes.clone()));
+                    expected_graph.insert(target_path.clone(), exact_bytes);
+                    assert_eq!(
+                        user_graph_bytes(&fixture.graph_root),
+                        expected_graph,
+                        "ordinary application save changes exactly its one graph file"
+                    );
+                    let parsed = Graph::open(&fixture.graph_root)
+                        .load_by_path(&target_path)
+                        .unwrap()
+                        .expect("saved target remains an exact graph page");
+                    assert_parser_dto_semantics(&returned, &parsed);
+                    assert_eq!(parsed.rev.as_deref(), Some(returned_revision.as_str()));
+
+                    if timed {
+                        assert_managed_application_save_foreground_counters(
+                            counters_before,
+                            counters_after,
+                        );
+                        managed_samples.push(ManagedApplicationSaveBenchmarkSample {
+                            caller,
+                            stages: counters_after.commit_stages,
+                        });
+                    }
+                    page = returned;
+                    revision = returned_revision;
+                }
+
+                // All foreground saves above are consecutive. Derivative work
+                // begins only after their timing and byte/semantic receipts.
+                for _ in 0..edits_per_run.saturating_mul(16).saturating_add(128) {
+                    if handle.status().unwrap().managed_local_pending == 0 {
+                        break;
+                    }
+                    handle.tick().unwrap();
+                }
+                assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+                assert_eq!(user_graph_bytes(&fixture.graph_root), expected_graph);
+                assert!(matches!(
+                    handle.clean_shutdown().unwrap(),
+                    SyncShutdownOutcome::Safe(_)
+                ));
+                let frames = managed_local_journal_frames(&request);
+                assert_eq!(frames.len(), expected_journal_targets.len());
+                for (sequence, (frame, (expected_path, expected_target))) in
+                    frames.iter().zip(&expected_journal_targets).enumerate()
+                {
+                    assert_eq!(frame.sequence(), sequence as u64);
+                    let record = decode_managed_local_record(frame).unwrap();
+                    assert_eq!(record.projection().intent().path().as_str(), expected_path);
+                    assert_eq!(
+                        record.projection().intent().target().bytes(),
+                        Some(expected_target.as_slice()),
+                        "each retained journal frame names the exact graph bytes returned by its save"
+                    );
+                }
+
+                let reopened = active_handle(SyncRuntimeHandle::open(request));
+                drive_initial_feed(&reopened);
+                let restored = load_application_exact(&reopened, &target_path);
+                assert_parser_dto_semantics(&page, &restored.0);
+                assert_eq!(revision, restored.1);
+                assert_eq!(user_graph_bytes(&fixture.graph_root), expected_graph);
+                assert!(matches!(
+                    reopened.clean_shutdown().unwrap(),
+                    SyncShutdownOutcome::Safe(_)
+                ));
+
+                // Direct Files saves are a separately reported comparable
+                // user operation: they avoid the managed application request,
+                // actor crossing, journal, and retained semantic overlay.
+                let direct_fixture = ActivationFixture::scaled_with_blocks(
+                    &format!("direct-files-save-{total_pages}-run-{run}"),
+                    0xa220 + total_pages as u128 * 16 + run as u128,
+                    additional_pages,
+                    10,
+                );
+                let mut direct_expected_graph = user_graph_bytes(&direct_fixture.graph_root);
+                assert_eq!(direct_expected_graph.len(), total_pages);
+                let direct_graph = Graph::open_checked(&direct_fixture.graph_root)
+                    .expect("direct fixture graph opens");
+                direct_graph.warm_cache();
+                let mut direct_page = direct_graph
+                    .load_named(NAMED_PAGE, PageKind::Page)
+                    .expect("direct benchmark named-page request succeeds")
+                    .expect("direct benchmark synthetic page exists");
+                let direct_target_path = direct_page.path.clone();
+                for edit in 0..edits_per_run {
+                    let content = format!(
+                        "direct files save total-pages={total_pages} run={run} edit={edit}"
+                    );
+                    direct_page.blocks[0].raw = content;
+                    let started = Instant::now();
+                    let next_revision = direct_graph
+                        .save_page(&direct_page, direct_page.rev.as_deref())
+                        .expect("direct existing-page save succeeds");
+                    let caller = started.elapsed();
+                    direct_page.rev = Some(next_revision.clone());
+                    let exact_bytes =
+                        fs::read(direct_fixture.graph_root.join(&direct_target_path)).unwrap();
+                    direct_expected_graph.insert(direct_target_path.clone(), exact_bytes);
+                    assert_eq!(
+                        user_graph_bytes(&direct_fixture.graph_root),
+                        direct_expected_graph
+                    );
+                    let parsed = Graph::open(&direct_fixture.graph_root)
+                        .load_by_path(&direct_target_path)
+                        .unwrap()
+                        .expect("direct saved target remains an exact graph page");
+                    assert_parser_dto_semantics(&direct_page, &parsed);
+                    assert_eq!(parsed.rev.as_deref(), Some(next_revision.as_str()));
+                    if edit >= warmups {
+                        direct_files_samples.push(caller);
+                    }
+                }
+            }
+
+            assert_eq!(managed_samples.len(), runs * samples_per_run);
+            assert_eq!(direct_files_samples.len(), runs * samples_per_run);
+            let (managed_p50, _) =
+                managed_application_save_quantiles(&managed_samples, |sample| sample.caller);
+            let direct_files_p50 = startup_median(&direct_files_samples);
+            let direct_files_p95 = startup_p95(&direct_files_samples);
+            assert!(
+                managed_p50 < Duration::from_millis(10),
+                "managed application save p50 exceeded 10 ms at {total_pages} pages: {managed_p50:?}"
+            );
+            eprintln!(
+                "managed_application_save_bench total_pages={total_pages} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
+                managed_application_save_phase_receipt(&managed_samples),
+                startup_ms(direct_files_p50),
+                startup_ms(direct_files_p95),
+            );
+        }
     }
 
     #[test]

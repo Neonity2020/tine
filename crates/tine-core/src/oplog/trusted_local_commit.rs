@@ -34,14 +34,14 @@ pub(crate) struct TrustedLocalCommitCoordinator;
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TrustedLocalCommitStageTimings {
-    prepared_record: Duration,
-    graph_total: Duration,
-    graph_validation: Duration,
-    journal_append: Duration,
-    graph_publication: Duration,
-    graph_cache_publication: Duration,
-    hot_overlay_apply: Duration,
-    direct_response: Duration,
+    pub(crate) prepared_record: Duration,
+    pub(crate) graph_total: Duration,
+    pub(crate) graph_validation: Duration,
+    pub(crate) journal_append: Duration,
+    pub(crate) graph_publication: Duration,
+    pub(crate) graph_cache_publication: Duration,
+    pub(crate) hot_overlay_apply: Duration,
+    pub(crate) direct_response: Duration,
 }
 
 #[cfg(test)]
@@ -65,7 +65,7 @@ fn reset_commit_stage_timings() {
 }
 
 #[cfg(test)]
-fn last_commit_stage_timings() -> TrustedLocalCommitStageTimings {
+pub(crate) fn last_commit_stage_timings() -> TrustedLocalCommitStageTimings {
     LAST_COMMIT_STAGE_TIMINGS.get()
 }
 
