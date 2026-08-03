@@ -6,8 +6,9 @@
 
 use super::{
     hot_engine::{
-        CurrentPathCatalogBinding, CurrentPathCatalogCursor, CurrentPathCatalogRow,
-        ShardedHotEngine, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
+        BootstrapBulkMaterializer, CurrentPathCatalogBinding, CurrentPathCatalogCursor,
+        CurrentPathCatalogRow, ProjectionPageState, ShardedHotEngine,
+        BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES, MAX_CURRENT_PATH_CURSOR_PAGE_ROWS,
     },
     object_store::EngineHistoryAuthority,
     projection_work_index::{
@@ -21,6 +22,7 @@ use super::{
 use crate::graph_text_scope::GraphTextScopeBinding;
 use crate::model::Graph;
 use sha2::{Digest, Sha256};
+use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
@@ -828,6 +830,12 @@ pub(crate) struct JoinedAuthenticatedExpectedPathSource<'a> {
     engine: &'a ShardedHotEngine,
     projection: &'a ProjectionWorkIndex,
     bootstrap: Option<&'a BootstrapProjectionAuthority>,
+    bootstrap_materializer: RefCell<Option<JoinedBootstrapMaterializer<'a>>>,
+}
+
+struct JoinedBootstrapMaterializer<'a> {
+    engine_binding: CurrentPathCatalogBinding,
+    materializer: BootstrapBulkMaterializer<'a>,
 }
 
 impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
@@ -839,6 +847,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             engine,
             projection,
             bootstrap: None,
+            bootstrap_materializer: RefCell::new(None),
         }
     }
 
@@ -851,7 +860,53 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             engine,
             projection,
             bootstrap: Some(bootstrap),
+            bootstrap_materializer: RefCell::new(None),
         }
+    }
+
+    /// Lazily pin one authenticated bulk materializer for this joined source.
+    ///
+    /// A full scan traverses the expected stream three times. Keeping this
+    /// scan-local capability beside the source authenticates and decodes the
+    /// accepted catalog once, while each traversal still reproves the joined
+    /// engine/projection head before and after every bounded page.
+    fn bootstrap_materializer(
+        &self,
+        engine_binding: CurrentPathCatalogBinding,
+    ) -> Result<Ref<'_, BootstrapBulkMaterializer<'a>>, ExpectedPathSourceFailure> {
+        if self.bootstrap.is_none() {
+            return Err(ExpectedPathSourceFailure::Missing);
+        }
+        if self.bootstrap_materializer.borrow().is_none() {
+            let root = self
+                .engine
+                .accepted_frontier_root()
+                .map_err(map_engine_expected_failure)?;
+            if root.state_digest() != engine_binding.accepted_frontier() {
+                return Err(ExpectedPathSourceFailure::Unavailable);
+            }
+            let materializer = self
+                .engine
+                .bootstrap_bulk_materializer(&root)
+                .map_err(map_engine_expected_failure)?;
+            *self.bootstrap_materializer.borrow_mut() = Some(JoinedBootstrapMaterializer {
+                engine_binding,
+                materializer,
+            });
+        }
+        let retained = self.bootstrap_materializer.borrow();
+        if retained
+            .as_ref()
+            .is_none_or(|retained| retained.engine_binding != engine_binding)
+        {
+            return Err(ExpectedPathSourceFailure::Unavailable);
+        }
+        Ok(Ref::map(retained, |retained| {
+            &retained
+                .as_ref()
+                .expect("joined bootstrap materializer was initialized")
+                .materializer
+        }))
     }
 
     pub(crate) fn current_scan_identity(
@@ -961,13 +1016,12 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             .map_err(map_projection_expected_failure)
     }
 
-    fn join_row(
+    fn completed_description(
         &self,
         head: ProjectionExpectedPathHead,
-        source_commitment: ContentDigest,
-        row: CurrentPathCatalogRow,
+        row: &CurrentPathCatalogRow,
         budget: &mut ProjectionExpectedPathReadBudget,
-    ) -> Result<AuthenticatedExpectedPath, ExpectedPathSourceFailure> {
+    ) -> Result<Option<BlobDescription>, ExpectedPathSourceFailure> {
         let receipt = self
             .projection
             .completed_receipt_at_expected_path_head_bounded(head, row.path(), budget)
@@ -981,16 +1035,17 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             let ProjectionWorkTarget::Present(description) = receipt.target() else {
                 return Err(ExpectedPathSourceFailure::Missing);
             };
-            return Ok(AuthenticatedExpectedPath {
-                page_id: row.page_id(),
-                path: row.path().clone(),
-                kind: row.kind(),
-                accepted_name_digest: row.accepted_name_digest(),
-                description,
-                owner_binding: joined_owner_binding(source_commitment, row.page_id(), row.path()),
-            });
+            return Ok(Some(description));
         }
+        Ok(None)
+    }
 
+    fn join_bootstrap_row(
+        &self,
+        source_commitment: ContentDigest,
+        row: &CurrentPathCatalogRow,
+        state: &ProjectionPageState,
+    ) -> Result<AuthenticatedExpectedPath, ExpectedPathSourceFailure> {
         let bootstrap = self.bootstrap.ok_or(ExpectedPathSourceFailure::Missing)?;
         let baseline = bootstrap
             .baseline_at(row.path())
@@ -1000,10 +1055,6 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                 )
             })?
             .ok_or(ExpectedPathSourceFailure::Missing)?;
-        let state = self
-            .engine
-            .materialize_page_for_projection(row.page_id())
-            .map_err(map_engine_expected_failure)?;
         let mismatch = if baseline.intent().workspace_id() != self.engine.workspace_id() {
             Some(ExpectedPathCorruptField::BootstrapWorkspaceId)
         } else if baseline.intent().page_id() != row.page_id() {
@@ -1043,6 +1094,74 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         })
     }
 
+    fn join_rows(
+        &self,
+        cursor: &JoinedAuthenticatedExpectedPathCursor<'a>,
+        semantic_rows: &[CurrentPathCatalogRow],
+        retained_bytes: u64,
+        budget: &mut ProjectionExpectedPathReadBudget,
+        rows: &mut Vec<AuthenticatedExpectedPath>,
+    ) -> Result<(), ExpectedPathSourceFailure> {
+        for semantic_chunk in semantic_rows.chunks(BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES) {
+            let mut completed = Vec::new();
+            completed
+                .try_reserve_exact(semantic_chunk.len())
+                .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+            let mut bootstrap_page_ids = Vec::new();
+            bootstrap_page_ids
+                .try_reserve_exact(semantic_chunk.len())
+                .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+            for semantic in semantic_chunk {
+                budget
+                    .reset_with_retained(retained_bytes)
+                    .map_err(map_projection_expected_failure)?;
+                let description =
+                    self.completed_description(cursor.projection_head, semantic, budget)?;
+                if description.is_none() {
+                    bootstrap_page_ids.push(semantic.page_id());
+                }
+                completed.push(description);
+            }
+
+            let bootstrap_states = if bootstrap_page_ids.is_empty() {
+                Vec::new()
+            } else {
+                self.bootstrap_materializer(cursor.engine_binding)?
+                    .materialize_pages_for_projection(&bootstrap_page_ids)
+                    .map_err(map_engine_expected_failure)?
+            };
+            let mut bootstrap_states = bootstrap_states.into_iter();
+            for (semantic, description) in semantic_chunk.iter().zip(completed) {
+                if let Some(description) = description {
+                    rows.push(AuthenticatedExpectedPath {
+                        page_id: semantic.page_id(),
+                        path: semantic.path().clone(),
+                        kind: semantic.kind(),
+                        accepted_name_digest: semantic.accepted_name_digest(),
+                        description,
+                        owner_binding: joined_owner_binding(
+                            cursor.source_commitment,
+                            semantic.page_id(),
+                            semantic.path(),
+                        ),
+                    });
+                    continue;
+                }
+                let state = bootstrap_states
+                    .next()
+                    .flatten()
+                    .ok_or(ExpectedPathSourceFailure::Missing)?;
+                rows.push(self.join_bootstrap_row(cursor.source_commitment, semantic, &state)?);
+            }
+            if bootstrap_states.next().is_some() {
+                return Err(ExpectedPathSourceFailure::CorruptField(
+                    ExpectedPathCorruptField::EngineAuthority,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn read_expected_path_page_bounded(
         &self,
         cursor: &mut JoinedAuthenticatedExpectedPathCursor<'a>,
@@ -1072,6 +1191,8 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             .ok_or(ExpectedPathSourceFailure::Corrupt)?;
         let worst_row_bytes = mem::size_of::<CurrentPathCatalogRow>()
             .saturating_add(mem::size_of::<AuthenticatedExpectedPath>())
+            .saturating_add(mem::size_of::<Option<BlobDescription>>())
+            .saturating_add(mem::size_of::<PageId>())
             .saturating_add(request.maximum_path_bytes.saturating_mul(2));
         let page_budget = request.maximum_retained_bytes / 2;
         let rows_by_bytes = usize::try_from(
@@ -1116,7 +1237,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             .checked_mul(mem::size_of::<AuthenticatedExpectedPath>() as u64)
             .ok_or(ExpectedPathSourceFailure::BoundExceeded)?;
         let mut aggregate_path_bytes = 0_u64;
-        for semantic in semantic_rows {
+        for semantic in &semantic_rows {
             let path_bytes = semantic.path().as_str().len();
             if path_bytes > request.maximum_path_bytes {
                 return Err(ExpectedPathSourceFailure::BoundExceeded);
@@ -1135,13 +1256,12 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                         .ok_or(ExpectedPathSourceFailure::BoundExceeded)?,
                 )
                 .map_err(map_projection_expected_failure)?;
-            rows.push(self.join_row(
-                cursor.projection_head,
-                cursor.source_commitment,
-                semantic,
-                budget,
-            )?);
         }
+        let retained_bytes = semantic_retained_bytes
+            .checked_add(output_capacity_bytes)
+            .and_then(|retained| retained.checked_add(aggregate_path_bytes))
+            .ok_or(ExpectedPathSourceFailure::BoundExceeded)?;
+        self.join_rows(cursor, &semantic_rows, retained_bytes, budget, &mut rows)?;
         self.require_join_current(cursor.engine_binding, cursor.projection_head, budget)?;
         Ok(AuthenticatedExpectedPathPage {
             rows,
@@ -1173,7 +1293,29 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             .reset_with_retained(if row.is_some() { point_bytes as u64 } else { 0 })
             .map_err(map_projection_expected_failure)?;
         let joined = row
-            .map(|row| self.join_row(projection, source_commitment, row, budget))
+            .map(|row| {
+                if let Some(description) = self.completed_description(projection, &row, budget)? {
+                    return Ok(AuthenticatedExpectedPath {
+                        page_id: row.page_id(),
+                        path: row.path().clone(),
+                        kind: row.kind(),
+                        accepted_name_digest: row.accepted_name_digest(),
+                        description,
+                        owner_binding: joined_owner_binding(
+                            source_commitment,
+                            row.page_id(),
+                            row.path(),
+                        ),
+                    });
+                }
+                // Preserve the bounded point-lookup path. The scan-local bulk
+                // materializer exists only to amortize a streamed full scan.
+                let state = self
+                    .engine
+                    .materialize_page_for_projection(row.page_id())
+                    .map_err(map_engine_expected_failure)?;
+                self.join_bootstrap_row(source_commitment, &row, &state)
+            })
             .transpose()?;
         self.require_join_current(engine, projection, budget)?;
         Ok(joined)

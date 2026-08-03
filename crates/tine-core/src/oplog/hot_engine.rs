@@ -4030,6 +4030,7 @@ pub(crate) struct BootstrapBulkMaterializer<'engine> {
     /// loading, but must resolve claims through the current fallback.
     current_claim_root_proven: bool,
     catalog: LoroDoc,
+    catalog_version: DecodedDocumentVersion,
     catalog_dependencies: DocumentDependencies,
     exact_document_loads: Cell<usize>,
     projection_claim_resolutions: Cell<BootstrapProjectionClaimResolutionStats>,
@@ -4081,10 +4082,19 @@ impl BootstrapBulkMaterializer<'_> {
         }
 
         let mut page_documents = BTreeMap::<PageId, DocumentId>::new();
-        // One catalog shape proof for the whole bounded chunk: it is a property
-        // of the retained catalog document, not of any page in it.
-        let validated_catalog =
-            validate_catalog_document(self.engine.catalog_document_id, &self.catalog)?;
+        // Construction proved the complete catalog once. Reprove the retained
+        // Loro identity cheaply before reusing that shape authority; repeating
+        // `get_value` here would make every bounded chunk graph-sized again.
+        if DecodedDocumentVersion::of(&self.catalog) != self.catalog_version {
+            return Err(EngineError::MalformedDocument {
+                document_id: self.engine.catalog_document_id,
+                reason: "bootstrap bulk catalog changed after validation".into(),
+            });
+        }
+        let validated_catalog = ValidatedCatalogDocument {
+            catalog_document_id: self.engine.catalog_document_id,
+            document: &self.catalog,
+        };
         let mut results = page_ids
             .iter()
             .map(|page_id| {
@@ -10055,11 +10065,13 @@ impl ShardedHotEngine {
             .remove(&self.catalog_document_id)
             .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
         validate_catalog(self.catalog_document_id, &catalog)?;
+        let catalog_version = DecodedDocumentVersion::of(&catalog);
         Ok(BootstrapBulkMaterializer {
             engine: self,
             root: root.clone(),
             current_claim_root_proven,
             catalog,
+            catalog_version,
             catalog_dependencies,
             exact_document_loads: Cell::new(1),
             projection_claim_resolutions: Cell::new(

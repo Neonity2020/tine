@@ -1640,6 +1640,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn bootstrap_expected_paths_share_bounded_bulk_materialization_across_full_scan() {
+        const PAGE_COUNT: usize = 65;
+        const EXPECTED_STREAM_PASSES: usize = 3;
+
+        let files = (0..PAGE_COUNT).map(|index| {
+            (
+                format!("pages/bootstrap-bulk-{index:03}.md"),
+                format!("- bootstrap block {index}\n").into_bytes(),
+            )
+        });
+        let mut fixture = Fixture::new("bootstrap-expected-path-bulk", None, files);
+        let enrollment = fixture.enrollment_root("bootstrap-expected-path-bulk");
+        let paths = PromotedPaths::new(&fixture, "bootstrap-expected-path-bulk");
+        let (mut authority, mut runtime) =
+            promote(&mut fixture, &enrollment, SessionId::new(), &paths);
+        let baseline = fixture.baseline(&fixture.graph, "bootstrap-expected-path-bulk", false);
+        let mut state =
+            ExactExternalFeedState::open(&fixture.graph, &fixture.receipts, &runtime, baseline)
+                .unwrap();
+        let manifests_before = fixture.manifest_count();
+        let _ = super::super::hot_engine::take_current_path_cursor_probe();
+        let mut clock = 0;
+
+        let result = drive_terminal(
+            &mut state,
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            &mut clock,
+        );
+
+        assert!(
+            matches!(result, ExactExternalFeedDrain::AdmittedNoop { .. }),
+            "an unchanged bootstrap graph must reconcile exactly: {result:?}"
+        );
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        let probe = super::super::hot_engine::take_current_path_cursor_probe();
+        assert_eq!(probe.rows, PAGE_COUNT * EXPECTED_STREAM_PASSES);
+        let chunks_per_pass =
+            PAGE_COUNT.div_ceil(super::super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES);
+        // Only the current-path cursor validates one catalog window at a time;
+        // the bulk projection catalog was proved once when its scan-local
+        // materializer opened. The old point path adds one projection
+        // validation per row and exceeds this scale-sensitive bound.
+        let maximum_catalog_validations = EXPECTED_STREAM_PASSES * chunks_per_pass;
+        assert!(
+            probe.catalog_document_validations <= maximum_catalog_validations,
+            "bootstrap expected-path materialization replayed graph-sized catalog work per row: \
+             {probe:?}, bound {maximum_catalog_validations}"
+        );
+    }
+
+    #[test]
     fn deferred_initial_catch_up_uses_the_sole_queue_and_one_fenced_graph_build() {
         let mut fixture = configured_fixture("sole-runtime-queue");
         let enrollment = fixture.enrollment_root("sole-runtime-queue");
