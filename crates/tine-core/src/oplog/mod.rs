@@ -100,14 +100,16 @@ pub use batch::{
 };
 pub(crate) use hot_engine::ProjectionTombstoneAuthorization;
 pub use hot_engine::{
-    AcceptedBatch, AcceptedBatchEvidence, AuthorBatch, AuthorTransactionDraft, BatchDisposition,
-    BlockContentRewrite, BlockLocation, CapabilityCapturedProjectionInput,
-    CapabilityCapturedProjectionState, CurrentPageAtPath, EngineError, EngineInstrumentation,
-    EngineStatus, FatalEvidenceHandle, HotOverlayApplyOutcome, HotOverlayError, HotOverlayWork,
-    ImmutableHomeClaim, ImmutableHomeConflict, ImmutableHomeEvidence, LogseqIdentityMutation,
-    LogseqIdentityTrigger, LogseqUuidClaim, LogseqUuidResolution, MaterializationStats,
+    append_managed_local_record, decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence,
+    AuthorBatch, AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation,
+    CapabilityCapturedProjectionInput, CapabilityCapturedProjectionState, CurrentPageAtPath,
+    EngineError, EngineInstrumentation, EngineStatus, FatalEvidenceHandle, ImmutableHomeClaim,
+    ImmutableHomeConflict, ImmutableHomeEvidence, LogseqIdentityMutation, LogseqIdentityTrigger,
+    LogseqUuidClaim, LogseqUuidResolution, ManagedLocalApplyOutcome,
+    ManagedLocalJournalPayloadKind, ManagedLocalPrefixState, ManagedLocalProjection,
+    ManagedLocalRecord, ManagedLocalRecordError, ManagedLocalWork, MaterializationStats,
     MaterializedBlock, MaterializedPage, OperationTransaction, PagePreambleRewrite, PageRename,
-    PortablePathConflict, PortablePathConflictParticipant, PreparedHotOverlayCommit,
+    PortablePathConflict, PortablePathConflictParticipant, PreparedManagedLocalRecord,
     ProjectionEndpointBinding, ProjectionPageState, ProjectionRequirement,
     ProjectionRequirementState, ProjectionWriteAuthorization, SemanticOperation, ShardedHotEngine,
     StageOutcome, WorkspaceStatus,

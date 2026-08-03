@@ -19,9 +19,9 @@
 //!
 //! The journal payload is an *existing* encoding. A semantic effect is carried
 //! in the canonical [`SemanticEffect`] encoding and a CRDT update is carried in
-//! the engine's own exported update bytes; the frame's payload kind is the
-//! existing [`ObjectKind`] vocabulary. This module introduces no second parser
-//! and no second digest.
+//! the engine's own exported update bytes. Its discriminator is explicitly
+//! prototype-only: these incomplete frames are not the managed-local durable
+//! record and cannot be replayed by that bridge.
 //!
 //! This is a narrowly scoped internal API. It is deliberately not wired into
 //! the shipping save route yet: the runtime integration is a later lane's work,
@@ -39,11 +39,12 @@ use std::time::{Duration, Instant};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use tine_storage::{
     LocalJournalAppend, LocalJournalError, LocalJournalFrame, LocalJournalRecovery,
-    LocalJournalSegment, LocalJournalStats, ObjectKind,
+    LocalJournalSegment, LocalJournalStats,
 };
 
 use crate::oplog::semantic::{SemanticEffect, SemanticError};
@@ -213,15 +214,31 @@ pub enum FastCommitIntent<'a> {
     CrdtUpdate(&'a [u8]),
 }
 
+/// Discriminator for this unpublished latency prototype's incomplete payloads.
+/// These are deliberately not managed-local records and cannot be replayed by
+/// the production record bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastCommitPrototypePayloadKind {
+    SemanticEffectV1,
+    CrdtUpdateOpaque,
+}
+
 impl FastCommitIntent<'_> {
     /// The frame's payload kind and bytes. A CRDT update is already encoded, so
     /// it is journalled without a copy.
-    fn journal_payload(&self) -> Result<(ObjectKind, Cow<'_, [u8]>), FastCommitError> {
+    fn journal_payload(
+        &self,
+    ) -> Result<(FastCommitPrototypePayloadKind, Cow<'_, [u8]>), FastCommitError> {
         match self {
-            Self::SemanticEffect(effect) => {
-                Ok((ObjectKind::SemanticEffect, Cow::Owned(effect.encode()?)))
-            }
-            Self::CrdtUpdate(bytes) => Ok((ObjectKind::CrdtUpdate, Cow::Borrowed(bytes))),
+            Self::SemanticEffect(effect) => Ok((
+                FastCommitPrototypePayloadKind::SemanticEffectV1,
+                Cow::Owned(effect.encode()?),
+            )),
+            Self::CrdtUpdate(bytes) => Ok((
+                FastCommitPrototypePayloadKind::CrdtUpdateOpaque,
+                Cow::Borrowed(bytes),
+            )),
         }
     }
 }
@@ -235,14 +252,15 @@ pub enum RecoveredCommitIntent {
 
 /// Decode one recovered frame back into the typed payload that was journalled.
 pub fn recover_commit_intent(
-    frame: &LocalJournalFrame<ObjectKind>,
+    frame: &LocalJournalFrame<FastCommitPrototypePayloadKind>,
 ) -> Result<RecoveredCommitIntent, FastCommitError> {
     match frame.payload_kind() {
-        ObjectKind::SemanticEffect => Ok(RecoveredCommitIntent::SemanticEffect(
-            SemanticEffect::decode(frame.payload())?,
-        )),
-        ObjectKind::CrdtUpdate => Ok(RecoveredCommitIntent::CrdtUpdate(frame.payload().to_vec())),
-        kind => Err(FastCommitError::UnsupportedPayloadKind(kind)),
+        FastCommitPrototypePayloadKind::SemanticEffectV1 => Ok(
+            RecoveredCommitIntent::SemanticEffect(SemanticEffect::decode(frame.payload())?),
+        ),
+        FastCommitPrototypePayloadKind::CrdtUpdateOpaque => {
+            Ok(RecoveredCommitIntent::CrdtUpdate(frame.payload().to_vec()))
+        }
     }
 }
 
@@ -298,7 +316,6 @@ pub enum FastCommitError {
         expected: String,
         offered: String,
     },
-    UnsupportedPayloadKind(ObjectKind),
     Journal(LocalJournalError),
     Semantic(SemanticError),
     Io(io::Error),
@@ -319,9 +336,6 @@ impl fmt::Display for FastCommitError {
                 formatter,
                 "stale base for {path}: expected {expected}, offered {offered}"
             ),
-            Self::UnsupportedPayloadKind(kind) => {
-                write!(formatter, "unsupported fast commit payload kind: {kind:?}")
-            }
             Self::Journal(error) => error.fmt(formatter),
             Self::Semantic(error) => error.fmt(formatter),
             Self::Io(error) => error.fmt(formatter),
@@ -352,7 +366,7 @@ impl From<io::Error> for FastCommitError {
 /// A device-local fast committer over one graph and one journal segment.
 pub struct FastLocalCommitter {
     graph: Arc<Graph>,
-    segment: LocalJournalSegment<ObjectKind>,
+    segment: LocalJournalSegment<FastCommitPrototypePayloadKind>,
     /// Graph-relative page path to the revision this device last committed.
     /// This is the trusted-local base; the audited replacement still proves the
     /// same revision against the file itself.
@@ -366,7 +380,7 @@ impl FastLocalCommitter {
         graph: Arc<Graph>,
         journal_root: &Path,
         device_id: Uuid,
-    ) -> Result<(Self, LocalJournalRecovery<ObjectKind>), FastCommitError> {
+    ) -> Result<(Self, LocalJournalRecovery<FastCommitPrototypePayloadKind>), FastCommitError> {
         let directory = journal_root.join(FAST_COMMIT_JOURNAL_DIR);
         std::fs::create_dir_all(&directory)?;
         let directory = Dir::open_ambient_dir(&directory, ambient_authority())?;
@@ -397,7 +411,7 @@ impl FastLocalCommitter {
     /// Stream every committed journal frame in append order.
     pub fn replay_journal(
         &self,
-        visit: impl FnMut(LocalJournalFrame<ObjectKind>),
+        visit: impl FnMut(LocalJournalFrame<FastCommitPrototypePayloadKind>),
     ) -> Result<u64, FastCommitError> {
         Ok(self.segment.replay(visit)?)
     }
@@ -494,7 +508,7 @@ mod fixtures {
     use tine_storage::ContentDigest;
     use uuid::Uuid;
 
-    use super::{FastCommitError, FastLocalCommitter};
+    use super::{FastCommitError, FastCommitPrototypePayloadKind, FastLocalCommitter};
     use crate::oplog::semantic::{BlockDelta, BlockOwner, BlockState, SemanticEffect};
     use crate::oplog::{BlockId, DocumentId, PageId};
     use crate::{Graph, PageDto, PageKind};
@@ -620,7 +634,7 @@ mod fixtures {
         ) -> Result<
             (
                 FastLocalCommitter,
-                tine_storage::LocalJournalRecovery<tine_storage::ObjectKind>,
+                tine_storage::LocalJournalRecovery<FastCommitPrototypePayloadKind>,
             ),
             FastCommitError,
         > {
@@ -742,8 +756,6 @@ mod tests {
 
     use std::fs;
 
-    use tine_storage::ObjectKind;
-
     use crate::model::content_rev;
     use crate::PageKind;
 
@@ -755,7 +767,9 @@ mod tests {
         std::env::temp_dir()
     }
 
-    fn journal_frames(committer: &FastLocalCommitter) -> Vec<LocalJournalFrame<ObjectKind>> {
+    fn journal_frames(
+        committer: &FastLocalCommitter,
+    ) -> Vec<LocalJournalFrame<FastCommitPrototypePayloadKind>> {
         let mut frames = Vec::new();
         committer
             .replay_journal(|frame| frames.push(frame))
@@ -839,7 +853,10 @@ mod tests {
             assert_eq!(frames.len(), 1);
             assert_eq!(frames[0].sequence(), 0);
             assert_eq!(frames[0].device_id(), device);
-            assert_eq!(frames[0].payload_kind(), ObjectKind::SemanticEffect);
+            assert_eq!(
+                frames[0].payload_kind(),
+                FastCommitPrototypePayloadKind::SemanticEffectV1
+            );
             assert_eq!(
                 recover_commit_intent(&frames[0]).unwrap(),
                 RecoveredCommitIntent::SemanticEffect(effect)
@@ -1094,7 +1111,10 @@ mod tests {
 
         let frames = journal_frames(&committer);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].payload_kind(), ObjectKind::CrdtUpdate);
+        assert_eq!(
+            frames[0].payload_kind(),
+            FastCommitPrototypePayloadKind::CrdtUpdateOpaque
+        );
         assert_eq!(
             recover_commit_intent(&frames[0]).unwrap(),
             RecoveredCommitIntent::CrdtUpdate(update_bytes)

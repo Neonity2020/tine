@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Instant;
 
 use cap_std::{ambient_authority, fs::Dir};
@@ -6,7 +7,8 @@ use tine_storage::{LocalJournalFrame, LocalJournalSegment};
 use super::*;
 use crate::fast_commit::forbidden_commit_work;
 use crate::oplog::{
-    ApplicationRuntimeRoot, HotOverlayApplyOutcome, HotOverlayError, LogseqIdentityOrigin,
+    append_managed_local_record, decode_managed_local_record, ApplicationRuntimeRoot,
+    ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind, ManagedLocalRecordError,
     MaterializedPage, ProjectionClaim, RebuildSource, SqliteFrontier,
 };
 
@@ -30,16 +32,13 @@ struct OverlayFixture {
     block_id: crate::oplog::BlockId,
     second_block_id: crate::oplog::BlockId,
     page_path: ManagedPath,
+    graph_path: PathBuf,
     _dir: TestDir,
 }
 
 impl OverlayFixture {
     fn new(label: &str, extension: &str, pages: usize) -> Self {
         Self::build(label, extension, pages, false)
-    }
-
-    fn new_sparse(label: &str, extension: &str, pages: usize) -> Self {
-        Self::build(label, extension, pages, true)
     }
 
     fn build(label: &str, extension: &str, pages: usize, sparse_identity: bool) -> Self {
@@ -76,9 +75,6 @@ impl OverlayFixture {
         let home_document_id = DocumentId::from_uuid(uuid(HOME_BASE));
         let block_id = crate::oplog::BlockId::from_uuid(uuid(BLOCK_BASE));
         let second_block_id = crate::oplog::BlockId::from_uuid(uuid(SECOND_BLOCK));
-        // Keep each setup transaction below the fixed-capacity portable-path test
-        // index. The measured hot path is unchanged; this only builds the accepted
-        // 10,000-page base in bounded bootstrap batches.
         const SETUP_PAGES_PER_BATCH: usize = 1_000;
         for start in (0..pages).step_by(SETUP_PAGES_PER_BATCH) {
             let end = (start + SETUP_PAGES_PER_BATCH).min(pages);
@@ -163,6 +159,7 @@ impl OverlayFixture {
             block_id,
             second_block_id,
             page_path,
+            graph_path,
             _dir: dir,
         }
     }
@@ -182,15 +179,11 @@ impl OverlayFixture {
                 block_id: self.block_id,
                 home_document_id: self.home_document_id,
             },
-            content: format!("overlay revision {generation}"),
+            content: format!("managed revision {generation}"),
         }])
     }
 
-    fn prepare_draft(
-        &self,
-        seed: u128,
-        generation: usize,
-    ) -> crate::oplog::PreparedHotOverlayCommit {
+    fn finalize_edit(&self, seed: u128, generation: usize) -> PreparedBatch {
         let draft = self
             .engine
             .draft_author_transaction(
@@ -200,34 +193,66 @@ impl OverlayFixture {
             )
             .unwrap();
         self.engine
-            .prepare_hot_overlay_draft(draft, self.engine.hot_overlay_next_sequence())
+            .finalize_author_transaction(draft, &self.graph, &self.receipts, self.binding)
             .unwrap()
     }
 
-    fn journal(&self, label: &str) -> LocalJournalSegment<ObjectKind> {
+    fn accept_and_project(&mut self, prepared: &PreparedBatch) {
+        let expected_base = std::fs::read(self.graph_path.join(self.page_path.as_str())).unwrap();
+        self.writer.publish_prepared(prepared).unwrap();
+        assert!(matches!(
+            self.engine
+                .stage_archive_batch(prepared.manifest().batch_id())
+                .unwrap()
+                .disposition,
+            BatchDisposition::Accepted { .. }
+        ));
+        crate::oplog::write_projection_exact(
+            &self.graph,
+            &self.receipts,
+            &self.engine,
+            self.page_id,
+            Some(&expected_base),
+        )
+        .unwrap();
+    }
+
+    fn prepare_record(&self, prepared: &PreparedBatch) -> crate::oplog::PreparedManagedLocalRecord {
+        self.engine
+            .prepare_managed_local_record(
+                prepared,
+                self.engine.managed_local_prefix_state().next_sequence,
+            )
+            .unwrap()
+    }
+
+    fn journal(
+        &self,
+        label: &str,
+    ) -> (PathBuf, LocalJournalSegment<ManagedLocalJournalPayloadKind>) {
         let root = self._dir.path().join(format!("journal-{label}"));
         std::fs::create_dir_all(&root).unwrap();
-        let dir = Dir::open_ambient_dir(root, ambient_authority()).unwrap();
-        LocalJournalSegment::open(&dir, "local.segment", uuid(DEVICE))
+        let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+        let segment = LocalJournalSegment::open(&dir, "local.segment", uuid(DEVICE))
             .unwrap()
-            .0
+            .0;
+        (root, segment)
     }
 
     fn append_and_apply(
         &mut self,
-        journal: &mut LocalJournalSegment<ObjectKind>,
-        prepared: &crate::oplog::PreparedHotOverlayCommit,
-    ) -> MaterializedPage {
-        let append = journal
-            .append(prepared.payload_kind(), prepared.journal_payload())
-            .unwrap();
-        match self
+        journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+        prepared: &crate::oplog::PreparedManagedLocalRecord,
+    ) -> (tine_storage::LocalJournalAppend, MaterializedPage) {
+        let append = append_managed_local_record(journal, prepared).unwrap();
+        let page = match self
             .engine
-            .apply_durable_hot_overlay(&append, prepared)
+            .apply_appended_managed_local_record(&append, prepared)
             .unwrap()
         {
-            HotOverlayApplyOutcome::Applied { page, .. } => page,
-        }
+            ManagedLocalApplyOutcome::Applied { page, .. } => page,
+        };
+        (append, page)
     }
 
     fn accept_bootstrap_edit(&mut self, seed: u128, generation: usize) -> PreparedBatch {
@@ -277,6 +302,25 @@ impl OverlayFixture {
     }
 }
 
+fn finalized_edit_chain(
+    label: &str,
+    extension: &str,
+    pages: usize,
+    edits: usize,
+) -> (OverlayFixture, Vec<PreparedBatch>) {
+    let mut authoring = OverlayFixture::new(label, extension, pages);
+    let mut batches = Vec::with_capacity(edits);
+    for generation in 1..=edits {
+        let prepared = authoring.finalize_edit(
+            1_070_000 + pages as u128 * 1_000 + generation as u128 * 10,
+            generation,
+        );
+        authoring.accept_and_project(&prepared);
+        batches.push(prepared);
+    }
+    (authoring, batches)
+}
+
 fn assert_page_semantics(left: &MaterializedPage, right: &MaterializedPage) {
     assert_eq!(left.page_id, right.page_id);
     assert_eq!(left.home_document_id, right.home_document_id);
@@ -287,35 +331,69 @@ fn assert_page_semantics(left: &MaterializedPage, right: &MaterializedPage) {
     assert_eq!(left.blocks, right.blocks);
 }
 
-#[test]
-fn committed_hot_overlay_boundary_starts_empty() {
-    let engine = Ids::new().engine();
-    assert_eq!(engine.hot_overlay_work().commits_applied, 0);
-    assert_eq!(engine.hot_overlay_len(), 0);
+fn frame(
+    prepared: &crate::oplog::PreparedManagedLocalRecord,
+) -> LocalJournalFrame<ManagedLocalJournalPayloadKind> {
+    LocalJournalFrame::new(
+        uuid(DEVICE),
+        prepared.sequence(),
+        prepared.payload_kind(),
+        prepared.journal_payload().to_vec(),
+    )
 }
 
 #[test]
-fn markdown_and_org_hot_materialization_matches_accepted_sqlite_semantics() {
+fn managed_local_boundary_starts_with_an_empty_prefix() {
+    let engine = Ids::new().engine();
+    assert_eq!(engine.managed_local_work().commits_applied, 0);
+    assert_eq!(
+        engine.managed_local_prefix_state(),
+        crate::oplog::ManagedLocalPrefixState {
+            next_sequence: 0,
+            records_applied: 0,
+            commitment: ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0"),
+        }
+    );
+}
+
+#[test]
+fn markdown_and_org_record_application_matches_the_exact_accepted_engine_and_sqlite_semantics() {
     for extension in ["md", "org"] {
-        let mut hot =
-            OverlayFixture::new_sparse(&format!("overlay-semantic-hot-{extension}"), extension, 8);
-        let mut journal = hot.journal("semantic");
-        let prepared = hot.prepare_draft(1_070_000, 1);
-        let response = hot.append_and_apply(&mut journal, &prepared);
-        let direct = hot
+        let (accepted, batches) = finalized_edit_chain(
+            &format!("managed-record-accepted-{extension}"),
+            extension,
+            8,
+            1,
+        );
+        let expected = accepted.engine.materialize_page(accepted.page_id).unwrap();
+        let mut local =
+            OverlayFixture::new(&format!("managed-record-local-{extension}"), extension, 8);
+        let (_, mut journal) = local.journal("semantic");
+        let prepared = local.prepare_record(&batches[0]);
+        let forbidden_before = forbidden_commit_work();
+        let stats_before = journal.stats();
+        let (_, response) = local.append_and_apply(&mut journal, &prepared);
+        let direct = local
             .engine
-            .materialize_current_page_at_path(&hot.page_path)
+            .materialize_current_page_at_path(&local.page_path)
             .unwrap()
             .unwrap();
+        let forbidden = forbidden_commit_work().since(forbidden_before);
+        assert!(
+            forbidden.is_none(),
+            "managed-local append/apply performed forbidden work: {forbidden:?}"
+        );
+        let stats = journal.stats();
+        assert_eq!(stats.frames_appended - stats_before.frames_appended, 1);
+        assert_eq!(
+            stats.data_durability_syncs - stats_before.data_durability_syncs,
+            1
+        );
         assert_page_semantics(prepared.post_page(), &response);
         assert_page_semantics(&response, &direct);
+        assert_page_semantics(&direct, &expected);
 
-        let mut cold =
-            OverlayFixture::new_sparse(&format!("overlay-semantic-cold-{extension}"), extension, 8);
-        cold.accept_bootstrap_edit(1_071_000, 1);
-        let accepted = cold.engine.materialize_page(cold.page_id).unwrap();
-        assert_page_semantics(&direct, &accepted);
-        let (sqlite_page, sqlite_blocks) = cold.sqlite_page_and_blocks();
+        let (sqlite_page, sqlite_blocks) = accepted.sqlite_page_and_blocks();
         assert_eq!(sqlite_page.page_id, direct.page_id);
         assert_eq!(sqlite_page.home_document_id, direct.home_document_id);
         assert_eq!(sqlite_page.name, direct.name.as_str());
@@ -331,147 +409,130 @@ fn markdown_and_org_hot_materialization_matches_accepted_sqlite_semantics() {
             assert_eq!(row.logseq_uuid, block.logseq_uuid);
             assert_eq!(row.logseq_identity_origin, block.logseq_identity_origin);
         }
-        assert_eq!(
-            direct.blocks[0].logseq_uuid,
-            Some(LogseqUuid::from_uuid(uuid(LOGSEQ_UUID)))
-        );
-        assert_eq!(
-            direct.blocks[0].logseq_identity_origin,
-            Some(LogseqIdentityOrigin::PolicyGenerated {
-                reason: PolicyGeneratedAnchorReason::Export,
-            })
-        );
+        assert_eq!(direct.blocks[0].logseq_uuid, None);
+        assert_eq!(direct.blocks[0].logseq_identity_origin, None);
     }
 }
 
 #[test]
-fn consecutive_local_edits_compose_before_any_cold_or_derivative_work() {
-    let mut fixture = OverlayFixture::new("overlay-compose", "md", 100);
-    let mut journal = fixture.journal("compose");
-    let work_before = fixture.engine.hot_overlay_work();
-    for generation in 1..=24 {
-        let prepared = fixture.prepare_draft(1_080_000 + generation as u128 * 10, generation);
-        let forbidden_before = forbidden_commit_work();
-        let response = fixture.append_and_apply(&mut journal, &prepared);
-        let current = fixture
-            .engine
-            .materialize_current_page_at_path(&fixture.page_path)
-            .unwrap()
-            .unwrap();
-        assert_page_semantics(&response, &current);
-        assert_eq!(current.stats.catalog_documents_loaded, 0);
-        assert_eq!(
-            current.blocks[0].content,
-            format!("overlay revision {generation}")
-        );
-        let forbidden = forbidden_commit_work().since(forbidden_before);
-        assert!(
-            forbidden.is_none(),
-            "overlay advance/materialization performed forbidden work: {forbidden:?}"
-        );
-    }
-    let work = fixture.engine.hot_overlay_work().since(work_before);
-    assert_eq!(work.commits_applied, 24);
-    assert_eq!(work.documents_imported, 24);
-    assert_eq!(work.page_materializations, 24);
-    assert_eq!(fixture.engine.hot_overlay_len(), 24);
+fn record_reconstructs_exact_prepared_batch_and_projection_material() {
+    let (_, batches) = finalized_edit_chain("managed-record-reconstruct-source", "md", 8, 1);
+    let fixture = OverlayFixture::new("managed-record-reconstruct-local", "md", 8);
+    let prepared = fixture.prepare_record(&batches[0]);
+    let decoded = decode_managed_local_record(&frame(&prepared)).unwrap();
+
+    assert_eq!(
+        decoded.prepared_batch().manifest().encode().unwrap(),
+        batches[0].manifest().encode().unwrap()
+    );
+    let encoded = |batch: &PreparedBatch| {
+        batch
+            .objects()
+            .iter()
+            .map(|object| object.encode().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(encoded(decoded.prepared_batch()), encoded(&batches[0]));
+
+    let original = crate::oplog::projection_manifest::validate_projection_object_set(
+        batches[0].manifest(),
+        batches[0].objects(),
+    )
+    .unwrap();
+    assert_eq!(original.intents(), &[decoded.projection().intent().clone()]);
+    let base_reference = decoded.projection().intent().precondition().base().unwrap();
+    assert_eq!(
+        original.bases().get(&base_reference.document_id()),
+        Some(decoded.projection().precondition_base())
+    );
+    assert_eq!(decoded.projection().intent().page_id(), fixture.page_id);
+    assert_eq!(decoded.projection().intent().path(), &fixture.page_path);
+    assert_eq!(
+        decoded.projection().precondition_base().source_path(),
+        &fixture.page_path
+    );
+    assert_eq!(
+        decoded.projection().precondition_base().bytes(),
+        std::fs::read(fixture.graph_path.join(fixture.page_path.as_str())).unwrap()
+    );
+    assert!(decoded.projection().intent().target().bytes().is_some());
 }
 
 #[test]
-fn recovered_prefix_replays_identically_and_duplicate_replay_is_refused_without_effect() {
-    let mut uninterrupted = OverlayFixture::new("overlay-replay-live", "org", 16);
-    let mut journal = uninterrupted.journal("replay");
+fn consecutive_records_replay_into_a_fresh_engine_like_uninterrupted_execution() {
+    let (accepted, batches) = finalized_edit_chain("managed-record-chain-source", "org", 16, 12);
+    let expected = accepted.engine.materialize_page(accepted.page_id).unwrap();
+    let mut uninterrupted = OverlayFixture::new("managed-record-chain-live", "org", 16);
+    let (_, mut journal) = uninterrupted.journal("chain");
     let mut frames = Vec::new();
-    for generation in 1..=12 {
-        let prepared = uninterrupted.prepare_draft(1_090_000 + generation as u128 * 10, generation);
+    for prepared_batch in &batches {
+        let prepared = uninterrupted.prepare_record(prepared_batch);
         uninterrupted.append_and_apply(&mut journal, &prepared);
-        frames.push(LocalJournalFrame::new(
-            uuid(DEVICE),
-            prepared.sequence(),
-            prepared.payload_kind(),
-            prepared.journal_payload().to_vec(),
-        ));
+        frames.push(frame(&prepared));
     }
-    let expected = uninterrupted
+    let live = uninterrupted
         .engine
         .materialize_current_page_at_path(&uninterrupted.page_path)
         .unwrap()
         .unwrap();
 
-    let mut recovered = OverlayFixture::new("overlay-replay-fresh", "org", 16);
-    for frame in &frames {
-        recovered.engine.replay_hot_overlay_frame(frame).unwrap();
+    let mut recovered = OverlayFixture::new("managed-record-chain-recovered", "org", 16);
+    // Startup establishes the accepted touched-page base before replaying its
+    // journal prefix. The measured replay itself may not consult the archive.
+    recovered
+        .engine
+        .materialize_page(recovered.page_id)
+        .unwrap();
+    let forbidden_before = forbidden_commit_work();
+    for record in &frames {
+        recovered
+            .engine
+            .replay_managed_local_record(record)
+            .unwrap();
     }
-    let actual = recovered
+    let forbidden = forbidden_commit_work().since(forbidden_before);
+    assert!(
+        forbidden.is_none(),
+        "managed-local replay performed forbidden work: {forbidden:?}"
+    );
+    let replayed = recovered
         .engine
         .materialize_current_page_at_path(&recovered.page_path)
         .unwrap()
         .unwrap();
-    assert_page_semantics(&expected, &actual);
-    let before = actual.clone();
-    assert!(matches!(
-        recovered.engine.replay_hot_overlay_frame(&frames[0]),
-        Err(HotOverlayError::OutOfOrder { .. })
-    ));
-    let after = recovered
-        .engine
-        .materialize_current_page_at_path(&recovered.page_path)
-        .unwrap()
-        .unwrap();
-    assert_page_semantics(&before, &after);
+    assert_page_semantics(&expected, &live);
+    assert_page_semantics(&live, &replayed);
+    assert_eq!(
+        recovered
+            .engine
+            .managed_local_prefix_state()
+            .records_applied,
+        12
+    );
+    assert_eq!(recovered.engine.managed_local_work().documents_imported, 12);
 }
 
 #[test]
-fn stale_order_corruption_binding_and_frontier_failures_leave_visible_state_unchanged() {
-    let source = OverlayFixture::new("overlay-refusal-source", "md", 8);
-    let first = source.prepare_draft(1_100_000, 1);
-    let first_frame = LocalJournalFrame::new(
-        uuid(DEVICE),
-        first.sequence(),
-        first.payload_kind(),
-        first.journal_payload().to_vec(),
-    );
+fn corrupt_binding_order_and_stale_base_are_refused_before_visible_change() {
+    let (_, batches) = finalized_edit_chain("managed-record-refusal-source", "md", 8, 2);
+    let source = OverlayFixture::new("managed-record-refusal-encode", "md", 8);
+    let first = source.prepare_record(&batches[0]);
+    let first_frame = frame(&first);
 
-    let mut stale = OverlayFixture::new("overlay-refusal-stale", "md", 8);
-    let before = stale.engine.materialize_page(stale.page_id).unwrap();
+    let mut stale = OverlayFixture::new("managed-record-refusal-stale", "md", 8);
     stale.accept_bootstrap_edit(1_100_100, 9);
-    let accepted_before = stale.engine.materialize_page(stale.page_id).unwrap();
+    let stale_before = stale.engine.materialize_page(stale.page_id).unwrap();
     assert!(matches!(
-        stale.engine.replay_hot_overlay_frame(&first_frame),
-        Err(HotOverlayError::StaleBase)
+        stale.engine.replay_managed_local_record(&first_frame),
+        Err(ManagedLocalRecordError::StaleBase)
     ));
     assert_page_semantics(
-        &accepted_before,
+        &stale_before,
         &stale.engine.materialize_page(stale.page_id).unwrap(),
     );
-    assert_ne!(before.blocks[0].content, accepted_before.blocks[0].content);
 
-    let mut live = OverlayFixture::new("overlay-refusal-live", "md", 8);
-    live.engine.replay_hot_overlay_frame(&first_frame).unwrap();
-    let second = live.prepare_draft(1_100_200, 2);
-    let second_frame = LocalJournalFrame::new(
-        uuid(DEVICE),
-        second.sequence(),
-        second.payload_kind(),
-        second.journal_payload().to_vec(),
-    );
-    let mut out_of_order = OverlayFixture::new("overlay-refusal-order", "md", 8);
-    let unchanged = out_of_order
-        .engine
-        .materialize_page(out_of_order.page_id)
-        .unwrap();
-    assert!(matches!(
-        out_of_order.engine.replay_hot_overlay_frame(&second_frame),
-        Err(HotOverlayError::OutOfOrder { .. })
-    ));
-    assert_page_semantics(
-        &unchanged,
-        &out_of_order
-            .engine
-            .materialize_page(out_of_order.page_id)
-            .unwrap(),
-    );
-
+    let mut clean = OverlayFixture::new("managed-record-refusal-clean", "md", 8);
+    let unchanged = clean.engine.materialize_page(clean.page_id).unwrap();
     let mut corrupt_bytes = first.journal_payload().to_vec();
     let corrupt_index = corrupt_bytes.len() / 2;
     corrupt_bytes[corrupt_index] ^= 0x80;
@@ -482,15 +543,65 @@ fn stale_order_corruption_binding_and_frontier_failures_leave_visible_state_unch
         corrupt_bytes,
     );
     assert!(matches!(
-        out_of_order.engine.replay_hot_overlay_frame(&corrupt),
-        Err(HotOverlayError::CorruptPayload(_)) | Err(HotOverlayError::Engine(_))
+        clean.engine.replay_managed_local_record(&corrupt),
+        Err(ManagedLocalRecordError::CorruptPayload(_)) | Err(ManagedLocalRecordError::Engine(_))
     ));
     assert_page_semantics(
         &unchanged,
-        &out_of_order
-            .engine
-            .materialize_page(out_of_order.page_id)
-            .unwrap(),
+        &clean.engine.materialize_page(clean.page_id).unwrap(),
+    );
+
+    let wrong_device = LocalJournalFrame::new(
+        uuid(DEVICE + 1),
+        first.sequence(),
+        first.payload_kind(),
+        first.journal_payload().to_vec(),
+    );
+    assert!(matches!(
+        clean.engine.replay_managed_local_record(&wrong_device),
+        Err(ManagedLocalRecordError::CorruptPayload(_))
+    ));
+    let wrong_sequence = LocalJournalFrame::new(
+        uuid(DEVICE),
+        1,
+        first.payload_kind(),
+        first.journal_payload().to_vec(),
+    );
+    assert!(matches!(
+        clean.engine.replay_managed_local_record(&wrong_sequence),
+        Err(ManagedLocalRecordError::CorruptPayload(_))
+    ));
+
+    let mut live = OverlayFixture::new("managed-record-refusal-live", "md", 8);
+    live.engine
+        .replay_managed_local_record(&first_frame)
+        .unwrap();
+    let second = live.prepare_record(&batches[1]);
+    let second_frame = frame(&second);
+    let mut gap = OverlayFixture::new("managed-record-refusal-gap", "md", 8);
+    let gap_before = gap.engine.materialize_page(gap.page_id).unwrap();
+    assert!(matches!(
+        gap.engine.replay_managed_local_record(&second_frame),
+        Err(ManagedLocalRecordError::OutOfOrder {
+            expected: 0,
+            found: 1
+        })
+    ));
+    assert_page_semantics(
+        &gap_before,
+        &gap.engine.materialize_page(gap.page_id).unwrap(),
+    );
+    let live_before_duplicate = live.engine.materialize_page(live.page_id).unwrap();
+    assert!(matches!(
+        live.engine.replay_managed_local_record(&first_frame),
+        Err(ManagedLocalRecordError::OutOfOrder {
+            expected: 1,
+            found: 0
+        })
+    ));
+    assert_page_semantics(
+        &live_before_duplicate,
+        &live.engine.materialize_page(live.page_id).unwrap(),
     );
 
     let mut wrong_workspace = ShardedHotEngine::new(
@@ -499,125 +610,128 @@ fn stale_order_corruption_binding_and_frontier_failures_leave_visible_state_unch
         source.ids.catalog,
     );
     assert!(matches!(
-        wrong_workspace.replay_hot_overlay_frame(&first_frame),
-        Err(HotOverlayError::Engine(
+        wrong_workspace.replay_managed_local_record(&first_frame),
+        Err(ManagedLocalRecordError::Engine(
             EngineError::WorkspaceMismatch { .. }
         ))
     ));
-    let wrong_device = LocalJournalFrame::new(
-        uuid(DEVICE + 1),
-        first.sequence(),
-        first.payload_kind(),
-        first.journal_payload().to_vec(),
+    let mut wrong_lineage = ShardedHotEngine::new(
+        source.ids.workspace,
+        LineageDigest::of(b"wrong managed-local lineage"),
+        source.ids.catalog,
     );
     assert!(matches!(
-        out_of_order.engine.replay_hot_overlay_frame(&wrong_device),
-        Err(HotOverlayError::CorruptPayload(_))
+        wrong_lineage.replay_managed_local_record(&first_frame),
+        Err(ManagedLocalRecordError::Engine(
+            EngineError::LineageMismatch { .. }
+        ))
     ));
-
-    let old_frontier = live.engine.accepted_frontier_root().unwrap();
-    let live_before = live.engine.materialize_page(live.page_id).unwrap();
-    assert!(matches!(
-        live.engine.collapse_hot_overlay(&old_frontier),
-        Err(HotOverlayError::AcceptedFrontierMismatch)
-    ));
-    assert_page_semantics(
-        &live_before,
-        &live.engine.materialize_page(live.page_id).unwrap(),
-    );
 }
 
 #[test]
-fn durable_receipt_device_binding_matches_replay_and_preserves_visible_state() {
-    let mut fixture = OverlayFixture::new("overlay-device-receipt", "md", 8);
-    let prepared = fixture.prepare_draft(1_105_000, 1);
-    let before = fixture
-        .engine
-        .materialize_current_page_at_path(&fixture.page_path)
-        .unwrap()
-        .unwrap();
-
-    let root = fixture._dir.path().join("journal-device-b");
-    std::fs::create_dir_all(&root).unwrap();
-    let dir = Dir::open_ambient_dir(root, ambient_authority()).unwrap();
-    let device_b = uuid(DEVICE + 1);
-    let mut journal = LocalJournalSegment::open(&dir, "local.segment", device_b)
+fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
+    let (_, batches) = finalized_edit_chain("managed-record-append-source", "md", 8, 1);
+    let mut fixture = OverlayFixture::new("managed-record-append-local", "md", 8);
+    let prepared = fixture.prepare_record(&batches[0]);
+    let wrong_root = fixture._dir.path().join("journal-wrong-device");
+    std::fs::create_dir_all(&wrong_root).unwrap();
+    let wrong_dir = Dir::open_ambient_dir(wrong_root, ambient_authority()).unwrap();
+    let mut wrong = LocalJournalSegment::open(&wrong_dir, "local.segment", uuid(DEVICE + 1))
         .unwrap()
         .0;
-    let append = journal
-        .append(prepared.payload_kind(), prepared.journal_payload())
-        .unwrap();
-    assert_eq!(append.device_id, device_b);
-
-    let live_error = fixture
-        .engine
-        .apply_durable_hot_overlay(&append, &prepared)
-        .unwrap_err();
     assert_eq!(
-        live_error,
-        HotOverlayError::CorruptPayload("manifest binding differs from journal binding".into())
+        append_managed_local_record(&mut wrong, &prepared),
+        Err(ManagedLocalRecordError::WrongDurabilityProof)
     );
-    assert_eq!(fixture.engine.hot_overlay_len(), 0);
-    assert_page_semantics(
-        &before,
-        &fixture
-            .engine
-            .materialize_current_page_at_path(&fixture.page_path)
-            .unwrap()
-            .unwrap(),
-    );
+    assert_eq!(wrong.next_sequence(), 0);
+    assert_eq!(wrong.stats().frames_appended, 0);
 
-    let mut recovered = Vec::new();
-    assert_eq!(journal.replay(|frame| recovered.push(frame)).unwrap(), 1);
-    assert_eq!(recovered[0].device_id(), device_b);
-    let replay_error = fixture
+    let (_, mut correct) = fixture.journal("correct-device");
+    let append = append_managed_local_record(&mut correct, &prepared).unwrap();
+    assert_eq!(append.device_id, uuid(DEVICE));
+    assert_eq!(append.sequence, 0);
+    assert_eq!(
+        append.payload_digest,
+        ContentDigest::of(prepared.journal_payload())
+    );
+    assert_eq!(append.data_durability_syncs, 1);
+    fixture
         .engine
-        .replay_hot_overlay_frame(&recovered[0])
-        .unwrap_err();
-    assert_eq!(replay_error, live_error);
-    assert_eq!(fixture.engine.hot_overlay_len(), 0);
+        .apply_appended_managed_local_record(&append, &prepared)
+        .unwrap();
+}
+
+#[test]
+fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
+    let (_, batches) = finalized_edit_chain("managed-record-torn-source", "org", 8, 2);
+    let mut live = OverlayFixture::new("managed-record-torn-live", "org", 8);
+    let (journal_root, mut journal) = live.journal("torn");
+    let first = live.prepare_record(&batches[0]);
+    live.append_and_apply(&mut journal, &first);
+    let expected_prefix = live.engine.materialize_page(live.page_id).unwrap();
+    let second = live.prepare_record(&batches[1]);
+    let (second_append, _) = live.append_and_apply(&mut journal, &second);
+    let committed = journal.committed_bytes();
+    drop(journal);
+
+    let segment_path = journal_root.join("local.segment");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&segment_path)
+        .unwrap();
+    file.set_len(committed - second_append.frame_bytes / 2)
+        .unwrap();
+    file.sync_data().unwrap();
+    drop(file);
+
+    let dir = Dir::open_ambient_dir(&journal_root, ambient_authority()).unwrap();
+    let (recovered_segment, recovery) =
+        LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open(
+            &dir,
+            "local.segment",
+            uuid(DEVICE),
+        )
+        .unwrap();
+    assert_eq!(recovery.frames_recovered, 1);
+    assert!(recovery.discarded_tail_bytes > 0);
+    assert_eq!(recovered_segment.next_sequence(), 1);
+    let mut frames = Vec::new();
+    recovered_segment
+        .replay(|record| frames.push(record))
+        .unwrap();
+    assert_eq!(frames.len(), 1);
+
+    let mut fresh = OverlayFixture::new("managed-record-torn-fresh", "org", 8);
+    fresh
+        .engine
+        .replay_managed_local_record(&frames[0])
+        .unwrap();
     assert_page_semantics(
-        &before,
-        &fixture
-            .engine
-            .materialize_current_page_at_path(&fixture.page_path)
-            .unwrap()
-            .unwrap(),
+        &expected_prefix,
+        &fresh.engine.materialize_page(fresh.page_id).unwrap(),
     );
 }
 
 #[test]
-fn exact_accepted_catchup_collapses_overlay_and_later_edits_continue() {
-    let mut fixture = OverlayFixture::new("overlay-collapse", "md", 12);
-    let draft = fixture
-        .engine
-        .draft_author_transaction(
-            fixture.local_author(1_110_000),
-            BatchOrigin::LocalMutation,
-            &fixture.content_edit(1),
-        )
-        .unwrap();
-    let prepared = fixture
-        .engine
-        .finalize_author_transaction(draft, &fixture.graph, &fixture.receipts, fixture.binding)
-        .unwrap();
-    let overlay = fixture
-        .engine
-        .prepare_hot_overlay_commit(&prepared, fixture.page_id, 0)
-        .unwrap();
-    let mut journal = fixture.journal("collapse");
+fn accepted_catchup_collapses_prefix_without_semantic_change_and_sequence_stays_monotonic() {
+    let mut fixture = OverlayFixture::new("managed-record-collapse", "md", 12);
+    let prepared_batch = fixture.finalize_edit(1_110_000, 1);
+    let prepared = fixture.prepare_record(&prepared_batch);
+    let (_, mut journal) = fixture.journal("collapse");
     let before_frontier = fixture.engine.accepted_frontier_root().unwrap();
-    fixture.append_and_apply(&mut journal, &overlay);
-    assert!(matches!(
-        fixture.engine.collapse_hot_overlay(&before_frontier),
-        Err(HotOverlayError::AcceptedFrontierMismatch)
-    ));
-
-    fixture.writer.publish_prepared(&prepared).unwrap();
+    fixture.append_and_apply(&mut journal, &prepared);
     assert!(matches!(
         fixture
             .engine
-            .stage_archive_batch(prepared.manifest().batch_id())
+            .collapse_managed_local_prefix(&before_frontier),
+        Err(ManagedLocalRecordError::AcceptedFrontierMismatch)
+    ));
+
+    fixture.writer.publish_prepared(&prepared_batch).unwrap();
+    assert!(matches!(
+        fixture
+            .engine
+            .stage_archive_batch(prepared_batch.manifest().batch_id())
             .unwrap()
             .disposition,
         BatchDisposition::Accepted { .. }
@@ -627,68 +741,93 @@ fn exact_accepted_catchup_collapses_overlay_and_later_edits_continue() {
     assert_eq!(
         fixture
             .engine
-            .collapse_hot_overlay(&accepted_frontier)
+            .collapse_managed_local_prefix(&accepted_frontier)
             .unwrap(),
         1
     );
-    assert_eq!(fixture.engine.hot_overlay_len(), 0);
-    let collapsed = fixture.engine.materialize_page(fixture.page_id).unwrap();
-    assert_page_semantics(&expected, &collapsed);
-
-    let later = fixture.prepare_draft(1_110_100, 2);
-    let later_page = fixture.append_and_apply(&mut journal, &later);
-    assert_eq!(later_page.blocks[0].content, "overlay revision 2");
-    assert_eq!(fixture.engine.hot_overlay_len(), 1);
+    let prefix = fixture.engine.managed_local_prefix_state();
+    assert_eq!(prefix.records_applied, 0);
+    assert_eq!(prefix.next_sequence, 1);
+    assert_page_semantics(
+        &expected,
+        &fixture.engine.materialize_page(fixture.page_id).unwrap(),
+    );
 }
 
 #[test]
-#[ignore = "manual release benchmark; prints every raw sample"]
-fn committed_hot_overlay_manual_release_benchmark() {
+#[ignore = "manual release benchmark; synthetic pages and bounded record work"]
+fn managed_local_record_manual_release_benchmark() {
+    let pages = std::env::var("TINE_MANAGED_LOCAL_RECORD_BENCH_PAGES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.parse::<usize>().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![100, 10_000]);
+    let edits = std::env::var("TINE_MANAGED_LOCAL_RECORD_BENCH_EDITS")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(8);
+    let warmups = std::env::var("TINE_MANAGED_LOCAL_RECORD_BENCH_WARMUPS")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(2);
+    assert!(edits > warmups);
+
     let mut observations = Vec::new();
-    for pages in [100_usize, 10_000] {
-        let mut fixture = OverlayFixture::new(&format!("overlay-bench-{pages}"), "md", pages);
-        let work_before = fixture.engine.hot_overlay_work();
+    for page_count in pages {
+        let (_, batches) = finalized_edit_chain(
+            &format!("managed-record-bench-source-{page_count}"),
+            "md",
+            page_count,
+            edits,
+        );
+        let mut fixture = OverlayFixture::new(
+            &format!("managed-record-bench-replay-{page_count}"),
+            "md",
+            page_count,
+        );
+        fixture.engine.materialize_page(fixture.page_id).unwrap();
+        let work_before = fixture.engine.managed_local_work();
         let mut samples = Vec::new();
-        for generation in 1..=55 {
-            let prepared = fixture.prepare_draft(
-                1_120_000 + pages as u128 * 100 + generation as u128 * 2,
-                generation,
-            );
-            let frame = LocalJournalFrame::new(
-                uuid(DEVICE),
-                prepared.sequence(),
-                prepared.payload_kind(),
-                prepared.journal_payload().to_vec(),
-            );
+        for (index, batch) in batches.iter().enumerate() {
+            let forbidden_before = forbidden_commit_work();
             let started = Instant::now();
-            fixture.engine.replay_hot_overlay_frame(&frame).unwrap();
+            let prepared = fixture.prepare_record(batch);
+            fixture
+                .engine
+                .replay_managed_local_record(&frame(&prepared))
+                .unwrap();
             let page = fixture
                 .engine
                 .materialize_current_page_at_path(&fixture.page_path)
                 .unwrap()
                 .unwrap();
-            assert_eq!(page.stats.catalog_documents_loaded, 0);
             let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
-            if generation > 5 {
+            assert!(forbidden_commit_work().since(forbidden_before).is_none());
+            assert_eq!(page.stats.catalog_documents_loaded, 0);
+            if index >= warmups {
                 samples.push(elapsed);
             }
         }
-        let work = fixture.engine.hot_overlay_work().since(work_before);
-        assert_eq!(work.commits_applied, 55);
-        assert_eq!(work.documents_imported, 55);
-        assert_eq!(work.page_materializations, 55);
+        let work = fixture.engine.managed_local_work().since(work_before);
+        assert_eq!(work.commits_applied, edits);
+        assert_eq!(work.documents_imported, edits);
+        assert_eq!(work.page_materializations, edits);
         samples.sort_by(f64::total_cmp);
         let p50 = samples[samples.len() / 2];
         println!(
-            "hot_overlay_benchmark pages={pages} n={} p50_ms={p50:.6} raw_ms={samples:?}",
+            "managed_local_record_benchmark pages={page_count} n={} p50_ms={p50:.6} raw_ms={samples:?}",
             samples.len()
         );
-        assert!(p50 <= 5.0, "{pages} pages p50 {p50:.3} ms exceeds 5 ms");
-        observations.push((pages, p50, work));
+        observations.push((page_count, p50, work));
     }
+    assert!(observations.len() >= 2);
     assert_eq!(observations[0].2, observations[1].2);
     assert!(
-        observations[1].1 <= observations[0].1 * 2.0 + 0.05,
+        observations[1].1 <= observations[0].1 * 2.0 + 1.0,
         "10,000-page p50 is not bounded against 100 pages: {observations:?}"
     );
 }

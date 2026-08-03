@@ -13,7 +13,7 @@ use loro::{
     UpdateOptions, ValueOrContainer, VersionVector,
 };
 use serde::{Deserialize, Serialize};
-use tine_storage::{LocalJournalAppend, LocalJournalFrame};
+use tine_storage::{LocalJournalAppend, LocalJournalError, LocalJournalFrame, LocalJournalSegment};
 use uuid::Uuid;
 
 use super::authenticated_patricia::{
@@ -98,7 +98,7 @@ const MAX_PREAUTHORING_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DOCUMENT_ENTRIES: usize = 1_000_000;
 const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
-const HOT_OVERLAY_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
 const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 13;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
@@ -5630,14 +5630,14 @@ impl EngineAuthority {
 /// archive/SQLite/receipt/application work is counted at those real boundaries
 /// by [`crate::fast_commit::ForbiddenCommitWork`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct HotOverlayWork {
+pub struct ManagedLocalWork {
     pub page_materializations: usize,
     pub commits_applied: usize,
     pub documents_imported: usize,
     pub update_bytes_imported: usize,
 }
 
-impl HotOverlayWork {
+impl ManagedLocalWork {
     pub const fn since(self, earlier: Self) -> Self {
         Self {
             page_materializations: self.page_materializations - earlier.page_materializations,
@@ -5648,21 +5648,22 @@ impl HotOverlayWork {
     }
 }
 
-/// One local update prepared by the engine for an exact journal sequence.
+/// One complete managed-local record prepared for an exact journal sequence.
 ///
-/// `journal_payload` is the canonical overlay envelope. Its CRDT objects are
-/// byte-for-byte the engine-exported objects from the prepared transaction;
-/// the envelope only binds those existing bytes to their workspace, lineage,
-/// sequence, exact pre-frontier, and resulting frontier.
+/// `journal_payload` contains the canonical manifest plus every canonical
+/// object envelope from the finalized batch. The decoded view is therefore the
+/// same input the later archive expander publishes, while its CRDT updates and
+/// projection objects directly drive hot replay and graph recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreparedHotOverlayCommit {
+pub struct PreparedManagedLocalRecord {
     batch_id: BatchId,
     sequence: u64,
     journal_payload: Vec<u8>,
+    record: ManagedLocalRecord,
     post_page: MaterializedPage,
 }
 
-impl PreparedHotOverlayCommit {
+impl PreparedManagedLocalRecord {
     pub const fn batch_id(&self) -> BatchId {
         self.batch_id
     }
@@ -5675,17 +5676,21 @@ impl PreparedHotOverlayCommit {
         &self.journal_payload
     }
 
-    pub const fn payload_kind(&self) -> ObjectKind {
-        ObjectKind::CrdtUpdate
+    pub const fn payload_kind(&self) -> ManagedLocalJournalPayloadKind {
+        ManagedLocalJournalPayloadKind::RecordV1
     }
 
     pub const fn post_page(&self) -> &MaterializedPage {
         &self.post_page
     }
+
+    pub const fn record(&self) -> &ManagedLocalRecord {
+        &self.record
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HotOverlayApplyOutcome {
+pub enum ManagedLocalApplyOutcome {
     Applied {
         batch_id: BatchId,
         page: MaterializedPage,
@@ -5693,58 +5698,339 @@ pub enum HotOverlayApplyOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HotOverlayError {
+pub enum ManagedLocalRecordError {
     CorruptPayload(String),
     Unsupported(String),
     StaleBase,
     OutOfOrder { expected: u64, found: u64 },
     WrongDurabilityProof,
     AcceptedFrontierMismatch,
+    Journal(LocalJournalError),
     Engine(EngineError),
 }
 
-impl fmt::Display for HotOverlayError {
+impl fmt::Display for ManagedLocalRecordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CorruptPayload(error) => write!(f, "corrupt hot-overlay payload: {error}"),
-            Self::Unsupported(error) => write!(f, "unsupported hot-overlay transition: {error}"),
-            Self::StaleBase => f.write_str("hot-overlay update is not based on current hot state"),
+            Self::CorruptPayload(error) => write!(f, "corrupt managed-local record: {error}"),
+            Self::Unsupported(error) => write!(f, "unsupported managed-local record: {error}"),
+            Self::StaleBase => {
+                f.write_str("managed-local record is not based on current hot state")
+            }
             Self::OutOfOrder { expected, found } => write!(
                 f,
-                "hot-overlay journal sequence is out of order: expected {expected}, found {found}"
+                "managed-local journal sequence is out of order: expected {expected}, found {found}"
             ),
             Self::WrongDurabilityProof => {
-                f.write_str("journal append proof does not cover this hot-overlay payload")
+                f.write_str("journal append proof does not cover this managed-local record")
             }
             Self::AcceptedFrontierMismatch => {
-                f.write_str("accepted frontier does not exactly cover the hot-overlay prefix")
+                f.write_str("accepted frontier does not exactly cover the managed-local prefix")
             }
+            Self::Journal(error) => error.fmt(f),
             Self::Engine(error) => error.fmt(f),
         }
     }
 }
 
-impl std::error::Error for HotOverlayError {}
+impl std::error::Error for ManagedLocalRecordError {}
 
-impl From<EngineError> for HotOverlayError {
+impl From<EngineError> for ManagedLocalRecordError {
     fn from(error: EngineError) -> Self {
         Self::Engine(error)
     }
 }
 
+impl From<LocalJournalError> for ManagedLocalRecordError {
+    fn from(error: LocalJournalError) -> Self {
+        Self::Journal(error)
+    }
+}
+
+/// The only payload discriminator used by the managed-local journal.
+///
+/// This names the complete replay/archive/projection record. It deliberately
+/// does not reuse any archive object kind: a journal frame is not a raw CRDT
+/// update, semantic effect, projection intent, or manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedLocalJournalPayloadKind {
+    RecordV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HotOverlayJournalPayloadV1 {
+struct ManagedLocalJournalRecordV1 {
     schema_version: u32,
-    workspace_id: WorkspaceId,
-    lineage_digest: LineageDigest,
     sequence: u64,
-    page_id: PageId,
     manifest: Vec<u8>,
-    semantic_effect_object: Vec<u8>,
-    crdt_update_objects: Vec<Vec<u8>>,
-    pre_frontier: FrontierV2,
-    post_frontier: FrontierV2,
+    objects: Vec<Vec<u8>>,
+}
+
+/// Exact projection material selected from one finalized prepared batch.
+///
+/// The intent owns the deterministic path, target, endpoint, post-frontier,
+/// and precondition reference. `precondition_base` resolves that reference to
+/// the exact existing annotated base, so recovery needs no SQLite lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedLocalProjection {
+    intent: ManifestedProjectionIntent,
+    precondition_base: AnnotatedProjectionBase,
+}
+
+impl ManagedLocalProjection {
+    pub const fn intent(&self) -> &ManifestedProjectionIntent {
+        &self.intent
+    }
+
+    pub const fn precondition_base(&self) -> &AnnotatedProjectionBase {
+        &self.precondition_base
+    }
+}
+
+/// Canonically decoded managed-local record for replay and later expansion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedLocalRecord {
+    sequence: u64,
+    prepared_batch: PreparedBatch,
+    projection: ManagedLocalProjection,
+    semantic_effect: SemanticEffect,
+    crdt_updates: BTreeMap<DocumentId, CrdtUpdatePayload>,
+}
+
+impl ManagedLocalRecord {
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn prepared_batch(&self) -> &PreparedBatch {
+        &self.prepared_batch
+    }
+
+    pub const fn projection(&self) -> &ManagedLocalProjection {
+        &self.projection
+    }
+}
+
+/// O(1) state of the replayed/applied managed-local prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagedLocalPrefixState {
+    pub next_sequence: u64,
+    pub records_applied: usize,
+    pub commitment: ContentDigest,
+}
+
+/// Append one prepared record to its device-owned segment.
+///
+/// Binding and sequence are checked before the durable write begins. The
+/// returned storage receipt names the actual segment device and sequence,
+/// payload digest, and its single data-durability barrier.
+pub fn append_managed_local_record(
+    segment: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+    prepared: &PreparedManagedLocalRecord,
+) -> Result<LocalJournalAppend, ManagedLocalRecordError> {
+    let author_device = prepared
+        .record
+        .prepared_batch
+        .manifest()
+        .author_device_id()
+        .as_uuid();
+    if segment.device_id() != author_device || segment.next_sequence() != prepared.sequence {
+        return Err(ManagedLocalRecordError::WrongDurabilityProof);
+    }
+    segment
+        .append(prepared.payload_kind(), prepared.journal_payload())
+        .map_err(ManagedLocalRecordError::from)
+}
+
+/// Decode and authenticate the complete canonical record represented by one
+/// recovered frame. This reconstructs the exact `PreparedBatch` used by the
+/// archive pipeline and resolves its existing-page projection base and target.
+pub fn decode_managed_local_record(
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+) -> Result<ManagedLocalRecord, ManagedLocalRecordError> {
+    if frame.payload_kind() != ManagedLocalJournalPayloadKind::RecordV1 {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "unknown managed-local payload kind".into(),
+        ));
+    }
+    decode_managed_local_payload(frame.device_id(), frame.sequence(), frame.payload())
+}
+
+fn decode_managed_local_payload(
+    device_id: Uuid,
+    frame_sequence: u64,
+    bytes: &[u8],
+) -> Result<ManagedLocalRecord, ManagedLocalRecordError> {
+    let payload: ManagedLocalJournalRecordV1 = postcard::from_bytes(bytes)
+        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+    let canonical = postcard::to_allocvec(&payload)
+        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+    if canonical != bytes {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "managed-local payload is not canonical".into(),
+        ));
+    }
+    if payload.schema_version != MANAGED_LOCAL_RECORD_SCHEMA_VERSION {
+        return Err(ManagedLocalRecordError::CorruptPayload(format!(
+            "unknown managed-local record schema {}",
+            payload.schema_version
+        )));
+    }
+    if payload.sequence != frame_sequence {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "frame and record sequences differ".into(),
+        ));
+    }
+    let manifest = OperationBatch::decode(&payload.manifest)
+        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+    if manifest
+        .encode()
+        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?
+        != payload.manifest
+    {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "manifest bytes are not canonical".into(),
+        ));
+    }
+    if manifest.author_device_id().as_uuid() != device_id {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "manifest device differs from journal segment device".into(),
+        ));
+    }
+    if manifest.origin() != BatchOrigin::LocalMutation {
+        return Err(ManagedLocalRecordError::Unsupported(
+            "only trusted local-mutation batches have managed-local records".into(),
+        ));
+    }
+    let objects = payload
+        .objects
+        .iter()
+        .map(|encoded| {
+            let object = OperationObject::decode(encoded)
+                .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+            if object
+                .encode()
+                .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?
+                != *encoded
+            {
+                return Err(ManagedLocalRecordError::CorruptPayload(
+                    "object bytes are not canonical".into(),
+                ));
+            }
+            Ok(object)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared_batch = PreparedBatch::new(manifest, objects)
+        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+    let reconstructed_objects = prepared_batch
+        .objects()
+        .iter()
+        .map(|object| {
+            object
+                .encode()
+                .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if reconstructed_objects != payload.objects {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "record objects are not in canonical manifest order".into(),
+        ));
+    }
+
+    let projection_objects = super::projection_manifest::validate_projection_object_set(
+        prepared_batch.manifest(),
+        prepared_batch.objects(),
+    )
+    .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+    let [intent] = projection_objects.intents() else {
+        return Err(ManagedLocalRecordError::Unsupported(
+            "managed-local content edits require exactly one finalized projection intent".into(),
+        ));
+    };
+    if intent.render_base().is_some() {
+        return Err(ManagedLocalRecordError::Unsupported(
+            "moves and renames remain on the slow path".into(),
+        ));
+    }
+    let precondition_reference = match intent.precondition() {
+        ManifestProjectionPrecondition::Present { base } => base,
+        ManifestProjectionPrecondition::Absent => {
+            return Err(ManagedLocalRecordError::Unsupported(
+                "page creation remains on the slow path".into(),
+            ));
+        }
+    };
+    if matches!(intent.target(), ManifestProjectionTarget::Absent) {
+        return Err(ManagedLocalRecordError::Unsupported(
+            "page deletion remains on the slow path".into(),
+        ));
+    }
+    let precondition_base = projection_objects
+        .bases()
+        .get(&precondition_reference.document_id())
+        .cloned()
+        .ok_or_else(|| {
+            ManagedLocalRecordError::CorruptPayload(
+                "projection precondition base is missing from the prepared batch".into(),
+            )
+        })?;
+    if precondition_base.source_page_id() != intent.page_id()
+        || precondition_base.source_path() != intent.path()
+    {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "projection base page/path differs from its target intent".into(),
+        ));
+    }
+
+    let semantic_object = prepared_batch
+        .objects()
+        .iter()
+        .find(|object| object.kind() == ObjectKind::SemanticEffect)
+        .expect("PreparedBatch validates one semantic effect");
+    let semantic_effect = SemanticEffect::decode(semantic_object.payload())
+        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+    if !semantic_effect.pages().is_empty() {
+        return Err(ManagedLocalRecordError::Unsupported(
+            "title, path, kind, creation, deletion, and rename stay on the slow path".into(),
+        ));
+    }
+    let affected = affected_projection_pages(&semantic_effect);
+    if affected.len() != 1 || !affected.contains(&intent.page_id()) {
+        return Err(ManagedLocalRecordError::Unsupported(
+            "a managed-local record must affect exactly one existing page".into(),
+        ));
+    }
+    let mut crdt_updates = BTreeMap::new();
+    for object in prepared_batch
+        .objects()
+        .iter()
+        .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
+    {
+        let update = decode_crdt_update_payload(
+            prepared_batch.manifest().batch_id(),
+            object.document_id(),
+            object.payload(),
+        )?;
+        if crdt_updates.insert(object.document_id(), update).is_some() {
+            return Err(EngineError::DuplicateDocumentUpdate(object.document_id()).into());
+        }
+    }
+    if crdt_updates.is_empty() {
+        return Err(ManagedLocalRecordError::CorruptPayload(
+            "prepared batch has no CRDT updates".into(),
+        ));
+    }
+    Ok(ManagedLocalRecord {
+        sequence: payload.sequence,
+        prepared_batch,
+        projection: ManagedLocalProjection {
+            intent: intent.clone(),
+            precondition_base,
+        },
+        semantic_effect,
+        crdt_updates,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -5761,10 +6047,10 @@ struct CommittedLocalOverlay {
     document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
     block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
     commitment: ContentDigest,
-    work: Cell<HotOverlayWork>,
+    work: Cell<ManagedLocalWork>,
 }
 
-struct ValidatedHotOverlayCandidate {
+struct ValidatedManagedLocalCandidate {
     page: MaterializedPage,
     documents: BTreeMap<DocumentId, LoroDoc>,
     document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
@@ -5780,8 +6066,8 @@ impl Default for CommittedLocalOverlay {
             documents: BTreeMap::new(),
             document_heads: BTreeMap::new(),
             block_claims: AHashMap::new(),
-            commitment: ContentDigest::of(b"tine/hot-overlay/empty/v1\0"),
-            work: Cell::new(HotOverlayWork::default()),
+            commitment: ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0"),
+            work: Cell::new(ManagedLocalWork::default()),
         }
     }
 }
@@ -8454,16 +8740,16 @@ impl ShardedHotEngine {
         self.lineage_digest
     }
 
-    pub fn hot_overlay_work(&self) -> HotOverlayWork {
+    pub fn managed_local_work(&self) -> ManagedLocalWork {
         self.local_overlay.work.get()
     }
 
-    pub fn hot_overlay_len(&self) -> usize {
-        self.local_overlay.entries.len()
-    }
-
-    pub const fn hot_overlay_next_sequence(&self) -> u64 {
-        self.local_overlay.next_sequence
+    pub fn managed_local_prefix_state(&self) -> ManagedLocalPrefixState {
+        ManagedLocalPrefixState {
+            next_sequence: self.local_overlay.next_sequence,
+            records_applied: self.local_overlay.entries.len(),
+            commitment: self.local_overlay.commitment,
+        }
     }
 
     /// Materialize one exact current path from accepted state plus the
@@ -8488,12 +8774,12 @@ impl ShardedHotEngine {
 
     /// Remove the complete pending overlay only after authenticated accepted
     /// state proves the same prefix and exact resulting documents.
-    pub fn collapse_hot_overlay(
+    pub fn collapse_managed_local_prefix(
         &mut self,
         expected_accepted_frontier: &AcceptedFrontierRoot,
-    ) -> Result<usize, HotOverlayError> {
+    ) -> Result<usize, ManagedLocalRecordError> {
         if &self.accepted_frontier_root()? != expected_accepted_frontier {
-            return Err(HotOverlayError::AcceptedFrontierMismatch);
+            return Err(ManagedLocalRecordError::AcceptedFrontierMismatch);
         }
         if self.local_overlay.entries.is_empty() {
             return Ok(0);
@@ -8503,13 +8789,13 @@ impl ShardedHotEngine {
                 self.archive_status(entry.batch_id)?,
                 Some(ArchiveStatus::Accepted { .. })
             ) {
-                return Err(HotOverlayError::AcceptedFrontierMismatch);
+                return Err(ManagedLocalRecordError::AcceptedFrontierMismatch);
             }
         }
         for (document_id, overlay) in &self.local_overlay.documents {
             let accepted = self.clone_visible_document(*document_id, 1)?;
             if DecodedDocumentVersion::of(&accepted) != DecodedDocumentVersion::of(overlay) {
-                return Err(HotOverlayError::AcceptedFrontierMismatch);
+                return Err(ManagedLocalRecordError::AcceptedFrontierMismatch);
             }
         }
         let removed = self.local_overlay.entries.len();
@@ -8517,7 +8803,7 @@ impl ShardedHotEngine {
         self.local_overlay.documents.clear();
         self.local_overlay.document_heads.clear();
         self.local_overlay.block_claims.clear();
-        self.local_overlay.commitment = ContentDigest::of(b"tine/hot-overlay/empty/v1\0");
+        self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
         Ok(removed)
     }
 
@@ -12186,332 +12472,172 @@ impl ShardedHotEngine {
         self.draft_author_transaction_with_observation(author, origin, transaction, None)
     }
 
-    /// Prepare the canonical journal payload for one already-finalized local
-    /// batch without changing visible state.
-    pub fn prepare_hot_overlay_commit(
-        &self,
-        prepared: &PreparedBatch,
-        page_id: PageId,
-        sequence: u64,
-    ) -> Result<PreparedHotOverlayCommit, HotOverlayError> {
-        self.prepare_hot_overlay_from_prepared(prepared, page_id, sequence)
-    }
-
-    /// Consume one engine-authored draft into the same overlay payload.
+    /// Prepare one canonical managed-local record from the exact finalized
+    /// `PreparedBatch` that the archive expander will later publish.
     ///
-    /// This is the seam the future trusted-local coordinator uses before its
-    /// receipt/archive-independent graph publication. Rename/title drafts are
-    /// intentionally refused here and remain on the established slow path.
-    pub fn prepare_hot_overlay_draft(
-        &self,
-        draft: AuthorTransactionDraft,
-        sequence: u64,
-    ) -> Result<PreparedHotOverlayCommit, HotOverlayError> {
-        if draft.generation != self.history_generation
-            || draft.root_token != self.author_generation_root()?
-        {
-            return Err(HotOverlayError::StaleBase);
-        }
-        let affected = affected_projection_pages(&draft.semantic_effect);
-        if affected.len() != 1 {
-            return Err(HotOverlayError::Unsupported(
-                "a hot commit must affect exactly one existing page".into(),
-            ));
-        }
-        let page_id = *affected.iter().next().expect("one affected page");
-        let prepared = draft.prepared_core;
-        self.prepare_hot_overlay_from_prepared(&prepared, page_id, sequence)
-    }
-
-    fn prepare_hot_overlay_from_prepared(
+    /// No draft or partial batch is accepted. The batch must already contain
+    /// its manifested projection intent and exact annotated existing base.
+    pub fn prepare_managed_local_record(
         &self,
         prepared: &PreparedBatch,
-        page_id: PageId,
         sequence: u64,
-    ) -> Result<PreparedHotOverlayCommit, HotOverlayError> {
+    ) -> Result<PreparedManagedLocalRecord, ManagedLocalRecordError> {
         if sequence != self.local_overlay.next_sequence {
-            return Err(HotOverlayError::OutOfOrder {
+            return Err(ManagedLocalRecordError::OutOfOrder {
                 expected: self.local_overlay.next_sequence,
                 found: sequence,
             });
         }
-        let manifest = prepared.manifest();
-        let mut semantic = None;
-        let mut updates = Vec::new();
-        for object in prepared.objects() {
-            match object.kind() {
-                ObjectKind::SemanticEffect => {
-                    if semantic.replace(object).is_some() {
-                        return Err(HotOverlayError::CorruptPayload(
-                            "prepared batch has duplicate semantic effects".into(),
-                        ));
-                    }
-                }
-                ObjectKind::CrdtUpdate => updates.push(object),
-                _ => {}
-            }
-        }
-        let semantic = semantic.ok_or_else(|| {
-            HotOverlayError::CorruptPayload("prepared batch has no semantic effect".into())
-        })?;
-        if updates.is_empty() {
-            return Err(HotOverlayError::CorruptPayload(
-                "prepared batch has no CRDT updates".into(),
-            ));
-        }
-        let decoded_updates = updates
-            .iter()
-            .map(|object| {
-                decode_crdt_update_payload(
-                    manifest.batch_id(),
-                    object.document_id(),
-                    object.payload(),
-                )
-                .map(|update| (object.document_id(), update))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let effect = SemanticEffect::decode(semantic.payload()).map_err(EngineError::from)?;
-        let candidate = self.validate_hot_overlay_candidate(
-            manifest,
-            &effect,
-            &decoded_updates,
-            page_id,
-            manifest.dependency_frontier(),
-            None,
-        )?;
-        let payload = HotOverlayJournalPayloadV1 {
-            schema_version: HOT_OVERLAY_JOURNAL_SCHEMA_VERSION,
-            workspace_id: self.workspace_id,
-            lineage_digest: self.lineage_digest,
+        let payload = ManagedLocalJournalRecordV1 {
+            schema_version: MANAGED_LOCAL_RECORD_SCHEMA_VERSION,
             sequence,
-            page_id,
-            manifest: manifest
+            manifest: prepared
+                .manifest()
                 .encode()
-                .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?,
-            semantic_effect_object: semantic
-                .encode()
-                .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?,
-            crdt_update_objects: updates
+                .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?,
+            objects: prepared
+                .objects()
                 .iter()
                 .map(|object| {
                     object
                         .encode()
-                        .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))
+                        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            pre_frontier: manifest.dependency_frontier().clone(),
-            post_frontier: FrontierV2::new(
-                candidate
-                    .documents
-                    .iter()
-                    .map(|(document_id, document)| {
-                        DocumentDependencies::new(
-                            *document_id,
-                            canonical_peer_counters(&document.oplog_vv())?,
-                            candidate.document_heads[document_id]
-                                .iter()
-                                .copied()
-                                .collect(),
-                        )
-                        .map_err(EngineError::from)
-                    })
-                    .collect::<Result<Vec<_>, EngineError>>()?,
-            )
-            .map_err(EngineError::from)?,
         };
         let journal_payload = postcard::to_allocvec(&payload)
-            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
-        Ok(PreparedHotOverlayCommit {
-            batch_id: manifest.batch_id(),
+            .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+        let record = decode_managed_local_payload(
+            prepared.manifest().author_device_id().as_uuid(),
+            sequence,
+            &journal_payload,
+        )?;
+        let candidate = self.validate_managed_local_candidate(&record)?;
+        Ok(PreparedManagedLocalRecord {
+            batch_id: record.prepared_batch.manifest().batch_id(),
             sequence,
             journal_payload,
+            record,
             post_page: candidate.page,
         })
     }
 
     /// Advance visible state only after the append receipt proves this exact
-    /// payload crossed the journal's durability barrier.
-    pub fn apply_durable_hot_overlay(
+    /// record crossed the owning segment's one data-durability barrier.
+    pub fn apply_appended_managed_local_record(
         &mut self,
         append: &LocalJournalAppend,
-        prepared: &PreparedHotOverlayCommit,
-    ) -> Result<HotOverlayApplyOutcome, HotOverlayError> {
-        if append.sequence != prepared.sequence
+        prepared: &PreparedManagedLocalRecord,
+    ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
+        if append.device_id
+            != prepared
+                .record
+                .prepared_batch
+                .manifest()
+                .author_device_id()
+                .as_uuid()
+            || append.sequence != prepared.sequence
             || append.payload_digest != ContentDigest::of(prepared.journal_payload())
             || append.data_durability_syncs != 1
         {
-            return Err(HotOverlayError::WrongDurabilityProof);
+            return Err(ManagedLocalRecordError::WrongDurabilityProof);
         }
-        self.apply_hot_overlay_payload(
-            append.device_id,
-            Some(append.sequence),
-            prepared.journal_payload(),
-        )
+        self.apply_managed_local_record(prepared.record.clone(), prepared.journal_payload())
     }
 
-    /// Replay one recovered canonical journal frame into a fresh overlay.
-    pub fn replay_hot_overlay_frame(
+    /// Replay one complete recovered record through the same transition used
+    /// by live admission.
+    pub fn replay_managed_local_record(
         &mut self,
-        frame: &LocalJournalFrame<ObjectKind>,
-    ) -> Result<HotOverlayApplyOutcome, HotOverlayError> {
-        if frame.payload_kind() != ObjectKind::CrdtUpdate {
-            return Err(HotOverlayError::CorruptPayload(
-                "journal frame is not typed as a CRDT update".into(),
-            ));
-        }
-        self.apply_hot_overlay_payload(frame.device_id(), Some(frame.sequence()), frame.payload())
+        frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
+        let record = decode_managed_local_record(frame)?;
+        self.apply_managed_local_record(record, frame.payload())
     }
 
-    fn apply_hot_overlay_payload(
-        &mut self,
-        device_id: Uuid,
-        journal_sequence: Option<u64>,
-        bytes: &[u8],
-    ) -> Result<HotOverlayApplyOutcome, HotOverlayError> {
-        let payload: HotOverlayJournalPayloadV1 = postcard::from_bytes(bytes)
-            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
-        let canonical = postcard::to_allocvec(&payload)
-            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
-        if canonical != bytes {
-            return Err(HotOverlayError::CorruptPayload(
-                "journal payload is not canonical".into(),
-            ));
-        }
-        if payload.schema_version != HOT_OVERLAY_JOURNAL_SCHEMA_VERSION {
-            return Err(HotOverlayError::CorruptPayload(format!(
-                "unknown schema version {}",
-                payload.schema_version
-            )));
-        }
-        if journal_sequence.is_some_and(|sequence| sequence != payload.sequence) {
-            return Err(HotOverlayError::CorruptPayload(
-                "frame and payload journal sequences differ".into(),
-            ));
-        }
-        if payload.workspace_id != self.workspace_id {
+    fn validate_managed_local_candidate(
+        &self,
+        record: &ManagedLocalRecord,
+    ) -> Result<ValidatedManagedLocalCandidate, ManagedLocalRecordError> {
+        let manifest = record.prepared_batch.manifest();
+        if manifest.workspace_id() != self.workspace_id {
             return Err(EngineError::WorkspaceMismatch {
                 expected: self.workspace_id,
-                found: payload.workspace_id,
+                found: manifest.workspace_id(),
             }
             .into());
         }
-        if payload.lineage_digest != self.lineage_digest {
+        if manifest.lineage_digest() != self.lineage_digest {
             return Err(EngineError::LineageMismatch {
                 expected: self.lineage_digest,
-                found: payload.lineage_digest,
+                found: manifest.lineage_digest(),
             }
             .into());
         }
-        if payload.sequence != self.local_overlay.next_sequence {
-            return Err(HotOverlayError::OutOfOrder {
+        if record.sequence != self.local_overlay.next_sequence {
+            return Err(ManagedLocalRecordError::OutOfOrder {
                 expected: self.local_overlay.next_sequence,
-                found: payload.sequence,
+                found: record.sequence,
             });
         }
-        let manifest = OperationBatch::decode(&payload.manifest)
-            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
-        if manifest
-            .encode()
-            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?
-            != payload.manifest
-        {
-            return Err(HotOverlayError::CorruptPayload(
-                "manifest bytes are not canonical".into(),
-            ));
-        }
-        if manifest.workspace_id() != self.workspace_id
-            || manifest.lineage_digest() != self.lineage_digest
-            || manifest.author_device_id().as_uuid() != device_id
-        {
-            return Err(HotOverlayError::CorruptPayload(
-                "manifest binding differs from journal binding".into(),
-            ));
-        }
-        let semantic = OperationObject::decode(&payload.semantic_effect_object)
-            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
-        if semantic.kind() != ObjectKind::SemanticEffect
-            || semantic.workspace_id() != self.workspace_id
-            || semantic.descriptor().map_err(EngineError::from)?
-                != *manifest
-                    .required_objects()
-                    .iter()
-                    .find(|descriptor| descriptor.kind() == ObjectKind::SemanticEffect)
-                    .ok_or_else(|| {
-                        HotOverlayError::CorruptPayload(
-                            "manifest has no semantic-effect descriptor".into(),
-                        )
-                    })?
-        {
-            return Err(HotOverlayError::CorruptPayload(
-                "semantic effect object is not bound by the manifest".into(),
-            ));
-        }
-        let effect = SemanticEffect::decode(semantic.payload()).map_err(EngineError::from)?;
-        if SemanticEffectDigest::of(semantic.payload()) != manifest.semantic_effect_digest() {
-            return Err(HotOverlayError::CorruptPayload(
-                "semantic effect digest differs from manifest".into(),
-            ));
-        }
-        let mut updates = BTreeMap::new();
-        let mut update_descriptors = BTreeSet::new();
-        for encoded in &payload.crdt_update_objects {
-            let object = OperationObject::decode(encoded)
-                .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
-            let descriptor = object.descriptor().map_err(EngineError::from)?;
-            if object.kind() != ObjectKind::CrdtUpdate
-                || object.workspace_id() != self.workspace_id
-                || manifest
-                    .required_objects()
-                    .binary_search(&descriptor)
-                    .is_err()
-            {
-                return Err(HotOverlayError::CorruptPayload(
-                    "CRDT object is not bound by the manifest".into(),
-                ));
-            }
-            update_descriptors.insert(descriptor);
-            let update = decode_crdt_update_payload(
-                manifest.batch_id(),
-                object.document_id(),
-                object.payload(),
-            )?;
-            if updates.insert(object.document_id(), update).is_some() {
-                return Err(EngineError::DuplicateDocumentUpdate(object.document_id()).into());
-            }
-        }
-        let expected_update_descriptors = manifest
-            .required_objects()
-            .iter()
-            .filter(|descriptor| descriptor.kind() == ObjectKind::CrdtUpdate)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if updates.is_empty()
-            || update_descriptors != expected_update_descriptors
-            || payload.pre_frontier != *manifest.dependency_frontier()
-        {
-            return Err(HotOverlayError::CorruptPayload(
-                "journal frontier or update set differs from manifest".into(),
-            ));
-        }
-        let candidate = self.validate_hot_overlay_candidate(
-            &manifest,
-            &effect,
-            &updates,
-            payload.page_id,
-            &payload.pre_frontier,
-            Some(&payload.post_frontier),
+        let candidate = self.validate_managed_local_overlay_candidate(
+            manifest,
+            &record.semantic_effect,
+            &record.crdt_updates,
+            record.projection.intent.page_id(),
+            manifest.dependency_frontier(),
         )?;
+        if candidate.page.path != *record.projection.intent.path() {
+            return Err(ManagedLocalRecordError::CorruptPayload(
+                "projection path differs from the semantic post-page".into(),
+            ));
+        }
+        let state = ProjectionPageState {
+            page: candidate.page.clone(),
+            frontier: record.projection.intent.post_frontier().clone(),
+            claim_evidence: record.projection.intent.claim_evidence().to_vec(),
+        };
+        let planned = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            &state,
+            Some(record.projection.precondition_base.bytes()),
+            Some(record.projection.precondition_base.annotations()),
+        )
+        .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
+        let (target_bytes, target_annotations) = match record.projection.intent.target() {
+            ManifestProjectionTarget::Present {
+                bytes, annotations, ..
+            } => (bytes, annotations),
+            ManifestProjectionTarget::Absent => unreachable!("decoded record requires Present"),
+        };
+        if planned.target() != target_bytes
+            || planned.intent().annotations() != target_annotations.as_slice()
+        {
+            return Err(ManagedLocalRecordError::CorruptPayload(
+                "projection target differs from deterministic semantic rendering".into(),
+            ));
+        }
+        Ok(candidate)
+    }
+
+    fn apply_managed_local_record(
+        &mut self,
+        record: ManagedLocalRecord,
+        bytes: &[u8],
+    ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
+        let candidate = self.validate_managed_local_candidate(&record)?;
+        let manifest = record.prepared_batch.manifest();
         let next_sequence = self
             .local_overlay
             .next_sequence
             .checked_add(1)
-            .ok_or_else(|| HotOverlayError::CorruptPayload("sequence overflow".into()))?;
+            .ok_or_else(|| ManagedLocalRecordError::CorruptPayload("sequence overflow".into()))?;
         let payload_digest = ContentDigest::of(bytes);
         let mut commitment = Vec::with_capacity(96);
-        commitment.extend_from_slice(b"tine/hot-overlay/prefix/v1\0");
+        commitment.extend_from_slice(b"tine/managed-local-prefix/v1\0");
         commitment.extend_from_slice(self.local_overlay.commitment.as_bytes());
         commitment.extend_from_slice(payload_digest.as_bytes());
-        commitment.extend_from_slice(&payload.sequence.to_be_bytes());
+        commitment.extend_from_slice(&record.sequence.to_be_bytes());
         self.local_overlay.commitment = ContentDigest::of(&commitment);
         for (document_id, document) in candidate.documents {
             self.local_overlay.documents.insert(document_id, document);
@@ -12535,26 +12661,25 @@ impl ShardedHotEngine {
         work.commits_applied = work.commits_applied.saturating_add(1);
         work.documents_imported = work
             .documents_imported
-            .saturating_add(payload.crdt_update_objects.len());
+            .saturating_add(record.crdt_updates.len());
         work.update_bytes_imported = work
             .update_bytes_imported
             .saturating_add(candidate.update_bytes);
         self.local_overlay.work.set(work);
-        Ok(HotOverlayApplyOutcome::Applied {
+        Ok(ManagedLocalApplyOutcome::Applied {
             batch_id: manifest.batch_id(),
             page: candidate.page,
         })
     }
 
-    fn validate_hot_overlay_candidate(
+    fn validate_managed_local_overlay_candidate(
         &self,
         manifest: &OperationBatch,
         effect: &SemanticEffect,
         updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
         page_id: PageId,
         expected_pre_frontier: &FrontierV2,
-        expected_post_frontier: Option<&FrontierV2>,
-    ) -> Result<ValidatedHotOverlayCandidate, HotOverlayError> {
+    ) -> Result<ValidatedManagedLocalCandidate, ManagedLocalRecordError> {
         if manifest.workspace_id() != self.workspace_id {
             return Err(EngineError::WorkspaceMismatch {
                 expected: self.workspace_id,
@@ -12570,12 +12695,12 @@ impl ShardedHotEngine {
             .into());
         }
         if manifest.origin() != BatchOrigin::LocalMutation {
-            return Err(HotOverlayError::Unsupported(
-                "only trusted local-mutation batches enter the hot overlay".into(),
+            return Err(ManagedLocalRecordError::Unsupported(
+                "only trusted local-mutation batches enter the managed-local prefix".into(),
             ));
         }
         if !effect.pages().is_empty() {
-            return Err(HotOverlayError::Unsupported(
+            return Err(ManagedLocalRecordError::Unsupported(
                 "title, path, kind, creation, deletion, and rename stay on the slow path".into(),
             ));
         }
@@ -12589,14 +12714,14 @@ impl ShardedHotEngine {
                 (Some(_), None) | (None, None) => false,
             }
         }) {
-            return Err(HotOverlayError::Unsupported(
+            return Err(ManagedLocalRecordError::Unsupported(
                 "Logseq identity mutation requires accepted claim-index publication".into(),
             ));
         }
         let affected = affected_projection_pages(effect);
         if affected.len() != 1 || !affected.contains(&page_id) {
-            return Err(HotOverlayError::Unsupported(
-                "a hot commit must affect exactly one existing page".into(),
+            return Err(ManagedLocalRecordError::Unsupported(
+                "a managed-local record must affect exactly one existing page".into(),
             ));
         }
         let mut before_documents = BTreeMap::new();
@@ -12620,12 +12745,12 @@ impl ShardedHotEngine {
                 || update.causal_state_digest != Some(dependencies.causal_state_digest())
                 || update.batch_dependency_heads != expected_batch_heads
             {
-                return Err(HotOverlayError::StaleBase);
+                return Err(ManagedLocalRecordError::StaleBase);
             }
             validate_update_base(*document_id, &before, &update.raw_update).map_err(|error| {
                 match error {
-                    EngineError::CrdtUpdateBaseMismatch(_) => HotOverlayError::StaleBase,
-                    other => HotOverlayError::Engine(other),
+                    EngineError::CrdtUpdateBaseMismatch(_) => ManagedLocalRecordError::StaleBase,
+                    other => ManagedLocalRecordError::Engine(other),
                 }
             })?;
             let after = clone_doc(&before, 1)?;
@@ -12653,7 +12778,7 @@ impl ShardedHotEngine {
         if &actual_pre != expected_pre_frontier
             || manifest.dependency_frontier() != expected_pre_frontier
         {
-            return Err(HotOverlayError::StaleBase);
+            return Err(ManagedLocalRecordError::StaleBase);
         }
         let before_snapshots =
             snapshot_documents_with_validation(self.catalog_document_id, &before_documents, false)?;
@@ -12663,26 +12788,6 @@ impl ShardedHotEngine {
             &before_snapshots,
             &after_snapshots,
         )?;
-        let actual_post = FrontierV2::new(
-            after_documents
-                .iter()
-                .map(|(document_id, document)| {
-                    DocumentDependencies::new(
-                        *document_id,
-                        canonical_peer_counters(&document.oplog_vv())?,
-                        vec![manifest.batch_id()],
-                    )
-                    .map_err(EngineError::from)
-                })
-                .collect::<Result<Vec<_>, EngineError>>()?,
-        )
-        .map_err(EngineError::from)?;
-        if expected_post_frontier.is_some_and(|expected| expected != &actual_post) {
-            return Err(HotOverlayError::CorruptPayload(
-                "declared post-frontier differs from the imported CRDT state".into(),
-            ));
-        }
-
         let created = effect
             .blocks()
             .iter()
@@ -12721,7 +12826,7 @@ impl ShardedHotEngine {
             ));
         }
         let page = self.materialize_hot_page_with_overrides(page_id, &after_documents)?;
-        Ok(ValidatedHotOverlayCandidate {
+        Ok(ValidatedManagedLocalCandidate {
             page,
             documents: after_documents,
             document_heads: post_heads,
@@ -14221,7 +14326,7 @@ impl ShardedHotEngine {
         bytes.extend_from_slice(&self.history_generation.to_be_bytes());
         bytes.extend_from_slice(self.history_root.as_bytes());
         if !self.local_overlay.entries.is_empty() {
-            bytes.extend_from_slice(b"tine/hot-overlay/author-root/v1\0");
+            bytes.extend_from_slice(b"tine/managed-local/author-root/v1\0");
             bytes.extend_from_slice(self.local_overlay.commitment.as_bytes());
         }
         #[cfg(test)]
