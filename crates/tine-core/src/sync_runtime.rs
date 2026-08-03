@@ -33,7 +33,8 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tine_storage::{
-    publish_immutable_exact, read_optional_regular, LocalJournalFrame, LocalJournalSegment,
+    publish_immutable_exact, read_optional_regular, sync_dir_required, LocalJournalFrame,
+    LocalJournalSegment,
 };
 
 #[cfg(test)]
@@ -162,6 +163,65 @@ const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_secs(30);
 const MANAGED_LOCAL_JOURNAL_NAMESPACE: &str = "managed-local-journal-v1";
 const MANAGED_LOCAL_CHECKPOINT_BYTES: u64 = 4096;
+const MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION: u32 = 1;
+const MANAGED_LOCAL_GENERATION_ANCHOR_BYTES: u64 = 8192;
+#[cfg(not(test))]
+const MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD: u64 = 64;
+#[cfg(test)]
+const MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD: u64 = 4;
+const MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD: u64 = 8 * 1024 * 1024;
+const MANAGED_LOCAL_RETAINED_GENERATIONS: usize = 2;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedLocalCompactionFaultPoint {
+    AfterCheckpointPublication,
+    AfterSegmentCreation,
+    AfterAnchorPublication,
+    AfterInMemorySwitch,
+    AfterCleanupRemoval,
+}
+
+#[cfg(test)]
+static MANAGED_LOCAL_COMPACTION_FAULT: Mutex<Option<(Uuid, ManagedLocalCompactionFaultPoint)>> =
+    Mutex::new(None);
+
+#[cfg(test)]
+fn fail_managed_local_compaction_once_at(device_id: Uuid, point: ManagedLocalCompactionFaultPoint) {
+    *MANAGED_LOCAL_COMPACTION_FAULT.lock().unwrap() = Some((device_id, point));
+}
+
+#[cfg(test)]
+fn managed_local_compaction_fault(
+    device_id: Uuid,
+    point: ManagedLocalCompactionFaultPoint,
+) -> bool {
+    let mut fault = MANAGED_LOCAL_COMPACTION_FAULT.lock().unwrap();
+    if *fault == Some((device_id, point)) {
+        *fault = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn managed_local_compaction_fault(_device_id: Uuid, _point: ()) -> bool {
+    false
+}
+
+macro_rules! managed_local_compaction_cut {
+    ($device_id:expr, $point:ident) => {{
+        #[cfg(test)]
+        {
+            managed_local_compaction_fault($device_id, ManagedLocalCompactionFaultPoint::$point)
+        }
+        #[cfg(not(test))]
+        {
+            managed_local_compaction_fault($device_id, ())
+        }
+    }};
+}
 const MAX_WATCHER_OBSERVATIONS: usize = 256;
 const MAX_WATCHER_PATH_BYTES: usize = 64 * 1024;
 const MAX_CLEAN_DRAIN_TURNS: usize = 64;
@@ -5499,12 +5559,15 @@ enum PendingManagedLocalCommit {
 struct ManagedLocalRuntimeState {
     directory: Dir,
     journal: LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+    generation: Option<u64>,
     frames: VecDeque<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     latest_projection_frames: BTreeMap<String, LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     checkpoint: ManagedLocalDrainCheckpoint,
+    checkpoint_batch_id: Option<BatchId>,
     continuation: Option<ManagedLocalDrainContinuation>,
     pending_commit: Option<PendingManagedLocalCommit>,
     authorship_complete: BTreeSet<BatchId>,
+    cleanup_pending: bool,
     last_failure: Option<String>,
 }
 
@@ -5516,6 +5579,9 @@ impl ManagedLocalRuntimeState {
     fn stage(&self) -> Option<String> {
         if self.pending_commit.is_some() {
             return Some("committed_foreground_recovery".into());
+        }
+        if self.cleanup_pending && self.frames.is_empty() {
+            return Some("compaction_cleanup".into());
         }
         self.continuation
             .as_ref()
@@ -6013,6 +6079,115 @@ fn managed_local_checkpoint_filename(next_sequence: u64) -> String {
     format!("checkpoint-{next_sequence:020}.bin")
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedLocalGenerationAnchor {
+    schema_version: u32,
+    generation: u64,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    device_id: Uuid,
+    checkpoint: ManagedLocalDrainCheckpoint,
+    accepted_batch_id: BatchId,
+}
+
+impl ManagedLocalGenerationAnchor {
+    fn new(
+        generation: u64,
+        checkpoint: ManagedLocalDrainCheckpoint,
+        accepted_batch_id: BatchId,
+    ) -> Self {
+        Self {
+            schema_version: MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION,
+            generation,
+            workspace_id: checkpoint.workspace_id(),
+            lineage_digest: checkpoint.lineage_digest(),
+            device_id: checkpoint.device_id(),
+            checkpoint,
+            accepted_batch_id,
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        postcard::to_allocvec(self).map_err(|error| error.to_string())
+    }
+
+    fn decode(
+        bytes: &[u8],
+        generation: u64,
+        binding: &EnrollmentBindingV1,
+    ) -> Result<Self, String> {
+        let anchor: Self =
+            postcard::from_bytes(bytes).map_err(|error| format!("invalid encoding: {error}"))?;
+        let checkpoint_bytes = anchor.checkpoint.encode()?;
+        let checkpoint = ManagedLocalDrainCheckpoint::decode(
+            &checkpoint_bytes,
+            binding.device_id().as_uuid(),
+            binding.workspace_id(),
+            binding.lineage_digest(),
+        )?;
+        if anchor.schema_version != MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION
+            || anchor.generation != generation
+            || anchor.workspace_id != binding.workspace_id()
+            || anchor.lineage_digest != binding.lineage_digest()
+            || anchor.device_id != binding.device_id().as_uuid()
+            || checkpoint.next_sequence() != generation
+            || postcard::to_allocvec(&anchor).map_err(|error| error.to_string())? != bytes
+        {
+            return Err("managed-local generation anchor binding is invalid".into());
+        }
+        Ok(anchor)
+    }
+}
+
+fn managed_local_generation_anchor_filename(device_id: Uuid, generation: u64) -> String {
+    format!(
+        "device-{}-generation-{generation:020}.anchor",
+        device_id.simple()
+    )
+}
+
+fn managed_local_generation_segment_filename(device_id: Uuid, generation: u64) -> String {
+    format!(
+        "device-{}-generation-{generation:020}.segment",
+        device_id.simple()
+    )
+}
+
+fn managed_local_generation_from_name(name: &str, device_id: Uuid, suffix: &str) -> Option<u64> {
+    let prefix = format!("device-{}-generation-", device_id.simple());
+    let digits = name.strip_prefix(&prefix)?.strip_suffix(suffix)?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let generation = digits.parse().ok()?;
+    (format!("{generation:020}") == digits).then_some(generation)
+}
+
+fn managed_local_directory_names(directory: &Dir) -> Result<Vec<String>, String> {
+    let entries = directory
+        .entries()
+        .map_err(|error| format!("cannot enumerate managed-local generations: {error}"))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot enumerate managed-local generation entry: {error}"))?;
+        if let Ok(name) = entry.file_name().into_string() {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn managed_local_checkpoint_sequence(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("checkpoint-")?.strip_suffix(".bin")?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let sequence = digits.parse().ok()?;
+    (format!("{sequence:020}") == digits).then_some(sequence)
+}
+
 fn open_managed_local_runtime(
     application_runtime_root: &Path,
     binding: &EnrollmentBindingV1,
@@ -6031,75 +6206,172 @@ fn open_managed_local_runtime(
     );
     ensure_directory_nofollow(&namespace, &workspace_name).map_err(display)?;
     let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(display)?;
-    let segment_name = format!("device-{}.segment", binding.device_id().as_uuid().simple());
-    let (journal, _recovery) =
-        LocalJournalSegment::open(&directory, &segment_name, binding.device_id().as_uuid())
+    let device_id = binding.device_id().as_uuid();
+    let names = managed_local_directory_names(&directory)?;
+    let mut generations = names
+        .iter()
+        .filter_map(|name| managed_local_generation_from_name(name, device_id, ".anchor"))
+        .collect::<Vec<_>>();
+    generations.sort_unstable();
+    generations.dedup();
+    let (generation, generation_anchor, journal) = if let Some(generation) = generations.last() {
+        let anchor_name = managed_local_generation_anchor_filename(device_id, *generation);
+        let anchor_bytes = read_optional_regular(
+            &directory,
+            &anchor_name,
+            MANAGED_LOCAL_GENERATION_ANCHOR_BYTES,
+            None,
+        )
+        .map_err(|error| {
+            format!("cannot read authoritative managed-local generation {anchor_name}: {error}")
+        })?
+        .ok_or_else(|| {
+            format!("authoritative managed-local generation {anchor_name} disappeared")
+        })?;
+        let anchor = ManagedLocalGenerationAnchor::decode(&anchor_bytes, *generation, binding)
+            .map_err(|error| {
+                format!("authoritative managed-local generation {anchor_name} is corrupt: {error}")
+            })?;
+        let segment_name = managed_local_generation_segment_filename(device_id, *generation);
+        let (journal, _) = LocalJournalSegment::open_from_sequence(
+            &directory,
+            &segment_name,
+            device_id,
+            *generation,
+        )
+        .map_err(|error| {
+            format!(
+                "cannot open authoritative managed-local generation segment {segment_name}: {error}"
+            )
+        })?;
+        (Some(*generation), Some(anchor), journal)
+    } else {
+        let segment_name = format!("device-{}.segment", device_id.simple());
+        let (journal, _) = LocalJournalSegment::open(&directory, &segment_name, device_id)
             .map_err(|error| format!("cannot open enrolled managed-local journal: {error}"))?;
+        (None, None, journal)
+    };
     let mut recovered_frames = Vec::new();
     journal
         .replay(|frame| recovered_frames.push(frame))
         .map_err(|error| format!("cannot scan enrolled managed-local journal: {error}"))?;
-    if recovered_frames.len() as u64 != journal.next_sequence() {
+    if journal
+        .base_sequence()
+        .checked_add(recovered_frames.len() as u64)
+        != Some(journal.next_sequence())
+    {
         return Err("managed-local journal sequence/count binding is inconsistent".into());
     }
 
-    let mut checkpoint = ManagedLocalDrainCheckpoint::initial(
-        binding.device_id().as_uuid(),
-        binding.workspace_id(),
-        binding.lineage_digest(),
+    let mut checkpoint = generation_anchor.as_ref().map_or_else(
+        || {
+            ManagedLocalDrainCheckpoint::initial(
+                device_id,
+                binding.workspace_id(),
+                binding.lineage_digest(),
+            )
+        },
+        |anchor| anchor.checkpoint.clone(),
     );
-    let mut missing_checkpoint = false;
-    let checkpoint_probe_end = journal
-        .next_sequence()
-        .checked_add(1)
-        .ok_or_else(|| "managed-local checkpoint sequence overflow".to_owned())?;
-    for next_sequence in 1..=checkpoint_probe_end {
-        let filename = managed_local_checkpoint_filename(next_sequence);
-        let bytes =
-            read_optional_regular(&directory, &filename, MANAGED_LOCAL_CHECKPOINT_BYTES, None)
-                .map_err(|error| {
-                    format!("cannot read managed-local checkpoint {filename}: {error}")
-                })?;
-        let Some(bytes) = bytes else {
-            missing_checkpoint = true;
-            continue;
-        };
-        if missing_checkpoint || next_sequence > journal.next_sequence() {
-            return Err(format!(
-                "managed-local checkpoint {filename} is divergent from the journal prefix"
-            ));
+    let mut checkpoint_batch_id = generation_anchor
+        .as_ref()
+        .map(|anchor| anchor.accepted_batch_id);
+    if generation.is_none() {
+        let mut missing_checkpoint = false;
+        let checkpoint_probe_end = journal
+            .next_sequence()
+            .checked_add(1)
+            .ok_or_else(|| "managed-local checkpoint sequence overflow".to_owned())?;
+        for next_sequence in 1..=checkpoint_probe_end {
+            let filename = managed_local_checkpoint_filename(next_sequence);
+            let bytes =
+                read_optional_regular(&directory, &filename, MANAGED_LOCAL_CHECKPOINT_BYTES, None)
+                    .map_err(|error| {
+                        format!("cannot read managed-local checkpoint {filename}: {error}")
+                    })?;
+            let Some(bytes) = bytes else {
+                missing_checkpoint = true;
+                continue;
+            };
+            if missing_checkpoint || next_sequence > journal.next_sequence() {
+                return Err(format!(
+                    "managed-local checkpoint {filename} is divergent from the journal prefix"
+                ));
+            }
+            let decoded = ManagedLocalDrainCheckpoint::decode(
+                &bytes,
+                device_id,
+                binding.workspace_id(),
+                binding.lineage_digest(),
+            )
+            .map_err(|error| format!("managed-local checkpoint {filename} is invalid: {error}"))?;
+            if decoded.next_sequence() != next_sequence {
+                return Err(format!(
+                    "managed-local checkpoint {filename} names sequence {}",
+                    decoded.next_sequence()
+                ));
+            }
+            checkpoint = decoded;
         }
-        let decoded = ManagedLocalDrainCheckpoint::decode(
-            &bytes,
-            binding.device_id().as_uuid(),
-            binding.workspace_id(),
-            binding.lineage_digest(),
-        )
-        .map_err(|error| format!("managed-local checkpoint {filename} is invalid: {error}"))?;
-        if decoded.next_sequence() != next_sequence {
-            return Err(format!(
-                "managed-local checkpoint {filename} names sequence {}",
-                decoded.next_sequence()
-            ));
+    } else {
+        let mut checkpoint_sequences = names
+            .iter()
+            .filter_map(|name| managed_local_checkpoint_sequence(name))
+            .filter(|sequence| *sequence > checkpoint.next_sequence())
+            .collect::<Vec<_>>();
+        checkpoint_sequences.sort_unstable();
+        checkpoint_sequences.dedup();
+        for next_sequence in checkpoint_sequences {
+            let filename = managed_local_checkpoint_filename(next_sequence);
+            if next_sequence > journal.next_sequence() {
+                return Err(format!(
+                    "managed-local checkpoint {filename} is ahead of the authoritative generation"
+                ));
+            }
+            let bytes =
+                read_optional_regular(&directory, &filename, MANAGED_LOCAL_CHECKPOINT_BYTES, None)
+                    .map_err(|error| {
+                        format!("cannot read managed-local checkpoint {filename}: {error}")
+                    })?
+                    .ok_or_else(|| format!("managed-local checkpoint {filename} disappeared"))?;
+            checkpoint = ManagedLocalDrainCheckpoint::decode(
+                &bytes,
+                device_id,
+                binding.workspace_id(),
+                binding.lineage_digest(),
+            )
+            .map_err(|error| format!("managed-local checkpoint {filename} is invalid: {error}"))?;
+            if checkpoint.next_sequence() != next_sequence {
+                return Err(format!(
+                    "managed-local checkpoint {filename} names sequence {}",
+                    checkpoint.next_sequence()
+                ));
+            }
         }
-        checkpoint = decoded;
     }
 
-    let checkpointed = usize::try_from(checkpoint.next_sequence())
+    let checkpointed = checkpoint
+        .next_sequence()
+        .checked_sub(journal.base_sequence())
+        .ok_or_else(|| "managed-local checkpoint is behind the physical generation".to_owned())?;
+    let checkpointed = usize::try_from(checkpointed)
         .map_err(|_| "managed-local checkpoint exceeds addressable memory".to_owned())?;
     if checkpointed > recovered_frames.len() {
         return Err("managed-local checkpoint is ahead of the authenticated journal".into());
     }
-    if recovered_frames.is_empty() {
+    if recovered_frames.is_empty() && checkpoint.next_sequence() == 0 {
         return Ok(ManagedLocalRuntimeState {
             directory,
             journal,
+            generation,
             frames: VecDeque::new(),
             latest_projection_frames: BTreeMap::new(),
             checkpoint,
+            checkpoint_batch_id,
             continuation: None,
             pending_commit: None,
             authorship_complete: BTreeSet::new(),
+            cleanup_pending: generation.is_some(),
             last_failure: None,
         });
     }
@@ -6126,27 +6398,43 @@ fn open_managed_local_runtime(
                 frame.sequence()
             ));
         }
-        engine
-            .restore_managed_local_record(frame)
-            .map_err(|error| {
-                format!(
-                    "cannot restore checkpointed managed-local record {}:{}: {error}",
-                    frame.device_id(),
-                    frame.sequence()
-                )
-            })?;
+        checkpoint_batch_id = Some(batch_id);
     }
     if checkpointed != 0 {
-        let accepted = engine.accepted_frontier_root().map_err(display)?;
         engine
-            .collapse_managed_local_prefix(&accepted)
-            .map_err(|error| {
-                format!("cannot collapse checkpointed managed-local prefix: {error}")
-            })?;
+            .seed_compacted_managed_local_prefix(
+                checkpoint.next_sequence(),
+                checkpoint_batch_id.ok_or_else(|| {
+                    "managed-local checkpoint has no accepted batch evidence".to_owned()
+                })?,
+            )
+            .map_err(|error| format!("cannot seed checkpointed managed-local prefix: {error}"))?;
+    } else if generation.is_some() {
+        engine
+            .seed_compacted_managed_local_prefix(
+                checkpoint.next_sequence(),
+                checkpoint_batch_id.ok_or_else(|| {
+                    "compacted managed-local anchor has no accepted batch evidence".to_owned()
+                })?,
+            )
+            .map_err(|error| format!("cannot seed compacted managed-local prefix: {error}"))?;
     }
 
     let mut frames = VecDeque::new();
     let mut latest_projection_frames = BTreeMap::new();
+    for frame in recovered_frames.iter().skip(checkpointed) {
+        let record = decode_managed_local_record(frame).map_err(|error| {
+            format!(
+                "managed-local journal record {}:{} is invalid: {error}",
+                frame.device_id(),
+                frame.sequence()
+            )
+        })?;
+        latest_projection_frames.insert(
+            record.projection().intent().path().as_str().to_owned(),
+            frame.clone(),
+        );
+    }
     for frame in recovered_frames.into_iter().skip(checkpointed) {
         let record = decode_managed_local_record(&frame).map_err(|error| {
             format!(
@@ -6164,20 +6452,25 @@ fn open_managed_local_runtime(
                 )
             },
         )?;
-        match TrustedLocalCommitCoordinator::recover_projection_after_restart(
-            graph,
-            frame.clone(),
-            input,
-        ) {
-            TrustedLocalRestartProjectionOutcome::Durable(_) => {}
-            TrustedLocalRestartProjectionOutcome::CommittedPending(pending) => {
-                return Err(format!(
-                    "managed-local journal record {}:{} cannot finish exact graph target {}: {}",
-                    frame.device_id(),
-                    frame.sequence(),
-                    pending.relative_path(),
-                    pending.last_error()
-                ));
+        let is_latest_projection = latest_projection_frames
+            .get(record.projection().intent().path().as_str())
+            .is_some_and(|latest| latest.sequence() == frame.sequence());
+        if is_latest_projection {
+            match TrustedLocalCommitCoordinator::recover_projection_after_restart(
+                graph,
+                frame.clone(),
+                input,
+            ) {
+                TrustedLocalRestartProjectionOutcome::Durable(_) => {}
+                TrustedLocalRestartProjectionOutcome::CommittedPending(pending) => {
+                    return Err(format!(
+                        "managed-local journal record {}:{} cannot finish exact graph target {}: {}",
+                        frame.device_id(),
+                        frame.sequence(),
+                        pending.relative_path(),
+                        pending.last_error()
+                    ));
+                }
             }
         }
         engine
@@ -6189,22 +6482,21 @@ fn open_managed_local_runtime(
                     frame.sequence()
                 )
             })?;
-        latest_projection_frames.insert(
-            record.projection().intent().path().as_str().to_owned(),
-            frame.clone(),
-        );
         frames.push_back(frame);
     }
 
     Ok(ManagedLocalRuntimeState {
         directory,
         journal,
+        generation,
         frames,
         latest_projection_frames,
         checkpoint,
+        checkpoint_batch_id,
         continuation: None,
         pending_commit: None,
         authorship_complete: BTreeSet::new(),
+        cleanup_pending: generation.is_some(),
         last_failure: None,
     })
 }
@@ -8451,6 +8743,23 @@ impl RuntimeActor {
                 Err(error) => SyncRuntimeTick::RecoveryBlocked(error),
             });
         }
+        if self
+            .managed_local
+            .as_ref()
+            .is_some_and(|managed| managed.frames.is_empty())
+        {
+            let compacted = match self.compact_drained_managed_local_journal() {
+                Ok(compacted) => compacted,
+                Err(error) => return Some(SyncRuntimeTick::RecoveryBlocked(error)),
+            };
+            let cleaned = match self.cleanup_managed_local_generations() {
+                Ok(cleaned) => cleaned,
+                Err(error) => return Some(SyncRuntimeTick::RecoveryBlocked(error)),
+            };
+            if compacted || cleaned {
+                return Some(SyncRuntimeTick::Recovering);
+            }
+        }
         let (frame, checkpoint, continuation, authorship_complete) = {
             let managed = self.managed_local.as_ref()?;
             let frame = managed.frames.front()?.clone();
@@ -8598,6 +8907,11 @@ impl RuntimeActor {
                         "cannot persist managed-local checkpoint {filename}: {error}"
                     )));
                 }
+                if managed_local_compaction_cut!(frame.device_id(), AfterCheckpointPublication) {
+                    return Some(SyncRuntimeTick::RecoveryBlocked(
+                        "injected crash after managed-local checkpoint publication".into(),
+                    ));
+                }
                 if managed.frames.front().map(LocalJournalFrame::sequence)
                     != Some(completion.sequence)
                 {
@@ -8607,6 +8921,7 @@ impl RuntimeActor {
                     return Some(SyncRuntimeTick::Terminal(detail));
                 }
                 managed.checkpoint = completion.checkpoint;
+                managed.checkpoint_batch_id = Some(completion.batch_id);
                 managed.frames.pop_front();
                 if managed
                     .latest_projection_frames
@@ -8619,11 +8934,18 @@ impl RuntimeActor {
                 }
                 managed.continuation = None;
                 managed.authorship_complete.remove(&completion.batch_id);
+                managed.cleanup_pending = true;
                 managed.last_failure = None;
                 if managed.frames.is_empty() {
                     if let Err(error) = self.collapse_drained_managed_local_overlay() {
                         return Some(SyncRuntimeTick::RecoveryBlocked(error));
                     }
+                    if let Err(error) = self.compact_drained_managed_local_journal() {
+                        return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                    }
+                }
+                if let Err(error) = self.cleanup_managed_local_generations() {
+                    return Some(SyncRuntimeTick::RecoveryBlocked(error));
                 }
                 Some(SyncRuntimeTick::Recovering)
             }
@@ -8695,6 +9017,223 @@ impl RuntimeActor {
             .collapse_managed_local_prefix(&accepted)
             .map(|_| ())
             .map_err(|error| format!("managed-local collapse failed: {error}"))
+    }
+
+    fn compact_drained_managed_local_journal(&mut self) -> Result<bool, String> {
+        let (base_sequence, next_sequence, committed_bytes, checkpoint, accepted_batch_id) = {
+            let managed = self
+                .managed_local
+                .as_ref()
+                .ok_or_else(|| "managed-local compaction has no runtime state".to_owned())?;
+            if !managed.frames.is_empty() || managed.pending_commit.is_some() {
+                return Ok(false);
+            }
+            (
+                managed.journal.base_sequence(),
+                managed.journal.next_sequence(),
+                managed.journal.committed_bytes(),
+                managed.checkpoint.clone(),
+                managed.checkpoint_batch_id,
+            )
+        };
+        let retained_frames = next_sequence
+            .checked_sub(base_sequence)
+            .ok_or_else(|| "managed-local compaction sequence moved behind its base".to_owned())?;
+        if retained_frames < MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+            && committed_bytes < MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD
+        {
+            return Ok(false);
+        }
+        if checkpoint.next_sequence() != next_sequence {
+            return Err("managed-local compaction checkpoint is behind the journal".into());
+        }
+        let accepted_batch_id = accepted_batch_id.ok_or_else(|| {
+            "managed-local compaction checkpoint has no accepted batch evidence".to_owned()
+        })?;
+
+        {
+            let authority = self
+                .authority
+                .as_mut()
+                .ok_or_else(|| "managed-local compaction has no active authority".to_owned())?;
+            let runtime = self
+                .runtime
+                .as_mut()
+                .ok_or_else(|| "managed-local compaction has no active runtime".to_owned())?;
+            let mut session = runtime
+                .admit_promoted_mutation(authority, &self.graph)
+                .map_err(|error| format!("managed-local compaction was refused: {error}"))?;
+            let engine = session.engine().map_err(|error| {
+                format!("managed-local compaction lost engine authority: {error}")
+            })?;
+            let prefix = engine.managed_local_prefix_state();
+            if prefix.next_sequence != next_sequence || prefix.records_applied != 0 {
+                return Err(
+                    "managed-local compaction requires an exactly collapsed hot overlay".into(),
+                );
+            }
+            if !engine
+                .accepted_batch_is_active(accepted_batch_id)
+                .map_err(display)?
+            {
+                return Err(
+                    "managed-local compaction accepted-history evidence is not active".into(),
+                );
+            }
+        }
+
+        let device_id = checkpoint.device_id();
+        let generation = next_sequence;
+        let segment_name = managed_local_generation_segment_filename(device_id, generation);
+        let anchor_name = managed_local_generation_anchor_filename(device_id, generation);
+        let anchor =
+            ManagedLocalGenerationAnchor::new(generation, checkpoint.clone(), accepted_batch_id);
+        let encoded_anchor = anchor
+            .encode()
+            .map_err(|error| format!("cannot encode managed-local generation anchor: {error}"))?;
+        let new_journal = {
+            let managed = self
+                .managed_local
+                .as_ref()
+                .expect("managed-local runtime remains installed");
+            let (journal, recovery) = LocalJournalSegment::open_from_sequence(
+                &managed.directory,
+                &segment_name,
+                device_id,
+                generation,
+            )
+            .map_err(|error| {
+                format!("cannot create managed-local generation segment {segment_name}: {error}")
+            })?;
+            if recovery.frames_recovered != 0
+                || recovery.discarded_tail_bytes != 0
+                || journal.next_sequence() != generation
+            {
+                return Err(format!(
+                    "incomplete managed-local generation segment {segment_name} is not empty"
+                ));
+            }
+            if managed_local_compaction_cut!(device_id, AfterSegmentCreation) {
+                return Err(
+                    "injected crash after managed-local generation segment creation".into(),
+                );
+            }
+            publish_immutable_exact(&managed.directory, &anchor_name, &encoded_anchor).map_err(
+                |error| {
+                    format!("cannot publish managed-local generation anchor {anchor_name}: {error}")
+                },
+            )?;
+            journal
+        };
+
+        if managed_local_compaction_cut!(device_id, AfterAnchorPublication) {
+            self.latch_terminal(
+                "injected crash after managed-local generation anchor publication".into(),
+            );
+            return Err("injected managed-local crash cut requires reopen".into());
+        }
+
+        let managed = self
+            .managed_local
+            .as_mut()
+            .expect("managed-local runtime remains installed");
+        let old_journal = std::mem::replace(&mut managed.journal, new_journal);
+        drop(old_journal);
+        managed.generation = Some(generation);
+        managed.cleanup_pending = true;
+        if managed_local_compaction_cut!(device_id, AfterInMemorySwitch) {
+            return Err("injected crash after managed-local in-memory generation switch".into());
+        }
+        Ok(true)
+    }
+
+    fn cleanup_managed_local_generations(&mut self) -> Result<bool, String> {
+        let managed = self
+            .managed_local
+            .as_mut()
+            .ok_or_else(|| "managed-local cleanup has no runtime state".to_owned())?;
+        if !managed.cleanup_pending {
+            return Ok(false);
+        }
+        let names = managed_local_directory_names(&managed.directory)?;
+        let device_id = managed.journal.device_id();
+        let mut generations = names
+            .iter()
+            .filter_map(|name| managed_local_generation_from_name(name, device_id, ".anchor"))
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        generations.dedup();
+        let retained = generations
+            .iter()
+            .rev()
+            .take(MANAGED_LOCAL_RETAINED_GENERATIONS)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let obsolete = generations
+            .iter()
+            .copied()
+            .filter(|generation| !retained.contains(generation))
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for generation in &obsolete {
+            let anchor_name = managed_local_generation_anchor_filename(device_id, *generation);
+            managed
+                .directory
+                .remove_file(&anchor_name)
+                .map_err(|error| {
+                    format!("cannot retire managed-local generation anchor {anchor_name}: {error}")
+                })?;
+            if managed_local_compaction_cut!(device_id, AfterCleanupRemoval) {
+                return Err("injected crash during managed-local generation cleanup".into());
+            }
+            sync_dir_required(&managed.directory).map_err(|error| {
+                format!("cannot make managed-local anchor retirement durable: {error}")
+            })?;
+            changed = true;
+        }
+
+        let retained_segments = retained
+            .iter()
+            .map(|generation| managed_local_generation_segment_filename(device_id, *generation))
+            .collect::<BTreeSet<_>>();
+        let legacy_segment = format!("device-{}.segment", device_id.simple());
+        for name in &names {
+            let is_own_generation_segment =
+                managed_local_generation_from_name(name, device_id, ".segment").is_some();
+            let remove = (managed.generation.is_some() && name == &legacy_segment)
+                || (is_own_generation_segment && !retained_segments.contains(name));
+            if remove {
+                managed.directory.remove_file(name).map_err(|error| {
+                    format!("cannot retire managed-local segment {name}: {error}")
+                })?;
+                if managed_local_compaction_cut!(device_id, AfterCleanupRemoval) {
+                    return Err("injected crash during managed-local segment cleanup".into());
+                }
+                changed = true;
+            }
+        }
+        if managed.generation.is_some() {
+            let retained_checkpoint =
+                managed_local_checkpoint_filename(managed.checkpoint.next_sequence());
+            for name in &names {
+                if managed_local_checkpoint_sequence(name).is_some() && name != &retained_checkpoint
+                {
+                    managed.directory.remove_file(name).map_err(|error| {
+                        format!("cannot retire managed-local checkpoint {name}: {error}")
+                    })?;
+                    if managed_local_compaction_cut!(device_id, AfterCleanupRemoval) {
+                        return Err("injected crash during managed-local checkpoint cleanup".into());
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            sync_dir_required(&managed.directory)
+                .map_err(|error| format!("cannot make managed-local cleanup durable: {error}"))?;
+        }
+        managed.cleanup_pending = false;
+        Ok(changed)
     }
 
     fn tick(&mut self) -> SyncRuntimeTick {
@@ -14937,6 +15476,39 @@ mod tests {
     fn managed_local_journal_frames(
         request: &SyncRuntimeOpenRequest,
     ) -> Vec<LocalJournalFrame<ManagedLocalJournalPayloadKind>> {
+        let workspace_directory = managed_local_workspace_directory(request);
+        let names = fs::read_dir(&workspace_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        let segment_names = names
+            .iter()
+            .filter(|name| name.starts_with("device-") && name.ends_with(".segment"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let device = managed_local_test_device_id(&segment_names);
+        let generation = names
+            .iter()
+            .filter_map(|name| managed_local_generation_from_name(name, device, ".anchor"))
+            .max();
+        let segment_name = generation.map_or_else(
+            || format!("device-{}.segment", device.simple()),
+            |generation| managed_local_generation_segment_filename(device, generation),
+        );
+        let directory = Dir::open_ambient_dir(&workspace_directory, ambient_authority()).unwrap();
+        let (journal, _) = LocalJournalSegment::open_from_sequence(
+            &directory,
+            &segment_name,
+            device,
+            generation.unwrap_or(0),
+        )
+        .unwrap();
+        let mut frames = Vec::new();
+        journal.replay(|frame| frames.push(frame)).unwrap();
+        frames
+    }
+
+    fn managed_local_workspace_directory(request: &SyncRuntimeOpenRequest) -> PathBuf {
         let namespace = request
             .application_runtime_root
             .join(MANAGED_LOCAL_JOURNAL_NAMESPACE);
@@ -14946,24 +15518,40 @@ mod tests {
             .filter(|path| path.is_dir())
             .collect::<Vec<_>>();
         assert_eq!(workspace_directories.len(), 1);
-        let workspace_directory = &workspace_directories[0];
-        let segment_names = fs::read_dir(workspace_directory)
+        workspace_directories.into_iter().next().unwrap()
+    }
+
+    fn managed_local_test_device_id(segment_names: &[String]) -> Uuid {
+        segment_names
+            .iter()
+            .find_map(|segment_name| {
+                segment_name
+                    .strip_prefix("device-")
+                    .and_then(|name| name.strip_suffix(".segment"))
+                    .and_then(|name| name.split("-generation-").next())
+                    .and_then(|device| Uuid::parse_str(device).ok())
+            })
+            .expect("managed-local segment has a canonical device UUID")
+    }
+
+    fn managed_local_file_names(request: &SyncRuntimeOpenRequest) -> Vec<String> {
+        let mut names = fs::read_dir(managed_local_workspace_directory(request))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .filter(|name| name.starts_with("device-") && name.ends_with(".segment"))
             .collect::<Vec<_>>();
-        assert_eq!(segment_names.len(), 1);
-        let segment_name = &segment_names[0];
-        let device = segment_name
-            .strip_prefix("device-")
-            .and_then(|name| name.strip_suffix(".segment"))
-            .and_then(|device| Uuid::parse_str(device).ok())
-            .expect("managed-local segment has a canonical device UUID");
-        let directory = Dir::open_ambient_dir(workspace_directory, ambient_authority()).unwrap();
-        let (journal, _) = LocalJournalSegment::open(&directory, segment_name, device).unwrap();
-        let mut frames = Vec::new();
-        journal.replay(|frame| frames.push(frame)).unwrap();
-        frames
+        names.sort();
+        names
+    }
+
+    fn drain_managed_local(handle: &SyncRuntimeHandle) {
+        for _ in 0..4096 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                handle.tick().unwrap();
+                return;
+            }
+            handle.tick().unwrap();
+        }
+        panic!("managed-local drain did not settle");
     }
 
     fn save_application_block_text(
@@ -15759,6 +16347,342 @@ mod tests {
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_local_generations_bound_history_and_reopen_pending_suffix_at_next_sequence() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-generations-bounded");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Generations café 日.md";
+        admit_external_page(&handle, &fixture, path, b"- generation zero\n");
+        let (mut page, mut revision) = load_application_exact(&handle, path);
+
+        let edits = MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize * 4;
+        for index in 1..=edits {
+            (page, revision) = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("generation edit {index} — café 日"),
+            );
+            if index % MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize == 0 {
+                drain_managed_local(&handle);
+            }
+        }
+        let compacted = load_application_exact(&handle, path);
+        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+        assert_eq!(
+            handle.status().unwrap().managed_local_next_sequence,
+            edits as u64
+        );
+
+        let names = managed_local_file_names(&request);
+        let anchors = names
+            .iter()
+            .filter(|name| name.ends_with(".anchor"))
+            .count();
+        let segments = names
+            .iter()
+            .filter(|name| name.ends_with(".segment"))
+            .count();
+        let checkpoints = names
+            .iter()
+            .filter(|name| managed_local_checkpoint_sequence(name).is_some())
+            .count();
+        assert!(anchors <= MANAGED_LOCAL_RETAINED_GENERATIONS);
+        assert!(segments <= MANAGED_LOCAL_RETAINED_GENERATIONS);
+        assert_eq!(checkpoints, 1);
+        assert!(names.len() <= MANAGED_LOCAL_RETAINED_GENERATIONS * 2 + 1);
+        let current_segment = names
+            .iter()
+            .filter(|name| name.ends_with(".segment"))
+            .max()
+            .unwrap();
+        assert_eq!(
+            fs::metadata(managed_local_workspace_directory(&request).join(current_segment))
+                .unwrap()
+                .len(),
+            0
+        );
+        let retained_bytes = fs::read_dir(managed_local_workspace_directory(&request))
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>();
+        let retained_bound = 2
+            * (MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD
+                + tine_storage::MAX_LOCAL_JOURNAL_FRAME_BYTES as u64)
+            + 64 * 1024;
+        assert!(retained_bytes < retained_bound);
+
+        for suffix in 1..=5 {
+            (page, revision) = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("pending suffix {suffix} — org/Markdown exact"),
+            );
+        }
+        let suffix_expected = load_application_exact(&handle, path);
+        let suffix_graph_bytes = fs::read(fixture.graph_root().join(path)).unwrap();
+        drop(handle);
+        let suffix_frames = managed_local_journal_frames(&request);
+        assert_eq!(suffix_frames.len(), 5);
+        assert_eq!(suffix_frames[0].sequence(), edits as u64);
+        assert_eq!(suffix_frames[4].sequence(), edits as u64 + 4);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+        let reopened_status = reopened.status().unwrap();
+        assert_eq!(reopened_status.managed_local_pending, 5);
+        assert_eq!(
+            reopened_status.managed_local_next_sequence,
+            edits as u64 + 5
+        );
+        drain_managed_local(&reopened);
+        drive_initial_feed(&reopened);
+        let restored = load_application_exact(&reopened, path);
+        assert_parser_dto_semantics(&suffix_expected.0, &restored.0);
+        assert_eq!(suffix_expected.1, restored.1);
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path)).unwrap(),
+            suffix_graph_bytes
+        );
+        assert_ne!(compacted.1, suffix_expected.1);
+
+        let (_next, _next_revision) = save_application_block_text(
+            &reopened,
+            restored.0,
+            restored.1,
+            "first append after compacted reopen",
+        );
+        assert_eq!(
+            reopened.status().unwrap().managed_local_next_sequence,
+            edits as u64 + 6
+        );
+        drain_managed_local(&reopened);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_local_compacted_and_uncompacted_references_match_semantically_and_exactly() {
+        let compacted_fixture = RuntimeHostFixture::safe("managed-local-compacted-reference");
+        let reference_fixture = RuntimeHostFixture::safe("managed-local-uncompacted-reference");
+        let compacted_request = compacted_fixture.request();
+        let compacted = active_handle(SyncRuntimeHandle::open(compacted_request.clone()));
+        let reference = active_handle(SyncRuntimeHandle::open(reference_fixture.request()));
+        drive_initial_feed(&compacted);
+        drive_initial_feed(&reference);
+        let path = "diary/日記/Compaction reference.org";
+        let initial = b"#+title: Compaction reference\n\n* before compaction\n";
+        admit_external_page(&compacted, &compacted_fixture, path, initial);
+        admit_external_page(&reference, &reference_fixture, path, initial);
+        let (mut compacted_page, mut compacted_revision) = load_application_exact(&compacted, path);
+        let (mut reference_page, mut reference_revision) = load_application_exact(&reference, path);
+        for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
+            let content = format!("reference edit {index} — café 日");
+            (compacted_page, compacted_revision) = save_application_block_text(
+                &compacted,
+                compacted_page,
+                compacted_revision,
+                &content,
+            );
+            (reference_page, reference_revision) = save_application_block_text(
+                &reference,
+                reference_page,
+                reference_revision,
+                &content,
+            );
+        }
+        drain_managed_local(&compacted);
+        assert_eq!(compacted.status().unwrap().managed_local_pending, 0);
+        assert_eq!(
+            reference.status().unwrap().managed_local_pending,
+            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize
+        );
+        let compacted_result = load_application_exact(&compacted, path);
+        let reference_result = load_application_exact(&reference, path);
+        assert_parser_dto_semantics(&reference_result.0, &compacted_result.0);
+        assert_eq!(
+            fs::read(compacted_fixture.graph_root().join(path)).unwrap(),
+            fs::read(reference_fixture.graph_root().join(path)).unwrap()
+        );
+        assert!(matches!(
+            compacted.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        assert!(managed_local_journal_frames(&compacted_request).is_empty());
+        drain_managed_local(&reference);
+        assert!(matches!(
+            reference.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_local_generation_crash_cuts_reopen_without_loss_or_sequence_reset() {
+        use ManagedLocalCompactionFaultPoint as Cut;
+
+        for (ordinal, cut) in [
+            Cut::AfterCheckpointPublication,
+            Cut::AfterSegmentCreation,
+            Cut::AfterAnchorPublication,
+            Cut::AfterInMemorySwitch,
+            Cut::AfterCleanupRemoval,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let label = format!("sync-runtime-managed-local-compaction-cut-{ordinal}");
+            let fixture = RuntimeHostFixture::safe(&label);
+            let request = fixture.request();
+            let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+            drive_initial_feed(&handle);
+            let paths = (0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD)
+                .map(|index| format!("content/nested pages/Crash Cut {index}.org"))
+                .collect::<Vec<_>>();
+            for path in &paths {
+                admit_external_page(&handle, &fixture, path, b"* before crash cut\n");
+            }
+            for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
+                let path = &paths[index as usize];
+                let (page, revision) = load_application_exact(&handle, &path);
+                save_application_block_text(
+                    &handle,
+                    page,
+                    revision,
+                    &format!("crash cut {ordinal} edit {index}"),
+                );
+            }
+            let last_path = paths.last().unwrap();
+            let expected = load_application_exact(&handle, &last_path);
+            let segment_names = managed_local_file_names(&request)
+                .into_iter()
+                .filter(|name| name.ends_with(".segment"))
+                .collect::<Vec<_>>();
+            let device_id = managed_local_test_device_id(&segment_names);
+            fail_managed_local_compaction_once_at(device_id, cut);
+            let mut observed_cut = false;
+            for _ in 0..4096 {
+                let tick = handle.tick().unwrap();
+                if matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(ref detail)
+                        if detail.contains("injected")
+                ) {
+                    observed_cut = true;
+                    break;
+                }
+            }
+            assert!(observed_cut, "crash cut {cut:?} was not reached");
+            drop(handle);
+
+            let opened = SyncRuntimeHandle::open(request.clone());
+            assert_eq!(
+                opened.status,
+                SyncRuntimeOpenStatus::Active,
+                "crash cut {cut:?} did not reopen"
+            );
+            let reopened = opened.handle.expect("active crash-cut reopen has a handle");
+            drive_initial_feed(&reopened);
+            drain_managed_local(&reopened);
+            let restored = load_application_exact(&reopened, &last_path);
+            assert_parser_dto_semantics(&expected.0, &restored.0);
+            assert_eq!(expected.1, restored.1);
+            assert_eq!(
+                reopened.status().unwrap().managed_local_next_sequence,
+                MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+            );
+            let (_next, _) = save_application_block_text(
+                &reopened,
+                restored.0,
+                restored.1,
+                "append after crash cut",
+            );
+            assert_eq!(
+                reopened.status().unwrap().managed_local_next_sequence,
+                MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD + 1
+            );
+            drain_managed_local(&reopened);
+            assert!(matches!(
+                reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_local_incomplete_generation_is_ignored_but_corrupt_authority_fails_closed() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-generation-authority");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Generation Authority.md";
+        admit_external_page(&handle, &fixture, path, b"- authority zero\n");
+        let (mut page, mut revision) = load_application_exact(&handle, path);
+        for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
+            (page, revision) = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("authority edit {index}"),
+            );
+        }
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let names = managed_local_file_names(&request);
+        let segment_names = names
+            .iter()
+            .filter(|name| name.ends_with(".segment"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let device_id = managed_local_test_device_id(&segment_names);
+        let incomplete_generation = MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD + 10_000;
+        let directory_path = managed_local_workspace_directory(&request);
+        let directory = Dir::open_ambient_dir(&directory_path, ambient_authority()).unwrap();
+        let incomplete_name =
+            managed_local_generation_segment_filename(device_id, incomplete_generation);
+        let (incomplete, _) =
+            LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open_from_sequence(
+                &directory,
+                &incomplete_name,
+                device_id,
+                incomplete_generation,
+            )
+            .unwrap();
+        drop(incomplete);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+        assert_eq!(
+            reopened.status().unwrap().managed_local_next_sequence,
+            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+        );
+        drop(reopened);
+
+        let anchor_name = names
+            .iter()
+            .filter(|name| name.ends_with(".anchor"))
+            .max()
+            .unwrap();
+        fs::write(
+            directory_path.join(anchor_name),
+            b"corrupt authoritative anchor",
+        )
+        .unwrap();
+        let refused = SyncRuntimeHandle::open(request);
+        assert!(matches!(
+            refused.status,
+            SyncRuntimeOpenStatus::OpenRefused { ref detail }
+                if detail.contains("authoritative managed-local generation")
+                    && detail.contains("corrupt")
         ));
     }
 

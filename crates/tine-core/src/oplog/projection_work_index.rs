@@ -1314,6 +1314,29 @@ impl ProjectionWorkIndex {
         })
     }
 
+    /// Authenticate immutable projection preparation while replaying accepted
+    /// history. `superseded` is intentionally not re-derived: it records the
+    /// pending-path cut at original acceptance time, which a later index state
+    /// cannot reproduce. The stable manifest and work rows must still match
+    /// exactly.
+    pub(crate) fn require_replayed_prepared_batch(
+        &self,
+        batch_id: BatchId,
+        manifest_fingerprint: ContentDigest,
+        work: &[ProjectionWork],
+    ) -> Result<(), ProjectionWorkError> {
+        let mut work = work.to_vec();
+        work.sort_unstable_by_key(ProjectionWork::work_id);
+        if !strictly_sorted_by(&work, ProjectionWork::work_id) {
+            return Err(ProjectionWorkError::NonCanonical);
+        }
+        let prepared = self.load_prepared(batch_id)?;
+        if prepared.manifest_fingerprint != manifest_fingerprint || prepared.work != work {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        Ok(())
+    }
+
     pub(crate) fn accept_batch_at_history(
         &self,
         batch_id: BatchId,

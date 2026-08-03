@@ -164,6 +164,18 @@ impl ManagedLocalDrainCheckpoint {
         self.next_sequence
     }
 
+    pub(crate) const fn device_id(&self) -> Uuid {
+        self.device_id
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.lineage_digest
+    }
+
     pub(crate) const fn commitment(&self) -> ContentDigest {
         self.commitment
     }

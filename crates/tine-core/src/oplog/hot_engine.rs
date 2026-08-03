@@ -8814,6 +8814,32 @@ impl ShardedHotEngine {
         Ok(removed)
     }
 
+    /// Restore the logical cursor represented by a compacted physical journal.
+    ///
+    /// The discarded frames are never reconstructed. The caller must instead
+    /// supply the authenticated accepted-batch evidence embedded in the
+    /// generation anchor. Only a genuinely empty overlay may be seeded, and
+    /// the current accepted engine must still prove that evidence active.
+    pub(crate) fn seed_compacted_managed_local_prefix(
+        &mut self,
+        next_sequence: u64,
+        accepted_batch_id: BatchId,
+    ) -> Result<(), ManagedLocalRecordError> {
+        let prefix = self.managed_local_prefix_state();
+        if prefix.next_sequence != 0 || prefix.records_applied != 0 {
+            return Err(ManagedLocalRecordError::OutOfOrder {
+                expected: 0,
+                found: prefix.next_sequence,
+            });
+        }
+        if !self.accepted_batch_is_active(accepted_batch_id)? {
+            return Err(ManagedLocalRecordError::AcceptedFrontierMismatch);
+        }
+        self.local_overlay.next_sequence = next_sequence;
+        self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
+        Ok(())
+    }
+
     pub fn configure_reference_catalog_policy(
         &mut self,
         policy: ReferenceCatalogPolicyV1,
@@ -15656,20 +15682,28 @@ impl ShardedHotEngine {
                 intent.post_frontier().clone(),
                 target,
             );
-            for older in index
-                .pending_for_path(intent.path())
-                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
-            {
-                if older.work_id() == row.work_id() {
-                    continue;
-                }
-                if self
-                    .projection_frontier_dominates(intent.post_frontier(), older.post_frontier())?
+            if !self.authenticated_history_replay {
+                for older in index
+                    .pending_for_path(intent.path())
+                    .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
                 {
-                    superseded.push(older.work_id());
+                    if older.work_id() == row.work_id() {
+                        continue;
+                    }
+                    if self.projection_frontier_dominates(
+                        intent.post_frontier(),
+                        older.post_frontier(),
+                    )? {
+                        superseded.push(older.work_id());
+                    }
                 }
             }
             work.push(row);
+        }
+        if self.authenticated_history_replay {
+            return index
+                .require_replayed_prepared_batch(batch_id, batch_fingerprint(batch), &work)
+                .map_err(|error| EngineError::ProjectionWork(error.to_string()));
         }
         superseded.sort_unstable();
         superseded.dedup();
