@@ -876,6 +876,16 @@ pub struct ManagedSyncPull {
 /// can enter between the quiescence proof and the exclusive reservation.
 struct ManagedTextWriteGate {
     state: std::sync::Mutex<ManagedTextWriteState>,
+    /// Resource-wide serialization for graph-text identity validation, the
+    /// corresponding filesystem transition, and retained-index publication.
+    ///
+    /// This is deliberately reentrant by thread: higher-level transactions
+    /// (rename/merge/projection recovery) call the same low-level publication
+    /// primitives while retaining one authority window. The handoff gate above
+    /// still decides who may write; this lock decides the total order in which
+    /// admitted writers change graph-text identity.
+    identity_mutation: std::sync::Mutex<GraphTextIdentityMutationState>,
+    identity_mutation_changed: std::sync::Condvar,
     #[cfg(test)]
     admission_race_barrier: std::sync::Mutex<Option<Arc<std::sync::Barrier>>>,
 }
@@ -888,14 +898,70 @@ struct ManagedTextWriteState {
     handoff_releases: usize,
 }
 
+#[derive(Default)]
+struct GraphTextIdentityMutationState {
+    owner: Option<std::thread::ThreadId>,
+    depth: usize,
+    /// Resource-wide version of every graph-text identity transition observed
+    /// under this authority. Per-Graph indexes may be reused only at this exact
+    /// epoch; their scope and configuration remain instance-local.
+    epoch: u64,
+}
+
+struct GraphTextIdentityMutationGuard<'a> {
+    gate: &'a ManagedTextWriteGate,
+}
+
 #[allow(dead_code)] // P4 authority is consumed by the later P7 publisher.
 impl ManagedTextWriteGate {
     fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(ManagedTextWriteState::default()),
+            identity_mutation: std::sync::Mutex::new(GraphTextIdentityMutationState::default()),
+            identity_mutation_changed: std::sync::Condvar::new(),
             #[cfg(test)]
             admission_race_barrier: std::sync::Mutex::new(None),
         }
+    }
+
+    fn lock_identity_mutation(&self) -> GraphTextIdentityMutationGuard<'_> {
+        let caller = std::thread::current().id();
+        let mut state = self.identity_mutation.lock().unwrap();
+        while state.owner.as_ref().is_some_and(|owner| owner != &caller) {
+            state = self.identity_mutation_changed.wait(state).unwrap();
+        }
+        if state.owner.is_none() {
+            state.owner = Some(caller);
+        }
+        state.depth = state
+            .depth
+            .checked_add(1)
+            .expect("graph-text identity mutation depth exhausted");
+        GraphTextIdentityMutationGuard { gate: self }
+    }
+
+    fn identity_mutation_epoch(&self) -> u64 {
+        self.identity_mutation.lock().unwrap().epoch
+    }
+
+    fn identity_mutation_epoch_under_authority(&self) -> u64 {
+        let caller = std::thread::current().id();
+        let state = self.identity_mutation.lock().unwrap();
+        debug_assert_eq!(state.owner.as_ref(), Some(&caller));
+        debug_assert_ne!(state.depth, 0);
+        state.epoch
+    }
+
+    fn advance_identity_mutation_epoch(&self) -> u64 {
+        let caller = std::thread::current().id();
+        let mut state = self.identity_mutation.lock().unwrap();
+        debug_assert_eq!(state.owner.as_ref(), Some(&caller));
+        debug_assert_ne!(state.depth, 0);
+        state.epoch = state
+            .epoch
+            .checked_add(1)
+            .expect("graph-text identity mutation epoch exhausted");
+        state.epoch
     }
 
     fn admit_writer(self: &Arc<Self>) -> io::Result<ManagedTextWritePermit> {
@@ -966,6 +1032,20 @@ impl ManagedTextWriteGate {
         let barrier = self.admission_race_barrier.lock().unwrap().clone();
         if let Some(barrier) = barrier {
             barrier.wait();
+        }
+    }
+}
+
+impl Drop for GraphTextIdentityMutationGuard<'_> {
+    fn drop(&mut self) {
+        let caller = std::thread::current().id();
+        let mut state = self.gate.identity_mutation.lock().unwrap();
+        debug_assert_eq!(state.owner.as_ref(), Some(&caller));
+        debug_assert_ne!(state.depth, 0);
+        state.depth = state.depth.saturating_sub(1);
+        if state.depth == 0 {
+            state.owner = None;
+            self.gate.identity_mutation_changed.notify_all();
         }
     }
 }
@@ -1675,6 +1755,12 @@ pub struct Graph {
     /// Unforgeable identity of this exact Graph instance. Reopening the same
     /// resource intentionally produces a different token.
     graph_text_admission_instance: Arc<GraphTextAdmissionInstance>,
+    /// Complete graph-text identity evidence retained specifically for ordinary
+    /// guarded writes. Unlike `graph_text_admission`, this generation does not
+    /// claim sparse-runtime feed authority: the legacy watcher owns its external
+    /// observation boundary and records exact paths or uncertainty here before
+    /// its deferred cache reconciliation.
+    guarded_graph_text_identity: RwLock<GuardedGraphTextIdentityState>,
     /// Journal date formats (filename + title) resolved from `config.edn`, used to
     /// recognize journal files in the user's format and render new ones. Built once
     /// at open (config changes need a reopen, as in OG).
@@ -1814,6 +1900,22 @@ struct GraphTextAdmissionInstance;
 
 struct GraphTextAdmissionControl {
     state: RwLock<GraphTextAdmissionState>,
+}
+
+#[derive(Default)]
+struct GuardedGraphTextIdentityState {
+    index: Option<Arc<CompleteGraphTextAdmissionIndex>>,
+    invalidated: bool,
+    invalidation_cause: Option<String>,
+    /// Epoch of the shared resource state represented by `index`. Before the
+    /// first lazy build, this records the epoch observed at Graph open so the
+    /// warm cache is reusable only if no sibling transition intervened.
+    observed_resource_epoch: Option<u64>,
+    generation: u64,
+    #[cfg(test)]
+    complete_builds: usize,
+    #[cfg(test)]
+    exact_updates: usize,
 }
 
 impl std::ops::Deref for GraphTextAdmissionControl {
@@ -2311,7 +2413,7 @@ pub(crate) enum GraphTextExactFeedFailure {
 /// Core classification for one exact graph-relative platform event path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub(crate) enum GraphTextExactFeedPathClass {
+pub enum GraphTextExactFeedPathClass {
     /// The path is wholly within a fixed or configured excluded subtree.
     Excluded,
     /// The exact path may affect retained file/resource evidence.
@@ -3398,6 +3500,7 @@ thread_local! {
     static GRAPH_TEXT_EVENT_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_EXACT_FEED_PREPARE_PATH: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -4537,6 +4640,10 @@ impl Graph {
         let projection_root = open_projection_root_nofollow(&root).ok();
         let managed_write_binding =
             managed_text_write_binding_for_resource(&root, projection_root.as_ref());
+        let guarded_resource_epoch = managed_write_binding
+            .as_ref()
+            .ok()
+            .map(|binding| binding.gate.identity_mutation_epoch());
         let config_path = reconciliation_scan_config_path_at_open(&root);
         let config_bytes = fs::read(config_path).ok();
         let config_text = config_bytes
@@ -4564,6 +4671,10 @@ impl Graph {
                 state: RwLock::new(GraphTextAdmissionState::Unbuilt),
             }),
             graph_text_admission_instance,
+            guarded_graph_text_identity: RwLock::new(GuardedGraphTextIdentityState {
+                observed_resource_epoch: guarded_resource_epoch,
+                ..GuardedGraphTextIdentityState::default()
+            }),
             journal_format,
             cache: RwLock::new(None),
             page_index_failures: RwLock::new(Vec::new()),
@@ -4700,6 +4811,10 @@ impl Graph {
                 format!("managed text resource identity is unavailable: {error}"),
             )
         })
+    }
+
+    fn lock_graph_text_identity_mutation(&self) -> io::Result<GraphTextIdentityMutationGuard<'_>> {
+        Ok(self.managed_write_binding()?.gate.lock_identity_mutation())
     }
 
     fn managed_permit_root<'a>(&self, permit: &'a ManagedTextWritePermit) -> io::Result<&'a Dir> {
@@ -4860,6 +4975,309 @@ impl Graph {
         )?;
         crate::fast_commit::note_graph_text_inventory(entries.len());
         Ok((entries, identities))
+    }
+
+    /// Return the complete retained identity generation used by ordinary
+    /// guarded writes, rebuilding it once after explicit watcher uncertainty.
+    /// The caller retains the resource-wide identity-mutation authority across
+    /// this call and the filesystem transition it authorizes.
+    fn guarded_graph_text_identity_index(
+        &self,
+    ) -> io::Result<Arc<CompleteGraphTextAdmissionIndex>> {
+        let binding = self.managed_write_binding()?;
+        let resource_epoch = binding.gate.identity_mutation_epoch_under_authority();
+        {
+            let state = self.guarded_graph_text_identity.read().unwrap();
+            if !state.invalidated && state.observed_resource_epoch == Some(resource_epoch) {
+                if let Some(index) = state.index.as_ref() {
+                    return Ok(Arc::clone(index));
+                }
+            }
+        }
+
+        let (prior, decode_semantics) = {
+            let state = self.guarded_graph_text_identity.read().unwrap();
+            (
+                state.index.clone(),
+                state.invalidated || state.observed_resource_epoch != Some(resource_epoch),
+            )
+        };
+        let (capture, combined_capture_bytes) = self
+            .capture_retained_graph_text_identity_with_limits(INITIAL_SHADOW_LIMITS)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("guarded graph-text identity capture failed: {error}"),
+                )
+            })?;
+        let replacement_peak = prior.as_ref().map_or(combined_capture_bytes, |index| {
+            combined_capture_bytes.saturating_add(index.permanent_bytes)
+        });
+        let mut replacement = build_graph_text_admission_index(
+            self,
+            &capture,
+            None,
+            INITIAL_SHADOW_LIMITS,
+            replacement_peak,
+            decode_semantics,
+        )
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("guarded graph-text identity construction failed: {error}"),
+            )
+        })?;
+
+        if binding.gate.identity_mutation_epoch_under_authority() != resource_epoch {
+            return Err(graph_text_admission_unavailable(
+                "resource epoch changed during guarded graph-text identity rebuild",
+            ));
+        }
+        let mut state = self.guarded_graph_text_identity.write().unwrap();
+        let next_generation = state.generation.checked_add(1).ok_or_else(|| {
+            graph_text_admission_unavailable("guarded graph-text identity generation overflow")
+        })?;
+        replacement.generation = next_generation;
+        let replacement = Arc::new(replacement);
+        state.generation = next_generation;
+        state.index = Some(Arc::clone(&replacement));
+        state.observed_resource_epoch = Some(resource_epoch);
+        state.invalidated = false;
+        state.invalidation_cause = None;
+        #[cfg(test)]
+        {
+            state.complete_builds = state.complete_builds.saturating_add(1);
+        }
+        Ok(replacement)
+    }
+
+    fn invalidate_guarded_graph_text_identity(&self, cause: impl Into<String>) {
+        // This helper is used both inside larger reentrant write transactions
+        // and by broad public invalidation. Taking the authority here makes the
+        // shared epoch transition unconditional in both cases.
+        let identity = self.lock_graph_text_identity_mutation().ok();
+        if let Some(identity) = identity.as_ref() {
+            identity.gate.advance_identity_mutation_epoch();
+        }
+        let mut state = self.guarded_graph_text_identity.write().unwrap();
+        state.invalidated = true;
+        state.invalidation_cause = Some(bounded_graph_text_admission_cause(cause.into()));
+    }
+
+    fn apply_guarded_graph_text_identity_path(
+        &self,
+        current: &CompleteGraphTextAdmissionIndex,
+        relative: String,
+        decode_semantics: bool,
+    ) -> io::Result<CompleteGraphTextAdmissionIndex> {
+        let event_scratch = graph_text_event_scratch_upper_bound(&relative)?;
+        ensure_graph_text_peak_limit(current.permanent_bytes, event_scratch, current.peak_limit)?;
+        let mut charges = GraphTextExactFeedBatchActualCharges::default();
+        let final_state = self.prepare_graph_text_admission_final_state(
+            current,
+            relative.clone(),
+            event_scratch,
+            &mut charges,
+            false,
+            decode_semantics,
+        )?;
+        let retained_growth = match &final_state {
+            PreparedGraphTextAdmissionFinalState::Present(prepared) => prepared.retained_growth,
+            PreparedGraphTextAdmissionFinalState::Absent(prepared) => prepared.retained_growth,
+        };
+        charges.retain_prepared_growth(current, event_scratch, retained_growth)?;
+        self.revalidate_prepared_graph_text_admission_batch(
+            current,
+            std::slice::from_ref(&final_state),
+            event_scratch,
+            retained_growth,
+            false,
+        )?;
+
+        let structural_peak = graph_text_admission_delta_structural_peak(current)?;
+        let payload_peak = match &final_state {
+            PreparedGraphTextAdmissionFinalState::Present(prepared) => {
+                graph_text_admission_delta_payload_peak(current, &relative, Some(prepared))?
+            }
+            PreparedGraphTextAdmissionFinalState::Absent(_) => {
+                graph_text_admission_delta_payload_peak(current, &relative, None)?
+            }
+        };
+        let peak = checked_add_bytes(current.permanent_bytes, retained_growth)
+            .and_then(|bytes| checked_add_bytes(bytes, structural_peak))
+            .and_then(|bytes| checked_add_bytes(bytes, payload_peak))
+            .and_then(|bytes| checked_add_bytes(bytes, event_scratch))?;
+        if peak > current.peak_limit {
+            return Err(initial_shadow_limit_error("peak build memory"));
+        }
+
+        let mut next = current.clone();
+        match final_state {
+            PreparedGraphTextAdmissionFinalState::Present(prepared) => {
+                if let Err(delta_error) =
+                    self.apply_prepared_graph_text_file_upsert(&mut next, prepared)
+                {
+                    let detail = validate_graph_text_admission_index(&next)
+                        .err()
+                        .map_or_else(
+                            || "complete index remains internally valid".to_owned(),
+                            |error| error.to_string(),
+                        );
+                    return Err(io::Error::new(
+                        delta_error.kind(),
+                        format!("{delta_error} at {relative}; {detail}"),
+                    ));
+                }
+            }
+            PreparedGraphTextAdmissionFinalState::Absent(prepared) => {
+                let removed = remove_graph_text_admission_path(&mut next, &relative);
+                if let (Ok(path), Some(tombstone)) = (ManagedPath::parse(relative.clone()), removed)
+                {
+                    next.tombstones_by_exact_path.insert(path, tombstone);
+                }
+                next.permanent_bytes =
+                    checked_add_bytes(next.permanent_bytes, prepared.retained_growth)?;
+            }
+        }
+        validate_graph_text_admission_delta(&next, &relative)?;
+        Ok(next)
+    }
+
+    /// Publish exact final-state changes made by Tine while the same
+    /// resource-wide identity authority still covers the filesystem mutation.
+    fn update_guarded_graph_text_identity_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+        decode_semantics: bool,
+    ) -> io::Result<()> {
+        let identity = self.lock_graph_text_identity_mutation()?;
+        let relatives = paths
+            .into_iter()
+            .map(|path| self.rel_path(path))
+            .collect::<Vec<_>>();
+        let prior_resource_epoch = identity.gate.identity_mutation_epoch_under_authority();
+        // Advance before attempting publication. If the filesystem transition
+        // was already committed and any later step fails, every sibling's older
+        // epoch is still immediately unusable once this authority is released.
+        let resource_epoch = identity.gate.advance_identity_mutation_epoch();
+        let mut state = self.guarded_graph_text_identity.write().unwrap();
+        if state.invalidated
+            || state.index.is_none()
+            || state.observed_resource_epoch != Some(prior_resource_epoch)
+        {
+            state.invalidated = true;
+            state.invalidation_cause = Some(bounded_graph_text_admission_cause(
+                "exact identity transition could not update a current retained index".to_owned(),
+            ));
+            return Ok(());
+        }
+        #[cfg(test)]
+        if FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE.with(|fail| fail.replace(false)) {
+            state.invalidated = true;
+            state.invalidation_cause =
+                Some("injected guarded graph-text identity publication failure".to_owned());
+            return Err(io::Error::other(
+                "injected guarded graph-text identity publication failure",
+            ));
+        }
+        let mut next = state
+            .index
+            .as_deref()
+            .expect("checked retained guarded identity")
+            .clone();
+        let update_result = (|| {
+            for relative in relatives {
+                if self.classify_graph_text_exact_feed_path(&relative)?
+                    != GraphTextExactFeedPathClass::RetainedFile
+                {
+                    continue;
+                }
+                next =
+                    self.apply_guarded_graph_text_identity_path(&next, relative, decode_semantics)?;
+            }
+            Ok::<(), io::Error>(())
+        })();
+        if let Err(error) = update_result {
+            state.invalidated = true;
+            state.invalidation_cause = Some(bounded_graph_text_admission_cause(format!(
+                "exact identity update failed: {error}"
+            )));
+            return Err(error);
+        }
+        let generation = state.generation.checked_add(1).ok_or_else(|| {
+            graph_text_admission_unavailable("guarded graph-text identity generation overflow")
+        })?;
+        next.generation = generation;
+        state.generation = generation;
+        state.index = Some(Arc::new(next));
+        state.observed_resource_epoch = Some(resource_epoch);
+        state.invalidated = false;
+        state.invalidation_cause = None;
+        #[cfg(test)]
+        {
+            state.exact_updates = state.exact_updates.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn finish_tine_owned_graph_text_identity_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> io::Result<()> {
+        let _ = self.update_guarded_graph_text_identity_paths(paths, false);
+        // The filesystem transition is already durable. Returning an error
+        // here would report failure for a committed edit and strand cache state
+        // behind disk; invalidation is the fail-closed recovery boundary.
+        Ok(())
+    }
+
+    /// Legacy watcher intake boundary for the retained guarded-save index.
+    ///
+    /// The Tauri watcher calls this directly from the platform callback, before
+    /// its 200 ms coalescing delay. Exact file paths update the retained final
+    /// state under the same resource-wide authority as Tine writes. Overflow,
+    /// notify errors, directory/configuration events, poll cycles, and any
+    /// ambiguous path invalidate the generation; the next guarded write must
+    /// perform exactly one complete rebuild before it can authorize mutation.
+    pub fn observe_graph_text_external_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+        uncertain: bool,
+    ) -> io::Result<()> {
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        if uncertain {
+            self.invalidate_guarded_graph_text_identity("external watcher generation is uncertain");
+            return Ok(());
+        }
+        let paths = paths.into_iter().collect::<Vec<_>>();
+        let _ = self.update_guarded_graph_text_identity_paths(paths.iter().copied(), true);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guarded_graph_text_identity_stats(&self) -> (usize, usize, bool, u64) {
+        let state = self.guarded_graph_text_identity.read().unwrap();
+        (
+            state.complete_builds,
+            state.exact_updates,
+            state.invalidated,
+            state.generation,
+        )
+    }
+
+    #[cfg(test)]
+    fn guarded_graph_text_identity_epochs(&self) -> (Option<u64>, u64) {
+        let observed = self
+            .guarded_graph_text_identity
+            .read()
+            .unwrap()
+            .observed_resource_epoch;
+        let resource = self
+            .managed_write_binding()
+            .expect("test graph has managed writer binding")
+            .gate
+            .identity_mutation_epoch();
+        (observed, resource)
     }
 
     fn text_entries_with_limits_and_budget<'a>(
@@ -5701,11 +6119,51 @@ impl Graph {
     /// cannot choose one without authenticated exact logical authority.
     fn validate_current_graph_text_collision_strict(
         &self,
-        permit: &ManagedTextWritePermit,
+        _permit: &ManagedTextWritePermit,
         target: &Path,
         target_identity: Option<ContentDigest>,
-    ) -> io::Result<Vec<PageEntry>> {
-        self.validate_current_graph_text_collision_policy(permit, target, target_identity, true)
+    ) -> io::Result<Arc<CompleteGraphTextAdmissionIndex>> {
+        let target_relative = self.rel_path(target);
+        let target_path = ManagedPath::parse(target_relative.clone()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        let index = self.guarded_graph_text_identity_index()?;
+        if let Some(sibling) = index
+            .paths_by_portable_key
+            .get(&target_path.portable_key())
+            .and_then(|members| members.iter().find(|member| *member != &target_path))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "graph text paths share one portable case/NFC identity: {} and {target_relative}",
+                    sibling.as_str()
+                ),
+            ));
+        }
+        if let Some(identity) = target_identity {
+            if let Some(sibling) = index
+                .paths_by_file_resource
+                .get(&identity)
+                .and_then(|members| {
+                    members
+                        .iter()
+                        .find(|member| member.as_str() != target_relative)
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "graph text files alias one physical resource: {} and {target_relative}",
+                        sibling
+                    ),
+                ));
+            }
+        }
+        Ok(index)
     }
 
     /// Validate an exact sparse-projection target. Its durable mutation
@@ -5717,34 +6175,11 @@ impl Graph {
         target: &Path,
         target_identity: Option<ContentDigest>,
     ) -> io::Result<Vec<PageEntry>> {
-        self.validate_current_graph_text_collision_policy(permit, target, target_identity, false)
-    }
-
-    fn validate_current_graph_text_collision_policy(
-        &self,
-        permit: &ManagedTextWritePermit,
-        target: &Path,
-        target_identity: Option<ContentDigest>,
-        reject_portable_sibling: bool,
-    ) -> io::Result<Vec<PageEntry>> {
         let target_relative = self.rel_path(target);
-        let target_portable = self.graph_text_scope.portable_path_key(&target_relative);
         let (entries, identities) = self.graph_text_inventory(permit)?;
         for entry in &entries {
             if entry.path == target {
                 continue;
-            }
-            if reject_portable_sibling
-                && target_portable.is_some()
-                && self.graph_text_scope.portable_path_key(&entry.rel_path) == target_portable
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "graph text paths share one portable case/NFC identity: {} and {target_relative}",
-                        entry.rel_path
-                    ),
-                ));
             }
             if target_identity.is_some() && identities.get(&entry.path).copied() == target_identity
             {
@@ -6020,14 +6455,30 @@ impl Graph {
         requested_identity: Option<(PageKind, &str)>,
     ) -> io::Result<ExactGraphValidation> {
         let loaded_target = self.load_validated_graph_text_target(permit, target)?;
-        let entries = self.validate_current_graph_text_collision_strict(
+        let index = self.validate_current_graph_text_collision_strict(
             permit,
             target,
             loaded_target.as_ref().map(|loaded| loaded.file_identity),
         )?;
         let requested_identity_elsewhere = match (loaded_target.as_ref(), requested_identity) {
             (None, Some((kind, name))) => {
-                self.validate_name_only_effective_identity(&entries, kind, name)?
+                let retained_collision = index
+                    .paths_by_semantic_key
+                    .get(&(
+                        match kind {
+                            PageKind::Page => 0,
+                            PageKind::Journal => 1,
+                        },
+                        crate::refs::page_key(name),
+                    ))
+                    .is_some_and(|members| !members.is_empty());
+                let entries = index
+                    .files_by_exact_path
+                    .iter()
+                    .map(|(_, record)| record.semantic.clone())
+                    .collect::<Vec<_>>();
+                retained_collision
+                    || self.validate_name_only_effective_identity(&entries, kind, name)?
             }
             _ => false,
         };
@@ -6235,6 +6686,12 @@ impl Graph {
         bytes: &[u8],
         create_new: bool,
     ) -> io::Result<()> {
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        // Establish the retained baseline before creating the staged inode. The
+        // temp name is deliberately outside the graph-text namespace, but its
+        // physical identity would otherwise be captured as a second owner when
+        // the staged inode is later published at `path`.
+        let _ = self.guarded_graph_text_identity_index()?;
         let target = self.managed_target(permit, path, true)?;
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
@@ -6258,7 +6715,8 @@ impl Graph {
             let _ = target.parent().remove_file(&temp);
             return Err(error);
         }
-        sync_projection_chain_required(&target.chain)
+        sync_projection_chain_required(&target.chain)?;
+        self.finish_tine_owned_graph_text_identity_paths(std::iter::once(path))
     }
 
     /// Replace an existing editor target without ever issuing an overwrite
@@ -6281,6 +6739,10 @@ impl Graph {
         expected_identity: ContentDigest,
         expected_bytes: Option<&[u8]>,
     ) -> io::Result<()> {
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        // Recovery/staging names are transaction-local states, not independent
+        // owners. Capture the complete baseline before introducing them.
+        let _ = self.guarded_graph_text_identity_index()?;
         use std::sync::atomic::{AtomicU64, Ordering};
         static RECOVERY_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -6342,7 +6804,7 @@ impl Graph {
             sync_projection_chain_required(&target.chain)
         })();
 
-        match result {
+        let outcome = match result {
             Ok(()) => {
                 let _ = target.parent().remove_file(&temp);
                 Ok(())
@@ -6361,29 +6823,41 @@ impl Graph {
                         Ok(()) => {
                             retired = false;
                             if let Err(sync_error) = sync_projection_chain_required(&target.chain) {
-                                return Err(io::Error::new(
+                                Err(io::Error::new(
                                     primary.kind(),
                                     format!(
                                         "{primary}; target identity was restored but directory sync failed: {sync_error}"
                                     ),
-                                ));
+                                ))
+                            } else {
+                                debug_assert!(!retired || published);
+                                let _ = target.parent().remove_file(&temp);
+                                Err(primary)
                             }
                         }
-                        Err(restore_error) => {
-                            return Err(io::Error::new(
-                                primary.kind(),
-                                format!(
-                                    "{primary}; displaced target retained as {recovery}, \
+                        Err(restore_error) => Err(io::Error::new(
+                            primary.kind(),
+                            format!(
+                                "{primary}; displaced target retained as {recovery}, \
                                      staged editor bytes retained as {temp}, \
                                      but exact-identity restore failed: {restore_error}"
-                                ),
-                            ));
-                        }
+                            ),
+                        )),
                     }
+                } else {
+                    debug_assert!(!retired || published);
+                    let _ = target.parent().remove_file(&temp);
+                    Err(primary)
                 }
-                debug_assert!(!retired || published);
-                let _ = target.parent().remove_file(&temp);
-                Err(primary)
+            }
+        };
+        match outcome {
+            Ok(()) => self.finish_tine_owned_graph_text_identity_paths(std::iter::once(path)),
+            Err(error) => {
+                self.invalidate_guarded_graph_text_identity(format!(
+                    "identity-bound replacement failed after staging: {error}"
+                ));
+                Err(error)
             }
         }
     }
@@ -6394,9 +6868,13 @@ impl Graph {
         source: &Path,
         destination: &Path,
     ) -> io::Result<()> {
-        let source = self.managed_target(permit, source, false)?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        let _ = self.guarded_graph_text_identity_index()?;
+        let source_path = source.to_path_buf();
+        let destination_path = destination.to_path_buf();
+        let source = self.managed_target(permit, &source_path, false)?;
         projection_optional_regular_metadata(source.parent(), &source.filename)?;
-        let destination = self.managed_target(permit, destination, true)?;
+        let destination = self.managed_target(permit, &destination_path, true)?;
         match destination.parent().symlink_metadata(&destination.filename) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
@@ -6410,7 +6888,11 @@ impl Graph {
             &destination.filename,
         )?;
         sync_projection_chain_required(&source.chain)?;
-        sync_projection_chain_required(&destination.chain)
+        sync_projection_chain_required(&destination.chain)?;
+        self.finish_tine_owned_graph_text_identity_paths([
+            source_path.as_path(),
+            destination_path.as_path(),
+        ])
     }
 
     fn managed_move_to_trash(
@@ -6598,6 +7080,7 @@ impl Graph {
                 armed_feed.as_ref().map(|binding| binding.fence.clone()),
                 limits,
                 combined_capture_bytes,
+                true,
             )?;
             let collision = initial_shadow_global_collision(&index);
             Ok((first, index, collision))
@@ -6636,6 +7119,43 @@ impl Graph {
             ));
         }
         self.ensure_projection_root_binding()?;
+        let combined_capture_bytes =
+            checked_add_bytes(first.peak_build_charge, second.peak_build_charge)?;
+        if combined_capture_bytes > limits.peak_build_bytes {
+            return Err(initial_shadow_limit_error("peak build memory"));
+        }
+        Ok((first, combined_capture_bytes))
+    }
+
+    /// Capture the resource retained by this Graph even when its ambient path
+    /// has subsequently been moved or reserved by a replacement graph. The
+    /// managed-write gate and retained directory capability are the authority;
+    /// checking the ambient path here would both reject supported moves and
+    /// accidentally inspect the replacement resource.
+    fn capture_retained_graph_text_identity_with_limits(
+        &self,
+        limits: InitialShadowLimits,
+    ) -> io::Result<(InitialShadowCapture, u64)> {
+        require_projection_platform()?;
+        let permit = self.admit_managed_text_writer()?;
+        let first = collect_initial_shadow_managed_inventory_with_limits_inner(
+            self, &permit, true, limits, 0, false,
+        )?;
+        initial_shadow_revalidation_hook(&self.root)?;
+        let second = collect_initial_shadow_managed_inventory_with_limits_inner(
+            self,
+            &permit,
+            false,
+            limits,
+            first.peak_build_charge,
+            false,
+        )?;
+        if !initial_shadow_captures_match(&first, &second) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "managed inventory changed during retained identity capture",
+            ));
+        }
         let combined_capture_bytes =
             checked_add_bytes(first.peak_build_charge, second.peak_build_charge)?;
         if combined_capture_bytes > limits.peak_build_bytes {
@@ -7032,6 +7552,7 @@ impl Graph {
             Some(GraphTextAdmissionFeedFence { last_sequence }),
             INITIAL_SHADOW_LIMITS,
             replacement_peak_base,
+            true,
         )?;
         if let Some(error) = initial_shadow_global_collision(&replacement) {
             return Err(error);
@@ -7078,7 +7599,7 @@ impl Graph {
     }
 
     /// Classify one exact feed path without duplicating scope policy.
-    pub(crate) fn classify_graph_text_exact_feed_path(
+    pub fn classify_graph_text_exact_feed_path(
         &self,
         relative: &str,
     ) -> io::Result<GraphTextExactFeedPathClass> {
@@ -7220,6 +7741,8 @@ impl Graph {
                 relative.clone(),
                 batch_scratch,
                 &mut actual_charges,
+                true,
+                true,
             ) {
                 Ok(final_state) => final_state,
                 Err(error) => return Err(self.poison_graph_text_admission_error(error)),
@@ -7269,6 +7792,7 @@ impl Graph {
             &prepared,
             batch_scratch,
             prepared_growth,
+            true,
         ) {
             return Err(self.poison_graph_text_admission_error(error));
         }
@@ -8015,7 +8539,7 @@ impl Graph {
                 }
             }
             GraphTextAdmissionExactEvent::FileRemove { relative } => {
-                match self.prepare_graph_text_file_remove(&current, relative.clone()) {
+                match self.prepare_graph_text_file_remove(&current, relative.clone(), true) {
                     Ok(prepared) => (None, Some(prepared)),
                     Err(error) => {
                         self.poison_graph_text_admission(error.to_string());
@@ -8227,9 +8751,11 @@ impl Graph {
         relative: String,
         batch_scratch: u64,
         actual_charges: &mut GraphTextExactFeedBatchActualCharges,
+        require_ambient_binding: bool,
+        decode_semantics: bool,
     ) -> io::Result<PreparedGraphTextAdmissionFinalState> {
         let target = self.graph_text_exact_path(&relative, false)?;
-        let parent = self.graph_text_event_parent(&target)?;
+        let parent = self.graph_text_event_parent_policy(&target, require_ambient_binding)?;
         validate_graph_text_event_parent(index, &target, &parent)?;
         match parent.final_dir().symlink_metadata(&target.filename) {
             Ok(metadata) if metadata.is_file() => self
@@ -8238,6 +8764,8 @@ impl Graph {
                     relative,
                     batch_scratch,
                     actual_charges,
+                    require_ambient_binding,
+                    decode_semantics,
                 )
                 .map(PreparedGraphTextAdmissionFinalState::Present),
             Ok(_) => Err(io::Error::new(
@@ -8248,7 +8776,7 @@ impl Graph {
                 ),
             )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => self
-                .prepare_graph_text_file_remove(index, relative)
+                .prepare_graph_text_file_remove(index, relative, require_ambient_binding)
                 .map(PreparedGraphTextAdmissionFinalState::Absent),
             Err(error) => Err(error),
         }
@@ -8260,8 +8788,9 @@ impl Graph {
         prepared: &[PreparedGraphTextAdmissionFinalState],
         batch_scratch: u64,
         prepared_growth: u64,
+        require_ambient_binding: bool,
     ) -> io::Result<()> {
-        self.ensure_graph_text_admission_snapshot_binding(index)?;
+        self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)?;
         let live = checked_add_bytes(index.permanent_bytes, batch_scratch)
             .and_then(|bytes| checked_add_bytes(bytes, prepared_growth))?;
         let remaining_peak = index
@@ -8277,7 +8806,7 @@ impl Graph {
                 PreparedGraphTextAdmissionFinalState::Absent(remove) => (&remove.relative, None),
             };
             let target = self.graph_text_exact_path(relative, false)?;
-            let parent = self.graph_text_event_parent(&target)?;
+            let parent = self.graph_text_event_parent_policy(&target, require_ambient_binding)?;
             validate_graph_text_event_parent(index, &target, &parent)?;
             match expected {
                 Some(upsert) => {
@@ -8340,7 +8869,7 @@ impl Graph {
                 },
             }
         }
-        self.ensure_graph_text_admission_snapshot_binding(index)
+        self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)
     }
 
     #[allow(dead_code)]
@@ -8350,7 +8879,14 @@ impl Graph {
         relative: String,
         event_scratch: u64,
     ) -> io::Result<PreparedGraphTextAdmissionUpsert> {
-        self.prepare_graph_text_file_upsert_with_batch_charges(index, relative, event_scratch, None)
+        self.prepare_graph_text_file_upsert_with_batch_charges(
+            index,
+            relative,
+            event_scratch,
+            None,
+            true,
+            true,
+        )
     }
 
     fn prepare_graph_text_file_upsert_for_batch(
@@ -8359,12 +8895,16 @@ impl Graph {
         relative: String,
         batch_scratch: u64,
         actual_charges: &mut GraphTextExactFeedBatchActualCharges,
+        require_ambient_binding: bool,
+        decode_semantics: bool,
     ) -> io::Result<PreparedGraphTextAdmissionUpsert> {
         self.prepare_graph_text_file_upsert_with_batch_charges(
             index,
             relative,
             batch_scratch,
             Some(actual_charges),
+            require_ambient_binding,
+            decode_semantics,
         )
     }
 
@@ -8374,9 +8914,11 @@ impl Graph {
         relative: String,
         event_scratch: u64,
         mut actual_charges: Option<&mut GraphTextExactFeedBatchActualCharges>,
+        require_ambient_binding: bool,
+        decode_semantics: bool,
     ) -> io::Result<PreparedGraphTextAdmissionUpsert> {
         let target = self.graph_text_exact_path(&relative, false)?;
-        let parent = self.graph_text_event_parent(&target)?;
+        let parent = self.graph_text_event_parent_policy(&target, require_ambient_binding)?;
         validate_graph_text_event_parent(index, &target, &parent)?;
         let enumerated = open_projection_file_nofollow(parent.final_dir(), &target.filename)?;
         let enumerated_resource = canonical_projection_file_resource_id(&enumerated)?;
@@ -8437,7 +8979,7 @@ impl Graph {
                 format!("exact feed upsert changed after observation: {relative}"),
             ));
         }
-        self.ensure_graph_text_admission_snapshot_binding(index)?;
+        self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)?;
         let eligible_path =
             if self.graph_text_scope.is_eligible(&relative) {
                 Some(ManagedPath::parse(relative.clone()).map_err(|error| {
@@ -8474,28 +9016,38 @@ impl Graph {
             }
         }
         let eligible = if let Some(path) = eligible_path {
-            let content = std::str::from_utf8(&bytes).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("graph text is not UTF-8: {path}"),
-                )
-            })?;
-            if let Some(charges) = actual_charges.as_deref_mut() {
-                charges.reserve_parser(
-                    index,
-                    event_scratch,
-                    managed_page_build_upper_bound(content)?,
+            let (semantic, format) = if decode_semantics {
+                let content = std::str::from_utf8(&bytes).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("graph text is not UTF-8: {path}"),
+                    )
+                })?;
+                if let Some(charges) = actual_charges.as_deref_mut() {
+                    charges.reserve_parser(
+                        index,
+                        event_scratch,
+                        managed_page_build_upper_bound(content)?,
+                    )?;
+                }
+                let parser_live = checked_add_bytes(live_bytes, usize_to_u64(bytes.capacity())?)?;
+                let permit = graph_text_parse_budget_permit(
+                    self,
+                    &path,
+                    content,
+                    parser_live,
+                    index.peak_limit,
                 )?;
-            }
-            let parser_live = checked_add_bytes(live_bytes, usize_to_u64(bytes.capacity())?)?;
-            let permit = graph_text_parse_budget_permit(
-                self,
-                &path,
-                content,
-                parser_live,
-                index.peak_limit,
-            )?;
-            let (semantic, format) = self.decode_present_graph_text(&path, &bytes, permit)?;
+                self.decode_present_graph_text(&path, &bytes, permit)?
+            } else {
+                (
+                    self.managed_entry_for_managed_path(&path)
+                        .map_err(|error| {
+                            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                        })?,
+                    Format::from_path(Path::new(path.as_str())),
+                )
+            };
             Some((
                 path,
                 GraphTextAdmissionRecord {
@@ -8534,7 +9086,8 @@ impl Graph {
             .checked_sub(revalidation_live)
             .ok_or_else(|| initial_shadow_limit_error("peak build memory"))?;
         graph_text_event_revalidation_race_hook()?;
-        let rebound_parent = self.graph_text_event_parent(&target)?;
+        let rebound_parent =
+            self.graph_text_event_parent_policy(&target, require_ambient_binding)?;
         validate_graph_text_event_parent(index, &target, &rebound_parent)?;
         let rebound = open_projection_file_nofollow(rebound_parent.final_dir(), &target.filename)?;
         if canonical_projection_file_resource_id(&rebound)? != file_resource_id
@@ -8571,7 +9124,7 @@ impl Graph {
                 format!("exact feed upsert changed during two-sided proof: {relative}"),
             ));
         }
-        self.ensure_graph_text_admission_snapshot_binding(index)?;
+        self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)?;
         Ok(PreparedGraphTextAdmissionUpsert {
             relative,
             description,
@@ -8661,9 +9214,10 @@ impl Graph {
         &self,
         index: &CompleteGraphTextAdmissionIndex,
         relative: String,
+        require_ambient_binding: bool,
     ) -> io::Result<PreparedGraphTextAdmissionRemove> {
         let target = self.graph_text_exact_path(&relative, false)?;
-        match self.graph_text_event_parent(&target) {
+        match self.graph_text_event_parent_policy(&target, require_ambient_binding) {
             Ok(parent) => {
                 validate_graph_text_event_parent(index, &target, &parent)?;
                 match parent.final_dir().symlink_metadata(&target.filename) {
@@ -8685,14 +9239,16 @@ impl Graph {
             }
             Err(error) => return Err(error),
         }
-        self.ensure_graph_text_admission_snapshot_binding(index)?;
+        self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)?;
         graph_text_event_revalidation_race_hook()?;
-        let rebound_parent = self.graph_text_event_parent(&target).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!("exact feed removal parent changed: {error}"),
-            )
-        })?;
+        let rebound_parent = self
+            .graph_text_event_parent_policy(&target, require_ambient_binding)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("exact feed removal parent changed: {error}"),
+                )
+            })?;
         validate_graph_text_event_parent(index, &target, &rebound_parent)?;
         match rebound_parent
             .final_dir()
@@ -8707,7 +9263,7 @@ impl Graph {
             }
             Err(error) => return Err(error),
         }
-        self.ensure_graph_text_admission_snapshot_binding(index)?;
+        self.ensure_graph_text_admission_snapshot_binding_policy(index, require_ambient_binding)?;
         let retained_growth = match target.managed_path.as_ref() {
             Some(path)
                 if index
@@ -8758,12 +9314,24 @@ impl Graph {
 
     #[allow(dead_code)]
     fn graph_text_event_parent(&self, target: &GraphTextExactPath) -> io::Result<ProjectionParent> {
-        let root = self.projection_root.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "graph has no retained no-follow projection capability",
-            )
-        })?;
+        self.graph_text_event_parent_policy(target, true)
+    }
+
+    fn graph_text_event_parent_policy(
+        &self,
+        target: &GraphTextExactPath,
+        require_ambient_binding: bool,
+    ) -> io::Result<ProjectionParent> {
+        let root = if require_ambient_binding {
+            self.projection_root.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "graph has no retained no-follow projection capability",
+                )
+            })?
+        } else {
+            &self.managed_write_binding()?.root
+        };
         let mut chain = vec![root.try_clone()?];
         for component in &target.parent_components {
             let current = chain.last().expect("graph-text parent contains root");
@@ -8777,9 +9345,30 @@ impl Graph {
         &self,
         index: &CompleteGraphTextAdmissionIndex,
     ) -> io::Result<()> {
-        self.ensure_projection_root_binding()?;
-        let graph_resource = self.canonical_resource_id()?;
-        let scope_binding = self.graph_text_scope_binding()?;
+        self.ensure_graph_text_admission_snapshot_binding_policy(index, true)
+    }
+
+    fn ensure_graph_text_admission_snapshot_binding_policy(
+        &self,
+        index: &CompleteGraphTextAdmissionIndex,
+        require_ambient_binding: bool,
+    ) -> io::Result<()> {
+        if require_ambient_binding {
+            self.ensure_projection_root_binding()?;
+        }
+        let (graph_resource, scope_binding) = if require_ambient_binding {
+            (
+                self.canonical_resource_id()?,
+                self.graph_text_scope_binding()?,
+            )
+        } else {
+            let binding = self.managed_write_binding()?;
+            (
+                binding.resource_id,
+                self.graph_text_scope
+                    .bind_graph_resource(binding.resource_id),
+            )
+        };
         if !Arc::ptr_eq(&index.instance, &self.graph_text_admission_instance)
             || graph_resource != index.graph_resource
             || scope_binding != index.scope_binding
@@ -10915,6 +11504,7 @@ impl Graph {
     /// it can't reach outside `journals/`.
     pub fn trash_journal_file(&self, name: &str) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         if name.is_empty() || name.contains('/') || name.contains('\\') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -10945,6 +11535,7 @@ impl Graph {
     /// written.
     pub fn merge_pages(&self, src_rel: &str, dst_rel: &str) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let src = self
             .resolve_managed_rel(&write, src_rel)?
             .ok_or_else(bad_path)?;
@@ -11070,6 +11661,7 @@ impl Graph {
     /// has any); the file's own content is unchanged.
     pub fn rename_file_to_page(&self, src_rel: &str, new_name: &str) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let src = self
             .resolve_managed_rel(&write, src_rel)?
             .ok_or_else(bad_path)?;
@@ -11100,7 +11692,7 @@ impl Graph {
         // parsed snapshot so its page/index set is rebuilt coherently on next use.
         *self.page_list_cache.write().unwrap() = None;
         *self.find_entry_cache.write().unwrap() = None;
-        self.invalidate_cache();
+        self.invalidate_cache_after_tine_mutation();
         Ok(())
     }
 
@@ -11196,6 +11788,7 @@ impl Graph {
     /// won. Existing content is never overwritten.
     pub fn create_markdown_page_if_absent(&self, name: &str, content: &str) -> io::Result<bool> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         if self
             .managed_find_entry(&write, name, PageKind::Page)?
             .is_some()
@@ -12092,6 +12685,13 @@ impl Graph {
     /// Discard the cache; it rebuilds on the next whole-graph query. Use when an
     /// external change may have touched many files.
     pub fn invalidate_cache(&self) {
+        self.invalidate_guarded_graph_text_identity(
+            "broad external cache invalidation has no exact path generation",
+        );
+        self.invalidate_cache_after_tine_mutation();
+    }
+
+    fn invalidate_cache_after_tine_mutation(&self) {
         let mut guard = self.cache.write().unwrap();
         *guard = None;
         self.page_index_failures.write().unwrap().clear();
@@ -12935,6 +13535,7 @@ impl Graph {
         expected_path: Option<&str>,
     ) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let old = old.trim();
         let new = new.trim();
         if new.is_empty() {
@@ -13476,10 +14077,10 @@ impl Graph {
                     }
                 }
             }
-            self.invalidate_cache();
+            self.invalidate_cache_after_tine_mutation();
             return Err(err);
         }
-        self.invalidate_cache();
+        self.invalidate_cache_after_tine_mutation();
         for edit in &edits {
             self.record_managed_projection(&write, &edit.dst);
         }
@@ -13502,6 +14103,7 @@ impl Graph {
         expected_path: Option<&str>,
     ) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         self.block_external_scope_mutation(&write, name, kind, expected_path, "delete")?;
         let entries = self.managed_text_entries(&write, false)?;
         // M1: with same-stem .md/.markdown/.org twins, "which file?" is
@@ -16761,6 +17363,7 @@ impl Graph {
     /// file must be durably imported before its bytes enter the live cache.
     pub fn sync_file_checked(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let lock = self.page_lock(path);
         let _guard = lock.lock().unwrap();
         // Watch events are untrusted path inputs. Lexically reject non-managed
@@ -16769,6 +17372,12 @@ impl Graph {
         if self.entry_for_path(path).is_none() {
             return Ok(None);
         }
+        // This checked watcher entrypoint is itself an exact external
+        // observation boundary (tests and non-Tauri callers use it directly).
+        // Publish the observed final state before changing cache evidence; an
+        // unreadable or ambiguous path poisons the retained generation and the
+        // next guarded write rebuilds instead of trusting stale ownership.
+        let _ = self.update_guarded_graph_text_identity_paths(std::iter::once(path), true);
         let (mut content, mut identity) =
             match self.managed_read_optional_text_with_identity(&write, path) {
                 Ok(Some(snapshot)) => snapshot,
@@ -17187,6 +17796,7 @@ impl Graph {
     /// Logseq/provider deletion becomes operation truth before cache eviction.
     pub fn sync_deleted_file(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         if self.entry_for_path(path).is_none() {
             return Ok(None);
         }
@@ -17697,6 +18307,7 @@ impl Graph {
             return Ok("guide-ephemeral".into());
         }
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let (path, cache) = self.save_target(&write, page)?;
         // Serialize against any other writer of THIS page (a PDF highlight write
         // of the same `hls__` page, or another save) for the whole
@@ -17797,6 +18408,7 @@ impl Graph {
             return Ok("guide-ephemeral".into());
         }
         let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let (path, cache) = self.save_target(&write, page)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
@@ -25831,10 +26443,28 @@ fn collect_initial_shadow_managed_inventory(
 
 fn collect_initial_shadow_managed_inventory_with_limits(
     graph: &Graph,
+    permit: &ManagedTextWritePermit,
+    retain_bytes: bool,
+    limits: InitialShadowLimits,
+    simultaneous_capture_bytes: u64,
+) -> io::Result<InitialShadowCapture> {
+    collect_initial_shadow_managed_inventory_with_limits_inner(
+        graph,
+        permit,
+        retain_bytes,
+        limits,
+        simultaneous_capture_bytes,
+        true,
+    )
+}
+
+fn collect_initial_shadow_managed_inventory_with_limits_inner(
+    graph: &Graph,
     _permit: &ManagedTextWritePermit,
     retain_bytes: bool,
     limits: InitialShadowLimits,
     simultaneous_capture_bytes: u64,
+    require_ambient_binding: bool,
 ) -> io::Result<InitialShadowCapture> {
     struct PendingDirectory {
         directory: Dir,
@@ -25862,17 +26492,23 @@ fn collect_initial_shadow_managed_inventory_with_limits(
     if directory_count > limits.directories {
         return Err(initial_shadow_limit_error("directory count"));
     }
-    graph.ensure_projection_root_binding()?;
-    let directory = graph
-        .projection_root
-        .as_ref()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "graph has no retained no-follow projection capability",
-            )
-        })?
-        .try_clone()?;
+    if require_ambient_binding {
+        graph.ensure_projection_root_binding()?;
+    }
+    let directory = if require_ambient_binding {
+        graph
+            .projection_root
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "graph has no retained no-follow projection capability",
+                )
+            })?
+            .try_clone()?
+    } else {
+        graph.managed_write_binding()?.root.try_clone()?
+    };
     let root_resource = canonical_projection_directory_resource_id(&directory)?;
     directories_by_exact_relative.insert(String::new(), root_resource);
     directory_resources.insert(root_resource, String::new());
@@ -26230,20 +26866,35 @@ fn build_graph_text_admission_index(
     feed: Option<GraphTextAdmissionFeedFence>,
     limits: InitialShadowLimits,
     combined_capture_bytes: u64,
+    decode_semantics: bool,
 ) -> io::Result<CompleteGraphTextAdmissionIndex> {
-    let scope_binding = graph.graph_text_scope_binding()?;
-    let graph_resource = graph.canonical_resource_id()?;
+    let (scope_binding, graph_resource) = if decode_semantics {
+        (
+            graph.graph_text_scope_binding()?,
+            graph.canonical_resource_id()?,
+        )
+    } else {
+        let binding = graph.managed_write_binding()?;
+        (
+            graph
+                .graph_text_scope
+                .bind_graph_resource(binding.resource_id),
+            binding.resource_id,
+        )
+    };
     if scope_binding.graph_resource_id() != graph_resource {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "graph-text scope binding does not match the retained graph resource",
         ));
     }
-    let permanent_bytes = graph_text_initial_permanent_upper_bound(graph, capture)?;
+    let permanent_bytes =
+        graph_text_initial_permanent_upper_bound(graph, capture, decode_semantics)?;
     if permanent_bytes > limits.permanent_index_bytes {
         return Err(initial_shadow_limit_error("permanent index memory"));
     }
-    let validation_scratch = graph_text_index_validation_scratch_upper_bound(graph, capture)?;
+    let validation_scratch =
+        graph_text_index_validation_scratch_upper_bound(graph, capture, decode_semantics)?;
     ensure_graph_text_peak_limit(
         combined_capture_bytes,
         checked_add_bytes(permanent_bytes, validation_scratch)?,
@@ -26297,25 +26948,55 @@ fn build_graph_text_admission_index(
     // before the boundary collision check.
     let mut portable_groups = std::collections::BTreeMap::new();
     let mut semantic_groups = std::collections::BTreeMap::new();
+    let cached_semantics = if decode_semantics {
+        std::collections::HashMap::new()
+    } else {
+        graph
+            .cache
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|pages| {
+                pages
+                    .iter()
+                    .map(|(entry, _)| (entry.rel_path.clone(), entry.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     for entry in &capture.entries {
         let bytes = entry
             .bytes
             .as_deref()
             .expect("the first initial-shadow pass retains bytes");
-        let content = std::str::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("graph text is not UTF-8: {}", entry.path),
+        let (semantic, format) = if decode_semantics {
+            let content = std::str::from_utf8(bytes).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("graph text is not UTF-8: {}", entry.path),
+                )
+            })?;
+            let permit = graph_text_parse_budget_permit(
+                graph,
+                &entry.path,
+                content,
+                checked_add_bytes(combined_capture_bytes, permanent_bytes)?,
+                limits.peak_build_bytes,
+            )?;
+            graph.decode_present_graph_text(&entry.path, bytes, permit)?
+        } else {
+            (
+                cached_semantics
+                    .get(entry.path.as_str())
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| graph.managed_entry_for_managed_path(&entry.path))
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+                    })?,
+                Format::from_path(Path::new(entry.path.as_str())),
             )
-        })?;
-        let permit = graph_text_parse_budget_permit(
-            graph,
-            &entry.path,
-            content,
-            checked_add_bytes(combined_capture_bytes, permanent_bytes)?,
-            limits.peak_build_bytes,
-        )?;
-        let (semantic, format) = graph.decode_present_graph_text(&entry.path, bytes, permit)?;
+        };
         let record = GraphTextAdmissionRecord {
             description: entry.description,
             file_resource_id: entry.file_resource_id,
@@ -26359,6 +27040,7 @@ fn build_graph_text_admission_index(
 fn graph_text_initial_permanent_upper_bound(
     graph: &Graph,
     capture: &InitialShadowCapture,
+    decode_semantics: bool,
 ) -> io::Result<u64> {
     let title_format = graph_text_journal_title_format_budget(graph)?;
     let mut bytes = checked_add_bytes(
@@ -26403,14 +27085,16 @@ fn graph_text_initial_permanent_upper_bound(
         }
     }
     for entry in &capture.entries {
-        let content =
-            std::str::from_utf8(entry.bytes.as_ref().expect("first capture retains bytes"))
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "graph text is not UTF-8")
-                })?;
-        let semantic_name_len =
+        let content_bytes = entry.bytes.as_ref().expect("first capture retains bytes");
+        let semantic_name_len = if decode_semantics {
+            let content = std::str::from_utf8(content_bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "graph text is not UTF-8")
+            })?;
             graph_text_observed_semantic_name_upper_bound(graph, &entry.path, content)?
-                .semantic_name_bytes;
+                .semantic_name_bytes
+        } else {
+            guarded_graph_text_semantic_name_upper_bound(graph, &entry.path, content_bytes.len())?
+        };
         bytes = checked_add_bytes(
             bytes,
             graph_text_file_record_worst_case_upper_bound(
@@ -26426,21 +27110,23 @@ fn graph_text_initial_permanent_upper_bound(
 fn graph_text_index_validation_scratch_upper_bound(
     graph: &Graph,
     capture: &InitialShadowCapture,
+    decode_semantics: bool,
 ) -> io::Result<u64> {
     let mut largest_path = 0_u64;
     let mut largest_name = 0_u64;
     for entry in &capture.entries {
         let path = usize_to_u64(entry.path.as_str().len())?;
-        let content =
-            std::str::from_utf8(entry.bytes.as_ref().expect("first capture retains bytes"))
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "graph text is not UTF-8")
-                })?;
+        let bytes = entry.bytes.as_ref().expect("first capture retains bytes");
         largest_path = largest_path.max(path);
-        largest_name = largest_name.max(
+        largest_name = largest_name.max(if decode_semantics {
+            let content = std::str::from_utf8(bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "graph text is not UTF-8")
+            })?;
             graph_text_observed_semantic_name_upper_bound(graph, &entry.path, content)?
-                .semantic_name_bytes,
-        );
+                .semantic_name_bytes
+        } else {
+            guarded_graph_text_semantic_name_upper_bound(graph, &entry.path, bytes.len())?
+        });
     }
     let mut bytes = checked_add_bytes(
         checked_add_bytes(
@@ -26571,6 +27257,20 @@ fn graph_text_observed_semantic_name_upper_bound(
         semantic_name_bytes: observed,
         title_format,
     })
+}
+
+fn guarded_graph_text_semantic_name_upper_bound(
+    graph: &Graph,
+    path: &ManagedPath,
+    _content_len: usize,
+) -> io::Result<u64> {
+    let title_format = graph_text_journal_title_format_budget(graph)?;
+    let observed =
+        checked_add_bytes(usize_to_u64(path.as_str().len())?, 64)?.max(title_format.rendered_bytes);
+    if observed > MAX_GRAPH_TEXT_SEMANTIC_NAME_BYTES {
+        return Err(initial_shadow_limit_error("semantic title bytes"));
+    }
+    Ok(observed)
 }
 
 fn graph_text_file_record_worst_case_upper_bound(
@@ -27170,7 +27870,20 @@ fn validate_graph_text_admission_delta(
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "exact graph-text delta has colliding or inconsistent evidence",
+                format!(
+                    "exact graph-text delta has colliding or inconsistent evidence: \
+                     resource_match={} link_match={} links={} portable_member={} \
+                     resource_members={} resource_member={} semantic_member={} \
+                     tombstoned={} graph_text={is_graph_text:?}",
+                    resource == Some(&record.file_resource_id),
+                    link_count == Some(&record.link_count),
+                    record.link_count,
+                    portable.contains(&path),
+                    resources.len(),
+                    resources.contains(relative),
+                    semantic.contains(&path),
+                    index.tombstones_by_exact_path.contains_key(&path),
+                ),
             ));
         }
     } else if let Some(resource) = resource {
@@ -31626,6 +32339,340 @@ mod tests {
             fs::read_to_string(dir.join("pages").join("Foo.org")).unwrap(),
             "* org body\n"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn guarded_test_resave(graph: &Graph, page: &mut PageDto, marker: &str) -> io::Result<()> {
+        page.blocks[0].raw = marker.to_owned();
+        let revision = graph.save_page(page, page.rev.as_deref())?;
+        page.rev = Some(revision);
+        Ok(())
+    }
+
+    fn guarded_test_prime_identity(graph: &Graph) {
+        let _identity = graph.lock_graph_text_identity_mutation().unwrap();
+        graph.guarded_graph_text_identity_index().unwrap();
+    }
+
+    fn guarded_test_warm_pair(dir: &Path) -> (Graph, Graph) {
+        let graph_a = Graph::open(dir);
+        let graph_b = Graph::open(dir);
+        graph_a.warm_cache();
+        graph_b.warm_cache();
+        guarded_test_prime_identity(&graph_a);
+        guarded_test_prime_identity(&graph_b);
+        assert_eq!(graph_a.guarded_graph_text_identity_epochs().0, Some(0));
+        assert_eq!(graph_b.guarded_graph_text_identity_epochs().0, Some(0));
+        (graph_a, graph_b)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_epoch_makes_a_sibling_rebuild_and_refuse_every_collision_class() {
+        // Portable path identity.
+        let dir = scratch("guarded-resource-epoch-portable");
+        let primary = dir.join("pages/Case.md");
+        let collision = dir.join("pages/case.md");
+        fs::write(&primary, "- primary\n").unwrap();
+        let (graph_a, graph_b) = guarded_test_warm_pair(&dir);
+        let mut page_b = graph_b.load_by_path("pages/Case.md").unwrap().unwrap();
+        fs::write(&collision, "- collision\n").unwrap();
+        graph_a
+            .observe_graph_text_external_paths(std::iter::once(collision.as_path()), false)
+            .unwrap();
+        assert_ne!(
+            graph_b.guarded_graph_text_identity_epochs().0,
+            Some(graph_b.guarded_graph_text_identity_epochs().1)
+        );
+        assert_eq!(
+            guarded_test_resave(&graph_b, &mut page_b, "refused")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        let _ = fs::remove_dir_all(&dir);
+
+        // Physical resource identity.
+        let dir = scratch("guarded-resource-epoch-hardlink");
+        let primary = dir.join("pages/A.md");
+        let alias = dir.join("pages/Alias.md");
+        fs::write(&primary, "- primary\n").unwrap();
+        let (graph_a, graph_b) = guarded_test_warm_pair(&dir);
+        let mut page_b = graph_b.load_by_path("pages/A.md").unwrap().unwrap();
+        fs::hard_link(&primary, &alias).unwrap();
+        graph_a
+            .observe_graph_text_external_paths(std::iter::once(alias.as_path()), false)
+            .unwrap();
+        assert_eq!(
+            guarded_test_resave(&graph_b, &mut page_b, "refused")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        let _ = fs::remove_dir_all(&dir);
+
+        // Content-derived semantic identity.
+        let dir = scratch("guarded-resource-epoch-semantic");
+        fs::write(dir.join("pages/Anchor.md"), "- anchor\n").unwrap();
+        let collision = dir.join("pages/Physical Name.md");
+        let (graph_a, graph_b) = guarded_test_warm_pair(&dir);
+        fs::write(&collision, "title:: Claimed Name\n\n- external\n").unwrap();
+        graph_a
+            .observe_graph_text_external_paths(std::iter::once(collision.as_path()), false)
+            .unwrap();
+        let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
+        assert_eq!(
+            graph_b.save_page(&claimed, None).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resource_epoch_rebuilds_a_sibling_once_then_keeps_its_warm_saves_scan_free() {
+        let dir = scratch("guarded-resource-epoch-warm");
+        fs::write(dir.join("pages/A.md"), "- a\n").unwrap();
+        fs::write(dir.join("pages/B.md"), "- b\n").unwrap();
+        let (graph_a, graph_b) = guarded_test_warm_pair(&dir);
+        let mut page_a = graph_a.load_by_path("pages/A.md").unwrap().unwrap();
+        let mut page_b = graph_b.load_by_path("pages/B.md").unwrap().unwrap();
+
+        guarded_test_resave(&graph_a, &mut page_a, "a transition").unwrap();
+        guarded_test_resave(&graph_b, &mut page_b, "b rebuild").unwrap();
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        let epochs = graph_b.guarded_graph_text_identity_epochs();
+        assert_eq!(epochs.0, Some(epochs.1));
+
+        let before_warm = crate::fast_commit::graph_wide_commit_work();
+        guarded_test_resave(&graph_b, &mut page_b, "b warm one").unwrap();
+        guarded_test_resave(&graph_b, &mut page_b, "b warm two").unwrap();
+        assert_eq!(
+            crate::fast_commit::graph_wide_commit_work().since(before_warm),
+            crate::fast_commit::GraphWideCommitWork::default()
+        );
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resource_epoch_propagates_uncertain_observation_to_a_sibling() {
+        let dir = scratch("guarded-resource-epoch-uncertain");
+        fs::write(dir.join("pages/A.md"), "- a\n").unwrap();
+        let (graph_a, graph_b) = guarded_test_warm_pair(&dir);
+        let mut page_b = graph_b.load_by_path("pages/A.md").unwrap().unwrap();
+
+        graph_a
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        assert_ne!(
+            graph_b.guarded_graph_text_identity_epochs().0,
+            Some(graph_b.guarded_graph_text_identity_epochs().1)
+        );
+        guarded_test_resave(&graph_b, &mut page_b, "rebuilt after uncertainty").unwrap();
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resource_epoch_survives_post_filesystem_publication_failure_across_graphs() {
+        let dir = scratch("guarded-resource-epoch-publication-failure");
+        fs::write(dir.join("pages/A.md"), "- a\n").unwrap();
+        fs::write(dir.join("pages/B.md"), "- b\n").unwrap();
+        let (graph_a, graph_b) = guarded_test_warm_pair(&dir);
+        let mut page_a = graph_a.load_by_path("pages/A.md").unwrap().unwrap();
+        let mut page_b = graph_b.load_by_path("pages/B.md").unwrap().unwrap();
+
+        FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE.with(|fail| fail.set(true));
+        guarded_test_resave(&graph_a, &mut page_a, "committed before publication failed").unwrap();
+        assert!(graph_a.guarded_graph_text_identity_stats().2);
+        assert_ne!(
+            graph_b.guarded_graph_text_identity_epochs().0,
+            Some(graph_b.guarded_graph_text_identity_epochs().1)
+        );
+        assert_eq!(
+            Graph::open(&dir)
+                .load_by_path("pages/A.md")
+                .unwrap()
+                .unwrap()
+                .blocks[0]
+                .raw,
+            "committed before publication failed"
+        );
+
+        guarded_test_resave(&graph_b, &mut page_b, "sibling rebuilt").unwrap();
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_identity_tracks_external_create_delete_rename_hardlink_and_overflow() {
+        let dir = scratch("guarded-external-transitions");
+        let primary = dir.join("pages/A.md");
+        let other = dir.join("pages/Other.md");
+        let renamed = dir.join("pages/Renamed.md");
+        let alias = dir.join("pages/Alias.md");
+        fs::write(&primary, "- original\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/A.md").unwrap().unwrap();
+
+        guarded_test_resave(&graph, &mut page, "baseline").unwrap();
+        assert_eq!(graph.guarded_graph_text_identity_stats().0, 1);
+
+        fs::write(&other, "- external\n").unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::once(other.as_path()), false)
+            .unwrap();
+        guarded_test_resave(&graph, &mut page, "after create").unwrap();
+
+        fs::rename(&other, &renamed).unwrap();
+        graph
+            .observe_graph_text_external_paths(
+                [other.as_path(), renamed.as_path()].into_iter(),
+                false,
+            )
+            .unwrap();
+        guarded_test_resave(&graph, &mut page, "after rename").unwrap();
+
+        fs::remove_file(&renamed).unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::once(renamed.as_path()), false)
+            .unwrap();
+        guarded_test_resave(&graph, &mut page, "after delete").unwrap();
+        assert_eq!(
+            graph.guarded_graph_text_identity_stats().0,
+            1,
+            "exact external final states do not rebuild the complete generation"
+        );
+
+        fs::hard_link(&primary, &alias).unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::once(alias.as_path()), false)
+            .unwrap();
+        assert!(graph.guarded_graph_text_identity_stats().2);
+        assert_eq!(
+            guarded_test_resave(&graph, &mut page, "hardlink refused")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(graph.guarded_graph_text_identity_stats().0, 2);
+
+        fs::remove_file(&alias).unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        assert!(graph.guarded_graph_text_identity_stats().2);
+        guarded_test_resave(&graph, &mut page, "after overflow rebuild").unwrap();
+        let stats = graph.guarded_graph_text_identity_stats();
+        assert_eq!(stats.0, 3, "overflow forces exactly one later rebuild");
+        assert!(!stats.2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guarded_identity_collision_classes_match_before_and_after_invalidation() {
+        for (label, first, sibling) in [
+            ("case", "Case.md", "case.md"),
+            ("nfc", "Caf\u{e9}.md", "Cafe\u{301}.md"),
+        ] {
+            let dir = scratch(&format!("guarded-portable-{label}"));
+            let first_path = dir.join("pages").join(first);
+            let sibling_path = dir.join("pages").join(sibling);
+            fs::write(&first_path, "- first\n").unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let mut page = graph
+                .load_by_path(&format!("pages/{first}"))
+                .unwrap()
+                .unwrap();
+            guarded_test_resave(&graph, &mut page, "baseline").unwrap();
+
+            fs::write(&sibling_path, "- sibling\n").unwrap();
+            graph
+                .observe_graph_text_external_paths(std::iter::once(sibling_path.as_path()), false)
+                .unwrap();
+            assert_eq!(
+                guarded_test_resave(&graph, &mut page, "retained refusal")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AlreadyExists,
+                "{label} collision must be refused by the exact retained delta"
+            );
+
+            graph
+                .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+                .unwrap();
+            assert_eq!(
+                guarded_test_resave(&graph, &mut page, "rebuilt refusal")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AlreadyExists,
+                "{label} collision must be refused after complete rebuild"
+            );
+            assert_eq!(graph.guarded_graph_text_identity_stats().0, 2);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // Semantic ownership is content-derived and must be visible at the
+        // watcher callback boundary, before deferred cache reconciliation.
+        let dir = scratch("guarded-semantic-collision");
+        fs::write(dir.join("pages/Anchor.md"), "- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut anchor = graph.load_by_path("pages/Anchor.md").unwrap().unwrap();
+        guarded_test_resave(&graph, &mut anchor, "baseline").unwrap();
+        let external = dir.join("pages/Physical Name.md");
+        fs::write(&external, "title:: Claimed Name\n\n- external\n").unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::once(external.as_path()), false)
+            .unwrap();
+        let claimed = markdown_page_dto("Claimed Name", "Claimed Name", "- local\n").unwrap();
+        assert_eq!(
+            graph.save_page(&claimed, None).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        assert_eq!(
+            graph.save_page(&claimed, None).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guarded_identity_update_failure_commits_cache_and_forces_one_safe_rebuild() {
+        let dir = scratch("guarded-index-update-failure");
+        fs::write(dir.join("pages/A.md"), "- original\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/A.md").unwrap().unwrap();
+        guarded_test_resave(&graph, &mut page, "baseline").unwrap();
+        assert_eq!(graph.guarded_graph_text_identity_stats().0, 1);
+
+        FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE.with(|fail| fail.set(true));
+        guarded_test_resave(&graph, &mut page, "committed across index failure").unwrap();
+        assert!(graph.guarded_graph_text_identity_stats().2);
+        assert_eq!(
+            Graph::open(&dir)
+                .load_by_path("pages/A.md")
+                .unwrap()
+                .unwrap()
+                .blocks[0]
+                .raw,
+            "committed across index failure"
+        );
+
+        guarded_test_resave(&graph, &mut page, "after safe rebuild").unwrap();
+        let stats = graph.guarded_graph_text_identity_stats();
+        assert_eq!(stats.0, 2);
+        assert!(!stats.2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -36794,7 +37841,7 @@ mod tests {
         let graph = Graph::open(&resource_root);
         let permit = graph.admit_retained_managed_text_writer().unwrap();
         let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-        let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture).unwrap();
+        let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
         assert!(permanent > 0);
         reset_graph_text_admission_test_counters();
         assert!(graph
@@ -36819,7 +37866,7 @@ mod tests {
         let second = collect_initial_shadow_managed_inventory(&graph, &permit, false).unwrap();
         let combined =
             checked_add_bytes(first.peak_build_charge, second.peak_build_charge).unwrap();
-        let permanent = graph_text_initial_permanent_upper_bound(&graph, &first).unwrap();
+        let permanent = graph_text_initial_permanent_upper_bound(&graph, &first, true).unwrap();
         let path = ManagedPath::parse("Page.md").unwrap();
         let semantic_budget =
             graph_text_observed_semantic_name_upper_bound(&graph, &path, &parser_content).unwrap();

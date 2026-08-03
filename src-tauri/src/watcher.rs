@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
 use tine_core::sync_runtime::{SyncRuntimeHandle, SyncRuntimeTick, SyncWatcherObservation};
-use tine_core::{model::PageKind, Graph};
+use tine_core::{model::GraphTextExactFeedPathClass, model::PageKind, Graph};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct GraphChange {
@@ -29,11 +29,12 @@ struct Pending {
 /// second legacy `Graph` or direct file watcher here.
 fn legacy_watch_paths(
     slot: &GraphSlot,
-) -> Result<(LegacyGraphLease, [PathBuf; 2], PathBuf), String> {
+) -> Result<(LegacyGraphLease, PathBuf, [PathBuf; 2], PathBuf), String> {
     let graph = slot.legacy_graph_cloned()?;
+    let root = slot.root_key.clone();
     let dirs = [graph.journals_path(), graph.pages_path()];
     let sync_dir = graph.managed_sync_store_path();
-    Ok((graph, dirs, sync_dir))
+    Ok((graph, root, dirs, sync_dir))
 }
 
 impl Pending {
@@ -454,6 +455,185 @@ fn pending_for_graph(paths: &HashSet<PathBuf>, dirs: &[PathBuf; 2]) -> HashSet<P
         .collect()
 }
 
+#[derive(Default)]
+struct LegacyGraphTextObservation {
+    exact_paths: Vec<PathBuf>,
+    uncertain: bool,
+    relevant: bool,
+}
+
+fn relative_graph_text_event_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    relative
+        .to_str()
+        .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+fn legacy_graph_text_observation(
+    graph: &Graph,
+    root: &Path,
+    event: Option<&notify::Event>,
+) -> LegacyGraphTextObservation {
+    use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
+
+    let Some(event) = event else {
+        return LegacyGraphTextObservation {
+            uncertain: true,
+            relevant: true,
+            ..LegacyGraphTextObservation::default()
+        };
+    };
+    if event.paths.is_empty() {
+        return LegacyGraphTextObservation {
+            uncertain: true,
+            relevant: true,
+            ..LegacyGraphTextObservation::default()
+        };
+    }
+
+    let owned = event
+        .paths
+        .iter()
+        .filter(|path| path.starts_with(root))
+        .collect::<Vec<_>>();
+    if owned.is_empty() {
+        return LegacyGraphTextObservation::default();
+    }
+
+    let mut observation = LegacyGraphTextObservation {
+        relevant: true,
+        uncertain: event.need_rescan(),
+        ..LegacyGraphTextObservation::default()
+    };
+    if observation.uncertain {
+        return observation;
+    }
+
+    let explicit_file_event = matches!(
+        event.kind,
+        EventKind::Create(CreateKind::File)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Metadata(_))
+            | EventKind::Remove(RemoveKind::File)
+    );
+    let rename_event = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
+    let rename_has_file_witness = rename_event
+        && event
+            .paths
+            .iter()
+            .any(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))
+        && !event
+            .paths
+            .iter()
+            .any(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()));
+
+    for path in owned {
+        let Some(relative) = relative_graph_text_event_path(root, path) else {
+            observation.uncertain = true;
+            break;
+        };
+        let class = match graph.classify_graph_text_exact_feed_path(&relative) {
+            Ok(class) => class,
+            Err(_) => {
+                observation.uncertain = true;
+                break;
+            }
+        };
+        match class {
+            GraphTextExactFeedPathClass::Excluded => continue,
+            GraphTextExactFeedPathClass::Configuration => {
+                observation.uncertain = true;
+                break;
+            }
+            GraphTextExactFeedPathClass::RetainedFile => {}
+            _ => {
+                observation.uncertain = true;
+                break;
+            }
+        }
+        let descendants_excluded = graph
+            .classify_graph_text_exact_feed_path(&format!(
+                "{relative}/__tine_watcher_descendant__.md"
+            ))
+            .is_ok_and(|class| class == GraphTextExactFeedPathClass::Excluded);
+
+        if explicit_file_event {
+            if path_is_existing_dir(path) {
+                if descendants_excluded {
+                    continue;
+                }
+                observation.uncertain = true;
+                break;
+            }
+            if is_page_file_path(path) {
+                observation.exact_paths.push(path.clone());
+            }
+        } else if rename_event {
+            if !rename_has_file_witness {
+                if descendants_excluded {
+                    continue;
+                }
+                observation.uncertain = true;
+                break;
+            }
+            if is_page_file_path(path) {
+                observation.exact_paths.push(path.clone());
+            }
+        } else {
+            if descendants_excluded {
+                continue;
+            }
+            observation.uncertain = true;
+            break;
+        }
+    }
+
+    if observation.uncertain {
+        observation.exact_paths.clear();
+    }
+    observation
+}
+
+fn observe_legacy_graph_text_event(
+    graph: &Graph,
+    root: &Path,
+    event: Option<&notify::Event>,
+) -> bool {
+    let observation = legacy_graph_text_observation(graph, root, event);
+    if !observation.relevant {
+        return false;
+    }
+    if observation.uncertain || !observation.exact_paths.is_empty() {
+        let _ = graph.observe_graph_text_external_paths(
+            observation.exact_paths.iter().map(PathBuf::as_path),
+            observation.uncertain,
+        );
+    }
+    true
+}
+
+/// Linearize a platform callback with guarded graph-text writes before the
+/// watcher's debounce/reconciliation delay. The callback does not mutate the
+/// cache; it only advances the core-owned retained identity generation (or
+/// marks it uncertain) under the same resource-scoped mutation authority that
+/// `Graph::save_page` uses.
+fn observe_legacy_graph_text_callback(app: &tauri::AppHandle, event: Option<&notify::Event>) {
+    let state = app.state::<AppState>();
+    let entries = match state.graphs.read() {
+        Ok(graphs) => graphs.entries(),
+        Err(_) => return,
+    };
+    for (_, slot) in entries {
+        let Ok((graph, root, _, _)) = legacy_watch_paths(&slot) else {
+            continue;
+        };
+        observe_legacy_graph_text_event(&graph, &root, event);
+    }
+}
+
 fn sparse_observations(
     root: &Path,
     paths: &HashSet<PathBuf>,
@@ -578,6 +758,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         struct WatchedGraph {
             legacy_graph: LegacyGraphLease,
+            root: PathBuf,
             dirs: [PathBuf; 2],
             sync_dir: PathBuf,
             snap: HashMap<PathBuf, FileStamp>,
@@ -627,14 +808,18 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     continue;
                 }
                 sparse_graphs.remove(&label);
-                let Ok((legacy_graph, dirs, sync_dir)) = legacy_watch_paths(&slot) else {
+                let Ok((legacy_graph, root, dirs, sync_dir)) = legacy_watch_paths(&slot) else {
                     // Sparse-v2 owns its actor in the slot. This legacy watcher
                     // must not retain or reopen a Graph for it.
                     graphs.remove(&label);
                     continue;
                 };
                 match graphs.get_mut(&label) {
-                    Some(current) if current.dirs == dirs && current.sync_dir == sync_dir => {
+                    Some(current)
+                        if current.root == root
+                            && current.dirs == dirs
+                            && current.sync_dir == sync_dir =>
+                    {
                         current.legacy_graph = legacy_graph;
                     }
                     _ => {
@@ -642,6 +827,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             label,
                             WatchedGraph {
                                 legacy_graph,
+                                root,
                                 dirs,
                                 sync_dir,
                                 snap: HashMap::new(),
@@ -656,23 +842,22 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
 
             let desired: HashSet<PathBuf> = graphs
                 .values()
-                .flat_map(|graph| {
-                    graph
-                        .dirs
-                        .iter()
-                        .cloned()
-                        .chain(graph.sync_dir.is_dir().then(|| graph.sync_dir.clone()))
-                })
+                .map(|graph| graph.root.clone())
                 .chain(sparse_graphs.values().map(|graph| graph.root.clone()))
                 .collect();
 
-            // Bring the OS watcher in line with the current mode + dirs.
+            // Bring the OS watcher in line with the current mode + graph roots.
             if inotify {
                 if watcher.is_none() {
                     let txc = tx.clone();
                     let pendingc = pending.clone();
+                    let appc = app.clone();
                     watcher =
                         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                            match &res {
+                                Ok(event) => observe_legacy_graph_text_callback(&appc, Some(event)),
+                                Err(_) => observe_legacy_graph_text_callback(&appc, None),
+                            }
                             if let Ok(mut p) = pendingc.lock() {
                                 match res {
                                     Ok(event) => p.add_event(event),
@@ -690,7 +875,8 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         watched.remove(&dir);
                     }
                     for dir in desired.difference(&watched).cloned().collect::<Vec<_>>() {
-                        // Recursive so nested graph pages wake the reconcile.
+                        // Recursive so the guarded-identity boundary includes
+                        // eligible graph text outside configured cache roots.
                         if w.watch(&dir, notify::RecursiveMode::Recursive).is_ok() {
                             watched.insert(dir);
                         }
@@ -719,6 +905,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             };
             for (label, graph) in graphs.iter_mut() {
                 let initial_cycle = !graph.baseline;
+                if initial_cycle || !inotify {
+                    let _ = graph
+                        .legacy_graph
+                        .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
+                }
                 if initial_cycle {
                     graph.snap = collect_graph_page_files(&graph.dirs);
                     graph.baseline = true;
@@ -978,6 +1169,7 @@ pub(crate) fn set_watch_mode(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tine_core::model::{BlockDto, Format, PageDto};
 
     #[test]
     fn atomic_page_save_temp_events_stay_incremental() {
@@ -1321,14 +1513,300 @@ mod tests {
     }
 
     #[test]
-    fn legacy_watch_paths_keep_existing_graph_paths() {
+    fn legacy_watch_paths_keep_the_bound_graph_root_and_existing_reconcile_paths() {
         let temp = TempGraph::new("legacy-authority");
         let slot = GraphSlot::new(Graph::open(&temp.root), temp.root.clone());
 
-        let (graph, dirs, sync_dir) = legacy_watch_paths(&slot).unwrap();
+        let (graph, root, dirs, sync_dir) = legacy_watch_paths(&slot).unwrap();
         assert_eq!(graph.root, temp.root);
+        assert_eq!(root, temp.root);
         assert_eq!(dirs, graph_dirs(&graph));
         assert_eq!(sync_dir, graph.managed_sync_store_path());
+    }
+
+    fn event(kind: notify::event::EventKind, paths: Vec<PathBuf>) -> notify::Event {
+        notify::Event {
+            kind,
+            paths,
+            attrs: Default::default(),
+        }
+    }
+
+    fn new_page(name: &str) -> PageDto {
+        PageDto {
+            name: name.to_owned(),
+            kind: PageKind::Page,
+            title: name.to_owned(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                id: format!("watcher-{}", name.replace(' ', "-")),
+                raw: "local".to_owned(),
+                ..BlockDto::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        }
+    }
+
+    fn warm_guarded_identity(graph: &Graph) {
+        warm_cache(graph);
+        let mut anchor = graph.load_by_path("pages/Anchor.md").unwrap().unwrap();
+        anchor.blocks[0].raw = "warm guarded identity".to_owned();
+        graph
+            .save_page(&anchor, anchor.rev.as_deref())
+            .expect("warm guarded identity save");
+    }
+
+    fn assert_new_page_refused(graph: &Graph, name: &str) {
+        assert_eq!(
+            graph.save_page(&new_page(name), None).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "{name} must remain owned by the observed external graph text"
+        );
+    }
+
+    #[test]
+    fn legacy_graph_root_text_create_delete_rename_and_semantics_reach_guarded_identity() {
+        use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
+
+        for extension in ["md", "org"] {
+            let graph_dir = TempGraph::new(&format!("root-text-{extension}"));
+            graph_dir.write("pages/Anchor.md", "- anchor\n");
+            let graph = Graph::open(&graph_dir.root);
+            warm_guarded_identity(&graph);
+
+            let created_rel = format!("nonstandard/deep/Physical Name.{extension}");
+            graph_dir.write(
+                &created_rel,
+                &format!("title:: Created {extension}\n\n- external\n"),
+            );
+            assert!(observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event(
+                    EventKind::Create(CreateKind::File),
+                    vec![graph_dir.path(&created_rel)],
+                )),
+            ));
+            assert_new_page_refused(&graph, &format!("Created {extension}"));
+
+            let deleted_rel = format!("nonstandard/deep/Delete {extension}.{extension}");
+            graph_dir.write(&deleted_rel, "- external\n");
+            observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event(
+                    EventKind::Create(CreateKind::File),
+                    vec![graph_dir.path(&deleted_rel)],
+                )),
+            );
+            assert_new_page_refused(&graph, &format!("Delete {extension}"));
+            graph_dir.remove(&deleted_rel);
+            let delete_event = event(
+                EventKind::Remove(RemoveKind::File),
+                vec![graph_dir.path(&deleted_rel)],
+            );
+            let deletion =
+                legacy_graph_text_observation(&graph, &graph_dir.root, Some(&delete_event));
+            assert!(!deletion.uncertain);
+            assert_eq!(deletion.exact_paths, vec![graph_dir.path(&deleted_rel)]);
+            observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&delete_event));
+
+            let old_rel = format!("nonstandard/deep/Old {extension}.{extension}");
+            let new_rel = format!("nonstandard/deep/New {extension}.{extension}");
+            graph_dir.write(&old_rel, "- external\n");
+            observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event(
+                    EventKind::Create(CreateKind::File),
+                    vec![graph_dir.path(&old_rel)],
+                )),
+            );
+            assert_new_page_refused(&graph, &format!("Old {extension}"));
+            graph_dir.rename(&old_rel, &new_rel);
+            let rename_event = event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                vec![graph_dir.path(&old_rel), graph_dir.path(&new_rel)],
+            );
+            let rename =
+                legacy_graph_text_observation(&graph, &graph_dir.root, Some(&rename_event));
+            assert!(!rename.uncertain);
+            assert_eq!(
+                rename.exact_paths,
+                vec![graph_dir.path(&old_rel), graph_dir.path(&new_rel)]
+            );
+            observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&rename_event));
+            assert_new_page_refused(&graph, &format!("New {extension}"));
+        }
+    }
+
+    #[test]
+    fn legacy_uncertain_graph_root_events_advance_the_shared_resource_epoch() {
+        use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
+        use notify::event::{EventAttributes, Flag};
+
+        for case in [
+            "config",
+            "root-create",
+            "directory-rename",
+            "rescan",
+            "notify-error",
+        ] {
+            let graph_dir = TempGraph::new(&format!("uncertain-{case}"));
+            graph_dir.write("pages/Anchor.md", "- anchor\n");
+            let observer = Graph::open(&graph_dir.root);
+            let guarded = Graph::open(&graph_dir.root);
+            warm_guarded_identity(&guarded);
+            graph_dir.write(
+                "nonstandard/deep/Physical.md",
+                &format!("title:: Epoch {case}\n\n- external\n"),
+            );
+
+            let event = match case {
+                "config" => {
+                    graph_dir.write("logseq/config.edn", "{}\n");
+                    Some(event(
+                        EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+                        vec![graph_dir.path("logseq/config.edn")],
+                    ))
+                }
+                "root-create" => Some(event(
+                    EventKind::Create(CreateKind::Folder),
+                    vec![graph_dir.root.clone()],
+                )),
+                "directory-rename" => {
+                    std::fs::create_dir_all(graph_dir.path("nonstandard/from.md")).unwrap();
+                    graph_dir.rename("nonstandard/from.md", "nonstandard/to.md");
+                    Some(event(
+                        EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                        vec![
+                            graph_dir.path("nonstandard/from.md"),
+                            graph_dir.path("nonstandard/to.md"),
+                        ],
+                    ))
+                }
+                "rescan" => {
+                    let mut attrs = EventAttributes::new();
+                    attrs.set_flag(Flag::Rescan);
+                    Some(notify::Event {
+                        kind: EventKind::Other,
+                        paths: Vec::new(),
+                        attrs,
+                    })
+                }
+                "notify-error" => None,
+                _ => unreachable!(),
+            };
+            let observation =
+                legacy_graph_text_observation(&observer, &graph_dir.root, event.as_ref());
+            assert!(observation.relevant, "{case}");
+            assert!(observation.uncertain, "{case}");
+            assert!(observe_legacy_graph_text_event(
+                &observer,
+                &graph_dir.root,
+                event.as_ref(),
+            ));
+            assert_new_page_refused(&guarded, &format!("Epoch {case}"));
+        }
+    }
+
+    #[test]
+    fn legacy_graph_root_observation_excludes_other_open_graphs() {
+        use notify::event::{CreateKind, EventKind};
+
+        let graph_a_dir = TempGraph::new("root-owner-a");
+        let graph_b_dir = TempGraph::new("root-owner-b");
+        graph_a_dir.write("pages/Anchor.md", "- anchor A\n");
+        graph_b_dir.write("pages/Anchor.md", "- anchor B\n");
+        let graph_a = Graph::open(&graph_a_dir.root);
+        let graph_b = Graph::open(&graph_b_dir.root);
+        warm_guarded_identity(&graph_b);
+
+        graph_b_dir.write(
+            "nonstandard/deep/Stale.md",
+            "title:: Must Stay Stale\n\n- external without a B callback\n",
+        );
+        graph_a_dir.write("nonstandard/deep/A.md", "- observed A\n");
+        let event_a = event(
+            EventKind::Create(CreateKind::File),
+            vec![graph_a_dir.path("nonstandard/deep/A.md")],
+        );
+        assert!(observe_legacy_graph_text_event(
+            &graph_a,
+            &graph_a_dir.root,
+            Some(&event_a),
+        ));
+        assert!(!observe_legacy_graph_text_event(
+            &graph_b,
+            &graph_b_dir.root,
+            Some(&event_a),
+        ));
+        graph_b
+            .save_page(&new_page("Must Stay Stale"), None)
+            .expect("an event owned by graph A must not invalidate graph B");
+    }
+
+    #[test]
+    fn excluded_private_text_and_exact_non_text_events_are_harmless() {
+        use notify::event::{CreateKind, EventKind};
+
+        let graph_dir = TempGraph::new("excluded-private");
+        graph_dir.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&graph_dir.root);
+        warm_guarded_identity(&graph);
+
+        for (relative, claimed) in [
+            (".tine-sync/private/Sync.md", "Excluded Sync"),
+            ("assets/private/Asset.org", "Excluded Asset"),
+            ("logseq/bak/recovery.md", "Excluded Recovery"),
+            (".hidden/private.md", "Excluded Hidden"),
+        ] {
+            graph_dir.write(relative, &format!("title:: {claimed}\n\n- private\n"));
+            let event = event(
+                EventKind::Create(CreateKind::File),
+                vec![graph_dir.path(relative)],
+            );
+            let observation = legacy_graph_text_observation(&graph, &graph_dir.root, Some(&event));
+            assert!(observation.relevant, "{relative}");
+            assert!(!observation.uncertain, "{relative}");
+            assert!(observation.exact_paths.is_empty(), "{relative}");
+            observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&event));
+            graph
+                .save_page(&new_page(claimed), None)
+                .expect("excluded text must not become a retained graph-text owner");
+        }
+
+        graph_dir.write(
+            "nonstandard/deep/Stale.md",
+            "title:: Exact Non Text Is Harmless\n\n- unobserved\n",
+        );
+        graph_dir.write("nonstandard/deep/image.png", "not graph text\n");
+        let non_text = event(
+            EventKind::Create(CreateKind::File),
+            vec![graph_dir.path("nonstandard/deep/image.png")],
+        );
+        let observation = legacy_graph_text_observation(&graph, &graph_dir.root, Some(&non_text));
+        assert!(!observation.uncertain);
+        assert!(observation.exact_paths.is_empty());
+        observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&non_text));
+        graph
+            .save_page(&new_page("Exact Non Text Is Harmless"), None)
+            .expect("an exact non-text event must not invalidate retained identity");
+
+        for relative in [".tine-sync", "assets", "logseq/bak", ".hidden"] {
+            let private_directory = event(
+                EventKind::Create(CreateKind::Folder),
+                vec![graph_dir.path(relative)],
+            );
+            let observation =
+                legacy_graph_text_observation(&graph, &graph_dir.root, Some(&private_directory));
+            assert!(!observation.uncertain, "{relative}");
+            assert!(observation.exact_paths.is_empty(), "{relative}");
+        }
     }
 
     fn graph_dirs(graph: &Graph) -> [PathBuf; 2] {

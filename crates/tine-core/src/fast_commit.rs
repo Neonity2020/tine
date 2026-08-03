@@ -158,11 +158,11 @@ pub(crate) fn note_application_page_load() {
 /// Whole-graph work an ordinary edit performs but has no latency budget for.
 ///
 /// The fast commit's own spine performs none of it. The audited guarded
-/// replacement it is contractually required to reuse re-derives the graph's
-/// text inventory on every save, to prove that no other path shares the
-/// target's portable case/NFC identity and that no other path aliases the same
-/// physical resource. Counting the entries that inventory visits turns a timing
-/// inference into an exact structural fact, at every graph size.
+/// replacement consults the retained graph-text identity generation, so these
+/// counters permanently prove that an ordinary warm save did not fall back to
+/// the complete inventory used after watcher uncertainty. Counting both scans
+/// and entries turns that contract into an exact structural fact at every graph
+/// size.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GraphWideCommitWork {
     /// Whole-graph text inventories derived.
@@ -902,23 +902,8 @@ mod tests {
         }
     }
 
-    /// The spine's own work must not depend on how big the graph is, and the
-    /// work that *does* depend on graph size must be attributable to exactly one
-    /// place. Both halves are asserted as identities at two graph sizes.
-    ///
-    /// The second half pins today's measured boundary: the audited guarded
-    /// replacement re-derives the whole graph's text inventory on every save, to
-    /// prove no other path shares the target's portable identity and no other
-    /// path aliases the same physical resource. That is the cost the release
-    /// benchmark measures and the ordinary-edit latency contract cannot absorb.
-    /// When that changes, this test must change with it — deliberately, and with
-    /// the reason recorded.
-    /// Whole-graph text inventories one audited guarded replacement derives.
-    /// Measured, not assumed; see the test below.
-    const INVENTORIES_PER_AUDITED_REPLACEMENT: usize = 4;
-
     #[test]
-    fn the_spine_costs_the_same_at_every_graph_size_and_the_audited_replacement_does_not() {
+    fn warm_guarded_saves_do_identical_work_at_four_and_four_hundred_pages() {
         let mut observations = Vec::new();
         for pages in [4_usize, 400] {
             let fixture = GraphFixture::build(
@@ -934,8 +919,7 @@ mod tests {
             let mut current = fixture.load(1);
             committer.adopt_loaded_page(&current).unwrap();
 
-            let mut forbidden = ForbiddenCommitWork::default();
-            let mut graph_wide = GraphWideCommitWork::default();
+            let mut warm_work = Vec::new();
             for generation in 1..=3 {
                 let base_rev = current.rev.clone().unwrap();
                 let (edited, effect) = content_edit(&current, 1, 0, generation);
@@ -945,13 +929,22 @@ mod tests {
                     .commit(edited, &base_rev, FastCommitIntent::SemanticEffect(&effect))
                     .unwrap()
                     .page;
-                forbidden = forbidden_commit_work().since(before);
-                graph_wide = graph_wide_commit_work().since(graph_wide_before);
+                if generation > 1 {
+                    warm_work.push((
+                        forbidden_commit_work().since(before),
+                        graph_wide_commit_work().since(graph_wide_before),
+                    ));
+                }
             }
-            observations.push((pages, committer.journal_stats(), forbidden, graph_wide));
+            observations.push((
+                pages,
+                committer.journal_stats(),
+                warm_work,
+                fixture.graph.guarded_graph_text_identity_stats(),
+            ));
         }
 
-        let [(_, small_journal, small_forbidden, small_graph_wide), (_, large_journal, large_forbidden, large_graph_wide)] =
+        let [(_, small_journal, small_work, small_index), (_, large_journal, large_work, large_index)] =
             observations.as_slice()
         else {
             unreachable!("two observations")
@@ -963,32 +956,19 @@ mod tests {
             small_journal, large_journal,
             "the journal spine must do identical work at every graph size"
         );
-        assert!(small_forbidden.is_none() && large_forbidden.is_none());
-
-        // The audited replacement: a fixed number of whole-graph inventories per
-        // commit, each visiting the whole graph. Both terms are pinned, because
-        // both are what the ordinary-edit latency contract cannot absorb.
         assert_eq!(
-            (
-                small_graph_wide.text_inventory_scans,
-                large_graph_wide.text_inventory_scans
-            ),
-            (
-                INVENTORIES_PER_AUDITED_REPLACEMENT,
-                INVENTORIES_PER_AUDITED_REPLACEMENT
-            ),
-            "the audited replacement re-derives the whole-graph text inventory a fixed \
-             number of times per save"
+            small_index.0, 1,
+            "the lazy complete build runs exactly once"
         );
-        // Four inventories minus the one entry the target-excluding pass skips.
-        let expected = |pages: usize| pages * INVENTORIES_PER_AUDITED_REPLACEMENT - 1;
+        assert_eq!(large_index.0, 1, "graph size cannot change build count");
+        assert_eq!(small_index.1, 3, "each Tine save advances one exact delta");
+        assert_eq!(large_index.1, 3, "exact delta count is size-independent");
+        assert!(small_work.iter().all(|(forbidden, graph_wide)| {
+            forbidden.is_none() && *graph_wide == GraphWideCommitWork::default()
+        }));
         assert_eq!(
-            (
-                small_graph_wide.text_inventory_entries,
-                large_graph_wide.text_inventory_entries
-            ),
-            (expected(4), expected(400)),
-            "the entries one commit visits are proportional to total graph pages"
+            small_work, large_work,
+            "every repeated warm replacement must do identical graph-size-invariant work"
         );
     }
 
