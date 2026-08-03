@@ -7100,6 +7100,30 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        if self.clean_startup_projection_read_available() {
+            let read = runtime
+                .database()
+                .materialized_read()
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            ensure_editor_frontier(runtime, read.acceptance_sequence())
+                .map_err(map_editor_application_error)?;
+            match read
+                .pages_by_path(&path, 2)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+                .as_slice()
+            {
+                [page] if page.path == path => {
+                    return self
+                        .load_application_page_id_ready(page.page_id)
+                        .map(ApplicationExactLoad::Loaded)
+                }
+                [] => return Ok(ApplicationExactLoad::Missing),
+                // Duplicate or malformed projected rows are exceptional. Keep
+                // the established authenticated catalog route for them rather
+                // than making SQLite decide their exact-path semantics.
+                _ => {}
+            }
+        }
         let page_id = match runtime
             .engine()
             .current_page_at_path(&path)
@@ -7129,6 +7153,15 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        if self.clean_startup_projection_read_available() {
+            return load_projected_source_authenticated_application_page(
+                runtime,
+                &self.graph,
+                page_id,
+            )
+            .map_err(map_editor_application_error)?
+            .ok_or(SyncApplicationPageRequestError::ActorRefused);
+        }
         load_hot_source_authenticated_application_page(runtime, &self.graph, page_id)
             .map_err(map_editor_application_error)?
             .ok_or(SyncApplicationPageRequestError::ActorRefused)
@@ -7378,7 +7411,16 @@ impl RuntimeActor {
                         .runtime
                         .as_ref()
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?
+                    if self.clean_startup_projection_read_available() {
+                        load_projected_source_authenticated_application_page(
+                            runtime,
+                            &self.graph,
+                            page_id,
+                        )?
+                        .map(|current| current.editor)
+                    } else {
+                        load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?
+                    }
                 };
                 if current.is_none() && self.clean_startup_projection_read_available() {
                     if let EditorTurnReadiness::Deferred(state) =
@@ -7426,11 +7468,20 @@ impl RuntimeActor {
                             .runtime
                             .as_ref()
                             .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                        let current = load_hot_source_authenticated_editor_page(
-                            runtime,
-                            &self.graph,
-                            page_id,
-                        )?
+                        let current = if self.clean_startup_projection_read_available() {
+                            load_projected_source_authenticated_application_page(
+                                runtime,
+                                &self.graph,
+                                page_id,
+                            )?
+                            .map(|current| current.editor)
+                        } else {
+                            load_hot_source_authenticated_editor_page(
+                                runtime,
+                                &self.graph,
+                                page_id,
+                            )?
+                        }
                         .ok_or(SyncEditorRequestError::ActorRefused)?;
                         Ok(SyncEditorLoadOutcome::Loaded { page: current.dto })
                     }
@@ -13100,6 +13151,23 @@ fn load_hot_source_authenticated_application_page(
         .map_err(|_| SyncEditorRequestError::ActorRefused)
 }
 
+fn load_projected_source_authenticated_application_page(
+    runtime: &PromotedLocalRuntime,
+    graph: &Graph,
+    page_id: PageId,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    let Some(current) = load_current_editor_page(runtime, page_id)? else {
+        return Ok(None);
+    };
+    let parsed = graph
+        .load_by_path(current.page.path.as_str())
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?
+        .ok_or(SyncEditorRequestError::ActorRefused)?;
+    join_application_page(parsed, current)
+        .map(Some)
+        .map_err(|_| SyncEditorRequestError::ActorRefused)
+}
+
 fn load_hot_source_authenticated_editor_page(
     runtime: &PromotedLocalRuntime,
     graph: &Graph,
@@ -15487,7 +15555,10 @@ mod tests {
         ));
         assert_eq!(org.format, Format::Org);
         assert_eq!(org.path, org_path);
-        assert_eq!(load_application_exact(&handle, org_path).1, org_revision);
+        assert_eq!(handle.status().unwrap().managed_local_pending, 2);
+        let hot_org = load_application_exact(&handle, org_path);
+        assert_eq!(hot_org.0.blocks[0].raw, "org one");
+        assert_eq!(hot_org.1, org_revision);
 
         for revision_number in 2..=13 {
             (markdown, markdown_revision) = save_application_block_text(
@@ -28266,7 +28337,8 @@ mod tests {
                     10,
                 );
                 let mut expected_graph = user_graph_bytes(&fixture.graph_root);
-                assert_eq!(expected_graph.len(), total_pages);
+                let (source_pages, _, _) = activation_source_counts(&fixture.graph_root);
+                assert_eq!(source_pages, total_pages);
                 let request = reopen_request(&fixture.request);
 
                 // Activation/import and its startup catch-up are intentionally
@@ -28417,7 +28489,8 @@ mod tests {
                     10,
                 );
                 let mut direct_expected_graph = user_graph_bytes(&direct_fixture.graph_root);
-                assert_eq!(direct_expected_graph.len(), total_pages);
+                let (source_pages, _, _) = activation_source_counts(&direct_fixture.graph_root);
+                assert_eq!(source_pages, total_pages);
                 let direct_graph = Graph::open_checked(&direct_fixture.graph_root)
                     .expect("direct fixture graph opens");
                 direct_graph.warm_cache();
