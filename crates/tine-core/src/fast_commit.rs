@@ -307,9 +307,7 @@ pub enum FastCommitError {
 impl fmt::Display for FastCommitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnpinnedPage => {
-                formatter.write_str("a fast commit requires a path-pinned page")
-            }
+            Self::UnpinnedPage => formatter.write_str("a fast commit requires a path-pinned page"),
             Self::UntrackedPage(path) => {
                 write!(formatter, "no trusted-local base is retained for {path}")
             }
@@ -482,7 +480,6 @@ impl FastLocalCommitter {
     }
 }
 
-
 #[cfg(test)]
 mod fixtures {
     //! Shared synthetic-graph builders for the fast-commit proofs and the
@@ -582,7 +579,8 @@ mod fixtures {
             }
             let journal_root = root.join("private");
             fs::create_dir_all(&journal_root).unwrap();
-            let graph = Arc::new(Graph::open_checked(&graph_root).expect("the synthetic graph opens"));
+            let graph =
+                Arc::new(Graph::open_checked(&graph_root).expect("the synthetic graph opens"));
             Self {
                 root,
                 graph_root,
@@ -641,7 +639,6 @@ mod fixtures {
                 .join(super::FAST_COMMIT_JOURNAL_DIR)
                 .join(format!("{}.journal", device.simple()))
         }
-
     }
 
     impl Drop for GraphFixture {
@@ -721,7 +718,9 @@ mod fixtures {
     }
 
     /// The semantics a proof compares: what the page says, not how it is stored.
-    pub(super) fn page_semantics(page: &PageDto) -> (String, PageKind, Option<String>, Vec<String>) {
+    pub(super) fn page_semantics(
+        page: &PageDto,
+    ) -> (String, PageKind, Option<String>, Vec<String>) {
         fn flatten(blocks: &[crate::BlockDto], into: &mut Vec<String>) {
             for block in blocks {
                 into.push(block.raw.clone());
@@ -730,18 +729,15 @@ mod fixtures {
         }
         let mut blocks = Vec::new();
         flatten(&page.blocks, &mut blocks);
-        (
-            page.name.clone(),
-            page.kind,
-            page.pre_block.clone(),
-            blocks,
-        )
+        (page.name.clone(), page.kind, page.pre_block.clone(), blocks)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{content_edit, page_semantics, FixtureFormat, GraphFixture, DEFAULT_BLOCKS_PER_PAGE};
+    use super::fixtures::{
+        content_edit, page_semantics, FixtureFormat, GraphFixture, DEFAULT_BLOCKS_PER_PAGE,
+    };
     use super::*;
 
     use std::fs;
@@ -759,11 +755,11 @@ mod tests {
         std::env::temp_dir()
     }
 
-    fn journal_frames(
-        committer: &FastLocalCommitter,
-    ) -> Vec<LocalJournalFrame<ObjectKind>> {
+    fn journal_frames(committer: &FastLocalCommitter) -> Vec<LocalJournalFrame<ObjectKind>> {
         let mut frames = Vec::new();
-        committer.replay_journal(|frame| frames.push(frame)).unwrap();
+        committer
+            .replay_journal(|frame| frames.push(frame))
+            .unwrap();
         frames
     }
 
@@ -792,7 +788,11 @@ mod tests {
             let (edited, effect) = content_edit(&loaded, 2, 3, 1);
             let before_syncs = committer.journal_stats().data_durability_syncs;
             let outcome = committer
-                .commit(edited.clone(), &base_rev, FastCommitIntent::SemanticEffect(&effect))
+                .commit(
+                    edited.clone(),
+                    &base_rev,
+                    FastCommitIntent::SemanticEffect(&effect),
+                )
                 .unwrap();
 
             // One durable journal record, one durability barrier.
@@ -863,8 +863,12 @@ mod tests {
 
             for generation in 1..=5 {
                 let base_rev = current.rev.clone().unwrap();
-                let (edited, effect) =
-                    content_edit(&current, 1, generation % DEFAULT_BLOCKS_PER_PAGE, generation);
+                let (edited, effect) = content_edit(
+                    &current,
+                    1,
+                    generation % DEFAULT_BLOCKS_PER_PAGE,
+                    generation,
+                );
                 let before = forbidden_commit_work();
                 let outcome = committer
                     .commit(edited, &base_rev, FastCommitIntent::SemanticEffect(&effect))
@@ -955,7 +959,10 @@ mod tests {
 
         // The spine: identical at both graph sizes.
         assert_eq!(small_journal.frames_appended, 3);
-        assert_eq!(small_journal, large_journal, "the journal spine must do identical work at every graph size");
+        assert_eq!(
+            small_journal, large_journal,
+            "the journal spine must do identical work at every graph size"
+        );
         assert!(small_forbidden.is_none() && large_forbidden.is_none());
 
         // The audited replacement: a fixed number of whole-graph inventories per
@@ -966,7 +973,10 @@ mod tests {
                 small_graph_wide.text_inventory_scans,
                 large_graph_wide.text_inventory_scans
             ),
-            (INVENTORIES_PER_AUDITED_REPLACEMENT, INVENTORIES_PER_AUDITED_REPLACEMENT),
+            (
+                INVENTORIES_PER_AUDITED_REPLACEMENT,
+                INVENTORIES_PER_AUDITED_REPLACEMENT
+            ),
             "the audited replacement re-derives the whole-graph text inventory a fixed \
              number of times per save"
         );
@@ -1534,8 +1544,10 @@ mod benchmark {
         );
         let sizes = graph_sizes();
         let formats = formats();
-        let blocks_per_page =
-            environment_usize("TINE_FAST_COMMIT_BENCH_BLOCKS_PER_PAGE", DEFAULT_BLOCKS_PER_PAGE);
+        let blocks_per_page = environment_usize(
+            "TINE_FAST_COMMIT_BENCH_BLOCKS_PER_PAGE",
+            DEFAULT_BLOCKS_PER_PAGE,
+        );
         let edits = environment_usize("TINE_FAST_COMMIT_BENCH_EDITS", 100);
         let warmups = environment_usize("TINE_FAST_COMMIT_BENCH_WARMUPS", 10);
 
@@ -1647,10 +1659,16 @@ mod benchmark {
             );
             if receipt.surface.is_receipt() {
                 if !hard {
-                    failures.push(format!("{key}: p50 {:.3}ms > 10ms", milliseconds(receipt.p50())));
+                    failures.push(format!(
+                        "{key}: p50 {:.3}ms > 10ms",
+                        milliseconds(receipt.p50())
+                    ));
                 }
                 if !tail {
-                    failures.push(format!("{key}: p95 {:.3}ms > 20ms", milliseconds(receipt.p95())));
+                    failures.push(format!(
+                        "{key}: p95 {:.3}ms > 20ms",
+                        milliseconds(receipt.p95())
+                    ));
                 }
             }
         }
