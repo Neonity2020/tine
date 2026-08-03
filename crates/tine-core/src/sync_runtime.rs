@@ -144,7 +144,7 @@ use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
     decode_managed_local_record, BatchId, BatchOrigin, BlockId, BlockLocation,
     CanonicalGraphResourceId, ContentDigest, CurrentPageAtPath, DeviceId, DocumentId,
-    FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqUuid,
+    FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin, LogseqUuid,
     ManagedLocalJournalPayloadKind, ManagedPath, ManagedTextKind, MaterializedBlock,
     MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
     MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
@@ -5696,6 +5696,7 @@ enum EditorTurnReadiness {
     Deferred(SyncEditorDeferred),
 }
 
+#[derive(Clone)]
 struct EditorCurrentPage {
     page: MaterializedPage,
     blocks: Vec<MaterializedBlock>,
@@ -7416,9 +7417,62 @@ impl RuntimeActor {
                 _ => {}
             }
         }
+        self.load_hot_application_exact_ready(&path)
+    }
+
+    fn load_application_save_exact_ready(
+        &self,
+        path: &str,
+    ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
+        let path = ManagedPath::parse(path.to_owned()).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            )
+        })?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        if let [page] = read
+            .pages_by_path(&path, 2)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+            .as_slice()
+        {
+            if page.path == path {
+                if let Ok(Some(current)) = load_projected_source_rebased_application_page(
+                    runtime,
+                    &self.graph,
+                    page.page_id,
+                ) {
+                    if current.editor.page.path == path {
+                        return Ok(ApplicationExactLoad::Loaded(current));
+                    }
+                }
+            }
+        }
+        // Missing, duplicate, and structurally malformed projected rows are
+        // exceptional. Authenticate those bounded cases through the retained
+        // engine state instead of allowing SQLite alone to decide them.
+        self.load_hot_application_exact_ready(&path)
+    }
+
+    fn load_hot_application_exact_ready(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
         let page_id = match runtime
             .engine()
-            .current_page_at_path(&path)
+            .current_page_at_path(path)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
         {
             CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
@@ -7430,8 +7484,10 @@ impl RuntimeActor {
                 return Ok(ApplicationExactLoad::Ambiguous)
             }
         };
-        let current = self.load_application_page_id_ready(page_id)?;
-        if current.editor.page.path != path {
+        let current = load_hot_source_authenticated_application_page(runtime, &self.graph, page_id)
+            .map_err(map_editor_application_error)?
+            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        if current.editor.page.path != *path {
             return Err(SyncApplicationPageRequestError::ActorRefused);
         }
         Ok(ApplicationExactLoad::Loaded(current))
@@ -7466,9 +7522,9 @@ impl RuntimeActor {
         if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncApplicationPageSaveOutcome::Deferred { state });
         }
-        let (editor_request, reload_target) = match &request.target {
+        let (editor_request, reload_target, prepared_existing) = match &request.target {
             SyncApplicationPageSaveTarget::Existing { path, revision } => {
-                let current = match self.load_application_exact_ready(path)? {
+                let mut current = match self.load_application_save_exact_ready(path)? {
                     ApplicationExactLoad::Loaded(current) => current,
                     ApplicationExactLoad::Missing => {
                         return Ok(SyncApplicationPageSaveOutcome::Conflict {
@@ -7481,6 +7537,26 @@ impl RuntimeActor {
                         })
                     }
                 };
+                if current.revision != *revision {
+                    // A just-accepted structural edit can leave SQLite at the
+                    // accepted frontier while its stable block identities lag
+                    // the page returned to the caller. Only this revision
+                    // disagreement takes the retained-engine fallback; an
+                    // ordinary exact SQLite/source rebase remains archive-free
+                    // before transaction execution.
+                    let managed_path = ManagedPath::parse(path.to_owned()).map_err(|_| {
+                        SyncApplicationPageRequestError::InvalidRequest(
+                            SyncApplicationPageInvalidRequest::InvalidPath,
+                        )
+                    })?;
+                    if let ApplicationExactLoad::Loaded(hot) =
+                        self.load_hot_application_exact_ready(&managed_path)?
+                    {
+                        if hot.revision == *revision {
+                            current = hot;
+                        }
+                    }
+                }
                 if current.revision != *revision {
                     return Ok(SyncApplicationPageSaveOutcome::Conflict {
                         reason: SyncApplicationPageConflict::StaleBase,
@@ -7506,6 +7582,7 @@ impl RuntimeActor {
                         blocks,
                     },
                     ApplicationSaveReloadTarget::ExistingPath(path.clone()),
+                    Some(current),
                 )
             }
             SyncApplicationPageSaveTarget::New { name, page_kind } => {
@@ -7546,14 +7623,15 @@ impl RuntimeActor {
                         blocks: application_editor_blocks_new(&request.page)?,
                     },
                     ApplicationSaveReloadTarget::CreatedPage,
+                    None,
                 )
             }
         };
         validate_editor_save_request(&editor_request).map_err(map_editor_application_error)?;
-        match self
-            .save_editor_page(editor_request)
-            .map_err(map_editor_application_error)?
-        {
+        let editor_outcome = self
+            .save_editor_page_with_existing_application(editor_request, prepared_existing)
+            .map_err(map_editor_application_error)?;
+        match editor_outcome {
             SyncEditorSaveOutcome::Durable { batch_id, page, .. } => {
                 let accepted = match self.prepared_application_reply.take() {
                     Some((prepared_batch, accepted)) if prepared_batch == batch_id => accepted,
@@ -7567,9 +7645,21 @@ impl RuntimeActor {
                 })
             }
             SyncEditorSaveOutcome::Unchanged { page, .. } => {
-                let accepted = self.load_application_page_id_ready(
-                    parse_editor_page_id(&page.page_id).map_err(map_editor_application_error)?,
-                )?;
+                let accepted = match reload_target {
+                    ApplicationSaveReloadTarget::ExistingPath(path) => {
+                        match self.load_application_save_exact_ready(&path)? {
+                            ApplicationExactLoad::Loaded(current) => current,
+                            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                                return Err(SyncApplicationPageRequestError::ActorRefused)
+                            }
+                        }
+                    }
+                    ApplicationSaveReloadTarget::CreatedPage => self
+                        .load_application_page_id_ready(
+                            parse_editor_page_id(&page.page_id)
+                                .map_err(map_editor_application_error)?,
+                        )?,
+                };
                 Ok(SyncApplicationPageSaveOutcome::Unchanged {
                     page: accepted.page,
                     revision: accepted.revision,
@@ -7798,6 +7888,14 @@ impl RuntimeActor {
         &mut self,
         request: SyncEditorSaveRequest,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
+        self.save_editor_page_with_existing_application(request, None)
+    }
+
+    fn save_editor_page_with_existing_application(
+        &mut self,
+        request: SyncEditorSaveRequest,
+        mut prepared_existing: Option<ApplicationCurrentPage>,
+    ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         self.prepared_application_reply = None;
         if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncEditorSaveOutcome::Deferred {
@@ -7805,7 +7903,6 @@ impl RuntimeActor {
                 affected_page_ids: Vec::new(),
             });
         }
-
         let (page_id, transaction, affected_page_ids, existing_application, trusted_target_page) =
             match &request.target {
                 SyncEditorSaveTarget::Existing { page_id, revision } => {
@@ -7814,23 +7911,33 @@ impl RuntimeActor {
                         .runtime
                         .as_ref()
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    let Some(current_application) = load_hot_source_authenticated_application_page(
-                        runtime,
-                        &self.graph,
-                        page_id,
-                    )?
-                    else {
-                        return Ok(SyncEditorSaveOutcome::Conflict {
-                            reason: SyncEditorConflict::MissingPage,
-                        });
+                    let (current_application, requires_hot_recheck) = match prepared_existing.take()
+                    {
+                        Some(current) if current.editor.page.page_id == page_id => (current, false),
+                        Some(_) => return Err(SyncEditorRequestError::ActorRefused),
+                        None => {
+                            let Some(current) = load_hot_source_authenticated_application_page(
+                                runtime,
+                                &self.graph,
+                                page_id,
+                            )?
+                            else {
+                                return Ok(SyncEditorSaveOutcome::Conflict {
+                                    reason: SyncEditorConflict::MissingPage,
+                                });
+                            };
+                            (current, true)
+                        }
                     };
                     let current = &current_application.editor;
-                    let authoritative = runtime
-                        .engine()
-                        .materialize_page(page_id)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-                    if !editor_materialization_matches(&authoritative, &current.page) {
-                        return Err(SyncEditorRequestError::ActorRefused);
+                    if requires_hot_recheck {
+                        let authoritative = runtime
+                            .engine()
+                            .materialize_page(page_id)
+                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        if !editor_materialization_matches(&authoritative, &current.page) {
+                            return Err(SyncEditorRequestError::ActorRefused);
+                        }
                     }
                     if current.dto.revision != *revision {
                         return Ok(SyncEditorSaveOutcome::Conflict {
@@ -7886,21 +7993,19 @@ impl RuntimeActor {
                         ManagedTextKind::Journal => PageKind::Journal,
                     };
                     trusted_target_page.rev = current_application.page.rev.clone();
-                    match runtime
-                        .engine()
-                        .current_page_for_logical_name(&final_name)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-                    {
-                        Some(owner) if owner != page_id => {
-                            return Ok(SyncEditorSaveOutcome::Conflict {
-                                reason: SyncEditorConflict::PageAlreadyExists,
-                            })
+                    if final_name != current.page.name {
+                        match runtime
+                            .engine()
+                            .current_page_for_logical_name(&final_name)
+                            .map_err(|_| SyncEditorRequestError::ActorRefused)?
+                        {
+                            Some(owner) if owner != page_id => {
+                                return Ok(SyncEditorSaveOutcome::Conflict {
+                                    reason: SyncEditorConflict::PageAlreadyExists,
+                                })
+                            }
+                            Some(_) | None => {}
                         }
-                        Some(_) => {}
-                        None if final_name == current.page.name => {
-                            return Err(SyncEditorRequestError::ActorRefused)
-                        }
-                        None => {}
                     }
 
                     let mut operations = Vec::new();
@@ -13707,6 +13812,134 @@ fn load_projected_source_authenticated_application_page(
         .map_err(|_| SyncEditorRequestError::ActorRefused)
 }
 
+fn load_projected_source_rebased_application_page(
+    runtime: &PromotedLocalRuntime,
+    graph: &Graph,
+    page_id: PageId,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    let Some(mut current) = load_projected_editor_page(runtime, page_id)? else {
+        return Ok(None);
+    };
+    let parsed = graph
+        .load_by_path(current.page.path.as_str())
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?
+        .ok_or(SyncEditorRequestError::ActorRefused)?;
+    rebase_projected_editor_page_from_source(&mut current, &parsed)?;
+    join_application_page(parsed, current)
+        .map(Some)
+        .map_err(|_| SyncEditorRequestError::ActorRefused)
+}
+
+fn rebase_projected_editor_page_from_source(
+    editor: &mut EditorCurrentPage,
+    parsed: &PageDto,
+) -> Result<(), SyncEditorRequestError> {
+    if parsed.guide || parsed.path != editor.page.path.as_str() {
+        return Err(SyncEditorRequestError::ActorRefused);
+    }
+    let parsed_blocks = flatten_application_blocks(&parsed.blocks);
+    if parsed_blocks.len() != editor.dto.blocks.len() || parsed_blocks.len() != editor.blocks.len()
+    {
+        return Err(SyncEditorRequestError::ActorRefused);
+    }
+    let materialized = editor
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    let sparse_indexes = editor
+        .dto
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| match &block.key {
+            SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id).map(|id| (id, index)),
+            SyncEditorBlockKey::Temporary(_) => Err(SyncEditorRequestError::ActorRefused),
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    if materialized.len() != editor.blocks.len() || sparse_indexes.len() != editor.dto.blocks.len()
+    {
+        return Err(SyncEditorRequestError::ActorRefused);
+    }
+
+    let mut source_content = HashMap::with_capacity(parsed_blocks.len());
+    for (index, parsed_block) in parsed_blocks.iter().enumerate() {
+        let sparse_id = match &editor.dto.blocks[index].key {
+            SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id)?,
+            SyncEditorBlockKey::Temporary(_) => return Err(SyncEditorRequestError::ActorRefused),
+        };
+        let projected = materialized
+            .get(&sparse_id)
+            .ok_or(SyncEditorRequestError::ActorRefused)?;
+        let projected_parent_index = projected
+            .parent
+            .map(|parent| {
+                sparse_indexes
+                    .get(&parent)
+                    .copied()
+                    .ok_or(SyncEditorRequestError::ActorRefused)
+            })
+            .transpose()?;
+        if parsed_block.parent != projected_parent_index {
+            return Err(SyncEditorRequestError::ActorRefused);
+        }
+        let raw_logseq_ids = parsed_block
+            .block
+            .properties
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("id"))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        match raw_logseq_ids.as_slice() {
+            [] => match (projected.logseq_uuid, projected.logseq_identity_origin) {
+                (None, None) | (Some(_), Some(LogseqIdentityOrigin::PolicyGenerated { .. })) => {}
+                _ => return Err(SyncEditorRequestError::ActorRefused),
+            },
+            [raw_uuid] => {
+                let parsed_uuid = Uuid::parse_str(raw_uuid)
+                    .map(LogseqUuid::from_uuid)
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                if !matches!(
+                    (projected.logseq_uuid, projected.logseq_identity_origin),
+                    (Some(projected_uuid), Some(LogseqIdentityOrigin::ExternalImported))
+                        if projected_uuid == parsed_uuid
+                ) {
+                    return Err(SyncEditorRequestError::ActorRefused);
+                }
+            }
+            [_, ..] => {
+                return Err(SyncEditorRequestError::ActorRefused);
+            }
+        }
+        if source_content
+            .insert(sparse_id, parsed_block.block.raw.clone())
+            .is_some()
+        {
+            return Err(SyncEditorRequestError::ActorRefused);
+        }
+    }
+
+    editor.page.preamble.clone_from(&parsed.pre_block);
+    editor.dto.preamble.clone_from(&parsed.pre_block);
+    for (block, parsed_block) in editor.dto.blocks.iter_mut().zip(&parsed_blocks) {
+        block.content.clone_from(&parsed_block.block.raw);
+    }
+    for block in editor
+        .page
+        .blocks
+        .iter_mut()
+        .chain(editor.blocks.iter_mut())
+    {
+        block.content.clone_from(
+            source_content
+                .get(&block.block_id)
+                .ok_or(SyncEditorRequestError::ActorRefused)?,
+        );
+    }
+    editor.dto.revision = existing_editor_revision(&editor.page, &editor.dto)?;
+    Ok(())
+}
+
 fn load_hot_source_authenticated_editor_page(
     runtime: &PromotedLocalRuntime,
     graph: &Graph,
@@ -15589,6 +15822,36 @@ mod tests {
         }
     }
 
+    fn save_application_block_text_with_bounded_page_local_reads(
+        handle: &SyncRuntimeHandle,
+        mut page: PageDto,
+        revision: String,
+        text: &str,
+    ) -> (PageDto, String) {
+        page.blocks[0].raw = text.into();
+        let page_blocks = flatten_application_blocks(&page.blocks).len();
+        let before = handle
+            .managed_application_save_instrumentation()
+            .expect("managed application save exposes foreground instrumentation");
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        let after = handle
+            .managed_application_save_instrumentation()
+            .expect("managed application save exposes post-save instrumentation");
+        assert_managed_application_save_foreground_counters(before, after, page_blocks);
+        match outcome {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("managed-local application save was not direct: {other:?}"),
+        }
+    }
+
     fn load_application_logical(
         handle: &SyncRuntimeHandle,
         name: &str,
@@ -15832,15 +16095,19 @@ mod tests {
             revision: String::new(),
         };
         dto.revision = existing_editor_revision(&materialized, &dto).unwrap();
-        let joined = join_application_page(
-            parsed,
-            EditorCurrentPage {
-                page: materialized,
-                blocks,
-                dto,
-            },
-        )
-        .unwrap();
+        let editor = EditorCurrentPage {
+            page: materialized,
+            blocks,
+            dto,
+        };
+        let mut malformed = parsed.clone();
+        let child = malformed.blocks[0].children.remove(0);
+        malformed.blocks.push(child);
+        assert!(matches!(
+            rebase_projected_editor_page_from_source(&mut editor.clone(), &malformed),
+            Err(SyncEditorRequestError::ActorRefused)
+        ));
+        let joined = join_application_page(parsed, editor).unwrap();
         assert!(joined.page.read_only);
         assert!(joined
             .page
@@ -15848,6 +16115,118 @@ mod tests {
             .iter()
             .all(|block| block.id.starts_with(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX)));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_application_save_rebases_nested_unicode_markdown_and_org_with_bounded_page_local_reads(
+    ) {
+        let fixture = ActivationFixture::nested_unicode("save-sqlite-source", 0xa121);
+        let markdown_path = "notes/層/žluťoučký/nested/Déjà 計画.md";
+        let org_path = "diary/nested/25-07-2026.org";
+        let markdown_parent = "b7fb3b57-5ec8-4a01-9875-8b66f46fe109";
+        let markdown_child = "e5a318b2-6968-40a4-b2bb-8a9b39b34ed9";
+        let org_parent = "a1a6d706-75d6-4010-a35b-dbf2db5cc905";
+        let org_child = "4d4e9638-6dd5-4338-ad97-0e109598fc29";
+        fs::write(
+            fixture.graph_root.join(markdown_path),
+            format!(
+                "\u{feff}title:: Déjà 計画\nicon:: 🧭\n\n- markdown editable\n- markdown parent\n  id:: {markdown_parent}\n  - markdown child\n    id:: {markdown_child}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            fixture.graph_root.join(org_path),
+            format!(
+                "* journal editable\n* journal parent\n:PROPERTIES:\n:ID: {org_parent}\n:END:\n** journal child\n:PROPERTIES:\n:ID: {org_child}\n:END:\n"
+            ),
+        )
+        .unwrap();
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains a runtime");
+        drive_initial_feed(&handle);
+
+        let (markdown, markdown_revision) =
+            load_application_logical(&handle, "Déjà 計画", SyncPageKind::Page);
+        assert_eq!(markdown.format, Format::Md);
+        assert_eq!(
+            markdown.pre_block.as_deref(),
+            Some("\u{feff}title:: Déjà 計画\nicon:: 🧭")
+        );
+        assert_eq!(markdown.blocks[1].id, markdown_parent);
+        assert_eq!(markdown.blocks[1].children[0].id, markdown_child);
+        let stale_markdown = markdown.clone();
+        let stale_revision = markdown_revision.clone();
+        let (markdown, first_revision) = save_application_block_text_with_bounded_page_local_reads(
+            &handle,
+            markdown,
+            markdown_revision,
+            "markdown first — café 日",
+        );
+        assert_eq!(markdown.blocks[1].id, markdown_parent);
+        assert_eq!(markdown.blocks[1].children[0].id, markdown_child);
+        let (markdown, second_revision) = save_application_block_text_with_bounded_page_local_reads(
+            &handle,
+            markdown,
+            first_revision.clone(),
+            "markdown second — λ",
+        );
+        assert_ne!(second_revision, first_revision);
+        assert!(markdown.blocks[0].raw.starts_with("markdown second — λ"));
+        assert_eq!(markdown.blocks[1].id, markdown_parent);
+        assert_eq!(markdown.blocks[1].children[0].id, markdown_child);
+        assert_eq!(handle.status().unwrap().managed_local_pending, 2);
+
+        let mut stale_markdown = stale_markdown;
+        stale_markdown.blocks[0].raw = "stale must stay invisible".into();
+        let bytes_before_stale = fs::read(fixture.graph_root.join(markdown_path)).unwrap();
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: markdown_path.into(),
+                        revision: stale_revision,
+                    },
+                    page: stale_markdown,
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Conflict {
+                reason: SyncApplicationPageConflict::StaleBase
+            }
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root.join(markdown_path)).unwrap(),
+            bytes_before_stale
+        );
+        let visible_markdown = load_application_exact(&handle, markdown_path);
+        assert!(visible_markdown.0.blocks[0]
+            .raw
+            .starts_with("markdown second — λ"));
+        assert_eq!(visible_markdown.1, second_revision);
+
+        let (org, org_revision) = load_application_exact(&handle, org_path);
+        assert_eq!(org.format, Format::Org);
+        assert_eq!(org.blocks[1].id, org_parent);
+        assert_eq!(org.blocks[1].children[0].id, org_child);
+        let (org, org_revision) = save_application_block_text_with_bounded_page_local_reads(
+            &handle,
+            org,
+            org_revision,
+            "journal edited — Ω",
+        );
+        assert!(org.blocks[0].raw.starts_with("journal edited — Ω"));
+        assert_eq!(org.blocks[1].id, org_parent);
+        assert_eq!(org.blocks[1].children[0].id, org_child);
+        let visible_org = load_application_exact(&handle, org_path);
+        assert_parser_dto_semantics(&org, &visible_org.0);
+        assert_eq!(org_revision, visible_org.1);
+
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     #[test]
@@ -15923,18 +16302,19 @@ mod tests {
             saved_alpha.0.blocks[0].children[0].id,
             "arbitrary frontend\nidentity"
         );
-        assert!(matches!(
-            handle
-                .save_application_page(SyncApplicationPageSaveRequest {
-                    target: SyncApplicationPageSaveTarget::Existing {
-                        path: saved_alpha.0.path.clone(),
-                        revision: saved_alpha.1.clone(),
-                    },
-                    page: saved_alpha.0.clone(),
-                })
-                .unwrap(),
-            SyncApplicationPageSaveOutcome::Unchanged { .. }
-        ));
+        let unchanged = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: saved_alpha.0.path.clone(),
+                    revision: saved_alpha.1.clone(),
+                },
+                page: saved_alpha.0.clone(),
+            })
+            .unwrap();
+        assert!(
+            matches!(unchanged, SyncApplicationPageSaveOutcome::Unchanged { .. }),
+            "unchanged structural application page unexpectedly saved: {unchanged:?}"
+        );
 
         let mut stale_alpha = stale_alpha;
         stale_alpha.blocks[0].raw = "must conflict".into();
@@ -16708,7 +17088,8 @@ mod tests {
         let path = "content/nested pages/Divergent Watcher.md";
         admit_external_page(&handle, &fixture, path, b"- original\n");
         let (page, revision) = load_application_exact(&handle, path);
-        save_application_block_text(&handle, page, revision, "journal projection");
+        let (mut pending_page, pending_revision) =
+            save_application_block_text(&handle, page, revision, "journal projection");
         assert_eq!(handle.status().unwrap().managed_local_next_sequence, 1);
 
         let divergent = b"- externally divergent\n";
@@ -16717,13 +17098,22 @@ mod tests {
             .observe_watcher(vec![SyncWatcherObservation::managed_path(path).unwrap()])
             .unwrap();
         assert!(handle.status().unwrap().watcher.pending);
-        let tick = handle.tick().unwrap();
+        pending_page.blocks[0].raw = "must not overwrite external divergence".into();
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: path.into(),
+                    revision: pending_revision,
+                },
+                page: pending_page,
+            })
+            .unwrap();
         assert!(matches!(
-            tick,
-            SyncRuntimeTick::Blocked(_)
-                | SyncRuntimeTick::RecoveryBlocked(_)
-                | SyncRuntimeTick::Recovering
-                | SyncRuntimeTick::RetryFull
+            outcome,
+            SyncApplicationPageSaveOutcome::Deferred { .. }
+                | SyncApplicationPageSaveOutcome::Conflict {
+                    reason: SyncApplicationPageConflict::StaleBase
+                }
         ));
         assert_eq!(
             fs::read(fixture.graph_root().join(path)).unwrap(),
@@ -28867,6 +29257,13 @@ mod tests {
     struct ManagedApplicationSaveBenchmarkSample {
         caller: Duration,
         stages: TrustedLocalCommitStageTimings,
+        page_local_reads: ManagedApplicationSavePageLocalReads,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ManagedApplicationSavePageLocalReads {
+        external_points: usize,
+        history_points: usize,
     }
 
     fn managed_application_save_quantiles(
@@ -28875,6 +29272,21 @@ mod tests {
     ) -> (Duration, Duration) {
         let values = samples.iter().map(select).collect::<Vec<_>>();
         (startup_median(&values), startup_p95(&values))
+    }
+
+    fn managed_application_save_read_quantiles(
+        samples: &[ManagedApplicationSaveBenchmarkSample],
+        select: impl Fn(&ManagedApplicationSaveBenchmarkSample) -> usize,
+    ) -> (usize, usize, usize) {
+        assert!(
+            !samples.is_empty(),
+            "benchmark receipt has at least one sample"
+        );
+        let mut values = samples.iter().map(select).collect::<Vec<_>>();
+        values.sort_unstable();
+        let p50 = values[values.len() / 2];
+        let p95 = values[(values.len() * 95).div_ceil(100).saturating_sub(1)];
+        (p50, p95, *values.last().unwrap())
     }
 
     fn managed_application_save_phase_receipt(
@@ -28900,8 +29312,16 @@ mod tests {
             managed_application_save_quantiles(samples, |sample| sample.stages.hot_overlay_apply);
         let (response_p50, response_p95) =
             managed_application_save_quantiles(samples, |sample| sample.stages.direct_response);
+        let (point_reads_p50, point_reads_p95, point_reads_max) =
+            managed_application_save_read_quantiles(samples, |sample| {
+                sample.page_local_reads.external_points
+            });
+        let (history_reads_p50, history_reads_p95, history_reads_max) =
+            managed_application_save_read_quantiles(samples, |sample| {
+                sample.page_local_reads.history_points
+            });
         format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
             startup_ms(prepared_p50),
@@ -28920,13 +29340,27 @@ mod tests {
             startup_ms(overlay_p95),
             startup_ms(response_p50),
             startup_ms(response_p95),
+            point_reads_p50,
+            point_reads_p95,
+            point_reads_max,
+            history_reads_p50,
+            history_reads_p95,
+            history_reads_max,
         )
+    }
+
+    fn managed_application_save_page_local_read_bound(blocks: usize) -> usize {
+        // The retained CRDT transaction can touch two authenticated points per
+        // block on its first page-shaped edit, plus four page-level points.
+        // This is intentionally a bound on the edited page, never graph size.
+        blocks.saturating_mul(2).saturating_add(4)
     }
 
     fn assert_managed_application_save_foreground_counters(
         before: ManagedApplicationSaveInstrumentation,
         after: ManagedApplicationSaveInstrumentation,
-    ) {
+        page_blocks: usize,
+    ) -> ManagedApplicationSavePageLocalReads {
         let forbidden = after.forbidden.since(before.forbidden);
         assert!(
             forbidden.is_none(),
@@ -28961,10 +29395,6 @@ mod tests {
             "ordinary application save must not flush external archive state"
         );
         assert_eq!(
-            after_engine.external_point_reads, before_engine.external_point_reads,
-            "ordinary application save must not read external archive state"
-        );
-        assert_eq!(
             after_engine.external_range_scans, before_engine.external_range_scans,
             "ordinary application save must not scan external archive state"
         );
@@ -28974,9 +29404,6 @@ mod tests {
                 after_engine.store.accepted_manifest_reads,
                 after_engine.store.accepted_object_reads,
                 after_engine.store.dag_manifest_reads,
-                after_engine.store.history_record_reads,
-                after_engine.store.history_index_reads,
-                after_engine.store.history_decodes,
                 after_engine.store.inspected_manifest_operations,
                 after_engine.store.inspected_manifest_bytes,
                 after_engine.store.inspected_object_operations,
@@ -28987,16 +29414,57 @@ mod tests {
                 before_engine.store.accepted_manifest_reads,
                 before_engine.store.accepted_object_reads,
                 before_engine.store.dag_manifest_reads,
-                before_engine.store.history_record_reads,
-                before_engine.store.history_index_reads,
-                before_engine.store.history_decodes,
                 before_engine.store.inspected_manifest_operations,
                 before_engine.store.inspected_manifest_bytes,
                 before_engine.store.inspected_object_operations,
                 before_engine.store.inspected_object_bytes,
             ),
-            "ordinary application save must not read or inspect archive state"
+            "ordinary application save must not enumerate or inspect archive state"
         );
+        let page_local_reads = ManagedApplicationSavePageLocalReads {
+            external_points: after_engine
+                .external_point_reads
+                .saturating_sub(before_engine.external_point_reads),
+            history_points: after_engine
+                .external_history_page_reads
+                .saturating_sub(before_engine.external_history_page_reads)
+                .saturating_add(
+                    after_engine
+                        .external_history_blob_reads
+                        .saturating_sub(before_engine.external_history_blob_reads),
+                )
+                .saturating_add(
+                    after_engine
+                        .store
+                        .history_record_reads
+                        .saturating_sub(before_engine.store.history_record_reads),
+                )
+                .saturating_add(
+                    after_engine
+                        .store
+                        .history_index_reads
+                        .saturating_sub(before_engine.store.history_index_reads),
+                )
+                .saturating_add(
+                    after_engine
+                        .store
+                        .history_decodes
+                        .saturating_sub(before_engine.store.history_decodes),
+                ),
+        };
+        let point_bound = managed_application_save_page_local_read_bound(page_blocks);
+        // Each point proof can decode both its history index and record, so
+        // the corresponding history counter has a fixed two-to-one ceiling.
+        let history_bound = point_bound.saturating_mul(2);
+        assert!(
+            page_local_reads.external_points <= point_bound,
+            "ordinary application save exceeded its page-local external-point read bound: {page_local_reads:?}, blocks={page_blocks}, bound={point_bound}"
+        );
+        assert!(
+            page_local_reads.history_points <= history_bound,
+            "ordinary application save exceeded its page-local history read bound: {page_local_reads:?}, blocks={page_blocks}, bound={history_bound}"
+        );
+        page_local_reads
     }
 
     fn startup_open_phase_receipt(open: &RuntimeOpenInstrumentation) -> String {
@@ -29303,6 +29771,7 @@ mod tests {
                         "managed application save total-pages={total_pages} run={run} edit={edit}"
                     );
                     page.blocks[0].raw = content.clone();
+                    let page_blocks = flatten_application_blocks(&page.blocks).len();
                     let timed = edit >= warmups;
                     let counters_before = handle
                         .managed_application_save_instrumentation()
@@ -29364,13 +29833,15 @@ mod tests {
                     );
 
                     if timed {
-                        assert_managed_application_save_foreground_counters(
+                        let page_local_reads = assert_managed_application_save_foreground_counters(
                             counters_before,
                             counters_after,
+                            page_blocks,
                         );
                         managed_samples.push(ManagedApplicationSaveBenchmarkSample {
                             caller,
                             stages: counters_after.commit_stages,
+                            page_local_reads,
                         });
                     }
                     page = returned;
@@ -29441,7 +29912,11 @@ mod tests {
                     let content = format!(
                         "direct files save total-pages={total_pages} run={run} edit={edit}"
                     );
-                    direct_page.blocks[0].raw = content;
+                    let direct_block = &mut direct_page.blocks[0];
+                    direct_block.raw = content;
+                    direct_block.marker = None;
+                    direct_block.properties.clear();
+                    direct_block.tags.clear();
                     let started = Instant::now();
                     let next_revision = direct_graph
                         .save_page(&direct_page, direct_page.rev.as_deref())
