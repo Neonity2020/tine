@@ -41,6 +41,8 @@ pub mod object_store;
 pub(crate) mod operational_coordinator;
 #[allow(dead_code)]
 pub(crate) mod shadow_projection;
+#[allow(dead_code)] // routed by the later sync-runtime lane
+pub(crate) mod trusted_local_commit;
 // P2N2 I1-I3 deliberately expose a foundation seam without activating it.
 #[allow(dead_code)]
 pub(crate) mod page_name_index;

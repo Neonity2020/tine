@@ -21,7 +21,7 @@ use loro::{ExportMode, LoroDoc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-mod hot_overlay_tests;
+pub(super) mod hot_overlay_tests;
 
 struct TestDir(PathBuf);
 

@@ -2954,15 +2954,20 @@ struct CapabilityCapturedPriorProjection {
     pub(crate) intent: ProjectionIntent,
     pub(crate) completion: Option<ProjectionCompletion>,
     pub(crate) bootstrap_owner_binding: Option<ContentDigest>,
+    pub(crate) managed_local_authority: Option<(u64, BatchId)>,
 }
 
 impl CapabilityCapturedPriorProjection {
     fn validate_authority(&self) -> Result<(), EngineError> {
-        match (&self.completion, self.bootstrap_owner_binding) {
-            (Some(completion), None) => completion
+        match (
+            &self.completion,
+            self.bootstrap_owner_binding,
+            self.managed_local_authority,
+        ) {
+            (Some(completion), None, None) => completion
                 .validate_against(&self.intent)
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
-            (None, Some(_)) => Ok(()),
+            (None, Some(_), None) | (None, None, Some(_)) => Ok(()),
             _ => Err(EngineError::ProjectionManifest(
                 "captured prior projection has ambiguous authority".into(),
             )),
@@ -3060,6 +3065,7 @@ impl CapabilityCapturedProjectionInput {
                     intent: prior_intent.clone(),
                     completion: Some(prior_completion.clone()),
                     bootstrap_owner_binding: None,
+                    managed_local_authority: None,
                 }),
             },
         };
@@ -6035,8 +6041,10 @@ fn decode_managed_local_payload(
 
 #[derive(Clone, Debug)]
 struct CommittedLocalOverlayEntry {
+    sequence: u64,
     batch_id: BatchId,
     causal_dot: BatchCausalDot,
+    projection: ManagedLocalProjection,
 }
 
 #[derive(Debug)]
@@ -12653,8 +12661,10 @@ impl ShardedHotEngine {
                 .insert(claim);
         }
         self.local_overlay.entries.push(CommittedLocalOverlayEntry {
+            sequence: record.sequence,
             batch_id: manifest.batch_id(),
             causal_dot: manifest.causal_dot(),
+            projection: record.projection.clone(),
         });
         self.local_overlay.next_sequence = next_sequence;
         let mut work = self.local_overlay.work.get();
@@ -13100,6 +13110,99 @@ impl ShardedHotEngine {
         }
     }
 
+    /// Reprove the latest unexpanded managed-local projection as the exact
+    /// semantic predecessor for another local edit. This is the receipt-free
+    /// bridge that lets a journal prefix compose while archive/receipt adoption
+    /// is still pending; it reuses the same projection planner and the exact
+    /// target retained by the authenticated managed record.
+    fn managed_local_projection_predecessor(
+        &self,
+        path: &ManagedPath,
+        page_id: PageId,
+        before: &ProjectionPageState,
+    ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
+        let Some(entry) = self.local_overlay.entries.iter().rev().find(|entry| {
+            entry.projection.intent.page_id() == page_id && entry.projection.intent.path() == path
+        }) else {
+            return Ok(None);
+        };
+        let intent = &entry.projection.intent;
+        let ManifestProjectionTarget::Present {
+            bytes, annotations, ..
+        } = intent.target()
+        else {
+            return Err(EngineError::ProjectionManifest(
+                "managed-local predecessor unexpectedly has an absent target".into(),
+            ));
+        };
+        if intent.workspace_id() != self.workspace_id
+            || intent.page_id() != before.page.page_id
+            || intent.path() != path
+            || intent.post_frontier() != &before.frontier
+            || intent.claim_evidence() != before.claim_evidence
+        {
+            return Err(EngineError::ProjectionManifest(
+                "managed-local predecessor is not the current semantic page state".into(),
+            ));
+        }
+        let replay = super::projection::plan_projection_with_layout_annotations(
+            self.workspace_id,
+            before,
+            Some(bytes),
+            Some(annotations),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if replay.target() != bytes || replay.intent().annotations() != annotations.as_slice() {
+            return Err(EngineError::ProjectionManifest(
+                "managed-local predecessor target is not its deterministic current rendering"
+                    .into(),
+            ));
+        }
+        Ok(Some(CapabilityCapturedPriorProjection {
+            bytes: bytes.clone(),
+            intent: replay.intent().clone(),
+            completion: None,
+            bootstrap_owner_binding: None,
+            managed_local_authority: Some((entry.sequence, entry.batch_id)),
+        }))
+    }
+
+    fn validate_managed_local_projection_authority(
+        &self,
+        path: &ManagedPath,
+        prior: &CapabilityCapturedPriorProjection,
+    ) -> Result<(), EngineError> {
+        let Some((sequence, batch_id)) = prior.managed_local_authority else {
+            return Ok(());
+        };
+        let entry = self
+            .local_overlay
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == sequence && entry.batch_id == batch_id)
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(
+                    "managed-local predecessor authority is no longer in the committed prefix"
+                        .into(),
+                )
+            })?;
+        let intent = &entry.projection.intent;
+        let target = intent.target();
+        if intent.path() != path
+            || intent.page_id() != prior.intent.page_id()
+            || intent.post_frontier() != prior.intent.frontier()
+            || target.bytes() != Some(prior.bytes.as_slice())
+            || target.description() != Some(prior.intent.target())
+            || target.annotations() != prior.intent.annotations()
+        {
+            return Err(EngineError::ProjectionManifest(
+                "managed-local predecessor authority does not bind the captured exact target"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn capture_external_author_transaction(
         &self,
         draft: AuthorTransactionDraft,
@@ -13223,7 +13326,24 @@ impl ShardedHotEngine {
                 .completed_receipts_for_path(path)
                 .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
             let mut authority_matches = true;
-            let prior = if let Some(requirement_index) = roles.semantic_predecessor {
+            let managed_prior = roles
+                .semantic_predecessor
+                .and_then(|requirement_index| {
+                    let requirement = &draft.requirements[requirement_index];
+                    draft.pages[&requirement.page_id]
+                        .before
+                        .as_ref()
+                        .map(|before| (requirement.page_id, before))
+                })
+                .map(|(page_id, before)| {
+                    self.managed_local_projection_predecessor(path, page_id, before)
+                })
+                .transpose()?
+                .flatten();
+            let prior = if let Some(prior) = managed_prior {
+                authority_matches = true;
+                Some(prior)
+            } else if let Some(requirement_index) = roles.semantic_predecessor {
                 let requirement = &draft.requirements[requirement_index];
                 let authority = match completed.as_slice() {
                     [authority]
@@ -13275,6 +13395,7 @@ impl ShardedHotEngine {
                             intent,
                             completion: Some(completion),
                             bootstrap_owner_binding: None,
+                            managed_local_authority: None,
                         })
                     }
                 } else if completed.is_empty() {
@@ -13326,6 +13447,7 @@ impl ShardedHotEngine {
                                 intent: replay.intent().clone(),
                                 completion: None,
                                 bootstrap_owner_binding: Some(baseline.owner_binding()),
+                                managed_local_authority: None,
                             })
                         }
                     } else {
@@ -13591,6 +13713,7 @@ impl ShardedHotEngine {
             };
             if let Some(prior) = prior {
                 prior.validate_authority()?;
+                self.validate_managed_local_projection_authority(path, prior)?;
                 let before = roles
                     .semantic_predecessor
                     .and_then(|index| {

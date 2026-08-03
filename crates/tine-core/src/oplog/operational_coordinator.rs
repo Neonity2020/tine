@@ -1188,6 +1188,31 @@ impl OperationalCoordinator {
         }
     }
 
+    /// Authorize, draft, capture, and finalize one local transaction without
+    /// entering the synchronous archive/SQLite pipeline. The returned sealed
+    /// value is the only input accepted by the trusted-local commit boundary.
+    pub(crate) fn prepare_trusted_local(
+        session: &mut PromotedRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        transaction: &OperationTransaction,
+    ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
+        let (admission, engine, _database, _tail, bootstrap) =
+            session.parts_with_bootstrap().map_err(|refusal| {
+                OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+            })?;
+        prepare_local_inner(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            Some(bootstrap),
+            LocalDraftSource::Promoted,
+            LocalPreparationBinding::TrustedLocal,
+            transaction,
+        )
+    }
+
     /// Execute one already-translated semantic local mutation under the
     /// currently admitted `LocalActive` runtime.
     ///
@@ -1275,6 +1300,27 @@ impl OperationalCoordinator {
             Err(error) => LocalMutationCoordinatorState::blocked(error),
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn prepare_trusted_local_with_author(
+        admission: &LocalRuntimeAdmission<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        engine: &mut ShardedHotEngine,
+        author: AuthorBatch,
+        transaction: &OperationTransaction,
+    ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
+        prepare_local_inner(
+            admission,
+            graph,
+            receipts,
+            engine,
+            None,
+            LocalDraftSource::Raw(author),
+            LocalPreparationBinding::TrustedLocal,
+            transaction,
+        )
+    }
 }
 
 enum LocalDraftSource {
@@ -1283,18 +1329,62 @@ enum LocalDraftSource {
     Raw(AuthorBatch),
 }
 
+#[derive(Clone, Copy)]
+enum LocalPreparationBinding {
+    SlowPipeline,
+    TrustedLocal,
+}
+
+pub(crate) enum PreparedLocalMutationState {
+    Prepared(PreparedLocalMutation),
+    ReconciliationRequired(ReconciliationNeeded),
+}
+
+/// Finalized local-author transaction plus the exact graph handoff retained
+/// from draft capture. Construction stays in the established local
+/// coordinator; the trusted-local commit consumes it and deliberately releases
+/// the old pipeline handoff before entering the journal-authorized path guard.
+pub(crate) struct PreparedLocalMutation {
+    endpoint: ProjectionEndpointBinding,
+    archive: Option<Arc<ObjectStore>>,
+    guard: HandoffSafeGuard,
+    prepared: PreparedBatch,
+    batch_id: BatchId,
+}
+
+impl PreparedLocalMutation {
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.batch_id
+    }
+
+    pub(crate) const fn prepared_batch(&self) -> &PreparedBatch {
+        &self.prepared
+    }
+
+    pub(super) fn into_trusted_batch(self) -> PreparedBatch {
+        let Self {
+            endpoint: _,
+            archive: _,
+            guard,
+            prepared,
+            batch_id: _,
+        } = self;
+        drop(guard);
+        prepared
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn execute_local_inner(
+fn prepare_local_inner(
     admission: &LocalRuntimeAdmission<'_>,
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     engine: &mut ShardedHotEngine,
-    database: &mut SqliteFrontier,
-    tail: &mut TailOverlay,
     bootstrap: Option<&BootstrapProjectionAuthority>,
     source: LocalDraftSource,
+    binding: LocalPreparationBinding,
     transaction: &OperationTransaction,
-) -> Result<LocalMutationCoordinatorState, OperationalCoordinatorError> {
+) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
     authorize_coordinator(admission, graph, engine)?;
     let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
         OperationalCoordinatorError::new(
@@ -1302,7 +1392,15 @@ fn execute_local_inner(
             "engine has no enrolled projection endpoint",
         )
     })?;
-    let archive = verify_bindings(graph, receipts, engine, endpoint, None)?;
+    let archive = match binding {
+        LocalPreparationBinding::SlowPipeline => {
+            Some(verify_bindings(graph, receipts, engine, endpoint, None)?)
+        }
+        LocalPreparationBinding::TrustedLocal => {
+            verify_projection_bindings(graph, receipts, engine, endpoint)?;
+            None
+        }
+    };
     let handoff = graph
         .mint_handoff_safe(engine.workspace_id(), endpoint)
         .map_err(|error| {
@@ -1365,8 +1463,8 @@ fn execute_local_inner(
         LocalAuthorCapture::Captured(captured) => captured,
         LocalAuthorCapture::ReconciliationNeeded(reconciliation) => {
             drop(guard);
-            return Ok(LocalMutationCoordinatorState::Recovering(
-                LocalMutationRecovery::ReconciliationRequired(reconciliation),
+            return Ok(PreparedLocalMutationState::ReconciliationRequired(
+                reconciliation,
             ));
         }
     };
@@ -1388,6 +1486,54 @@ fn execute_local_inner(
         ));
     }
     fault(OperationalFaultPoint::AfterFinalize)?;
+    Ok(PreparedLocalMutationState::Prepared(
+        PreparedLocalMutation {
+            endpoint,
+            archive,
+            guard,
+            prepared,
+            batch_id,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_local_inner(
+    admission: &LocalRuntimeAdmission<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    database: &mut SqliteFrontier,
+    tail: &mut TailOverlay,
+    bootstrap: Option<&BootstrapProjectionAuthority>,
+    source: LocalDraftSource,
+    transaction: &OperationTransaction,
+) -> Result<LocalMutationCoordinatorState, OperationalCoordinatorError> {
+    let prepared = match prepare_local_inner(
+        admission,
+        graph,
+        receipts,
+        engine,
+        bootstrap,
+        source,
+        LocalPreparationBinding::SlowPipeline,
+        transaction,
+    )? {
+        PreparedLocalMutationState::Prepared(prepared) => prepared,
+        PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
+            return Ok(LocalMutationCoordinatorState::Recovering(
+                LocalMutationRecovery::ReconciliationRequired(reconciliation),
+            ));
+        }
+    };
+    let PreparedLocalMutation {
+        endpoint,
+        archive,
+        guard,
+        prepared,
+        batch_id,
+    } = prepared;
+    let archive = archive.expect("slow local preparation retains its verified archive");
 
     match publish_and_drain(
         admission,
@@ -1607,20 +1753,7 @@ fn verify_bindings(
     endpoint: ProjectionEndpointBinding,
     expected_archive: Option<&Arc<ObjectStore>>,
 ) -> Result<Arc<ObjectStore>, OperationalCoordinatorError> {
-    let graph_resource = graph.canonical_resource_id().map_err(|error| {
-        OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
-    })?;
-    if endpoint.graph_resource_id() != graph_resource
-        || receipts.workspace_id() != engine.workspace_id()
-        || receipts.endpoint_binding() != Some(endpoint)
-        || engine.projection_receipt_store_id() != Some(receipts.store_id())
-    {
-        return Err(OperationalCoordinatorError::retained_block(
-            OperationalPhase::Bindings,
-            "graph, engine endpoint, or receipt namespace binding mismatch",
-            RetainedBlockReason::StableBinding,
-        ));
-    }
+    verify_projection_bindings(graph, receipts, engine, endpoint)?;
     let (archive, index) = engine.enrolled_projection_runtime().map_err(|error| {
         OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
     })?;
@@ -1655,6 +1788,29 @@ fn verify_bindings(
         }
     }
     Ok(archive)
+}
+
+fn verify_projection_bindings(
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &ShardedHotEngine,
+    endpoint: ProjectionEndpointBinding,
+) -> Result<(), OperationalCoordinatorError> {
+    let graph_resource = graph.canonical_resource_id().map_err(|error| {
+        OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+    })?;
+    if endpoint.graph_resource_id() != graph_resource
+        || receipts.workspace_id() != engine.workspace_id()
+        || receipts.endpoint_binding() != Some(endpoint)
+        || engine.projection_receipt_store_id() != Some(receipts.store_id())
+    {
+        return Err(OperationalCoordinatorError::retained_block(
+            OperationalPhase::Bindings,
+            "graph, engine endpoint, or receipt namespace binding mismatch",
+            RetainedBlockReason::StableBinding,
+        ));
+    }
+    Ok(())
 }
 
 fn authenticate_published(

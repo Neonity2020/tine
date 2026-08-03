@@ -4582,6 +4582,13 @@ fn managed_write_after_retire_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn inject_journal_projection_before_publish_failure(error: io::Error) {
+    JOURNAL_PROJECTION_BEFORE_PUBLISH.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || Err(error)));
+    });
+}
+
+#[cfg(test)]
 fn journal_projection_before_publish_hook() -> io::Result<()> {
     JOURNAL_PROJECTION_BEFORE_PUBLISH.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
@@ -11015,7 +11022,14 @@ impl Graph {
                 }
             }
             let entry = self.entry_for_path(path).ok_or_else(bad_path)?;
-            self.cache_upsert(entry, parse_doc(path, content), rev);
+            let (effective, document, parsed_revision) = parse_exact_page(self, &entry, content)?;
+            if parsed_revision != rev {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact projection parser revision differs from durable target",
+                ));
+            }
+            self.cache_upsert(effective, document, rev);
         }
         Ok(())
     }

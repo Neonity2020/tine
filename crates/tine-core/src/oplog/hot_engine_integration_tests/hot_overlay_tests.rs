@@ -20,28 +20,42 @@ const BLOCK_BASE: u128 = 1_020_000;
 const SECOND_BLOCK: u128 = 1_040_000;
 const LOGSEQ_UUID: u128 = 1_050_000;
 
-struct OverlayFixture {
+pub(crate) struct OverlayFixture {
     writer: ObjectStore,
-    graph: Graph,
-    receipts: ProjectionReceiptStore,
-    engine: ShardedHotEngine,
-    binding: ProjectionEndpointBinding,
+    pub(crate) graph: Graph,
+    pub(crate) receipts: ProjectionReceiptStore,
+    pub(crate) engine: ShardedHotEngine,
+    pub(crate) binding: ProjectionEndpointBinding,
     ids: Ids,
-    page_id: PageId,
-    home_document_id: DocumentId,
-    block_id: crate::oplog::BlockId,
+    pub(crate) page_id: PageId,
+    pub(crate) home_document_id: DocumentId,
+    pub(crate) block_id: crate::oplog::BlockId,
     second_block_id: crate::oplog::BlockId,
-    page_path: ManagedPath,
-    graph_path: PathBuf,
+    pub(crate) page_path: ManagedPath,
+    pub(crate) graph_path: PathBuf,
     _dir: TestDir,
 }
 
 impl OverlayFixture {
-    fn new(label: &str, extension: &str, pages: usize) -> Self {
-        Self::build(label, extension, pages, false)
+    pub(crate) fn new(label: &str, extension: &str, pages: usize) -> Self {
+        Self::build(label, extension, pages, false, None)
     }
 
-    fn build(label: &str, extension: &str, pages: usize, sparse_identity: bool) -> Self {
+    pub(crate) fn new_at_path(label: &str, relative_path: &str, pages: usize) -> Self {
+        let extension = std::path::Path::new(relative_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap();
+        Self::build(label, extension, pages, false, Some(relative_path))
+    }
+
+    fn build(
+        label: &str,
+        extension: &str,
+        pages: usize,
+        sparse_identity: bool,
+        first_path: Option<&str>,
+    ) -> Self {
         assert!(pages > 0);
         let ids = Ids::new();
         let dir = TestDir::new(label);
@@ -88,7 +102,12 @@ impl OverlayFixture {
                     home_document_id,
                     name: crate::oplog::LogicalPageName::parse(format!("Overlay {index:05}"))
                         .unwrap(),
-                    path: path(&format!("pages/Overlay-{index:05}.{extension}")),
+                    path: path(
+                        &first_path
+                            .filter(|_| index == 0)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| format!("pages/Overlay-{index:05}.{extension}")),
+                    ),
                     kind: ManagedTextKind::Page,
                 });
                 operations.push(SemanticOperation::CreateBlock {
@@ -146,7 +165,12 @@ impl OverlayFixture {
             ));
         }
         crate::oplog::write_projection_exact(&graph, &receipts, &engine, page_id, None).unwrap();
-        let page_path = path(&format!("pages/Overlay-00000.{extension}"));
+        graph.warm_cache();
+        let page_path = path(
+            &first_path
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("pages/Overlay-00000.{extension}")),
+        );
         Self {
             writer,
             graph,
@@ -164,7 +188,7 @@ impl OverlayFixture {
         }
     }
 
-    fn local_author(&self, seed: u128) -> AuthorBatch {
+    pub(crate) fn local_author(&self, seed: u128) -> AuthorBatch {
         AuthorBatch {
             batch_id: BatchId::from_uuid(uuid(seed)),
             author_device_id: self.binding.device_id(),
@@ -173,7 +197,7 @@ impl OverlayFixture {
         }
     }
 
-    fn content_edit(&self, generation: usize) -> OperationTransaction {
+    pub(crate) fn content_edit(&self, generation: usize) -> OperationTransaction {
         tx(vec![SemanticOperation::EditBlockContent {
             block: BlockLocation {
                 block_id: self.block_id,
@@ -183,7 +207,7 @@ impl OverlayFixture {
         }])
     }
 
-    fn finalize_edit(&self, seed: u128, generation: usize) -> PreparedBatch {
+    pub(crate) fn finalize_edit(&self, seed: u128, generation: usize) -> PreparedBatch {
         let draft = self
             .engine
             .draft_author_transaction(
@@ -197,7 +221,7 @@ impl OverlayFixture {
             .unwrap()
     }
 
-    fn accept_and_project(&mut self, prepared: &PreparedBatch) {
+    pub(crate) fn accept_and_project(&mut self, prepared: &PreparedBatch) {
         let expected_base = std::fs::read(self.graph_path.join(self.page_path.as_str())).unwrap();
         self.writer.publish_prepared(prepared).unwrap();
         assert!(matches!(
@@ -226,14 +250,22 @@ impl OverlayFixture {
             .unwrap()
     }
 
-    fn journal(
+    pub(crate) fn journal(
         &self,
         label: &str,
+    ) -> (PathBuf, LocalJournalSegment<ManagedLocalJournalPayloadKind>) {
+        self.journal_for_device(label, uuid(DEVICE))
+    }
+
+    pub(crate) fn journal_for_device(
+        &self,
+        label: &str,
+        device: uuid::Uuid,
     ) -> (PathBuf, LocalJournalSegment<ManagedLocalJournalPayloadKind>) {
         let root = self._dir.path().join(format!("journal-{label}"));
         std::fs::create_dir_all(&root).unwrap();
         let dir = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
-        let segment = LocalJournalSegment::open(&dir, "local.segment", uuid(DEVICE))
+        let segment = LocalJournalSegment::open(&dir, "local.segment", device)
             .unwrap()
             .0;
         (root, segment)
