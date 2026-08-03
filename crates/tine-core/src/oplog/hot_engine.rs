@@ -13,6 +13,7 @@ use loro::{
     UpdateOptions, ValueOrContainer, VersionVector,
 };
 use serde::{Deserialize, Serialize};
+use tine_storage::{LocalJournalAppend, LocalJournalFrame};
 use uuid::Uuid;
 
 use super::authenticated_patricia::{
@@ -97,7 +98,8 @@ const MAX_PREAUTHORING_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DOCUMENT_ENTRIES: usize = 1_000_000;
 const MAX_HOT_NON_CATALOG_DOCUMENTS: usize = 64;
 const CRDT_UPDATE_PAYLOAD_SCHEMA_VERSION: u32 = 7;
-const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 12;
+const HOT_OVERLAY_JOURNAL_SCHEMA_VERSION: u32 = 1;
+const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 13;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
 const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 6;
@@ -110,7 +112,7 @@ const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 // deliberately not an object-store, receipt, or projection format.
 #[allow(dead_code)]
 const CURRENT_PATH_CURSOR_SCHEMA_VERSION: u32 = 2;
-const CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION: u32 = 2;
+const CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION: u32 = 3;
 #[allow(dead_code)]
 pub(crate) const MAX_CURRENT_PATH_CURSOR_PAGE_ROWS: usize = 1_024;
 #[allow(dead_code)]
@@ -357,10 +359,13 @@ struct CurrentPathCatalogTransition {
 ///
 /// Version 2 adds the immutable home so block-only authoring and validation
 /// can prove page identity without reconstructing the complete CRDT catalog.
+/// Version 3 adds the exact effective name so direct page materialization is
+/// likewise a point lookup rather than a complete catalog reconstruction.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CurrentPathCatalogStoredRow {
     schema_version: u32,
+    name: LogicalPageName,
     path: ManagedPath,
     kind: ManagedTextKind,
     accepted_name_digest: ContentDigest,
@@ -5618,6 +5623,169 @@ impl EngineAuthority {
     }
 }
 
+/// Structural work performed by the direct committed-local hot boundary.
+///
+/// The counters are engine-local and monotonic. They deliberately count only
+/// touched pages, imported documents, and canonical update bytes; forbidden
+/// archive/SQLite/receipt/application work is counted at those real boundaries
+/// by [`crate::fast_commit::ForbiddenCommitWork`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HotOverlayWork {
+    pub page_materializations: usize,
+    pub commits_applied: usize,
+    pub documents_imported: usize,
+    pub update_bytes_imported: usize,
+}
+
+impl HotOverlayWork {
+    pub const fn since(self, earlier: Self) -> Self {
+        Self {
+            page_materializations: self.page_materializations - earlier.page_materializations,
+            commits_applied: self.commits_applied - earlier.commits_applied,
+            documents_imported: self.documents_imported - earlier.documents_imported,
+            update_bytes_imported: self.update_bytes_imported - earlier.update_bytes_imported,
+        }
+    }
+}
+
+/// One local update prepared by the engine for an exact journal sequence.
+///
+/// `journal_payload` is the canonical overlay envelope. Its CRDT objects are
+/// byte-for-byte the engine-exported objects from the prepared transaction;
+/// the envelope only binds those existing bytes to their workspace, lineage,
+/// sequence, exact pre-frontier, and resulting frontier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedHotOverlayCommit {
+    batch_id: BatchId,
+    sequence: u64,
+    journal_payload: Vec<u8>,
+    post_page: MaterializedPage,
+}
+
+impl PreparedHotOverlayCommit {
+    pub const fn batch_id(&self) -> BatchId {
+        self.batch_id
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn journal_payload(&self) -> &[u8] {
+        &self.journal_payload
+    }
+
+    pub const fn payload_kind(&self) -> ObjectKind {
+        ObjectKind::CrdtUpdate
+    }
+
+    pub const fn post_page(&self) -> &MaterializedPage {
+        &self.post_page
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HotOverlayApplyOutcome {
+    Applied {
+        batch_id: BatchId,
+        page: MaterializedPage,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HotOverlayError {
+    CorruptPayload(String),
+    Unsupported(String),
+    StaleBase,
+    OutOfOrder { expected: u64, found: u64 },
+    WrongDurabilityProof,
+    AcceptedFrontierMismatch,
+    Engine(EngineError),
+}
+
+impl fmt::Display for HotOverlayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CorruptPayload(error) => write!(f, "corrupt hot-overlay payload: {error}"),
+            Self::Unsupported(error) => write!(f, "unsupported hot-overlay transition: {error}"),
+            Self::StaleBase => f.write_str("hot-overlay update is not based on current hot state"),
+            Self::OutOfOrder { expected, found } => write!(
+                f,
+                "hot-overlay journal sequence is out of order: expected {expected}, found {found}"
+            ),
+            Self::WrongDurabilityProof => {
+                f.write_str("journal append proof does not cover this hot-overlay payload")
+            }
+            Self::AcceptedFrontierMismatch => {
+                f.write_str("accepted frontier does not exactly cover the hot-overlay prefix")
+            }
+            Self::Engine(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for HotOverlayError {}
+
+impl From<EngineError> for HotOverlayError {
+    fn from(error: EngineError) -> Self {
+        Self::Engine(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HotOverlayJournalPayloadV1 {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    sequence: u64,
+    page_id: PageId,
+    manifest: Vec<u8>,
+    semantic_effect_object: Vec<u8>,
+    crdt_update_objects: Vec<Vec<u8>>,
+    pre_frontier: FrontierV2,
+    post_frontier: FrontierV2,
+}
+
+#[derive(Clone, Debug)]
+struct CommittedLocalOverlayEntry {
+    batch_id: BatchId,
+    causal_dot: BatchCausalDot,
+}
+
+#[derive(Debug)]
+struct CommittedLocalOverlay {
+    next_sequence: u64,
+    entries: Vec<CommittedLocalOverlayEntry>,
+    documents: BTreeMap<DocumentId, LoroDoc>,
+    document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    block_claims: AHashMap<u128, BTreeSet<ImmutableHomeClaim>>,
+    commitment: ContentDigest,
+    work: Cell<HotOverlayWork>,
+}
+
+struct ValidatedHotOverlayCandidate {
+    page: MaterializedPage,
+    documents: BTreeMap<DocumentId, LoroDoc>,
+    document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    block_claims: Vec<(u128, ImmutableHomeClaim)>,
+    update_bytes: usize,
+}
+
+impl Default for CommittedLocalOverlay {
+    fn default() -> Self {
+        Self {
+            next_sequence: 0,
+            entries: Vec::new(),
+            documents: BTreeMap::new(),
+            document_heads: BTreeMap::new(),
+            block_claims: AHashMap::new(),
+            commitment: ContentDigest::of(b"tine/hot-overlay/empty/v1\0"),
+            work: Cell::new(HotOverlayWork::default()),
+        }
+    }
+}
+
 pub struct ShardedHotEngine {
     runtime_authority: EngineAuthority,
     workspace_id: WorkspaceId,
@@ -5720,6 +5888,11 @@ pub struct ShardedHotEngine {
     pending_author_documents: RefCell<Option<PendingAuthorDocuments>>,
     visible_document_lru: VecDeque<DocumentId>,
     visible_document_heads: BTreeMap<DocumentId, BTreeSet<BatchId>>,
+    /// Durable-local commits that are visible before their archive acceptance.
+    ///
+    /// This is rebuildable state, never durable authority. The local journal
+    /// owns durability; accepted engine state remains the compacted base.
+    local_overlay: CommittedLocalOverlay,
     // Lazily created only after the terminal latch. This CRDT frontier
     // validates offered descendants without ever becoming visible authority.
     terminal_documents: BTreeMap<DocumentId, LoroDoc>,
@@ -5888,6 +6061,7 @@ impl ShardedHotEngine {
             pending_author_documents: RefCell::new(None),
             visible_document_lru: VecDeque::new(),
             visible_document_heads: BTreeMap::new(),
+            local_overlay: CommittedLocalOverlay::default(),
             terminal_documents: BTreeMap::new(),
             terminal_document_heads: BTreeMap::new(),
             status_point_cache: RefCell::new(BTreeMap::new()),
@@ -8280,6 +8454,73 @@ impl ShardedHotEngine {
         self.lineage_digest
     }
 
+    pub fn hot_overlay_work(&self) -> HotOverlayWork {
+        self.local_overlay.work.get()
+    }
+
+    pub fn hot_overlay_len(&self) -> usize {
+        self.local_overlay.entries.len()
+    }
+
+    pub const fn hot_overlay_next_sequence(&self) -> u64 {
+        self.local_overlay.next_sequence
+    }
+
+    /// Materialize one exact current path from accepted state plus the
+    /// journal-committed local overlay, without SQLite or a graph reload.
+    pub fn materialize_current_page_at_path(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<Option<MaterializedPage>, EngineError> {
+        let page_id = match self.current_page_at_path(path)? {
+            CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
+            CurrentPageAtPath::Released(_)
+            | CurrentPageAtPath::Unowned
+            | CurrentPageAtPath::PortableCollision(_)
+            | CurrentPageAtPath::ReleasedPortableCollision(_) => return Ok(None),
+        };
+        let page = self.materialize_hot_page_with_overrides(page_id, &BTreeMap::new())?;
+        let mut work = self.local_overlay.work.get();
+        work.page_materializations = work.page_materializations.saturating_add(1);
+        self.local_overlay.work.set(work);
+        Ok(Some(page))
+    }
+
+    /// Remove the complete pending overlay only after authenticated accepted
+    /// state proves the same prefix and exact resulting documents.
+    pub fn collapse_hot_overlay(
+        &mut self,
+        expected_accepted_frontier: &AcceptedFrontierRoot,
+    ) -> Result<usize, HotOverlayError> {
+        if &self.accepted_frontier_root()? != expected_accepted_frontier {
+            return Err(HotOverlayError::AcceptedFrontierMismatch);
+        }
+        if self.local_overlay.entries.is_empty() {
+            return Ok(0);
+        }
+        for entry in &self.local_overlay.entries {
+            if !matches!(
+                self.archive_status(entry.batch_id)?,
+                Some(ArchiveStatus::Accepted { .. })
+            ) {
+                return Err(HotOverlayError::AcceptedFrontierMismatch);
+            }
+        }
+        for (document_id, overlay) in &self.local_overlay.documents {
+            let accepted = self.clone_visible_document(*document_id, 1)?;
+            if DecodedDocumentVersion::of(&accepted) != DecodedDocumentVersion::of(overlay) {
+                return Err(HotOverlayError::AcceptedFrontierMismatch);
+            }
+        }
+        let removed = self.local_overlay.entries.len();
+        self.local_overlay.entries.clear();
+        self.local_overlay.documents.clear();
+        self.local_overlay.document_heads.clear();
+        self.local_overlay.block_claims.clear();
+        self.local_overlay.commitment = ContentDigest::of(b"tine/hot-overlay/empty/v1\0");
+        Ok(removed)
+    }
+
     pub fn configure_reference_catalog_policy(
         &mut self,
         policy: ReferenceCatalogPolicyV1,
@@ -8635,13 +8876,56 @@ impl ShardedHotEngine {
         kind: ManagedTextKind,
         accepted_name_digest: ContentDigest,
     ) {
-        let home_document_id = self
+        let current = self
             .authenticated_current_page_catalog_row(page_id)
             .unwrap()
-            .expect("test replacement requires an existing current-page row")
-            .home_document_id;
+            .expect("test replacement requires an existing current-page row");
+        self.replace_current_path_catalog_row_values_for_test(
+            page_id,
+            current.name,
+            path,
+            kind,
+            accepted_name_digest,
+            current.home_document_id,
+        );
+    }
+
+    #[cfg(test)]
+    fn replace_current_path_catalog_row_with_name_for_test(
+        &mut self,
+        page_id: PageId,
+        path: ManagedPath,
+        kind: ManagedTextKind,
+        accepted_name: LogicalPageName,
+    ) {
+        let current = self
+            .authenticated_current_page_catalog_row(page_id)
+            .unwrap()
+            .expect("test replacement requires an existing current-page row");
+        let accepted_name_digest = ContentDigest::of(accepted_name.as_str().as_bytes());
+        self.replace_current_path_catalog_row_values_for_test(
+            page_id,
+            accepted_name,
+            path,
+            kind,
+            accepted_name_digest,
+            current.home_document_id,
+        );
+    }
+
+    #[cfg(test)]
+    fn replace_current_path_catalog_row_values_for_test(
+        &mut self,
+        page_id: PageId,
+        accepted_name: LogicalPageName,
+        path: ManagedPath,
+        kind: ManagedTextKind,
+        accepted_name_digest: ContentDigest,
+        home_document_id: DocumentId,
+    ) {
         let encoded = encode_current_path_catalog_row(&CurrentPathCatalogStoredRow {
             schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
+            name: accepted_name,
             path,
             kind,
             accepted_name_digest,
@@ -9977,6 +10261,7 @@ impl ShardedHotEngine {
         }
         let mut row = current_path_catalog_row_from_page_state(state)
             .expect("a live page always produces a current-path row");
+        row.name.clone_from(selection.exact_name());
         row.accepted_name_digest = ContentDigest::of(selection.exact_name().as_str().as_bytes());
         Ok(Some(row))
     }
@@ -11901,6 +12186,610 @@ impl ShardedHotEngine {
         self.draft_author_transaction_with_observation(author, origin, transaction, None)
     }
 
+    /// Prepare the canonical journal payload for one already-finalized local
+    /// batch without changing visible state.
+    pub fn prepare_hot_overlay_commit(
+        &self,
+        prepared: &PreparedBatch,
+        page_id: PageId,
+        sequence: u64,
+    ) -> Result<PreparedHotOverlayCommit, HotOverlayError> {
+        self.prepare_hot_overlay_from_prepared(prepared, page_id, sequence)
+    }
+
+    /// Consume one engine-authored draft into the same overlay payload.
+    ///
+    /// This is the seam the future trusted-local coordinator uses before its
+    /// receipt/archive-independent graph publication. Rename/title drafts are
+    /// intentionally refused here and remain on the established slow path.
+    pub fn prepare_hot_overlay_draft(
+        &self,
+        draft: AuthorTransactionDraft,
+        sequence: u64,
+    ) -> Result<PreparedHotOverlayCommit, HotOverlayError> {
+        if draft.generation != self.history_generation
+            || draft.root_token != self.author_generation_root()?
+        {
+            return Err(HotOverlayError::StaleBase);
+        }
+        let affected = affected_projection_pages(&draft.semantic_effect);
+        if affected.len() != 1 {
+            return Err(HotOverlayError::Unsupported(
+                "a hot commit must affect exactly one existing page".into(),
+            ));
+        }
+        let page_id = *affected.iter().next().expect("one affected page");
+        let prepared = draft.prepared_core;
+        self.prepare_hot_overlay_from_prepared(&prepared, page_id, sequence)
+    }
+
+    fn prepare_hot_overlay_from_prepared(
+        &self,
+        prepared: &PreparedBatch,
+        page_id: PageId,
+        sequence: u64,
+    ) -> Result<PreparedHotOverlayCommit, HotOverlayError> {
+        if sequence != self.local_overlay.next_sequence {
+            return Err(HotOverlayError::OutOfOrder {
+                expected: self.local_overlay.next_sequence,
+                found: sequence,
+            });
+        }
+        let manifest = prepared.manifest();
+        let mut semantic = None;
+        let mut updates = Vec::new();
+        for object in prepared.objects() {
+            match object.kind() {
+                ObjectKind::SemanticEffect => {
+                    if semantic.replace(object).is_some() {
+                        return Err(HotOverlayError::CorruptPayload(
+                            "prepared batch has duplicate semantic effects".into(),
+                        ));
+                    }
+                }
+                ObjectKind::CrdtUpdate => updates.push(object),
+                _ => {}
+            }
+        }
+        let semantic = semantic.ok_or_else(|| {
+            HotOverlayError::CorruptPayload("prepared batch has no semantic effect".into())
+        })?;
+        if updates.is_empty() {
+            return Err(HotOverlayError::CorruptPayload(
+                "prepared batch has no CRDT updates".into(),
+            ));
+        }
+        let decoded_updates = updates
+            .iter()
+            .map(|object| {
+                decode_crdt_update_payload(
+                    manifest.batch_id(),
+                    object.document_id(),
+                    object.payload(),
+                )
+                .map(|update| (object.document_id(), update))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let effect = SemanticEffect::decode(semantic.payload()).map_err(EngineError::from)?;
+        let candidate = self.validate_hot_overlay_candidate(
+            manifest,
+            &effect,
+            &decoded_updates,
+            page_id,
+            manifest.dependency_frontier(),
+            None,
+        )?;
+        let payload = HotOverlayJournalPayloadV1 {
+            schema_version: HOT_OVERLAY_JOURNAL_SCHEMA_VERSION,
+            workspace_id: self.workspace_id,
+            lineage_digest: self.lineage_digest,
+            sequence,
+            page_id,
+            manifest: manifest
+                .encode()
+                .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?,
+            semantic_effect_object: semantic
+                .encode()
+                .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?,
+            crdt_update_objects: updates
+                .iter()
+                .map(|object| {
+                    object
+                        .encode()
+                        .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            pre_frontier: manifest.dependency_frontier().clone(),
+            post_frontier: FrontierV2::new(
+                candidate
+                    .documents
+                    .iter()
+                    .map(|(document_id, document)| {
+                        DocumentDependencies::new(
+                            *document_id,
+                            canonical_peer_counters(&document.oplog_vv())?,
+                            candidate.document_heads[document_id]
+                                .iter()
+                                .copied()
+                                .collect(),
+                        )
+                        .map_err(EngineError::from)
+                    })
+                    .collect::<Result<Vec<_>, EngineError>>()?,
+            )
+            .map_err(EngineError::from)?,
+        };
+        let journal_payload = postcard::to_allocvec(&payload)
+            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
+        Ok(PreparedHotOverlayCommit {
+            batch_id: manifest.batch_id(),
+            sequence,
+            journal_payload,
+            post_page: candidate.page,
+        })
+    }
+
+    /// Advance visible state only after the append receipt proves this exact
+    /// payload crossed the journal's durability barrier.
+    pub fn apply_durable_hot_overlay(
+        &mut self,
+        append: &LocalJournalAppend,
+        prepared: &PreparedHotOverlayCommit,
+    ) -> Result<HotOverlayApplyOutcome, HotOverlayError> {
+        if append.sequence != prepared.sequence
+            || append.payload_digest != ContentDigest::of(prepared.journal_payload())
+            || append.data_durability_syncs != 1
+        {
+            return Err(HotOverlayError::WrongDurabilityProof);
+        }
+        self.apply_hot_overlay_payload(
+            append.device_id,
+            Some(append.sequence),
+            prepared.journal_payload(),
+        )
+    }
+
+    /// Replay one recovered canonical journal frame into a fresh overlay.
+    pub fn replay_hot_overlay_frame(
+        &mut self,
+        frame: &LocalJournalFrame<ObjectKind>,
+    ) -> Result<HotOverlayApplyOutcome, HotOverlayError> {
+        if frame.payload_kind() != ObjectKind::CrdtUpdate {
+            return Err(HotOverlayError::CorruptPayload(
+                "journal frame is not typed as a CRDT update".into(),
+            ));
+        }
+        self.apply_hot_overlay_payload(frame.device_id(), Some(frame.sequence()), frame.payload())
+    }
+
+    fn apply_hot_overlay_payload(
+        &mut self,
+        device_id: Uuid,
+        journal_sequence: Option<u64>,
+        bytes: &[u8],
+    ) -> Result<HotOverlayApplyOutcome, HotOverlayError> {
+        let payload: HotOverlayJournalPayloadV1 = postcard::from_bytes(bytes)
+            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
+        let canonical = postcard::to_allocvec(&payload)
+            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
+        if canonical != bytes {
+            return Err(HotOverlayError::CorruptPayload(
+                "journal payload is not canonical".into(),
+            ));
+        }
+        if payload.schema_version != HOT_OVERLAY_JOURNAL_SCHEMA_VERSION {
+            return Err(HotOverlayError::CorruptPayload(format!(
+                "unknown schema version {}",
+                payload.schema_version
+            )));
+        }
+        if journal_sequence.is_some_and(|sequence| sequence != payload.sequence) {
+            return Err(HotOverlayError::CorruptPayload(
+                "frame and payload journal sequences differ".into(),
+            ));
+        }
+        if payload.workspace_id != self.workspace_id {
+            return Err(EngineError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: payload.workspace_id,
+            }
+            .into());
+        }
+        if payload.lineage_digest != self.lineage_digest {
+            return Err(EngineError::LineageMismatch {
+                expected: self.lineage_digest,
+                found: payload.lineage_digest,
+            }
+            .into());
+        }
+        if payload.sequence != self.local_overlay.next_sequence {
+            return Err(HotOverlayError::OutOfOrder {
+                expected: self.local_overlay.next_sequence,
+                found: payload.sequence,
+            });
+        }
+        let manifest = OperationBatch::decode(&payload.manifest)
+            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
+        if manifest
+            .encode()
+            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?
+            != payload.manifest
+        {
+            return Err(HotOverlayError::CorruptPayload(
+                "manifest bytes are not canonical".into(),
+            ));
+        }
+        if manifest.workspace_id() != self.workspace_id
+            || manifest.lineage_digest() != self.lineage_digest
+            || manifest.author_device_id().as_uuid() != device_id
+        {
+            return Err(HotOverlayError::CorruptPayload(
+                "manifest binding differs from journal binding".into(),
+            ));
+        }
+        let semantic = OperationObject::decode(&payload.semantic_effect_object)
+            .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
+        if semantic.kind() != ObjectKind::SemanticEffect
+            || semantic.workspace_id() != self.workspace_id
+            || semantic.descriptor().map_err(EngineError::from)?
+                != *manifest
+                    .required_objects()
+                    .iter()
+                    .find(|descriptor| descriptor.kind() == ObjectKind::SemanticEffect)
+                    .ok_or_else(|| {
+                        HotOverlayError::CorruptPayload(
+                            "manifest has no semantic-effect descriptor".into(),
+                        )
+                    })?
+        {
+            return Err(HotOverlayError::CorruptPayload(
+                "semantic effect object is not bound by the manifest".into(),
+            ));
+        }
+        let effect = SemanticEffect::decode(semantic.payload()).map_err(EngineError::from)?;
+        if SemanticEffectDigest::of(semantic.payload()) != manifest.semantic_effect_digest() {
+            return Err(HotOverlayError::CorruptPayload(
+                "semantic effect digest differs from manifest".into(),
+            ));
+        }
+        let mut updates = BTreeMap::new();
+        let mut update_descriptors = BTreeSet::new();
+        for encoded in &payload.crdt_update_objects {
+            let object = OperationObject::decode(encoded)
+                .map_err(|error| HotOverlayError::CorruptPayload(error.to_string()))?;
+            let descriptor = object.descriptor().map_err(EngineError::from)?;
+            if object.kind() != ObjectKind::CrdtUpdate
+                || object.workspace_id() != self.workspace_id
+                || manifest
+                    .required_objects()
+                    .binary_search(&descriptor)
+                    .is_err()
+            {
+                return Err(HotOverlayError::CorruptPayload(
+                    "CRDT object is not bound by the manifest".into(),
+                ));
+            }
+            update_descriptors.insert(descriptor);
+            let update = decode_crdt_update_payload(
+                manifest.batch_id(),
+                object.document_id(),
+                object.payload(),
+            )?;
+            if updates.insert(object.document_id(), update).is_some() {
+                return Err(EngineError::DuplicateDocumentUpdate(object.document_id()).into());
+            }
+        }
+        let expected_update_descriptors = manifest
+            .required_objects()
+            .iter()
+            .filter(|descriptor| descriptor.kind() == ObjectKind::CrdtUpdate)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if updates.is_empty()
+            || update_descriptors != expected_update_descriptors
+            || payload.pre_frontier != *manifest.dependency_frontier()
+        {
+            return Err(HotOverlayError::CorruptPayload(
+                "journal frontier or update set differs from manifest".into(),
+            ));
+        }
+        let candidate = self.validate_hot_overlay_candidate(
+            &manifest,
+            &effect,
+            &updates,
+            payload.page_id,
+            &payload.pre_frontier,
+            Some(&payload.post_frontier),
+        )?;
+        let next_sequence = self
+            .local_overlay
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| HotOverlayError::CorruptPayload("sequence overflow".into()))?;
+        let payload_digest = ContentDigest::of(bytes);
+        let mut commitment = Vec::with_capacity(96);
+        commitment.extend_from_slice(b"tine/hot-overlay/prefix/v1\0");
+        commitment.extend_from_slice(self.local_overlay.commitment.as_bytes());
+        commitment.extend_from_slice(payload_digest.as_bytes());
+        commitment.extend_from_slice(&payload.sequence.to_be_bytes());
+        self.local_overlay.commitment = ContentDigest::of(&commitment);
+        for (document_id, document) in candidate.documents {
+            self.local_overlay.documents.insert(document_id, document);
+        }
+        for (document_id, heads) in candidate.document_heads {
+            self.local_overlay.document_heads.insert(document_id, heads);
+        }
+        for (block_key, claim) in candidate.block_claims {
+            self.local_overlay
+                .block_claims
+                .entry(block_key)
+                .or_default()
+                .insert(claim);
+        }
+        self.local_overlay.entries.push(CommittedLocalOverlayEntry {
+            batch_id: manifest.batch_id(),
+            causal_dot: manifest.causal_dot(),
+        });
+        self.local_overlay.next_sequence = next_sequence;
+        let mut work = self.local_overlay.work.get();
+        work.commits_applied = work.commits_applied.saturating_add(1);
+        work.documents_imported = work
+            .documents_imported
+            .saturating_add(payload.crdt_update_objects.len());
+        work.update_bytes_imported = work
+            .update_bytes_imported
+            .saturating_add(candidate.update_bytes);
+        self.local_overlay.work.set(work);
+        Ok(HotOverlayApplyOutcome::Applied {
+            batch_id: manifest.batch_id(),
+            page: candidate.page,
+        })
+    }
+
+    fn validate_hot_overlay_candidate(
+        &self,
+        manifest: &OperationBatch,
+        effect: &SemanticEffect,
+        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        page_id: PageId,
+        expected_pre_frontier: &FrontierV2,
+        expected_post_frontier: Option<&FrontierV2>,
+    ) -> Result<ValidatedHotOverlayCandidate, HotOverlayError> {
+        if manifest.workspace_id() != self.workspace_id {
+            return Err(EngineError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            }
+            .into());
+        }
+        if manifest.lineage_digest() != self.lineage_digest {
+            return Err(EngineError::LineageMismatch {
+                expected: self.lineage_digest,
+                found: manifest.lineage_digest(),
+            }
+            .into());
+        }
+        if manifest.origin() != BatchOrigin::LocalMutation {
+            return Err(HotOverlayError::Unsupported(
+                "only trusted local-mutation batches enter the hot overlay".into(),
+            ));
+        }
+        if !effect.pages().is_empty() {
+            return Err(HotOverlayError::Unsupported(
+                "title, path, kind, creation, deletion, and rename stay on the slow path".into(),
+            ));
+        }
+        if effect.blocks().iter().any(|delta| {
+            let identity = |state: &BlockState| (state.logseq_uuid, state.logseq_identity_origin);
+            match (&delta.before, &delta.after) {
+                (Some(before), Some(after)) => identity(before) != identity(after),
+                (None, Some(after)) => {
+                    after.logseq_uuid.is_some() || after.logseq_identity_origin.is_some()
+                }
+                (Some(_), None) | (None, None) => false,
+            }
+        }) {
+            return Err(HotOverlayError::Unsupported(
+                "Logseq identity mutation requires accepted claim-index publication".into(),
+            ));
+        }
+        let affected = affected_projection_pages(effect);
+        if affected.len() != 1 || !affected.contains(&page_id) {
+            return Err(HotOverlayError::Unsupported(
+                "a hot commit must affect exactly one existing page".into(),
+            ));
+        }
+        let mut before_documents = BTreeMap::new();
+        let mut after_documents = BTreeMap::new();
+        let mut pre_dependencies = Vec::new();
+        let mut post_heads = BTreeMap::new();
+        let mut update_bytes = 0_usize;
+        let expected_batch_heads = expected_pre_frontier
+            .documents()
+            .iter()
+            .flat_map(|dependencies| dependencies.direct_dependency_heads().iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for (document_id, update) in updates {
+            let before = self.clone_current_hot_document(*document_id, 1)?;
+            let dependencies = self.current_hot_document_dependencies(*document_id, &before)?;
+            if update.batch_id != manifest.batch_id()
+                || update.document_id != *document_id
+                || update.dependency_heads != dependencies.direct_dependency_heads()
+                || update.causal_state_digest != Some(dependencies.causal_state_digest())
+                || update.batch_dependency_heads != expected_batch_heads
+            {
+                return Err(HotOverlayError::StaleBase);
+            }
+            validate_update_base(*document_id, &before, &update.raw_update).map_err(|error| {
+                match error {
+                    EngineError::CrdtUpdateBaseMismatch(_) => HotOverlayError::StaleBase,
+                    other => HotOverlayError::Engine(other),
+                }
+            })?;
+            let after = clone_doc(&before, 1)?;
+            import_complete(
+                *document_id,
+                &after,
+                std::slice::from_ref(&update.raw_update),
+            )?;
+            let prior_page = if *document_id == self.catalog_document_id {
+                None
+            } else {
+                shard_page_id(&before)?
+            };
+            if *document_id != self.catalog_document_id {
+                validate_shard(self.catalog_document_id, *document_id, &after)?;
+                validate_immutable_shard_identity(*document_id, prior_page, &after)?;
+            }
+            update_bytes = update_bytes.saturating_add(update.raw_update.len());
+            pre_dependencies.push(dependencies);
+            before_documents.insert(*document_id, before);
+            after_documents.insert(*document_id, after);
+            post_heads.insert(*document_id, BTreeSet::from([manifest.batch_id()]));
+        }
+        let actual_pre = FrontierV2::new(pre_dependencies).map_err(EngineError::from)?;
+        if &actual_pre != expected_pre_frontier
+            || manifest.dependency_frontier() != expected_pre_frontier
+        {
+            return Err(HotOverlayError::StaleBase);
+        }
+        let before_snapshots =
+            snapshot_documents_with_validation(self.catalog_document_id, &before_documents, false)?;
+        let after_snapshots = snapshot_documents(self.catalog_document_id, &after_documents)?;
+        compare_declared_effect_against_snapshots_with_catalog(
+            effect,
+            &before_snapshots,
+            &after_snapshots,
+        )?;
+        let actual_post = FrontierV2::new(
+            after_documents
+                .iter()
+                .map(|(document_id, document)| {
+                    DocumentDependencies::new(
+                        *document_id,
+                        canonical_peer_counters(&document.oplog_vv())?,
+                        vec![manifest.batch_id()],
+                    )
+                    .map_err(EngineError::from)
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?,
+        )
+        .map_err(EngineError::from)?;
+        if expected_post_frontier.is_some_and(|expected| expected != &actual_post) {
+            return Err(HotOverlayError::CorruptPayload(
+                "declared post-frontier differs from the imported CRDT state".into(),
+            ));
+        }
+
+        let created = effect
+            .blocks()
+            .iter()
+            .filter(|delta| delta.before.is_none() && delta.after.is_some())
+            .collect::<Vec<_>>();
+        let created_ids = created
+            .iter()
+            .map(|delta| delta.block_id)
+            .collect::<Vec<_>>();
+        let accepted_claims = self.block_home_claims_many(&created_ids)?;
+        let mut block_claims = Vec::with_capacity(created.len());
+        for delta in created {
+            let key = delta.block_id.as_uuid().as_u128();
+            if accepted_claims
+                .get(&key)
+                .is_some_and(|claims| !claims.is_empty())
+                || self
+                    .local_overlay
+                    .block_claims
+                    .get(&key)
+                    .is_some_and(|claims| !claims.is_empty())
+            {
+                return Err(EngineError::BlockAlreadyExists(delta.block_id).into());
+            }
+            block_claims.push((
+                key,
+                if self.scratch.is_some() {
+                    ImmutableHomeClaim::with_causal_dot(
+                        manifest.batch_id(),
+                        delta.home_document_id,
+                        manifest.causal_dot(),
+                    )
+                } else {
+                    ImmutableHomeClaim::new(manifest.batch_id(), delta.home_document_id)
+                },
+            ));
+        }
+        let page = self.materialize_hot_page_with_overrides(page_id, &after_documents)?;
+        Ok(ValidatedHotOverlayCandidate {
+            page,
+            documents: after_documents,
+            document_heads: post_heads,
+            block_claims,
+            update_bytes,
+        })
+    }
+
+    fn materialize_hot_page_with_overrides(
+        &self,
+        page_id: PageId,
+        overrides: &BTreeMap<DocumentId, LoroDoc>,
+    ) -> Result<MaterializedPage, EngineError> {
+        let mut documents = BTreeMap::new();
+        let state = match overrides.get(&self.catalog_document_id) {
+            Some(catalog) => require_live_page(catalog, page_id)?,
+            None => self.current_hot_page_state(page_id)?,
+        };
+        let page_document_id = state.home_document_id();
+        let page_document = match overrides.get(&page_document_id) {
+            Some(document) => clone_doc(document, 1)?,
+            None => self.clone_current_hot_document(page_document_id, 1)?,
+        };
+        let memberships = read_memberships(page_document_id, &page_document)?;
+        documents.insert(page_document_id, page_document);
+        for home_document_id in memberships
+            .values()
+            .map(|claim| claim.home_document_id)
+            .collect::<BTreeSet<_>>()
+        {
+            if documents.contains_key(&home_document_id) {
+                continue;
+            }
+            let home = match overrides.get(&home_document_id) {
+                Some(document) => clone_doc(document, 1)?,
+                None => self.clone_current_hot_document(home_document_id, 1)?,
+            };
+            documents.insert(home_document_id, home);
+        }
+        self.materialize_page_from_state(
+            page_id,
+            state,
+            |document_id| documents.get(&document_id),
+            0,
+        )
+    }
+
+    fn current_hot_page_state(&self, page_id: PageId) -> Result<PageState, EngineError> {
+        if let Some(catalog) = self.local_overlay.documents.get(&self.catalog_document_id) {
+            return require_live_page(catalog, page_id);
+        }
+        if self.scratch.is_some() {
+            let row = self
+                .authenticated_current_page_catalog_row(page_id)?
+                .ok_or(EngineError::PageNotFound(page_id))?;
+            return Ok(PageState::Live {
+                name: row.name,
+                path: row.path,
+                kind: row.kind,
+                home_document_id: row.home_document_id,
+            });
+        }
+        let catalog = self
+            .current_catalog_document()?
+            .ok_or(EngineError::PageNotFound(page_id))?;
+        require_live_page(catalog, page_id)
+    }
+
     /// Draft one transaction twice — once with the in-place prospective
     /// derivation and once with the previous derivation, which reproduced every
     /// document it read — and prove the two drafts are the same draft.
@@ -12944,6 +13833,16 @@ impl ShardedHotEngine {
                 return Err(EngineError::BlockAlreadyExists(block_id));
             }
         }
+        for block_id in &created_blocks {
+            if self
+                .local_overlay
+                .block_claims
+                .get(&block_id.as_uuid().as_u128())
+                .is_some_and(|claims| !claims.is_empty())
+            {
+                return Err(EngineError::BlockAlreadyExists(*block_id));
+            }
+        }
 
         let mut working = BTreeMap::<DocumentId, EngineDocument>::new();
         let mut before_vectors = BTreeMap::<DocumentId, VersionVector>::new();
@@ -13011,7 +13910,12 @@ impl ShardedHotEngine {
             let direct_heads: Vec<_> = match authenticated_direct_heads.remove(document_id) {
                 Some(heads) => heads.into_iter().collect(),
                 None => self
-                    .document_dependency_heads(*document_id, false)?
+                    .local_overlay
+                    .document_heads
+                    .get(document_id)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| self.document_dependency_heads(*document_id, false))?
                     .into_iter()
                     .collect(),
             };
@@ -13075,11 +13979,28 @@ impl ShardedHotEngine {
             .iter()
             .map(OperationObject::descriptor)
             .collect::<Result<Vec<_>, _>>()?;
+        let peer = CausalPeerId::from_device_id(author.author_device_id);
+        let overlay_prior = (origin == BatchOrigin::LocalMutation)
+            .then(|| self.local_overlay.entries.last())
+            .flatten()
+            .map(|entry| {
+                if entry.causal_dot.peer_id() != peer {
+                    return Err(EngineError::InvalidTransaction(
+                        "one local journal prefix cannot mix author devices".into(),
+                    ));
+                }
+                let counter = entry.causal_dot.counter().checked_add(1).ok_or_else(|| {
+                    EngineError::InvalidTransaction("causal counter overflow".into())
+                })?;
+                Ok((BatchCausalDot::new(peer, counter)?, entry.batch_id))
+            })
+            .transpose()?;
         let mut manifest = if let Some(store) = &self.scratch {
-            let peer = CausalPeerId::from_device_id(author.author_device_id);
-            let (dot, prior_batch) =
-                super::causal_index::next_dot(store, &self.scratch_roots, peer)
-                    .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
+            let (dot, prior_batch) = match overlay_prior {
+                Some((dot, prior_batch)) => (dot, Some(prior_batch)),
+                None => super::causal_index::next_dot(store, &self.scratch_roots, peer)
+                    .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?,
+            };
             let mut causal_dependency_heads = batch_dependency_heads;
             causal_dependency_heads.extend(prior_batch);
             OperationBatch::new_with_causality(
@@ -13096,15 +14017,25 @@ impl ShardedHotEngine {
                 descriptors,
             )?
         } else {
-            let peer = CausalPeerId::from_device_id(author.author_device_id);
-            let prior = self.ephemeral_causal_chain.borrow().get(&peer).copied();
-            let counter = prior
-                .map(|(counter, _)| counter)
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or_else(|| EngineError::InvalidTransaction("causal counter overflow".into()))?;
+            let (dot, prior_batch) = match overlay_prior {
+                Some((dot, batch_id)) => (dot, Some(batch_id)),
+                None => {
+                    let prior = self.ephemeral_causal_chain.borrow().get(&peer).copied();
+                    let counter = prior
+                        .map(|(counter, _)| counter)
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            EngineError::InvalidTransaction("causal counter overflow".into())
+                        })?;
+                    (
+                        BatchCausalDot::new(peer, counter)?,
+                        prior.map(|(_, batch_id)| batch_id),
+                    )
+                }
+            };
             let mut causal_dependency_heads = batch_dependency_heads;
-            causal_dependency_heads.extend(prior.map(|(_, batch_id)| batch_id));
+            causal_dependency_heads.extend(prior_batch);
             OperationBatch::new_with_causality(
                 self.workspace_id,
                 self.lineage_digest,
@@ -13112,7 +14043,7 @@ impl ShardedHotEngine {
                 author.author_device_id,
                 author.author_session_id,
                 origin,
-                BatchCausalDot::new(peer, counter)?,
+                dot,
                 causal_dependency_heads,
                 frontier,
                 SemanticEffectDigest::of(&effect_bytes),
@@ -13289,6 +14220,10 @@ impl ShardedHotEngine {
         );
         bytes.extend_from_slice(&self.history_generation.to_be_bytes());
         bytes.extend_from_slice(self.history_root.as_bytes());
+        if !self.local_overlay.entries.is_empty() {
+            bytes.extend_from_slice(b"tine/hot-overlay/author-root/v1\0");
+            bytes.extend_from_slice(self.local_overlay.commitment.as_bytes());
+        }
         #[cfg(test)]
         let before_heads = bytes.len();
         for (document_id, heads) in &self.visible_document_heads {
@@ -13442,7 +14377,7 @@ impl ShardedHotEngine {
     ) -> Result<LoroDoc, EngineError> {
         let copy = match prospective.get(&document_id) {
             Some(document) => clone_doc(document, 1),
-            None => self.clone_visible_document(document_id, 1),
+            None => self.clone_current_hot_document(document_id, 1),
         }?;
         self.record_prospective_document_copy(document_id, &copy);
         Ok(copy)
@@ -13523,7 +14458,7 @@ impl ShardedHotEngine {
             )
             .map_err(Into::into)
         } else {
-            self.current_document_dependencies(document_id, document)
+            self.current_hot_document_dependencies(document_id, document)
         }
     }
 
@@ -15387,6 +16322,16 @@ impl ShardedHotEngine {
         };
         let page_state = read_validated_catalog_page(validated_catalog, page_id)?
             .ok_or(EngineError::PageNotFound(page_id))?;
+        self.materialize_page_from_state(page_id, page_state, document, 1)
+    }
+
+    fn materialize_page_from_state<'document>(
+        &self,
+        page_id: PageId,
+        page_state: PageState,
+        mut document: impl FnMut(DocumentId) -> Option<&'document LoroDoc>,
+        catalog_documents_loaded: usize,
+    ) -> Result<MaterializedPage, EngineError> {
         let PageState::Live {
             name,
             path,
@@ -15452,7 +16397,7 @@ impl ShardedHotEngine {
             preamble,
             blocks,
             stats: MaterializationStats {
-                catalog_documents_loaded: 1,
+                catalog_documents_loaded,
                 membership_documents_loaded: 1,
                 home_documents_loaded: by_home.len(),
                 distinct_home_documents: by_home.keys().copied().collect(),
@@ -15485,7 +16430,7 @@ impl ShardedHotEngine {
         if include_frontier {
             frontier_documents.insert(
                 self.catalog_document_id,
-                self.current_document_dependencies(self.catalog_document_id, catalog)?,
+                self.current_hot_document_dependencies(self.catalog_document_id, catalog)?,
             );
         }
         let page_state = validate_catalog_page(self.catalog_document_id, catalog, page_id)?
@@ -15500,12 +16445,12 @@ impl ShardedHotEngine {
         else {
             return Err(EngineError::PageDeleted(page_id));
         };
-        let page_document = self.clone_visible_document(page_document_id, 1)?;
+        let page_document = self.clone_current_hot_document(page_document_id, 1)?;
         validate_shard(self.catalog_document_id, page_document_id, &page_document)?;
         if include_frontier {
             frontier_documents.insert(
                 page_document_id,
-                self.current_document_dependencies(page_document_id, &page_document)?,
+                self.current_hot_document_dependencies(page_document_id, &page_document)?,
             );
         }
         if shard_page_id(&page_document)? != Some(page_id) {
@@ -15551,12 +16496,12 @@ impl ShardedHotEngine {
                 }
                 continue;
             }
-            let home = self.clone_visible_document(*home_document_id, 1)?;
+            let home = self.clone_current_hot_document(*home_document_id, 1)?;
             validate_shard(self.catalog_document_id, *home_document_id, &home)?;
             if include_frontier {
                 frontier_documents.insert(
                     *home_document_id,
-                    self.current_document_dependencies(*home_document_id, &home)?,
+                    self.current_hot_document_dependencies(*home_document_id, &home)?,
                 );
             }
             for (block_id, claim) in claims {
@@ -15633,9 +16578,9 @@ impl ShardedHotEngine {
                     });
                 }
                 for (home_document_id, home) in homes {
-                    frontier_documents
-                        .entry(home_document_id)
-                        .or_insert(self.current_document_dependencies(home_document_id, &home)?);
+                    frontier_documents.entry(home_document_id).or_insert(
+                        self.current_hot_document_dependencies(home_document_id, &home)?,
+                    );
                 }
                 if let Some(evidence) = evidence {
                     claim_evidence.push(evidence);
@@ -20297,6 +21242,19 @@ impl ShardedHotEngine {
         }
     }
 
+    /// Clone the current foreground document, including journal-committed
+    /// local state that has not reached accepted archive state yet.
+    fn clone_current_hot_document(
+        &self,
+        document_id: DocumentId,
+        peer: u64,
+    ) -> Result<LoroDoc, EngineError> {
+        match self.local_overlay.documents.get(&document_id) {
+            Some(document) => clone_doc(document, peer),
+            None => self.clone_visible_document(document_id, peer),
+        }
+    }
+
     fn clone_validation_document(
         &self,
         document_id: DocumentId,
@@ -20766,6 +21724,22 @@ impl ShardedHotEngine {
         )?)
     }
 
+    fn current_hot_document_dependencies(
+        &self,
+        document_id: DocumentId,
+        document: &LoroDoc,
+    ) -> Result<DocumentDependencies, EngineError> {
+        let heads = match self.local_overlay.document_heads.get(&document_id) {
+            Some(heads) => heads.clone(),
+            None => self.document_dependency_heads(document_id, false)?,
+        };
+        Ok(DocumentDependencies::new(
+            document_id,
+            canonical_peer_counters(&document.oplog_vv())?,
+            heads.into_iter().collect(),
+        )?)
+    }
+
     fn retain_hot_document(&mut self, document_id: DocumentId) {
         if document_id == self.catalog_document_id {
             return;
@@ -21193,7 +22167,11 @@ impl ShardedHotEngine {
         peer_id: CrdtPeerId,
     ) -> Result<&'a LoroDoc, EngineError> {
         if let Entry::Vacant(entry) = working.entry(document_id) {
-            let document = if self.scratch.is_some() {
+            let document = if let Some(current) = self.local_overlay.documents.get(&document_id) {
+                let document = clone_doc(current, peer_id.as_u64())?;
+                self.record_author_snapshot_clone(&document);
+                EngineDocument::InMemory(document)
+            } else if self.scratch.is_some() {
                 let (document, _) = self.load_external_validation_document(document_id)?;
                 document
                     .document()
@@ -22206,7 +23184,8 @@ impl ShardedHotEngine {
                 let Some(before_catalog) = before_catalog else {
                     return Ok(false);
                 };
-                let before_document = self.clone_visible_document(referrer.home_document_id, 1)?;
+                let before_document =
+                    self.clone_current_hot_document(referrer.home_document_id, 1)?;
                 let Some(state) = read_block_state(
                     referrer.home_document_id,
                     &before_document,
@@ -22267,11 +23246,8 @@ impl ShardedHotEngine {
                 )),
             };
         }
-        let catalog = self
-            .visible_documents
-            .get(&self.catalog_document_id)
-            .ok_or(EngineError::PageNotFound(page_id))?;
-        Ok(require_live_page(catalog, page_id)?.home_document_id())
+        let catalog = self.clone_current_hot_document(self.catalog_document_id, 1)?;
+        Ok(require_live_page(&catalog, page_id)?.home_document_id())
     }
 
     fn read_only_catalog<'a>(
@@ -22279,7 +23255,7 @@ impl ShardedHotEngine {
         read_only_catalog: &'a mut AuthorCatalogLookup,
     ) -> Result<&'a LoroDoc, EngineError> {
         if read_only_catalog.document.is_none() {
-            let catalog = self.clone_visible_document(self.catalog_document_id, 1)?;
+            let catalog = self.clone_current_hot_document(self.catalog_document_id, 1)?;
             #[cfg(test)]
             self.read_only_catalog_clones
                 .set(self.read_only_catalog_clones.get().saturating_add(1));
@@ -25537,6 +26513,7 @@ fn current_path_catalog_row_from_page_state(
             home_document_id,
         } => Some(CurrentPathCatalogStoredRow {
             schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
+            name: name.clone(),
             path: path.clone(),
             kind: *kind,
             accepted_name_digest: ContentDigest::of(name.as_str().as_bytes()),
@@ -25558,6 +26535,7 @@ fn decode_current_path_catalog_row(
     let row: CurrentPathCatalogStoredRow =
         postcard::from_bytes(encoded).map_err(|error| EngineError::Archive(error.to_string()))?;
     if row.schema_version != CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION
+        || ContentDigest::of(row.name.as_str().as_bytes()) != row.accepted_name_digest
         || encode_current_path_catalog_row(&row)? != encoded
     {
         return Err(EngineError::Archive(
@@ -26469,7 +27447,7 @@ mod validation_tests {
     }
 
     #[test]
-    fn bootstrap_history_schema_12_binds_exact_aggregate_and_retains_no_op() {
+    fn bootstrap_history_schema_13_binds_exact_aggregate_and_retains_no_op() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_015));
         let lineage = LineageDigest::of(b"bootstrap-history-schema-12");
         let catalog = DocumentId::from_uuid(Uuid::from_u128(91_016));
@@ -26580,7 +27558,7 @@ mod validation_tests {
         )
         .unwrap();
         let record = decode_history_record(descriptor.batch_id(), &bytes).unwrap();
-        assert_eq!(record.schema_version, 12);
+        assert_eq!(record.schema_version, 13);
         assert_eq!(record.bootstrap, Some(binding));
         assert_eq!(
             match &record.status {
@@ -29223,18 +30201,22 @@ mod validation_tests {
         fixture.author_accepted_round(710_600, "semantic current-path binding");
         let (digest_page, _, _, digest_path) = fixture.pages[0].clone();
         let (kind_page, _, _, kind_path) = fixture.pages[1].clone();
-        fixture.engine.replace_current_path_catalog_row_for_test(
-            digest_page,
-            digest_path.clone(),
-            ManagedTextKind::Page,
-            ContentDigest::of(b"authenticated but wrong accepted name"),
-        );
-        fixture.engine.replace_current_path_catalog_row_for_test(
-            kind_page,
-            kind_path.clone(),
-            ManagedTextKind::Journal,
-            ContentDigest::of(b"Gate 1"),
-        );
+        fixture
+            .engine
+            .replace_current_path_catalog_row_with_name_for_test(
+                digest_page,
+                digest_path.clone(),
+                ManagedTextKind::Page,
+                LogicalPageName::parse("authenticated but wrong accepted name").unwrap(),
+            );
+        fixture
+            .engine
+            .replace_current_path_catalog_row_with_name_for_test(
+                kind_page,
+                kind_path.clone(),
+                ManagedTextKind::Journal,
+                LogicalPageName::parse("Gate 1").unwrap(),
+            );
         let snapshot = fixture
             .engine
             .runtime_resume_snapshot()
@@ -31231,6 +32213,7 @@ mod validation_tests {
     fn current_page_catalog_row_binds_home_evidence_schema() {
         let row = CurrentPathCatalogStoredRow {
             schema_version: CURRENT_PATH_CATALOG_ROW_SCHEMA_VERSION,
+            name: LogicalPageName::parse("Schema").unwrap(),
             path: ManagedPath::parse("pages/schema.md").unwrap(),
             kind: ManagedTextKind::Page,
             accepted_name_digest: ContentDigest::of(b"Schema"),
@@ -31491,11 +32474,11 @@ mod validation_tests {
             .find(|row| row.page_id() == first)
             .unwrap()
             .path;
-        duplicate.replace_current_path_catalog_row_for_test(
+        duplicate.replace_current_path_catalog_row_with_name_for_test(
             second,
             first_path,
             ManagedTextKind::Page,
-            ContentDigest::of(b"test accepted name"),
+            LogicalPageName::parse("test accepted name").unwrap(),
         );
         let duplicate_cursor = duplicate.begin_current_path_cursor().unwrap();
         assert!(matches!(
@@ -31556,11 +32539,11 @@ mod validation_tests {
             "x".repeat(MAX_CURRENT_PATH_CURSOR_PATH_BYTES)
         ))
         .unwrap();
-        long_path_engine.replace_current_path_catalog_row_for_test(
+        long_path_engine.replace_current_path_catalog_row_with_name_for_test(
             page_id,
             long_path,
             ManagedTextKind::Page,
-            ContentDigest::of(b"test accepted name"),
+            LogicalPageName::parse("test accepted name").unwrap(),
         );
         let long_cursor = long_path_engine.begin_current_path_cursor().unwrap();
         assert!(matches!(
@@ -36234,7 +37217,7 @@ mod validation_tests {
         let left_then_right = deliver(left.manifest().batch_id(), right.manifest().batch_id());
         let right_then_left = deliver(right.manifest().batch_id(), left.manifest().batch_id());
         assert_eq!(left_then_right, right_then_left);
-        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 12);
+        assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 13);
         assert_eq!(
             super::super::page_name_index::PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION,
             1
