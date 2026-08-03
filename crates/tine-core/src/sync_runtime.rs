@@ -29999,15 +29999,15 @@ mod tests {
                 managed_application_save_quantiles(&managed_samples, |sample| sample.caller);
             let direct_files_p50 = startup_median(&direct_files_samples);
             let direct_files_p95 = startup_p95(&direct_files_samples);
-            assert!(
-                managed_p50 < Duration::from_millis(10),
-                "managed application save p50 exceeded 10 ms at {total_pages} pages: {managed_p50:?}"
-            );
             eprintln!(
                 "managed_application_save_bench total_pages={total_pages} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
                 managed_application_save_phase_receipt(&managed_samples),
                 startup_ms(direct_files_p50),
                 startup_ms(direct_files_p95),
+            );
+            assert!(
+                managed_p50 < Duration::from_millis(10),
+                "managed application save p50 exceeded 10 ms at {total_pages} pages: {managed_p50:?}"
             );
         }
     }
