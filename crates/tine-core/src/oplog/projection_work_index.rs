@@ -360,7 +360,10 @@ pub(crate) struct ProjectionExpectedPathHead {
     generation: u64,
     engine_history_generation: u64,
     engine_history_root: ContentDigest,
+    rows_root: ContentDigest,
+    paths_root: ContentDigest,
     completed_paths_root: ContentDigest,
+    accepted_root: ContentDigest,
 }
 
 #[derive(Debug)]
@@ -1817,7 +1820,10 @@ impl ProjectionWorkIndex {
             generation: root.generation,
             engine_history_generation: root.engine_history_generation,
             engine_history_root: root.engine_history_root,
+            rows_root: root.rows_root,
+            paths_root: root.paths_root,
             completed_paths_root: root.completed_paths_root,
+            accepted_root: root.accepted_root,
         })
     }
 
@@ -1875,7 +1881,10 @@ impl ProjectionWorkIndex {
             generation: root.generation,
             engine_history_generation: root.engine_history_generation,
             engine_history_root: root.engine_history_root,
+            rows_root: root.rows_root,
+            paths_root: root.paths_root,
             completed_paths_root: root.completed_paths_root,
+            accepted_root: root.accepted_root,
         };
         if actual != head {
             return Err(ProjectionWorkError::BindingMismatch);
@@ -1900,6 +1909,114 @@ impl ProjectionWorkIndex {
                 Err(ProjectionWorkError::AmbiguousCompletedPath)
             }
         }
+    }
+
+    /// Read the one unambiguous accepted Ready work row for an exact path from
+    /// the pinned head. The path index is only current Ready state; the row is
+    /// additionally rebound to its accepted witness, immutable pending-source
+    /// root, and prepared batch before its target can describe expected bytes.
+    pub(crate) fn ready_work_at_expected_path_head_bounded(
+        &self,
+        head: ProjectionExpectedPathHead,
+        path: &ManagedPath,
+        budget: &mut ProjectionExpectedPathReadBudget,
+    ) -> Result<Option<ProjectionWork>, ProjectionWorkError> {
+        if head.workspace_id != self.workspace_id
+            || head.endpoint_id != self.endpoint_id
+            || head.graph_resource_id != self.graph_resource_id
+            || head.receipt_store_id != self.receipt_store_id
+        {
+            return Err(ProjectionWorkError::BindingMismatch);
+        }
+        let root = self.load_root_bounded(
+            head.head_digest,
+            ProjectionExpectedPathBudgetReadKind::PinnedRoot,
+            budget,
+        )?;
+        let actual = ProjectionExpectedPathHead {
+            head_digest: head.head_digest,
+            workspace_id: root.workspace_id,
+            endpoint_id: root.endpoint_id,
+            graph_resource_id: root.graph_resource_id,
+            receipt_store_id: root.receipt_store_id,
+            generation: root.generation,
+            engine_history_generation: root.engine_history_generation,
+            engine_history_root: root.engine_history_root,
+            rows_root: root.rows_root,
+            paths_root: root.paths_root,
+            completed_paths_root: root.completed_paths_root,
+            accepted_root: root.accepted_root,
+        };
+        if actual != head {
+            return Err(ProjectionWorkError::BindingMismatch);
+        }
+        budget.reserve(32)?;
+        let Some(bytes) = self.tree_lookup_bounded(
+            head.paths_root,
+            &path_key(path),
+            ProjectionExpectedPathBudgetReadKind::CompletedPathNode,
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        let ids: Vec<ProjectionWorkId> = decode_canonical_bounded(&bytes, budget)?;
+        if !strictly_sorted(&ids) {
+            return Err(ProjectionWorkError::NonCanonical);
+        }
+        let [work_id] = ids.as_slice() else {
+            return Err(ProjectionWorkError::AmbiguousCompletedPath);
+        };
+        let state = self
+            .load_state_bounded(&root, *work_id, budget)?
+            .ok_or(ProjectionWorkError::MissingWork(*work_id))?;
+        if !matches!(state.status, StoredWorkStatus::Ready) || state.work.path() != path {
+            return Err(ProjectionWorkError::MissingReadyRow);
+        }
+        budget.reserve(16)?;
+        let witness = self
+            .tree_lookup_bounded(
+                head.accepted_root,
+                &batch_key(state.work.batch_id()),
+                ProjectionExpectedPathBudgetReadKind::AcceptedWitnessNode,
+                budget,
+            )?
+            .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
+        let witness: AcceptedBatchWitness = decode_canonical_bounded(&witness, budget)?;
+        if witness.schema_version != INDEX_SCHEMA_VERSION
+            || witness.workspace_id != self.workspace_id
+            || witness.endpoint_id != self.endpoint_id
+            || witness.batch_id != state.work.batch_id()
+            || witness.work_ids.binary_search(work_id).is_err()
+            || !strictly_sorted(&witness.work_ids)
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        let source_root = self.load_root_bounded(
+            witness.pending_root_digest,
+            ProjectionExpectedPathBudgetReadKind::PendingSourceRoot,
+            budget,
+        )?;
+        budget.reserve(16)?;
+        let pending = self
+            .tree_lookup_bounded(
+                source_root.pending_root,
+                &batch_key(witness.batch_id),
+                ProjectionExpectedPathBudgetReadKind::PendingActivationNode,
+                budget,
+            )?
+            .ok_or(ProjectionWorkError::PendingActivationMissing)?;
+        let pending: ProjectionPendingActivation = decode_canonical_bounded(&pending, budget)?;
+        self.require_pending_binding(&pending)?;
+        self.require_pending_prepared_bounded(&pending, budget)?;
+        if pending.batch_id != witness.batch_id
+            || pending.manifest_fingerprint != witness.manifest_fingerprint
+            || pending.prepared_digest != witness.prepared_digest
+            || pending.work_ids != witness.work_ids
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        Ok(Some(state.work))
     }
 
     #[cfg(test)]

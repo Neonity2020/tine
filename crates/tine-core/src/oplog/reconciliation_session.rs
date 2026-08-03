@@ -778,6 +778,7 @@ impl LiveReconciliationSessionDispatch<'_> {
             let ReconciliationSessionDependencies {
                 graph,
                 engine,
+                database,
                 baseline,
                 bootstrap,
                 observed_at,
@@ -803,7 +804,7 @@ impl LiveReconciliationSessionDispatch<'_> {
                 || JoinedAuthenticatedExpectedPathSource::new(engine, projection),
                 |bootstrap| {
                     JoinedAuthenticatedExpectedPathSource::with_bootstrap(
-                        engine, projection, bootstrap,
+                        engine, projection, bootstrap, database,
                     )
                 },
             );
@@ -1015,6 +1016,7 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
     ) -> ReconciliationSessionBaselineFinish {
         let ReconciliationSessionDependencies {
             engine,
+            database,
             baseline,
             bootstrap,
             observed_at,
@@ -1027,7 +1029,9 @@ impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
         let source = bootstrap.map_or_else(
             || JoinedAuthenticatedExpectedPathSource::new(engine, projection),
             |bootstrap| {
-                JoinedAuthenticatedExpectedPathSource::with_bootstrap(engine, projection, bootstrap)
+                JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+                    engine, projection, bootstrap, database,
+                )
             },
         );
         match finish_stable_scan_baseline(baseline, &source, pending, terminal, *observed_at) {

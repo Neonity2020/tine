@@ -44,7 +44,11 @@ use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
     TrustedPrivateApplicationRuntimeRoot,
 };
-use crate::oplog::reconciliation_scan::{ReconciliationSchedulerLimits, ReconciliationTrigger};
+use crate::oplog::reconciliation_scan::{
+    scan_graph_text, take_bootstrap_page_materializations_for_test, GraphTextCandidateKind,
+    GraphTextScanLimits, JoinedAuthenticatedExpectedPathSource, ReconciliationSchedulerLimits,
+    ReconciliationTrigger,
+};
 use crate::oplog::reconciliation_session::{
     ReconciliationSession, ReconciliationSessionDependencies, ReconciliationSessionStep,
 };
@@ -57,11 +61,11 @@ use crate::oplog::sqlite::{
 };
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
-    AuthorBatch, BatchDisposition, BatchId, BatchOrigin, BlockId, BlockLocation,
-    CanonicalArchiveResourceId, CrdtPeerId, DeviceId, DocumentId, LineageDigest, LogicalPageName,
-    ManagedPath, ManagedTextKind, ObjectStore, OperationTransaction, PageId, ProjectionClaim,
-    ProjectionEndpointId, ProjectionReceiptStore, ReferenceCatalogPolicyV1, SemanticOperation,
-    ShardedHotEngine, WorkspaceId,
+    execute_manifested_projection_work, AuthorBatch, BatchDisposition, BatchId, BatchOrigin,
+    BlockId, BlockLocation, CanonicalArchiveResourceId, CrdtPeerId, DeviceId, DocumentId,
+    LineageDigest, LogicalPageName, ManagedPath, ManagedTextKind, ObjectStore,
+    OperationTransaction, PageId, ProjectionClaim, ProjectionEndpointId, ProjectionReceiptStore,
+    ReferenceCatalogPolicyV1, SemanticOperation, ShardedHotEngine, WorkspaceId,
 };
 
 #[test]
@@ -1732,6 +1736,171 @@ fn full_scan_dispatch_with_wrong_authority_never_mutates_the_baseline() {
     fixture.assert_graph_unchanged();
 }
 
+#[test]
+fn unchanged_bootstrap_full_scan_never_materializes_crdt_pages_at_any_graph_size() {
+    for page_count in [1, 17] {
+        let files = (0..page_count)
+            .map(|index| {
+                (
+                    format!("pages/unchanged-{index:03}.md"),
+                    format!("- unchanged {index}\n").into_bytes(),
+                )
+            })
+            .collect();
+        let label = format!("unchanged-bootstrap-scan-{page_count}");
+        let mut fixture = Fixture::new(&label, None, files);
+        let root = fixture.enrollment_root(&label);
+        let paths = PromotedPaths::new(&fixture, &label);
+        let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+        let mut window = runtime
+            .admit_promoted_mutation(&mut authority, &fixture.graph)
+            .unwrap();
+        let (_admission, engine, database, _tail, bootstrap) =
+            window.parts_with_bootstrap().unwrap();
+        engine.reconcile_expected_path_history().unwrap();
+        let projection = engine.projection_work_index().unwrap();
+        let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+            engine, projection, bootstrap, database,
+        );
+
+        take_bootstrap_page_materializations_for_test();
+        let scan = scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default())
+            .expect("unchanged bootstrap scan must be semantically exact");
+        let materialized = take_bootstrap_page_materializations_for_test();
+
+        assert!(scan.candidates.is_empty());
+        assert_eq!(
+            materialized, 0,
+            "{page_count} unchanged bootstrap pages must require no CRDT materialization"
+        );
+    }
+}
+
+#[test]
+fn one_accepted_pending_page_uses_authenticated_work_without_touching_bootstrap_pages() {
+    let files = (0..17)
+        .map(|index| {
+            (
+                format!("pages/pending-control-{index:03}.md"),
+                format!("- unchanged control {index}\n").into_bytes(),
+            )
+        })
+        .collect();
+    let mut fixture = Fixture::new("pending-bootstrap-suffix", None, files);
+    let root = fixture.enrollment_root("pending-bootstrap-suffix");
+    let paths = PromotedPaths::new(&fixture, "pending-bootstrap-suffix");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    const SEED: u128 = 0xB005_7000;
+    append_local_batch(&fixture, &mut authority, &mut runtime, SEED);
+    let pending_path = ManagedPath::parse(&format!("pages/promoted-{SEED}.md")).unwrap();
+
+    let mut window = runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .unwrap();
+    let (_admission, engine, database, _tail, bootstrap) = window.parts_with_bootstrap().unwrap();
+    engine.reconcile_expected_path_history().unwrap();
+    let exceptions = database
+        .authenticated_bootstrap_projection_exceptions(
+            engine,
+            bootstrap.binding(),
+            1_000_000,
+            512 * 1024 * 1024,
+        )
+        .unwrap();
+    assert_eq!(exceptions.len(), 1);
+
+    let projection = engine.projection_work_index().unwrap();
+    let work = projection
+        .next()
+        .unwrap()
+        .expect("one Ready projection row");
+    assert_eq!(work.path(), &pending_path);
+    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+        engine, projection, bootstrap, database,
+    );
+    take_bootstrap_page_materializations_for_test();
+    let pending_scan = scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default())
+        .expect("authenticated Ready target must drive the pending scan");
+    assert_eq!(take_bootstrap_page_materializations_for_test(), 0);
+    assert_eq!(pending_scan.candidates.len(), 1);
+    assert_eq!(pending_scan.candidates[0].path, pending_path);
+    assert_eq!(
+        pending_scan.candidates[0].change,
+        GraphTextCandidateKind::Absence
+    );
+    drop(source);
+
+    execute_manifested_projection_work(&fixture.graph, &fixture.receipts, engine, &work).unwrap();
+    let projection = engine.projection_work_index().unwrap();
+    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+        engine, projection, bootstrap, database,
+    );
+    take_bootstrap_page_materializations_for_test();
+    let completed_scan = scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default())
+        .expect("completed projection and Ready target must describe the same bytes");
+    assert!(completed_scan.candidates.is_empty());
+    assert_eq!(take_bootstrap_page_materializations_for_test(), 0);
+}
+
+#[test]
+fn corrupt_bootstrap_payload_is_refused_without_crdt_fallback() {
+    let mut fixture = Fixture::new(
+        "corrupt-bootstrap-reconciliation",
+        None,
+        vec![("pages/corrupt.md".into(), b"- exact bootstrap\n".to_vec())],
+    );
+    let payload = fixture.shadow.directory().join("payload/pages/corrupt.md");
+    let root = fixture.enrollment_root("corrupt-bootstrap-reconciliation");
+    let paths = PromotedPaths::new(&fixture, "corrupt-bootstrap-reconciliation");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    fs::write(payload, b"- unauthenticated replacement\n").unwrap();
+
+    let mut window = runtime
+        .admit_promoted_mutation(&mut authority, &fixture.graph)
+        .unwrap();
+    let (_admission, engine, database, _tail, bootstrap) = window.parts_with_bootstrap().unwrap();
+    engine.reconcile_expected_path_history().unwrap();
+    let projection = engine.projection_work_index().unwrap();
+    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+        engine, projection, bootstrap, database,
+    );
+    take_bootstrap_page_materializations_for_test();
+    assert!(scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default()).is_err());
+    assert_eq!(take_bootstrap_page_materializations_for_test(), 0);
+}
+
+#[test]
+fn stale_sqlite_bootstrap_suffix_binding_is_never_treated_as_unchanged() {
+    let mut fixture = Fixture::new(
+        "stale-bootstrap-suffix",
+        None,
+        vec![("pages/stale.md".into(), b"- bootstrap\n".to_vec())],
+    );
+    let root = fixture.enrollment_root("stale-bootstrap-suffix");
+    let paths = PromotedPaths::new(&fixture, "stale-bootstrap-suffix");
+    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
+    stage_local_batch_at(
+        &fixture,
+        &mut authority,
+        &mut runtime,
+        0xB005_7100,
+        "pages",
+        false,
+    );
+
+    let engine = &runtime.engine;
+    let projection = engine.projection_work_index().unwrap();
+    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+        engine,
+        projection,
+        &runtime.bootstrap_projection,
+        runtime.projection.database(),
+    );
+    assert!(source
+        .current_scan_identity(GraphTextScanLimits::default().retained_bytes)
+        .is_err());
+}
+
 /// Compile-time proof that the authority cannot be cloned, serialized, or
 /// deserialized. The inherent associated const wins whenever the bound holds.
 struct Probe<T>(PhantomData<T>);
@@ -2094,6 +2263,17 @@ fn append_local_batch_at(
     seed: u128,
     page_directory: &str,
 ) {
+    stage_local_batch_at(fixture, authority, runtime, seed, page_directory, true);
+}
+
+fn stage_local_batch_at(
+    fixture: &Fixture,
+    authority: &mut LocalActiveAuthority,
+    runtime: &mut PromotedLocalRuntime,
+    seed: u128,
+    page_directory: &str,
+    drain_sqlite: bool,
+) {
     let endpoint = authority.endpoint();
     let mut session = runtime
         .admit_promoted_mutation(authority, &fixture.graph)
@@ -2155,8 +2335,10 @@ fn append_local_batch_at(
     // A promoted admission requires the device-local SQLite projection to be at
     // the current accepted frontier, so every mutation drains before the next
     // window opens. This is the ordinary bounded tail drain.
-    let drained = session.drain_projection(16).unwrap();
-    assert_eq!(drained, 1, "exactly the new accepted batch drains");
+    if drain_sqlite {
+        let drained = session.drain_projection(16).unwrap();
+        assert_eq!(drained, 1, "exactly the new accepted batch drains");
+    }
 }
 
 #[test]

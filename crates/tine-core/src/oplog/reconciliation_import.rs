@@ -499,7 +499,9 @@ pub(crate) fn execute_stable_scan_import(
         let source = bootstrap.map_or_else(
             || JoinedAuthenticatedExpectedPathSource::new(engine, projection),
             |bootstrap| {
-                JoinedAuthenticatedExpectedPathSource::with_bootstrap(engine, projection, bootstrap)
+                JoinedAuthenticatedExpectedPathSource::with_bootstrap(
+                    engine, projection, bootstrap, database,
+                )
             },
         );
         let authority = LiveReconciliationImportAuthority { graph, source };

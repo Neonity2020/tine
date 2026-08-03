@@ -16,12 +16,15 @@ use super::{
         ProjectionWorkIndex,
     },
     shadow_projection::BootstrapProjectionAuthority,
+    sqlite::AuthenticatedBootstrapProjectionExceptions,
     BlobDescription, CanonicalGraphResourceId, ContentDigest, ManagedPath, ManagedTextKind, PageId,
-    PortablePathKey, ProjectionWorkTarget,
+    PortablePathKey, ProjectionWorkTarget, SqliteFrontier,
 };
 use crate::graph_text_scope::GraphTextScopeBinding;
 use crate::model::Graph;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::{Ref, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -36,6 +39,23 @@ pub(crate) const GRAPH_TEXT_EXPECTED_PAGE_BYTES: u64 = 1024 * 1024;
 const MAX_SCAN_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCAN_EXPECTED_PATHS: usize = 1_000_000;
 const MAX_SCAN_EXACT_PATH_BYTES: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    static BOOTSTRAP_PAGE_MATERIALIZATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_bootstrap_page_materializations_for_test() -> u64 {
+    BOOTSTRAP_PAGE_MATERIALIZATIONS.with(|counter| counter.replace(0))
+}
+
+#[cfg(test)]
+fn record_bootstrap_page_materializations_for_test(pages: usize) {
+    BOOTSTRAP_PAGE_MATERIALIZATIONS.with(|counter| {
+        counter.set(counter.get().saturating_add(pages as u64));
+    });
+}
 
 /// Bounded, single-flight scheduling limits for one graph endpoint.
 ///
@@ -830,12 +850,26 @@ pub(crate) struct JoinedAuthenticatedExpectedPathSource<'a> {
     engine: &'a ShardedHotEngine,
     projection: &'a ProjectionWorkIndex,
     bootstrap: Option<&'a BootstrapProjectionAuthority>,
+    database: Option<&'a SqliteFrontier>,
+    bootstrap_exceptions: RefCell<Option<JoinedBootstrapExceptions>>,
+    bootstrap_fallback_rows: RefCell<Option<JoinedBootstrapFallbackRows>>,
     bootstrap_materializer: RefCell<Option<JoinedBootstrapMaterializer<'a>>>,
+}
+
+struct JoinedBootstrapExceptions {
+    engine_binding: CurrentPathCatalogBinding,
+    exceptions: AuthenticatedBootstrapProjectionExceptions,
 }
 
 struct JoinedBootstrapMaterializer<'a> {
     engine_binding: CurrentPathCatalogBinding,
     materializer: BootstrapBulkMaterializer<'a>,
+}
+
+struct JoinedBootstrapFallbackRows {
+    engine_binding: CurrentPathCatalogBinding,
+    retained_bytes: u64,
+    rows: HashMap<PageId, AuthenticatedExpectedPath>,
 }
 
 impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
@@ -847,6 +881,9 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             engine,
             projection,
             bootstrap: None,
+            database: None,
+            bootstrap_exceptions: RefCell::new(None),
+            bootstrap_fallback_rows: RefCell::new(None),
             bootstrap_materializer: RefCell::new(None),
         }
     }
@@ -855,13 +892,119 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         engine: &'a ShardedHotEngine,
         projection: &'a ProjectionWorkIndex,
         bootstrap: &'a BootstrapProjectionAuthority,
+        database: &'a SqliteFrontier,
     ) -> Self {
         Self {
             engine,
             projection,
             bootstrap: Some(bootstrap),
+            database: Some(database),
+            bootstrap_exceptions: RefCell::new(None),
+            bootstrap_fallback_rows: RefCell::new(None),
             bootstrap_materializer: RefCell::new(None),
         }
+    }
+
+    fn cached_bootstrap_fallback(
+        &self,
+        engine_binding: CurrentPathCatalogBinding,
+        page_id: PageId,
+    ) -> Result<Option<AuthenticatedExpectedPath>, ExpectedPathSourceFailure> {
+        let retained = self.bootstrap_fallback_rows.borrow();
+        match retained.as_ref() {
+            Some(retained) if retained.engine_binding != engine_binding => {
+                Err(ExpectedPathSourceFailure::Unavailable)
+            }
+            Some(retained) => Ok(retained.rows.get(&page_id).cloned()),
+            None => Ok(None),
+        }
+    }
+
+    fn retain_bootstrap_fallback(
+        &self,
+        engine_binding: CurrentPathCatalogBinding,
+        row: AuthenticatedExpectedPath,
+    ) -> Result<(), ExpectedPathSourceFailure> {
+        let mut retained = self.bootstrap_fallback_rows.borrow_mut();
+        if retained.is_none() {
+            *retained = Some(JoinedBootstrapFallbackRows {
+                engine_binding,
+                retained_bytes: 0,
+                rows: HashMap::new(),
+            });
+        }
+        let retained = retained
+            .as_mut()
+            .expect("bootstrap fallback retention was initialized");
+        if retained.engine_binding != engine_binding {
+            return Err(ExpectedPathSourceFailure::Unavailable);
+        }
+        if retained.rows.contains_key(&row.page_id) {
+            return Ok(());
+        }
+        let row_bytes = (mem::size_of::<(PageId, AuthenticatedExpectedPath)>() as u64)
+            .saturating_add(row.path.as_str().len() as u64);
+        let next_bytes = retained
+            .retained_bytes
+            .checked_add(row_bytes)
+            .ok_or(ExpectedPathSourceFailure::BoundExceeded)?;
+        if retained.rows.len() >= MAX_SCAN_EXPECTED_PATHS || next_bytes > MAX_SCAN_RETAINED_BYTES {
+            return Err(ExpectedPathSourceFailure::BoundExceeded);
+        }
+        retained.retained_bytes = next_bytes;
+        retained.rows.insert(row.page_id, row);
+        Ok(())
+    }
+
+    fn bootstrap_exceptions(
+        &self,
+        engine_binding: CurrentPathCatalogBinding,
+    ) -> Result<Ref<'_, AuthenticatedBootstrapProjectionExceptions>, ExpectedPathSourceFailure>
+    {
+        let bootstrap = self.bootstrap.ok_or(ExpectedPathSourceFailure::Missing)?;
+        let database = self.database.ok_or(ExpectedPathSourceFailure::Missing)?;
+        if self.bootstrap_exceptions.borrow().is_none() {
+            let anchor = EngineHistoryAuthority {
+                generation: bootstrap.binding().history_generation(),
+                index_root: bootstrap.binding().history_root(),
+            };
+            self.engine
+                .authenticate_history_descends_from(anchor)
+                .map_err(|_| {
+                    ExpectedPathSourceFailure::CorruptField(
+                        ExpectedPathCorruptField::BootstrapAuthority,
+                    )
+                })?;
+            let exceptions = database
+                .authenticated_bootstrap_projection_exceptions(
+                    self.engine,
+                    bootstrap.binding(),
+                    MAX_SCAN_EXPECTED_PATHS,
+                    MAX_SCAN_RETAINED_BYTES,
+                )
+                .map_err(|_| {
+                    ExpectedPathSourceFailure::CorruptField(
+                        ExpectedPathCorruptField::BootstrapAuthority,
+                    )
+                })?;
+            *self.bootstrap_exceptions.borrow_mut() = Some(JoinedBootstrapExceptions {
+                engine_binding,
+                exceptions,
+            });
+        }
+        let retained = self.bootstrap_exceptions.borrow();
+        if retained
+            .as_ref()
+            .is_none_or(|exceptions| exceptions.engine_binding != engine_binding)
+        {
+            return Err(ExpectedPathSourceFailure::Unavailable);
+        }
+        Ok(Ref::map(retained, |exceptions| {
+            &exceptions
+                .as_ref()
+                .expect("bootstrap projection exceptions were initialized")
+                .exceptions
+        }))
     }
 
     /// Lazily pin one authenticated bulk materializer for this joined source.
@@ -996,6 +1139,21 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             accepted_frontier: engine.accepted_frontier(),
             projection_generation: projection.generation(),
         };
+        if let Some(bootstrap) = self.bootstrap {
+            let bootstrap = bootstrap.binding();
+            if bootstrap.workspace_id() != engine.workspace_id()
+                || bootstrap.lineage_digest() != engine.lineage_digest()
+                || bootstrap.endpoint_id() != endpoint.endpoint_id()
+                || bootstrap.device_id() != endpoint.device_id()
+                || bootstrap.graph_resource_id() != endpoint.graph_resource_id()
+                || bootstrap.receipt_store_id() != receipt_store_id
+            {
+                return Err(ExpectedPathSourceFailure::CorruptField(
+                    ExpectedPathCorruptField::BootstrapAuthority,
+                ));
+            }
+            drop(self.bootstrap_exceptions(engine)?);
+        }
         let source_commitment =
             joined_source_commitment(engine, projection, endpoint.device_id(), self.bootstrap);
         Ok((engine, projection, binding, source_commitment))
@@ -1044,7 +1202,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         &self,
         source_commitment: ContentDigest,
         row: &CurrentPathCatalogRow,
-        state: &ProjectionPageState,
+        state: Option<&ProjectionPageState>,
     ) -> Result<AuthenticatedExpectedPath, ExpectedPathSourceFailure> {
         let bootstrap = self.bootstrap.ok_or(ExpectedPathSourceFailure::Missing)?;
         let baseline = bootstrap
@@ -1063,9 +1221,9 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             Some(ExpectedPathCorruptField::BootstrapPath)
         } else if baseline.kind() != row.kind() {
             Some(ExpectedPathCorruptField::BootstrapKind)
-        } else if state.page.page_id != row.page_id() {
+        } else if state.is_some_and(|state| state.page.page_id != row.page_id()) {
             Some(ExpectedPathCorruptField::MaterializedPageId)
-        } else if state.page.path != *row.path() {
+        } else if state.is_some_and(|state| state.page.path != *row.path()) {
             Some(ExpectedPathCorruptField::MaterializedPath)
         } else if baseline.intent().target() != BlobDescription::of(baseline.source_bytes()) {
             Some(ExpectedPathCorruptField::BootstrapTarget)
@@ -1075,7 +1233,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         if let Some(mismatch) = mismatch {
             return Err(ExpectedPathSourceFailure::CorruptField(mismatch));
         }
-        if &state.frontier != baseline.intent().frontier() {
+        if let Some(state) = state.filter(|state| &state.frontier != baseline.intent().frontier()) {
             baseline
                 .rebind_semantic_successor(self.engine.workspace_id(), &state)
                 .map_err(|_| {
@@ -1102,9 +1260,20 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         budget: &mut ProjectionExpectedPathReadBudget,
         rows: &mut Vec<AuthenticatedExpectedPath>,
     ) -> Result<(), ExpectedPathSourceFailure> {
+        enum Resolution {
+            Projection(BlobDescription),
+            Bootstrap,
+            CachedBootstrap(AuthenticatedExpectedPath),
+            MaterializeBootstrap,
+        }
+
+        let exceptions = self
+            .bootstrap
+            .map(|_| self.bootstrap_exceptions(cursor.engine_binding))
+            .transpose()?;
         for semantic_chunk in semantic_rows.chunks(BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES) {
-            let mut completed = Vec::new();
-            completed
+            let mut resolutions = Vec::new();
+            resolutions
                 .try_reserve_exact(semantic_chunk.len())
                 .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
             let mut bootstrap_page_ids = Vec::new();
@@ -1117,22 +1286,81 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                     .map_err(map_projection_expected_failure)?;
                 let description =
                     self.completed_description(cursor.projection_head, semantic, budget)?;
-                if description.is_none() {
+                let resolution = if let Some(description) = description {
+                    Resolution::Projection(description)
+                } else if exceptions
+                    .as_ref()
+                    .is_some_and(|exceptions| !exceptions.contains(semantic.page_id()))
+                {
+                    Resolution::Bootstrap
+                } else if exceptions.is_some() {
+                    let exceptions = exceptions
+                        .as_ref()
+                        .expect("bootstrap exception branch has authenticated exceptions");
+                    budget
+                        .reset_with_retained(retained_bytes)
+                        .map_err(map_projection_expected_failure)?;
+                    let ready = self
+                        .projection
+                        .ready_work_at_expected_path_head_bounded(
+                            cursor.projection_head,
+                            semantic.path(),
+                            budget,
+                        )
+                        .map_err(map_projection_expected_failure)?;
+                    match ready {
+                        Some(work)
+                            if work.page_id() == semantic.page_id()
+                                && work.path() == semantic.path()
+                                && exceptions.latest_batch(semantic.page_id())
+                                    == Some(work.batch_id()) =>
+                        {
+                            let ProjectionWorkTarget::Present(description) = work.target() else {
+                                return Err(ExpectedPathSourceFailure::Missing);
+                            };
+                            Resolution::Projection(description)
+                        }
+                        Some(work)
+                            if work.page_id() == semantic.page_id()
+                                && work.path() == semantic.path() =>
+                        {
+                            return Err(ExpectedPathSourceFailure::CorruptField(
+                                ExpectedPathCorruptField::ProjectionAcceptedWitness,
+                            ))
+                        }
+                        Some(_) => {
+                            return Err(ExpectedPathSourceFailure::CorruptField(
+                                ExpectedPathCorruptField::CompletedReceiptIdentity,
+                            ))
+                        }
+                        None => match self
+                            .cached_bootstrap_fallback(cursor.engine_binding, semantic.page_id())?
+                        {
+                            Some(row) => Resolution::CachedBootstrap(row),
+                            None => Resolution::MaterializeBootstrap,
+                        },
+                    }
+                } else {
+                    return Err(ExpectedPathSourceFailure::Missing);
+                };
+                if matches!(resolution, Resolution::MaterializeBootstrap) {
                     bootstrap_page_ids.push(semantic.page_id());
                 }
-                completed.push(description);
+                resolutions.push(resolution);
             }
 
             let bootstrap_states = if bootstrap_page_ids.is_empty() {
                 Vec::new()
             } else {
+                #[cfg(test)]
+                record_bootstrap_page_materializations_for_test(bootstrap_page_ids.len());
                 self.bootstrap_materializer(cursor.engine_binding)?
                     .materialize_pages_for_projection(&bootstrap_page_ids)
                     .map_err(map_engine_expected_failure)?
             };
             let mut bootstrap_states = bootstrap_states.into_iter();
-            for (semantic, description) in semantic_chunk.iter().zip(completed) {
-                if let Some(description) = description {
+            for (semantic, resolution) in semantic_chunk.iter().zip(resolutions) {
+                if let Resolution::Projection(description) = resolution {
                     rows.push(AuthenticatedExpectedPath {
                         page_id: semantic.page_id(),
                         path: semantic.path().clone(),
@@ -1147,11 +1375,33 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                     });
                     continue;
                 }
-                let state = bootstrap_states
-                    .next()
-                    .flatten()
-                    .ok_or(ExpectedPathSourceFailure::Missing)?;
-                rows.push(self.join_bootstrap_row(cursor.source_commitment, semantic, &state)?);
+                if let Resolution::CachedBootstrap(row) = resolution {
+                    let refreshed =
+                        self.join_bootstrap_row(cursor.source_commitment, semantic, None)?;
+                    if refreshed != row {
+                        return Err(ExpectedPathSourceFailure::CorruptField(
+                            ExpectedPathCorruptField::BootstrapSemanticRebind,
+                        ));
+                    }
+                    rows.push(refreshed);
+                    continue;
+                }
+                let state = match resolution {
+                    Resolution::Bootstrap => None,
+                    Resolution::MaterializeBootstrap => Some(
+                        bootstrap_states
+                            .next()
+                            .flatten()
+                            .ok_or(ExpectedPathSourceFailure::Missing)?,
+                    ),
+                    Resolution::Projection(_) | Resolution::CachedBootstrap(_) => unreachable!(),
+                };
+                let joined =
+                    self.join_bootstrap_row(cursor.source_commitment, semantic, state.as_ref())?;
+                if state.is_some() {
+                    self.retain_bootstrap_fallback(cursor.engine_binding, joined.clone())?;
+                }
+                rows.push(joined);
             }
             if bootstrap_states.next().is_some() {
                 return Err(ExpectedPathSourceFailure::CorruptField(
@@ -1308,13 +1558,64 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                         ),
                     });
                 }
+                let exceptions = self.bootstrap_exceptions(engine)?;
+                if !exceptions.contains(row.page_id()) {
+                    return self.join_bootstrap_row(source_commitment, &row, None);
+                }
+                budget
+                    .reset_with_retained(point_bytes as u64)
+                    .map_err(map_projection_expected_failure)?;
+                if let Some(work) = self
+                    .projection
+                    .ready_work_at_expected_path_head_bounded(projection, row.path(), budget)
+                    .map_err(map_projection_expected_failure)?
+                {
+                    if work.page_id() != row.page_id() || work.path() != row.path() {
+                        return Err(ExpectedPathSourceFailure::CorruptField(
+                            ExpectedPathCorruptField::CompletedReceiptIdentity,
+                        ));
+                    }
+                    if exceptions.latest_batch(row.page_id()) != Some(work.batch_id()) {
+                        return Err(ExpectedPathSourceFailure::CorruptField(
+                            ExpectedPathCorruptField::ProjectionAcceptedWitness,
+                        ));
+                    }
+                    let ProjectionWorkTarget::Present(description) = work.target() else {
+                        return Err(ExpectedPathSourceFailure::Missing);
+                    };
+                    return Ok(AuthenticatedExpectedPath {
+                        page_id: row.page_id(),
+                        path: row.path().clone(),
+                        kind: row.kind(),
+                        accepted_name_digest: row.accepted_name_digest(),
+                        description,
+                        owner_binding: joined_owner_binding(
+                            source_commitment,
+                            row.page_id(),
+                            row.path(),
+                        ),
+                    });
+                }
+                if let Some(cached) = self.cached_bootstrap_fallback(engine, row.page_id())? {
+                    let refreshed = self.join_bootstrap_row(source_commitment, &row, None)?;
+                    if refreshed != cached {
+                        return Err(ExpectedPathSourceFailure::CorruptField(
+                            ExpectedPathCorruptField::BootstrapSemanticRebind,
+                        ));
+                    }
+                    return Ok(refreshed);
+                }
                 // Preserve the bounded point-lookup path. The scan-local bulk
                 // materializer exists only to amortize a streamed full scan.
+                #[cfg(test)]
+                record_bootstrap_page_materializations_for_test(1);
                 let state = self
                     .engine
                     .materialize_page_for_projection(row.page_id())
                     .map_err(map_engine_expected_failure)?;
-                self.join_bootstrap_row(source_commitment, &row, &state)
+                let joined = self.join_bootstrap_row(source_commitment, &row, Some(&state))?;
+                self.retain_bootstrap_fallback(engine, joined.clone())?;
+                Ok(joined)
             })
             .transpose()?;
         self.require_join_current(engine, projection, budget)?;
