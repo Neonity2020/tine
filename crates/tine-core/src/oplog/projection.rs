@@ -1223,11 +1223,18 @@ fn execute_manifested_projection_work_with_runtime(
     engine
         .authorize_projection_work(work_index, work)
         .map_err(ProjectionError::Engine)?;
-    if work_index
-        .status(work.work_id())
-        .map_err(|error| ProjectionError::Work(error.to_string()))?
-        != Some(ProjectionWorkStatus::Ready)
-    {
+    // A journal drain has no affine process-memory continuation after a
+    // restart. Re-entering with the exact already-completed work must therefore
+    // authenticate the same archive/intent/receipt authority below and adopt
+    // it idempotently. `mark_completed` already performs that exact terminal
+    // comparison; blocked, superseded, absent, and merely reserved work remain
+    // refusals.
+    if !matches!(
+        work_index
+            .status(work.work_id())
+            .map_err(|error| ProjectionError::Work(error.to_string()))?,
+        Some(ProjectionWorkStatus::Ready | ProjectionWorkStatus::Completed)
+    ) {
         return Err(ProjectionError::WorkNotReady);
     }
     let batch = match archive

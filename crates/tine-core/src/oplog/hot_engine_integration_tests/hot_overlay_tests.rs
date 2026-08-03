@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::time::Instant;
+use std::{collections::BTreeMap, fs};
 
 use cap_std::{ambient_authority, fs::Dir};
 use tine_storage::{LocalJournalFrame, LocalJournalSegment};
@@ -332,6 +333,147 @@ impl OverlayFixture {
             .collect();
         (page, blocks)
     }
+
+    fn database_and_tail(&self, label: &str) -> (SqliteFrontier, crate::oplog::TailOverlay) {
+        let app = ApplicationRuntimeRoot::open_for_test(
+            &self._dir.path().join(format!("drain-app-runtime-{label}")),
+        )
+        .unwrap();
+        let source = RebuildSource::new(&self.engine, &self.writer).unwrap();
+        let opened = SqliteFrontier::open_or_rebuild(
+            &self
+                ._dir
+                .path()
+                .join(format!("drain-projection-{label}.sqlite")),
+            &app,
+            ProjectionClaim::current(self.ids.workspace, self.ids.lineage),
+            source,
+        )
+        .unwrap();
+        let source = RebuildSource::new(&self.engine, &self.writer).unwrap();
+        let tail = crate::oplog::TailOverlay::from_durable(&opened.database, &source).unwrap();
+        (opened.database, tail)
+    }
+}
+
+#[derive(Default)]
+struct DrainPublisher {
+    authorship: BTreeMap<BatchId, crate::local_journal_drain_test::ManagedLocalDerivativeAuthority>,
+    provider: BTreeMap<BatchId, crate::local_journal_drain_test::ManagedLocalDerivativeAuthority>,
+    pending_authorship_once: bool,
+    pending_provider_once: bool,
+}
+
+impl crate::local_journal_drain_test::ManagedLocalDerivativePublisher for DrainPublisher {
+    fn ensure_local_authorship(
+        &mut self,
+        authority: &crate::local_journal_drain_test::ManagedLocalDerivativeAuthority,
+    ) -> crate::local_journal_drain_test::ManagedLocalPublicationState {
+        if self.pending_authorship_once {
+            self.pending_authorship_once = false;
+            return crate::local_journal_drain_test::ManagedLocalPublicationState::Pending(
+                "synthetic authorship cut".into(),
+            );
+        }
+        match self.authorship.get(&authority.batch_id) {
+            Some(existing) if existing == authority => {
+                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+            }
+            Some(_) => crate::local_journal_drain_test::ManagedLocalPublicationState::Conflict(
+                "divergent authorship winner".into(),
+            ),
+            None => {
+                self.authorship
+                    .insert(authority.batch_id, authority.clone());
+                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+            }
+        }
+    }
+
+    fn ensure_provider_publication(
+        &mut self,
+        authority: &crate::local_journal_drain_test::ManagedLocalDerivativeAuthority,
+    ) -> crate::local_journal_drain_test::ManagedLocalPublicationState {
+        if self.pending_provider_once {
+            self.pending_provider_once = false;
+            return crate::local_journal_drain_test::ManagedLocalPublicationState::Pending(
+                "synthetic provider cut".into(),
+            );
+        }
+        match self.provider.get(&authority.batch_id) {
+            Some(existing) if existing == authority => {
+                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+            }
+            Some(_) => crate::local_journal_drain_test::ManagedLocalPublicationState::Conflict(
+                "divergent provider winner".into(),
+            ),
+            None => {
+                self.provider.insert(authority.batch_id, authority.clone());
+                crate::local_journal_drain_test::ManagedLocalPublicationState::Complete
+            }
+        }
+    }
+}
+
+fn drain_frame_to_completion(
+    fixture: &mut OverlayFixture,
+    database: &mut SqliteFrontier,
+    tail: &mut crate::oplog::TailOverlay,
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    checkpoint: &crate::local_journal_drain_test::ManagedLocalDrainCheckpoint,
+    publisher: &mut DrainPublisher,
+) -> crate::local_journal_drain_test::ManagedLocalDrainCompletion {
+    let admission = crate::oplog::local_active::LocalRuntimeAdmission::unenrolled_pre_activation();
+    let mut continuation = None;
+    for _ in 0..64 {
+        let outcome =
+            crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+                &admission,
+                &fixture.graph,
+                &fixture.receipts,
+                &mut fixture.engine,
+                database,
+                tail,
+                frame,
+                checkpoint,
+                continuation.as_ref(),
+                publisher,
+            );
+        match outcome {
+            crate::local_journal_drain_test::ManagedLocalDrainOutcome::Complete(completion) => {
+                return completion
+            }
+            crate::local_journal_drain_test::ManagedLocalDrainOutcome::Pending(next) => {
+                continuation = Some(next);
+            }
+            other => panic!("managed-local drain did not converge: {other:?}"),
+        }
+    }
+    panic!("managed-local drain exceeded the bounded retry allowance at {continuation:?}")
+}
+
+fn publish_journal_graph_target(
+    fixture: &OverlayFixture,
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+) -> Vec<u8> {
+    let record = decode_managed_local_record(frame).unwrap();
+    let base = record.projection().precondition_base().bytes();
+    let target = record.projection().intent().target().bytes().unwrap();
+    let base_text = std::str::from_utf8(base).unwrap();
+    let target_text = std::str::from_utf8(target).unwrap();
+    let outcome = fixture.graph.recover_committed_journal_page_projection(
+        frame.payload_digest(),
+        record.projection().intent().path().as_str(),
+        &crate::model::content_rev(base_text),
+        base,
+        target,
+        &crate::model::content_rev(target_text),
+    );
+    let crate::model::JournalPageProjectionOutcome::Durable(durable) = outcome else {
+        panic!("synthetic foreground journal projection remained pending")
+    };
+    assert_eq!(durable.target().target(), target);
+    target.to_vec()
 }
 
 fn finalized_edit_chain(
@@ -787,6 +929,527 @@ fn accepted_catchup_collapses_prefix_without_semantic_change_and_sequence_stays_
 }
 
 #[test]
+fn managed_local_drain_converges_markdown_and_org_without_rewriting_exact_graph_target() {
+    for (extension, exact_path) in [
+        ("md", "journals/team/deep/2026_08_03.md"),
+        ("org", "pages/nonstandard/nested/Drain_Note.org"),
+    ] {
+        let mut accepted = OverlayFixture::new_at_path(
+            &format!("managed-drain-accepted-{extension}"),
+            exact_path,
+            12,
+        );
+        let batch = accepted.finalize_edit(1_081_000, 1);
+        accepted.accept_and_project(&batch);
+        let expected = accepted.engine.materialize_page(accepted.page_id).unwrap();
+        let mut fixture = OverlayFixture::new_at_path(
+            &format!("managed-drain-local-{extension}"),
+            exact_path,
+            12,
+        );
+        let (mut database, mut tail) = fixture.database_and_tail("semantic");
+        let prepared = fixture.prepare_record(&batch);
+        let record = frame(&prepared);
+        fixture.engine.replay_managed_local_record(&record).unwrap();
+        let decoded = decode_managed_local_record(&record).unwrap();
+        let target = decoded
+            .projection()
+            .intent()
+            .target()
+            .bytes()
+            .unwrap()
+            .to_vec();
+        let target_path = fixture.graph_path.join(fixture.page_path.as_str());
+        fs::write(&target_path, &target).unwrap();
+        fixture.graph = Graph::open(&fixture.graph_path);
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt as _;
+            fs::metadata(&target_path).unwrap().ino()
+        };
+        let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+            uuid(DEVICE),
+            fixture.ids.workspace,
+            fixture.ids.lineage,
+        );
+        let mut publisher = DrainPublisher {
+            pending_authorship_once: true,
+            pending_provider_once: true,
+            ..DrainPublisher::default()
+        };
+        let completion = drain_frame_to_completion(
+            &mut fixture,
+            &mut database,
+            &mut tail,
+            &record,
+            &checkpoint,
+            &mut publisher,
+        );
+        assert_eq!(completion.sequence, 0);
+        assert_eq!(completion.batch_id, prepared.batch_id());
+        assert_eq!(completion.checkpoint.next_sequence(), 1);
+        assert_eq!(completion.reclaimable_through_after_checkpoint, 0);
+        let checkpoint_bytes = completion.checkpoint.encode().unwrap();
+        assert_eq!(
+            crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::decode(
+                &checkpoint_bytes,
+                uuid(DEVICE),
+                fixture.ids.workspace,
+                fixture.ids.lineage,
+            )
+            .unwrap(),
+            completion.checkpoint
+        );
+        assert_eq!(fs::read(&target_path).unwrap(), target);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(fs::metadata(&target_path).unwrap().ino(), inode_before);
+        }
+        let actual = fixture.engine.materialize_page(fixture.page_id).unwrap();
+        assert_page_semantics(&expected, &actual);
+        let read = database.materialized_read().unwrap();
+        assert_eq!(
+            read.page(fixture.page_id).unwrap().unwrap().path,
+            fixture.page_path
+        );
+        assert_eq!(
+            fixture
+                .engine
+                .projection_work_index()
+                .unwrap()
+                .completed_receipts_for_path(&fixture.page_path)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(publisher.authorship.len(), 1);
+        assert_eq!(publisher.provider.len(), 1);
+        // Lose the returned checkpoint and every live continuation: exact
+        // archive/SQLite/receipt/provider winners are adopted and derive the
+        // identical checkpoint without touching graph text.
+        let repeated = drain_frame_to_completion(
+            &mut fixture,
+            &mut database,
+            &mut tail,
+            &record,
+            &checkpoint,
+            &mut publisher,
+        );
+        assert_eq!(repeated.checkpoint, completion.checkpoint);
+        assert_eq!(publisher.authorship.len(), 1);
+        assert_eq!(publisher.provider.len(), 1);
+    }
+}
+
+#[test]
+fn managed_local_drain_restarts_at_every_derivative_boundary_without_duplication() {
+    use crate::local_journal_drain_test::ManagedLocalDrainFaultPoint as Cut;
+
+    let (_, batches) = finalized_edit_chain("managed-drain-cuts-source", "md", 8, 1);
+    let mut fixture = OverlayFixture::new("managed-drain-cuts-local", "md", 8);
+    let (mut database, mut tail) = fixture.database_and_tail("cuts");
+    let prepared = fixture.prepare_record(&batches[0]);
+    let record = frame(&prepared);
+    fixture.engine.replay_managed_local_record(&record).unwrap();
+    let target = decode_managed_local_record(&record)
+        .unwrap()
+        .projection()
+        .intent()
+        .target()
+        .bytes()
+        .unwrap()
+        .to_vec();
+    let target_path = fixture.graph_path.join(fixture.page_path.as_str());
+    fs::write(&target_path, &target).unwrap();
+    fixture.graph = Graph::open(&fixture.graph_path);
+    #[cfg(unix)]
+    let inode_before = {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(&target_path).unwrap().ino()
+    };
+    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+        uuid(DEVICE),
+        fixture.ids.workspace,
+        fixture.ids.lineage,
+    );
+    let admission = crate::oplog::local_active::LocalRuntimeAdmission::unenrolled_pre_activation();
+    let mut publisher = DrainPublisher::default();
+    for cut in [
+        Cut::BeforeArchivePublication,
+        Cut::AfterArchivePublication,
+        Cut::BeforeEngineAcceptance,
+        Cut::AfterEngineAcceptance,
+        Cut::BeforeTailAdmission,
+        Cut::AfterTailAdmission,
+        Cut::BeforeSqliteCommit,
+        Cut::AfterSqliteCommit,
+        Cut::BeforeProjectionAdoption,
+        Cut::AfterProjectionAdoption,
+        Cut::BeforeAuthorship,
+        Cut::AfterAuthorship,
+        Cut::BeforeProvider,
+        Cut::AfterProvider,
+    ] {
+        crate::local_journal_drain_test::fail_managed_local_drain_once_at(cut);
+        let outcome =
+            crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+                &admission,
+                &fixture.graph,
+                &fixture.receipts,
+                &mut fixture.engine,
+                &mut database,
+                &mut tail,
+                &record,
+                &checkpoint,
+                None,
+                &mut publisher,
+            );
+        assert!(
+            matches!(
+                outcome,
+                crate::local_journal_drain_test::ManagedLocalDrainOutcome::Pending(_)
+            ),
+            "cut {cut:?} did not retain the exact record: {outcome:?}"
+        );
+        assert_eq!(checkpoint.next_sequence(), 0);
+    }
+    let completion = drain_frame_to_completion(
+        &mut fixture,
+        &mut database,
+        &mut tail,
+        &record,
+        &checkpoint,
+        &mut publisher,
+    );
+    assert_eq!(completion.checkpoint.next_sequence(), 1);
+    assert_eq!(publisher.authorship.len(), 1);
+    assert_eq!(publisher.provider.len(), 1);
+    assert_eq!(fs::read(&target_path).unwrap(), target);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(fs::metadata(&target_path).unwrap().ino(), inode_before);
+    }
+}
+
+#[test]
+fn managed_local_drain_expands_twelve_records_in_order_and_restarts_from_durable_state() {
+    let (accepted, batches) = finalized_edit_chain("managed-drain-chain-accepted", "org", 16, 12);
+    let expected = accepted.engine.materialize_page(accepted.page_id).unwrap();
+    let mut fixture = OverlayFixture::new("managed-drain-chain-local", "org", 16);
+    let (mut database, mut tail) = fixture.database_and_tail("chain");
+    let mut checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+        uuid(DEVICE),
+        fixture.ids.workspace,
+        fixture.ids.lineage,
+    );
+    let mut publisher = DrainPublisher::default();
+    let mut batch_ids = Vec::new();
+    for (index, batch) in batches.iter().enumerate() {
+        let prepared = fixture.prepare_record(batch);
+        let record = frame(&prepared);
+        fixture.engine.replay_managed_local_record(&record).unwrap();
+        let decoded = decode_managed_local_record(&record).unwrap();
+        let target = decoded.projection().intent().target().bytes().unwrap();
+        fs::write(fixture.graph_path.join(fixture.page_path.as_str()), target).unwrap();
+        fixture.graph = Graph::open(&fixture.graph_path);
+        if matches!(index, 2 | 6 | 10) {
+            publisher.pending_provider_once = true;
+        }
+        let completion = drain_frame_to_completion(
+            &mut fixture,
+            &mut database,
+            &mut tail,
+            &record,
+            &checkpoint,
+            &mut publisher,
+        );
+        // Persist/redecode at representative boundaries and intentionally lose
+        // every live continuation before the next sequence.
+        let bytes = completion.checkpoint.encode().unwrap();
+        checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::decode(
+            &bytes,
+            uuid(DEVICE),
+            fixture.ids.workspace,
+            fixture.ids.lineage,
+        )
+        .unwrap();
+        batch_ids.push(completion.batch_id);
+    }
+    assert_eq!(checkpoint.next_sequence(), 12);
+    assert_eq!(publisher.authorship.len(), 12);
+    assert_eq!(publisher.provider.len(), 12);
+    assert_eq!(batch_ids.len(), 12);
+    assert_eq!(
+        database.frontier_root().unwrap(),
+        fixture.engine.accepted_frontier_root().unwrap()
+    );
+    assert_page_semantics(
+        &expected,
+        &fixture.engine.materialize_page(fixture.page_id).unwrap(),
+    );
+}
+
+#[test]
+fn managed_local_drain_refuses_gap_duplicate_and_wrong_graph_before_checkpoint_advance() {
+    let (_, batches) = finalized_edit_chain("managed-drain-refusal-source", "md", 8, 2);
+    let mut fixture = OverlayFixture::new("managed-drain-refusal-local", "md", 8);
+    let (mut database, mut tail) = fixture.database_and_tail("refusal");
+    let first = fixture.prepare_record(&batches[0]);
+    let first_frame = frame(&first);
+    fixture
+        .engine
+        .replay_managed_local_record(&first_frame)
+        .unwrap();
+    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+        uuid(DEVICE),
+        fixture.ids.workspace,
+        fixture.ids.lineage,
+    );
+    let admission = crate::oplog::local_active::LocalRuntimeAdmission::unenrolled_pre_activation();
+    let mut publisher = DrainPublisher::default();
+    let outcome = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+        &admission,
+        &fixture.graph,
+        &fixture.receipts,
+        &mut fixture.engine,
+        &mut database,
+        &mut tail,
+        &first_frame,
+        &checkpoint,
+        None,
+        &mut publisher,
+    );
+    assert!(matches!(
+        outcome,
+        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+    ));
+    assert_eq!(checkpoint.next_sequence(), 0);
+    assert_eq!(
+        fixture.writer.inspect_batch(first.batch_id()).unwrap(),
+        BatchInspection::Absent
+    );
+
+    let target = decode_managed_local_record(&first_frame)
+        .unwrap()
+        .projection()
+        .intent()
+        .target()
+        .bytes()
+        .unwrap()
+        .to_vec();
+    fs::write(fixture.graph_path.join(fixture.page_path.as_str()), target).unwrap();
+    fixture.graph = Graph::open(&fixture.graph_path);
+    let completion = drain_frame_to_completion(
+        &mut fixture,
+        &mut database,
+        &mut tail,
+        &first_frame,
+        &checkpoint,
+        &mut publisher,
+    );
+    let duplicate = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+        &admission,
+        &fixture.graph,
+        &fixture.receipts,
+        &mut fixture.engine,
+        &mut database,
+        &mut tail,
+        &first_frame,
+        &completion.checkpoint,
+        None,
+        &mut publisher,
+    );
+    assert!(matches!(
+        duplicate,
+        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+    ));
+
+    let second = fixture.prepare_record(&batches[1]);
+    let second_frame = frame(&second);
+    fixture
+        .engine
+        .replay_managed_local_record(&second_frame)
+        .unwrap();
+    let gap_checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+        uuid(DEVICE),
+        fixture.ids.workspace,
+        fixture.ids.lineage,
+    );
+    let gap = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+        &admission,
+        &fixture.graph,
+        &fixture.receipts,
+        &mut fixture.engine,
+        &mut database,
+        &mut tail,
+        &second_frame,
+        &gap_checkpoint,
+        None,
+        &mut publisher,
+    );
+    assert!(matches!(
+        gap,
+        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Blocked(_)
+    ));
+    assert_eq!(gap_checkpoint.next_sequence(), 0);
+}
+
+#[test]
+fn managed_local_drain_adopts_exact_winners_and_rejects_divergent_archive_or_provider() {
+    let mut source = OverlayFixture::new("managed-drain-divergence-source", "md", 8);
+    let batch = source.finalize_edit(1_095_000, 1);
+    source.accept_and_project(&batch);
+
+    let mut archive_conflict = OverlayFixture::new("managed-drain-archive-conflict", "md", 8);
+    let divergent = archive_conflict.finalize_edit(1_095_000, 99);
+    assert_eq!(divergent.manifest().batch_id(), batch.manifest().batch_id());
+    assert_ne!(
+        divergent.manifest().encode().unwrap(),
+        batch.manifest().encode().unwrap()
+    );
+    archive_conflict
+        .writer
+        .publish_prepared(&divergent)
+        .unwrap();
+    let (mut database, mut tail) = archive_conflict.database_and_tail("archive-conflict");
+    let prepared = archive_conflict.prepare_record(&batch);
+    let record = frame(&prepared);
+    archive_conflict
+        .engine
+        .replay_managed_local_record(&record)
+        .unwrap();
+    let target = decode_managed_local_record(&record)
+        .unwrap()
+        .projection()
+        .intent()
+        .target()
+        .bytes()
+        .unwrap()
+        .to_vec();
+    fs::write(
+        archive_conflict
+            .graph_path
+            .join(archive_conflict.page_path.as_str()),
+        target,
+    )
+    .unwrap();
+    archive_conflict.graph = Graph::open(&archive_conflict.graph_path);
+    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+        uuid(DEVICE),
+        archive_conflict.ids.workspace,
+        archive_conflict.ids.lineage,
+    );
+    let admission = crate::oplog::local_active::LocalRuntimeAdmission::unenrolled_pre_activation();
+    let mut publisher = DrainPublisher::default();
+    let outcome = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+        &admission,
+        &archive_conflict.graph,
+        &archive_conflict.receipts,
+        &mut archive_conflict.engine,
+        &mut database,
+        &mut tail,
+        &record,
+        &checkpoint,
+        None,
+        &mut publisher,
+    );
+    assert!(matches!(
+        outcome,
+        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+    ));
+    assert_eq!(checkpoint.next_sequence(), 0);
+    let BatchInspection::Ready(stored_divergent) = archive_conflict
+        .writer
+        .inspect_batch(divergent.manifest().batch_id())
+        .unwrap()
+    else {
+        panic!("divergent archive winner disappeared")
+    };
+    assert_eq!(
+        stored_divergent.manifest().encode().unwrap(),
+        divergent.manifest().encode().unwrap()
+    );
+
+    let mut provider_conflict = OverlayFixture::new("managed-drain-provider-conflict", "md", 8);
+    let (mut database, mut tail) = provider_conflict.database_and_tail("provider-conflict");
+    let prepared = provider_conflict.prepare_record(&batch);
+    let record = frame(&prepared);
+    provider_conflict
+        .engine
+        .replay_managed_local_record(&record)
+        .unwrap();
+    let target = decode_managed_local_record(&record)
+        .unwrap()
+        .projection()
+        .intent()
+        .target()
+        .bytes()
+        .unwrap()
+        .to_vec();
+    fs::write(
+        provider_conflict
+            .graph_path
+            .join(provider_conflict.page_path.as_str()),
+        target,
+    )
+    .unwrap();
+    provider_conflict.graph = Graph::open(&provider_conflict.graph_path);
+    let checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+        uuid(DEVICE),
+        provider_conflict.ids.workspace,
+        provider_conflict.ids.lineage,
+    );
+    let mut publisher = DrainPublisher {
+        pending_provider_once: true,
+        ..DrainPublisher::default()
+    };
+    let pending = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+        &admission,
+        &provider_conflict.graph,
+        &provider_conflict.receipts,
+        &mut provider_conflict.engine,
+        &mut database,
+        &mut tail,
+        &record,
+        &checkpoint,
+        None,
+        &mut publisher,
+    );
+    assert!(matches!(
+        pending,
+        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Pending(_)
+    ));
+    let mut divergent_authority = publisher.authorship[&prepared.batch_id()].clone();
+    divergent_authority.accepted_frontier_digest = ContentDigest::of(b"divergent provider");
+    publisher
+        .provider
+        .insert(prepared.batch_id(), divergent_authority.clone());
+    let conflict = crate::local_journal_drain_test::resume_managed_local_journal_drain_with_parts(
+        &admission,
+        &provider_conflict.graph,
+        &provider_conflict.receipts,
+        &mut provider_conflict.engine,
+        &mut database,
+        &mut tail,
+        &record,
+        &checkpoint,
+        None,
+        &mut publisher,
+    );
+    assert!(matches!(
+        conflict,
+        crate::local_journal_drain_test::ManagedLocalDrainOutcome::Conflict(_)
+    ));
+    assert_eq!(
+        publisher.provider[&prepared.batch_id()],
+        divergent_authority
+    );
+    assert_eq!(checkpoint.next_sequence(), 0);
+}
+
+#[test]
 #[ignore = "manual release benchmark; synthetic pages and bounded record work"]
 fn managed_local_record_manual_release_benchmark() {
     let pages = std::env::var("TINE_MANAGED_LOCAL_RECORD_BENCH_PAGES")
@@ -862,4 +1525,80 @@ fn managed_local_record_manual_release_benchmark() {
         observations[1].1 <= observations[0].1 * 2.0 + 1.0,
         "10,000-page p50 is not bounded against 100 pages: {observations:?}"
     );
+}
+
+#[test]
+#[ignore = "manual release benchmark; includes normal archive/SQLite/receipt derivative cost"]
+fn managed_local_drain_manual_release_benchmark() {
+    let pages = std::env::var("TINE_MANAGED_LOCAL_DRAIN_BENCH_PAGES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.parse::<usize>().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![100, 10_000]);
+    let edits = std::env::var("TINE_MANAGED_LOCAL_DRAIN_BENCH_EDITS")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(3);
+    assert!(edits > 0);
+
+    let mut structural = Vec::new();
+    for page_count in pages {
+        let (_, batches) = finalized_edit_chain(
+            &format!("managed-drain-bench-source-{page_count}"),
+            "md",
+            page_count,
+            edits,
+        );
+        let mut fixture = OverlayFixture::new(
+            &format!("managed-drain-bench-local-{page_count}"),
+            "md",
+            page_count,
+        );
+        let (mut database, mut tail) = fixture.database_and_tail("bench");
+        let mut checkpoint = crate::local_journal_drain_test::ManagedLocalDrainCheckpoint::initial(
+            uuid(DEVICE),
+            fixture.ids.workspace,
+            fixture.ids.lineage,
+        );
+        let mut publisher = DrainPublisher::default();
+        let mut samples = Vec::new();
+        let mut observed_work = Vec::new();
+        for batch in &batches {
+            let prepared = fixture.prepare_record(batch);
+            let record = frame(&prepared);
+            fixture.engine.replay_managed_local_record(&record).unwrap();
+            publish_journal_graph_target(&fixture, &record);
+            let started = Instant::now();
+            let completion = drain_frame_to_completion(
+                &mut fixture,
+                &mut database,
+                &mut tail,
+                &record,
+                &checkpoint,
+                &mut publisher,
+            );
+            samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+            checkpoint = completion.checkpoint;
+            observed_work.push(completion.work);
+        }
+        samples.sort_by(f64::total_cmp);
+        let p50 = samples[samples.len() / 2];
+        for work in &observed_work {
+            assert_eq!(work.records, 1);
+            assert_eq!(work.graph_target_point_reads, 1);
+            assert_eq!(work.accepted_events, 1);
+            assert_eq!(work.projection_work_point_reads, 1);
+            assert_eq!(work.authorship_attempts, 1);
+            assert_eq!(work.provider_attempts, 1);
+        }
+        println!(
+            "managed-local-drain pages={page_count} p50_ms={p50:.6} samples_ms={samples:?} work={observed_work:?}"
+        );
+        structural.push(observed_work);
+    }
+    assert!(structural.windows(2).all(|pair| pair[0] == pair[1]));
 }

@@ -8,8 +8,15 @@ pub mod date;
 pub mod doc;
 pub mod edn;
 pub mod fast_commit;
+
+// The production owner adds this file to `oplog` when the runtime lane is
+// integrated. Compile it here in tests so this deliberately file-disjoint
+// change still receives ordinary type checking and its focused proof suite.
 pub mod graph_text_scope;
 pub mod html_sanitize;
+#[cfg(test)]
+#[path = "oplog/local_journal_drain.rs"]
+mod local_journal_drain_test;
 pub mod logbook;
 pub mod model;
 pub mod onboarding;

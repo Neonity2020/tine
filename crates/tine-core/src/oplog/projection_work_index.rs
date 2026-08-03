@@ -1967,7 +1967,12 @@ impl ProjectionWorkIndex {
         let state = self
             .load_state(&root, work.work_id())?
             .ok_or(ProjectionWorkError::MissingWork(work.work_id()))?;
-        if state.work != *work || !matches!(state.status, StoredWorkStatus::Ready) {
+        if state.work != *work
+            || !matches!(
+                state.status,
+                StoredWorkStatus::Ready | StoredWorkStatus::Completed { .. }
+            )
+        {
             return Err(ProjectionWorkError::AcceptedWitnessMismatch);
         }
         let bytes = self
