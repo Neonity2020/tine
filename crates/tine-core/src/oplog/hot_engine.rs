@@ -8837,6 +8837,7 @@ impl ShardedHotEngine {
         }
         self.local_overlay.next_sequence = next_sequence;
         self.local_overlay.commitment = ContentDigest::of(b"tine/managed-local-prefix/empty/v1\0");
+        self.advance_author_mutation_generation();
         Ok(())
     }
 

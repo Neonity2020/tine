@@ -15495,7 +15495,17 @@ mod tests {
             || format!("device-{}.segment", device.simple()),
             |generation| managed_local_generation_segment_filename(device, generation),
         );
-        let directory = Dir::open_ambient_dir(&workspace_directory, ambient_authority()).unwrap();
+        let snapshot_directory = std::env::temp_dir().join(format!(
+            "tine-managed-local-journal-snapshot-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&snapshot_directory).unwrap();
+        fs::copy(
+            workspace_directory.join(&segment_name),
+            snapshot_directory.join(&segment_name),
+        )
+        .unwrap();
+        let directory = Dir::open_ambient_dir(&snapshot_directory, ambient_authority()).unwrap();
         let (journal, _) = LocalJournalSegment::open_from_sequence(
             &directory,
             &segment_name,
@@ -15505,6 +15515,9 @@ mod tests {
         .unwrap();
         let mut frames = Vec::new();
         journal.replay(|frame| frames.push(frame)).unwrap();
+        drop(journal);
+        drop(directory);
+        fs::remove_dir_all(snapshot_directory).unwrap();
         frames
     }
 
@@ -16171,6 +16184,20 @@ mod tests {
         assert_eq!(foreground.managed_local_pending, 14);
         assert_eq!(fixture.manifest_count(), manifests_before);
         assert_eq!(fixture.applied_batch_count(), applied_before);
+        let foreground_frames = managed_local_journal_frames(&request);
+        assert_eq!(foreground_frames.len(), expected_targets.len());
+        for (sequence, (frame, (expected_path, expected_target))) in
+            foreground_frames.iter().zip(&expected_targets).enumerate()
+        {
+            assert_eq!(frame.sequence(), sequence as u64);
+            let record = decode_managed_local_record(frame).unwrap();
+            assert_eq!(record.sequence(), sequence as u64);
+            assert_eq!(record.projection().intent().path().as_str(), expected_path);
+            assert_eq!(
+                record.projection().intent().target().bytes(),
+                Some(expected_target.as_slice())
+            );
+        }
 
         handle
             .observe_watcher(vec![
@@ -16201,20 +16228,7 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
-        let frames = managed_local_journal_frames(&request);
-        assert_eq!(frames.len(), expected_targets.len());
-        for (sequence, (frame, (expected_path, expected_target))) in
-            frames.iter().zip(&expected_targets).enumerate()
-        {
-            assert_eq!(frame.sequence(), sequence as u64);
-            let record = decode_managed_local_record(frame).unwrap();
-            assert_eq!(record.sequence(), sequence as u64);
-            assert_eq!(record.projection().intent().path().as_str(), expected_path);
-            assert_eq!(
-                record.projection().intent().target().bytes(),
-                Some(expected_target.as_slice())
-            );
-        }
+        assert!(managed_local_journal_frames(&request).is_empty());
         let reopened = active_handle(SyncRuntimeHandle::open(request));
         drive_initial_feed(&reopened);
         let cold_markdown = load_application_exact(&reopened, markdown_path);
