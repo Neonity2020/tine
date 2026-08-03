@@ -28394,11 +28394,6 @@ mod tests {
                     assert_eq!(returned.path, target_path);
                     assert_eq!(returned.blocks[0].raw, content);
                     assert_ne!(returned_revision, revision);
-                    assert_eq!(
-                        returned.rev.as_deref(),
-                        Some(returned_revision.as_str()),
-                        "the caller receives the exact revision it just saved"
-                    );
 
                     let exact_bytes = fs::read(fixture.graph_root.join(&target_path)).unwrap();
                     assert_eq!(
@@ -28423,7 +28418,12 @@ mod tests {
                         .unwrap()
                         .expect("saved target remains an exact graph page");
                     assert_parser_dto_semantics(&returned, &parsed);
-                    assert_eq!(parsed.rev.as_deref(), Some(returned_revision.as_str()));
+                    let immediate = load_application_exact(&handle, &target_path);
+                    assert_parser_dto_semantics(&returned, &immediate.0);
+                    assert_eq!(
+                        immediate.1, returned_revision,
+                        "the returned application revision must be the next save conflict base"
+                    );
 
                     if timed {
                         assert_managed_application_save_foreground_counters(
