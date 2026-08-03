@@ -830,10 +830,64 @@ fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
         ContentDigest::of(prepared.journal_payload())
     );
     assert_eq!(append.data_durability_syncs, 1);
+    let mut wrong_receipt = append;
+    wrong_receipt.data_durability_syncs = 0;
+    assert_eq!(
+        fixture
+            .engine
+            .apply_appended_managed_local_record(&wrong_receipt, &prepared),
+        Err(ManagedLocalRecordError::WrongDurabilityProof)
+    );
+    assert_eq!(
+        fixture.engine.managed_local_prefix_state().records_applied,
+        0
+    );
     fixture
         .engine
         .apply_appended_managed_local_record(&append, &prepared)
         .unwrap();
+}
+
+#[test]
+fn intervening_engine_mutation_refuses_retained_managed_candidate_before_visibility() {
+    let mut fixture = OverlayFixture::new("managed-record-retained-stale", "md", 8);
+    let intervening = fixture
+        .engine
+        .prepare_bootstrap_transaction(fixture.local_author(1_120_000), &fixture.content_edit(9))
+        .unwrap();
+    let prepared_batch = fixture.finalize_edit(1_120_010, 1);
+    let prepared = fixture.prepare_record(&prepared_batch);
+    let (_, mut journal) = fixture.journal("retained-stale");
+    let append = append_managed_local_record(&mut journal, &prepared).unwrap();
+
+    fixture
+        .writer
+        .publish_bootstrap_prepared_for_test(&intervening)
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .engine
+            .stage_archive_batch(intervening.manifest().batch_id())
+            .unwrap()
+            .disposition,
+        BatchDisposition::Accepted { .. }
+    ));
+    let visible_before = fixture.engine.materialize_page(fixture.page_id).unwrap();
+
+    assert!(matches!(
+        fixture
+            .engine
+            .apply_appended_managed_local_record(&append, &prepared),
+        Err(ManagedLocalRecordError::StaleBase)
+    ));
+    assert_eq!(
+        fixture.engine.managed_local_prefix_state().records_applied,
+        0
+    );
+    assert_page_semantics(
+        &visible_before,
+        &fixture.engine.materialize_page(fixture.page_id).unwrap(),
+    );
 }
 
 #[test]
