@@ -461,9 +461,6 @@ mod fixtures {
         pub(super) graph_root: PathBuf,
         pub(super) journal_root: PathBuf,
         pub(super) graph: Arc<Graph>,
-        pub(super) format: FixtureFormat,
-        pub(super) blocks_per_page: usize,
-        remove_on_drop: bool,
     }
 
     impl GraphFixture {
@@ -500,9 +497,6 @@ mod fixtures {
                 graph_root,
                 journal_root,
                 graph,
-                format,
-                blocks_per_page,
-                remove_on_drop: true,
             }
         }
 
@@ -557,16 +551,11 @@ mod fixtures {
                 .join(format!("{}.journal", device.simple()))
         }
 
-        pub(super) fn keep(&mut self) {
-            self.remove_on_drop = false;
-        }
     }
 
     impl Drop for GraphFixture {
         fn drop(&mut self) {
-            if self.remove_on_drop {
-                let _ = fs::remove_dir_all(&self.root);
-            }
+            let _ = fs::remove_dir_all(&self.root);
         }
     }
 
@@ -1018,5 +1007,461 @@ mod tests {
                 .expect("the page survives journal recovery");
             assert_eq!(page_semantics(&seen), page_semantics(&committed_page));
         }
+    }
+}
+
+#[cfg(test)]
+mod benchmark {
+    //! Permanent release receipt for the fast trusted-local commit.
+    //!
+    //! The hard receipt is a real local ext4/NVMe filesystem. A volatile
+    //! overlay (`/tmp` on many Linux hosts) is measured as a diagnostic only:
+    //! its `fsync` is nearly free, so it prices CPU and memory work rather than
+    //! durability. Both surfaces are reported and labelled.
+    //!
+    //! ```text
+    //! RUST_MIN_STACK=134217728 cargo test --release -p tine-core --lib \
+    //!   fast_local_commit_latency_manual_release_benchmark -- --ignored --nocapture
+    //! ```
+    //!
+    //! Environment overrides: `TINE_FAST_COMMIT_BENCH_PAGES` (comma-separated
+    //! graph sizes), `_BLOCKS_PER_PAGE`, `_EDITS`, `_WARMUPS`, `_FORMATS`
+    //! (`markdown`, `org`), `_EXT4_ROOT`, `_OVERLAY_ROOT`, `_SURFACES`
+    //! (`ext4`, `overlay`).
+
+    use super::fixtures::{
+        content_edit, page_semantics, FixtureFormat, GraphFixture, DEFAULT_BLOCKS_PER_PAGE,
+    };
+    use super::*;
+
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use crate::PageKind;
+
+    /// Contract from the performance dossier, in nanoseconds.
+    const HARD_P50: Duration = Duration::from_millis(10);
+    const TARGET_P50: Duration = Duration::from_millis(5);
+    const HARD_P95: Duration = Duration::from_millis(20);
+    /// The 10,000-page kill gate: p50 at the largest size versus the smallest.
+    const SCALE_GATE: f64 = 2.0;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Surface {
+        Ext4,
+        Overlay,
+    }
+
+    impl Surface {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Ext4 => "ext4",
+                Self::Overlay => "overlay",
+            }
+        }
+
+        /// Whether this surface's numbers are contractual or diagnostic.
+        const fn is_receipt(self) -> bool {
+            matches!(self, Self::Ext4)
+        }
+    }
+
+    struct Configuration {
+        surface: Surface,
+        base: PathBuf,
+        format: FixtureFormat,
+        pages: usize,
+        blocks_per_page: usize,
+        warmups: usize,
+        edits: usize,
+    }
+
+    struct Receipt {
+        surface: Surface,
+        format: FixtureFormat,
+        pages: usize,
+        samples: Vec<Duration>,
+        journal: LocalJournalStats,
+        forbidden: ForbiddenCommitWork,
+        journal_bytes_per_commit: f64,
+    }
+
+    impl Receipt {
+        fn percentile(&self, fraction: f64) -> Duration {
+            let mut sorted = self.samples.clone();
+            sorted.sort_unstable();
+            let index = ((sorted.len() as f64 - 1.0) * fraction).round() as usize;
+            sorted[index.min(sorted.len() - 1)]
+        }
+
+        fn p50(&self) -> Duration {
+            self.percentile(0.50)
+        }
+
+        fn p95(&self) -> Duration {
+            self.percentile(0.95)
+        }
+
+        fn min(&self) -> Duration {
+            *self.samples.iter().min().expect("at least one sample")
+        }
+
+        fn max(&self) -> Duration {
+            *self.samples.iter().max().expect("at least one sample")
+        }
+
+        fn mean(&self) -> Duration {
+            self.samples.iter().sum::<Duration>() / self.samples.len() as u32
+        }
+    }
+
+    fn milliseconds(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1_000.0
+    }
+
+    fn environment_usize(name: &str, fallback: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(fallback)
+    }
+
+    fn graph_sizes() -> Vec<usize> {
+        match std::env::var("TINE_FAST_COMMIT_BENCH_PAGES") {
+            Ok(value) => {
+                let sizes: Vec<usize> = value
+                    .split(',')
+                    .filter_map(|entry| entry.trim().parse::<usize>().ok())
+                    .filter(|pages| *pages > 0)
+                    .collect();
+                assert!(!sizes.is_empty(), "TINE_FAST_COMMIT_BENCH_PAGES is empty");
+                sizes
+            }
+            Err(_) => vec![100, 1_000, 10_000],
+        }
+    }
+
+    fn formats() -> Vec<FixtureFormat> {
+        match std::env::var("TINE_FAST_COMMIT_BENCH_FORMATS") {
+            Ok(value) => value
+                .split(',')
+                .filter_map(|entry| match entry.trim() {
+                    "markdown" | "md" => Some(FixtureFormat::Markdown),
+                    "org" => Some(FixtureFormat::Org),
+                    _ => None,
+                })
+                .collect(),
+            Err(_) => vec![FixtureFormat::Markdown, FixtureFormat::Org],
+        }
+    }
+
+    /// The workspace target directory, which lives on the repository's own
+    /// filesystem. That is the real local disk on a development machine, which
+    /// is what the contract's hard receipt requires.
+    fn default_ext4_root() -> PathBuf {
+        std::env::var("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("target")
+            })
+            .join("fast-commit-bench")
+    }
+
+    fn surfaces() -> Vec<(Surface, PathBuf)> {
+        let ext4 = std::env::var("TINE_FAST_COMMIT_BENCH_EXT4_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_ext4_root());
+        let overlay = std::env::var("TINE_FAST_COMMIT_BENCH_OVERLAY_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let selected = std::env::var("TINE_FAST_COMMIT_BENCH_SURFACES")
+            .unwrap_or_else(|_| "ext4,overlay".to_owned());
+        let mut chosen = Vec::new();
+        for entry in selected.split(',') {
+            match entry.trim() {
+                "ext4" => chosen.push((Surface::Ext4, ext4.clone())),
+                "overlay" => chosen.push((Surface::Overlay, overlay.clone())),
+                _ => {}
+            }
+        }
+        assert!(!chosen.is_empty(), "no benchmark surface was selected");
+        chosen
+    }
+
+    /// Measure one configuration. Every sample is a complete fast commit: the
+    /// stale check, the journal append and its durability barrier, the audited
+    /// replacement, and the returned post-edit state. Nothing else is timed and
+    /// nothing else is elided — each sample also proves it did the right thing.
+    fn measure(configuration: &Configuration) -> Receipt {
+        std::fs::create_dir_all(&configuration.base).unwrap();
+        let fixture = GraphFixture::build(
+            &configuration.base,
+            &format!(
+                "bench-{}-{}-{}",
+                configuration.surface.label(),
+                configuration.format.label(),
+                configuration.pages
+            ),
+            configuration.pages,
+            configuration.blocks_per_page,
+            configuration.format,
+        );
+        // The edited page sits in the middle of the graph, so nothing about the
+        // measurement depends on the target being the first or last entry.
+        let page_index = configuration.pages / 2;
+        let mut committer = fixture.committer(Uuid::from_u128(0x_be6c_4000));
+        let mut current = fixture.load(page_index);
+        assert!(
+            !current.read_only,
+            "the {} fixture must be editable",
+            configuration.format.label()
+        );
+        committer.adopt_loaded_page(&current).unwrap();
+
+        let before_digests = fixture.text_digests();
+        let mut samples = Vec::with_capacity(configuration.edits);
+        let mut forbidden = ForbiddenCommitWork::default();
+        let total = configuration.warmups + configuration.edits;
+        for generation in 1..=total {
+            let base_rev = current.rev.clone().unwrap();
+            let (edited, effect) = content_edit(
+                &current,
+                page_index,
+                generation % configuration.blocks_per_page,
+                generation,
+            );
+            let expected = page_semantics(&edited);
+            let intent = FastCommitIntent::SemanticEffect(&effect);
+
+            let observed_before = forbidden_commit_work();
+            let started = Instant::now();
+            let outcome = committer.commit(edited, &base_rev, intent).unwrap();
+            let elapsed = started.elapsed();
+            let performed = forbidden_commit_work().since(observed_before);
+
+            assert_eq!(
+                outcome.journal.data_durability_syncs, 1,
+                "an ordinary fast commit performs exactly one durability barrier"
+            );
+            assert_eq!(
+                page_semantics(&outcome.page),
+                expected,
+                "the returned state must be the caller's post-edit page"
+            );
+            assert!(outcome.page.rev.is_some());
+            if generation > configuration.warmups {
+                samples.push(elapsed);
+                forbidden = ForbiddenCommitWork {
+                    sqlite_drains: forbidden.sqlite_drains + performed.sqlite_drains,
+                    archive_object_reads: forbidden.archive_object_reads
+                        + performed.archive_object_reads,
+                    projection_receipt_loads: forbidden.projection_receipt_loads
+                        + performed.projection_receipt_loads,
+                    graph_wide_catalog_decodes: forbidden.graph_wide_catalog_decodes
+                        + performed.graph_wide_catalog_decodes,
+                    application_page_loads: forbidden.application_page_loads
+                        + performed.application_page_loads,
+                };
+            }
+            current = outcome.page;
+        }
+
+        // Exactly one file changed across the whole measured run, and the
+        // reparsed page is the page the last commit returned.
+        let after_digests = fixture.text_digests();
+        let changed: Vec<_> = after_digests
+            .iter()
+            .filter(|(path, digest)| before_digests.get(*path) != Some(*digest))
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(
+            changed,
+            vec![format!(
+                "pages/Fast-Commit-{page_index}.{}",
+                configuration.format.extension()
+            )],
+            "only the edited page's file may change"
+        );
+        assert_eq!(
+            before_digests.len(),
+            after_digests.len(),
+            "no graph file may be created or removed"
+        );
+        let reopened = fixture.reopen();
+        let seen = reopened
+            .load_named(&fixture.page_name(page_index), PageKind::Page)
+            .unwrap()
+            .expect("the committed page exists after a fresh reopen");
+        assert_eq!(
+            page_semantics(&seen),
+            page_semantics(&current),
+            "a fresh reopen must see the last committed edit"
+        );
+
+        let journal = committer.journal_stats();
+        assert_eq!(journal.frames_appended, total as u64);
+        assert_eq!(journal.data_durability_syncs, total as u64);
+        assert_eq!(journal.directory_durability_syncs, 1);
+        assert_eq!(journal.recovery_truncations, 0);
+        Receipt {
+            surface: configuration.surface,
+            format: configuration.format,
+            pages: configuration.pages,
+            journal_bytes_per_commit: journal.bytes_appended as f64 / total as f64,
+            samples,
+            journal,
+            forbidden,
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: fast trusted-local commit latency at 100/1,000/10,000 pages"]
+    fn fast_local_commit_latency_manual_release_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test --release -p tine-core --lib \
+             fast_local_commit_latency_manual_release_benchmark -- --ignored --nocapture"
+        );
+        let sizes = graph_sizes();
+        let formats = formats();
+        let blocks_per_page =
+            environment_usize("TINE_FAST_COMMIT_BENCH_BLOCKS_PER_PAGE", DEFAULT_BLOCKS_PER_PAGE);
+        let edits = environment_usize("TINE_FAST_COMMIT_BENCH_EDITS", 100);
+        let warmups = environment_usize("TINE_FAST_COMMIT_BENCH_WARMUPS", 10);
+
+        let mut receipts = Vec::new();
+        for (surface, base) in surfaces() {
+            for format in &formats {
+                for pages in &sizes {
+                    let receipt = measure(&Configuration {
+                        surface,
+                        base: base.clone(),
+                        format: *format,
+                        pages: *pages,
+                        blocks_per_page,
+                        warmups,
+                        edits,
+                    });
+                    eprintln!(
+                        "fast_commit surface={} format={} pages={} blocks_per_page={} warmups={} edits={} \
+                         p50_ms={:.3} p95_ms={:.3} min_ms={:.3} max_ms={:.3} mean_ms={:.3} \
+                         durability_syncs_per_commit={:.3} directory_syncs={} journal_bytes_per_commit={:.1} \
+                         forbidden={:?}",
+                        receipt.surface.label(),
+                        receipt.format.label(),
+                        receipt.pages,
+                        blocks_per_page,
+                        warmups,
+                        receipt.samples.len(),
+                        milliseconds(receipt.p50()),
+                        milliseconds(receipt.p95()),
+                        milliseconds(receipt.min()),
+                        milliseconds(receipt.max()),
+                        milliseconds(receipt.mean()),
+                        receipt.journal.data_durability_syncs as f64
+                            / receipt.journal.frames_appended as f64,
+                        receipt.journal.directory_durability_syncs,
+                        receipt.journal_bytes_per_commit,
+                        receipt.forbidden,
+                    );
+                    // Raw samples, so the receipt can be re-derived rather than
+                    // trusted.
+                    eprintln!(
+                        "fast_commit_samples_ms surface={} format={} pages={} {}",
+                        receipt.surface.label(),
+                        receipt.format.label(),
+                        receipt.pages,
+                        receipt
+                            .samples
+                            .iter()
+                            .map(|sample| format!("{:.3}", milliseconds(*sample)))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                    receipts.push(receipt);
+                }
+            }
+        }
+
+        // Gate evaluation. Every gate is reported for every configuration
+        // before any of them is enforced, so a failure still produces a
+        // complete receipt.
+        let smallest = *sizes.iter().min().expect("at least one graph size");
+        let largest = *sizes.iter().max().expect("at least one graph size");
+        let mut failures = Vec::new();
+        for receipt in &receipts {
+            let key = format!(
+                "{}/{}/{} pages",
+                receipt.surface.label(),
+                receipt.format.label(),
+                receipt.pages
+            );
+            let hard = receipt.p50() <= HARD_P50;
+            let target = receipt.p50() <= TARGET_P50;
+            let tail = receipt.p95() <= HARD_P95;
+            eprintln!(
+                "fast_commit_gate {key}: p50={:.3}ms hard<=10ms:{} target<=5ms:{} p95={:.3}ms <=20ms:{} \
+                 forbidden_work_zero:{}",
+                milliseconds(receipt.p50()),
+                if hard { "PASS" } else { "FAIL" },
+                if target { "PASS" } else { "MISS" },
+                milliseconds(receipt.p95()),
+                if tail { "PASS" } else { "FAIL" },
+                receipt.forbidden.is_none(),
+            );
+            assert!(
+                receipt.forbidden.is_none(),
+                "{key} performed forbidden structural work: {:?}",
+                receipt.forbidden
+            );
+            if receipt.surface.is_receipt() {
+                if !hard {
+                    failures.push(format!("{key}: p50 {:.3}ms > 10ms", milliseconds(receipt.p50())));
+                }
+                if !tail {
+                    failures.push(format!("{key}: p95 {:.3}ms > 20ms", milliseconds(receipt.p95())));
+                }
+            }
+        }
+
+        for format in &formats {
+            for (surface, _) in surfaces() {
+                let at = |pages: usize| {
+                    receipts.iter().find(|receipt| {
+                        receipt.surface == surface
+                            && receipt.format == *format
+                            && receipt.pages == pages
+                    })
+                };
+                let (Some(small), Some(large)) = (at(smallest), at(largest)) else {
+                    continue;
+                };
+                if smallest == largest {
+                    continue;
+                }
+                let ratio = large.p50().as_secs_f64() / small.p50().as_secs_f64();
+                let key = format!("{}/{}", surface.label(), format.label());
+                eprintln!(
+                    "fast_commit_scale_gate {key}: p50({largest})/p50({smallest}) = {ratio:.3} \
+                     (<= {SCALE_GATE:.1}) {}",
+                    if ratio <= SCALE_GATE { "PASS" } else { "FAIL" }
+                );
+                if surface.is_receipt() && ratio > SCALE_GATE {
+                    failures.push(format!(
+                        "{key}: p50 at {largest} pages is {ratio:.3}x p50 at {smallest} pages"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "the ext4 receipt did not meet the ordinary-edit latency contract:\n  {}",
+            failures.join("\n  ")
+        );
     }
 }
