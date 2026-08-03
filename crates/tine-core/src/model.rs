@@ -868,6 +868,193 @@ pub struct ManagedSyncPull {
     pub conflicts_changed: bool,
 }
 
+/// Exact durable graph target produced by one journal-authorized existing-page
+/// commit.  The append proof remains opaque to the graph model; this value only
+/// describes the path and bytes whose file and parent-directory barriers have
+/// completed.
+#[derive(Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+pub(crate) struct JournalPageProjectionTarget {
+    relative_path: String,
+    target: Vec<u8>,
+    revision: String,
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+impl JournalPageProjectionTarget {
+    pub(crate) fn relative_path(&self) -> &str {
+        &self.relative_path
+    }
+
+    pub(crate) fn target(&self) -> &[u8] {
+        &self.target
+    }
+
+    pub(crate) fn revision(&self) -> &str {
+        &self.revision
+    }
+}
+
+/// A journal proof paired with its exact durable graph target.
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+pub(crate) struct DurableJournalPageProjection<A> {
+    append_proof: A,
+    target: JournalPageProjectionTarget,
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+impl<A> DurableJournalPageProjection<A> {
+    pub(crate) fn append_proof(&self) -> &A {
+        &self.append_proof
+    }
+
+    pub(crate) fn target(&self) -> &JournalPageProjectionTarget {
+        &self.target
+    }
+
+    pub(crate) fn into_parts(self) -> (A, JournalPageProjectionTarget) {
+        (self.append_proof, self.target)
+    }
+}
+
+/// A durable append whose exact graph publication still needs completion.
+///
+/// This state deliberately owns the caller's proof unchanged.  Retrying it
+/// never calls the append callback and can only authenticate/publish the exact
+/// path, base, and target captured before the append boundary.
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+pub(crate) struct CommittedPendingJournalPageProjection<A> {
+    append_proof: A,
+    recovery: JournalPageProjectionRecovery,
+    last_error: io::Error,
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+impl<A> CommittedPendingJournalPageProjection<A> {
+    pub(crate) fn append_proof(&self) -> &A {
+        &self.append_proof
+    }
+
+    pub(crate) fn relative_path(&self) -> &str {
+        self.recovery.relative_path()
+    }
+
+    pub(crate) fn target(&self) -> &[u8] {
+        self.recovery.target()
+    }
+
+    pub(crate) fn last_error(&self) -> &io::Error {
+        &self.last_error
+    }
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+pub(crate) enum JournalPageProjectionOutcome<A> {
+    Durable(DurableJournalPageProjection<A>),
+    CommittedPending(CommittedPendingJournalPageProjection<A>),
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+enum JournalPageProjectionRecovery {
+    InProcess(JournalPageProjectionPlan),
+    Restart(JournalPageProjectionRestartRecord),
+}
+
+impl JournalPageProjectionRecovery {
+    fn relative_path(&self) -> &str {
+        match self {
+            Self::InProcess(plan) => &plan.relative_path,
+            Self::Restart(record) => &record.relative_path,
+        }
+    }
+
+    fn target(&self) -> &[u8] {
+        match self {
+            Self::InProcess(plan) => plan.target.as_bytes(),
+            Self::Restart(record) => &record.target,
+        }
+    }
+}
+
+/// Authenticated journal material sufficient to reacquire runtime-only file and
+/// parent identities after process memory has been lost.
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+struct JournalPageProjectionRestartRecord {
+    relative_path: String,
+    expected_base: Vec<u8>,
+    base_revision: String,
+    target: Vec<u8>,
+    revision: String,
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+struct JournalPageProjectionPlan {
+    path: PathBuf,
+    relative_path: String,
+    expected_base: String,
+    expected_identity: ContentDigest,
+    expected_parent_identity: ContentDigest,
+    target: String,
+    revision: String,
+    cache: bool,
+}
+
+/// Private pre-append typestate.  It has no graph mutation method; consuming
+/// the append callback is the only transition to the publication-capable state.
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+struct VerifiedJournalPageProjection<'a> {
+    graph: &'a Graph,
+    write: &'a ManagedTextWritePermit,
+    plan: JournalPageProjectionPlan,
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+struct JournalCommittedPageProjection<'a, A> {
+    graph: &'a Graph,
+    write: &'a ManagedTextWritePermit,
+    plan: JournalPageProjectionPlan,
+    append_proof: A,
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+impl<'a> VerifiedJournalPageProjection<'a> {
+    fn append<A>(
+        self,
+        append: impl FnOnce() -> io::Result<A>,
+    ) -> io::Result<JournalCommittedPageProjection<'a, A>> {
+        let append_proof = append()?;
+        Ok(JournalCommittedPageProjection {
+            graph: self.graph,
+            write: self.write,
+            plan: self.plan,
+            append_proof,
+        })
+    }
+}
+
+#[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+impl<A> JournalCommittedPageProjection<'_, A> {
+    fn publish(self) -> JournalPageProjectionOutcome<A> {
+        let result = journal_projection_before_publish_hook().and_then(|()| {
+            self.graph
+                .publish_journal_page_projection(self.write, &self.plan)
+        });
+        match result {
+            Ok(target) => JournalPageProjectionOutcome::Durable(DurableJournalPageProjection {
+                append_proof: self.append_proof,
+                target,
+            }),
+            Err(last_error) => JournalPageProjectionOutcome::CommittedPending(
+                CommittedPendingJournalPageProjection {
+                    append_proof: self.append_proof,
+                    recovery: JournalPageProjectionRecovery::InProcess(self.plan),
+                    last_error,
+                },
+            ),
+        }
+    }
+}
+
 /// Per-retained-resource admission state for every Tine-managed page or journal
 /// mutation.
 ///
@@ -3489,6 +3676,10 @@ thread_local! {
     static MANAGED_WRITE_AFTER_IDENTITY_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_BEFORE_MUTATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_AFTER_RETIRE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static JOURNAL_PROJECTION_BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static JOURNAL_PROJECTION_AFTER_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static JOURNAL_PROJECTION_AFTER_FILE_SYNC: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_REPLACEMENT_HANDOFF: std::cell::RefCell<Option<HandoffSafe>> = const { std::cell::RefCell::new(None) };
@@ -4387,6 +4578,58 @@ fn managed_write_after_retire_hook() -> io::Result<()> {
 
 #[cfg(not(test))]
 fn managed_write_after_retire_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn journal_projection_before_publish_hook() -> io::Result<()> {
+    JOURNAL_PROJECTION_BEFORE_PUBLISH.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn journal_projection_before_publish_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn journal_projection_after_publish_hook() -> io::Result<()> {
+    JOURNAL_PROJECTION_AFTER_PUBLISH.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn journal_projection_after_publish_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn journal_projection_after_file_sync_hook() -> io::Result<()> {
+    JOURNAL_PROJECTION_AFTER_FILE_SYNC.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn journal_projection_after_file_sync_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn journal_projection_before_cache_publication_hook() -> io::Result<()> {
+    JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn journal_projection_before_cache_publication_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -6488,6 +6731,59 @@ impl Graph {
         })
     }
 
+    fn validate_managed_target_parent_identity(
+        &self,
+        index: &CompleteGraphTextAdmissionIndex,
+        path: &Path,
+        target: &ManagedTextTarget,
+    ) -> io::Result<ContentDigest> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| bad_path())?;
+        let parent_components = relative
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .map(|component| match component {
+                std::path::Component::Normal(component) => component
+                    .to_str()
+                    .filter(|component| projection_component_is_portable(component))
+                    .map(str::to_owned)
+                    .ok_or_else(bad_path),
+                _ => Err(bad_path()),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if target.chain.len() != parent_components.len().saturating_add(1) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed text parent chain changed during exact validation",
+            ));
+        }
+        let mut retained_relative = String::new();
+        for (depth, directory) in target.chain.iter().enumerate() {
+            if depth > 0 {
+                if !retained_relative.is_empty() {
+                    retained_relative.push('/');
+                }
+                retained_relative.push_str(&parent_components[depth - 1]);
+            }
+            let expected = index
+                .directories_by_exact_relative
+                .get(&retained_relative)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("managed text parent was not retained at {retained_relative:?}"),
+                    )
+                })?;
+            if canonical_projection_directory_resource_id(directory)? != *expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("managed text parent identity changed at {retained_relative:?}"),
+                ));
+            }
+        }
+        canonical_projection_directory_resource_id(target.parent())
+    }
+
     fn managed_read_to_string(
         &self,
         permit: &ManagedTextWritePermit,
@@ -6793,6 +7089,7 @@ impl Graph {
 
             rename_projection_noreplace(target.parent(), &temp, &target.filename)?;
             published = true;
+            journal_projection_after_publish_hook()?;
             sync_projection_chain_required(&target.chain)?;
             self.validate_current_graph_text_collision_strict(
                 permit,
@@ -18296,6 +18593,511 @@ impl Graph {
         Ok(())
     }
 
+    /// Commit one already-existing exact page through the trusted-local journal
+    /// boundary.  The managed writer permit, resource identity authority, and
+    /// exact path lock remain held from validation through the append callback
+    /// and graph publication.
+    ///
+    /// Validation and append failures are ordinary precommit errors.  Once the
+    /// callback returns its opaque durable proof, every later failure is returned
+    /// as [`JournalPageProjectionOutcome::CommittedPending`] and must be retried
+    /// with [`Graph::retry_committed_journal_page_projection`], never redrafted or
+    /// appended again.
+    #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+    pub(crate) fn commit_existing_page_with_journal<A>(
+        &self,
+        page: &PageDto,
+        base_rev: &str,
+        expected_base: &[u8],
+        exact_target: &[u8],
+        append: impl FnOnce() -> io::Result<A>,
+    ) -> io::Result<JournalPageProjectionOutcome<A>> {
+        if page.guide {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "bundled Guide pages cannot be journal projected",
+            ));
+        }
+        if page.path.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal projection supports only an existing exact page path",
+            ));
+        }
+        let write = self.admit_managed_text_writer()?;
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        let (path, cache) = self.save_target(&write, page)?;
+        let lock = self.page_lock(&path);
+        let _guard = lock.lock().unwrap();
+        let verified = self.verify_existing_journal_page_projection(
+            &write,
+            page,
+            base_rev,
+            expected_base,
+            exact_target,
+            path,
+            cache,
+        )?;
+        Ok(verified.append(append)?.publish())
+    }
+
+    /// Resume only graph durability/cache publication for an already committed
+    /// journal append.  No callback is accepted here, making a second append
+    /// structurally impossible.
+    #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+    pub(crate) fn retry_committed_journal_page_projection<A>(
+        &self,
+        pending: CommittedPendingJournalPageProjection<A>,
+    ) -> JournalPageProjectionOutcome<A> {
+        let CommittedPendingJournalPageProjection {
+            append_proof,
+            recovery,
+            last_error: _,
+        } = pending;
+        let plan = match recovery {
+            JournalPageProjectionRecovery::InProcess(plan) => plan,
+            JournalPageProjectionRecovery::Restart(record) => {
+                return self.resume_journal_page_projection_from_record(append_proof, record);
+            }
+        };
+        let result = (|| {
+            let write = self.admit_managed_text_writer()?;
+            let _identity = self.lock_graph_text_identity_mutation()?;
+            let lock = self.page_lock(&plan.path);
+            let _guard = lock.lock().unwrap();
+            self.publish_journal_page_projection(&write, &plan)
+        })();
+        match result {
+            Ok(target) => JournalPageProjectionOutcome::Durable(DurableJournalPageProjection {
+                append_proof,
+                target,
+            }),
+            Err(last_error) => JournalPageProjectionOutcome::CommittedPending(
+                CommittedPendingJournalPageProjection {
+                    append_proof,
+                    recovery: JournalPageProjectionRecovery::InProcess(plan),
+                    last_error,
+                },
+            ),
+        }
+    }
+
+    /// Reconstruct graph-publication authority from one already authenticated
+    /// durable journal record after process memory has been lost.  This boundary
+    /// accepts no append callback and cannot create another journal record.
+    /// Runtime-only file and parent identities are reacquired under the managed
+    /// writer, retained graph-text identity authority, and exact path lock.
+    #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
+    pub(crate) fn recover_committed_journal_page_projection<A>(
+        &self,
+        append_proof: A,
+        relative_path: &str,
+        base_revision: &str,
+        expected_base: &[u8],
+        exact_target: &[u8],
+        revision: &str,
+    ) -> JournalPageProjectionOutcome<A> {
+        self.resume_journal_page_projection_from_record(
+            append_proof,
+            JournalPageProjectionRestartRecord {
+                relative_path: relative_path.to_owned(),
+                expected_base: expected_base.to_vec(),
+                base_revision: base_revision.to_owned(),
+                target: exact_target.to_vec(),
+                revision: revision.to_owned(),
+            },
+        )
+    }
+
+    fn resume_journal_page_projection_from_record<A>(
+        &self,
+        append_proof: A,
+        record: JournalPageProjectionRestartRecord,
+    ) -> JournalPageProjectionOutcome<A> {
+        let result = (|| {
+            let expected_base = std::str::from_utf8(&record.expected_base).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "committed journal base is not valid UTF-8",
+                )
+            })?;
+            let exact_target = std::str::from_utf8(&record.target).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "committed journal target is not valid UTF-8",
+                )
+            })?;
+            if expected_base == exact_target
+                || content_rev(expected_base) != record.base_revision
+                || content_rev(exact_target) != record.revision
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "committed journal record revision material is inconsistent",
+                ));
+            }
+
+            let write = self.admit_managed_text_writer()?;
+            let _identity = self.lock_graph_text_identity_mutation()?;
+            let path = self
+                .resolve_graph_rel_with_permit(&write, &record.relative_path)?
+                .filter(|path| self.rel_path(path) == record.relative_path)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "committed journal path is outside eligible graph text",
+                    )
+                })?;
+            let lock = self.page_lock(&path);
+            let _guard = lock.lock().unwrap();
+
+            let (current, current_identity) = self
+                .managed_read_optional_text_with_identity(&write, &path)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "committed journal target is absent",
+                    )
+                })?;
+            if current != expected_base && current != exact_target {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "committed journal projection conflicts with an external winner",
+                ));
+            }
+
+            let index = self.validate_current_graph_text_collision_strict(
+                &write,
+                &path,
+                Some(current_identity),
+            )?;
+            let managed_path =
+                ManagedPath::parse(record.relative_path.clone()).map_err(|_| bad_path())?;
+            let retained = index
+                .files_by_exact_path
+                .get(&managed_path)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "committed journal path lacks retained file identity authority",
+                    )
+                })?;
+            if retained.file_resource_id != current_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "committed journal file identity is incompatible with retained authority",
+                ));
+            }
+            let target = self.managed_target(&write, &path, false)?;
+            let expected_parent_identity =
+                self.validate_managed_target_parent_identity(&index, &path, &target)?;
+            let cache = self.managed_path_is_cacheable(&write, &path)?;
+            self.publish_journal_page_projection(
+                &write,
+                &JournalPageProjectionPlan {
+                    path,
+                    relative_path: record.relative_path.clone(),
+                    expected_base: expected_base.to_owned(),
+                    expected_identity: current_identity,
+                    expected_parent_identity,
+                    target: exact_target.to_owned(),
+                    revision: record.revision.clone(),
+                    cache,
+                },
+            )
+        })();
+        match result {
+            Ok(target) => JournalPageProjectionOutcome::Durable(DurableJournalPageProjection {
+                append_proof,
+                target,
+            }),
+            Err(last_error) => JournalPageProjectionOutcome::CommittedPending(
+                CommittedPendingJournalPageProjection {
+                    append_proof,
+                    recovery: JournalPageProjectionRecovery::Restart(record),
+                    last_error,
+                },
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_existing_journal_page_projection<'a>(
+        &'a self,
+        write: &'a ManagedTextWritePermit,
+        page: &PageDto,
+        base_rev: &str,
+        expected_base: &[u8],
+        exact_target: &[u8],
+        path: PathBuf,
+        cache: bool,
+    ) -> io::Result<VerifiedJournalPageProjection<'a>> {
+        let expected_base = std::str::from_utf8(expected_base).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal projection base is not valid UTF-8",
+            )
+        })?;
+        let exact_target = std::str::from_utf8(exact_target).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal projection target is not valid UTF-8",
+            )
+        })?;
+        if expected_base == exact_target {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unchanged existing pages do not require a journal projection",
+            ));
+        }
+
+        let validation =
+            self.validate_graph_text_target(write, &path, Some((page.kind, &page.name)))?;
+        self.require_pinned_save_owner(page, &path, validation.target.as_ref(), Some(base_rev))?;
+        if validation.requested_identity_elsewhere {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "another graph document owns this effective page identity",
+            ));
+        }
+        let loaded = validation.target.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "journal projection exact existing target disappeared",
+            )
+        })?;
+        if loaded.entry.path != path
+            || loaded.entry.kind != page.kind
+            || !crate::refs::same_page(&loaded.entry.name, &page.name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal projection cannot create, rename, or change page ownership",
+            ));
+        }
+        if loaded.content != expected_base
+            || loaded.revision != base_rev
+            || content_rev(expected_base) != base_rev
+        {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+        }
+        let retained_matches = self
+            .loaded_file_identities
+            .read()
+            .unwrap()
+            .get(&path)
+            .is_some_and(|(revision, identity)| {
+                revision == base_rev && *identity == loaded.file_identity
+            });
+        if !retained_matches {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "existing page identity changed since load",
+            ));
+        }
+
+        let (_, serialized) = self.serialize_page_dto_for_path(page, &path, Some(expected_base))?;
+        if serialized != exact_target {
+            return Err(projection_semantic_refusal(
+                io::ErrorKind::InvalidData,
+                "journal target differs from strict guarded page serialization",
+            ));
+        }
+
+        let index = self.validate_current_graph_text_collision_strict(
+            write,
+            &path,
+            Some(loaded.file_identity),
+        )?;
+        let managed_path = ManagedPath::parse(self.rel_path(&path)).map_err(|_| bad_path())?;
+        let semantic_key = (
+            match page.kind {
+                PageKind::Page => 0,
+                PageKind::Journal => 1,
+            },
+            crate::refs::page_key(&page.name),
+        );
+        if index
+            .paths_by_semantic_key
+            .get(&semantic_key)
+            .is_some_and(|members| members.iter().any(|member| member != &managed_path))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "another graph document owns this effective page identity",
+            ));
+        }
+        let effective = self.current_effective_identity_index()?;
+        let effective_owners = effective.owners.get(&page_cache_key(page.kind, &page.name));
+        if !effective_owners.is_some_and(|owners| {
+            owners.len() == 1 && owners.first().is_some_and(|owner| owner.path == path)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "effective page ownership is not uniquely bound to the exact journal path",
+            ));
+        }
+        let managed_target = self.managed_target(write, &path, false)?;
+        let expected_parent_identity =
+            self.validate_managed_target_parent_identity(&index, &path, &managed_target)?;
+
+        // Final exact pre-append reread. External writers do not take our locks;
+        // a winner that landed before this boundary must prevent journal commit.
+        let (current, current_identity) = self
+            .managed_read_optional_text_with_identity(write, &path)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "conflict"))?;
+        if current != expected_base || current_identity != loaded.file_identity {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+        }
+        let current_target = self.managed_target(write, &path, false)?;
+        if canonical_projection_directory_resource_id(current_target.parent())?
+            != expected_parent_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed text parent changed before journal append",
+            ));
+        }
+
+        Ok(VerifiedJournalPageProjection {
+            graph: self,
+            write,
+            plan: JournalPageProjectionPlan {
+                relative_path: self.rel_path(&path),
+                path,
+                expected_base: expected_base.to_owned(),
+                expected_identity: loaded.file_identity,
+                expected_parent_identity,
+                target: exact_target.to_owned(),
+                revision: content_rev(exact_target),
+                cache,
+            },
+        })
+    }
+
+    fn publish_journal_page_projection(
+        &self,
+        write: &ManagedTextWritePermit,
+        plan: &JournalPageProjectionPlan,
+    ) -> io::Result<JournalPageProjectionTarget> {
+        let current = self
+            .managed_read_optional_text_with_identity(write, &plan.path)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "committed journal target is absent",
+                )
+            })?;
+        let target_already_visible = current.0 == plan.target;
+        if target_already_visible {
+            let index = self.validate_current_graph_text_collision_strict(
+                write,
+                &plan.path,
+                Some(current.1),
+            )?;
+            let target = self.managed_target(write, &plan.path, false)?;
+            if self.validate_managed_target_parent_identity(&index, &plan.path, &target)?
+                != plan.expected_parent_identity
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "committed journal target parent identity changed",
+                ));
+            }
+        } else {
+            if current.0 != plan.expected_base || current.1 != plan.expected_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "committed journal projection conflicts with an external winner",
+                ));
+            }
+            let index = self.validate_current_graph_text_collision_strict(
+                write,
+                &plan.path,
+                Some(plan.expected_identity),
+            )?;
+            let target = self.managed_target(write, &plan.path, false)?;
+            if self.validate_managed_target_parent_identity(&index, &plan.path, &target)?
+                != plan.expected_parent_identity
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "committed journal base parent identity changed",
+                ));
+            }
+            self.commit_editor_write(
+                write,
+                &plan.path,
+                &plan.target,
+                Some(&plan.expected_base),
+                true,
+                Some(plan.expected_identity),
+            )?;
+        }
+
+        let target = self.managed_target(write, &plan.path, false)?;
+        if canonical_projection_directory_resource_id(target.parent())?
+            != plan.expected_parent_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "committed journal target parent changed before durability proof",
+            ));
+        }
+        let (file, reread) =
+            sync_open_and_read_projection_regular(target.parent(), &target.filename)?;
+        let identity = canonical_projection_file_resource_id(&file)?;
+        if reread != plan.target.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "committed journal target changed before durability proof",
+            ));
+        }
+        file.sync_all()?;
+        journal_projection_after_file_sync_hook()?;
+        sync_projection_chain_required(&target.chain)?;
+        let rebound = self.managed_target(write, &plan.path, false)?;
+        if canonical_projection_directory_resource_id(rebound.parent())?
+            != plan.expected_parent_identity
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "committed journal target parent changed after durability barrier",
+            ));
+        }
+        let final_reread = read_projection_optional(rebound.parent(), &rebound.filename)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "committed journal target disappeared before final reread",
+                )
+            })?;
+        if final_reread != plan.target.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "committed journal target changed before final reread",
+            ));
+        }
+        if target_already_visible {
+            self.finish_tine_owned_graph_text_identity_paths(std::iter::once(plan.path.as_path()))?;
+            self.note_self_write(&plan.path, plan.revision.clone());
+        }
+        self.loaded_file_identities
+            .write()
+            .unwrap()
+            .insert(plan.path.clone(), (plan.revision.clone(), identity));
+        journal_projection_before_cache_publication_hook()?;
+        if plan.cache {
+            self.cache_projection_page_text(write, &plan.path, &plan.target)?;
+        }
+        self.drop_self_write_marker(&plan.path, &plan.revision);
+        Ok(JournalPageProjectionTarget {
+            relative_path: plan.relative_path.clone(),
+            target: final_reread,
+            revision: plan.revision.clone(),
+        })
+    }
+
     /// Save a page, refusing to clobber an external change. If the file on disk
     /// no longer matches what Tine last knew (another app or a Syncthing pull
     /// wrote it), returns an `AlreadyExists` "conflict" error WITHOUT writing,
@@ -18489,20 +19291,7 @@ impl Graph {
         expected_identity: Option<ContentDigest>,
         cache: bool,
     ) -> io::Result<String> {
-        let dto_is_org = matches!(Format::from_path(path), Format::Org);
-        let mut doc = Document {
-            pre_block: page.pre_block.clone(),
-            roots: dto_blocks_to_doc_checked(&page.blocks, dto_is_org)?,
-        };
-        if existing.is_none() && page.kind == PageKind::Page {
-            let filename_name = self
-                .graph_entry_for_relative_path(&self.rel_path(path))?
-                .name;
-            if filename_name != page.name {
-                bind_document_title_property(&mut doc, &page.name);
-            }
-        }
-        let (doc, content) = self.serialize_page_document(doc, path, existing, &[])?;
+        let (doc, content) = self.serialize_page_dto_for_path(page, path, existing)?;
         // No-op save: identical bytes already on disk (e.g. focus/blur with no real
         // edit, or a forced flush of an unchanged page). Skip the write, the
         // watcher record, AND — crucially — the cache update below.
@@ -18579,6 +19368,28 @@ impl Graph {
         // The new baseline rev = hash of exactly what's now on disk (the content we
         // serialized, or the identical existing bytes on a no-op) — no re-read.
         Ok(rev)
+    }
+
+    fn serialize_page_dto_for_path(
+        &self,
+        page: &PageDto,
+        path: &Path,
+        existing: Option<&str>,
+    ) -> io::Result<(Document, String)> {
+        let dto_is_org = matches!(Format::from_path(path), Format::Org);
+        let mut doc = Document {
+            pre_block: page.pre_block.clone(),
+            roots: dto_blocks_to_doc_checked(&page.blocks, dto_is_org)?,
+        };
+        if existing.is_none() && page.kind == PageKind::Page {
+            let filename_name = self
+                .graph_entry_for_relative_path(&self.rel_path(path))?
+                .name;
+            if filename_name != page.name {
+                bind_document_title_property(&mut doc, &page.name);
+            }
+        }
+        self.serialize_page_document(doc, path, existing, &[])
     }
 
     /// The one page serialization and corruption-firewall boundary used by
@@ -29215,6 +30026,778 @@ mod tests {
         release(handoff);
         released.wait();
         assert!(worker.join().unwrap().unwrap());
+    }
+
+    struct JournalProjectionFixture {
+        root: PathBuf,
+        graph: Graph,
+        path: PathBuf,
+        base: String,
+        base_rev: String,
+        page: PageDto,
+        target: String,
+        cleanup_root: bool,
+    }
+
+    impl JournalProjectionFixture {
+        fn new(tag: &str, relative_path: &str, base: &str, edited: &str) -> Self {
+            let root = scratch(tag);
+            Self::from_root(root, relative_path, base, edited)
+        }
+
+        fn from_root(root: PathBuf, relative_path: &str, base: &str, edited: &str) -> Self {
+            let path = root.join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, base).unwrap();
+            let graph = Graph::open(&root);
+            let mut page = graph.load_by_path(relative_path).unwrap().unwrap();
+            graph.warm_cache();
+            let base_rev = page.rev.clone().unwrap();
+            page.blocks[0].raw = edited.to_owned();
+            let (_, target) = graph
+                .serialize_page_dto_for_path(&page, &path, Some(base))
+                .unwrap();
+            Self {
+                root,
+                graph,
+                path,
+                base: base.to_owned(),
+                base_rev,
+                page,
+                target,
+                cleanup_root: true,
+            }
+        }
+
+        fn commit<A>(
+            &self,
+            append: impl FnOnce() -> io::Result<A>,
+        ) -> io::Result<JournalPageProjectionOutcome<A>> {
+            self.graph.commit_existing_page_with_journal(
+                &self.page,
+                &self.base_rev,
+                self.base.as_bytes(),
+                self.target.as_bytes(),
+                append,
+            )
+        }
+
+        fn close_for_restart(mut self) {
+            self.cleanup_root = false;
+        }
+    }
+
+    impl Drop for JournalProjectionFixture {
+        fn drop(&mut self) {
+            if self.cleanup_root {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn prime_journal_projection_restart_graph(graph: &Graph) {
+        graph.warm_cache();
+        let _write = graph.admit_managed_text_writer().unwrap();
+        let _identity = graph.lock_graph_text_identity_mutation().unwrap();
+        graph.guarded_graph_text_identity_index().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    struct JournalProjectionRestartTestRecord {
+        root: PathBuf,
+        path: PathBuf,
+        relative_path: String,
+        base: String,
+        base_revision: String,
+        target: String,
+        revision: String,
+        proof: (String, u64),
+    }
+
+    #[cfg(any(unix, windows))]
+    impl Drop for JournalProjectionRestartTestRecord {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    fn journal_projection_restart_record(
+        tag: &str,
+        relative_path: &str,
+        base: &str,
+        edited: &str,
+    ) -> JournalProjectionRestartTestRecord {
+        let fixture = JournalProjectionFixture::new(tag, relative_path, base, edited);
+        JOURNAL_PROJECTION_BEFORE_PUBLISH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(injected_journal_projection_cut(
+                    "after append before publication",
+                ))
+            }));
+        });
+        let proof = (format!("authenticated:{relative_path}"), 73_u64);
+        let calls = Cell::new(0_usize);
+        let outcome = fixture
+            .commit(|| {
+                calls.set(calls.get() + 1);
+                Ok(proof.clone())
+            })
+            .unwrap();
+        let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
+            panic!("synthetic append-before-publication cut was not retained")
+        };
+        assert_eq!(calls.get(), 1);
+        assert_eq!(pending.append_proof(), &proof);
+        assert_eq!(pending.target(), fixture.target.as_bytes());
+        assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
+        drop(pending);
+
+        let record = JournalProjectionRestartTestRecord {
+            root: fixture.root.clone(),
+            path: fixture.path.clone(),
+            relative_path: relative_path.to_owned(),
+            base: fixture.base.clone(),
+            base_revision: fixture.base_rev.clone(),
+            target: fixture.target.clone(),
+            revision: content_rev(&fixture.target),
+            proof,
+        };
+        fixture.close_for_restart();
+        record
+    }
+
+    fn injected_journal_projection_cut(label: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::Interrupted, label)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_exact_base_appends_once_then_publishes_markdown_and_org() {
+        for (tag, path, base, edited) in [
+            (
+                "journal-projection-success-md",
+                "pages/nested/Exact.md",
+                "- base markdown\n",
+                "target markdown",
+            ),
+            (
+                "journal-projection-success-org",
+                "journals/archive/2026_08_03.org",
+                "* base org\n",
+                "target org",
+            ),
+        ] {
+            let fixture = JournalProjectionFixture::new(tag, path, base, edited);
+            let calls = Cell::new(0_usize);
+            let outcome = fixture
+                .commit(|| {
+                    assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
+                    calls.set(calls.get() + 1);
+                    Ok(format!("proof:{path}"))
+                })
+                .unwrap();
+            let JournalPageProjectionOutcome::Durable(durable) = outcome else {
+                panic!("successful journal projection remained pending")
+            };
+            assert_eq!(calls.get(), 1);
+            assert_eq!(durable.append_proof(), &format!("proof:{path}"));
+            assert_eq!(durable.target().relative_path(), path);
+            assert_eq!(durable.target().target(), fixture.target.as_bytes());
+            assert_eq!(durable.target().revision(), content_rev(&fixture.target));
+            assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_precommit_conflicts_append_zero_and_change_zero_bytes() {
+        fn refused(label: &str, fixture: &JournalProjectionFixture, base_rev: &str) {
+            let before = regular_file_tree(&fixture.root);
+            let calls = Cell::new(0_usize);
+            let error = fixture
+                .graph
+                .commit_existing_page_with_journal(
+                    &fixture.page,
+                    base_rev,
+                    fixture.base.as_bytes(),
+                    fixture.target.as_bytes(),
+                    || {
+                        calls.set(calls.get() + 1);
+                        Ok(())
+                    },
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{label} precommit conflict produced an outcome"));
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidInput
+            ));
+            assert_eq!(calls.get(), 0);
+            assert_eq!(regular_file_tree(&fixture.root), before);
+        }
+
+        let stale = JournalProjectionFixture::new(
+            "journal-projection-stale",
+            "pages/Stale.md",
+            "- base\n",
+            "target",
+        );
+        refused("stale", &stale, &"0".repeat(64));
+
+        let resource = JournalProjectionFixture::new(
+            "journal-projection-resource",
+            "pages/Resource.md",
+            "- base\n",
+            "target",
+        );
+        fs::rename(
+            &resource.path,
+            resource.root.join("pages/.Resource.retained-old"),
+        )
+        .unwrap();
+        fs::write(&resource.path, resource.base.as_bytes()).unwrap();
+        refused("resource", &resource, &resource.base_rev);
+
+        let portable = JournalProjectionFixture::new(
+            "journal-projection-portable",
+            "pages/Portable.md",
+            "- base\n",
+            "target",
+        );
+        fs::write(portable.root.join("pages/portable.md"), "- alias\n").unwrap();
+        refused("portable", &portable, &portable.base_rev);
+
+        #[cfg(unix)]
+        {
+            let hardlink = JournalProjectionFixture::new(
+                "journal-projection-hardlink",
+                "pages/Hardlink.md",
+                "- base\n",
+                "target",
+            );
+            fs::hard_link(&hardlink.path, hardlink.root.join("pages/Alias.md")).unwrap();
+            refused("hardlink", &hardlink, &hardlink.base_rev);
+        }
+
+        let semantic = JournalProjectionFixture::new(
+            "journal-projection-semantic",
+            "pages/One.md",
+            "title:: Shared\n\n- base\n",
+            "target",
+        );
+        fs::create_dir_all(semantic.root.join("other")).unwrap();
+        fs::write(
+            semantic.root.join("other/Two.org"),
+            "#+title: Shared\n* other owner\n",
+        )
+        .unwrap();
+        semantic.graph.invalidate_cache();
+        semantic.graph.warm_cache();
+        {
+            let _identity = semantic.graph.lock_graph_text_identity_mutation().unwrap();
+            let index = semantic.graph.guarded_graph_text_identity_index().unwrap();
+            assert_eq!(
+                index
+                    .paths_by_semantic_key
+                    .get(&(0, crate::refs::page_key("Shared")))
+                    .map(std::collections::BTreeSet::len),
+                Some(2),
+                "page name {:?}, semantics {:?}",
+                semantic.page.name,
+                index
+                    .files_by_exact_path
+                    .iter()
+                    .map(|(path, record)| (
+                        path.as_str(),
+                        record.semantic.name.as_str(),
+                        record.semantic.kind
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+        refused("semantic", &semantic, &semantic.base_rev);
+
+        #[cfg(unix)]
+        {
+            let parent = JournalProjectionFixture::new(
+                "journal-projection-parent",
+                "pages/Parent.md",
+                "- base\n",
+                "target",
+            );
+            {
+                let _identity = parent.graph.lock_graph_text_identity_mutation().unwrap();
+                parent.graph.guarded_graph_text_identity_index().unwrap();
+            }
+            let old_parent = parent.root.join("pages-old");
+            fs::rename(parent.root.join("pages"), &old_parent).unwrap();
+            fs::create_dir(parent.root.join("pages")).unwrap();
+            fs::hard_link(old_parent.join("Parent.md"), &parent.path).unwrap();
+            refused("parent", &parent, &parent.base_rev);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_append_error_is_same_precommit_error_and_changes_zero_bytes() {
+        let fixture = JournalProjectionFixture::new(
+            "journal-projection-append-error",
+            "pages/Append.md",
+            "- base\n",
+            "target",
+        );
+        let before = regular_file_tree(&fixture.root);
+        let calls = Cell::new(0_usize);
+        let error = fixture
+            .commit(|| {
+                calls.set(calls.get() + 1);
+                Err::<(), _>(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "durable append failed exactly",
+                ))
+            })
+            .err()
+            .expect("append error is precommit");
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(error.to_string(), "durable append failed exactly");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(regular_file_tree(&fixture.root), before);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_failure_cuts_are_committed_pending_and_retry_without_append() {
+        for cut in 0..5 {
+            let fixture = JournalProjectionFixture::new(
+                &format!("journal-projection-cut-{cut}"),
+                "pages/Cut.md",
+                "- base\n",
+                "target",
+            );
+            match cut {
+                0 => MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(|| {
+                        Err(injected_journal_projection_cut("after retire"))
+                    }));
+                }),
+                1 => JOURNAL_PROJECTION_AFTER_PUBLISH.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(|| {
+                        Err(injected_journal_projection_cut("after publish"))
+                    }));
+                }),
+                2 => JOURNAL_PROJECTION_AFTER_FILE_SYNC.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(|| {
+                        Err(injected_journal_projection_cut("after file sync"))
+                    }));
+                }),
+                3 => FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true)),
+                4 => JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(|| {
+                        Err(injected_journal_projection_cut("before cache publication"))
+                    }));
+                }),
+                _ => unreachable!(),
+            }
+            let calls = Cell::new(0_usize);
+            let outcome = fixture
+                .commit(|| {
+                    calls.set(calls.get() + 1);
+                    Ok((cut, "opaque-proof"))
+                })
+                .unwrap();
+            let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
+                panic!("cut {cut} did not report committed-pending")
+            };
+            assert_eq!(calls.get(), 1);
+            assert_eq!(pending.append_proof(), &(cut, "opaque-proof"));
+            assert_eq!(pending.relative_path(), "pages/Cut.md");
+            assert_eq!(pending.target(), fixture.target.as_bytes());
+            assert!(!pending.last_error().to_string().is_empty());
+
+            let retried = fixture
+                .graph
+                .retry_committed_journal_page_projection(pending);
+            let JournalPageProjectionOutcome::Durable(durable) = retried else {
+                panic!("cut {cut} did not recover on exact retry")
+            };
+            assert_eq!(calls.get(), 1, "retry must not append again");
+            assert_eq!(durable.append_proof(), &(cut, "opaque-proof"));
+            assert_eq!(durable.target().target(), fixture.target.as_bytes());
+            assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_restart_reconstructs_record_only_and_publishes_markdown_and_org() {
+        for (tag, path, base, edited) in [
+            (
+                "journal-projection-restart-md",
+                "notes/nonstandard/deep/Restart.markdown",
+                "- base markdown\n",
+                "restart markdown target",
+            ),
+            (
+                "journal-projection-restart-org",
+                "archive/nonstandard/deep/Restart.org",
+                "* base org\n",
+                "restart org target",
+            ),
+        ] {
+            let record = journal_projection_restart_record(tag, path, base, edited);
+            let graph = Graph::open(&record.root);
+            prime_journal_projection_restart_graph(&graph);
+            let graph_work_before = crate::fast_commit::graph_wide_commit_work();
+            let forbidden_before = crate::fast_commit::forbidden_commit_work();
+            let mutations = Rc::new(Cell::new(0_usize));
+            MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+                let mutations = Rc::clone(&mutations);
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    mutations.set(mutations.get() + 1);
+                    Ok(())
+                }));
+            });
+
+            let outcome = graph.recover_committed_journal_page_projection(
+                record.proof.clone(),
+                &record.relative_path,
+                &record.base_revision,
+                record.base.as_bytes(),
+                record.target.as_bytes(),
+                &record.revision,
+            );
+            let JournalPageProjectionOutcome::Durable(durable) = outcome else {
+                panic!("restart recovery did not publish {path}")
+            };
+            assert_eq!(durable.append_proof(), &record.proof);
+            assert_eq!(durable.target().relative_path(), path);
+            assert_eq!(durable.target().target(), record.target.as_bytes());
+            assert_eq!(durable.target().revision(), record.revision);
+            assert_eq!(fs::read(&record.path).unwrap(), record.target.as_bytes());
+            assert_eq!(mutations.get(), 1);
+
+            let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
+            assert_eq!(graph_work.text_inventory_scans, 0);
+            assert_eq!(graph_work.text_inventory_entries, 0);
+            assert!(crate::fast_commit::forbidden_commit_work()
+                .since(forbidden_before)
+                .is_none());
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_restart_already_target_reproves_durable_state() {
+        let record = journal_projection_restart_record(
+            "journal-projection-restart-already-target",
+            "elsewhere/nested/Already.md",
+            "- base\n",
+            "already target",
+        );
+        fs::write(&record.path, record.target.as_bytes()).unwrap();
+        let graph = Graph::open(&record.root);
+        prime_journal_projection_restart_graph(&graph);
+        let graph_work_before = crate::fast_commit::graph_wide_commit_work();
+        let forbidden_before = crate::fast_commit::forbidden_commit_work();
+        let mutations = Rc::new(Cell::new(0_usize));
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let mutations = Rc::clone(&mutations);
+            *hook.borrow_mut() = Some(Box::new(move || {
+                mutations.set(mutations.get() + 1);
+                Ok(())
+            }));
+        });
+
+        let outcome = graph.recover_committed_journal_page_projection(
+            record.proof.clone(),
+            &record.relative_path,
+            &record.base_revision,
+            record.base.as_bytes(),
+            record.target.as_bytes(),
+            &record.revision,
+        );
+        let JournalPageProjectionOutcome::Durable(durable) = outcome else {
+            panic!("already exact restart target was not reproved")
+        };
+        assert_eq!(durable.append_proof(), &record.proof);
+        assert_eq!(durable.target().target(), record.target.as_bytes());
+        assert_eq!(fs::read(&record.path).unwrap(), record.target.as_bytes());
+        assert_eq!(
+            mutations.get(),
+            0,
+            "already-target recovery rewrote the file"
+        );
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+        let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
+        assert_eq!(graph_work.text_inventory_scans, 0);
+        assert_eq!(graph_work.text_inventory_entries, 0);
+        assert!(crate::fast_commit::forbidden_commit_work()
+            .since(forbidden_before)
+            .is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_restart_preserves_divergent_external_winner() {
+        let record = journal_projection_restart_record(
+            "journal-projection-restart-divergent",
+            "elsewhere/nested/Divergent.org",
+            "* base\n",
+            "restart target",
+        );
+        let external = b"* external winner\n";
+        fs::write(&record.path, external).unwrap();
+        let graph = Graph::open(&record.root);
+        prime_journal_projection_restart_graph(&graph);
+        let graph_work_before = crate::fast_commit::graph_wide_commit_work();
+        let forbidden_before = crate::fast_commit::forbidden_commit_work();
+        let mutations = Rc::new(Cell::new(0_usize));
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let mutations = Rc::clone(&mutations);
+            *hook.borrow_mut() = Some(Box::new(move || {
+                mutations.set(mutations.get() + 1);
+                Ok(())
+            }));
+        });
+
+        let outcome = graph.recover_committed_journal_page_projection(
+            record.proof.clone(),
+            &record.relative_path,
+            &record.base_revision,
+            record.base.as_bytes(),
+            record.target.as_bytes(),
+            &record.revision,
+        );
+        let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
+            panic!("divergent external winner was silently replaced")
+        };
+        assert_eq!(pending.append_proof(), &record.proof);
+        assert_eq!(pending.relative_path(), record.relative_path);
+        assert_eq!(pending.target(), record.target.as_bytes());
+        assert_eq!(pending.last_error().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&record.path).unwrap(), external);
+        assert!(matches!(
+            graph.retry_committed_journal_page_projection(pending),
+            JournalPageProjectionOutcome::CommittedPending(_)
+        ));
+        assert_eq!(fs::read(&record.path).unwrap(), external);
+        assert_eq!(mutations.get(), 0, "divergent winner was rewritten");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| drop(hook.borrow_mut().take()));
+        let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
+        assert_eq!(graph_work.text_inventory_scans, 0);
+        assert_eq!(graph_work.text_inventory_entries, 0);
+        assert!(crate::fast_commit::forbidden_commit_work()
+            .since(forbidden_before)
+            .is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_external_writer_is_precommit_winner_or_preserved_after_commit() {
+        let before = JournalProjectionFixture::new(
+            "journal-projection-external-before",
+            "pages/Race.md",
+            "- base\n",
+            "target",
+        );
+        fs::write(&before.path, "- external before\n").unwrap();
+        let calls = Cell::new(0_usize);
+        assert!(before
+            .commit(|| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .is_err());
+        assert_eq!(calls.get(), 0);
+        assert_eq!(fs::read(&before.path).unwrap(), b"- external before\n");
+
+        let after = JournalProjectionFixture::new(
+            "journal-projection-external-after",
+            "pages/Race.md",
+            "- base\n",
+            "target",
+        );
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let path = after.path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- external after\n")));
+        });
+        let calls = Cell::new(0_usize);
+        let outcome = after
+            .commit(|| {
+                calls.set(calls.get() + 1);
+                Ok("journal-won")
+            })
+            .unwrap();
+        let JournalPageProjectionOutcome::CommittedPending(pending) = outcome else {
+            panic!("post-append external winner must remain committed-pending")
+        };
+        assert_eq!(calls.get(), 1);
+        assert_eq!(pending.append_proof(), &"journal-won");
+        assert_eq!(fs::read(&after.path).unwrap(), b"- external after\n");
+        assert!(matches!(
+            after.graph.retry_committed_journal_page_projection(pending),
+            JournalPageProjectionOutcome::CommittedPending(_)
+        ));
+        assert_eq!(fs::read(&after.path).unwrap(), b"- external after\n");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_nested_configured_paths_work_and_private_paths_are_refused() {
+        for (tag, path, base, edited) in [
+            (
+                "journal-projection-nested-config-md",
+                "content/wiki/deep/Topic.md",
+                "- base md\n",
+                "target md",
+            ),
+            (
+                "journal-projection-nested-config-org",
+                "diary/archive/2026_08_03.org",
+                "* base org\n",
+                "target org",
+            ),
+        ] {
+            let root = scratch(tag);
+            fs::create_dir_all(root.join("logseq")).unwrap();
+            fs::write(
+                root.join("logseq/config.edn"),
+                "{:pages-directory \"content/wiki/deep\"\n :journals-directory \"diary/archive\"}\n",
+            )
+            .unwrap();
+            let fixture = JournalProjectionFixture::from_root(root, path, base, edited);
+            let outcome = fixture.commit(|| Ok("proof")).unwrap();
+            assert!(matches!(outcome, JournalPageProjectionOutcome::Durable(_)));
+            assert_eq!(fs::read(&fixture.path).unwrap(), fixture.target.as_bytes());
+        }
+
+        let root = scratch("journal-projection-private-refusal");
+        let path = root.join(".private/Secret.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "- secret\n").unwrap();
+        let graph = Graph::open(&root);
+        let mut page = markdown_page_dto("Secret", "Secret", "- changed\n").unwrap();
+        page.path = ".private/Secret.md".to_owned();
+        page.rev = Some(content_rev("- secret\n"));
+        let calls = Cell::new(0_usize);
+        assert!(graph
+            .commit_existing_page_with_journal(
+                &page,
+                page.rev.as_deref().unwrap(),
+                b"- secret\n",
+                b"- changed\n",
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .is_err());
+        assert_eq!(calls.get(), 0);
+        assert_eq!(fs::read(&path).unwrap(), b"- secret\n");
+        let restart = graph.recover_committed_journal_page_projection(
+            "authenticated-private-record",
+            ".private/Secret.md",
+            &content_rev("- secret\n"),
+            b"- secret\n",
+            b"- changed\n",
+            &content_rev("- changed\n"),
+        );
+        let JournalPageProjectionOutcome::CommittedPending(pending) = restart else {
+            panic!("restart recovery admitted a private graph path")
+        };
+        assert_eq!(pending.append_proof(), &"authenticated-private-record");
+        assert_eq!(pending.target(), b"- changed\n");
+        assert_eq!(pending.last_error().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(&path).unwrap(), b"- secret\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn journal_projection_warm_repeats_have_zero_inventory_and_forbidden_work() {
+        let mut fixture = JournalProjectionFixture::new(
+            "journal-projection-warm-work",
+            "pages/Warm.md",
+            "- base\n",
+            "target 0",
+        );
+        let first = fixture.commit(|| Ok(0_u64)).unwrap();
+        let JournalPageProjectionOutcome::Durable(first) = first else {
+            panic!("warmup commit remained pending")
+        };
+        let mut base = fixture.target.clone();
+        let mut revision = first.target().revision().to_owned();
+        fixture.page.rev = Some(revision.clone());
+        let graph_work_before = crate::fast_commit::graph_wide_commit_work();
+        let forbidden_before = crate::fast_commit::forbidden_commit_work();
+        for index in 1..=8_u64 {
+            fixture.page.blocks[0].raw = format!("target {index}");
+            let (_, target) = fixture
+                .graph
+                .serialize_page_dto_for_path(&fixture.page, &fixture.path, Some(&base))
+                .unwrap();
+            let outcome = fixture
+                .graph
+                .commit_existing_page_with_journal(
+                    &fixture.page,
+                    &revision,
+                    base.as_bytes(),
+                    target.as_bytes(),
+                    || Ok(index),
+                )
+                .unwrap();
+            let JournalPageProjectionOutcome::Durable(durable) = outcome else {
+                panic!("warm commit {index} remained pending")
+            };
+            assert_eq!(durable.append_proof(), &index);
+            base = target;
+            revision = durable.target().revision().to_owned();
+            fixture.page.rev = Some(revision.clone());
+        }
+        let graph_work = crate::fast_commit::graph_wide_commit_work().since(graph_work_before);
+        assert_eq!(graph_work.text_inventory_scans, 0);
+        assert_eq!(graph_work.text_inventory_entries, 0);
+        assert!(crate::fast_commit::forbidden_commit_work()
+            .since(forbidden_before)
+            .is_none());
+        assert_eq!(fs::read(&fixture.path).unwrap(), base.as_bytes());
+    }
+
+    #[test]
+    fn journal_projection_source_keeps_append_and_retry_authority_structural() {
+        let source = include_str!("model.rs");
+        let entry = source
+            .split("pub(crate) fn commit_existing_page_with_journal")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn retry_committed_journal_page_projection")
+            .next()
+            .unwrap();
+        assert!(entry.contains("verified.append(append)?.publish()"));
+        assert!(!entry.contains("graph_text_inventory("));
+        assert!(!entry.contains("save_page("));
+        let retry = source
+            .split("pub(crate) fn retry_committed_journal_page_projection")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn recover_committed_journal_page_projection")
+            .next()
+            .unwrap();
+        assert!(!retry.contains("FnOnce"));
+        assert!(!retry.contains("append("));
+        let restart = source
+            .split("pub(crate) fn recover_committed_journal_page_projection")
+            .nth(1)
+            .unwrap()
+            .split("fn verify_existing_journal_page_projection")
+            .next()
+            .unwrap();
+        assert!(!restart.contains("FnOnce"));
+        assert!(!restart.contains("append("));
+        assert!(!restart.contains("graph_text_inventory("));
+        assert!(!restart.contains("save_page("));
     }
 
     #[test]
