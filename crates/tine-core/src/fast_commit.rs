@@ -170,6 +170,14 @@ pub struct GraphWideCommitWork {
     pub text_inventory_scans: usize,
     /// Graph text entries those inventories visited.
     pub text_inventory_entries: usize,
+    /// Complete effective-identity indexes rebuilt from the parsed page cache.
+    pub effective_identity_rebuilds: usize,
+    /// Parsed page-cache entries visited by complete effective-identity rebuilds.
+    pub effective_identity_entries: usize,
+    /// Complete real-page-name maps materialized from the reference index.
+    pub real_page_name_materializations: usize,
+    /// Real page names copied into complete materialized maps.
+    pub real_page_names_materialized: usize,
 }
 
 impl GraphWideCommitWork {
@@ -178,6 +186,14 @@ impl GraphWideCommitWork {
         Self {
             text_inventory_scans: self.text_inventory_scans - earlier.text_inventory_scans,
             text_inventory_entries: self.text_inventory_entries - earlier.text_inventory_entries,
+            effective_identity_rebuilds: self.effective_identity_rebuilds
+                - earlier.effective_identity_rebuilds,
+            effective_identity_entries: self.effective_identity_entries
+                - earlier.effective_identity_entries,
+            real_page_name_materializations: self.real_page_name_materializations
+                - earlier.real_page_name_materializations,
+            real_page_names_materialized: self.real_page_names_materialized
+                - earlier.real_page_names_materialized,
         }
     }
 }
@@ -187,6 +203,10 @@ thread_local! {
         Cell::new(GraphWideCommitWork {
             text_inventory_scans: 0,
             text_inventory_entries: 0,
+            effective_identity_rebuilds: 0,
+            effective_identity_entries: 0,
+            real_page_name_materializations: 0,
+            real_page_names_materialized: 0,
         })
     };
 }
@@ -201,6 +221,27 @@ pub(crate) fn note_graph_text_inventory(entries: usize) {
         let mut current = counters.get();
         current.text_inventory_scans = current.text_inventory_scans.saturating_add(1);
         current.text_inventory_entries = current.text_inventory_entries.saturating_add(entries);
+        counters.set(current);
+    });
+}
+
+pub(crate) fn note_effective_identity_rebuild(entries: usize) {
+    GRAPH_WIDE_COMMIT_WORK.with(|counters| {
+        let mut current = counters.get();
+        current.effective_identity_rebuilds = current.effective_identity_rebuilds.saturating_add(1);
+        current.effective_identity_entries =
+            current.effective_identity_entries.saturating_add(entries);
+        counters.set(current);
+    });
+}
+
+pub(crate) fn note_real_page_name_materialization(entries: usize) {
+    GRAPH_WIDE_COMMIT_WORK.with(|counters| {
+        let mut current = counters.get();
+        current.real_page_name_materializations =
+            current.real_page_name_materializations.saturating_add(1);
+        current.real_page_names_materialized =
+            current.real_page_names_materialized.saturating_add(entries);
         counters.set(current);
     });
 }
@@ -1477,6 +1518,14 @@ mod benchmark {
                         + performed_graph_wide.text_inventory_scans,
                     text_inventory_entries: graph_wide.text_inventory_entries
                         + performed_graph_wide.text_inventory_entries,
+                    effective_identity_rebuilds: graph_wide.effective_identity_rebuilds
+                        + performed_graph_wide.effective_identity_rebuilds,
+                    effective_identity_entries: graph_wide.effective_identity_entries
+                        + performed_graph_wide.effective_identity_entries,
+                    real_page_name_materializations: graph_wide.real_page_name_materializations
+                        + performed_graph_wide.real_page_name_materializations,
+                    real_page_names_materialized: graph_wide.real_page_names_materialized
+                        + performed_graph_wide.real_page_names_materialized,
                 };
             }
             current = outcome.page;

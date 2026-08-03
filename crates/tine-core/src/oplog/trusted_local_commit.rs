@@ -9,6 +9,11 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
+use std::time::{Duration, Instant};
+
 use tine_storage::{LocalJournalAppend, LocalJournalSegment};
 
 use crate::model::{
@@ -25,6 +30,73 @@ use super::{
 };
 
 pub(crate) struct TrustedLocalCommitCoordinator;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TrustedLocalCommitStageTimings {
+    prepared_record: Duration,
+    graph_total: Duration,
+    graph_validation: Duration,
+    journal_append: Duration,
+    graph_publication: Duration,
+    graph_cache_publication: Duration,
+    hot_overlay_apply: Duration,
+    direct_response: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_COMMIT_STAGE_TIMINGS: Cell<TrustedLocalCommitStageTimings> =
+        Cell::new(TrustedLocalCommitStageTimings {
+            prepared_record: Duration::ZERO,
+            graph_total: Duration::ZERO,
+            graph_validation: Duration::ZERO,
+            journal_append: Duration::ZERO,
+            graph_publication: Duration::ZERO,
+            graph_cache_publication: Duration::ZERO,
+            hot_overlay_apply: Duration::ZERO,
+            direct_response: Duration::ZERO,
+        });
+}
+
+#[cfg(test)]
+fn reset_commit_stage_timings() {
+    LAST_COMMIT_STAGE_TIMINGS.set(TrustedLocalCommitStageTimings::default());
+}
+
+#[cfg(test)]
+fn last_commit_stage_timings() -> TrustedLocalCommitStageTimings {
+    LAST_COMMIT_STAGE_TIMINGS.get()
+}
+
+#[cfg(test)]
+fn note_commit_stage(update: impl FnOnce(&mut TrustedLocalCommitStageTimings)) {
+    LAST_COMMIT_STAGE_TIMINGS.with(|timings| {
+        let mut current = timings.get();
+        update(&mut current);
+        timings.set(current);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn note_trusted_local_graph_validation(elapsed: Duration) {
+    note_commit_stage(|timings| timings.graph_validation += elapsed);
+}
+
+#[cfg(test)]
+pub(crate) fn note_trusted_local_journal_append(elapsed: Duration) {
+    note_commit_stage(|timings| timings.journal_append += elapsed);
+}
+
+#[cfg(test)]
+pub(crate) fn note_trusted_local_graph_publication(elapsed: Duration) {
+    note_commit_stage(|timings| timings.graph_publication += elapsed);
+}
+
+#[cfg(test)]
+pub(crate) fn note_trusted_local_graph_cache_publication(elapsed: Duration) {
+    note_commit_stage(|timings| timings.graph_cache_publication += elapsed);
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedLocalDeclineReason {
@@ -239,6 +311,10 @@ impl TrustedLocalCommitCoordinator {
             ));
         }
 
+        #[cfg(test)]
+        reset_commit_stage_timings();
+        #[cfg(test)]
+        let prepared_started = Instant::now();
         let batch = prepared.into_trusted_batch();
         let sequence = engine.managed_local_prefix_state().next_sequence;
         let prepared = match engine.prepare_managed_local_record(&batch, sequence) {
@@ -273,6 +349,11 @@ impl TrustedLocalCommitCoordinator {
             ));
         }
 
+        #[cfg(test)]
+        note_commit_stage(|timings| timings.prepared_record = prepared_started.elapsed());
+
+        #[cfg(test)]
+        let graph_started = Instant::now();
         let graph_outcome = graph
             .commit_existing_page_with_journal(
                 page,
@@ -285,6 +366,8 @@ impl TrustedLocalCommitCoordinator {
                 },
             )
             .map_err(TrustedLocalCommitError::PrecommitGraph)?;
+        #[cfg(test)]
+        note_commit_stage(|timings| timings.graph_total = graph_started.elapsed());
         Ok(finish_committed_graph(engine, prepared, graph_outcome))
     }
 
@@ -457,8 +540,12 @@ fn finish_committed_state(
         CommittedGraphState::Durable(graph) => graph.append_proof(),
         CommittedGraphState::Pending(graph) => graph.append_proof(),
     };
+    #[cfg(test)]
+    let overlay_started = Instant::now();
     let applied = before_overlay_hook()
         .and_then(|()| engine.apply_appended_managed_local_record(append, &prepared));
+    #[cfg(test)]
+    note_commit_stage(|timings| timings.hot_overlay_apply = overlay_started.elapsed());
     let post_page = match applied {
         Ok(ManagedLocalApplyOutcome::Applied { batch_id, page }) => {
             debug_assert_eq!(batch_id, prepared.batch_id());
@@ -475,7 +562,9 @@ fn finish_committed_state(
             );
         }
     };
-    match graph {
+    #[cfg(test)]
+    let response_started = Instant::now();
+    let outcome = match graph {
         CommittedGraphState::Durable(graph) => {
             TrustedLocalCommitOutcome::Committed(TrustedLocalCommitted {
                 prepared,
@@ -492,7 +581,10 @@ fn finish_committed_state(
                 },
             )
         }
-    }
+    };
+    #[cfg(test)]
+    note_commit_stage(|timings| timings.direct_response = response_started.elapsed());
+    outcome
 }
 
 #[cfg(test)]
@@ -592,7 +684,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::fast_commit::{forbidden_commit_work, graph_wide_commit_work};
+    use crate::fast_commit::{forbidden_commit_work, graph_wide_commit_work, GraphWideCommitWork};
     use crate::oplog::hot_engine_integration_tests::hot_overlay_tests::OverlayFixture;
     use crate::oplog::local_active::LocalRuntimeAdmission;
     use crate::oplog::operational_coordinator::{
@@ -790,6 +882,8 @@ mod tests {
         let mut fixture = OverlayFixture::new("trusted-local-chain", "md", 32);
         let (_, mut journal) = fixture.journal("chain");
         let forbidden_before = forbidden_commit_work();
+        let graph_before = graph_wide_commit_work();
+        let managed_before = fixture.engine.managed_local_work();
         let (mut page, mut base_revision) = edited_page(&fixture, 1);
         for generation in 1..=12 {
             page.blocks[0].raw = format!("managed revision {generation}");
@@ -836,6 +930,13 @@ mod tests {
         let forbidden = forbidden_commit_work().since(forbidden_before);
         assert_eq!(forbidden.sqlite_drains, 0);
         assert_eq!(forbidden.application_page_loads, 0);
+        assert_eq!(
+            graph_wide_commit_work().since(graph_before),
+            Default::default()
+        );
+        let managed = fixture.engine.managed_local_work().since(managed_before);
+        assert_eq!(managed.accepted_base_documents_loaded, 0);
+        assert_eq!(managed.retained_author_candidates_used, 24);
     }
 
     #[test]
@@ -1196,42 +1297,116 @@ mod tests {
     #[test]
     #[ignore = "manual release probe: builds synthetic 100 and 10,000 page graphs"]
     fn trusted_local_commit_manual_release_boundedness_probe() {
+        let page_counts = std::env::var("TINE_TRUSTED_LOCAL_BENCH_PAGES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| part.parse::<usize>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![100, 10_000]);
+        let edits = std::env::var("TINE_TRUSTED_LOCAL_BENCH_EDITS")
+            .ok()
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(7);
+        let warmups = std::env::var("TINE_TRUSTED_LOCAL_BENCH_WARMUPS")
+            .ok()
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(2);
+        assert!(edits > warmups);
+
+        fn p50(mut samples: Vec<Duration>) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+        fn millis(duration: Duration) -> f64 {
+            duration.as_secs_f64() * 1_000.0
+        }
+
         let mut observed = Vec::new();
-        for pages in [100, 10_000] {
+        for pages in page_counts {
             let mut fixture =
                 OverlayFixture::new(&format!("trusted-local-bounded-{pages}"), "md", pages);
             let (_, mut journal) = fixture.journal("bounded");
-            let (page, base_revision) = edited_page(&fixture, 1);
-            let prepared = prepared_edit(&mut fixture, 1_260_000 + pages as u128, 1);
             let managed_before = fixture.engine.managed_local_work();
-            let graph_before = graph_wide_commit_work();
-            let forbidden_before = forbidden_commit_work();
-            let started = std::time::Instant::now();
-            let outcome = TrustedLocalCommitCoordinator::commit(
-                &fixture.graph,
-                &mut journal,
-                &mut fixture.engine,
-                &page,
-                &base_revision,
-                prepared,
-            )
-            .unwrap();
-            let elapsed = started.elapsed();
-            assert!(matches!(outcome, TrustedLocalCommitOutcome::Committed(_)));
+            let mut totals = Vec::new();
+            let mut prepared_stages = Vec::new();
+            let mut graph_stages = Vec::new();
+            let mut graph_validation_stages = Vec::new();
+            let mut append_stages = Vec::new();
+            let mut graph_publication_stages = Vec::new();
+            let mut graph_cache_stages = Vec::new();
+            let mut overlay_stages = Vec::new();
+            let mut response_stages = Vec::new();
+            for generation in 1..=edits {
+                // Exact page loading and finalized-operation preparation are
+                // deliberately outside the measured commit interval.
+                let (page, base_revision) = edited_page(&fixture, generation);
+                let prepared = prepared_edit(
+                    &mut fixture,
+                    1_260_000 + pages as u128 * 100 + generation as u128,
+                    generation,
+                );
+                let graph_before = graph_wide_commit_work();
+                let forbidden_before = forbidden_commit_work();
+                let started = std::time::Instant::now();
+                let outcome = TrustedLocalCommitCoordinator::commit(
+                    &fixture.graph,
+                    &mut journal,
+                    &mut fixture.engine,
+                    &page,
+                    &base_revision,
+                    prepared,
+                )
+                .unwrap();
+                let elapsed = started.elapsed();
+                assert!(matches!(outcome, TrustedLocalCommitOutcome::Committed(_)));
+                assert!(forbidden_commit_work().since(forbidden_before).is_none());
+                assert_eq!(
+                    graph_wide_commit_work().since(graph_before),
+                    Default::default()
+                );
+                if generation > warmups {
+                    let stages = last_commit_stage_timings();
+                    totals.push(elapsed);
+                    prepared_stages.push(stages.prepared_record);
+                    graph_stages.push(stages.graph_total);
+                    graph_validation_stages.push(stages.graph_validation);
+                    append_stages.push(stages.journal_append);
+                    graph_publication_stages.push(stages.graph_publication);
+                    graph_cache_stages.push(stages.graph_cache_publication);
+                    overlay_stages.push(stages.hot_overlay_apply);
+                    response_stages.push(stages.direct_response);
+                }
+            }
             let managed = fixture.engine.managed_local_work().since(managed_before);
-            let graph = graph_wide_commit_work().since(graph_before);
-            let forbidden = forbidden_commit_work().since(forbidden_before);
-            assert_eq!(graph, Default::default());
-            assert_eq!(forbidden.sqlite_drains, 0);
-            assert_eq!(forbidden.archive_object_reads, 0);
-            assert_eq!(forbidden.graph_wide_catalog_decodes, 0);
-            assert_eq!(forbidden.application_page_loads, 0);
+            assert_eq!(managed.commits_applied, edits);
+            assert_eq!(managed.documents_imported, edits);
+            assert_eq!(managed.accepted_base_documents_loaded, 0);
+            assert_eq!(managed.retained_author_candidates_used, edits * 2);
+            let total_p50 = p50(totals);
             eprintln!(
-                "trusted-local bounded probe: pages={pages} commit_us={}",
-                elapsed.as_micros()
+                "trusted-local bounded probe: pages={pages} samples={} total_p50_ms={:.6} prepared_p50_ms={:.6} graph_p50_ms={:.6} graph_validation_p50_ms={:.6} append_p50_ms={:.6} graph_publication_p50_ms={:.6} graph_cache_p50_ms={:.6} overlay_p50_ms={:.6} response_p50_ms={:.6} managed_work={managed:?} graph_work={:?}",
+                edits - warmups,
+                millis(total_p50),
+                millis(p50(prepared_stages)),
+                millis(p50(graph_stages)),
+                millis(p50(graph_validation_stages)),
+                millis(p50(append_stages)),
+                millis(p50(graph_publication_stages)),
+                millis(p50(graph_cache_stages)),
+                millis(p50(overlay_stages)),
+                millis(p50(response_stages)),
+                GraphWideCommitWork::default(),
             );
-            observed.push((managed.commits_applied, managed.documents_imported));
+            assert!(
+                total_p50 < Duration::from_millis(10),
+                "warm commit p50 exceeded 10 ms at {pages} pages: {total_p50:?}"
+            );
+            observed.push((pages, total_p50, managed));
         }
-        assert_eq!(observed[0], observed[1]);
+        assert!(observed.len() >= 2);
+        assert_eq!(observed[0].2, observed[1].2);
     }
 }

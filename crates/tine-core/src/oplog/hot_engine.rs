@@ -412,6 +412,8 @@ struct CrdtUpdatePayload {
 struct PendingAuthorDocuments {
     batch_id: BatchId,
     manifest_fingerprint: ContentDigest,
+    generation: u64,
+    root_token: ContentDigest,
     documents: BTreeMap<DocumentId, LoroDoc>,
 }
 
@@ -5641,6 +5643,8 @@ pub struct ManagedLocalWork {
     pub commits_applied: usize,
     pub documents_imported: usize,
     pub update_bytes_imported: usize,
+    pub accepted_base_documents_loaded: usize,
+    pub retained_author_candidates_used: usize,
 }
 
 impl ManagedLocalWork {
@@ -5650,6 +5654,10 @@ impl ManagedLocalWork {
             commits_applied: self.commits_applied - earlier.commits_applied,
             documents_imported: self.documents_imported - earlier.documents_imported,
             update_bytes_imported: self.update_bytes_imported - earlier.update_bytes_imported,
+            accepted_base_documents_loaded: self.accepted_base_documents_loaded
+                - earlier.accepted_base_documents_loaded,
+            retained_author_candidates_used: self.retained_author_candidates_used
+                - earlier.retained_author_candidates_used,
         }
     }
 }
@@ -5667,6 +5675,7 @@ pub struct PreparedManagedLocalRecord {
     journal_payload: Vec<u8>,
     record: ManagedLocalRecord,
     post_page: MaterializedPage,
+    retained_author_root: Option<ContentDigest>,
 }
 
 impl PreparedManagedLocalRecord {
@@ -12520,13 +12529,18 @@ impl ShardedHotEngine {
             sequence,
             &journal_payload,
         )?;
-        let candidate = self.validate_managed_local_candidate(&record)?;
+        let retained = self.pending_author_managed_local_candidate(&record, false)?;
+        let (candidate, retained_author_root) = match retained {
+            Some((candidate, root)) => (candidate, Some(root)),
+            None => (self.validate_managed_local_candidate(&record)?, None),
+        };
         Ok(PreparedManagedLocalRecord {
             batch_id: record.prepared_batch.manifest().batch_id(),
             sequence,
             journal_payload,
             record,
             post_page: candidate.page,
+            retained_author_root,
         })
     }
 
@@ -12549,6 +12563,21 @@ impl ShardedHotEngine {
             || append.data_durability_syncs != 1
         {
             return Err(ManagedLocalRecordError::WrongDurabilityProof);
+        }
+        if let Some(expected_root) = prepared.retained_author_root {
+            if self.author_generation_root()? == expected_root {
+                if let Some((candidate, retained_root)) =
+                    self.pending_author_managed_local_candidate(&prepared.record, true)?
+                {
+                    if retained_root == expected_root {
+                        return self.apply_validated_managed_local_record(
+                            prepared.record.clone(),
+                            prepared.journal_payload(),
+                            candidate,
+                        );
+                    }
+                }
+            }
         }
         self.apply_managed_local_record(prepared.record.clone(), prepared.journal_payload())
     }
@@ -12595,6 +12624,14 @@ impl ShardedHotEngine {
             record.projection.intent.page_id(),
             manifest.dependency_frontier(),
         )?;
+        self.validate_managed_local_projection_candidate(record, candidate)
+    }
+
+    fn validate_managed_local_projection_candidate(
+        &self,
+        record: &ManagedLocalRecord,
+        candidate: ValidatedManagedLocalCandidate,
+    ) -> Result<ValidatedManagedLocalCandidate, ManagedLocalRecordError> {
         if candidate.page.path != *record.projection.intent.path() {
             return Err(ManagedLocalRecordError::CorruptPayload(
                 "projection path differs from the semantic post-page".into(),
@@ -12628,12 +12665,194 @@ impl ShardedHotEngine {
         Ok(candidate)
     }
 
+    /// Reuse the exact bounded post-documents retained by the immediately
+    /// preceding local author draft. The draft root and finalized batch
+    /// fingerprint bind this evidence to the unchanged engine generation; a
+    /// miss falls back to ordinary record validation and replay.
+    fn pending_author_managed_local_candidate(
+        &self,
+        record: &ManagedLocalRecord,
+        consume: bool,
+    ) -> Result<Option<(ValidatedManagedLocalCandidate, ContentDigest)>, ManagedLocalRecordError>
+    {
+        let manifest = record.prepared_batch.manifest();
+        let fingerprint = prepared_manifest_fingerprint(&record.prepared_batch);
+        let current_root = self.author_generation_root()?;
+        let matches = self
+            .pending_author_documents
+            .borrow()
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.batch_id == manifest.batch_id()
+                    && pending.manifest_fingerprint == fingerprint
+                    && pending.generation == self.history_generation
+                    && pending.root_token == current_root
+                    && pending.documents.keys().eq(record.crdt_updates.keys())
+            });
+        if !matches {
+            return Ok(None);
+        }
+        if manifest.workspace_id() != self.workspace_id {
+            return Err(EngineError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            }
+            .into());
+        }
+        if manifest.lineage_digest() != self.lineage_digest {
+            return Err(EngineError::LineageMismatch {
+                expected: self.lineage_digest,
+                found: manifest.lineage_digest(),
+            }
+            .into());
+        }
+        if record.sequence != self.local_overlay.next_sequence {
+            return Err(ManagedLocalRecordError::OutOfOrder {
+                expected: self.local_overlay.next_sequence,
+                found: record.sequence,
+            });
+        }
+        if manifest.origin() != BatchOrigin::LocalMutation
+            || !record.semantic_effect.pages().is_empty()
+            || record.semantic_effect.blocks().iter().any(|delta| {
+                let identity =
+                    |state: &BlockState| (state.logseq_uuid, state.logseq_identity_origin);
+                match (&delta.before, &delta.after) {
+                    (Some(before), Some(after)) => identity(before) != identity(after),
+                    (None, Some(after)) => {
+                        after.logseq_uuid.is_some() || after.logseq_identity_origin.is_some()
+                    }
+                    (Some(_), None) | (None, None) => false,
+                }
+            })
+        {
+            return Err(ManagedLocalRecordError::Unsupported(
+                "title, path, kind, creation, deletion, rename, and Logseq identity mutation stay on the slow path"
+                    .into(),
+            ));
+        }
+        let page_id = record.projection.intent.page_id();
+        let affected = affected_projection_pages(&record.semantic_effect);
+        if affected.len() != 1 || !affected.contains(&page_id) {
+            return Err(ManagedLocalRecordError::Unsupported(
+                "a managed-local record must affect exactly one existing page".into(),
+            ));
+        }
+
+        let documents = if consume {
+            self.pending_author_documents
+                .borrow_mut()
+                .take()
+                .expect("matching pending author evidence exists")
+                .documents
+        } else {
+            self.pending_author_documents
+                .borrow()
+                .as_ref()
+                .expect("matching pending author evidence exists")
+                .documents
+                .iter()
+                .map(|(document_id, document)| {
+                    clone_doc(document, 1).map(|copy| (*document_id, copy))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?
+        };
+        let expected_batch_heads = manifest
+            .dependency_frontier()
+            .documents()
+            .iter()
+            .flat_map(|dependencies| dependencies.direct_dependency_heads().iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut document_heads = BTreeMap::new();
+        let mut update_bytes = 0_usize;
+        for (document_id, document) in &documents {
+            let update = &record.crdt_updates[document_id];
+            if update.batch_id != manifest.batch_id()
+                || update.document_id != *document_id
+                || update.batch_dependency_heads != expected_batch_heads
+            {
+                return Err(ManagedLocalRecordError::StaleBase);
+            }
+            if *document_id != self.catalog_document_id {
+                validate_shard(self.catalog_document_id, *document_id, document)?;
+            }
+            update_bytes = update_bytes.saturating_add(update.raw_update.len());
+            document_heads.insert(*document_id, BTreeSet::from([manifest.batch_id()]));
+        }
+
+        let created = record
+            .semantic_effect
+            .blocks()
+            .iter()
+            .filter(|delta| delta.before.is_none() && delta.after.is_some())
+            .collect::<Vec<_>>();
+        let created_ids = created
+            .iter()
+            .map(|delta| delta.block_id)
+            .collect::<Vec<_>>();
+        let accepted_claims = self.block_home_claims_many(&created_ids)?;
+        let mut block_claims = Vec::with_capacity(created.len());
+        for delta in created {
+            let key = delta.block_id.as_uuid().as_u128();
+            if accepted_claims
+                .get(&key)
+                .is_some_and(|claims| !claims.is_empty())
+                || self
+                    .local_overlay
+                    .block_claims
+                    .get(&key)
+                    .is_some_and(|claims| !claims.is_empty())
+            {
+                return Err(EngineError::BlockAlreadyExists(delta.block_id).into());
+            }
+            block_claims.push((
+                key,
+                if self.scratch.is_some() {
+                    ImmutableHomeClaim::with_causal_dot(
+                        manifest.batch_id(),
+                        delta.home_document_id,
+                        manifest.causal_dot(),
+                    )
+                } else {
+                    ImmutableHomeClaim::new(manifest.batch_id(), delta.home_document_id)
+                },
+            ));
+        }
+        let page = self.materialize_hot_page_with_overrides(page_id, &documents)?;
+        let candidate = self.validate_managed_local_projection_candidate(
+            record,
+            ValidatedManagedLocalCandidate {
+                page,
+                documents,
+                document_heads,
+                block_claims,
+                update_bytes,
+            },
+        )?;
+        let mut work = self.local_overlay.work.get();
+        work.retained_author_candidates_used =
+            work.retained_author_candidates_used.saturating_add(1);
+        self.local_overlay.work.set(work);
+        Ok(Some((candidate, current_root)))
+    }
+
     fn apply_managed_local_record(
         &mut self,
         record: ManagedLocalRecord,
         bytes: &[u8],
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
         let candidate = self.validate_managed_local_candidate(&record)?;
+        self.apply_validated_managed_local_record(record, bytes, candidate)
+    }
+
+    fn apply_validated_managed_local_record(
+        &mut self,
+        record: ManagedLocalRecord,
+        bytes: &[u8],
+        candidate: ValidatedManagedLocalCandidate,
+    ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
         let manifest = record.prepared_batch.manifest();
         let next_sequence = self
             .local_overlay
@@ -12747,6 +12966,12 @@ impl ShardedHotEngine {
             .into_iter()
             .collect::<Vec<_>>();
         for (document_id, update) in updates {
+            if !self.local_overlay.documents.contains_key(document_id) && self.scratch.is_some() {
+                let mut work = self.local_overlay.work.get();
+                work.accepted_base_documents_loaded =
+                    work.accepted_base_documents_loaded.saturating_add(2);
+                self.local_overlay.work.set(work);
+            }
             let before = self.clone_current_hot_document(*document_id, 1)?;
             let dependencies = self.current_hot_document_dependencies(*document_id, &before)?;
             if update.batch_id != manifest.batch_id()
@@ -13988,10 +14213,12 @@ impl ShardedHotEngine {
             descriptors,
         )?;
         let prepared = PreparedBatch::new(manifest, objects)?;
-        if self.scratch.is_none() {
+        if draft.origin == BatchOrigin::LocalMutation {
             *self.pending_author_documents.borrow_mut() = Some(PendingAuthorDocuments {
                 batch_id: draft.author.batch_id,
                 manifest_fingerprint: prepared_manifest_fingerprint(&prepared),
+                generation: draft.generation,
+                root_token: draft.root_token,
                 documents: draft.prospective_documents,
             });
         }
@@ -14405,6 +14632,8 @@ impl ShardedHotEngine {
             *self.pending_author_documents.borrow_mut() = Some(PendingAuthorDocuments {
                 batch_id: author.batch_id,
                 manifest_fingerprint: prepared_manifest_fingerprint(&prepared),
+                generation: self.history_generation,
+                root_token: self.author_generation_root()?,
                 documents: working
                     .into_iter()
                     .map(|(document_id, document)| {
@@ -18909,20 +19138,25 @@ impl ShardedHotEngine {
         }
         let manifest_fingerprint = self.archive_fingerprints.get(&batch_id).copied();
         let pending_documents = self
-            .pending_author_documents
-            .borrow()
-            .as_ref()
-            .filter(|pending| {
-                pending.batch_id == batch_id
-                    && Some(pending.manifest_fingerprint) == manifest_fingerprint
+            .scratch
+            .is_none()
+            .then(|| {
+                self.pending_author_documents
+                    .borrow()
+                    .as_ref()
+                    .filter(|pending| {
+                        pending.batch_id == batch_id
+                            && Some(pending.manifest_fingerprint) == manifest_fingerprint
+                    })
+                    .map(|pending| {
+                        pending
+                            .documents
+                            .iter()
+                            .map(|(document_id, document)| (*document_id, document.clone()))
+                            .collect::<BTreeMap<_, _>>()
+                    })
             })
-            .map(|pending| {
-                pending
-                    .documents
-                    .iter()
-                    .map(|(document_id, document)| (*document_id, document.clone()))
-                    .collect::<BTreeMap<_, _>>()
-            });
+            .flatten();
         if let Some(pending_documents) = pending_documents {
             #[cfg(test)]
             {

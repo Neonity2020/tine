@@ -1035,10 +1035,14 @@ impl<'a> VerifiedJournalPageProjection<'a> {
 #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl<A> JournalCommittedPageProjection<'_, A> {
     fn publish(self) -> JournalPageProjectionOutcome<A> {
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let result = journal_projection_before_publish_hook().and_then(|()| {
             self.graph
                 .publish_journal_page_projection(self.write, &self.plan)
         });
+        #[cfg(test)]
+        crate::oplog::trusted_local_commit::note_trusted_local_graph_publication(started.elapsed());
         match result {
             Ok(target) => JournalPageProjectionOutcome::Durable(DurableJournalPageProjection {
                 append_proof: self.append_proof,
@@ -3320,6 +3324,7 @@ fn build_effective_identity_index(
     pages: &[(PageEntry, Arc<Document>)],
     failures: Vec<String>,
 ) -> EffectiveIdentityIndex {
+    crate::fast_commit::note_effective_identity_rebuild(pages.len());
     let mut owners = std::collections::HashMap::with_capacity(pages.len());
     let mut physical_paths = std::collections::HashSet::with_capacity(pages.len());
     for (entry, _) in pages {
@@ -11029,7 +11034,7 @@ impl Graph {
                     "exact projection parser revision differs from durable target",
                 ));
             }
-            self.cache_upsert(effective, document, rev);
+            self.cache_upsert_inner(effective, document, rev, true);
         }
         Ok(())
     }
@@ -12512,6 +12517,7 @@ impl Graph {
         if !index.complete || index.generation != generation {
             return None;
         }
+        crate::fast_commit::note_real_page_name_materialization(index.real_pages.len());
         let names = index
             .real_pages
             .iter()
@@ -13037,7 +13043,17 @@ impl Graph {
     /// if the cache hasn't been built yet. `disk_rev` is `content_rev` of the
     /// exact on-disk bytes `doc` was produced from (the freshness key — see
     /// `disk_revs`).
-    fn cache_upsert(&self, entry: PageEntry, mut doc: Document, disk_rev: String) {
+    fn cache_upsert(&self, entry: PageEntry, doc: Document, disk_rev: String) {
+        self.cache_upsert_inner(entry, doc, disk_rev, false);
+    }
+
+    fn cache_upsert_inner(
+        &self,
+        entry: PageEntry,
+        mut doc: Document,
+        disk_rev: String,
+        bounded_foreground: bool,
+    ) {
         // Fill runtime ids for any block that lacks one (e.g. PDF-highlight writes)
         // from this physical owner. Blocks saved from the frontend already carry
         // live ids, which are deliberately kept through the in-memory save path.
@@ -13062,6 +13078,7 @@ impl Graph {
         let mut failures_guard = self.page_index_failures.write().unwrap();
         let mut resulting_failures = failures_guard.clone();
         resulting_failures.retain(|failure| failure != &evict_entry.rel_path);
+        let failures_changed = resulting_failures != *failures_guard;
         let cache_built = guard.is_some();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
@@ -13126,7 +13143,17 @@ impl Graph {
             .cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1;
-        if let Some(pages) = guard.as_ref() {
+        if bounded_foreground
+            && cache_built
+            && !identity_changed
+            && !is_new_page
+            && !failures_changed
+        {
+            // Exact content-only publication does not alter effective identity.
+            // Drop the generation tag instead of rebuilding every unrelated
+            // owner now; name-only creation can reconstruct it on demand.
+            *self.effective_identity_index.write().unwrap() = None;
+        } else if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() = Some(Arc::new(
                 build_effective_identity_index(newgen, pages, resulting_failures.clone()),
             ));
@@ -13179,14 +13206,19 @@ impl Graph {
         // page is in or now matches. An alias change, a new page, or a cold cache
         // has graph-wide effects → drop everything. Guarded by the differential
         // fuzz oracle in tests/derived_cache_fuzz.rs.
-        let scoped = cache_built && !alias_touched && !is_new_page && !identity_changed;
-        self.scope_derived_invalidation(
-            &evict_entry,
-            previous_doc.as_deref(),
-            &evict_doc,
-            newgen,
-            scoped,
-        );
+        if bounded_foreground {
+            *self.derived_cache.write().unwrap() = None;
+            *self.advanced_cache.write().unwrap() = None;
+        } else {
+            let scoped = cache_built && !alias_touched && !is_new_page && !identity_changed;
+            self.scope_derived_invalidation(
+                &evict_entry,
+                previous_doc.as_deref(),
+                &evict_doc,
+                newgen,
+                scoped,
+            );
+        }
     }
 
     /// See `cache_upsert`. When `scoped`, evict only derived entries the edited
@@ -18635,6 +18667,8 @@ impl Graph {
         exact_target: &[u8],
         append: impl FnOnce() -> io::Result<A>,
     ) -> io::Result<JournalPageProjectionOutcome<A>> {
+        #[cfg(test)]
+        let validation_started = std::time::Instant::now();
         if page.guide {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -18661,7 +18695,18 @@ impl Graph {
             path,
             cache,
         )?;
-        Ok(verified.append(append)?.publish())
+        #[cfg(test)]
+        crate::oplog::trusted_local_commit::note_trusted_local_graph_validation(
+            validation_started.elapsed(),
+        );
+        #[cfg(test)]
+        let append_started = std::time::Instant::now();
+        let committed = verified.append(append)?;
+        #[cfg(test)]
+        crate::oplog::trusted_local_commit::note_trusted_local_journal_append(
+            append_started.elapsed(),
+        );
+        Ok(committed.publish())
     }
 
     /// Resume only graph durability/cache publication for an already committed
@@ -18950,16 +18995,10 @@ impl Graph {
                 "another graph document owns this effective page identity",
             ));
         }
-        let effective = self.current_effective_identity_index()?;
-        let effective_owners = effective.owners.get(&page_cache_key(page.kind, &page.name));
-        if !effective_owners.is_some_and(|owners| {
-            owners.len() == 1 && owners.first().is_some_and(|owner| owner.path == path)
-        }) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "effective page ownership is not uniquely bound to the exact journal path",
-            ));
-        }
+        // The retained guarded admission index above already proves the exact
+        // current path and unique semantic owner under the identity-mutation
+        // authority. Rebuilding the legacy page-cache identity map here would
+        // repeat the same proof over every unrelated cached page.
         let managed_target = self.managed_target(write, &path, false)?;
         let expected_parent_identity =
             self.validate_managed_target_parent_identity(&index, &path, &managed_target)?;
@@ -19111,7 +19150,14 @@ impl Graph {
             .insert(plan.path.clone(), (plan.revision.clone(), identity));
         journal_projection_before_cache_publication_hook()?;
         if plan.cache {
-            self.cache_projection_page_text(write, &plan.path, &plan.target)?;
+            #[cfg(test)]
+            let cache_started = std::time::Instant::now();
+            let cache_result = self.cache_projection_page_text(write, &plan.path, &plan.target);
+            #[cfg(test)]
+            crate::oplog::trusted_local_commit::note_trusted_local_graph_cache_publication(
+                cache_started.elapsed(),
+            );
+            cache_result?;
         }
         self.drop_self_write_marker(&plan.path, &plan.revision);
         Ok(JournalPageProjectionTarget {
