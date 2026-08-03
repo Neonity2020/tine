@@ -6698,6 +6698,15 @@ impl Graph {
         requested_identity: Option<(PageKind, &str)>,
     ) -> io::Result<ExactGraphValidation> {
         let loaded_target = self.load_validated_graph_text_target(permit, target)?;
+        if let (None, Some((kind, name))) = (loaded_target.as_ref(), requested_identity.as_ref()) {
+            // A watcher failure can make the guarded collision generation
+            // undecodable. Its generation-bound effective-identity evidence is
+            // already sufficient to refuse name-only creation, so consult that
+            // evidence before attempting a semantic guarded-index rebuild.
+            if !self.page_index_failures.read().unwrap().is_empty() {
+                self.validate_name_only_effective_identity(&[], *kind, name)?;
+            }
+        }
         let index = self.validate_current_graph_text_collision_strict(
             permit,
             target,
@@ -33662,10 +33671,8 @@ mod tests {
             assert_eq!(failed.failures, vec!["pages/Mutable.md"]);
             let blocked =
                 markdown_page_dto("Blocked Watcher", "Blocked Watcher", "- no\n").unwrap();
-            assert_eq!(
-                graph.save_page(&blocked, None).unwrap_err().kind(),
-                io::ErrorKind::AlreadyExists
-            );
+            let error = graph.save_page(&blocked, None).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
 
             fs::write(&path, b"title:: Repaired Identity\n\n- after\n").unwrap();
             graph.sync_file_checked(&path).unwrap();
@@ -33781,10 +33788,8 @@ mod tests {
             assert!(failed.physical_paths.contains(&path));
 
             let blocked = markdown_page_dto("Blocked Cold", "Blocked Cold", "- no\n").unwrap();
-            assert_eq!(
-                graph.save_page(&blocked, None).unwrap_err().kind(),
-                io::ErrorKind::AlreadyExists
-            );
+            let error = graph.save_page(&blocked, None).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
             assert!(!dir.join("pages/Blocked Cold.md").exists());
 
             fs::write(&path, "title:: Repaired Cold\n\n- after\n").unwrap();
