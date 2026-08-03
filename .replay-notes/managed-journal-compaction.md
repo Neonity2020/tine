@@ -52,6 +52,9 @@ prefix and proves its last batch active, then seeds an empty overlay directly at
 that logical sequence. Only the uncheckpointed physical suffix is restored.
 For repeated edits of one path, restart repairs only the latest exact projection
 while the normal drain authenticates earlier records against that successor.
+Authenticated engine replay verifies the immutable prepared projection batch's
+stable manifest/work rows instead of re-deriving its historical supersession
+cut from today's projection index.
 
 Legacy startup performs the same accepted-batch proof before seeding its
 checkpointed cursor. Its bytes remain untouched until a new segment and anchor
@@ -77,7 +80,10 @@ maximum journal frame, rather than lifetime edit count.
   semantic DTO, revision, and exact graph-target assertions.
 - 16 sequential Unicode-path saves across four test generations, bounded file
   count/bytes, zero active replay after drain, five-frame pending suffix,
-  unsafe reopen, next logical append, and exact semantic/revision equality.
+  unsafe reopen, next logical append, and exact semantic/revision/graph-byte
+  equality.
+- A compacted and still-uncompacted reference actor perform the same threshold
+  edit sequence and compare parsed semantics plus exact Org graph bytes.
 - Real actor restart cuts after checkpoint publication, generation-segment
   creation, anchor publication, in-memory switch, and cleanup removal. Each
   restart drains without loss and appends the next sequence.
