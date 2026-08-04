@@ -275,7 +275,10 @@ async function openSyncSettings() {
 }
 
 async function closeSettings() {
-  await browser.keys(["Escape"]);
+  for (let attempt = 0; attempt < 3 && await browser.$(".settings-modal").isExisting(); attempt += 1) {
+    await browser.keys(["Escape"]);
+    await sleep(100);
+  }
   await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 10_000 });
 }
 
