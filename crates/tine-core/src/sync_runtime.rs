@@ -7455,7 +7455,7 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        if self.clean_startup_projection_read_available() {
+        if self.exact_projection_read_available() {
             let read = runtime
                 .database()
                 .materialized_read()
@@ -7563,7 +7563,7 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        if self.clean_startup_projection_read_available() {
+        if self.exact_projection_read_available() {
             return load_projected_source_authenticated_application_page(
                 runtime,
                 &self.graph,
@@ -7890,7 +7890,7 @@ impl RuntimeActor {
                         .runtime
                         .as_ref()
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    if self.clean_startup_projection_read_available() {
+                    if self.exact_projection_read_available() {
                         load_projected_source_authenticated_application_page(
                             runtime,
                             &self.graph,
@@ -7947,7 +7947,7 @@ impl RuntimeActor {
                             .runtime
                             .as_ref()
                             .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                        let current = if self.clean_startup_projection_read_available() {
+                        let current = if self.exact_projection_read_available() {
                             load_projected_source_authenticated_application_page(
                                 runtime,
                                 &self.graph,
@@ -8459,6 +8459,15 @@ impl RuntimeActor {
                 .as_ref()
                 .zip(self.runtime.as_ref())
                 .is_some_and(|(feed, runtime)| feed.only_startup_catch_up_pending(runtime))
+    }
+
+    fn exact_projection_read_available(&self) -> bool {
+        self.local_mutation.is_none()
+            && self.terminal.is_none()
+            && self
+                .managed_local
+                .as_ref()
+                .is_none_or(|managed| managed.pending_commit.is_none() && managed.frames.is_empty())
     }
 
     fn execute_editor_transaction(

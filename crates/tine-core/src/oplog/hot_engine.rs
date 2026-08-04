@@ -17390,6 +17390,7 @@ impl ShardedHotEngine {
             self.title_selection_at_page_name_root(&self.page_name_root, page_id, &page.name)?;
         let effective_transition = effective_selection
             .as_ref()
+            .filter(|selection| selection.exact_name() != &page.name)
             .map(|selection| self.authenticate_selected_title_transition(selection, None))
             .transpose()?;
         if let Some(transition) = &effective_transition {
