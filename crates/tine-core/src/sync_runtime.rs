@@ -29521,6 +29521,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release gate: activation of a real graph copy"]
+    fn managed_activation_real_graph_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_activation_real_graph_manual_benchmark -- --ignored --nocapture"
+        );
+        let source = PathBuf::from(
+            std::env::var("TINE_MANAGED_ACTIVATION_GRAPH_COPY")
+                .or_else(|_| std::env::var("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY"))
+                .expect("TINE_MANAGED_ACTIVATION_GRAPH_COPY must name a disposable graph copy"),
+        );
+        let fixture = ActivationFixture::copied_graph("managed-activation-real", 0xa0d4, &source);
+        let receipt = activate_with_scale_receipt(&fixture);
+        eprintln!(
+            "managed_activation_real total_ms={} source_files={} source_bytes={} blocks={} phases={:?} construction={:?}",
+            receipt.total_ms,
+            receipt.source_files,
+            receipt.source_bytes,
+            receipt.blocks,
+            receipt.phase_ms,
+            receipt.construction,
+        );
+        assert!(
+            receipt.total_ms < 10_000,
+            "real-graph managed activation exceeded 10 seconds: {receipt:?}"
+        );
+    }
+
+    #[test]
     #[ignore = "manual release 1,000/10,000-page activation timing receipt"]
     fn activation_scaled_manual_phase_receipt() {
         let small_pages = std::env::var("TINE_ACTIVATION_SMALL_PAGES")
