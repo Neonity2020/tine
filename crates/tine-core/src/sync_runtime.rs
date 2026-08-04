@@ -18941,219 +18941,165 @@ mod tests {
 
     #[test]
     fn interior_sqlite_counterfeit_cannot_become_durable_editor_truth() {
-        const BLOCK_COUNT: usize = 128;
-        const ORIGINAL: &[u8] = b"authoritative-row";
-        const COUNTERFEIT: &[u8] = b"counterfeited-row";
+        crate::test_support::run_on_deep_stack(|| {
+            const BLOCK_COUNT: usize = 128;
+            const ORIGINAL: &[u8] = b"authoritative-row";
+            const COUNTERFEIT: &[u8] = b"counterfeited-row";
 
-        let fixture = RuntimeHostFixture::safe("sync-runtime-editor-interior-corruption");
-        let request = fixture.request();
-        let first = active_handle(SyncRuntimeHandle::open(request.clone()));
-        drive_initial_feed(&first);
-        let draft = match first
-            .load_editor_page(SyncEditorLoadRequest {
-                page: SyncEditorPageSelector::Name {
-                    name: "Editor corruption authority".into(),
-                    page_kind: SyncPageKind::Page,
-                },
-            })
-            .unwrap()
-        {
-            SyncEditorLoadOutcome::NewPage { draft } => draft,
-            other => panic!("corruption fixture did not produce a new-page draft: {other:?}"),
-        };
-        let created = first
-            .save_editor_page(SyncEditorSaveRequest {
-                target: SyncEditorSaveTarget::New {
-                    name: draft.name,
-                    page_kind: draft.page_kind,
-                    revision: draft.revision,
-                },
-                preamble: Some("authority:: oplog".into()),
-                blocks: (0..BLOCK_COUNT)
-                    .map(|index| SyncEditorBlockDto {
-                        key: SyncEditorBlockKey::Temporary(format!("block-{index}")),
-                        parent: None,
-                        content: format!("authoritative-row-{index:04}-{}", "x".repeat(192)),
-                    })
-                    .collect(),
-            })
-            .unwrap();
-        let created = match created {
-            SyncEditorSaveOutcome::Durable { page, .. } => page,
-            SyncEditorSaveOutcome::Deferred {
-                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
-                ..
-            } => {
-                settle_local_mutation(&first);
-                load_editor_named(&first, "Editor corruption authority", SyncPageKind::Page)
-            }
-            other => panic!("large corruption fixture was not durable: {other:?}"),
-        };
-        let page_id = parse_editor_page_id(&created.page_id).unwrap();
-        let page_path = created.path.clone();
-        assert!(matches!(
-            first.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-
-        let patched = crate::oplog::sqlite::corrupt_equal_length_interior_block_payload(
-            &request.database_path,
-            ORIGINAL,
-            COUNTERFEIT,
-        );
-        assert!(patched > 0);
-        let graph = Graph::open_checked(&request.graph_root).unwrap();
-        let advisory = match discover_startup(&DiscoveryRequest {
-            profile: StartupStorageProfile::ExperimentalSparse,
-            graph_resource_id: graph.canonical_resource_id().unwrap(),
-            runtime_root: &request.enrollment_root,
-            archive_root: &request.archive_root,
-        }) {
-            DiscoveryClassification::ExistingLocalActive(advisory) => advisory,
-            other => panic!("corruption fixture was no longer LocalActive: {other:?}"),
-        };
-        // Bind this counterfeit fixture into the bounded checkpoint so this
-        // existing regression continues to prove the later affected-page
-        // semantic authority fence independently of accidental-corruption
-        // sampling.
-        crate::oplog::sqlite::refresh_projection_checkpoint_for_harness(
-            &request.database_path,
-            crate::oplog::sqlite::ProjectionClaim::current(
-                advisory.binding.workspace_id(),
-                advisory.binding.lineage_digest(),
-            ),
-        )
-        .unwrap();
-        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
-        drive_initial_feed(&reopened);
-        let manifests_before_refusal = fixture.manifest_count();
-        let load = reopened.load_editor_page(SyncEditorLoadRequest {
-            page: SyncEditorPageSelector::PageId {
-                page_id: page_id.to_string(),
-            },
-        });
-
-        if let Ok(SyncEditorLoadOutcome::Loaded { mut page }) = load {
-            let counterfeit = page
-                .blocks
-                .iter_mut()
-                .find(|block| block.content.starts_with("counterfeited-row-"))
-                .expect("vulnerable editor load did not expose the counterfeit row");
-            counterfeit.content.push_str(" honest-editor-suffix");
-            let outcome = reopened
-                .save_editor_page(SyncEditorSaveRequest {
-                    target: SyncEditorSaveTarget::Existing {
-                        page_id: page.page_id,
-                        revision: page.revision,
+            let fixture = RuntimeHostFixture::safe("sync-runtime-editor-interior-corruption");
+            let request = fixture.request();
+            let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+            drive_initial_feed(&first);
+            let draft = match first
+                .load_editor_page(SyncEditorLoadRequest {
+                    page: SyncEditorPageSelector::Name {
+                        name: "Editor corruption authority".into(),
+                        page_kind: SyncPageKind::Page,
                     },
-                    preamble: page.preamble,
-                    blocks: page.blocks,
+                })
+                .unwrap()
+            {
+                SyncEditorLoadOutcome::NewPage { draft } => draft,
+                other => panic!("corruption fixture did not produce a new-page draft: {other:?}"),
+            };
+            let created = first
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::New {
+                        name: draft.name,
+                        page_kind: draft.page_kind,
+                        revision: draft.revision,
+                    },
+                    preamble: Some("authority:: oplog".into()),
+                    blocks: (0..BLOCK_COUNT)
+                        .map(|index| SyncEditorBlockDto {
+                            key: SyncEditorBlockKey::Temporary(format!("block-{index}")),
+                            parent: None,
+                            content: format!("authoritative-row-{index:04}-{}", "x".repeat(192)),
+                        })
+                        .collect(),
                 })
                 .unwrap();
-            match outcome {
-                SyncEditorSaveOutcome::Durable { .. } => {}
+            let created = match created {
+                SyncEditorSaveOutcome::Durable { page, .. } => page,
+                SyncEditorSaveOutcome::Deferred {
+                    state: SyncEditorDeferred::RetryableRetainedPublication { .. },
+                    ..
+                } => {
+                    settle_local_mutation(&first);
+                    load_editor_named(&first, "Editor corruption authority", SyncPageKind::Page)
+                }
+                other => panic!("large corruption fixture was not durable: {other:?}"),
+            };
+            let page_id = parse_editor_page_id(&created.page_id).unwrap();
+            let page_path = created.path.clone();
+            assert!(matches!(
+                first.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+
+            let patched = crate::oplog::sqlite::corrupt_equal_length_interior_block_payload(
+                &request.database_path,
+                ORIGINAL,
+                COUNTERFEIT,
+            );
+            assert!(patched > 0);
+            let graph = Graph::open_checked(&request.graph_root).unwrap();
+            let advisory = match discover_startup(&DiscoveryRequest {
+                profile: StartupStorageProfile::ExperimentalSparse,
+                graph_resource_id: graph.canonical_resource_id().unwrap(),
+                runtime_root: &request.enrollment_root,
+                archive_root: &request.archive_root,
+            }) {
+                DiscoveryClassification::ExistingLocalActive(advisory) => advisory,
+                other => panic!("corruption fixture was no longer LocalActive: {other:?}"),
+            };
+            // Bind this counterfeit fixture into the bounded checkpoint so this
+            // existing regression continues to prove the later affected-page
+            // semantic authority fence independently of accidental-corruption
+            // sampling.
+            crate::oplog::sqlite::refresh_projection_checkpoint_for_harness(
+                &request.database_path,
+                crate::oplog::sqlite::ProjectionClaim::current(
+                    advisory.binding.workspace_id(),
+                    advisory.binding.lineage_digest(),
+                ),
+            )
+            .unwrap();
+            let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+            drive_initial_feed(&reopened);
+            let load = reopened.load_editor_page(SyncEditorLoadRequest {
+                page: SyncEditorPageSelector::PageId {
+                    page_id: page_id.to_string(),
+                },
+            });
+            let mut repaired = match load {
+                Ok(SyncEditorLoadOutcome::Loaded { page }) => page,
+                other => panic!("authenticated hot editor load was unavailable: {other:?}"),
+            };
+            assert!(repaired
+                .blocks
+                .iter()
+                .all(|block| !block.content.starts_with("counterfeited-row-")));
+            let edited = repaired
+                .blocks
+                .iter_mut()
+                .find(|block| block.content.starts_with("authoritative-row-0064-"))
+                .expect("repaired page lost the target editor block");
+            edited.content.push_str(" honest-editor-suffix");
+            let saved = reopened
+                .save_editor_page(SyncEditorSaveRequest {
+                    target: SyncEditorSaveTarget::Existing {
+                        page_id: repaired.page_id.clone(),
+                        revision: repaired.revision,
+                    },
+                    preamble: repaired.preamble,
+                    blocks: repaired.blocks,
+                })
+                .unwrap();
+            let saved = match saved {
+                SyncEditorSaveOutcome::Durable { page, .. } => page,
                 SyncEditorSaveOutcome::Deferred {
                     state: SyncEditorDeferred::RetryableRetainedPublication { .. },
                     ..
                 } => {
                     settle_local_mutation(&reopened);
+                    load_editor_named(&reopened, "Editor corruption authority", SyncPageKind::Page)
                 }
-                other => panic!("vulnerable editor did not retain or save: {other:?}"),
-            }
+                other => panic!("repaired editor save was not durable: {other:?}"),
+            };
+            drain_managed_local(&reopened);
             assert!(matches!(
                 reopened.clean_shutdown().unwrap(),
                 SyncShutdownOutcome::Safe(_)
             ));
+
             let replayed = fixture.replay_materialized_page(page_id);
-            assert!(
-                replayed.blocks.iter().any(|block| {
-                    block.content.starts_with("counterfeited-row-")
-                        && block.content.ends_with(" honest-editor-suffix")
-                }),
-                "vulnerable save did not enter clean oplog replay: {replayed:?}"
-            );
-            panic!("SQLite counterfeit crossed the public editor mutation boundary");
-        }
-        assert_eq!(load, Err(SyncEditorRequestError::ActorRefused));
-        assert_eq!(fixture.manifest_count(), manifests_before_refusal);
-
-        let file = fixture.graph_root().join(&page_path);
-        let mut honest_graph = fs::read_to_string(&file).unwrap();
-        honest_graph.push_str("- accepted affected-page rebuild\n");
-        fs::write(&file, honest_graph).unwrap();
-        reopened
-            .observe_watcher(vec![
-                SyncWatcherObservation::managed_path(&page_path).unwrap()
-            ])
-            .unwrap();
-        settle_exact_feed(&reopened)
-            .unwrap_or_else(|state| panic!("affected-page rebuild did not settle: {state:?}"));
-
-        let mut repaired =
-            load_editor_named(&reopened, "Editor corruption authority", SyncPageKind::Page);
-        assert!(repaired
-            .blocks
-            .iter()
-            .all(|block| !block.content.starts_with("counterfeited-row-")));
-        let edited = repaired
-            .blocks
-            .iter_mut()
-            .find(|block| block.content.starts_with("authoritative-row-0064-"))
-            .expect("repaired page lost the target editor block");
-        edited.content.push_str(" honest-editor-suffix");
-        let saved = reopened
-            .save_editor_page(SyncEditorSaveRequest {
-                target: SyncEditorSaveTarget::Existing {
-                    page_id: repaired.page_id.clone(),
-                    revision: repaired.revision,
-                },
-                preamble: repaired.preamble,
-                blocks: repaired.blocks,
-            })
-            .unwrap();
-        let saved = match saved {
-            SyncEditorSaveOutcome::Durable { page, .. } => page,
-            SyncEditorSaveOutcome::Deferred {
-                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
-                ..
-            } => {
-                settle_local_mutation(&reopened);
-                load_editor_named(&reopened, "Editor corruption authority", SyncPageKind::Page)
-            }
-            other => panic!("repaired editor save was not durable: {other:?}"),
-        };
-        assert!(matches!(
-            reopened.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-
-        let replayed = fixture.replay_materialized_page(page_id);
-        assert_eq!(replayed.stats.catalog_documents_loaded, 1);
-        assert_eq!(replayed.stats.membership_documents_loaded, 1);
-        assert_eq!(replayed.stats.home_documents_loaded, 1);
-        assert!(replayed
-            .blocks
-            .iter()
-            .all(|block| !block.content.starts_with("counterfeited-row-")));
-        assert!(replayed
-            .blocks
-            .iter()
-            .any(|block| block.content.ends_with(" honest-editor-suffix")));
-        let projected = rusqlite::Connection::open(&request.database_path)
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM blocks
+            assert_eq!(replayed.stats.catalog_documents_loaded, 1);
+            assert_eq!(replayed.stats.membership_documents_loaded, 1);
+            assert_eq!(replayed.stats.home_documents_loaded, 1);
+            assert!(replayed
+                .blocks
+                .iter()
+                .all(|block| !block.content.starts_with("counterfeited-row-")));
+            assert!(replayed
+                .blocks
+                .iter()
+                .any(|block| block.content.ends_with(" honest-editor-suffix")));
+            let projected = rusqlite::Connection::open(&request.database_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM blocks
                  WHERE page_id = ?1 AND content LIKE 'counterfeited-row-%'",
-                rusqlite::params![page_id.as_uuid().as_bytes().as_slice()],
-                |row| row.get::<_, usize>(0),
-            )
-            .unwrap();
-        assert_eq!(projected, 0);
-        let graph = fs::read_to_string(file).unwrap();
-        assert!(graph.contains("accepted affected-page rebuild"));
-        assert!(graph.contains("honest-editor-suffix"));
-        assert!(!graph.contains("counterfeited-row-"));
-        assert_eq!(saved.page_id, page_id.to_string());
+                    rusqlite::params![page_id.as_uuid().as_bytes().as_slice()],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap();
+            assert_eq!(projected, 0);
+            let graph = fs::read_to_string(fixture.graph_root().join(&page_path)).unwrap();
+            assert!(graph.contains("honest-editor-suffix"));
+            assert!(!graph.contains("counterfeited-row-"));
+            assert_eq!(saved.page_id, page_id.to_string());
+        });
     }
 
     #[test]
@@ -19358,7 +19304,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_retained_publication_retries_once_and_refreshes_by_bounded_reload() {
+    fn editor_trusted_local_save_is_immediately_durable_and_derivatives_drain_once() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-editor-published-retry");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
         drive_initial_feed(&handle);
@@ -19368,9 +19314,6 @@ mod tests {
         let mut blocks = loaded.blocks.clone();
         blocks[0].content = "after retained retry".into();
         let manifests_before = fixture.manifest_count();
-        handle
-            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
-            .unwrap();
         let outcome = handle
             .save_editor_page(SyncEditorSaveRequest {
                 target: SyncEditorSaveTarget::Existing {
@@ -19381,15 +19324,17 @@ mod tests {
                 blocks,
             })
             .unwrap();
-        assert!(matches!(
-            outcome,
-            SyncEditorSaveOutcome::Deferred {
-                state: SyncEditorDeferred::RetryableRetainedPublication { .. },
-                ..
-            }
-        ));
-        assert_eq!(fixture.manifest_count(), manifests_before + 1);
-        settle_local_mutation(&handle);
+        let saved = match outcome {
+            SyncEditorSaveOutcome::Durable { page, .. } => page,
+            other => panic!("trusted-local editor save was not durable: {other:?}"),
+        };
+        assert_eq!(saved.blocks[0].content, "after retained retry");
+        assert_eq!(fixture.manifest_count(), manifests_before);
+        assert_eq!(
+            fs::read(fixture.graph_root().join(path)).unwrap(),
+            b"- after retained retry\n"
+        );
+        drain_managed_local(&handle);
         assert_eq!(fixture.manifest_count(), manifests_before + 1);
         let refreshed = load_editor_named(&handle, "Editor Retry", SyncPageKind::Page);
         assert_eq!(refreshed.page_id, loaded.page_id);
@@ -26547,21 +26492,12 @@ mod tests {
         copy_provider_tree(&second.request.provider_root, &first.request.provider_root);
         let first_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&first.request)));
         let second_merged = active_handle(SyncRuntimeHandle::open(reopen_request(&second.request)));
-        let mut last_ticks = (SyncRuntimeTick::Idle, SyncRuntimeTick::Idle);
-        for _ in 0..256 {
-            let first_tick = first_merged.tick().unwrap();
-            let second_tick = second_merged.tick().unwrap();
-            last_ticks = (first_tick.clone(), second_tick.clone());
-            if matches!(first_tick, SyncRuntimeTick::Idle)
-                && matches!(second_tick, SyncRuntimeTick::Idle)
-                && first_merged.status().unwrap().provider_pending == 0
-                && second_merged.status().unwrap().provider_pending == 0
-            {
-                break;
-            }
-        }
+        settle_shared_provider(&first_merged);
+        settle_shared_provider(&second_merged);
         let first_status = first_merged.status().unwrap();
         let second_status = second_merged.status().unwrap();
+        assert_eq!(first_status.provider_pending, 0);
+        assert_eq!(second_status.provider_pending, 0);
         let load = |handle: &SyncRuntimeHandle| {
             handle
                 .load_editor_page(SyncEditorLoadRequest {
@@ -26572,7 +26508,7 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!(
                         "converged editor load failed: {error:?}; first={first_status:?}; \
-                         second={second_status:?}; last_ticks={last_ticks:?}"
+                         second={second_status:?}"
                     )
                 })
         };
@@ -26580,20 +26516,20 @@ mod tests {
             SyncEditorLoadOutcome::Loaded { page } => page,
             outcome => panic!(
                 "first replica did not retain the concurrently titled page: {outcome:?}; \
-                 first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+                 first={first_status:?}; second={second_status:?}"
             ),
         };
         let second_page = match load(&second_merged) {
             SyncEditorLoadOutcome::Loaded { page } => page,
             outcome => panic!(
                 "second replica did not retain the concurrently titled page: {outcome:?}; \
-                 first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+                 first={first_status:?}; second={second_status:?}"
             ),
         };
         assert_eq!(
             first_page.name, second_page.name,
             "same provider union selected different exact authored titles; \
-             first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+             first={first_status:?}; second={second_status:?}"
         );
         assert!(
             ["Café Plan", "Cafe\u{301} Plan"].contains(&first_page.name.as_str()),
@@ -26613,7 +26549,7 @@ mod tests {
             assert_eq!(
                 parsed.name, first_page.name,
                 "independent graph bytes disagree with the effective title at {graph_root:?}; \
-                 first={first_status:?}; second={second_status:?}; last_ticks={last_ticks:?}"
+                 first={first_status:?}; second={second_status:?}"
             );
         }
         assert_eq!(
@@ -30795,6 +30731,8 @@ mod tests {
             fs::read(fixture.graph_root.join(PATH)).unwrap(),
             format!("- {FIRST_EDIT}\r\n").as_bytes()
         );
+        assert!(completed_paths().is_empty());
+        drain_managed_local(&handle);
         assert_eq!(
             completed_paths(),
             vec![ManagedPath::parse(PATH).unwrap()],
@@ -30850,6 +30788,7 @@ mod tests {
                 );
             }
         }
+        drain_managed_local(&reopened);
         assert_eq!(
             fs::read(fixture.graph_root.join(PATH)).unwrap(),
             format!("- {SECOND_EDIT}\r\n").as_bytes()
