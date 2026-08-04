@@ -34,6 +34,8 @@ let graphToken = 0;
 // Per-page save queue: writes for one page run strictly one-after-another (never
 // concurrently) and each runs against the LATEST store state.
 const saveChain = new Map<string, Promise<boolean>>();
+const transientFailures = new Map<string, number>();
+const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let dataRevTimer: ReturnType<typeof setTimeout> | null = null;
 const assetWriteChain = new Set<Promise<boolean>>();
@@ -132,6 +134,7 @@ export function untombstone(name: string) {
 export function forgetSaveState(name: string) {
   dirty.delete(name);
   baseRev.delete(name);
+  clearTransientRetry(name);
 }
 /** Cancel timers, invalidate in-flight saves (bump the graph token), and clear
  *  all guard state — on graph switch / reset, so nothing from the old graph can
@@ -151,6 +154,9 @@ export function resetSaveState() {
   deletedPages.clear();
   heldSources.clear();
   heldByDest.clear();
+  transientFailures.clear();
+  for (const timer of retryTimers.values()) clearTimeout(timer);
+  retryTimers.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +171,32 @@ function scheduleDataRev() {
     dataRevTimer = null;
     bumpDataRev();
   }, 700);
+}
+
+function clearTransientRetry(name: string) {
+  transientFailures.delete(name);
+  const timer = retryTimers.get(name);
+  if (timer) clearTimeout(timer);
+  retryTimers.delete(name);
+}
+
+function scheduleTransientRetry(name: string, token: number, error: unknown) {
+  const failures = (transientFailures.get(name) ?? 0) + 1;
+  transientFailures.set(name, failures);
+  if (failures >= 3) {
+    transientFailures.delete(name);
+    pushToast(`Couldn't save “${name}” — will retry. (${String(error)})`, "error");
+    return;
+  }
+  const prior = retryTimers.get(name);
+  if (prior) clearTimeout(prior);
+  const timer = setTimeout(() => {
+    retryTimers.delete(name);
+    if (token === graphToken && dirty.has(name) && !isConflicted(name)) {
+      void enqueueSave(name);
+    }
+  }, failures === 1 ? 100 : 300);
+  retryTimers.set(name, timer);
 }
 
 function cutSourceMatches(expected: ClipboardSourcePage): boolean {
@@ -243,14 +275,16 @@ async function doSave(
       baseRev.set(name, rev);
       if (baseline === null) bumpPageInventoryRev();
     }
+    clearTransientRetry(name);
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
     if (String(e).includes("conflict")) {
+      clearTransientRetry(name);
       markConflict(name);
     } else if (token === graphToken) {
       dirty.add(name); // keep pending — retried on next edit / flush
-      pushToast(`Couldn't save “${name}” — will retry. (${String(e)})`, "error");
+      scheduleTransientRetry(name, token, e);
     }
     return false;
   }

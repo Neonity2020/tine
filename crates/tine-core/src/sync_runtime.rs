@@ -1798,6 +1798,7 @@ pub enum SyncApplicationPageRequestError {
     InvalidRequest(SyncApplicationPageInvalidRequest),
     RequestTooLarge(SyncEditorRequestSize),
     ActorRefused,
+    ActorRefusedAt(&'static str),
     ActorUnavailable,
 }
 
@@ -1813,6 +1814,9 @@ impl fmt::Display for SyncApplicationPageRequestError {
                 size.blocks, size.depth, size.temporary_key_bytes, size.text_bytes
             ),
             Self::ActorRefused => formatter.write_str("sync actor refused application page intent"),
+            Self::ActorRefusedAt(stage) => {
+                write!(formatter, "sync actor refused application page intent at {stage}")
+            }
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
@@ -1844,6 +1848,7 @@ pub enum SyncEditorRequestError {
     InvalidRequest(SyncEditorInvalidRequest),
     RequestTooLarge(SyncEditorRequestSize),
     ActorRefused,
+    ActorRefusedAt(&'static str),
     ActorUnavailable,
 }
 
@@ -1857,6 +1862,9 @@ impl fmt::Display for SyncEditorRequestError {
                 size.blocks, size.depth, size.temporary_key_bytes, size.text_bytes
             ),
             Self::ActorRefused => formatter.write_str("sync actor refused editor intent"),
+            Self::ActorRefusedAt(stage) => {
+                write!(formatter, "sync actor refused editor intent at {stage}")
+            }
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
@@ -8006,7 +8014,10 @@ impl RuntimeActor {
                                 runtime,
                                 &self.graph,
                                 page_id,
-                            )?
+                            )
+                            .map_err(|error| {
+                                editor_refusal_at(error, "loading the current managed page")
+                            })?
                             else {
                                 return Ok(SyncEditorSaveOutcome::Conflict {
                                     reason: SyncEditorConflict::MissingPage,
@@ -8036,21 +8047,44 @@ impl RuntimeActor {
                     let base = self
                         .graph
                         .read_projection_input(&current.page.path)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-                        .ok_or(SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt(
+                                "reading the current Markdown or Org projection",
+                            )
+                        })?
+                        .ok_or(SyncEditorRequestError::ActorRefusedAt(
+                            "reading the current Markdown or Org projection",
+                        ))?;
                     let target = render_requested_page_document(&requested_page, Some(&base))
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt(
+                                "rendering the requested page edit",
+                            )
+                        })?;
                     let accepted_target =
-                        render_requested_page_document(&current.page, Some(&base))
-                            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        render_requested_page_document(&current.page, Some(&base)).map_err(
+                            |_| {
+                                SyncEditorRequestError::ActorRefusedAt(
+                                    "rendering the accepted page baseline",
+                                )
+                            },
+                        )?;
                     let accepted_source = self
                         .graph
                         .parse_external_document(&current.page.path, &accepted_target, false)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt(
+                                "parsing the accepted page baseline",
+                            )
+                        })?;
                     let parsed = self
                         .graph
                         .parse_external_document(&current.page.path, &target, false)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt(
+                                "parsing the requested page edit",
+                            )
+                        })?;
                     let identity =
                         parsed.resolve_identity(Some(AcceptedExternalDocumentIdentity {
                             name: current.page.name.as_str(),
@@ -8069,7 +8103,11 @@ impl RuntimeActor {
                     let mut trusted_target_page = self
                         .graph
                         .parse_exact_page_dto(&current.page.path, &target)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedAt(
+                                "constructing the accepted application page",
+                            )
+                        })?;
                     trusted_target_page.name = final_name.as_str().to_owned();
                     trusted_target_page
                         .title
@@ -8121,9 +8159,12 @@ impl RuntimeActor {
                             kind: final_kind,
                         });
                     }
-                    if let Some(content) =
-                        build_existing_editor_transaction(&current, &request, &resolved)?
-                    {
+                    if let Some(content) = build_existing_editor_transaction(
+                        &current, &request, &resolved,
+                    )
+                    .map_err(|error| {
+                        editor_refusal_at(error, "building the semantic page transaction")
+                    })? {
                         // Requested page bytes are authoritative over any stale
                         // target-page snapshot carried by the rename planner.
                         operations.extend(content.operations);
@@ -8256,6 +8297,7 @@ impl RuntimeActor {
             affected_page_ids,
             trusted_target_page,
         )
+        .map_err(|error| editor_refusal_at(error, "committing the semantic page transaction"))
     }
 
     fn prepare_editor_turn(&mut self) -> EditorTurnReadiness {
@@ -13467,9 +13509,19 @@ fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicatio
         SyncEditorRequestError::ActorUnavailable => {
             SyncApplicationPageRequestError::ActorUnavailable
         }
+        SyncEditorRequestError::ActorRefusedAt(stage) => {
+            SyncApplicationPageRequestError::ActorRefusedAt(stage)
+        }
         SyncEditorRequestError::InvalidRequest(_) | SyncEditorRequestError::ActorRefused => {
             SyncApplicationPageRequestError::ActorRefused
         }
+    }
+}
+
+fn editor_refusal_at(error: SyncEditorRequestError, stage: &'static str) -> SyncEditorRequestError {
+    match error {
+        SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),
+        other => other,
     }
 }
 
@@ -16474,6 +16526,64 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn managed_application_task_toggle_is_direct_and_durable() {
+        let fixture = ActivationFixture::nested_unicode("application-task-toggle", 0xa125);
+        let markdown_path = "notes/Tine.md";
+        fs::write(
+            fixture.graph_root.join(markdown_path),
+            b"- TODO managed task\n- DONE completed task\n",
+        )
+        .unwrap();
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("task fixture activates");
+        drive_initial_feed(&handle);
+
+        let (mut page, revision) = load_application_exact(&handle, markdown_path);
+        assert_eq!(page.blocks[0].raw, "TODO managed task");
+        page.blocks[0].raw = "DONE managed task".into();
+        let (mut page, revision) = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: markdown_path.into(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("TODO-to-DONE toggle was not saved directly: {other:?}"),
+        };
+        assert_eq!(page.blocks[0].raw, "DONE managed task");
+        assert_eq!(
+            fs::read_to_string(fixture.graph_root.join(markdown_path)).unwrap(),
+            "- DONE managed task\n- DONE completed task\n"
+        );
+
+        page.blocks[0].raw = "TODO managed task".into();
+        let (page, _) = match handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: markdown_path.into(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap()
+        {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("DONE-to-TODO toggle was not saved directly: {other:?}"),
+        };
+        assert_eq!(page.blocks[0].raw, "TODO managed task");
+        assert_eq!(
+            fs::read_to_string(fixture.graph_root.join(markdown_path)).unwrap(),
+            "- TODO managed task\n- DONE completed task\n"
+        );
     }
 
     #[test]

@@ -91,6 +91,8 @@ import {
   renamePageInNavigation,
   dataRev,
   pageInventoryRev,
+  setToasts,
+  toasts,
   setWorkflow,
   setGraphMeta,
 } from "./ui";
@@ -1566,6 +1568,7 @@ describe("save engine (persistence)", () => {
       .slice()
       .forEach(clearConflict); // ui conflicts aren't cleared by resetStore
     vi.useFakeTimers();
+    setToasts([]);
     saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("rev1");
   });
   afterEach(() => {
@@ -1657,13 +1660,36 @@ describe("save engine (persistence)", () => {
     expect(isConflicted("Test")).toBe(true);
   });
 
-  it("a transient error keeps the page dirty for retry", async () => {
+  it("a transient error retries automatically before showing a save failure", async () => {
     load([blk("x")]);
     markDirty("Test");
     saveSpy.mockRejectedValueOnce(new Error("disk full"));
     expect(await flushPage("Test")).toBe(false);
     expect(isDirty("Test")).toBe(true);
-    expect(await flushPage("Test")).toBe(true); // retry succeeds
+    expect(toasts()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(saveSpy).toHaveBeenCalledTimes(2);
+    expect(isDirty("Test")).toBe(false);
+    expect(toasts()).toHaveLength(0);
+  });
+
+  it("reports a save failure only after bounded automatic retries also fail", async () => {
+    load([blk("x")]);
+    markDirty("Test");
+    saveSpy.mockRejectedValue(new Error("persistent failure"));
+
+    await vi.advanceTimersByTimeAsync(400);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(toasts()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(saveSpy).toHaveBeenCalledTimes(3);
+    expect(isDirty("Test")).toBe(true);
+    expect(toasts().at(-1)).toMatchObject({
+      kind: "error",
+      message: expect.stringContaining("persistent failure"),
+    });
   });
 
   it("no-ops guide-flagged pages at the persistence boundary", async () => {

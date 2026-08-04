@@ -779,7 +779,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         let mut sparse_graphs: HashMap<String, WatchedSparse> = HashMap::new();
         let mut watcher: Option<notify::RecommendedWatcher> = None;
         let mut watched: HashSet<PathBuf> = HashSet::new();
+        let mut forced_sparse_tick = false;
         loop {
+            let force_sparse_tick = std::mem::take(&mut forced_sparse_tick);
             let inotify = watch_mode(&app) != "poll";
             let entries = app.state::<AppState>().graphs.read().unwrap().entries();
             let live: HashSet<String> = entries.iter().map(|(label, _)| label.clone()).collect();
@@ -1010,6 +1012,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     && !provider_poll
                     && !retry_due
                     && !initial_tick
+                    && !force_sparse_tick
                 {
                     continue;
                 }
@@ -1103,6 +1106,12 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     None => rx.recv().is_ok(),
                 };
                 if woke_for_event {
+                    // Control pokes do not carry filesystem paths. Retain one
+                    // explicit sparse actor turn for the next loop so a local
+                    // managed save can drain its queued derivative work even
+                    // when inotify correctly suppresses or coalesces its own
+                    // projection write.
+                    forced_sparse_tick = true;
                     std::thread::sleep(Duration::from_millis(200));
                     while rx.try_recv().is_ok() {}
                 }
