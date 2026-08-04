@@ -255,6 +255,9 @@ pub const MAX_SYNC_RUNTIME_QUERY_BYTES: usize = MAX_MATERIALIZATION_QUERY_BYTES;
 /// A whole-page editor save can require both content and membership operations
 /// for every retained block plus one preamble operation.
 pub const MAX_SYNC_EDITOR_BLOCKS: usize = (MAX_LOCAL_MUTATION_ROWS - 2) / 2;
+/// Existing application pages are read as bounded SQLite projections. Their
+/// size is independent of the number of operations an eventual edit emits.
+pub const MAX_SYNC_APPLICATION_PAGE_BLOCKS: usize = MAX_MATERIALIZATION_QUERY_ROWS - 1;
 /// Deep outlines are rejected before actor enqueue and are traversed
 /// iteratively on both sides of the actor boundary.
 pub const MAX_SYNC_EDITOR_DEPTH: usize = 128;
@@ -3901,11 +3904,12 @@ fn flatten_application_blocks(blocks: &[BlockDto]) -> Vec<ApplicationBlockRef<'_
 
 fn flatten_application_blocks_bounded(
     blocks: &[BlockDto],
+    block_limit: usize,
 ) -> Result<Vec<ApplicationBlockRef<'_>>, SyncApplicationPageRequestError> {
-    if blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
+    if blocks.len() > block_limit {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(
             SyncEditorRequestSize {
-                blocks: MAX_SYNC_EDITOR_BLOCKS + 1,
+                blocks: block_limit + 1,
                 ..SyncEditorRequestSize::default()
             },
         ));
@@ -3919,7 +3923,7 @@ fn flatten_application_blocks_bounded(
     let mut max_depth = 0_usize;
     while let Some((block, parent, depth)) = stack.pop() {
         max_depth = max_depth.max(depth);
-        if output.len() == MAX_SYNC_EDITOR_BLOCKS || depth > MAX_SYNC_EDITOR_DEPTH {
+        if output.len() == block_limit || depth > MAX_SYNC_EDITOR_DEPTH {
             return Err(SyncApplicationPageRequestError::RequestTooLarge(
                 SyncEditorRequestSize {
                     blocks: output.len().saturating_add(1),
@@ -3929,10 +3933,10 @@ fn flatten_application_blocks_bounded(
             ));
         }
         let retained_after_current = output.len().saturating_add(stack.len()).saturating_add(1);
-        if block.children.len() > MAX_SYNC_EDITOR_BLOCKS.saturating_sub(retained_after_current) {
+        if block.children.len() > block_limit.saturating_sub(retained_after_current) {
             return Err(SyncApplicationPageRequestError::RequestTooLarge(
                 SyncEditorRequestSize {
-                    blocks: MAX_SYNC_EDITOR_BLOCKS + 1,
+                    blocks: block_limit + 1,
                     depth: max_depth,
                     ..SyncEditorRequestSize::default()
                 },
@@ -4020,7 +4024,7 @@ fn validate_application_save_request(
             editor_charge_text(&mut size, name.len());
         }
     }
-    if editor_request_too_large(size) {
+    if application_page_request_too_large(size) {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
     }
     Ok(())
@@ -4029,9 +4033,10 @@ fn validate_application_save_request(
 fn validate_application_page_bounds(
     page: &PageDto,
 ) -> Result<SyncEditorRequestSize, SyncApplicationPageRequestError> {
-    let flattened = flatten_application_blocks_bounded(&page.blocks)?;
+    let flattened =
+        flatten_application_blocks_bounded(&page.blocks, MAX_SYNC_APPLICATION_PAGE_BLOCKS)?;
     let mut size = SyncEditorRequestSize {
-        blocks: flattened.len().min(MAX_SYNC_EDITOR_BLOCKS + 1),
+        blocks: flattened.len().min(MAX_SYNC_APPLICATION_PAGE_BLOCKS + 1),
         ..SyncEditorRequestSize::default()
     };
     for value in [
@@ -4046,7 +4051,7 @@ fn validate_application_page_bounds(
     {
         editor_charge_text(&mut size, value.len());
     }
-    if flattened.len() > MAX_SYNC_EDITOR_BLOCKS {
+    if flattened.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
     }
     let mut identities = HashSet::with_capacity(flattened.len());
@@ -4090,7 +4095,7 @@ fn validate_application_page_bounds(
                 SyncApplicationPageInvalidRequest::MalformedPage,
             ));
         }
-        if editor_request_too_large(size) {
+        if application_page_request_too_large(size) {
             return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
         }
     }
@@ -4373,6 +4378,12 @@ fn editor_charge_text(size: &mut SyncEditorRequestSize, bytes: usize) {
 
 fn editor_request_too_large(size: SyncEditorRequestSize) -> bool {
     size.blocks > MAX_SYNC_EDITOR_BLOCKS
+        || size.depth > MAX_SYNC_EDITOR_DEPTH
+        || size.text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+}
+
+fn application_page_request_too_large(size: SyncEditorRequestSize) -> bool {
+    size.blocks > MAX_SYNC_APPLICATION_PAGE_BLOCKS
         || size.depth > MAX_SYNC_EDITOR_DEPTH
         || size.text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
 }
@@ -7304,7 +7315,7 @@ impl RuntimeActor {
     fn application_page_inventory(
         &mut self,
     ) -> Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError> {
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
             return Ok(SyncApplicationPageInventoryOutcome::Deferred { state });
         }
         self.application_inventory_ready()
@@ -7314,10 +7325,6 @@ impl RuntimeActor {
     fn application_inventory_ready(
         &self,
     ) -> Result<Vec<PageEntry>, SyncApplicationPageRequestError> {
-        let pages = self.graph.list_pages();
-        if !self.graph.page_index_failures().is_empty() {
-            return Err(SyncApplicationPageRequestError::ActorRefused);
-        }
         let runtime = self
             .runtime
             .as_ref()
@@ -7328,44 +7335,31 @@ impl RuntimeActor {
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
         ensure_editor_frontier(runtime, read.acceptance_sequence())
             .map_err(map_editor_application_error)?;
-        let mut exact_paths = HashSet::with_capacity(pages.len());
-        for entry in &pages {
-            if !exact_paths.insert(entry.rel_path.clone()) {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
+        const INVENTORY_BATCH: usize = 256;
+        let mut pages = Vec::new();
+        let mut cursor: Option<(ManagedPath, PageId)> = None;
+        loop {
+            let batch = read
+                .page_inventory_after(
+                    cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                    None,
+                    INVENTORY_BATCH,
+                )
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if batch.is_empty() {
+                break;
             }
-            let path = ManagedPath::parse(entry.rel_path.clone())
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-            let page_id = match runtime
-                .engine()
-                .current_page_at_path(&path)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-            {
-                CurrentPageAtPath::ExactOwner(owner) => owner.page_id(),
-                CurrentPageAtPath::Released(_)
-                | CurrentPageAtPath::Unowned
-                | CurrentPageAtPath::PortableCollision(_)
-                | CurrentPageAtPath::ReleasedPortableCollision(_) => {
-                    return Err(SyncApplicationPageRequestError::ActorRefused)
-                }
-            };
-            let authoritative = runtime
-                .engine()
-                .materialize_page(page_id)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-            let projected = read
-                .page(page_id)
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
-            if authoritative.path != path
-                || projected.page_id != authoritative.page_id
-                || projected.home_document_id != authoritative.home_document_id
-                || projected.name != authoritative.name.as_str()
-                || projected.name_key != authoritative.name.canonical_key()
-                || projected.path != authoritative.path
-                || projected.kind != authoritative.kind
-                || projected.preamble != authoritative.preamble
-            {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
+            let batch_len = batch.len();
+            for page in batch {
+                let entry = self
+                    .graph
+                    .projected_inventory_entry(&page.path, &page.name, page.kind)
+                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                cursor = Some((page.path, page.page_id));
+                pages.push(entry);
+            }
+            if batch_len < INVENTORY_BATCH {
+                break;
             }
         }
         Ok(pages)
@@ -8943,7 +8937,10 @@ impl RuntimeActor {
         if parsed.rev.as_deref() != Some(committed.revision()) {
             return Err(SyncEditorRequestError::ActorRefused);
         }
-        let editor = editor_current_page_from_materialized(committed.post_page().clone())?;
+        let editor = editor_current_page_from_materialized(
+            committed.post_page().clone(),
+            MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+        )?;
         join_application_page(parsed, editor).map_err(|_| SyncEditorRequestError::ActorRefused)
     }
 
@@ -13508,6 +13505,17 @@ fn join_application_page(
         || parsed.path != editor.page.path.as_str()
         || parsed.pre_block != editor.page.preamble
     {
+        #[cfg(test)]
+        if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
+            eprintln!(
+                "managed read header mismatch parsed_path={:?} projected_path={} parsed_preamble={:?} projected_preamble={:?} guide={}",
+                parsed.path,
+                editor.page.path,
+                parsed.pre_block,
+                editor.page.preamble,
+                parsed.guide,
+            );
+        }
         return Err(SyncApplicationPageRequestError::ActorRefused);
     }
     // Filename and journal formatting policy are parser inputs, not accepted
@@ -13523,6 +13531,16 @@ fn join_application_page(
     let parsed_blocks = flatten_application_blocks(&parsed.blocks);
     if parsed_blocks.len() != editor.dto.blocks.len() || parsed_blocks.len() != editor.blocks.len()
     {
+        #[cfg(test)]
+        if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
+            eprintln!(
+                "managed read block-count mismatch path={} parsed={} dto={} projected={}",
+                editor.page.path,
+                parsed_blocks.len(),
+                editor.dto.blocks.len(),
+                editor.blocks.len(),
+            );
+        }
         return Err(SyncApplicationPageRequestError::ActorRefused);
     }
     let materialized = editor
@@ -13569,6 +13587,18 @@ fn join_application_page(
         if parsed_block.parent != actor_parent_index
             || parsed_block.block.raw != editor_block.content
         {
+            #[cfg(test)]
+            if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
+                eprintln!(
+                    "managed read block mismatch path={} index={} parsed_parent={:?} projected_parent={:?} parsed_raw={:?} projected_content={:?}",
+                    editor.page.path,
+                    index,
+                    parsed_block.parent,
+                    actor_parent_index,
+                    parsed_block.block.raw,
+                    editor_block.content,
+                );
+            }
             return Err(SyncApplicationPageRequestError::ActorRefused);
         }
         let frontend_id = match actor_block.logseq_uuid {
@@ -13814,6 +13844,21 @@ fn load_projected_editor_page(
     runtime: &PromotedLocalRuntime,
     page_id: PageId,
 ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
+    load_projected_page_with_block_limit(runtime, page_id, MAX_SYNC_EDITOR_BLOCKS)
+}
+
+fn load_projected_application_page(
+    runtime: &PromotedLocalRuntime,
+    page_id: PageId,
+) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
+    load_projected_page_with_block_limit(runtime, page_id, MAX_SYNC_APPLICATION_PAGE_BLOCKS)
+}
+
+fn load_projected_page_with_block_limit(
+    runtime: &PromotedLocalRuntime,
+    page_id: PageId,
+    block_limit: usize,
+) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
     let read = runtime
         .database()
         .materialized_read()
@@ -13823,9 +13868,9 @@ fn load_projected_editor_page(
         .page(page_id)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
     let projected_blocks = read
-        .blocks_on_page(page_id, MAX_SYNC_EDITOR_BLOCKS + 1)
+        .blocks_on_page(page_id, block_limit + 1)
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    if projected_blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
+    if projected_blocks.len() > block_limit {
         return Err(editor_too_large(projected_blocks.len(), 0, 0, 0));
     }
     let Some(projected_page) = page else {
@@ -13867,8 +13912,9 @@ fn load_current_editor_page(
 
 fn editor_current_page_from_materialized(
     page: MaterializedPage,
+    block_limit: usize,
 ) -> Result<EditorCurrentPage, SyncEditorRequestError> {
-    if page.blocks.len() > MAX_SYNC_EDITOR_BLOCKS {
+    if page.blocks.len() > block_limit {
         return Err(editor_too_large(page.blocks.len(), 0, 0, 0));
     }
     let blocks = page.blocks.clone();
@@ -13890,6 +13936,20 @@ fn load_hot_source_authenticated_application_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    load_hot_source_authenticated_page_with_block_limit(
+        runtime,
+        graph,
+        page_id,
+        MAX_SYNC_APPLICATION_PAGE_BLOCKS,
+    )
+}
+
+fn load_hot_source_authenticated_page_with_block_limit(
+    runtime: &PromotedLocalRuntime,
+    graph: &Graph,
+    page_id: PageId,
+    block_limit: usize,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
     let page = match runtime.engine().materialize_page(page_id) {
         Ok(page) => page,
         Err(
@@ -13898,7 +13958,7 @@ fn load_hot_source_authenticated_application_page(
         ) => return Ok(None),
         Err(_) => return Err(SyncEditorRequestError::ActorRefused),
     };
-    let current = editor_current_page_from_materialized(page)?;
+    let current = editor_current_page_from_materialized(page, block_limit)?;
     let parsed = graph
         .load_by_path(current.page.path.as_str())
         .map_err(|_| SyncEditorRequestError::ActorRefused)?
@@ -13915,11 +13975,7 @@ fn load_preferred_source_authenticated_application_page(
     projected_available: bool,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
     if projected_available {
-        if let Ok(Some(current)) =
-            load_projected_source_authenticated_application_page(runtime, graph, page_id)
-        {
-            return Ok(Some(current));
-        }
+        return load_projected_source_authenticated_application_page(runtime, graph, page_id);
     }
     load_hot_source_authenticated_application_page(runtime, graph, page_id)
 }
@@ -13929,14 +13985,48 @@ fn load_projected_source_authenticated_application_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    let Some(current) = load_current_editor_page(runtime, page_id)? else {
+    let projected = load_projected_application_page(runtime, page_id);
+    #[cfg(test)]
+    if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
+        if let Err(error) = &projected {
+            eprintln!("managed read projected-stage page_id={page_id} failed: {error:?}");
+        }
+    }
+    let Some(mut current) = projected? else {
         return Ok(None);
     };
+    let revision = existing_editor_revision(&current.page, &current.dto);
+    #[cfg(test)]
+    if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
+        if let Err(error) = &revision {
+            eprintln!(
+                "managed read revision-stage path={} failed: {error:?}",
+                current.page.path
+            );
+        }
+    }
+    current.dto.revision = revision?;
     let parsed = graph
         .load_by_path(current.page.path.as_str())
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?
-        .ok_or(SyncEditorRequestError::ActorRefused)?;
-    join_application_page(parsed, current)
+        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    let Some(parsed) = parsed else {
+        #[cfg(test)]
+        if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
+            eprintln!(
+                "managed read source-stage path={} was missing",
+                current.page.path
+            );
+        }
+        return Err(SyncEditorRequestError::ActorRefused);
+    };
+    let joined = join_application_page(parsed, current);
+    #[cfg(test)]
+    if std::env::var_os("TINE_TRACE_MANAGED_READ").is_some() {
+        if let Err(error) = &joined {
+            eprintln!("managed read join-stage failed: {error:?}");
+        }
+    }
+    joined
         .map(Some)
         .map_err(|_| SyncEditorRequestError::ActorRefused)
 }
@@ -13946,7 +14036,7 @@ fn load_projected_source_rebased_application_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
-    let Some(mut current) = load_projected_editor_page(runtime, page_id)? else {
+    let Some(mut current) = load_projected_application_page(runtime, page_id)? else {
         return Ok(None);
     };
     let parsed = graph
@@ -14074,8 +14164,13 @@ fn load_hot_source_authenticated_editor_page(
     graph: &Graph,
     page_id: PageId,
 ) -> Result<Option<EditorCurrentPage>, SyncEditorRequestError> {
-    load_hot_source_authenticated_application_page(runtime, graph, page_id)
-        .map(|current| current.map(|current| current.editor))
+    load_hot_source_authenticated_page_with_block_limit(
+        runtime,
+        graph,
+        page_id,
+        MAX_SYNC_EDITOR_BLOCKS,
+    )
+    .map(|current| current.map(|current| current.editor))
 }
 
 fn editor_materialization_matches(
@@ -14146,12 +14241,9 @@ fn ensure_editor_frontier(
         .engine()
         .accepted_frontier_root()
         .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-    let sqlite_frontier = runtime
-        .database()
-        .frontier_root()
-        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+    let sqlite_frontier = runtime.database().required_frontier_root();
     if frontier.acceptance_sequence() != sqlite_acceptance_sequence
-        || !frontier.same_accepted_authority(&sqlite_frontier)
+        || !frontier.same_accepted_authority(sqlite_frontier)
     {
         return Err(SyncEditorRequestError::ActorRefused);
     }
@@ -16145,8 +16237,30 @@ mod tests {
                 ],
             )
             .unwrap();
+        let inventory_after_unrelated_content_corruption =
+            match handle.application_page_inventory().unwrap() {
+                SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+                other => panic!("application inventory was not ready: {other:?}"),
+            };
+        assert_eq!(
+            inventory_after_unrelated_content_corruption
+                .iter()
+                .map(|entry| (
+                    entry.rel_path.clone(),
+                    entry.name.clone(),
+                    entry.kind,
+                    entry.date_key,
+                ))
+                .collect::<Vec<_>>(),
+            inventory_semantics,
+            "page-list metadata does not read unrelated page bodies"
+        );
         assert!(matches!(
-            handle.application_page_inventory(),
+            handle.load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: "diary/日記/2026_07_30.org".into(),
+                },
+            }),
             Err(SyncApplicationPageRequestError::ActorRefused)
         ));
         let (logical, _) = load_application_logical(&handle, " /ORDINARY Ω/ ", SyncPageKind::Page);
@@ -16737,7 +16851,7 @@ mod tests {
                 SyncApplicationPageSaveOutcome::Conflict { reason: actual } if actual == reason
             ));
         }
-        let oversized = (0..=MAX_SYNC_EDITOR_BLOCKS)
+        let oversized = (0..=MAX_SYNC_APPLICATION_PAGE_BLOCKS)
             .map(|index| BlockDto {
                 id: format!("oversized-{index}"),
                 raw: "body".into(),
@@ -21229,6 +21343,75 @@ mod tests {
                 )
                 .unwrap();
             }
+            fixture
+        }
+
+        fn scaled_mixed_with_journals(
+            label: &str,
+            seed: u128,
+            additional_pages: usize,
+            blocks_per_page: usize,
+        ) -> Self {
+            let fixture = Self::nested_unicode(label, seed);
+            for page in 0..additional_pages {
+                let journal = page % 11 == 0;
+                let org = page % 2 == 0;
+                let extension = if org { "org" } else { "md" };
+                let (directory, stem, title) = if journal {
+                    let journal_index = page / 11;
+                    let date = crate::date::JournalDate::from_ordinal(20260731)
+                        .add_days(-(journal_index as i64));
+                    (
+                        fixture.graph_root.join("diary/mixed/deep"),
+                        format!("{:02}-{:02}-{:04}", date.day, date.month, date.year),
+                        None,
+                    )
+                } else {
+                    (
+                        fixture
+                            .graph_root
+                            .join(format!("notes/mixed/{}/deep", page % 8)),
+                        format!("Synthetic-{page}"),
+                        Some(format!("Synthetic {page}")),
+                    )
+                };
+                fs::create_dir_all(&directory).unwrap();
+                let mut content = match (org, title) {
+                    (true, Some(title)) => {
+                        format!("#+TITLE: {title}\n#+ALIAS: Mixed Alias {page}\n\n")
+                    }
+                    (false, Some(title)) => {
+                        format!("title:: {title}\nalias:: Mixed Alias {page}\n\n")
+                    }
+                    _ => String::new(),
+                };
+                for block in 0..blocks_per_page {
+                    if org {
+                        content.push_str(&format!(
+                            "* {} task {page}-{block} references [[Synthetic {}]]\n  :PROPERTIES:\n  :priority: {}\n  :END:\n",
+                            if block % 2 == 0 { "TODO" } else { "DONE" },
+                            page.saturating_sub(1),
+                            if block % 3 == 0 { "A" } else { "B" },
+                        ));
+                    } else {
+                        content.push_str(&format!(
+                            "- {} task {page}-{block} references [[Synthetic {}]] and #[[mixed-tag]]\n  priority:: {}\n",
+                            if block % 2 == 0 { "TODO" } else { "DONE" },
+                            page.saturating_sub(1),
+                            if block % 3 == 0 { "A" } else { "B" },
+                        ));
+                    }
+                }
+                fs::write(directory.join(format!("{stem}.{extension}")), content).unwrap();
+            }
+            fixture
+        }
+
+        fn copied_graph(label: &str, seed: u128, source: &Path) -> Self {
+            assert!(source.is_dir(), "graph-copy source must be a directory");
+            let fixture = Self::nested_unicode(label, seed);
+            fs::remove_dir_all(&fixture.graph_root).unwrap();
+            copy_provider_tree(source, &fixture.graph_root);
             fixture
         }
     }
@@ -30046,6 +30229,344 @@ mod tests {
             startup_ms(managed_first_page),
             startup_ms(managed_whole_graph),
         );
+    }
+
+    #[test]
+    #[ignore = "manual release gate: managed page and Journals reads at 1,000 and 10,000 mixed pages"]
+    fn managed_application_read_1000_and_10000_page_manual_gate() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this gate is release-only; run cargo test -p tine-core --release managed_application_read_1000_and_10000_page_manual_gate -- --ignored --nocapture"
+        );
+        let page_counts = std::env::var("TINE_MANAGED_APPLICATION_READ_GATE_PAGES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| part.trim().parse::<usize>().unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![1_000, 10_000]);
+        let samples = std::env::var("TINE_MANAGED_APPLICATION_READ_GATE_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|samples| *samples >= 2)
+            .unwrap_or(20);
+        let mut managed_page_p95_by_scale = Vec::new();
+
+        for (scale, total_pages) in page_counts.into_iter().enumerate() {
+            assert!(total_pages >= 4);
+            let fixture = ActivationFixture::scaled_mixed_with_journals(
+                "managed-application-read-gate",
+                0xa0f0 + scale as u128 * 16,
+                total_pages - 3,
+                4,
+            );
+            let source = user_graph_bytes(&fixture.graph_root);
+            assert_eq!(source.len(), total_pages + 1);
+
+            let direct_graph = Graph::open(&fixture.graph_root);
+            let direct_entries = direct_graph.list_pages();
+            assert_eq!(direct_entries.len(), total_pages);
+            let target = direct_entries
+                .iter()
+                .find(|entry| entry.name == "Synthetic 1")
+                .expect("mixed fixture retains its ordinary target")
+                .clone();
+            let mut direct_journals = direct_entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == PageKind::Journal
+                        && entry.date_key.is_some_and(|day| {
+                            day <= crate::date::JournalDate::today().ordinal_key()
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            direct_journals.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap()));
+            assert!(direct_journals.len() >= 3);
+
+            let mut direct_page_samples = Vec::with_capacity(samples);
+            let mut direct_target = None;
+            for _ in 0..samples {
+                let started = Instant::now();
+                let page = direct_graph.load_page(&target).unwrap();
+                direct_page_samples.push(started.elapsed());
+                direct_target = Some(page);
+            }
+            let direct_feed_started = Instant::now();
+            let direct_feed = direct_journals
+                .iter()
+                .take(3)
+                .map(|entry| direct_graph.load_page(entry).unwrap())
+                .collect::<Vec<_>>();
+            let direct_feed_elapsed = direct_feed_started.elapsed();
+
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let activation_handle = activated.handle.expect("activation retains its actor");
+            drive_initial_feed(&activation_handle);
+            assert!(matches!(
+                activation_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+            drop(activation_handle);
+
+            let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+            assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+            let handle = opened.handle.expect("managed reopen retains its actor");
+            let mut managed_page_samples = Vec::with_capacity(samples);
+            let mut managed_target = None;
+            for _ in 0..samples {
+                let started = Instant::now();
+                let page = load_application_exact(&handle, &target.rel_path).0;
+                managed_page_samples.push(started.elapsed());
+                managed_target = Some(page);
+            }
+
+            let inventory_engine_before = handle.engine_instrumentation().unwrap();
+            let managed_feed_started = Instant::now();
+            let managed_entries = match handle.application_page_inventory().unwrap() {
+                SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+                other => panic!("managed page inventory did not load: {other:?}"),
+            };
+            let mut managed_journals = managed_entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.kind == PageKind::Journal
+                        && entry.date_key.is_some_and(|day| {
+                            day <= crate::date::JournalDate::today().ordinal_key()
+                        })
+                })
+                .collect::<Vec<_>>();
+            managed_journals.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap()));
+            let managed_feed = managed_journals
+                .iter()
+                .take(3)
+                .map(|entry| load_application_exact(&handle, &entry.rel_path).0)
+                .collect::<Vec<_>>();
+            let managed_feed_elapsed = managed_feed_started.elapsed();
+            let inventory_engine_after = handle.engine_instrumentation().unwrap();
+
+            assert_parser_dto_semantics(
+                &direct_target.expect("direct target loaded"),
+                &managed_target.expect("managed target loaded"),
+            );
+            assert_eq!(direct_feed.len(), managed_feed.len());
+            for (direct, managed) in direct_feed.iter().zip(&managed_feed) {
+                assert_parser_dto_semantics(direct, managed);
+            }
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root),
+                source,
+                "read gates preserve the source tree"
+            );
+
+            let direct_page_p50 = startup_median(&direct_page_samples);
+            let direct_page_p95 = startup_p95(&direct_page_samples);
+            let managed_page_p50 = startup_median(&managed_page_samples);
+            let managed_page_p95 = startup_p95(&managed_page_samples);
+            eprintln!(
+                "managed_application_read_gate pages={total_pages} samples={samples} direct_page_p50_ms={:.3} direct_page_p95_ms={:.3} managed_page_p50_ms={:.3} managed_page_p95_ms={:.3} direct_journals_first_page_ms={:.3} managed_journals_first_page_ms={:.3}",
+                startup_ms(direct_page_p50),
+                startup_ms(direct_page_p95),
+                startup_ms(managed_page_p50),
+                startup_ms(managed_page_p95),
+                startup_ms(direct_feed_elapsed),
+                startup_ms(managed_feed_elapsed),
+            );
+            assert!(
+                managed_page_p50 <= Duration::from_millis(50)
+                    && managed_page_p50 <= direct_page_p50.saturating_mul(10),
+                "managed page-open p50 gate failed at {total_pages} pages: direct={direct_page_p50:?}, managed={managed_page_p50:?}"
+            );
+            assert!(
+                managed_page_p95 <= Duration::from_millis(50)
+                    && managed_page_p95 <= direct_page_p95.saturating_mul(10),
+                "managed page-open p95 gate failed at {total_pages} pages: direct={direct_page_p95:?}, managed={managed_page_p95:?}"
+            );
+            assert!(
+                managed_feed_elapsed <= Duration::from_millis(500),
+                "managed Journals first-page gate failed at {total_pages} pages: {managed_feed_elapsed:?}"
+            );
+            assert_eq!(
+                inventory_engine_after.catalog_hot_state_loads,
+                inventory_engine_before.catalog_hot_state_loads,
+                "page inventory must not materialize the hot catalog once per graph page"
+            );
+            managed_page_p95_by_scale.push((total_pages, managed_page_p95));
+            assert!(matches!(
+                handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+        }
+
+        if let [(_, smaller), (larger_pages, larger)] = managed_page_p95_by_scale.as_slice() {
+            assert!(
+                *larger <= smaller.saturating_mul(2).max(*smaller + Duration::from_millis(5)),
+                "managed page-open p95 scales with unrelated graph size at {larger_pages} pages: smaller={smaller:?}, larger={larger:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release gate: managed reads on an explicitly supplied backed-up graph copy"]
+    fn managed_application_read_real_graph_copy_manual_gate() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this gate is release-only; run with TINE_MANAGED_READ_REAL_GRAPH_COPY=<copy> cargo test -p tine-core --release managed_application_read_real_graph_copy_manual_gate -- --ignored --nocapture"
+        );
+        let source_root = PathBuf::from(
+            std::env::var("TINE_MANAGED_READ_REAL_GRAPH_COPY")
+                .expect("set TINE_MANAGED_READ_REAL_GRAPH_COPY to a backed-up graph copy"),
+        );
+        let source_root = fs::canonicalize(source_root).unwrap();
+        assert_ne!(
+            source_root,
+            PathBuf::from("/home/koutecky/research/brain"),
+            "the live graph is forbidden; supply a copy"
+        );
+        let fixture = ActivationFixture::copied_graph(
+            "managed-application-read-real-copy",
+            0xa140,
+            &source_root,
+        );
+        let source = user_graph_bytes(&fixture.graph_root);
+        let direct_graph = Graph::open(&fixture.graph_root);
+        let mut direct_entries = direct_graph.list_pages();
+        direct_entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        assert!(!direct_entries.is_empty());
+        eprintln!(
+            "managed_real_graph_read_gate copied_files={} activating disposable copy",
+            direct_entries.len()
+        );
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("managed reopen retains its actor");
+        let engine_before = handle.engine_instrumentation().unwrap();
+        let feed_started = Instant::now();
+        let mut managed_entries = match handle.application_page_inventory().unwrap() {
+            SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
+            other => panic!("managed page inventory did not load: {other:?}"),
+        };
+        managed_entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        let direct_inventory_semantics = direct_entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.rel_path.clone(),
+                    entry.name.clone(),
+                    entry.kind,
+                    entry.date_key,
+                )
+            })
+            .collect::<Vec<_>>();
+        let managed_inventory_semantics = managed_entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.rel_path.clone(),
+                    entry.name.clone(),
+                    entry.kind,
+                    entry.date_key,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(managed_inventory_semantics, direct_inventory_semantics);
+
+        let all_journals = managed_entries
+            .iter()
+            .filter(|entry| entry.kind == PageKind::Journal && entry.date_key.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut journals = all_journals
+            .iter()
+            .filter(|entry| {
+                entry
+                    .date_key
+                    .is_some_and(|day| day <= crate::date::JournalDate::today().ordinal_key())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if journals.len() < 3 {
+            journals = all_journals;
+        }
+        journals.sort_by_key(|entry| std::cmp::Reverse(entry.date_key.unwrap()));
+        assert!(journals.len() >= 3);
+        for entry in journals.iter().take(3) {
+            let direct = direct_graph.load_page(entry).unwrap();
+            let managed = load_application_exact(&handle, &entry.rel_path).0;
+            assert_parser_dto_semantics(&direct, &managed);
+        }
+        let feed_elapsed = feed_started.elapsed();
+
+        let mut direct_samples = Vec::with_capacity(direct_entries.len());
+        let mut managed_samples = Vec::with_capacity(direct_entries.len());
+        let mut slowest = (Duration::ZERO, String::new());
+        for entry in &direct_entries {
+            let direct_started = Instant::now();
+            let direct = direct_graph.load_page(entry).unwrap();
+            direct_samples.push(direct_started.elapsed());
+
+            let managed_started = Instant::now();
+            let managed = load_application_exact(&handle, &entry.rel_path).0;
+            let managed_elapsed = managed_started.elapsed();
+            if managed_elapsed > slowest.0 {
+                slowest = (managed_elapsed, entry.rel_path.clone());
+            }
+            managed_samples.push(managed_elapsed);
+            assert_parser_dto_semantics(&direct, &managed);
+        }
+        let engine_after = handle.engine_instrumentation().unwrap();
+        let direct_p50 = startup_median(&direct_samples);
+        let direct_p95 = startup_p95(&direct_samples);
+        let managed_p50 = startup_median(&managed_samples);
+        let managed_p95 = startup_p95(&managed_samples);
+        eprintln!(
+            "managed_real_graph_read_gate pages={} direct_p50_ms={:.3} direct_p95_ms={:.3} managed_p50_ms={:.3} managed_p95_ms={:.3} journals_first_page_ms={:.3} slowest_managed_ms={:.3} slowest_path={:?}",
+            direct_entries.len(),
+            startup_ms(direct_p50),
+            startup_ms(direct_p95),
+            startup_ms(managed_p50),
+            startup_ms(managed_p95),
+            startup_ms(feed_elapsed),
+            startup_ms(slowest.0),
+            slowest.1,
+        );
+        assert!(
+            managed_p50 <= Duration::from_millis(50)
+                && managed_p50 <= direct_p50.saturating_mul(10),
+            "real-copy managed page-open p50 failed: direct={direct_p50:?}, managed={managed_p50:?}"
+        );
+        assert!(
+            managed_p95 <= Duration::from_millis(50)
+                && managed_p95 <= direct_p95.saturating_mul(10),
+            "real-copy managed page-open p95 failed: direct={direct_p95:?}, managed={managed_p95:?}"
+        );
+        assert!(
+            feed_elapsed <= Duration::from_millis(500),
+            "real-copy Journals first-page gate failed: {feed_elapsed:?}"
+        );
+        assert_eq!(
+            engine_after.catalog_hot_state_loads, engine_before.catalog_hot_state_loads,
+            "ordinary real-copy reads must not enter hot catalog materialization"
+        );
+        assert_eq!(user_graph_bytes(&fixture.graph_root), source);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 
     #[test]

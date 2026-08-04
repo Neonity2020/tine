@@ -2086,7 +2086,7 @@ pub struct TailOverlay {
 }
 
 struct RequiredFrontierTransition {
-    replacement: Option<AcceptedFrontierRoot>,
+    replacement: Option<(AcceptedFrontierRoot, ContentDigest)>,
 }
 
 struct TailAdmissionPlan {
@@ -2691,6 +2691,7 @@ pub struct SqliteFrontier {
     physical: PhysicalSqliteDatabase,
     runtime_authority: EngineAuthority,
     required_frontier_root: AcceptedFrontierRoot,
+    required_frontier_digest: ContentDigest,
     checkpoint_each_apply: bool,
     reference_coverage: Option<InductiveReferenceCoverage>,
     _lease: Arc<HeldApplierLocks>,
@@ -3349,6 +3350,9 @@ impl SqliteFrontier {
                     physical,
                     runtime_authority: source.runtime_authority.clone(),
                     required_frontier_root: source.exact_frontier_root.clone(),
+                    required_frontier_digest: canonical_frontier_root_digest(
+                        &source.exact_frontier_root,
+                    )?,
                     checkpoint_each_apply: true,
                     reference_coverage: None,
                     _lease: lease,
@@ -3387,6 +3391,9 @@ impl SqliteFrontier {
                                 physical,
                                 runtime_authority: source.runtime_authority.clone(),
                                 required_frontier_root: source.exact_frontier_root.clone(),
+                                required_frontier_digest: canonical_frontier_root_digest(
+                                    &source.exact_frontier_root,
+                                )?,
                                 checkpoint_each_apply: true,
                                 reference_coverage: None,
                                 _lease: lease,
@@ -3409,6 +3416,9 @@ impl SqliteFrontier {
                             physical,
                             runtime_authority: source.runtime_authority.clone(),
                             required_frontier_root: source.exact_frontier_root.clone(),
+                            required_frontier_digest: canonical_frontier_root_digest(
+                                &source.exact_frontier_root,
+                            )?,
                             checkpoint_each_apply: true,
                             reference_coverage: None,
                             _lease: lease,
@@ -3573,6 +3583,9 @@ impl SqliteFrontier {
                 physical,
                 runtime_authority: source.runtime_authority.clone(),
                 required_frontier_root: source.exact_frontier_root.clone(),
+                required_frontier_digest: canonical_frontier_root_digest(
+                    &source.exact_frontier_root,
+                )?,
                 checkpoint_each_apply: true,
                 reference_coverage: None,
                 _lease: lease,
@@ -3598,6 +3611,9 @@ impl SqliteFrontier {
             physical,
             runtime_authority,
             required_frontier_root: AcceptedFrontierRoot::empty(),
+            required_frontier_digest: canonical_frontier_root_digest(
+                &AcceptedFrontierRoot::empty(),
+            )?,
             checkpoint_each_apply: false,
             reference_coverage: Some(InductiveReferenceCoverage {
                 applied_through: 0,
@@ -3619,12 +3635,12 @@ impl SqliteFrontier {
         &self,
         root: &AcceptedFrontierRoot,
     ) -> Result<RequiredFrontierTransition, ProjectionError> {
-        canonical_frontier_root_bytes(root)?;
+        let digest = canonical_frontier_root_digest(root)?;
         let replacement = match root
             .acceptance_sequence()
             .cmp(&self.required_frontier_root.acceptance_sequence())
         {
-            std::cmp::Ordering::Greater => Some(root.clone()),
+            std::cmp::Ordering::Greater => Some((root.clone(), digest)),
             std::cmp::Ordering::Equal if root == &self.required_frontier_root => None,
             std::cmp::Ordering::Equal => {
                 return Err(ProjectionError::Corrupt(
@@ -3637,8 +3653,9 @@ impl SqliteFrontier {
     }
 
     fn commit_required_frontier(&mut self, transition: RequiredFrontierTransition) {
-        if let Some(root) = transition.replacement {
+        if let Some((root, digest)) = transition.replacement {
             self.required_frontier_root = root;
+            self.required_frontier_digest = digest;
         }
     }
 
@@ -3687,6 +3704,10 @@ impl SqliteFrontier {
 
     pub fn frontier_root(&self) -> Result<AcceptedFrontierRoot, ProjectionError> {
         read_frontier_root(&self.physical)
+    }
+
+    pub(crate) const fn required_frontier_root(&self) -> &AcceptedFrontierRoot {
+        &self.required_frontier_root
     }
 
     /// Explicit whole-frontier materialization for diagnostics and recovery.
@@ -3820,17 +3841,11 @@ impl SqliteFrontier {
     }
 
     pub fn materialized_read(&self) -> Result<super::SqliteMaterializedRead<'_>, ProjectionError> {
-        let root = read_frontier_root(&self.physical)?;
-        if root != self.required_frontier_root {
-            return Err(ProjectionError::Materialization(format!(
-                "SQLite materialization frontier {} is behind required accepted frontier {}",
-                root.acceptance_sequence(),
-                self.required_frontier_root.acceptance_sequence()
-            )));
-        }
-        let root_bytes = canonical_frontier_root_bytes(&root)?;
         self.physical
-            .materialized_read(root.acceptance_sequence(), ContentDigest::of(&root_bytes))
+            .materialized_read(
+                self.required_frontier_root.acceptance_sequence(),
+                self.required_frontier_digest,
+            )
             .map(super::SqliteMaterializedRead::from_storage)
             .map_err(Into::into)
     }
@@ -5475,6 +5490,12 @@ fn canonical_frontier_root_bytes(root: &AcceptedFrontierRoot) -> Result<Vec<u8>,
         ));
     }
     Ok(bytes)
+}
+
+fn canonical_frontier_root_digest(
+    root: &AcceptedFrontierRoot,
+) -> Result<ContentDigest, ProjectionError> {
+    canonical_frontier_root_bytes(root).map(|bytes| ContentDigest::of(&bytes))
 }
 
 fn decode_frontier_root(bytes: &[u8]) -> Result<AcceptedFrontierRoot, ProjectionError> {

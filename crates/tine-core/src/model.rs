@@ -5968,6 +5968,25 @@ impl Graph {
         })
     }
 
+    pub(crate) fn projected_inventory_entry(
+        &self,
+        path: &ManagedPath,
+        name: &str,
+        kind: ManagedTextKind,
+    ) -> io::Result<PageEntry> {
+        let mut entry = self.graph_entry_for_relative_path(path.as_str())?;
+        let projected_kind = match kind {
+            ManagedTextKind::Page => PageKind::Page,
+            ManagedTextKind::Journal => PageKind::Journal,
+        };
+        entry.kind = projected_kind;
+        if projected_kind == PageKind::Page {
+            entry.date_key = None;
+        }
+        entry.name = name.to_owned();
+        Ok(entry)
+    }
+
     /// Filename-only semantic evidence for an exact graph-relative path.
     ///
     /// This is intentionally provisional: callers with present bytes must use

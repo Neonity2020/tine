@@ -1877,6 +1877,14 @@ pub struct MaterializedPageRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedPageInventoryRow {
+    pub page_id: PageId,
+    pub name: String,
+    pub path: ManagedPath,
+    pub kind: ManagedTextKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedBlockRow {
     pub block_id: BlockId,
     pub page_id: PageId,
@@ -2060,6 +2068,25 @@ impl<'a> SqliteMaterializedRead<'a> {
         )
     }
 
+    pub fn page_inventory_after(
+        &self,
+        after: Option<(&ManagedPath, PageId)>,
+        kind: Option<ManagedTextKind>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPageInventoryRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner.page_inventory_after_with_header_validation(
+                after.map(|(path, _)| path.as_str()),
+                after_page_id.as_ref(),
+                kind.map(text_kind_to_sql),
+                limit,
+                validate_storage_page_header,
+            )?,
+            page_inventory_row_from_storage,
+        )
+    }
+
     pub fn blocks_on_page(
         &self,
         page_id: PageId,
@@ -2162,6 +2189,17 @@ fn page_row_from_storage(
         kind: text_kind_from_sql(row.text_kind).map_err(typed_sql_decode_error)?,
         preamble: row.preamble,
         searchable_text: row.searchable_text,
+    })
+}
+
+fn page_inventory_row_from_storage(
+    row: storage::PhysicalPageInventoryRow,
+) -> Result<MaterializedPageInventoryRow, MaterializationError> {
+    Ok(MaterializedPageInventoryRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        name: row.name,
+        path: ManagedPath::parse(row.path).map_err(typed_sql_decode_error)?,
+        kind: text_kind_from_sql(row.text_kind).map_err(typed_sql_decode_error)?,
     })
 }
 
