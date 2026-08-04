@@ -17489,11 +17489,15 @@ impl ShardedHotEngine {
         }
         let derived_transition = if effective_transition.is_none() {
             match (effective_selection, lifecycle_completion.as_ref()) {
+                // A same-key title revision can already supply the selected
+                // catalog name while its merged shard still has the other
+                // branch's explicit-title preamble. Reapply that authenticated
+                // revision even when its projection lifecycle is complete.
                 (Some(selection), Some(completion))
                     if !self.projection_frontier_contains_path_acquisition(
                         completion.frontier(),
                         selection.exact_state_batch(),
-                    )? =>
+                    )? || selection.revises_acquired_exact_name() =>
                 {
                     Some(self.authenticate_selected_title_transition(selection, None)?)
                 }

@@ -469,6 +469,7 @@ pub(crate) struct AuthenticatedPageNameExactStateV1 {
     canonical_key: PageNameKeyDigest,
     page_id: PageId,
     exact_name: LogicalPageName,
+    acquisition_batch: BatchId,
     exact_state_batch: BatchId,
     exact_state_dot: BatchCausalDot,
 }
@@ -502,6 +503,7 @@ impl PageNamePublicationCandidateV1 {
             canonical_key: key,
             page_id: occupied.page_id,
             exact_name,
+            acquisition_batch: occupied.acquisition_batch,
             exact_state_batch: occupied.exact_state_batch,
             exact_state_dot: occupied.exact_state_dot,
         }))
@@ -523,6 +525,10 @@ impl AuthenticatedPageNameExactStateV1 {
 
     pub(crate) const fn exact_state_batch(&self) -> BatchId {
         self.exact_state_batch
+    }
+
+    pub(crate) fn revises_acquired_exact_name(&self) -> bool {
+        self.exact_state_batch != self.acquisition_batch
     }
 
     pub(crate) const fn exact_state_dot(&self) -> BatchCausalDot {
@@ -579,6 +585,7 @@ impl EphemeralPageNameOwnershipStateV1 {
             canonical_key: key,
             page_id: occupied.page_id,
             exact_name,
+            acquisition_batch: occupied.acquisition_batch,
             exact_state_batch: occupied.exact_state_batch,
             exact_state_dot: occupied.exact_state_dot,
         }))
@@ -1709,6 +1716,7 @@ impl PageNameOwnershipStore {
             canonical_key: key,
             page_id: occupied.page_id(),
             exact_name,
+            acquisition_batch: occupied.acquisition_batch(),
             exact_state_batch: occupied.exact_state_batch(),
             exact_state_dot: occupied.exact_state_dot(),
         }))

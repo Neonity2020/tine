@@ -868,12 +868,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             // authenticated authority for the winning UTF-8 spelling and for
             // whether that title was explicit or filename-derived.
             match engine.authenticate_effective_title_projection_candidate(source.page_id()) {
-                Ok(candidate)
-                    if candidate.source().source_endpoint_id() != endpoint.endpoint_id =>
-                {
-                    effective_candidate = Some(candidate)
-                }
-                Ok(_) => return Ok(Some(false)),
+                Ok(candidate) => effective_candidate = Some(candidate),
                 Err(EngineError::ProjectionAuthorizationUnavailable) => {
                     return Ok(Some(false));
                 }
