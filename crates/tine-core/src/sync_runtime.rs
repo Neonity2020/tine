@@ -13975,7 +13975,13 @@ fn load_preferred_source_authenticated_application_page(
     projected_available: bool,
 ) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
     if projected_available {
-        return load_projected_source_authenticated_application_page(runtime, graph, page_id);
+        if let Ok(Some(current)) =
+            load_projected_source_authenticated_application_page(runtime, graph, page_id)
+        {
+            return Ok(Some(current));
+        }
+        // A point-local projection fault may be recovered from authenticated
+        // oplog authority. Ordinary reads never enter this graph-sized path.
     }
     load_hot_source_authenticated_application_page(runtime, graph, page_id)
 }
@@ -16255,14 +16261,12 @@ mod tests {
             inventory_semantics,
             "page-list metadata does not read unrelated page bodies"
         );
-        assert!(matches!(
-            handle.load_application_page(SyncApplicationPageLoadRequest {
-                page: SyncApplicationPageSelector::ExactPath {
-                    path: "diary/日記/2026_07_30.org".into(),
-                },
-            }),
-            Err(SyncApplicationPageRequestError::ActorRefused)
-        ));
+        let expected_journal = graph
+            .load_by_path("diary/日記/2026_07_30.org")
+            .unwrap()
+            .unwrap();
+        let (recovered_journal, _) = load_application_exact(&handle, "diary/日記/2026_07_30.org");
+        assert_parser_dto_semantics(&expected_journal, &recovered_journal);
         let (logical, _) = load_application_logical(&handle, " /ORDINARY Ω/ ", SyncPageKind::Page);
         assert_parser_dto_semantics(&ordinary, &logical);
         connection
