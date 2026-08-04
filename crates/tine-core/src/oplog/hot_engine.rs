@@ -4461,7 +4461,7 @@ impl BootstrapBulkMaterializer<'_> {
         }
         let frontier = FrontierV2::new(frontier_documents.into_values().collect())?;
         let (frontier, effective_closure) = match self.engine.page_stable_projection_frontier(
-            &bulk.page,
+            &mut bulk.page,
             &frontier,
             &claim_evidence,
             effective_selection.as_ref(),
@@ -17399,7 +17399,7 @@ impl ShardedHotEngine {
             .transpose()?;
         let (frontier, effective_closure) = match frontier {
             Some(frontier) => match self.page_stable_projection_frontier(
-                &page,
+                &mut page,
                 &frontier,
                 &claim_evidence,
                 effective_selection.as_ref(),
@@ -17439,7 +17439,7 @@ impl ShardedHotEngine {
 
     fn page_stable_projection_frontier(
         &self,
-        page: &MaterializedPage,
+        page: &mut MaterializedPage,
         current: &FrontierV2,
         claim_evidence: &[ProjectionClaimEvidence],
         effective_selection: Option<&AuthenticatedPageNameExactStateV1>,
@@ -17485,24 +17485,25 @@ impl ShardedHotEngine {
                 return Ok(None);
             }
         }
-        let derived_transition;
-        let effective_transition = match effective_transition {
-            Some(transition) => Some(transition),
-            None => {
-                derived_transition = match (effective_selection, lifecycle_completion.as_ref()) {
-                    (Some(selection), Some(completion))
-                        if !self.projection_frontier_contains_path_acquisition(
-                            completion.frontier(),
-                            selection.exact_state_batch(),
-                        )? =>
-                    {
-                        Some(self.authenticate_selected_title_transition(selection, None)?)
-                    }
-                    _ => None,
-                };
-                derived_transition.as_ref()
+        let derived_transition = if effective_transition.is_none() {
+            match (effective_selection, lifecycle_completion.as_ref()) {
+                (Some(selection), Some(completion))
+                    if !self.projection_frontier_contains_path_acquisition(
+                        completion.frontier(),
+                        selection.exact_state_batch(),
+                    )? =>
+                {
+                    Some(self.authenticate_selected_title_transition(selection, None)?)
+                }
+                _ => None,
             }
+        } else {
+            None
         };
+        if let Some(transition) = &derived_transition {
+            transition.apply_to_materialized(page)?;
+        }
+        let effective_transition = effective_transition.or(derived_transition.as_ref());
         let current_catalog = current
             .documents()
             .iter()

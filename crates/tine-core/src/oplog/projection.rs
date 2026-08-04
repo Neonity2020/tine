@@ -865,7 +865,8 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             // Most superseded immutable intents are historical evidence only.
             // One exception is an exact-title event selected by the current
             // merged frontier: its original source intent remains the
-            // authenticated authority for the winning UTF-8 spelling.
+            // authenticated authority for the winning UTF-8 spelling and for
+            // whether that title was explicit or filename-derived.
             match engine.authenticate_effective_title_projection_candidate(source) {
                 Ok(candidate) => effective_candidate = Some(candidate),
                 Err(EngineError::ProjectionAuthorizationUnavailable) => {
