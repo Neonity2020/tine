@@ -867,8 +867,13 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             // merged frontier: its original source intent remains the
             // authenticated authority for the winning UTF-8 spelling and for
             // whether that title was explicit or filename-derived.
-            match engine.authenticate_effective_title_projection_candidate(source) {
-                Ok(candidate) => effective_candidate = Some(candidate),
+            match engine.authenticate_effective_title_projection_candidate(source.page_id()) {
+                Ok(candidate)
+                    if candidate.source().source_endpoint_id() != endpoint.endpoint_id =>
+                {
+                    effective_candidate = Some(candidate)
+                }
+                Ok(_) => return Ok(Some(false)),
                 Err(EngineError::ProjectionAuthorizationUnavailable) => {
                     return Ok(Some(false));
                 }
@@ -877,7 +882,11 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
         }
         None
     };
-    let local_base = graph.read_projection_input(source.path())?;
+    let projection_source = effective_candidate
+        .as_ref()
+        .map(|candidate| candidate.source())
+        .unwrap_or(source);
+    let local_base = graph.read_projection_input(projection_source.path())?;
     let mut effective_prior_completion = None;
     let plan = if source_absent {
         receiver_tombstone_plan(
@@ -896,7 +905,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             .ok_or(ProjectionError::ReceiverBaseMismatch)?;
         let authorization = engine.authorize_effective_title_projection_write(
             candidate,
-            source,
+            projection_source,
             &completed_intent,
             &completion,
             local_base,
@@ -1001,7 +1010,7 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
                     .ok_or(ProjectionError::ReceiverBaseMismatch)?;
                 let authorization = engine.authorize_effective_title_projection_write(
                     candidate,
-                    source,
+                    projection_source,
                     completed_intent,
                     completion,
                     exact_local_base,

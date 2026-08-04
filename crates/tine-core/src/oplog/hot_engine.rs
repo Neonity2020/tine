@@ -465,6 +465,10 @@ impl AuthenticatedEffectiveTitleProjectionCandidate {
     pub(crate) const fn lifecycle_completion(&self) -> &ProjectionCompletedReceipt {
         &self.lifecycle_completion
     }
+
+    pub(crate) const fn source(&self) -> &ManifestedProjectionIntent {
+        &self.source
+    }
 }
 
 /// Run-local proof that one materialized projection state was selected while
@@ -16356,17 +16360,15 @@ impl ShardedHotEngine {
 
     pub(crate) fn authenticate_effective_title_projection_candidate(
         &self,
-        source: &ManifestedProjectionIntent,
+        page_id: PageId,
     ) -> Result<AuthenticatedEffectiveTitleProjectionCandidate, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
         let (page, frontier, claim_evidence, effective_closure) =
-            self.materialize_page_inner(source.page_id(), true)?;
+            self.materialize_page_inner(page_id, true)?;
         let effective_closure =
             effective_closure.ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
-        if effective_closure.transition.selected_intent != *source {
-            return Err(EngineError::ProjectionAuthorizationUnavailable);
-        }
+        let source = effective_closure.transition.selected_intent.clone();
         let state = ProjectionPageState {
             page,
             frontier: frontier.expect("projection materialization requested a frontier"),
@@ -16376,7 +16378,7 @@ impl ShardedHotEngine {
         Ok(AuthenticatedEffectiveTitleProjectionCandidate {
             seal: EffectiveTitleTransitionSeal::Authenticated,
             state,
-            source: source.clone(),
+            source,
             lifecycle_completion: effective_closure.lifecycle_completion,
             accepted_frontier,
         })
@@ -16390,7 +16392,7 @@ impl ShardedHotEngine {
         completion: &ProjectionCompletion,
         exact_local_base: &[u8],
     ) -> Result<ProjectionWriteAuthorization, EngineError> {
-        let fresh = self.authenticate_effective_title_projection_candidate(source)?;
+        let fresh = self.authenticate_effective_title_projection_candidate(source.page_id())?;
         if candidate.seal != EffectiveTitleTransitionSeal::Authenticated
             || candidate.source != *source
             || fresh.seal != candidate.seal
@@ -17388,7 +17390,6 @@ impl ShardedHotEngine {
             self.title_selection_at_page_name_root(&self.page_name_root, page_id, &page.name)?;
         let effective_transition = effective_selection
             .as_ref()
-            .filter(|selection| selection.exact_name() != &page.name)
             .map(|selection| self.authenticate_selected_title_transition(selection, None))
             .transpose()?;
         if let Some(transition) = &effective_transition {
