@@ -3825,6 +3825,12 @@ struct ColdHistoryRecord {
     status: ArchiveStatus,
 }
 
+fn is_bootstrap_generation(record: &ColdHistoryRecord) -> bool {
+    record.bootstrap.is_some_and(|bootstrap| {
+        record.generation != 0 && record.generation <= u64::from(bootstrap.part_count())
+    })
+}
+
 /// Move-only proof of the current durable authority established by the
 /// enrolled open before recovery resets run-local state.
 ///
@@ -11513,7 +11519,10 @@ impl ShardedHotEngine {
                 return self.outcome(batch_id, BatchDisposition::Rejected { error }, Vec::new());
             }
             if matches!(existing.status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.prepare_projection_work_for_batch(&batch) {
+                if let Err(error) = self.prepare_projection_work_for_batch(
+                    &batch,
+                    self.authenticated_history_replay && is_bootstrap_generation(&existing),
+                ) {
                     self.history_failure = Some(error.clone());
                     return self.outcome(
                         batch_id,
@@ -11767,6 +11776,11 @@ impl ShardedHotEngine {
             Some(record) => Ok(Some(record)),
             None => self.cold_history_record(offered_batch_id),
         };
+        let replaying_bootstrap_generation = history_record
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(is_bootstrap_generation);
         // Authenticated recovery replays durable accepted history into a fresh
         // scratch run and truthfully reports that reconstruction as Accepted.
         // Ordinary ingress seeing the same durable record is a duplicate even
@@ -12148,7 +12162,10 @@ impl ShardedHotEngine {
                 );
             }
             if matches!(status, ArchiveStatus::Accepted { .. }) {
-                if let Err(error) = self.prepare_projection_work_for_batch(&batch) {
+                if let Err(error) = self.prepare_projection_work_for_batch(
+                    &batch,
+                    self.authenticated_history_replay && replaying_bootstrap_generation,
+                ) {
                     self.history_failure = Some(error.clone());
                     return self.outcome(
                         offered_batch_id,
@@ -15756,10 +15773,24 @@ impl ShardedHotEngine {
     }
 
     fn prepare_projection_work(&self, batch_id: BatchId) -> Result<(), EngineError> {
-        self.prepare_projection_work_for_batch(&self.archive[&batch_id])
+        let reconstructible_bootstrap = if self.authenticated_history_replay {
+            self.authenticated_recovery_history_record(batch_id)?
+                .as_ref()
+                .is_some_and(|record| {
+                    matches!(record.status, ArchiveStatus::Accepted { .. })
+                        && is_bootstrap_generation(record)
+                })
+        } else {
+            false
+        };
+        self.prepare_projection_work_for_batch(&self.archive[&batch_id], reconstructible_bootstrap)
     }
 
-    fn prepare_projection_work_for_batch(&self, batch: &ValidatedBatch) -> Result<(), EngineError> {
+    fn prepare_projection_work_for_batch(
+        &self,
+        batch: &ValidatedBatch,
+        reconstructible_bootstrap: bool,
+    ) -> Result<(), EngineError> {
         let (Some(endpoint), Some(index)) = (
             self.projection_endpoint,
             self.projection_work_index.as_ref(),
@@ -15832,8 +15863,21 @@ impl ShardedHotEngine {
             work.push(row);
         }
         if self.authenticated_history_replay {
+            match index.require_replayed_prepared_batch(batch_id, batch_fingerprint(batch), &work) {
+                Ok(()) => return Ok(()),
+                Err(super::projection_work_index::ProjectionWorkError::MissingPreparedBatch(
+                    missing,
+                )) if reconstructible_bootstrap && missing == batch_id => {}
+                Err(error) => return Err(EngineError::ProjectionWork(error.to_string())),
+            }
+            // Bootstrap history is installed before projection-work authority
+            // exists. A full authenticated replay may therefore be the first
+            // operation able to publish its prepared row. `prepare_batch`
+            // still refuses a missing file when this index already references
+            // the batch as pending or accepted, preserving the corruption
+            // boundary for unfinished and previously witnessed work.
             return index
-                .require_replayed_prepared_batch(batch_id, batch_fingerprint(batch), &work)
+                .prepare_batch(batch_id, batch_fingerprint(batch), &work, &[])
                 .map_err(|error| EngineError::ProjectionWork(error.to_string()));
         }
         superseded.sort_unstable();
