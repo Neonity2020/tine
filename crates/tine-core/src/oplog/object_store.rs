@@ -11112,12 +11112,19 @@ mod bootstrap_store_tests {
                 &BTreeMap::from([(b"detached key".to_vec(), b"detached value".to_vec())]),
             )
             .unwrap();
-        indexes
+        let construction = indexes
             .logseq_claim_index()
             .finish_detached_construction(detached_root)
-            .unwrap();
+            .unwrap()
+            .expect("detached construction completed");
+        let stats = construction.stats();
+        assert_eq!(stats.loose_publication_calls, 0);
+        assert!(stats.pack_publication_calls > 0);
+        assert!(stats.catalog_publication_calls > 0);
+        assert_eq!(stats.head_transitions, 1);
+        assert_eq!(stats.capacity_fallbacks, 0);
         let completed = publication.finish_without_patricia_for_test().unwrap();
-        assert_eq!(completed.publication_count(), 1);
+        assert_eq!(completed.publication_count(), 0);
         assert_eq!(completed.existing_publication_count(), 0);
         DETACHED_BOOTSTRAP_BATCH_FINISH_COUNT.with(|count| assert_eq!(count.get(), 1));
 
