@@ -7472,7 +7472,7 @@ impl RuntimeActor {
                         .load_application_page_id_ready(page.page_id)
                         .map(ApplicationExactLoad::Loaded)
                 }
-                [] => return Ok(ApplicationExactLoad::Missing),
+                [] => {}
                 // Duplicate or malformed projected rows are exceptional. Keep
                 // the established authenticated catalog route for them rather
                 // than making SQLite decide their exact-path semantics.
@@ -7563,18 +7563,14 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        if self.exact_projection_read_available() {
-            return load_projected_source_authenticated_application_page(
-                runtime,
-                &self.graph,
-                page_id,
-            )
-            .map_err(map_editor_application_error)?
-            .ok_or(SyncApplicationPageRequestError::ActorRefused);
-        }
-        load_hot_source_authenticated_application_page(runtime, &self.graph, page_id)
-            .map_err(map_editor_application_error)?
-            .ok_or(SyncApplicationPageRequestError::ActorRefused)
+        load_preferred_source_authenticated_application_page(
+            runtime,
+            &self.graph,
+            page_id,
+            self.exact_projection_read_available(),
+        )
+        .map_err(map_editor_application_error)?
+        .ok_or(SyncApplicationPageRequestError::ActorRefused)
     }
 
     fn save_application_page(
@@ -7890,16 +7886,13 @@ impl RuntimeActor {
                         .runtime
                         .as_ref()
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    if self.exact_projection_read_available() {
-                        load_projected_source_authenticated_application_page(
-                            runtime,
-                            &self.graph,
-                            page_id,
-                        )?
-                        .map(|current| current.editor)
-                    } else {
-                        load_hot_source_authenticated_editor_page(runtime, &self.graph, page_id)?
-                    }
+                    load_preferred_source_authenticated_application_page(
+                        runtime,
+                        &self.graph,
+                        page_id,
+                        self.exact_projection_read_available(),
+                    )?
+                    .map(|current| current.editor)
                 };
                 if current.is_none() && self.clean_startup_projection_read_available() {
                     if let EditorTurnReadiness::Deferred(state) =
@@ -7947,20 +7940,13 @@ impl RuntimeActor {
                             .runtime
                             .as_ref()
                             .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                        let current = if self.exact_projection_read_available() {
-                            load_projected_source_authenticated_application_page(
-                                runtime,
-                                &self.graph,
-                                page_id,
-                            )?
-                            .map(|current| current.editor)
-                        } else {
-                            load_hot_source_authenticated_editor_page(
-                                runtime,
-                                &self.graph,
-                                page_id,
-                            )?
-                        }
+                        let current = load_preferred_source_authenticated_application_page(
+                            runtime,
+                            &self.graph,
+                            page_id,
+                            self.exact_projection_read_available(),
+                        )?
+                        .map(|current| current.editor)
                         .ok_or(SyncEditorRequestError::ActorRefused)?;
                         Ok(SyncEditorLoadOutcome::Loaded { page: current.dto })
                     }
@@ -13920,6 +13906,22 @@ fn load_hot_source_authenticated_application_page(
     join_application_page(parsed, current)
         .map(Some)
         .map_err(|_| SyncEditorRequestError::ActorRefused)
+}
+
+fn load_preferred_source_authenticated_application_page(
+    runtime: &PromotedLocalRuntime,
+    graph: &Graph,
+    page_id: PageId,
+    projected_available: bool,
+) -> Result<Option<ApplicationCurrentPage>, SyncEditorRequestError> {
+    if projected_available {
+        if let Ok(Some(current)) =
+            load_projected_source_authenticated_application_page(runtime, graph, page_id)
+        {
+            return Ok(Some(current));
+        }
+    }
+    load_hot_source_authenticated_application_page(runtime, graph, page_id)
 }
 
 fn load_projected_source_authenticated_application_page(
