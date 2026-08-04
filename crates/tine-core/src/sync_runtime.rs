@@ -30172,7 +30172,7 @@ mod tests {
     ) -> String {
         let engine = &promoted.engine;
         format!(
-            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={}",
+            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={}",
             startup_ms(promoted.total),
             startup_ms(promoted.bootstrap_anchor),
             startup_ms(promoted.enrollment_session),
@@ -30182,6 +30182,7 @@ mod tests {
             startup_ms(promoted.bootstrap_projection),
             startup_ms(promoted.bootstrap_runtime_authority),
             startup_ms(promoted.resume_candidate),
+            promoted.reconstructed_bootstrap_resume,
             startup_ms(promoted.engine_open),
             startup_ms(promoted.sqlite_open),
             startup_ms(promoted.tail_construction),
@@ -30443,6 +30444,12 @@ mod tests {
         assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
         let open = take_runtime_open_instrumentation(workspace_id);
         let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        if std::env::var_os("TINE_MANAGED_CRASH_REOPEN_FORCE_FULL_REPLAY").is_some() {
+            assert!(
+                promoted.reconstructed_bootstrap_resume,
+                "cacheless crash recovery must reconstruct one detached bootstrap resume"
+            );
+        }
         let resume = reopened
             .handle
             .as_ref()

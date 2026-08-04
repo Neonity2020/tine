@@ -3764,13 +3764,14 @@ fn assert_promoted_reopen_refuses_a_tampered_archive_claim(
 }
 
 /// Uninterrupted promotion migrates its accepted candidate without replay;
-/// fresh-process recovery still replays immutable bootstrap parts one at a
-/// time.
+/// fresh-process recovery reconstructs the same candidate from immutable parts
+/// and adopts it as an authenticated bootstrap checkpoint.
 ///
 /// Restart resident memory must be one bootstrap part, not the whole graph, so
 /// the same-process promoted engine must report zero payload reads and zero
 /// replayed generations. A fresh-process reopen that holds no retained evidence
-/// must still read every part with maximum residency exactly one.
+/// must reconstruct the bootstrap once before entering ordinary enrolled
+/// recovery.
 ///
 /// The counter measures payload *ownership*, not a staging bracket, and this
 /// test proves that executably rather than by assertion: the test-only preload
@@ -3883,25 +3884,24 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
 
         let same_process_observation = public_runtime_observation(&runtime);
 
-        // A restarted process reconstructs everything from durable state; full
-        // replay and its aggregate-backed part validation remain mandatory.
+        // A restarted process reconstructs the bootstrap from durable state in
+        // one detached candidate. The ordinary enrolled engine adopts that
+        // authenticated checkpoint instead of rebuilding the cumulative
+        // catalog independently for every cold recovery step.
         drop(runtime);
         drop(authority);
         remove_every_resume_point(&fixture.archive_root);
         let (_reopened_authority, reopened) =
             reopen_promoted_local_runtime(&root, &binding, session, &paths.open(&fixture)).unwrap();
         let fresh_process = reopened.engine().bootstrap_recovery_instrumentation();
-        assert_eq!(fresh_process.bootstrap_part_reads, part_count);
-        assert_eq!(
-            fresh_process.bootstrap_object_reads,
-            preloaded.bootstrap_object_reads
-        );
-        assert_eq!(fresh_process.max_live_bootstrap_parts, 1);
+        assert_eq!(fresh_process.bootstrap_part_reads, 0);
+        assert_eq!(fresh_process.bootstrap_object_reads, 0);
+        assert_eq!(fresh_process.max_live_bootstrap_parts, 0);
         let fresh_resume = reopened.resume_open_status().observation();
-        assert!(!fresh_resume.adopted);
-        assert_eq!(fresh_resume.replay_base_generation, 0);
+        assert!(fresh_resume.adopted);
+        assert_eq!(fresh_resume.replay_base_generation, part_count as u64);
         assert_eq!(fresh_resume.live_history_generation, part_count as u64);
-        assert_eq!(fresh_resume.replayed_generations, part_count as u64);
+        assert_eq!(fresh_resume.replayed_generations, 0);
         let (fresh_preloaded, fresh_live_after_release) = reopened
             .engine()
             .probe_preloaded_bootstrap_part_residency()
@@ -3924,9 +3924,9 @@ fn promoted_recovery_streams_exactly_one_bootstrap_part_at_a_time() {
 
 /// A process token is an accelerator, never authority. If its exact typed
 /// binding does not match, the retained workspace lease stays continuously
-/// held and the unchanged ordinary full replay path constructs the runtime.
+/// held and a fresh detached reconstruction supplies the bootstrap checkpoint.
 #[test]
-fn a_same_process_promotion_token_mismatch_falls_back_under_the_retained_lease() {
+fn a_same_process_promotion_token_mismatch_reconstructs_under_the_retained_lease() {
     on_a_deep_stack(|| {
         force_next_bootstrap_part_operation_limit(1);
         let mut fixture = Fixture::new(
@@ -3947,13 +3947,13 @@ fn a_same_process_promotion_token_mismatch_falls_back_under_the_retained_lease()
         let before = PromotedRuntimeInstrumentation::capture();
         let (_authority, runtime) = promote(&mut fixture, &root, session, &paths);
         let replay = runtime.engine().bootstrap_recovery_instrumentation();
-        assert_eq!(replay.bootstrap_part_reads, part_count);
-        assert!(replay.bootstrap_object_reads > 0);
-        assert_eq!(replay.max_live_bootstrap_parts, 1);
+        assert_eq!(replay.bootstrap_part_reads, 0);
+        assert_eq!(replay.bootstrap_object_reads, 0);
+        assert_eq!(replay.max_live_bootstrap_parts, 0);
         let observation = runtime.resume_open_status().observation();
-        assert!(!observation.adopted);
-        assert_eq!(observation.replay_base_generation, 0);
-        assert_eq!(observation.replayed_generations, part_count as u64);
+        assert!(observation.adopted);
+        assert_eq!(observation.replay_base_generation, part_count as u64);
+        assert_eq!(observation.replayed_generations, 0);
         assert_eq!(
             before.since().workspace_lease_acquisitions,
             0,
@@ -4099,11 +4099,8 @@ fn corrupted_same_process_candidate_falls_back_before_writable_authority() {
         .map_err(|refusal| refusal.into_parts().1)
         .unwrap();
     let replay = runtime.engine().bootstrap_recovery_instrumentation();
-    assert_eq!(
-        replay.bootstrap_part_reads,
-        fixture.verified.part_count() as usize
-    );
-    assert!(!runtime.resume_open_status().observation().adopted);
+    assert_eq!(replay.bootstrap_part_reads, 0);
+    assert!(runtime.resume_open_status().observation().adopted);
     assert!(matches!(
         runtime.resume_open_status().unavailable(),
         Some(ResumeAcceleratorUnavailable::Unavailable(reason))
@@ -7498,8 +7495,8 @@ fn the_resume_accelerator_publishes_adopts_and_reclaims_across_restarts() {
             },
         );
 
-        // (4) Exact observable equivalence with a fresh full replay of the same
-        //     bytes at the same paths: only the accelerator is removed.
+        // (4) Exact observable equivalence with a fresh detached bootstrap
+        //     reconstruction of the same bytes at the same paths.
         remove_every_resume_point(&fixture.archive_root);
         let replayed_observation = with_reopened_runtime(
             &fixture,
@@ -7507,21 +7504,29 @@ fn the_resume_accelerator_publishes_adopts_and_reclaims_across_restarts() {
             &binding,
             &paths,
             session,
-            |_, _, runtime| {
+            |fixture, _, runtime| {
                 let opened = runtime.resume_open_status().clone();
-                assert!(!opened.adopted());
+                assert!(opened.adopted(), "{opened:?}");
                 assert_eq!(
                     opened.unavailable(),
                     Some(&ResumeAcceleratorUnavailable::NeverPublished)
                 );
-                assert_eq!(opened.observation().replay_base_generation, 0);
+                assert_eq!(
+                    opened.observation().replay_base_generation,
+                    u64::from(fixture.verified.part_count())
+                );
+                assert_eq!(
+                    opened.observation().replayed_generations,
+                    opened.observation().live_history_generation
+                        - opened.observation().replay_base_generation
+                );
                 public_runtime_observation(runtime)
             },
         );
         assert_publicly_indistinguishable(
             &adopted_observation,
             &replayed_observation,
-            "an adopted restart must be publicly indistinguishable from a full replay",
+            "an adopted restart must be publicly indistinguishable from detached reconstruction",
         );
         fixture.assert_graph_unchanged();
     });
@@ -7569,17 +7574,19 @@ fn assert_damaged_candidate_replays_in_full(
         &binding,
         &paths,
         session,
-        |_, _, runtime| {
+        |fixture, _, runtime| {
             let opened = runtime.resume_open_status().clone();
-            assert!(
-                !opened.adopted(),
-                "{label}: an unusable candidate must not be adopted: {opened:?}"
-            );
-            assert_eq!(
-                opened.observation().replay_base_generation,
-                0,
-                "{label}: a refusal costs exactly one full replay"
-            );
+            if expect_engine_refusal {
+                assert!(!opened.adopted(), "{label}: {opened:?}");
+                assert_eq!(opened.observation().replay_base_generation, 0);
+            } else {
+                assert!(opened.adopted(), "{label}: {opened:?}");
+                assert_eq!(
+                    opened.observation().replay_base_generation,
+                    u64::from(fixture.verified.part_count())
+                );
+                assert!(opened.unavailable().is_some());
+            }
             assert_eq!(
                 opened.observation().refused,
                 expect_engine_refusal,
@@ -7746,25 +7753,14 @@ fn a_clean_safe_restart_adopts_the_exact_safe_bound_point() {
             &paths,
             SessionId::new(),
             |_, _, runtime| {
-                assert!(!runtime.resume_open_status().adopted());
-                assert!(
-                    runtime
-                        .engine()
-                        .instrumentation()
-                        .recovery_history_record_reads
-                        >= runtime
-                            .resume_open_status()
-                            .observation()
-                            .live_history_generation as usize,
-                    "the no-candidate control must perform complete per-record replay validation"
-                );
+                assert!(runtime.resume_open_status().adopted());
                 public_runtime_observation(runtime)
             },
         );
         assert_publicly_indistinguishable(
             &adopted,
             &replayed,
-            "Safe-bound adoption must equal a full replay",
+            "Safe-bound adoption must equal detached bootstrap reconstruction",
         );
         assert_eq!(
             points_before.len(),
@@ -7975,10 +7971,8 @@ fn lease_deletion_after_clear_but_before_safe_stays_unsafe_and_full_replays() {
             &paths,
             SessionId::new(),
             |_, _, runtime| {
-                assert!(
-                    !runtime.resume_open_status().adopted(),
-                    "clear-before-Safe leaves no point, so recovery must full-replay"
-                );
+                assert!(runtime.resume_open_status().adopted());
+                assert!(runtime.resume_open_status().unavailable().is_some());
                 runtime.engine().accepted_frontier_root().unwrap();
                 runtime.database().frontier_root().unwrap();
             },
@@ -8053,10 +8047,7 @@ fn post_safe_mint_and_precommit_publication_failures_full_replay_without_reclama
                 &paths,
                 SessionId::new(),
                 |_, _, runtime| {
-                    assert!(
-                        !runtime.resume_open_status().adopted(),
-                        "{label}: a failed Safe publication must full-replay"
-                    );
+                    assert!(runtime.resume_open_status().unavailable().is_some());
                 },
             );
             fixture.assert_graph_unchanged();
@@ -8328,10 +8319,8 @@ fn post_open_publication_bounds_crash_takeovers_and_reclaims_the_first_unreachab
             &paths,
             SessionId::new(),
             |fixture, authority, runtime| {
-                assert!(
-                    !runtime.resume_open_status().adopted(),
-                    "the torn point must force a fresh retained full replay"
-                );
+                assert!(runtime.resume_open_status().adopted());
+                assert!(runtime.resume_open_status().unavailable().is_some());
                 assert!(matches!(
                     runtime.resume_publication_status(),
                     Some(ResumePublicationStatus::NotPublished(
@@ -8981,7 +8970,7 @@ fn the_resume_lifecycle_works_over_nested_and_utf8_paths() {
             &paths,
             session,
             |_, _, runtime| {
-                assert!(!runtime.resume_open_status().adopted());
+                assert!(runtime.resume_open_status().adopted());
                 public_runtime_observation(runtime)
             },
         );
@@ -9180,7 +9169,7 @@ fn first_mutation_refuses_when_deferred_catalog_bytes_are_missing() {
             &paths,
             session,
             |_, _, runtime| {
-                assert!(!runtime.resume_open_status().adopted());
+                assert!(runtime.resume_open_status().adopted());
                 public_runtime_observation(runtime)
             },
         );
@@ -9327,10 +9316,8 @@ fn a_point_older_than_one_or_more_takeovers_refuses_before_automatic_supersessio
                 &paths,
                 SessionId::new(),
                 |_, _, runtime| {
-                    assert!(
-                        !runtime.resume_open_status().adopted(),
-                        "the point older than {distance} takeover records must full-replay"
-                    );
+                    assert!(runtime.resume_open_status().adopted());
+                    assert!(runtime.resume_open_status().unavailable().is_some());
                     assert!(
                         matches!(
                             runtime.resume_publication_status(),
@@ -9400,10 +9387,8 @@ fn a_safe_point_older_than_the_clean_restart_refuses_before_automatic_supersessi
             &paths,
             SessionId::new(),
             |_, _, runtime| {
-                assert!(
-                    !runtime.resume_open_status().adopted(),
-                    "the prior Safe generation is not this crashed Unsafe session"
-                );
+                assert!(runtime.resume_open_status().adopted());
+                assert!(runtime.resume_open_status().unavailable().is_some());
                 assert!(matches!(
                     runtime.resume_publication_status(),
                     Some(ResumePublicationStatus::Published { .. })

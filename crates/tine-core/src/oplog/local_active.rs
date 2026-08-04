@@ -297,8 +297,9 @@ use super::enrollment::{
     VerifiedLocalCompositionError, VerifiedLocalEvidence, VerifiedLocalProofSet,
 };
 use super::hot_engine::{
-    EngineError, EngineOpenRetention, LocalAuthorGeneration, PackedPatriciaMaintenanceReport,
-    ProjectionStorageBinding, RuntimeResumeObservation, ShardedHotEngine,
+    replay_promoted_bootstrap_validating_history, EngineError, EngineOpenRetention,
+    LocalAuthorGeneration, PackedPatriciaMaintenanceReport, ProjectionStorageBinding,
+    RuntimeResumeObservation, ShardedHotEngine,
 };
 use super::import::{
     InactiveBootstrapAcceptedAuthority, RetainedBootstrapPromotionCandidate,
@@ -388,6 +389,7 @@ pub(crate) struct PromotedRuntimeOpenInstrumentation {
     pub(crate) bootstrap_projection: Duration,
     pub(crate) bootstrap_runtime_authority: Duration,
     pub(crate) resume_candidate: Duration,
+    pub(crate) reconstructed_bootstrap_resume: bool,
     pub(crate) engine_open: Duration,
     pub(crate) sqlite_open: Duration,
     pub(crate) tail_construction: Duration,
@@ -428,6 +430,7 @@ fn record_promoted_runtime_mint(
     record.bootstrap_projection = timing.bootstrap_projection;
     record.bootstrap_runtime_authority = timing.bootstrap_runtime_authority;
     record.resume_candidate = timing.resume_candidate;
+    record.reconstructed_bootstrap_resume = timing.reconstructed_bootstrap_resume;
     record.engine_open = timing.engine_open;
     record.sqlite_open = timing.sqlite_open;
     record.tail_construction = timing.tail_construction;
@@ -5103,7 +5106,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         timing.bootstrap_runtime_authority = phase_started.elapsed();
     }
     let mut verified_same_process_sqlite = None;
-    let migrated = match (same_process, &retention_plan) {
+    let mut migrated = match (same_process, &retention_plan) {
         (Some(token), EngineScratchRetentionPlan::Retained { .. })
             if post_open.is_some_and(|(authority, _)| {
                 same_process_token_matches(&token, &state, authority)
@@ -5155,6 +5158,68 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         }
         (None, _) => None,
     };
+    // A crash can leave no adoptable run-local resume point even though the
+    // immutable bootstrap publication and its sealed history are intact. Build
+    // that bootstrap once in the detached authoring engine, then migrate the
+    // completed candidate into the same authenticated resume path used by
+    // same-process promotion. The enrolled open below still validates the
+    // migrated snapshot and replays every post-bootstrap history record.
+    if migrated.is_none()
+        && snapshot.is_none()
+        && matches!(retention_plan, EngineScratchRetentionPlan::Retained { .. })
+    {
+        let reconstructed = (|| {
+            let (history_store_capability, history_store) =
+                open_retained_history_control(&archive, &state)?;
+            let (candidate, terminal_binding) = replay_promoted_bootstrap_validating_history(
+                &history_store_capability,
+                &bootstrap_runtime_authority.publication,
+                state.workspace_id,
+                state.lineage_digest,
+                state.catalog_document_id,
+                promoted_storage_binding(&state),
+                &history_store,
+                state.anchor_history_index_root,
+                state.bootstrap,
+            )?;
+            let terminal_batch_id = bootstrap_runtime_authority
+                .publication
+                .aggregate()
+                .parts()
+                .last()
+                .map(|part| part.batch_id())
+                .ok_or_else(|| {
+                    RuntimePromotionError::Anchor("promoted bootstrap has no terminal part")
+                })?;
+            candidate
+                .migrate_for_same_process_promotion(
+                    &history_store_capability,
+                    EngineHistoryAuthority {
+                        generation: state.anchor_history_generation,
+                        index_root: state.anchor_history_index_root,
+                    },
+                    terminal_batch_id,
+                    &terminal_binding,
+                    state.lineage_digest,
+                    state.catalog_document_id,
+                )
+                .map_err(RuntimePromotionError::from)
+        })();
+        match reconstructed {
+            Ok(reconstructed) => {
+                migrated = Some(reconstructed);
+                #[cfg(test)]
+                {
+                    timing.reconstructed_bootstrap_resume = true;
+                }
+            }
+            Err(error) => {
+                unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(
+                    "detached bootstrap recovery refused: {error}"
+                )));
+            }
+        }
+    }
     let retention = match (retention_plan.clone(), migrated) {
         (_, Some((retained, resume))) => EngineOpenRetention::MigratedBootstrap {
             retained: Box::new(retained),

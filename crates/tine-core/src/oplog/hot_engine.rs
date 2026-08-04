@@ -2869,6 +2869,82 @@ pub(crate) fn replay_direct_loaded_bootstrap_validating_history(
     Ok((candidate, terminal_history_binding))
 }
 
+/// Reconstruct a promoted bootstrap into one detached candidate, deriving the
+/// catalog policy from the authenticated terminal bootstrap record.
+///
+/// This is the restart counterpart of same-process promotion. It avoids the
+/// ordinary enrolled engine's per-part cold recovery path while preserving the
+/// same immutable-part and durable-history checks. The finished candidate is
+/// still only an accelerator; callers migrate it into a resume snapshot and
+/// the enrolled open authenticates that snapshot before replaying any records
+/// written after the bootstrap anchor.
+pub(crate) fn replay_promoted_bootstrap_validating_history(
+    store: &ObjectStore,
+    publication: &super::object_store::ValidatedBootstrapPublicationV1,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    storage: ProjectionStorageBinding,
+    history: &super::object_store::DurableEngineHistoryStore,
+    history_root: ContentDigest,
+    bootstrap: super::object_store::BootstrapAggregateHistoryBindingV1,
+) -> Result<
+    (
+        DetachedBootstrapCandidate,
+        super::object_store::EngineHistoryBinding,
+    ),
+    EngineError,
+> {
+    let terminal = publication
+        .aggregate()
+        .parts()
+        .last()
+        .copied()
+        .ok_or_else(|| EngineError::Archive("promoted bootstrap has no terminal part".into()))?;
+    let bytes = history
+        .lookup(history_root, terminal.batch_id())
+        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .ok_or_else(|| {
+            EngineError::Archive(
+                "promoted bootstrap terminal record is absent from durable history".into(),
+            )
+        })?;
+    let record = decode_history_record(terminal.batch_id(), &bytes)?;
+    if record.generation != u64::from(bootstrap.part_count())
+        || record.bootstrap != Some(bootstrap)
+        || !matches!(record.status, ArchiveStatus::Accepted { .. })
+    {
+        return Err(EngineError::Archive(
+            "promoted bootstrap terminal record does not bind the aggregate anchor".into(),
+        ));
+    }
+    let terminal_binding = history_record_binding(&record);
+    let replay_identity = DetachedBootstrapReplayIdentity::new(
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        record.reference_catalog_policy,
+        storage,
+        store
+            .canonical_archive_identity()
+            .map_err(|error| EngineError::Archive(error.to_string()))?,
+    );
+    let (candidate, replayed_terminal_binding) = replay_direct_loaded_bootstrap_validating_history(
+        store,
+        publication,
+        &replay_identity,
+        history,
+        history_root,
+        bootstrap,
+    )?;
+    if replayed_terminal_binding != terminal_binding {
+        return Err(EngineError::Archive(
+            "detached bootstrap replay changed the terminal history binding".into(),
+        ));
+    }
+    Ok((candidate, terminal_binding))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProjectionEndpointBinding {
     pub(crate) endpoint_id: ProjectionEndpointId,
