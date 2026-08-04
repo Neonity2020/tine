@@ -18415,35 +18415,37 @@ mod tests {
 
     #[test]
     fn fresh_attack_round3_editor_title_change_must_preserve_graph_oplog_sqlite_equivalence() {
-        let scenario = ExistingEditorIdentityScenario {
-            label: "fresh-attack-r3-editor-title-authority",
-            config: None,
-            path: "content/nested pages/physical-editor-title.md",
-            initial: b"title:: Editor Title Before\n\n- body\n",
-            initial_name: "Editor Title Before",
-            initial_kind: SyncPageKind::Page,
-            requested_preamble: Some("title:: Editor Title After"),
-            expected_name: "Editor Title After",
-            expected_kind: SyncPageKind::Page,
-        };
-        let evidence = run_existing_editor_identity_scenario(&scenario);
+        crate::test_support::run_on_deep_stack(|| {
+            let scenario = ExistingEditorIdentityScenario {
+                label: "fresh-attack-r3-editor-title-authority",
+                config: None,
+                path: "content/nested pages/physical-editor-title.md",
+                initial: b"title:: Editor Title Before\n\n- body\n",
+                initial_name: "Editor Title Before",
+                initial_kind: SyncPageKind::Page,
+                requested_preamble: Some("title:: Editor Title After"),
+                expected_name: "Editor Title After",
+                expected_kind: SyncPageKind::Page,
+            };
+            let evidence = run_existing_editor_identity_scenario(&scenario);
 
-        assert_eq!(
-            (
-                evidence.graph_name.as_str(),
-                evidence.replayed_name.as_str(),
-                evidence.sqlite_name.as_str(),
-                evidence.restarted.name.as_str(),
-            ),
-            (
-                "Editor Title After",
-                "Editor Title After",
-                "Editor Title After",
-                "Editor Title After",
-            ),
-            "parser-owned title changes accepted by the editor must be one logical rename \
-             across Graph, authoritative oplog replay, SQLite, and restart"
-        );
+            assert_eq!(
+                (
+                    evidence.graph_name.as_str(),
+                    evidence.replayed_name.as_str(),
+                    evidence.sqlite_name.as_str(),
+                    evidence.restarted.name.as_str(),
+                ),
+                (
+                    "Editor Title After",
+                    "Editor Title After",
+                    "Editor Title After",
+                    "Editor Title After",
+                ),
+                "parser-owned title changes accepted by the editor must be one logical rename \
+                 across Graph, authoritative oplog replay, SQLite, and restart"
+            );
+        });
     }
 
     #[test]
