@@ -2064,14 +2064,15 @@
       "sources": {
         "issues": [],
         "commits": [
-          "92edd261"
+          "92edd261",
+          "fe5dfb7f"
         ]
       },
       "platforms": [
         "all"
       ],
       "layer": "core-native",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs::managed_crash_reopen_real_graph_manual_benchmark"
@@ -2079,7 +2080,7 @@
         "scenario": "managed-storage.crash-reopen-with-and-without-resume-accelerator",
         "failBefore": "proven"
       },
-      "notes": "Fail-before on 92edd261 against the permitted 1,045-file anonymized graph copy: ordinary pending-save crash takeover adopted its resume point in about 0.2 seconds, while forced accelerator unavailability replayed five bootstrap parts in 30.9 seconds locally (the user observed about 58 seconds on slower hardware), emitted about 338 MiB of filesystem output for a 1.3 MiB graph, and failed the 10-second gate. The visible requirement is prompt correct recovery, not any particular cache representation."
+      "notes": "Fail-before on 92edd261 against the permitted 1,045-file anonymized graph copy: ordinary pending-save crash takeover adopted its resume point in about 0.2 seconds, while forced accelerator unavailability replayed five bootstrap parts in 30.9 seconds locally (the user observed about 58 seconds on slower hardware), emitted about 338 MiB of filesystem output for a 1.3 MiB graph, and failed the 10-second gate. Fixed on fe5dfb7f by reconstructing the immutable bootstrap once in the existing detached authoring engine, migrating that authenticated candidate into the resume path, and replaying only post-bootstrap history in the enrolled engine. The exact fail-before fixture then reopened in 2.36 seconds, adopted bootstrap generation 5, replayed zero bootstrap generations through enrolled recovery, and preserved the original accelerator-refusal reason."
     }
   ]
 }
