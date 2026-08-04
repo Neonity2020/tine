@@ -18986,13 +18986,27 @@ impl Graph {
                 "journal projection exact existing target disappeared",
             )
         })?;
-        if loaded.entry.path != path
-            || loaded.entry.kind != page.kind
-            || !crate::refs::same_page(&loaded.entry.name, &page.name)
-        {
+        if loaded.entry.path != path {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "journal projection cannot create, rename, or change page ownership",
+                "journal projection cannot change its exact page owner",
+            ));
+        }
+        let managed_path = ManagedPath::parse(self.rel_path(&path)).map_err(|_| bad_path())?;
+        let parsed_base =
+            self.parse_external_document(&managed_path, expected_base.as_bytes(), false)?;
+        let parsed_target =
+            self.parse_external_document(&managed_path, exact_target.as_bytes(), false)?;
+        let resolved_target =
+            parsed_target.resolve_identity(Some(AcceptedExternalDocumentIdentity {
+                name: &page.name,
+                kind: page.kind,
+                explicit_title: parsed_base.explicit_title.as_deref(),
+            }));
+        if resolved_target.name != page.name || resolved_target.kind != page.kind {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal projection target does not preserve its accepted semantic identity",
             ));
         }
         if loaded.content != expected_base
@@ -19029,7 +19043,6 @@ impl Graph {
             &path,
             Some(loaded.file_identity),
         )?;
-        let managed_path = ManagedPath::parse(self.rel_path(&path)).map_err(|_| bad_path())?;
         let semantic_key = (
             match page.kind {
                 PageKind::Page => 0,
