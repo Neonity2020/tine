@@ -64,19 +64,23 @@ fn fenced_code_with_bullet_line_stays_one_block() {
 }
 
 #[test]
-fn nested_backtick_fence_not_closed_early() {
-    // A ```` (4-backtick) fence whose body contains ``` must NOT close at the
-    // inner ```; the `- ` line stays literal and the block survives round-trip.
+fn mldoc_three_tick_closer_reclassifies_a_longer_fence_run() {
+    // mldoc recognizes exactly three structural backticks from a 3+ run, so
+    // the inner ``` closes this fence and the following bullet is structural.
     let input = "- ````\n  ```\n  - still code\n  ````\n- after\n";
-    assert_roundtrip(input);
-    let doc = doc::parse(input);
-    assert_eq!(doc.roots.len(), 2);
+    let parsed = doc::parse(input);
+    assert_eq!(parsed.roots.len(), 2);
+    assert_eq!(parsed.roots[0].raw, "````\n```");
     assert_eq!(
-        doc.roots[0].children.len(),
-        0,
-        "inner ``` must not split the block"
+        parsed.roots[0].children.len(),
+        1,
+        "the post-closer bullet remains parser-owned"
     );
-    assert_eq!(doc.roots[0].raw, "````\n```\n- still code\n````");
+    assert_eq!(parsed.roots[0].children[0].raw, "still code\n````");
+    assert_eq!(parsed.roots[1].raw, "after");
+
+    let canonical = doc::serialize(&parsed);
+    assert_eq!(doc::parse(&canonical), parsed);
 }
 
 #[test]
@@ -161,25 +165,25 @@ fn headings() {
 }
 
 #[test]
-fn preamble_collapsed_heading_owns_the_following_outline() {
-    // Some Logseq importers/plugins emit the parent ATX heading without a list
-    // bullet. Logseq still treats it as the collapsible parent, but Tine used to
-    // hide it in the page preamble and promote its children to page roots (#67).
+fn parser_owned_collapsed_heading_keeps_same_level_bullets_as_siblings() {
+    // The parser owns the ATX heading instead of hiding it in page preamble,
+    // while same-level bullets retain their parser-reported sibling topology.
     let input = "title:: Imported feed\n\n# Park Ji Hyun Confirmed To Reunite\ncollapsed:: true\n- article link\n- article body\n";
     let parsed = doc::parse(input);
 
     assert_eq!(parsed.pre_block.as_deref(), Some("title:: Imported feed"));
-    assert_eq!(parsed.roots.len(), 1);
+    assert_eq!(parsed.roots.len(), 3);
     assert_eq!(
         parsed.roots[0].raw,
         "# Park Ji Hyun Confirmed To Reunite\ncollapsed:: true"
     );
     assert!(parsed.roots[0].collapsed());
-    assert_eq!(parsed.roots[0].children.len(), 2);
-    assert_eq!(parsed.roots[0].children[0].raw, "article link");
-    assert_eq!(parsed.roots[0].children[1].raw, "article body");
+    assert!(parsed.roots[0].children.is_empty());
+    assert_eq!(parsed.roots[1].raw, "article link");
+    assert_eq!(parsed.roots[2].raw, "article body");
 
     let saved = doc::serialize_with(&parsed, &doc::SerializeOpts::detect(Some(input)));
+    assert_eq!(saved, input);
     assert_eq!(
         doc::parse(&saved),
         parsed,
@@ -193,15 +197,20 @@ fn preamble_collapsed_heading_owns_the_following_outline() {
 }
 
 #[test]
-fn ordinary_markdown_preamble_is_not_promoted() {
+fn ordinary_markdown_heading_is_parser_owned_with_its_prose_body() {
     let input = "# A normal Markdown introduction\nprose remains page-level\n\n- first list item\n";
     let parsed = doc::parse(input);
+    assert_eq!(parsed.pre_block, None);
+    assert_eq!(parsed.roots.len(), 2);
     assert_eq!(
-        parsed.pre_block.as_deref(),
-        Some("# A normal Markdown introduction\nprose remains page-level")
+        parsed.roots[0].raw,
+        "# A normal Markdown introduction\nprose remains page-level"
     );
-    assert_eq!(parsed.roots.len(), 1);
-    assert_eq!(parsed.roots[0].raw, "first list item");
+    assert_eq!(parsed.roots[1].raw, "first list item");
+    assert_eq!(
+        doc::serialize_with(&parsed, &doc::SerializeOpts::detect(Some(input))),
+        input
+    );
 }
 
 #[test]
