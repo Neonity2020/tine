@@ -2081,6 +2081,33 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before on 92edd261 against the permitted 1,045-file anonymized graph copy: ordinary pending-save crash takeover adopted its resume point in about 0.2 seconds, while forced accelerator unavailability replayed five bootstrap parts in 30.9 seconds locally (the user observed about 58 seconds on slower hardware), emitted about 338 MiB of filesystem output for a 1.3 MiB graph, and failed the 10-second gate. Fixed on fe5dfb7f by reconstructing the immutable bootstrap once in the existing detached authoring engine, migrating that authenticated candidate into the resume path, and replaying only post-bootstrap history in the enrolled engine. The exact fail-before fixture then reopened in 2.36 seconds, adopted bootstrap generation 5, replayed zero bootstrap generations through enrolled recovery, and preserved the original accelerator-refusal reason."
+    },
+    {
+      "id": "REG-MISSING-REMEMBERED-GRAPH-250",
+      "title": "A missing remembered graph path cannot prevent startup and leaves the graph chooser usable",
+      "family": "data-safety",
+      "sources": {
+        "issues": [
+          250
+        ],
+        "commits": [
+          "abf7af83"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/App.startupRecovery.test.tsx",
+          "src/startupReveal.test.ts"
+        ],
+        "scenario": "startup.missing-remembered-graph-recovery",
+        "failBefore": "proven"
+      },
+      "notes": "GH #250 failed on v0.6.5 because the missing remembered graph was opened synchronously from native setup and panicked before a usable app appeared. The later abf7af83 startup refactor co-fixed it by deferring graph loading to the visible frontend. The semantic regression proves the failed remembered-root load completes startup and exposes an enabled Open an existing graph action; the native structural neighbor proves setup no longer invokes graph loading. No filesystem path is created or mutated by this frontend recovery path."
     }
   ]
 }
