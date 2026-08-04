@@ -1888,22 +1888,30 @@ impl BootstrapSqliteRebuildInstrumentation {
     ///
     /// Each proof reads the catalog document, which is linear in its page
     /// entries, so a per-row proof makes the graph-sized traversal quadratic in
-    /// pages. This is asserted as an exact identity rather than a bound so that
-    /// a regression to per-row derivation cannot hide inside slack.
+    /// pages. Cursor and materialization work may reuse one authenticated proof,
+    /// so the contract is an upper bound rather than an exact count.
     #[cfg(test)]
     pub(crate) fn assert_catalog_authority_is_window_bounded(&self) {
         assert_eq!(
             self.terminal_catalog_rows_authenticated, self.terminal_pages_materialized,
             "every terminal page comes from one authenticated catalog row"
         );
-        assert_eq!(
-            self.terminal_catalog_document_validations,
-            self.terminal_catalog_rows_authenticated
-                .div_ceil(TERMINAL_CATALOG_CURSOR_PAGE_ROWS)
-                + self.terminal_materialization_chunks,
-            "catalog shape proofs must count cursor pages plus materialization \
-             chunks, never catalog rows: {self:?}"
+        let validation_bound = self
+            .terminal_catalog_rows_authenticated
+            .div_ceil(TERMINAL_CATALOG_CURSOR_PAGE_ROWS)
+            .saturating_add(self.terminal_materialization_chunks)
+            .max(1);
+        assert!(
+            self.terminal_catalog_document_validations <= validation_bound,
+            "catalog shape proofs must be bounded by cursor pages plus \
+             materialization chunks, never catalog rows: bound={validation_bound} {self:?}"
         );
+        if self.terminal_catalog_rows_authenticated != 0 {
+            assert_ne!(
+                self.terminal_catalog_document_validations, 0,
+                "a nonempty terminal catalog must be authenticated"
+            );
+        }
         // The one graph-lifetime decoded-segment session is measured, not
         // assumed: it must not thrash while it covers the whole terminal root.
         assert_eq!(self.terminal_accepted_frontier_session_evictions, 0);
