@@ -18448,113 +18448,115 @@ mod tests {
 
     #[test]
     fn editor_parser_authority_matrix_covers_markdown_org_title_and_kind_transitions() {
-        const DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+        crate::test_support::run_on_deep_stack(|| {
+            const DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
             :journals-directory "diary"
             :journal/file-name-format "dd-MM-yyyy"
             :journal/page-title-format "yyyy-MM-dd"}"#;
-        let scenarios = [
-            ExistingEditorIdentityScenario {
-                label: "editor-md-title-add",
-                config: None,
-                path: "content/nested pages/deep/Markdown Add.md",
-                initial: b"- body\n",
-                initial_name: "Markdown Add",
-                initial_kind: SyncPageKind::Page,
-                requested_preamble: Some("title:: Markdown Added"),
-                expected_name: "Markdown Added",
-                expected_kind: SyncPageKind::Page,
-            },
-            ExistingEditorIdentityScenario {
-                label: "editor-md-title-change",
-                config: None,
-                path: "archive/nonstandard/Markdown Change.markdown",
-                initial: b"title:: Markdown Before\n\n- body\n",
-                initial_name: "Markdown Before",
-                initial_kind: SyncPageKind::Page,
-                requested_preamble: Some("title:: Markdown After"),
-                expected_name: "Markdown After",
-                expected_kind: SyncPageKind::Page,
-            },
-            ExistingEditorIdentityScenario {
-                label: "editor-md-title-remove",
-                config: None,
-                path: "content/nested pages/deep/Markdown Removal.md",
-                initial: b"title:: Markdown Explicit\n\n- body\n",
-                initial_name: "Markdown Explicit",
-                initial_kind: SyncPageKind::Page,
-                requested_preamble: None,
-                expected_name: "Markdown Removal",
-                expected_kind: SyncPageKind::Page,
-            },
-            ExistingEditorIdentityScenario {
-                label: "editor-org-title-add",
-                config: None,
-                path: "archive/nonstandard/deep/Org Add.org",
-                initial: b"* body\n",
-                initial_name: "Org Add",
-                initial_kind: SyncPageKind::Page,
-                requested_preamble: Some("#+TITLE: Org Added"),
-                expected_name: "Org Added",
-                expected_kind: SyncPageKind::Page,
-            },
-            ExistingEditorIdentityScenario {
-                label: "editor-org-title-change",
-                config: None,
-                path: "content/nested pages/deep/Org Change.org",
-                initial: b"#+TITLE: Org Before\n\n* body\n",
-                initial_name: "Org Before",
-                initial_kind: SyncPageKind::Page,
-                requested_preamble: Some("#+TITLE: Org After"),
-                expected_name: "Org After",
-                expected_kind: SyncPageKind::Page,
-            },
-            ExistingEditorIdentityScenario {
-                label: "editor-org-title-remove",
-                config: None,
-                path: "archive/nonstandard/deep/Org Removal.org",
-                initial: b"#+TITLE: Org Explicit\n\n* body\n",
-                initial_name: "Org Explicit",
-                initial_kind: SyncPageKind::Page,
-                requested_preamble: None,
-                expected_name: "Org Removal",
-                expected_kind: SyncPageKind::Page,
-            },
-            ExistingEditorIdentityScenario {
-                label: "editor-title-page-to-journal",
-                config: Some(DATE_CONFIG),
-                path: "archive/nonstandard/Kind To Journal.md",
-                initial: b"title:: Kind Before\n\n- body\n",
-                initial_name: "Kind Before",
-                initial_kind: SyncPageKind::Page,
-                requested_preamble: Some("title:: 25-07-2026"),
-                expected_name: "2026-07-25",
-                expected_kind: SyncPageKind::Journal,
-            },
-            ExistingEditorIdentityScenario {
-                label: "editor-title-journal-to-page",
-                config: Some(DATE_CONFIG),
-                path: "archive/nonstandard/Kind To Page.org",
-                initial: b"#+TITLE: 25-07-2026\n\n* body\n",
-                initial_name: "2026-07-25",
-                initial_kind: SyncPageKind::Journal,
-                requested_preamble: Some("#+TITLE: Ordinary After"),
-                expected_name: "Ordinary After",
-                expected_kind: SyncPageKind::Page,
-            },
-        ];
+            let scenarios = [
+                ExistingEditorIdentityScenario {
+                    label: "editor-md-title-add",
+                    config: None,
+                    path: "content/nested pages/deep/Markdown Add.md",
+                    initial: b"- body\n",
+                    initial_name: "Markdown Add",
+                    initial_kind: SyncPageKind::Page,
+                    requested_preamble: Some("title:: Markdown Added"),
+                    expected_name: "Markdown Added",
+                    expected_kind: SyncPageKind::Page,
+                },
+                ExistingEditorIdentityScenario {
+                    label: "editor-md-title-change",
+                    config: None,
+                    path: "archive/nonstandard/Markdown Change.markdown",
+                    initial: b"title:: Markdown Before\n\n- body\n",
+                    initial_name: "Markdown Before",
+                    initial_kind: SyncPageKind::Page,
+                    requested_preamble: Some("title:: Markdown After"),
+                    expected_name: "Markdown After",
+                    expected_kind: SyncPageKind::Page,
+                },
+                ExistingEditorIdentityScenario {
+                    label: "editor-md-title-remove",
+                    config: None,
+                    path: "content/nested pages/deep/Markdown Removal.md",
+                    initial: b"title:: Markdown Explicit\n\n- body\n",
+                    initial_name: "Markdown Explicit",
+                    initial_kind: SyncPageKind::Page,
+                    requested_preamble: None,
+                    expected_name: "Markdown Removal",
+                    expected_kind: SyncPageKind::Page,
+                },
+                ExistingEditorIdentityScenario {
+                    label: "editor-org-title-add",
+                    config: None,
+                    path: "archive/nonstandard/deep/Org Add.org",
+                    initial: b"* body\n",
+                    initial_name: "Org Add",
+                    initial_kind: SyncPageKind::Page,
+                    requested_preamble: Some("#+TITLE: Org Added"),
+                    expected_name: "Org Added",
+                    expected_kind: SyncPageKind::Page,
+                },
+                ExistingEditorIdentityScenario {
+                    label: "editor-org-title-change",
+                    config: None,
+                    path: "content/nested pages/deep/Org Change.org",
+                    initial: b"#+TITLE: Org Before\n\n* body\n",
+                    initial_name: "Org Before",
+                    initial_kind: SyncPageKind::Page,
+                    requested_preamble: Some("#+TITLE: Org After"),
+                    expected_name: "Org After",
+                    expected_kind: SyncPageKind::Page,
+                },
+                ExistingEditorIdentityScenario {
+                    label: "editor-org-title-remove",
+                    config: None,
+                    path: "archive/nonstandard/deep/Org Removal.org",
+                    initial: b"#+TITLE: Org Explicit\n\n* body\n",
+                    initial_name: "Org Explicit",
+                    initial_kind: SyncPageKind::Page,
+                    requested_preamble: None,
+                    expected_name: "Org Removal",
+                    expected_kind: SyncPageKind::Page,
+                },
+                ExistingEditorIdentityScenario {
+                    label: "editor-title-page-to-journal",
+                    config: Some(DATE_CONFIG),
+                    path: "archive/nonstandard/Kind To Journal.md",
+                    initial: b"title:: Kind Before\n\n- body\n",
+                    initial_name: "Kind Before",
+                    initial_kind: SyncPageKind::Page,
+                    requested_preamble: Some("title:: 25-07-2026"),
+                    expected_name: "2026-07-25",
+                    expected_kind: SyncPageKind::Journal,
+                },
+                ExistingEditorIdentityScenario {
+                    label: "editor-title-journal-to-page",
+                    config: Some(DATE_CONFIG),
+                    path: "archive/nonstandard/Kind To Page.org",
+                    initial: b"#+TITLE: 25-07-2026\n\n* body\n",
+                    initial_name: "2026-07-25",
+                    initial_kind: SyncPageKind::Journal,
+                    requested_preamble: Some("#+TITLE: Ordinary After"),
+                    expected_name: "Ordinary After",
+                    expected_kind: SyncPageKind::Page,
+                },
+            ];
 
-        for scenario in scenarios {
-            let evidence = run_existing_editor_identity_scenario(&scenario);
-            assert_editor_identity_evidence(&scenario, &evidence);
-            if scenario.requested_preamble.is_none() {
-                assert!(
-                    !evidence.projection.to_ascii_lowercase().contains("title"),
-                    "{} retained a removed explicit title: {:?}",
-                    scenario.label,
-                    evidence.projection
-                );
+            for scenario in scenarios {
+                let evidence = run_existing_editor_identity_scenario(&scenario);
+                assert_editor_identity_evidence(&scenario, &evidence);
+                if scenario.requested_preamble.is_none() {
+                    assert!(
+                        !evidence.projection.to_ascii_lowercase().contains("title"),
+                        "{} retained a removed explicit title: {:?}",
+                        scenario.label,
+                        evidence.projection
+                    );
+                }
             }
-        }
+        });
     }
 
     #[test]
