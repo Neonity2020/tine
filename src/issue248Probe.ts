@@ -32,13 +32,23 @@ export function measureIssue248<T>(metric: string, work: () => T): T {
   }
 }
 
-export async function measureIssue248Async<T>(metric: string, work: () => Promise<T>): Promise<T> {
+export function measureIssue248Async<T>(metric: string, work: () => Promise<T>): Promise<T> {
   const collector = issue248Collector();
   if (!collector) return work();
   const started = issue248Now();
   try {
-    return await work();
-  } finally {
+    return work().then(
+      (result) => {
+        collector.record(metric, issue248Now() - started);
+        return result;
+      },
+      (error) => {
+        collector.record(metric, issue248Now() - started);
+        throw error;
+      },
+    );
+  } catch (error) {
     collector.record(metric, issue248Now() - started);
+    return Promise.reject(error);
   }
 }
