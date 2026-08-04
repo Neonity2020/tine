@@ -852,28 +852,27 @@ pub(crate) fn execute_receiver_local_projection_under_handoff(
             Err(error) => return Err(error.into()),
         }
     } else {
-        match engine.authorize_projection_write(source.page_id()) {
+        let current_matches_source = match engine.authorize_projection_write(source.page_id()) {
             Ok(current) => {
-                if current.state().page.path != *source.path()
-                    || current.state().frontier != *source.post_frontier()
-                    || current.state().claim_evidence != source.claim_evidence()
-                {
-                    // A later accepted frontier has superseded this immutable provider
-                    // intent. Historical bytes remain evidence, but they may not roll
-                    // the receiver's graph back.
+                current.state().page.path == *source.path()
+                    && current.state().frontier == *source.post_frontier()
+                    && current.state().claim_evidence == source.claim_evidence()
+            }
+            Err(EngineError::ProjectionAuthorizationUnavailable) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if !current_matches_source {
+            // Most superseded immutable intents are historical evidence only.
+            // One exception is an exact-title event selected by the current
+            // merged frontier: its original source intent remains the
+            // authenticated authority for the winning UTF-8 spelling.
+            match engine.authenticate_effective_title_projection_candidate(source) {
+                Ok(candidate) => effective_candidate = Some(candidate),
+                Err(EngineError::ProjectionAuthorizationUnavailable) => {
                     return Ok(Some(false));
                 }
+                Err(error) => return Err(error.into()),
             }
-            Err(EngineError::ProjectionAuthorizationUnavailable) => {
-                match engine.authenticate_effective_title_projection_candidate(source) {
-                    Ok(candidate) => effective_candidate = Some(candidate),
-                    Err(EngineError::ProjectionAuthorizationUnavailable) => {
-                        return Ok(Some(false));
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Err(error) => return Err(error.into()),
         }
         None
     };
