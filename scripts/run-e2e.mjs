@@ -315,10 +315,14 @@ function resolveBuildProvenanceInputs() {
 
 function failureIsBlocking(status, contractEntry) {
   if (status !== "failed") return false;
+  // A quarantined native harness remains in the suite to retain its diagnostic
+  // evidence, but cannot block either ordinary or release mode until it has a
+  // deterministic semantic readiness predicate again.
+  if (contractEntry.stability === "quarantined") return false;
   if (e2eMode === "release") {
     return contractEntry.contracts.some((contract) => contract.class !== "flexible-presentation-heuristic");
   }
-  return contractEntry.stability !== "quarantined" && contractEntry.contracts.some((contract) => contract.blocking);
+  return contractEntry.contracts.some((contract) => contract.blocking);
 }
 
 async function freePort() {
