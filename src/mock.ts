@@ -1650,6 +1650,9 @@ export function mockBackend(): Backend {
     async onGraphChanged(): Promise<() => void> {
       return () => {}; // no external watcher in the browser mock
     },
+    async onSparseV2Changed(): Promise<() => void> {
+      return () => {};
+    },
     async onManagedSyncError(): Promise<() => void> {
       return () => {};
     },

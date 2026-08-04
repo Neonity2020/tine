@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { backend } from "./backend";
-import { handleGraphChange, installMobileExternalLinkHandler } from "./App";
+import { handleGraphChange, handleSparseV2Changed, installMobileExternalLinkHandler } from "./App";
 import { resetPaneLayoutToSingle, restorePaneLayout } from "./panes";
-import { resetStore, setDoc, type FeedPage, type Node as StoreNode } from "./store";
+import { pageByName, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "./store";
 import { pageInventoryRev } from "./ui";
 
 function addAnchor(href: string): HTMLAnchorElement {
@@ -117,5 +117,33 @@ describe("watcher page inventory invalidation", () => {
     const before = pageInventoryRev();
     await handleGraphChange({ name: "Created Elsewhere", kind: "page", created: true, removed: false });
     expect(pageInventoryRev()).toBeGreaterThan(before);
+  });
+});
+
+describe("managed watcher reconciliation", () => {
+  it("reloads a visible page and invalidates inventory after an admitted aggregate change", async () => {
+    const name = "Managed External";
+    resetPaneLayoutToSingle({
+      tabs: [{ history: [{ kind: "page", name, pageKind: "page" }], pos: 0, pinned: false }],
+      activeIndex: 0,
+    });
+    setDoc({ byId: { old: node("old", name) }, pages: [page(name, "page", ["old"])], feed: [name], loaded: true });
+    const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue({
+      name,
+      kind: "page",
+      title: name,
+      pre_block: null,
+      blocks: [
+        { id: "one", raw: "accepted first", collapsed: false, children: [], breadcrumb: [] },
+        { id: "two", raw: "accepted external", collapsed: false, children: [], breadcrumb: [] },
+      ],
+    });
+    const before = pageInventoryRev();
+
+    await handleSparseV2Changed();
+
+    expect(getPage).toHaveBeenCalledWith(name, "page");
+    expect(pageInventoryRev()).toBeGreaterThan(before);
+    expect(pageByName(name)?.roots).toEqual(["one", "two"]);
   });
 });

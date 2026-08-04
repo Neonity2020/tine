@@ -261,6 +261,32 @@ export async function handleGraphChange(c: GraphChange) {
   }
 }
 
+export async function handleSparseV2Changed() {
+  // Managed reconciliation reports one admitted aggregate epoch rather than
+  // legacy per-file changes. Refresh only live surfaces and invalidate the
+  // bounded inventory; unloaded pages remain demand-loaded from SQLite.
+  bumpDataRev();
+  bumpPageInventoryRev();
+  const routes = layoutPaneIds().map((paneId) => ({
+    paneId,
+    route: paneRouter(paneId).route(),
+  }));
+  const refreshed = new Set<string>();
+  for (const { route } of routes) {
+    if (route.kind !== "page" || refreshed.has(`${route.pageKind}:${route.name}`)) continue;
+    refreshed.add(`${route.pageKind}:${route.name}`);
+    const disposition = reloadDisposition(route.name);
+    if (disposition === "skip") continue;
+    if (disposition === "conflict") {
+      markConflict(route.name);
+      continue;
+    }
+    const dto = await backend().getPage(route.name, route.pageKind);
+    if (dto) reloadPage(toLoadablePage(dto, route.name));
+  }
+  requestJournalFeedWatcherRestart(routes);
+}
+
 export function PaneTree(props: { node: LayoutNode; path: number[] }): JSX.Element {
   const n = () => props.node;
   // Keyed leaf: PaneLeaf freezes its router (and its context providers) at
@@ -621,6 +647,13 @@ export function App(): JSX.Element {
     let unsub = () => {};
     void backend()
       .onGraphChanged((c) => void handleGraphChange(c))
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onSparseV2Changed(() => void handleSparseV2Changed())
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });

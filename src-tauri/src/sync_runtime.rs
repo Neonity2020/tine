@@ -2648,7 +2648,7 @@ mod tests {
         );
         std::fs::write(
             graph_root.join(relative),
-            "- externally imported through watcher\n",
+            "- externally imported through watcher\n- second external block\n",
         )
         .unwrap();
         handle
@@ -2684,9 +2684,28 @@ mod tests {
             matches!(
                 reloaded,
                 SyncEditorLoadOutcome::Loaded { ref page }
-                    if page.blocks[0].content == "externally imported through watcher"
+                    if page.blocks.len() == 2
+                        && page.blocks[0].content == "externally imported through watcher"
+                        && page.blocks[1].content == "second external block"
             ),
             "editor load must observe the watcher-authored batch: {reloaded:?}"
+        );
+        let application_reloaded = handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: relative.into(),
+                },
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                application_reloaded,
+                SyncApplicationPageLoadOutcome::Loaded { ref page, .. }
+                    if page.blocks.len() == 2
+                        && page.blocks[0].raw == "externally imported through watcher"
+                        && page.blocks[1].raw == "second external block"
+            ),
+            "application load must observe the watcher-authored batch: {application_reloaded:?}"
         );
 
         assert!(matches!(

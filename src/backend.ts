@@ -463,6 +463,8 @@ export interface Backend {
   savePdfAreaImage(pdf: string, page: number, id: string, stamp: number, bytes: Uint8Array): Promise<string>;
   /** Subscribe to external file changes (file watcher). Returns an unsubscribe. */
   onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void>;
+  /** Subscribe to an admitted aggregate managed-storage change. */
+  onSparseV2Changed(cb: () => void): Promise<() => void>;
   /** Subscribe to deduplicated managed-sync reconciliation failures. */
   onManagedSyncError(cb: (message: string) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
@@ -1081,6 +1083,10 @@ class TauriBackend implements Backend {
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<GraphChange>("graph-changed", (e) => cb(e.payload));
+  }
+  async onSparseV2Changed(cb: () => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen("sparse-v2-changed", () => cb());
   }
   async onManagedSyncError(cb: (message: string) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
