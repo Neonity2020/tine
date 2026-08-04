@@ -18563,80 +18563,82 @@ mod tests {
 
     #[test]
     fn new_markdown_and_org_pages_are_born_with_parsed_final_identity_at_selected_path() {
-        const MARKDOWN_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+        crate::test_support::run_on_deep_stack(|| {
+            const MARKDOWN_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
             :journals-directory "diary"
             :preferred-format "Markdown"}"#;
-        const ORG_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            const ORG_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
             :journals-directory "diary"
             :preferred-format "Org"}"#;
-        const MARKDOWN_DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            const MARKDOWN_DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
             :journals-directory "diary"
             :preferred-format "Markdown"
             :journal/file-name-format "dd-MM-yyyy"
             :journal/page-title-format "yyyy-MM-dd"}"#;
-        const ORG_DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            const ORG_DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
             :journals-directory "diary"
             :preferred-format "Org"
             :journal/file-name-format "dd-MM-yyyy"
             :journal/page-title-format "yyyy-MM-dd"}"#;
-        let scenarios = [
-            NewEditorIdentityScenario {
-                label: "editor-new-markdown-explicit-title",
-                config: MARKDOWN_CONFIG,
-                draft_name: "Markdown Physical Draft",
-                draft_kind: SyncPageKind::Page,
-                preamble: "title:: Markdown Final",
-                expected_name: "Markdown Final",
-                expected_kind: SyncPageKind::Page,
-                expected_extension: ".md",
-            },
-            NewEditorIdentityScenario {
-                label: "editor-new-org-explicit-title",
-                config: ORG_CONFIG,
-                draft_name: "Org Physical Draft",
-                draft_kind: SyncPageKind::Page,
-                preamble: "#+TITLE: Org Final",
-                expected_name: "Org Final",
-                expected_kind: SyncPageKind::Page,
-                expected_extension: ".org",
-            },
-            NewEditorIdentityScenario {
-                label: "editor-new-markdown-page-to-journal",
-                config: MARKDOWN_DATE_CONFIG,
-                draft_name: "Markdown Physical Page Draft",
-                draft_kind: SyncPageKind::Page,
-                preamble: "title:: 25-07-2026",
-                expected_name: "2026-07-25",
-                expected_kind: SyncPageKind::Journal,
-                expected_extension: ".md",
-            },
-            NewEditorIdentityScenario {
-                label: "editor-new-org-journal-to-page",
-                config: ORG_DATE_CONFIG,
-                draft_name: "2026-07-26",
-                draft_kind: SyncPageKind::Journal,
-                preamble: "#+TITLE: Ordinary Org Final",
-                expected_name: "Ordinary Org Final",
-                expected_kind: SyncPageKind::Page,
-                expected_extension: ".org",
-            },
-        ];
+            let scenarios = [
+                NewEditorIdentityScenario {
+                    label: "editor-new-markdown-explicit-title",
+                    config: MARKDOWN_CONFIG,
+                    draft_name: "Markdown Physical Draft",
+                    draft_kind: SyncPageKind::Page,
+                    preamble: "title:: Markdown Final",
+                    expected_name: "Markdown Final",
+                    expected_kind: SyncPageKind::Page,
+                    expected_extension: ".md",
+                },
+                NewEditorIdentityScenario {
+                    label: "editor-new-org-explicit-title",
+                    config: ORG_CONFIG,
+                    draft_name: "Org Physical Draft",
+                    draft_kind: SyncPageKind::Page,
+                    preamble: "#+TITLE: Org Final",
+                    expected_name: "Org Final",
+                    expected_kind: SyncPageKind::Page,
+                    expected_extension: ".org",
+                },
+                NewEditorIdentityScenario {
+                    label: "editor-new-markdown-page-to-journal",
+                    config: MARKDOWN_DATE_CONFIG,
+                    draft_name: "Markdown Physical Page Draft",
+                    draft_kind: SyncPageKind::Page,
+                    preamble: "title:: 25-07-2026",
+                    expected_name: "2026-07-25",
+                    expected_kind: SyncPageKind::Journal,
+                    expected_extension: ".md",
+                },
+                NewEditorIdentityScenario {
+                    label: "editor-new-org-journal-to-page",
+                    config: ORG_DATE_CONFIG,
+                    draft_name: "2026-07-26",
+                    draft_kind: SyncPageKind::Journal,
+                    preamble: "#+TITLE: Ordinary Org Final",
+                    expected_name: "Ordinary Org Final",
+                    expected_kind: SyncPageKind::Page,
+                    expected_extension: ".org",
+                },
+            ];
 
-        for scenario in scenarios {
-            let (editor, graph, replayed, sqlite, projection) =
-                run_new_editor_identity_scenario(&scenario);
-            assert_eq!(editor.name, scenario.expected_name);
-            assert_eq!(editor.page_kind, scenario.expected_kind);
-            assert_eq!(graph.name, scenario.expected_name);
-            assert_eq!(graph.kind, sync_model_page_kind(scenario.expected_kind));
-            assert_eq!(replayed.name.as_str(), scenario.expected_name);
-            assert_eq!(replayed.kind, ManagedTextKind::from(scenario.expected_kind));
-            assert_eq!(sqlite.name, scenario.expected_name);
-            assert_eq!(sqlite.kind, scenario.expected_kind);
-            assert_eq!(sqlite.path, editor.path);
-            assert!(projection.contains(scenario.preamble));
-            assert!(projection.contains("new explicit-title body"));
-        }
+            for scenario in scenarios {
+                let (editor, graph, replayed, sqlite, projection) =
+                    run_new_editor_identity_scenario(&scenario);
+                assert_eq!(editor.name, scenario.expected_name);
+                assert_eq!(editor.page_kind, scenario.expected_kind);
+                assert_eq!(graph.name, scenario.expected_name);
+                assert_eq!(graph.kind, sync_model_page_kind(scenario.expected_kind));
+                assert_eq!(replayed.name.as_str(), scenario.expected_name);
+                assert_eq!(replayed.kind, ManagedTextKind::from(scenario.expected_kind));
+                assert_eq!(sqlite.name, scenario.expected_name);
+                assert_eq!(sqlite.kind, scenario.expected_kind);
+                assert_eq!(sqlite.path, editor.path);
+                assert!(projection.contains(scenario.preamble));
+                assert!(projection.contains("new explicit-title body"));
+            }
+        });
     }
 
     #[test]
