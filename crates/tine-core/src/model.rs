@@ -13234,19 +13234,14 @@ impl Graph {
         // page is in or now matches. An alias change, a new page, or a cold cache
         // has graph-wide effects → drop everything. Guarded by the differential
         // fuzz oracle in tests/derived_cache_fuzz.rs.
-        if bounded_foreground {
-            *self.derived_cache.write().unwrap() = None;
-            *self.advanced_cache.write().unwrap() = None;
-        } else {
-            let scoped = cache_built && !alias_touched && !is_new_page && !identity_changed;
-            self.scope_derived_invalidation(
-                &evict_entry,
-                previous_doc.as_deref(),
-                &evict_doc,
-                newgen,
-                scoped,
-            );
-        }
+        let scoped = cache_built && !alias_touched && !is_new_page && !identity_changed;
+        self.scope_derived_invalidation(
+            &evict_entry,
+            previous_doc.as_deref(),
+            &evict_doc,
+            newgen,
+            scoped,
+        );
     }
 
     /// See `cache_upsert`. When `scoped`, evict only derived entries the edited
@@ -13260,6 +13255,15 @@ impl Graph {
         newgen: u64,
         scoped: bool,
     ) {
+        // Most edits have no derived query state to invalidate. Avoid building
+        // graph-wide alias and real-page inputs merely to rediscover that both
+        // memo families are absent. A memo installed after this observation is
+        // computed against the already-published cache generation and content.
+        if self.derived_cache.read().unwrap().is_none()
+            && self.advanced_cache.read().unwrap().is_none()
+        {
+            return;
+        }
         // Resolve aliases BEFORE taking the derived lock (page_aliases may take the
         // cache lock); never hold derived while taking cache.
         let (aliases, real_pages) = if scoped {
