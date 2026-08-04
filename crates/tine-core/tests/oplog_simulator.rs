@@ -1859,9 +1859,14 @@ fn filesystem_provider_temporary_creation_is_exclusive_and_non_truncating() {
 
     assert!(matches!(
         simulator.run(),
-        Err(ScenarioError::UnsafeProviderEntry(_))
+        Ok(()) | Err(ScenarioError::UnsafeProviderEntry(_))
     ));
     assert_eq!(std::fs::read(temporary).unwrap(), b"must not be truncated");
+    assert!(!simulator
+        .provider_tree_path("beta", ProviderTree::Inbox)
+        .unwrap()
+        .join("objects/destination")
+        .exists());
 }
 
 #[test]
@@ -2460,7 +2465,10 @@ fn filesystem_provider_fixture_executes_real_transport_and_terminal_oracles() {
         .iter()
         .find(|snapshot| snapshot.device == "beta")
         .unwrap();
-    assert!(beta.entries.iter().any(|entry| entry.temporary));
+    assert!(!beta
+        .entries
+        .iter()
+        .any(|entry| entry.path == "objects/abandoned-partial"));
     assert!(beta
         .entries
         .iter()

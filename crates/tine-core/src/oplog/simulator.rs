@@ -14548,6 +14548,44 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
+    fn provider_named_fallback_rejects_preexisting_staging_collision_without_publication() {
+        struct RestoreProviderStagingMode(ProviderStagingMode);
+
+        impl Drop for RestoreProviderStagingMode {
+            fn drop(&mut self) {
+                PROVIDER_STAGING_MODE.with(|mode| mode.set(self.0));
+            }
+        }
+
+        let mut simulator = simulator_with_provider_item(b"provider bytes");
+        let inbox = simulator
+            .provider_tree_path("beta", ProviderTree::Inbox)
+            .unwrap();
+        let collision = inbox.join(".part/collision.part");
+        let collision_bytes = b"must not be truncated";
+        std::fs::write(&collision, collision_bytes).unwrap();
+        let previous =
+            PROVIDER_STAGING_MODE.with(|mode| mode.replace(ProviderStagingMode::NamedFallback));
+        let _restore = RestoreProviderStagingMode(previous);
+
+        let result = simulator.run_action(&action(
+            1,
+            ScheduledActionKind::BeginProviderWrite {
+                source: ProviderSource::Mailbox {
+                    item_id: "fixture-object".into(),
+                },
+                destination: location("objects/destination"),
+                transfer_id: "collision".into(),
+            },
+        ));
+
+        assert!(matches!(result, Err(ScenarioError::UnsafeProviderEntry(_))));
+        assert_eq!(std::fs::read(collision).unwrap(), collision_bytes);
+        assert!(!inbox.join("objects/destination").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
     fn anonymous_and_named_staging_produce_identical_canonical_provider_snapshots() {
         fn run(mode: ProviderStagingMode) -> ProviderTreeSnapshot {
             let previous = PROVIDER_STAGING_MODE.with(|current| current.replace(mode));
