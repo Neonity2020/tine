@@ -30358,6 +30358,110 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release benchmark: crash reopen of a real graph copy"]
+    fn managed_crash_reopen_real_graph_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_crash_reopen_real_graph_manual_benchmark -- --ignored --nocapture"
+        );
+        let source = PathBuf::from(
+            std::env::var("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY")
+                .expect("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY must name a disposable graph copy"),
+        );
+        let fixture = ActivationFixture::copied_graph("managed-crash-reopen-real", 0xa0d5, &source);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("real graph copy activates");
+        drive_initial_feed(&handle);
+
+        let mut directories = vec![fixture.graph_root.clone()];
+        let mut managed_paths = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if matches!(
+                    entry.path().extension().and_then(|value| value.to_str()),
+                    Some("md" | "org")
+                ) {
+                    managed_paths.push(
+                        entry
+                            .path()
+                            .strip_prefix(&fixture.graph_root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        managed_paths.sort();
+        let path = managed_paths
+            .into_iter()
+            .find(|path| {
+                let (page, _) = load_application_exact(&handle, path);
+                !page.blocks.is_empty()
+            })
+            .expect("real graph copy has an editable managed page");
+        let (page, revision) = load_application_exact(&handle, &path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "crash-reopen benchmark pending edit",
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+        // Dropping the live actor without draining its committed local frame or
+        // calling clean_shutdown matches a killed process during a pending save.
+        drop(handle);
+        if std::env::var_os("TINE_MANAGED_CRASH_REOPEN_FORCE_FULL_REPLAY").is_some() {
+            let mut directories = vec![fixture.request.archive_root.clone()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(entry.path());
+                    } else if entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "resume-point")
+                    {
+                        fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+            }
+        }
+        reset_runtime_open_instrumentation(workspace_id);
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let elapsed = started.elapsed();
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let open = take_runtime_open_instrumentation(workspace_id);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        let resume = reopened
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.engine_instrumentation().ok())
+            .map(|instrumentation| instrumentation.resume);
+        eprintln!(
+            "managed_crash_reopen_real elapsed_ms={:.3} resume={resume:?} open_phases: {} promoted_phases: {}",
+            startup_ms(elapsed),
+            startup_open_phase_receipt(&open),
+            startup_promoted_open_phase_receipt(&promoted),
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "real-graph crash reopen exceeded 10 seconds"
+        );
+        drop(reopened.handle);
+    }
+
+    #[test]
     #[ignore = "manual release gate: managed page and Journals reads at 1,000 and 10,000 mixed pages"]
     fn managed_application_read_1000_and_10000_page_manual_gate() {
         assert!(
