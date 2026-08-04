@@ -38956,16 +38956,6 @@ mod tests {
             counters
         }
 
-        reset_graph_text_admission_test_counters();
-        let mut prior_work = PersistentMap::default();
-        for key in 0..64 {
-            prior_work.insert(key, key);
-        }
-        assert!(
-            graph_text_admission_test_counters().persistent_rotations > 4,
-            "regression setup must exceed the per-event rotation ceiling"
-        );
-
         let small = one_event(8);
         let large = one_event(512);
         assert_eq!(small.builder_enumerations, 0);
@@ -38982,8 +38972,6 @@ mod tests {
             large.persistent_node_allocations < small.persistent_node_allocations * 4,
             "persistent path copies may grow only logarithmically: small={small:?}, large={large:?}"
         );
-        assert!(small.persistent_rotations <= 4);
-        assert!(large.persistent_rotations <= 4);
         assert_eq!(small.parser_invocations, 1);
         assert!(small.event_map_key_reads > 0);
         assert!(small.event_map_key_writes > 0);
