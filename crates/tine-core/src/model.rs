@@ -5314,9 +5314,9 @@ impl Graph {
                     if !is_page_file(Path::new(name)) {
                         continue;
                     }
-                    page_files = page_files.checked_add(1).ok_or_else(|| {
-                        managed_text_inventory_limit_error("managed file count")
-                    })?;
+                    page_files = page_files
+                        .checked_add(1)
+                        .ok_or_else(|| managed_text_inventory_limit_error("managed file count"))?;
                     if page_files > limits.managed_files {
                         return Err(managed_text_inventory_limit_error("managed file count"));
                     }
@@ -5341,9 +5341,9 @@ impl Graph {
                 if name.starts_with('.') {
                     continue;
                 }
-                let child_depth = depth.checked_add(1).ok_or_else(|| {
-                    managed_text_inventory_limit_error("managed directory depth")
-                })?;
+                let child_depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| managed_text_inventory_limit_error("managed directory depth"))?;
                 if child_depth > limits.directory_depth {
                     return Err(managed_text_inventory_limit_error(
                         "managed directory depth",
@@ -22212,7 +22212,10 @@ pub(crate) fn encode_page_name(name: &str, fmt: FileNameFormat) -> String {
         let encode = character == '%'
             || character <= '\u{1f}'
             || character == '\u{7f}'
-            || matches!(character, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*' | '#')
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*' | '#'
+            )
             || (character == '.'
                 && (fmt == FileNameFormat::Legacy
                     || offset == 0
@@ -22261,7 +22264,10 @@ fn escape_windows_device_stem(stem: &mut String) {
     let reserved = matches!(body.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ["COM", "LPT"].iter().any(|prefix| {
             body.strip_prefix(prefix).is_some_and(|suffix| {
-                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
             })
         });
     if reserved {
@@ -31328,9 +31334,11 @@ mod tests {
     fn assert_windows_safe_page_stem(stem: &str) {
         assert!(!stem.is_empty(), "page filename stem is empty");
         assert!(
-            !stem
-                .chars()
-                .any(|character| character <= '\u{1f}' || matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')),
+            !stem.chars().any(|character| character <= '\u{1f}'
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )),
             "page filename stem is not Windows-safe: {stem:?}"
         );
         assert!(
@@ -31536,7 +31544,9 @@ mod tests {
         );
 
         let rescued = "CON";
-        graph.rename_file_to_page("journals/Loose.md", rescued).unwrap();
+        graph
+            .rename_file_to_page("journals/Loose.md", rescued)
+            .unwrap();
         let rescued_stem = encode_page_name(rescued, FileNameFormat::TripleLowbar);
         assert_windows_safe_page_stem(&rescued_stem);
         assert_eq!(
@@ -43204,7 +43214,9 @@ mod tests {
         fs::write(&stray, stray_bytes).unwrap();
         let graph = Graph::open(&dir);
 
-        let error = graph.rename_file_to_page("journals/Loose.md", "A:B").unwrap_err();
+        let error = graph
+            .rename_file_to_page("journals/Loose.md", "A:B")
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);
@@ -43230,7 +43242,9 @@ mod tests {
         symlink(outside.join("pages"), dir.join("pages")).unwrap();
         let graph = Graph::open(&dir);
 
-        let error = graph.rename_file_to_page("journals/Loose.md", "A:B").unwrap_err();
+        let error = graph
+            .rename_file_to_page("journals/Loose.md", "A:B")
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);
@@ -43252,7 +43266,9 @@ mod tests {
         fs::write(&stray, stray_bytes).unwrap();
         let graph = Graph::open(&dir);
 
-        let error = graph.rename_file_to_page("journals/Loose.org", "B:C").unwrap_err();
+        let error = graph
+            .rename_file_to_page("journals/Loose.org", "B:C")
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);
@@ -43272,7 +43288,9 @@ mod tests {
         fs::write(&stray, stray_bytes).unwrap();
         let graph = Graph::open(&dir);
 
-        let error = graph.rename_file_to_page("journals/Loose.md", "A:B").unwrap_err();
+        let error = graph
+            .rename_file_to_page("journals/Loose.md", "A:B")
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);

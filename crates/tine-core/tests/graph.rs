@@ -990,12 +990,14 @@ fn journal_template_bytes_survive_reopen_and_idempotent_resave() {
         .expect("templated journal must be indexed after restart");
     let loaded = reopened.load_page(&entry).unwrap();
     assert_eq!(
-        loaded.blocks.iter().map(|block| block.raw.as_str()).collect::<Vec<_>>(),
+        loaded
+            .blocks
+            .iter()
+            .map(|block| block.raw.as_str())
+            .collect::<Vec<_>>(),
         vec!["### Meetings", "### Notes", "### Tasks"]
     );
-    reopened
-        .save_page(&loaded, loaded.rev.as_deref())
-        .unwrap();
+    reopened.save_page(&loaded, loaded.rev.as_deref()).unwrap();
     assert_eq!(std::fs::read(&journal_path).unwrap(), expected);
 
     std::fs::remove_dir_all(&root).ok();

@@ -324,11 +324,9 @@ pub(crate) fn rename_refs_multi_with_format(
             // rename (L1). Only for org; markdown has no `file:` page links.
             if is_org && rest.starts_with("[[") {
                 if let Some(end) = rest[2..].find("]]") {
-                    if let Some(rw) = rewrite_org_file_link(
-                        &rest[2..2 + end],
-                        renames,
-                        file_name_format,
-                    ) {
+                    if let Some(rw) =
+                        rewrite_org_file_link(&rest[2..2 + end], renames, file_name_format)
+                    {
                         out.push_str(&rw);
                         i += 2 + end + 2;
                         continue;
