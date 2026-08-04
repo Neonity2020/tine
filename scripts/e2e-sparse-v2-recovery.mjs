@@ -266,6 +266,12 @@ async function openSyncSettings() {
     "Backups & recovery settings tab",
   );
   await assertVisible("Storage & sync", "storage-and-sync settings");
+  const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
+  await experimental.waitForExist({ timeout: 10_000 });
+  if ((await experimental.getAttribute("aria-expanded")) !== "true") {
+    await experimental.click();
+  }
+  await assertVisible("Testing only.", "experimental managed-storage disclosure");
 }
 
 async function closeSettings() {
