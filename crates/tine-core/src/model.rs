@@ -5213,6 +5213,166 @@ impl Graph {
         Ok(self.graph_text_inventory(permit)?.0)
     }
 
+    /// Check historical page filenames through the retained graph capability.
+    ///
+    /// Unlike graph-text inventory, this deliberately admits legacy filenames
+    /// which cannot be parsed as `ManagedPath`s. It is filename-only evidence:
+    /// parser-derived effective-title validation remains with the admitted
+    /// graph-text inventory below the caller.
+    fn retained_legacy_page_identity_exists(
+        &self,
+        permit: &ManagedTextWritePermit,
+        page_name: &str,
+    ) -> io::Result<bool> {
+        struct PendingDirectory {
+            directory: Dir,
+            relative: String,
+            depth: usize,
+        }
+
+        let limits = managed_text_inventory_limits();
+        let root_depth = managed_root_components(&self.config.pages_dir)
+            .ok_or_else(bad_path)?
+            .len();
+        if root_depth > limits.directory_depth {
+            return Err(managed_text_inventory_limit_error(
+                "managed directory depth",
+            ));
+        }
+        let root = self.pages_path();
+        // `managed_target` opens every configured root component from the
+        // retained root capability and rejects a root-level pages symlink
+        // before this scan can inspect an ambient pathname.
+        let target = match self.managed_target(
+            permit,
+            &root.join(".tine-capability-legacy-page-scan"),
+            false,
+        ) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut all_entries = 0_usize;
+        let mut page_files = 0_usize;
+        let mut directory_count = 1_usize;
+        if directory_count > limits.directories {
+            return Err(managed_text_inventory_limit_error("directory count"));
+        }
+        let mut path_bytes = usize_to_u64(self.config.pages_dir.len())?;
+        if path_bytes > limits.path_bytes {
+            return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+        }
+        let mut pending = Vec::new();
+        if pending.len() >= limits.pending_directories {
+            return Err(managed_text_inventory_limit_error("pending directories"));
+        }
+        pending.push(PendingDirectory {
+            directory: target.parent().try_clone()?,
+            relative: self.config.pages_dir.clone(),
+            depth: root_depth,
+        });
+
+        while let Some(PendingDirectory {
+            directory,
+            relative,
+            depth,
+        }) = pending.pop()
+        {
+            for entry in directory.entries()? {
+                all_entries = all_entries
+                    .checked_add(1)
+                    .ok_or_else(|| managed_text_inventory_limit_error("all directory entries"))?;
+                if all_entries > limits.all_entries {
+                    return Err(managed_text_inventory_limit_error("all directory entries"));
+                }
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "legacy page scan entry name is not UTF-8",
+                    )
+                })?;
+                let child_relative_len = relative
+                    .len()
+                    .checked_add(usize::from(!relative.is_empty()))
+                    .and_then(|length| length.checked_add(name.len()))
+                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                path_bytes = path_bytes
+                    .checked_add(usize_to_u64(child_relative_len)?)
+                    .ok_or_else(|| managed_text_inventory_limit_error("aggregate path bytes"))?;
+                if path_bytes > limits.path_bytes {
+                    return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                }
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    // Legacy behavior ignores linked files and directories; do
+                    // not follow them while deciding a rescue collision.
+                    continue;
+                }
+                if file_type.is_file() {
+                    if !is_page_file(Path::new(name)) {
+                        continue;
+                    }
+                    page_files = page_files.checked_add(1).ok_or_else(|| {
+                        managed_text_inventory_limit_error("managed file count")
+                    })?;
+                    if page_files > limits.managed_files {
+                        return Err(managed_text_inventory_limit_error("managed file count"));
+                    }
+                    let Some(stem) = Path::new(name).file_stem().and_then(|stem| stem.to_str())
+                    else {
+                        continue;
+                    };
+                    if crate::refs::same_page(
+                        &decode_page_name(stem, self.config.file_name_format),
+                        page_name,
+                    ) {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                if !file_type.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("legacy page scan entry is not a regular file: {relative}/{name}"),
+                    ));
+                }
+                if name.starts_with('.') {
+                    continue;
+                }
+                let child_depth = depth.checked_add(1).ok_or_else(|| {
+                    managed_text_inventory_limit_error("managed directory depth")
+                })?;
+                if child_depth > limits.directory_depth {
+                    return Err(managed_text_inventory_limit_error(
+                        "managed directory depth",
+                    ));
+                }
+                directory_count = directory_count
+                    .checked_add(1)
+                    .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                if directory_count > limits.directories {
+                    return Err(managed_text_inventory_limit_error("directory count"));
+                }
+                // Both checks are required: metadata prevents a changed entry
+                // from being treated as a directory and the platform no-follow
+                // open closes the check/open race.
+                projection_real_directory(&directory, name)?;
+                let child = open_projection_dir_nofollow(&directory, name)?;
+                if pending.len() >= limits.pending_directories {
+                    return Err(managed_text_inventory_limit_error("pending directories"));
+                }
+                pending.push(PendingDirectory {
+                    directory: child,
+                    relative: format!("{relative}/{name}"),
+                    depth: child_depth,
+                });
+            }
+        }
+        Ok(false)
+    }
+
     fn graph_text_inventory(
         &self,
         permit: &ManagedTextWritePermit,
@@ -12024,8 +12184,9 @@ impl Graph {
     /// `pages/<encoded new_name>.<its ext>` (#21) — the way to rescue a duplicate-day
     /// leftover whose name collides with the canonical day. Refuses if a page for
     /// `new_name` already exists in any supported text extension (never clobbers)
-    /// or the name is empty. Inbound references are NOT rewritten (a stray rarely
-    /// has any); the file's own content is unchanged.
+    /// or another graph-text file already owns that logical page identity. Inbound
+    /// references are NOT rewritten (a stray rarely has any); the file's own
+    /// content is unchanged.
     pub fn rename_file_to_page(&self, src_rel: &str, new_name: &str) -> io::Result<()> {
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
@@ -12042,8 +12203,40 @@ impl Graph {
         let ext = text_extension_from_path(&src)
             .map(|extension| extension.to_owned())
             .ok_or_else(bad_path)?;
-        let enc = encode_page_name(name, self.config.file_name_format);
         let dir = self.pages_path();
+        let mut existing_identity = self.retained_legacy_page_identity_exists(&write, name)?;
+        // Historical page filenames can be non-portable and therefore cannot
+        // enter the strict managed-path admission index. Keep the retained
+        // filename walk above as their compatibility authority, then use the
+        // exact no-follow reader and canonical parser for portable admitted
+        // graph text so an explicit title cannot be rescued over.
+        if !existing_identity {
+            for entry in self.graph_text_entries(&write)? {
+                if entry.path == src {
+                    continue;
+                }
+                if ManagedPath::parse(entry.rel_path.as_str()).is_err() {
+                    continue;
+                }
+                let Some(incumbent) = self.load_validated_graph_text_target(&write, &entry.path)?
+                else {
+                    continue;
+                };
+                if incumbent.entry.kind == PageKind::Page
+                    && crate::refs::same_page(&incumbent.entry.name, name)
+                {
+                    existing_identity = true;
+                    break;
+                }
+            }
+        }
+        if existing_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "a page with that name already exists",
+            ));
+        }
+        let enc = encode_page_name(name, self.config.file_name_format);
         for target in configured_text_variant_paths(&dir, &enc) {
             if self.managed_exists(&write, &target)? {
                 return Err(io::Error::new(
@@ -42997,6 +43190,94 @@ mod tests {
                 .exists(),
             "source left intact on refusal"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_file_to_page_refuses_legacy_page_identity_collision() {
+        let dir = scratch("renamefile-legacy-identity-collision");
+        let incumbent = dir.join("pages/A:B.md");
+        let stray = dir.join("journals/Loose.md");
+        let incumbent_bytes = b"- authoritative historical page\n";
+        let stray_bytes = b"- loose journal stray\n";
+        fs::write(&incumbent, incumbent_bytes).unwrap();
+        fs::write(&stray, stray_bytes).unwrap();
+        let graph = Graph::open(&dir);
+
+        let error = graph.rename_file_to_page("journals/Loose.md", "A:B").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);
+        assert_eq!(fs::read(&stray).unwrap(), stray_bytes);
+        assert!(!dir.join("pages/A%3AB.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_file_to_page_rejects_symlinked_pages_before_legacy_collision_scan() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("renamefile-retained-pages-symlink");
+        let outside = scratch("renamefile-retained-pages-symlink-outside");
+        let incumbent = outside.join("pages/A:B.md");
+        let stray = dir.join("journals/Loose.md");
+        let incumbent_bytes = b"- external legacy page\n";
+        let stray_bytes = b"- admitted loose stray\n";
+        fs::write(&incumbent, incumbent_bytes).unwrap();
+        fs::write(&stray, stray_bytes).unwrap();
+        fs::remove_dir_all(dir.join("pages")).unwrap();
+        symlink(outside.join("pages"), dir.join("pages")).unwrap();
+        let graph = Graph::open(&dir);
+
+        let error = graph.rename_file_to_page("journals/Loose.md", "A:B").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);
+        assert_eq!(fs::read(&stray).unwrap(), stray_bytes);
+        assert!(!outside.join("pages/A%3AB.md").exists());
+        fs::remove_file(dir.join("pages")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn rename_file_to_page_refuses_legacy_identity_in_other_text_extension() {
+        let dir = scratch("renamefile-legacy-identity-extension");
+        let incumbent = dir.join("pages/B:C.markdown");
+        let stray = dir.join("journals/Loose.org");
+        let incumbent_bytes = b"- authoritative legacy markdown page\n";
+        let stray_bytes = b"* loose org journal stray\n";
+        fs::write(&incumbent, incumbent_bytes).unwrap();
+        fs::write(&stray, stray_bytes).unwrap();
+        let graph = Graph::open(&dir);
+
+        let error = graph.rename_file_to_page("journals/Loose.org", "B:C").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);
+        assert_eq!(fs::read(&stray).unwrap(), stray_bytes);
+        assert!(!dir.join("pages/B%3AC.org").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_file_to_page_refuses_effective_markdown_title_collision() {
+        let dir = scratch("renamefile-effective-markdown-title-collision");
+        let incumbent = dir.join("pages/Other.md");
+        let stray = dir.join("journals/Loose.md");
+        let incumbent_bytes = b"title:: A:B\n\n- authoritative page\n";
+        let stray_bytes = b"- loose journal stray\n";
+        fs::write(&incumbent, incumbent_bytes).unwrap();
+        fs::write(&stray, stray_bytes).unwrap();
+        let graph = Graph::open(&dir);
+
+        let error = graph.rename_file_to_page("journals/Loose.md", "A:B").unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&incumbent).unwrap(), incumbent_bytes);
+        assert_eq!(fs::read(&stray).unwrap(), stray_bytes);
+        assert!(!dir.join("pages/A%3AB.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
