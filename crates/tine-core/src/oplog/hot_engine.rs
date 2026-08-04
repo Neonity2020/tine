@@ -3141,6 +3141,8 @@ pub(crate) struct DraftOracleObservation {
     pub(crate) refused: Option<EngineError>,
     pub(crate) oracle_catalog_copies: usize,
     pub(crate) optimized_catalog_copies: usize,
+    pub(crate) oracle_catalog_shape_entry_visits: usize,
+    pub(crate) optimized_catalog_shape_entry_visits: usize,
 }
 
 /// Speculative author state. Only bounded path requirements are observable;
@@ -3940,17 +3942,25 @@ impl DecodedDocumentVersion {
 /// within one lane, and this value never outlives the [`ShardedHotEngine`] that
 /// owns the one workspace, lineage and scratch store that pair is resolved in.
 ///
-/// It deliberately carries **no authority**. Nothing here proves which causal
-/// state an accepted root selects, that the root is authentic, or that the
-/// checkpoint behind it was intact. Those proofs stay on
-/// [`ShardedHotEngine::accepted_frontier_document`] and the full load, and they
-/// run on every single use.
+/// The frontier binding is published only after the accepted-root point proof
+/// and full checkpoint load both succeed. It advances across a later accepted
+/// event only when that authenticated event starts at the bound root and does
+/// not affect the catalog document. A cold or mismatched root takes the point
+/// proof again.
 #[derive(Debug)]
 struct RetainedDecodedCatalog {
+    accepted_frontier_state_digest: ContentDigest,
+    dependencies: DocumentDependencies,
     document_id: DocumentId,
     causal_state_digest: DocumentCausalDigest,
     version: DecodedDocumentVersion,
     document: LoroDoc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuthenticatedCatalogDependencyAnchor {
+    accepted_frontier_state_digest: ContentDigest,
+    causal_state_digest: DocumentCausalDigest,
 }
 
 /// Engine-lifetime accounting for the retained catalog decode. This is the
@@ -4517,7 +4527,7 @@ impl AcceptedRootMaterializer<'_> {
                 return Ok(Some(key));
             }
         }
-        let frontier = FrontierV2::new(vec![dependencies]).map_err(EngineError::from)?;
+        let frontier = FrontierV2::new(vec![dependencies.clone()]).map_err(EngineError::from)?;
         let mut reconstructed = self.engine.reconstruct_projection_frontier(&frontier)?;
         let document = reconstructed
             .remove(&document_id)
@@ -4526,8 +4536,12 @@ impl AcceptedRootMaterializer<'_> {
             // Publication happens only here, after the full load and every
             // integrity proof inside it succeeded. A refused or malformed
             // checkpoint returns above and leaves any prior valid entry alone.
-            self.engine
-                .retain_accepted_document(document_id, key.causal_state_digest, &document);
+            self.engine.retain_accepted_document(
+                &self.root,
+                dependencies,
+                key.causal_state_digest,
+                &document,
+            );
         }
         self.documents.insert(key, document);
         self.document_keys.insert(document_id, key);
@@ -4691,6 +4705,8 @@ struct HistoryWorkStats {
     prospective_document_copies: usize,
     prospective_document_copy_ops: usize,
     prospective_catalog_document_copies: usize,
+    prospective_catalog_shape_entry_visits: usize,
+    projection_acquisition_durable_head_visits: usize,
     stage_snapshot_clones: usize,
     stage_snapshot_clone_ops: usize,
     stage_structural_buffer_reuses: usize,
@@ -5039,6 +5055,12 @@ pub struct EngineInstrumentation {
     pub prospective_document_copy_ops: usize,
     /// The subset of those copies that reproduced the whole-graph catalog.
     pub prospective_catalog_document_copies: usize,
+    /// Catalog entries visited while deriving prospective projection state.
+    /// An ordinary existing-page edit must keep this at zero.
+    pub prospective_catalog_shape_entry_visits: usize,
+    /// Accepted causal heads consulted while proving that a projection stays
+    /// in the current portable-path acquisition lifecycle.
+    pub projection_acquisition_durable_head_visits: usize,
     pub stage_snapshot_clones: usize,
     pub stage_snapshot_clone_ops: usize,
     pub stage_structural_buffer_reuses: usize,
@@ -6227,10 +6249,11 @@ pub struct ShardedHotEngine {
     // content identity alone. Unlike the two point caches above this is *not*
     // cleared per operation: a content-only save leaves the catalog's causal
     // state untouched, and reusing that decode is the whole point. It is
-    // deliberately one entry with no eviction policy to tune, holds no
-    // authority, and is consulted only after the accepted-frontier lookup has
-    // named the exact causal state the root selects.
+    // deliberately one entry with no eviction policy to tune. Its decoded
+    // value is reusable only while the adjacent authenticated frontier binding
+    // names the exact causal state selected by the current accepted root.
     retained_accepted_catalog: RefCell<Option<RetainedDecodedCatalog>>,
+    retained_catalog_dependency_anchor: Cell<Option<AuthenticatedCatalogDependencyAnchor>>,
     #[cfg(test)]
     retained_catalog_decode_stats: Cell<RetainedCatalogDecodeStats>,
     /// Restores the previous behaviour, which decoded the catalog for every
@@ -6371,6 +6394,7 @@ impl ShardedHotEngine {
             status_point_cache: RefCell::new(BTreeMap::new()),
             external_anchor_point_cache: RefCell::new(BTreeSet::new()),
             retained_accepted_catalog: RefCell::new(None),
+            retained_catalog_dependency_anchor: Cell::new(None),
             #[cfg(test)]
             retained_catalog_decode_stats: Cell::new(RetainedCatalogDecodeStats::default()),
             #[cfg(test)]
@@ -8990,6 +9014,9 @@ impl ShardedHotEngine {
             prospective_document_copies: work.prospective_document_copies,
             prospective_document_copy_ops: work.prospective_document_copy_ops,
             prospective_catalog_document_copies: work.prospective_catalog_document_copies,
+            prospective_catalog_shape_entry_visits: work.prospective_catalog_shape_entry_visits,
+            projection_acquisition_durable_head_visits: work
+                .projection_acquisition_durable_head_visits,
             stage_snapshot_clones: work.stage_snapshot_clones,
             stage_snapshot_clone_ops: work.stage_snapshot_clone_ops,
             stage_structural_buffer_reuses: work.stage_structural_buffer_reuses,
@@ -10409,6 +10436,7 @@ impl ShardedHotEngine {
         evidence: AcceptedBatchEvidence,
         roots: ScratchRoots,
     ) {
+        self.advance_retained_catalog_frontier_binding(&evidence);
         self.next_acceptance_sequence = evidence.acceptance_sequence;
         self.accepted_frontier_root = evidence.post_frontier_root.clone();
         if self.scratch.is_some() {
@@ -13324,16 +13352,34 @@ impl ShardedHotEngine {
         transaction: &OperationTransaction,
     ) -> DraftOracleObservation {
         let oracle_copies = self.prospective_catalog_document_copies();
+        let oracle_shape_visits = self
+            .history_work
+            .get()
+            .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(true);
         let oracle =
             self.draft_author_transaction_with_observation(author, origin, transaction, None);
         let oracle_copies = self.prospective_catalog_document_copies() - oracle_copies;
+        let oracle_shape_visits = self
+            .history_work
+            .get()
+            .prospective_catalog_shape_entry_visits
+            - oracle_shape_visits;
 
         let optimized_copies = self.prospective_catalog_document_copies();
+        let optimized_shape_visits = self
+            .history_work
+            .get()
+            .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(false);
         let optimized =
             self.draft_author_transaction_with_observation(author, origin, transaction, None);
         let optimized_copies = self.prospective_catalog_document_copies() - optimized_copies;
+        let optimized_shape_visits = self
+            .history_work
+            .get()
+            .prospective_catalog_shape_entry_visits
+            - optimized_shape_visits;
 
         match (oracle, optimized) {
             (Ok(oracle), Ok(optimized)) => {
@@ -13379,6 +13425,8 @@ impl ShardedHotEngine {
                     refused: None,
                     oracle_catalog_copies: oracle_copies,
                     optimized_catalog_copies: optimized_copies,
+                    oracle_catalog_shape_entry_visits: oracle_shape_visits,
+                    optimized_catalog_shape_entry_visits: optimized_shape_visits,
                 }
             }
             (Err(oracle), Err(optimized)) => {
@@ -13387,6 +13435,8 @@ impl ShardedHotEngine {
                     refused: Some(oracle),
                     oracle_catalog_copies: oracle_copies,
                     optimized_catalog_copies: optimized_copies,
+                    oracle_catalog_shape_entry_visits: oracle_shape_visits,
+                    optimized_catalog_shape_entry_visits: optimized_shape_visits,
                 }
             }
             (oracle, optimized) => panic!(
@@ -13455,6 +13505,7 @@ impl ShardedHotEngine {
                 author.batch_id,
                 &parts.prospective_documents,
                 &parts.semantic_effect,
+                before.as_ref(),
             )?;
             let post_frontier = match &after {
                 Some(after) => after.frontier.clone(),
@@ -14989,6 +15040,14 @@ impl ShardedHotEngine {
         self.history_work.set(work);
     }
 
+    fn record_prospective_catalog_shape_validation(&self, catalog: &LoroDoc) {
+        let mut work = self.history_work.get();
+        work.prospective_catalog_shape_entry_visits = work
+            .prospective_catalog_shape_entry_visits
+            .saturating_add(catalog.get_map(CATALOG_PAGES).len());
+        self.history_work.set(work);
+    }
+
     /// Test-only escape hatch that restores the previous derivation, which
     /// reproduced every document it read. Differential proofs use it as the
     /// oracle.
@@ -15027,26 +15086,54 @@ impl ShardedHotEngine {
         batch_id: BatchId,
         prospective: &BTreeMap<DocumentId, LoroDoc>,
         effect: &SemanticEffect,
+        prior: Option<&ProjectionPageState>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
-        let catalog = self.prospective_document_ref(self.catalog_document_id, prospective)?;
-        let Some(page_state) =
-            validate_catalog_page(self.catalog_document_id, catalog.document(), page_id)?
-        else {
-            return Ok(None);
+        // A changed catalog must be read from the transaction's prospective
+        // state. An unchanged catalog already has a fixed-depth, authenticated
+        // page row bound to the engine's exact accepted frontier, so ordinary
+        // block edits do not need `LoroDoc::get_value` over every unrelated
+        // catalog entry. Tests can retain the old whole-document derivation as
+        // a semantic oracle.
+        let catalog = if prospective.contains_key(&self.catalog_document_id)
+            || self.uses_previous_document_derivation()
+        {
+            Some(self.prospective_document_ref(self.catalog_document_id, prospective)?)
+        } else {
+            None
+        };
+        let page_state = match catalog.as_ref() {
+            Some(catalog) => {
+                self.record_prospective_catalog_shape_validation(catalog.document());
+                let Some(state) =
+                    validate_catalog_page(self.catalog_document_id, catalog.document(), page_id)?
+                else {
+                    return Ok(None);
+                };
+                state
+            }
+            None => {
+                let prior = prior.ok_or(EngineError::PageNotFound(page_id))?;
+                PageState::Live {
+                    name: prior.page.name.clone(),
+                    path: prior.page.path.clone(),
+                    kind: prior.page.kind,
+                    home_document_id: prior.page.home_document_id,
+                }
+            }
         };
         let PageState::Live {
             home_document_id: page_document_id,
             ..
-        } = page_state
+        } = &page_state
         else {
             return Ok(None);
         };
-        let page_document = self.prospective_document_ref(page_document_id, prospective)?;
-        let members = read_memberships(page_document_id, page_document.document())?;
-        let mut documents = BTreeMap::from([
-            (self.catalog_document_id, catalog),
-            (page_document_id, page_document),
-        ]);
+        let page_document = self.prospective_document_ref(*page_document_id, prospective)?;
+        let members = read_memberships(*page_document_id, page_document.document())?;
+        let mut documents = BTreeMap::from([(*page_document_id, page_document)]);
+        if let Some(catalog) = catalog {
+            documents.insert(self.catalog_document_id, catalog);
+        }
         for claim in members.values() {
             if !documents.contains_key(&claim.home_document_id) {
                 documents.insert(
@@ -15055,11 +15142,16 @@ impl ShardedHotEngine {
                 );
             }
         }
-        let page = self.materialize_page_from_document_lookup(page_id, |document_id| {
-            documents
-                .get(&document_id)
-                .map(ProspectiveDocument::document)
-        })?;
+        let page = self.materialize_page_from_state(
+            page_id,
+            page_state,
+            |document_id| {
+                documents
+                    .get(&document_id)
+                    .map(ProspectiveDocument::document)
+            },
+            1,
+        )?;
         let mut requested =
             page_logseq_references(&page.path, page.preamble.as_deref(), &page.blocks);
         requested.extend(page.blocks.iter().filter_map(|block| block.logseq_uuid));
@@ -15107,13 +15199,28 @@ impl ShardedHotEngine {
             }
             let evidence =
                 ProjectionClaimEvidence::new(logseq_uuid, participants.into_iter().collect())?;
-            match self.resolve_logseq_uuid_from_document_lookup(
+            match self.resolve_logseq_uuid_from_document_lookup_with_page_state(
                 logseq_uuid,
                 &evidence,
                 |document_id| {
                     documents
                         .get(&document_id)
                         .map(ProspectiveDocument::document)
+                },
+                |participant_page_id| {
+                    if let Some(catalog) = documents.get(&self.catalog_document_id) {
+                        self.record_prospective_catalog_shape_validation(catalog.document());
+                        return validate_catalog_page(
+                            self.catalog_document_id,
+                            catalog.document(),
+                            participant_page_id,
+                        );
+                    }
+                    match self.current_hot_page_state(participant_page_id) {
+                        Ok(state) => Ok(Some(state)),
+                        Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => Ok(None),
+                        Err(error) => Err(error),
+                    }
                 },
             )? {
                 LogseqUuidResolution::Ambiguous { claim_count } => {
@@ -15127,19 +15234,30 @@ impl ShardedHotEngine {
             claim_evidence.push(evidence);
         }
         claim_evidence.sort_unstable_by_key(ProjectionClaimEvidence::logseq_uuid);
-        let frontier = FrontierV2::new(
-            documents
-                .iter()
-                .map(|(document_id, document)| {
-                    self.prospective_document_dependencies(
-                        *document_id,
-                        document.document(),
-                        batch_id,
-                        prospective,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )?;
+        let mut frontier_documents = documents
+            .iter()
+            .map(|(document_id, document)| {
+                self.prospective_document_dependencies(
+                    *document_id,
+                    document.document(),
+                    batch_id,
+                    prospective,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !documents.contains_key(&self.catalog_document_id) {
+            frontier_documents.push(
+                prior
+                    .and_then(|prior| {
+                        prior.frontier.documents().iter().find(|dependencies| {
+                            dependencies.document_id() == self.catalog_document_id
+                        })
+                    })
+                    .cloned()
+                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
+            );
+        }
+        let frontier = FrontierV2::new(frontier_documents)?;
         Ok(Some(ProjectionPageState {
             page,
             frontier,
@@ -16058,58 +16176,76 @@ impl ShardedHotEngine {
                 return Ok(false);
             };
             let new = &newer.documents()[index];
-            for old_counter in old.peer_counters() {
-                let Some(new_counter) = new
-                    .peer_counters()
-                    .iter()
-                    .find(|counter| counter.peer_id() == old_counter.peer_id())
-                else {
-                    return Ok(false);
-                };
-                if new_counter.max_counter() < old_counter.max_counter() {
-                    return Ok(false);
-                }
-            }
-            let direct_heads = new
-                .direct_dependency_heads()
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            let ancestry = match self.collect_batch_ancestry(&direct_heads, self.is_blocked()) {
-                Ok(ancestry) => ancestry,
-                Err(EngineError::MissingDependency(candidate))
-                    if direct_heads.contains(&candidate)
-                        && matches!(self.statuses.get(&candidate), Some(ArchiveStatus::Staged)) =>
-                {
-                    // Projection work is prepared after the candidate's
-                    // accepted status is durable but before its in-memory
-                    // status transition is committed. Its post-frontier
-                    // therefore names the candidate itself. Authenticate the
-                    // candidate through the retained staged manifest, then
-                    // prove older heads through its already-accepted causal
-                    // dependencies.
-                    let dependencies = self
-                        .archive
-                        .get(&candidate)
-                        .ok_or(EngineError::MissingDependency(candidate))?
-                        .manifest()
-                        .causal_dependency_heads()
-                        .iter()
-                        .copied()
-                        .collect();
-                    self.collect_batch_ancestry(&dependencies, self.is_blocked())?
-                }
-                Err(error) => return Err(error),
-            };
-            if old
-                .direct_dependency_heads()
-                .iter()
-                .any(|head| !direct_heads.contains(head) && !ancestry.contains_key(head))
-            {
+            if !self.document_dependencies_dominate(new, old)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn document_dependencies_dominate(
+        &self,
+        newer: &DocumentDependencies,
+        older: &DocumentDependencies,
+    ) -> Result<bool, EngineError> {
+        if newer.document_id() != older.document_id() {
+            return Ok(false);
+        }
+        if newer.causal_state_digest() == older.causal_state_digest() {
+            return Ok(true);
+        }
+        let mut newer_counters = newer.peer_counters().iter().peekable();
+        for older_counter in older.peer_counters() {
+            while newer_counters
+                .peek()
+                .is_some_and(|counter| counter.peer_id() < older_counter.peer_id())
+            {
+                newer_counters.next();
+            }
+            let Some(newer_counter) = newer_counters.peek() else {
+                return Ok(false);
+            };
+            if newer_counter.peer_id() != older_counter.peer_id()
+                || newer_counter.max_counter() < older_counter.max_counter()
+            {
+                return Ok(false);
+            }
+        }
+        let direct_heads = newer
+            .direct_dependency_heads()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if direct_heads
+            .iter()
+            .copied()
+            .eq(older.direct_dependency_heads().iter().copied())
+        {
+            return Ok(true);
+        }
+        let ancestry = match self.collect_batch_ancestry(&direct_heads, self.is_blocked()) {
+            Ok(ancestry) => ancestry,
+            Err(EngineError::MissingDependency(candidate))
+                if direct_heads.contains(&candidate)
+                    && matches!(self.statuses.get(&candidate), Some(ArchiveStatus::Staged)) =>
+            {
+                let dependencies = self
+                    .archive
+                    .get(&candidate)
+                    .ok_or(EngineError::MissingDependency(candidate))?
+                    .manifest()
+                    .causal_dependency_heads()
+                    .iter()
+                    .copied()
+                    .collect();
+                self.collect_batch_ancestry(&dependencies, self.is_blocked())?
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(older
+            .direct_dependency_heads()
+            .iter()
+            .all(|head| direct_heads.contains(head) || ancestry.contains_key(head)))
     }
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {
@@ -16722,9 +16858,6 @@ impl ShardedHotEngine {
             return Ok((LogseqUuidResolution::Unclaimed, None, BTreeMap::new()));
         }
 
-        let catalog = self
-            .current_catalog_document()?
-            .ok_or(EngineError::ProjectionAuthorizationUnavailable)?;
         let mut homes = BTreeMap::new();
         let mut live = BTreeMap::<BlockId, LogseqUuidClaim>::new();
         for participant in &participants {
@@ -16747,12 +16880,13 @@ impl ShardedHotEngine {
             else {
                 continue;
             };
-            if current_uuid != logseq_uuid
-                || !matches!(
-                    validate_catalog_page(self.catalog_document_id, catalog, page_id)?,
-                    Some(PageState::Live { .. })
-                )
-            {
+            let page_is_live = match self.current_hot_page_state(page_id) {
+                Ok(PageState::Live { .. }) => true,
+                Ok(PageState::Tombstone { .. })
+                | Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => false,
+                Err(error) => return Err(error),
+            };
+            if current_uuid != logseq_uuid || !page_is_live {
                 continue;
             }
             live.insert(
@@ -16839,6 +16973,21 @@ impl ShardedHotEngine {
     ) -> Result<LogseqUuidResolution, EngineError> {
         let catalog = document(self.catalog_document_id)
             .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        self.resolve_logseq_uuid_from_document_lookup_with_page_state(
+            logseq_uuid,
+            evidence,
+            document,
+            |page_id| validate_catalog_page(self.catalog_document_id, catalog, page_id),
+        )
+    }
+
+    fn resolve_logseq_uuid_from_document_lookup_with_page_state<'document>(
+        &self,
+        logseq_uuid: LogseqUuid,
+        evidence: &ProjectionClaimEvidence,
+        document: impl Fn(DocumentId) -> Option<&'document LoroDoc>,
+        mut page_state: impl FnMut(PageId) -> Result<Option<PageState>, EngineError>,
+    ) -> Result<LogseqUuidResolution, EngineError> {
         let mut live = BTreeMap::<BlockId, LogseqUuidClaim>::new();
         for participant in evidence.participants() {
             let home_document_id = participant.home_document_id();
@@ -16854,11 +17003,7 @@ impl ShardedHotEngine {
             else {
                 continue;
             };
-            if uuid != logseq_uuid
-                || !matches!(
-                    validate_catalog_page(self.catalog_document_id, catalog, page_id)?,
-                    Some(PageState::Live { .. })
-                )
+            if uuid != logseq_uuid || !matches!(page_state(page_id)?, Some(PageState::Live { .. }))
             {
                 continue;
             }
@@ -17017,18 +17162,8 @@ impl ShardedHotEngine {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
         let reads_before = self.archive_read_stats();
-        let catalog = self
-            .current_catalog_document()?
-            .ok_or(EngineError::PageNotFound(page_id))?;
         let mut frontier_documents = BTreeMap::new();
-        if include_frontier {
-            frontier_documents.insert(
-                self.catalog_document_id,
-                self.current_hot_document_dependencies(self.catalog_document_id, catalog)?,
-            );
-        }
-        let page_state = validate_catalog_page(self.catalog_document_id, catalog, page_id)?
-            .ok_or(EngineError::PageNotFound(page_id))?;
+        let page_state = self.current_hot_page_state(page_id)?;
         let PageState::Live {
             name,
             path,
@@ -17214,7 +17349,7 @@ impl ShardedHotEngine {
             transition.apply_to_materialized(&mut page)?;
         }
         let frontier = include_frontier
-            .then(|| FrontierV2::new(frontier_documents.into_values().collect()))
+            .then(|| FrontierV2::new(frontier_documents.values().cloned().collect()))
             .transpose()?;
         let (frontier, effective_closure) = match frontier {
             Some(frontier) => match self.page_stable_projection_frontier(
@@ -17225,11 +17360,35 @@ impl ShardedHotEngine {
                 effective_transition.as_ref(),
             )? {
                 Some((stable, closure)) => (Some(stable), closure),
-                None => (Some(frontier), None),
+                None => {
+                    frontier_documents.insert(
+                        self.catalog_document_id,
+                        self.current_hot_document_dependencies_by_id(self.catalog_document_id)?,
+                    );
+                    (
+                        Some(FrontierV2::new(frontier_documents.into_values().collect())?),
+                        None,
+                    )
+                }
             },
             None => (None, None),
         };
         Ok((page, frontier, claim_evidence, effective_closure))
+    }
+
+    fn current_catalog_dependencies_dominate(
+        &self,
+        current: Option<&DocumentDependencies>,
+        candidate: &DocumentDependencies,
+    ) -> Result<bool, EngineError> {
+        if let Some(current) = current {
+            return self.document_dependencies_dominate(current, candidate);
+        }
+        if self.retained_accepted_catalog_matches(&self.accepted_frontier_root, candidate) {
+            return Ok(true);
+        }
+        let current = self.current_hot_document_dependencies_by_id(self.catalog_document_id)?;
+        self.document_dependencies_dominate(&current, candidate)
     }
 
     fn page_stable_projection_frontier(
@@ -17339,15 +17498,7 @@ impl ShardedHotEngine {
             else {
                 return Ok(None);
             };
-            let Some(current_catalog) = current_catalog else {
-                return Ok(None);
-            };
-            let current_catalog_frontier = FrontierV2::new(vec![current_catalog.clone()])?;
-            let candidate_catalog_frontier = FrontierV2::new(vec![candidate_catalog.clone()])?;
-            if !self.projection_frontier_dominates(
-                &current_catalog_frontier,
-                &candidate_catalog_frontier,
-            )? {
+            if !self.current_catalog_dependencies_dominate(current_catalog, candidate_catalog)? {
                 return Ok(None);
             }
             let state = ProjectionPageState {
@@ -17389,7 +17540,26 @@ impl ShardedHotEngine {
             .collect::<Vec<_>>();
         let mut stable = None;
         for batch_id in candidate_batches {
-            for intent in self.load_accepted_projection_intents(batch_id)? {
+            // A managed-local head is already authenticated by the durable
+            // journal prefix and is deliberately not present in accepted
+            // history yet. Use its one validated projection intent directly;
+            // admission requires one exact existing page/path and an empty
+            // page-effect set, so the record cannot change its authenticated
+            // path acquisition. Asking accepted history to reprove either the
+            // known absence or that unchanged acquisition makes foreground
+            // work proportional to unrelated history.
+            let managed_local_intent = self
+                .local_overlay
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.batch_id == batch_id)
+                .map(|entry| entry.projection.intent.clone());
+            let (intents, managed_local) = match managed_local_intent {
+                Some(intent) => (vec![intent], true),
+                None => (self.load_accepted_projection_intents(batch_id)?, false),
+            };
+            for intent in intents {
                 // The portable-path acquisition is the lifecycle identity.
                 // A prior A projection after A -> B -> A cannot authorize the
                 // next A acquisition because its causal frontier cannot contain
@@ -17398,10 +17568,11 @@ impl ShardedHotEngine {
                     || intent.path() != &page.path
                     || intent.claim_evidence() != claim_evidence
                     || !matches!(intent.target(), ManifestProjectionTarget::Present { .. })
-                    || !self.projection_frontier_contains_path_acquisition(
-                        intent.post_frontier(),
-                        occupied.acquisition_batch(),
-                    )?
+                    || (!managed_local
+                        && !self.projection_frontier_contains_path_acquisition(
+                            intent.post_frontier(),
+                            occupied.acquisition_batch(),
+                        )?)
                 {
                     continue;
                 }
@@ -17432,15 +17603,9 @@ impl ShardedHotEngine {
                 else {
                     continue;
                 };
-                let Some(current_catalog) = current_catalog else {
-                    continue;
-                };
-                let current_catalog_frontier = FrontierV2::new(vec![current_catalog.clone()])?;
-                let candidate_catalog_frontier = FrontierV2::new(vec![candidate_catalog.clone()])?;
-                if !self.projection_frontier_dominates(
-                    &current_catalog_frontier,
-                    &candidate_catalog_frontier,
-                )? {
+                if !self
+                    .current_catalog_dependencies_dominate(current_catalog, candidate_catalog)?
+                {
                     continue;
                 }
                 let state = ProjectionPageState {
@@ -17481,6 +17646,14 @@ impl ShardedHotEngine {
         let Some(store) = self.scratch.as_ref() else {
             return Ok(false);
         };
+        #[cfg(test)]
+        {
+            let mut work = self.history_work.get();
+            work.projection_acquisition_durable_head_visits = work
+                .projection_acquisition_durable_head_visits
+                .saturating_add(heads.len());
+            self.history_work.set(work);
+        }
         let Some(acquisition) =
             super::causal_index::batch_record(store, &self.scratch_roots, acquisition_batch)
                 .map_err(|error| EngineError::Archive(error.to_string()))?
@@ -17488,13 +17661,15 @@ impl ShardedHotEngine {
             return Ok(false);
         };
         for head in heads {
-            let record = super::causal_index::batch_record(store, &self.scratch_roots, head)
+            let Some(record) = super::causal_index::batch_record(store, &self.scratch_roots, head)
                 .map_err(|error| EngineError::Archive(error.to_string()))?
-                .ok_or_else(|| {
-                    EngineError::Archive(format!(
-                        "projection frontier head {head} has no authenticated causal record"
-                    ))
-                })?;
+            else {
+                // A multipart bootstrap may retain a frontier head outside the
+                // live causal index. Its absence proves nothing, so ignore it;
+                // another authenticated head must still prove containment or
+                // this optional stable-frontier reuse returns false below.
+                continue;
+            };
             if acquisition
                 .clock()
                 .iter()
@@ -18669,10 +18844,12 @@ impl ShardedHotEngine {
     /// proofs succeeded, so a refusal can never replace a valid entry.
     fn retain_accepted_document(
         &self,
-        document_id: DocumentId,
+        root: &AcceptedFrontierRoot,
+        dependencies: DocumentDependencies,
         causal_state_digest: DocumentCausalDigest,
         document: &LoroDoc,
     ) {
+        let document_id = dependencies.document_id();
         if document_id != self.catalog_document_id {
             return;
         }
@@ -18680,7 +18857,14 @@ impl ShardedHotEngine {
         if !self.retained_catalog_enabled.get() {
             return;
         }
+        self.retained_catalog_dependency_anchor
+            .set(Some(AuthenticatedCatalogDependencyAnchor {
+                accepted_frontier_state_digest: root.state_digest(),
+                causal_state_digest: dependencies.causal_state_digest(),
+            }));
         *self.retained_accepted_catalog.borrow_mut() = Some(RetainedDecodedCatalog {
+            accepted_frontier_state_digest: root.state_digest(),
+            dependencies,
             document_id,
             causal_state_digest,
             version: DecodedDocumentVersion::of(document),
@@ -18694,6 +18878,77 @@ impl ShardedHotEngine {
         }
     }
 
+    /// Carry the already-proved catalog binding across a bounded accepted
+    /// transition. The accepted evidence names both roots and the complete set
+    /// of changed documents, so absence from that set proves the catalog's
+    /// dependency row is unchanged without another trie lookup.
+    fn advance_retained_catalog_frontier_binding(&self, evidence: &AcceptedBatchEvidence) {
+        if let Some(mut anchor) = self.retained_catalog_dependency_anchor.get() {
+            if anchor.accepted_frontier_state_digest != evidence.prior_frontier_root.state_digest()
+                || evidence
+                    .affected_documents
+                    .iter()
+                    .any(|dependencies| dependencies.document_id() == self.catalog_document_id)
+            {
+                self.retained_catalog_dependency_anchor.set(None);
+            } else {
+                anchor.accepted_frontier_state_digest = evidence.post_frontier_root.state_digest();
+                self.retained_catalog_dependency_anchor.set(Some(anchor));
+            }
+        }
+        let mut retained = self.retained_accepted_catalog.borrow_mut();
+        let Some(entry) = retained.as_mut() else {
+            return;
+        };
+        if entry.accepted_frontier_state_digest != evidence.prior_frontier_root.state_digest()
+            || evidence
+                .affected_documents
+                .iter()
+                .any(|dependencies| dependencies.document_id() == self.catalog_document_id)
+        {
+            *retained = None;
+            return;
+        }
+        entry.accepted_frontier_state_digest = evidence.post_frontier_root.state_digest();
+    }
+
+    fn retained_accepted_catalog_dependencies(
+        &self,
+        root: &AcceptedFrontierRoot,
+    ) -> Option<DocumentDependencies> {
+        let retained = self.retained_accepted_catalog.borrow();
+        let entry = retained.as_ref()?;
+        (entry.document_id == self.catalog_document_id
+            && entry.accepted_frontier_state_digest == root.state_digest())
+        .then(|| entry.dependencies.clone())
+    }
+
+    fn retained_accepted_catalog_matches(
+        &self,
+        root: &AcceptedFrontierRoot,
+        candidate: &DocumentDependencies,
+    ) -> bool {
+        if self
+            .retained_catalog_dependency_anchor
+            .get()
+            .is_some_and(|anchor| {
+                candidate.document_id() == self.catalog_document_id
+                    && anchor.accepted_frontier_state_digest == root.state_digest()
+                    && anchor.causal_state_digest == candidate.causal_state_digest()
+            })
+        {
+            return true;
+        }
+        let retained = self.retained_accepted_catalog.borrow();
+        let Some(entry) = retained.as_ref() else {
+            return false;
+        };
+        entry.document_id == self.catalog_document_id
+            && candidate.document_id() == self.catalog_document_id
+            && entry.accepted_frontier_state_digest == root.state_digest()
+            && entry.dependencies.causal_state_digest() == candidate.causal_state_digest()
+    }
+
     /// Drop the retained decode when the store it was resolved against is
     /// replaced. Content identity would survive such a swap on its own, since
     /// the causal state names the same CRDT state in the same lineage, but the
@@ -18702,6 +18957,7 @@ impl ShardedHotEngine {
     /// argument.
     fn forget_retained_accepted_documents(&self) {
         *self.retained_accepted_catalog.borrow_mut() = None;
+        self.retained_catalog_dependency_anchor.set(None);
     }
 
     #[cfg(test)]
@@ -22337,6 +22593,62 @@ impl ShardedHotEngine {
             canonical_peer_counters(&document.oplog_vv())?,
             heads.into_iter().collect(),
         )?)
+    }
+
+    /// Recover one exact current document frontier without materializing the
+    /// document. Journal-local state wins. The catalog may reuse the exact
+    /// accepted-root binding retained by catalog materialization and advanced
+    /// only across authenticated events that did not touch it; a cold or
+    /// mismatched binding takes the accepted-frontier point proof.
+    fn current_hot_document_dependencies_by_id(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<DocumentDependencies, EngineError> {
+        if let Some(document) = self.local_overlay.documents.get(&document_id) {
+            return self.current_hot_document_dependencies(document_id, document);
+        }
+        if document_id == self.catalog_document_id {
+            if let Some(dependencies) =
+                self.retained_accepted_catalog_dependencies(&self.accepted_frontier_root)
+            {
+                return Ok(dependencies);
+            }
+        }
+        if self.scratch.is_some() {
+            if let Some(dependencies) =
+                self.accepted_frontier_document(&self.accepted_frontier_root, document_id)?
+            {
+                if document_id == self.catalog_document_id {
+                    self.retained_catalog_dependency_anchor.set(Some(
+                        AuthenticatedCatalogDependencyAnchor {
+                            accepted_frontier_state_digest: self
+                                .accepted_frontier_root
+                                .state_digest(),
+                            causal_state_digest: dependencies.causal_state_digest(),
+                        },
+                    ));
+                }
+                return Ok(dependencies);
+            }
+            // A promoted engine can author its initial local seed before the
+            // first accepted frontier contains the catalog. That engine-owned
+            // visible document remains the authority for this narrow
+            // pre-acceptance state; an authenticated lookup error still
+            // returns above and never falls through here.
+            if document_id == self.catalog_document_id {
+                if let Some(document) = self.current_catalog_document()? {
+                    return self.current_hot_document_dependencies(document_id, document);
+                }
+            }
+            return Err(EngineError::MissingDocument(document_id));
+        }
+        let document = if document_id == self.catalog_document_id {
+            self.current_catalog_document()?
+        } else {
+            self.visible_documents.get(&document_id)
+        }
+        .ok_or(EngineError::MissingDocument(document_id))?;
+        self.current_hot_document_dependencies(document_id, document)
     }
 
     fn retain_hot_document(&mut self, document_id: DocumentId) {

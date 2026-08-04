@@ -98,7 +98,10 @@ use crate::oplog::object_store::{
     ObjectStore, ObjectStoreManifestCursor,
 };
 #[cfg(test)]
-use crate::oplog::operational_coordinator::{fail_repeatedly_at, OperationalFaultPoint};
+use crate::oplog::operational_coordinator::{
+    fail_repeatedly_at, last_trusted_local_preparation_stage_timings, OperationalFaultPoint,
+    TrustedLocalPreparationStageTimings,
+};
 use crate::oplog::operational_coordinator::{
     LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
     LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
@@ -328,6 +331,8 @@ struct RuntimeOpenInstrumentation {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct ManagedApplicationSaveInstrumentation {
+    application_stages: ManagedApplicationSaveStageTimings,
+    preparation_stages: TrustedLocalPreparationStageTimings,
     commit_stages: TrustedLocalCommitStageTimings,
     forbidden: ForbiddenCommitWork,
     graph_wide: GraphWideCommitWork,
@@ -335,6 +340,55 @@ struct ManagedApplicationSaveInstrumentation {
     provider_pending: usize,
     managed_local_pending: usize,
     managed_local_next_sequence: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ManagedApplicationSaveStageTimings {
+    actor_total: Duration,
+    application_prepare_turn: Duration,
+    application_request_build: Duration,
+    exact_page_load: Duration,
+    editor_prepare_turn: Duration,
+    editor_total: Duration,
+    editor_transaction_build: Duration,
+    promoted_mutation_admission: Duration,
+    application_outcome: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_APPLICATION_SAVE_STAGE_TIMINGS: std::cell::Cell<ManagedApplicationSaveStageTimings> =
+        std::cell::Cell::new(ManagedApplicationSaveStageTimings {
+            actor_total: Duration::ZERO,
+            application_prepare_turn: Duration::ZERO,
+            application_request_build: Duration::ZERO,
+            exact_page_load: Duration::ZERO,
+            editor_prepare_turn: Duration::ZERO,
+            editor_total: Duration::ZERO,
+            editor_transaction_build: Duration::ZERO,
+            promoted_mutation_admission: Duration::ZERO,
+            application_outcome: Duration::ZERO,
+        });
+}
+
+#[cfg(test)]
+fn reset_application_save_stage_timings() {
+    LAST_APPLICATION_SAVE_STAGE_TIMINGS.set(ManagedApplicationSaveStageTimings::default());
+}
+
+#[cfg(test)]
+fn note_application_save_stage(update: impl FnOnce(&mut ManagedApplicationSaveStageTimings)) {
+    LAST_APPLICATION_SAVE_STAGE_TIMINGS.with(|timings| {
+        let mut current = timings.get();
+        update(&mut current);
+        timings.set(current);
+    });
+}
+
+#[cfg(test)]
+fn last_application_save_stage_timings() -> ManagedApplicationSaveStageTimings {
+    LAST_APPLICATION_SAVE_STAGE_TIMINGS.get()
 }
 
 #[cfg(test)]
@@ -5384,7 +5438,13 @@ fn run_actor_loop(
                 false
             }
             ActorRequest::SaveApplicationPage { request, reply } => {
+                #[cfg(test)]
+                let started = Instant::now();
                 let result = actor.save_application_page(request);
+                #[cfg(test)]
+                note_application_save_stage(|timings| {
+                    timings.actor_total = started.elapsed();
+                });
                 let _ = reply.send(result);
                 false
             }
@@ -5470,6 +5530,8 @@ fn run_actor_loop(
                     .engine()
                     .instrumentation();
                 let _ = reply.send(ManagedApplicationSaveInstrumentation {
+                    application_stages: last_application_save_stage_timings(),
+                    preparation_stages: last_trusted_local_preparation_stage_timings(),
                     commit_stages: last_commit_stage_timings(),
                     forbidden: forbidden_commit_work(),
                     graph_wide: graph_wide_commit_work(),
@@ -7519,12 +7581,30 @@ impl RuntimeActor {
         &mut self,
         request: SyncApplicationPageSaveRequest,
     ) -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+        #[cfg(test)]
+        reset_application_save_stage_timings();
+        #[cfg(test)]
+        let prepare_started = Instant::now();
+        let readiness = self.prepare_editor_turn();
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.application_prepare_turn = prepare_started.elapsed();
+        });
+        if let EditorTurnReadiness::Deferred(state) = readiness {
             return Ok(SyncApplicationPageSaveOutcome::Deferred { state });
         }
+        #[cfg(test)]
+        let request_started = Instant::now();
         let (editor_request, reload_target, prepared_existing) = match &request.target {
             SyncApplicationPageSaveTarget::Existing { path, revision } => {
-                let mut current = match self.load_application_save_exact_ready(path)? {
+                #[cfg(test)]
+                let load_started = Instant::now();
+                let load = self.load_application_save_exact_ready(path)?;
+                #[cfg(test)]
+                note_application_save_stage(|timings| {
+                    timings.exact_page_load = load_started.elapsed();
+                });
+                let mut current = match load {
                     ApplicationExactLoad::Loaded(current) => current,
                     ApplicationExactLoad::Missing => {
                         return Ok(SyncApplicationPageSaveOutcome::Conflict {
@@ -7628,10 +7708,22 @@ impl RuntimeActor {
             }
         };
         validate_editor_save_request(&editor_request).map_err(map_editor_application_error)?;
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.application_request_build = request_started.elapsed();
+        });
+        #[cfg(test)]
+        let editor_started = Instant::now();
         let editor_outcome = self
             .save_editor_page_with_existing_application(editor_request, prepared_existing)
             .map_err(map_editor_application_error)?;
-        match editor_outcome {
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.editor_total = editor_started.elapsed();
+        });
+        #[cfg(test)]
+        let outcome_started = Instant::now();
+        let outcome = match editor_outcome {
             SyncEditorSaveOutcome::Durable { batch_id, page, .. } => {
                 let accepted = match self.prepared_application_reply.take() {
                     Some((prepared_batch, accepted)) if prepared_batch == batch_id => accepted,
@@ -7702,7 +7794,12 @@ impl RuntimeActor {
             SyncEditorSaveOutcome::Deferred { state, .. } => {
                 Ok(SyncApplicationPageSaveOutcome::Deferred { state })
             }
-        }
+        };
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.application_outcome = outcome_started.elapsed();
+        });
+        outcome
     }
 
     fn settle_application_publication(
@@ -7897,12 +7994,21 @@ impl RuntimeActor {
         mut prepared_existing: Option<ApplicationCurrentPage>,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         self.prepared_application_reply = None;
-        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+        #[cfg(test)]
+        let prepare_started = Instant::now();
+        let readiness = self.prepare_editor_turn();
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.editor_prepare_turn = prepare_started.elapsed();
+        });
+        if let EditorTurnReadiness::Deferred(state) = readiness {
             return Ok(SyncEditorSaveOutcome::Deferred {
                 state,
                 affected_page_ids: Vec::new(),
             });
         }
+        #[cfg(test)]
+        let transaction_started = Instant::now();
         let (page_id, transaction, affected_page_ids, existing_application, trusted_target_page) =
             match &request.target {
                 SyncEditorSaveTarget::Existing { page_id, revision } => {
@@ -8142,6 +8248,11 @@ impl RuntimeActor {
                 }
             };
 
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.editor_transaction_build = transaction_started.elapsed();
+        });
+
         let Some(transaction) = transaction else {
             let current = match existing_application {
                 Some(current) => current.editor,
@@ -8366,7 +8477,14 @@ impl RuntimeActor {
                 .runtime
                 .as_mut()
                 .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-            let mut session = match runtime.admit_promoted_mutation(authority, &self.graph) {
+            #[cfg(test)]
+            let admission_started = Instant::now();
+            let admission = runtime.admit_promoted_mutation(authority, &self.graph);
+            #[cfg(test)]
+            note_application_save_stage(|timings| {
+                timings.promoted_mutation_admission = admission_started.elapsed();
+            });
+            let mut session = match admission {
                 Ok(session) => session,
                 Err(_) => {
                     if runtime.workspace_authority_revocation().is_some() {
@@ -16227,6 +16345,177 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn managed_application_save_is_semantically_and_structurally_page_local_across_graph_sizes() {
+        fn run(
+            total_pages: usize,
+            seed: u128,
+        ) -> (
+            serde_json::Value,
+            Vec<u8>,
+            ManagedApplicationSavePageLocalReads,
+            usize,
+            usize,
+        ) {
+            let fixture = ActivationFixture::scaled_with_target_and_unrelated_blocks(
+                &format!("managed-save-page-local-{total_pages}"),
+                seed,
+                total_pages - 3,
+                10,
+                1,
+            );
+            let request = reopen_request(&fixture.request);
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let handle = activated.handle.expect("scaled fixture activates");
+            drive_initial_feed(&handle);
+
+            let (mut page, revision) =
+                load_application_logical(&handle, "Synthetic 0", SyncPageKind::Page);
+            let stale_page = page.clone();
+            let stale_revision = revision.clone();
+            page.blocks[0].raw = "same bounded managed edit — Ω".into();
+            let page_blocks = flatten_application_blocks(&page.blocks).len();
+            let before = handle
+                .managed_application_save_instrumentation()
+                .expect("scaled save exposes foreground instrumentation");
+            let outcome = handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: page.path.clone(),
+                        revision,
+                    },
+                    page,
+                })
+                .unwrap();
+            let after = handle
+                .managed_application_save_instrumentation()
+                .expect("scaled save exposes post-save instrumentation");
+            let reads =
+                assert_managed_application_save_foreground_counters(before, after, page_blocks);
+            let (mut saved, mut saved_revision) = match outcome {
+                SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+                other => panic!("scaled ordinary save was not direct: {other:?}"),
+            };
+            saved.blocks[0].raw = "same bounded consecutive managed edit — Ω".into();
+            let before = handle
+                .managed_application_save_instrumentation()
+                .expect("consecutive save exposes foreground instrumentation");
+            let outcome = handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: saved.path.clone(),
+                        revision: saved_revision,
+                    },
+                    page: saved,
+                })
+                .unwrap();
+            let after = handle
+                .managed_application_save_instrumentation()
+                .expect("consecutive save exposes post-save instrumentation");
+            let consecutive_reads =
+                assert_managed_application_save_foreground_counters(before, after, page_blocks);
+            let acquisition_head_visits = after.engine.projection_acquisition_durable_head_visits
+                - before.engine.projection_acquisition_durable_head_visits;
+            let ancestry_traversals =
+                after.engine.ancestry_traversals - before.engine.ancestry_traversals;
+            assert_eq!(consecutive_reads.external_points, 0);
+            assert_eq!(
+                consecutive_reads.history_points,
+                0,
+                "history components page={} blob={} record={} index={} decode={}",
+                after.engine.external_history_page_reads
+                    - before.engine.external_history_page_reads,
+                after.engine.external_history_blob_reads
+                    - before.engine.external_history_blob_reads,
+                after.engine.store.history_record_reads - before.engine.store.history_record_reads,
+                after.engine.store.history_index_reads - before.engine.store.history_index_reads,
+                after.engine.store.history_decodes - before.engine.store.history_decodes,
+            );
+            (saved, saved_revision) = match outcome {
+                SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+                other => panic!("consecutive scaled ordinary save was not direct: {other:?}"),
+            };
+            let saved_bytes = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
+            let parsed = Graph::open(&fixture.graph_root)
+                .load_by_path(&saved.path)
+                .unwrap()
+                .expect("scaled saved page remains parseable");
+            assert_parser_dto_semantics(&saved, &parsed);
+
+            // A foreign block identity and a stale page revision both refuse
+            // without appending another journal frame or changing visible
+            // graph/actor state.
+            let committed_status = handle.status().unwrap();
+            let committed_graph = user_graph_bytes(&fixture.graph_root);
+            let committed_frames = managed_local_journal_frames(&request);
+            let mut wrong_identity = saved.clone();
+            wrong_identity.blocks[0].id =
+                format!("{SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX}{}", Uuid::new_v4());
+            wrong_identity.blocks[0].raw = "foreign identity must remain invisible".into();
+            assert!(matches!(
+                handle.save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: saved.path.clone(),
+                        revision: saved_revision,
+                    },
+                    page: wrong_identity,
+                }),
+                Err(SyncApplicationPageRequestError::ActorRefused)
+                    | Ok(SyncApplicationPageSaveOutcome::Conflict {
+                        reason: SyncApplicationPageConflict::UnknownOrForeignBlock
+                    })
+            ));
+            let mut stale_page = stale_page;
+            stale_page.blocks[0].raw = "stale edit must remain invisible".into();
+            assert!(matches!(
+                handle
+                    .save_application_page(SyncApplicationPageSaveRequest {
+                        target: SyncApplicationPageSaveTarget::Existing {
+                            path: stale_page.path.clone(),
+                            revision: stale_revision,
+                        },
+                        page: stale_page,
+                    })
+                    .unwrap(),
+                SyncApplicationPageSaveOutcome::Conflict {
+                    reason: SyncApplicationPageConflict::StaleBase
+                }
+            ));
+            assert_eq!(handle.status().unwrap(), committed_status);
+            assert_eq!(user_graph_bytes(&fixture.graph_root), committed_graph);
+            assert_eq!(managed_local_journal_frames(&request), committed_frames);
+
+            let mut semantic = saved;
+            erase_application_block_ids(&mut semantic.blocks);
+            let semantic = serde_json::to_value(semantic).unwrap();
+            drop(handle);
+            (
+                semantic,
+                saved_bytes,
+                reads,
+                acquisition_head_visits,
+                ancestry_traversals,
+            )
+        }
+
+        let small = run(4, 0xa122);
+        let large = run(128, 0xa132);
+        assert_eq!(small.0, large.0, "unrelated pages changed save semantics");
+        assert_eq!(
+            small.1, large.1,
+            "unrelated pages changed exact graph bytes"
+        );
+        assert_eq!(
+            small.2, large.2,
+            "foreground point work must depend on the edited page, not graph size"
+        );
+        assert_eq!(small.3, 0, "journal-local acquisition is already proven");
+        assert_eq!(large.3, 0, "journal-local acquisition is already proven");
+        assert_eq!(small.4, 0, "unchanged catalog needs no ancestry traversal");
+        assert_eq!(large.4, 0, "unchanged catalog needs no ancestry traversal");
     }
 
     #[test]
@@ -29277,11 +29566,13 @@ mod tests {
     #[derive(Clone, Copy)]
     struct ManagedApplicationSaveBenchmarkSample {
         caller: Duration,
+        application_stages: ManagedApplicationSaveStageTimings,
+        preparation_stages: TrustedLocalPreparationStageTimings,
         stages: TrustedLocalCommitStageTimings,
         page_local_reads: ManagedApplicationSavePageLocalReads,
     }
 
-    #[derive(Clone, Copy, Debug, Default)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct ManagedApplicationSavePageLocalReads {
         external_points: usize,
         history_points: usize,
@@ -29315,6 +29606,56 @@ mod tests {
     ) -> String {
         let (caller_p50, caller_p95) =
             managed_application_save_quantiles(samples, |sample| sample.caller);
+        let (actor_total_p50, actor_total_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.actor_total
+            });
+        let (application_prepare_p50, application_prepare_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.application_prepare_turn
+            });
+        let (exact_page_load_p50, exact_page_load_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.exact_page_load
+            });
+        let (application_request_p50, application_request_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.application_request_build
+            });
+        let (editor_prepare_p50, editor_prepare_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.editor_prepare_turn
+            });
+        let (editor_transaction_p50, editor_transaction_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.editor_transaction_build
+            });
+        let (editor_total_p50, editor_total_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.editor_total
+            });
+        let (mutation_admission_p50, mutation_admission_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.promoted_mutation_admission
+            });
+        let (application_outcome_p50, application_outcome_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.application_stages.application_outcome
+            });
+        let (session_parts_p50, session_parts_p95) =
+            managed_application_save_quantiles(samples, |sample| {
+                sample.preparation_stages.session_parts
+            });
+        let (bindings_p50, bindings_p95) = managed_application_save_quantiles(samples, |sample| {
+            sample.preparation_stages.bindings
+        });
+        let (draft_p50, draft_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.preparation_stages.draft);
+        let (capture_p50, capture_p95) =
+            managed_application_save_quantiles(samples, |sample| sample.preparation_stages.capture);
+        let (finalize_p50, finalize_p95) = managed_application_save_quantiles(samples, |sample| {
+            sample.preparation_stages.finalize
+        });
         let (prepared_p50, prepared_p95) =
             managed_application_save_quantiles(samples, |sample| sample.stages.prepared_record);
         let (graph_p50, graph_p95) =
@@ -29342,9 +29683,37 @@ mod tests {
                 sample.page_local_reads.history_points
             });
         format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
+            startup_ms(actor_total_p50),
+            startup_ms(actor_total_p95),
+            startup_ms(application_prepare_p50),
+            startup_ms(application_prepare_p95),
+            startup_ms(application_request_p50),
+            startup_ms(application_request_p95),
+            startup_ms(exact_page_load_p50),
+            startup_ms(exact_page_load_p95),
+            startup_ms(editor_prepare_p50),
+            startup_ms(editor_prepare_p95),
+            startup_ms(editor_total_p50),
+            startup_ms(editor_total_p95),
+            startup_ms(editor_transaction_p50),
+            startup_ms(editor_transaction_p95),
+            startup_ms(mutation_admission_p50),
+            startup_ms(mutation_admission_p95),
+            startup_ms(application_outcome_p50),
+            startup_ms(application_outcome_p95),
+            startup_ms(session_parts_p50),
+            startup_ms(session_parts_p95),
+            startup_ms(bindings_p50),
+            startup_ms(bindings_p95),
+            startup_ms(draft_p50),
+            startup_ms(draft_p95),
+            startup_ms(capture_p50),
+            startup_ms(capture_p95),
+            startup_ms(finalize_p50),
+            startup_ms(finalize_p95),
             startup_ms(prepared_p50),
             startup_ms(prepared_p95),
             startup_ms(graph_p50),
@@ -29406,6 +29775,11 @@ mod tests {
         assert_eq!(
             after_engine.catalog_hot_state_loads, before_engine.catalog_hot_state_loads,
             "warm ordinary save must not materialize the catalog"
+        );
+        assert_eq!(
+            after_engine.prospective_catalog_shape_entry_visits,
+            before_engine.prospective_catalog_shape_entry_visits,
+            "ordinary application save must not visit unrelated catalog entries while drafting"
         );
         assert_eq!(
             after_engine.drain_candidate_visits, before_engine.drain_candidate_visits,
@@ -29869,6 +30243,8 @@ mod tests {
                         );
                         managed_samples.push(ManagedApplicationSaveBenchmarkSample {
                             caller,
+                            application_stages: counters_after.application_stages,
+                            preparation_stages: counters_after.preparation_stages,
                             stages: counters_after.commit_stages,
                             page_local_reads,
                         });

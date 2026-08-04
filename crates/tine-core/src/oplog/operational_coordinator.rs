@@ -8,6 +8,8 @@
 
 use std::fmt;
 use std::sync::Arc;
+#[cfg(test)]
+use std::time::{Duration, Instant};
 
 use crate::model::{HandoffSafeGuard, PublishedHandoffLatch};
 use crate::Graph;
@@ -31,6 +33,52 @@ use super::{
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
 const RESUME_OPERATION_BUDGET: usize = 16;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TrustedLocalPreparationStageTimings {
+    pub(crate) session_parts: Duration,
+    pub(crate) bindings: Duration,
+    pub(crate) draft: Duration,
+    pub(crate) capture: Duration,
+    pub(crate) finalize: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_TRUSTED_LOCAL_PREPARATION_STAGE_TIMINGS:
+        std::cell::Cell<TrustedLocalPreparationStageTimings> =
+        std::cell::Cell::new(TrustedLocalPreparationStageTimings {
+            session_parts: Duration::ZERO,
+            bindings: Duration::ZERO,
+            draft: Duration::ZERO,
+            capture: Duration::ZERO,
+            finalize: Duration::ZERO,
+        });
+}
+
+#[cfg(test)]
+fn reset_trusted_local_preparation_stage_timings() {
+    LAST_TRUSTED_LOCAL_PREPARATION_STAGE_TIMINGS
+        .set(TrustedLocalPreparationStageTimings::default());
+}
+
+#[cfg(test)]
+fn note_trusted_local_preparation_stage(
+    update: impl FnOnce(&mut TrustedLocalPreparationStageTimings),
+) {
+    LAST_TRUSTED_LOCAL_PREPARATION_STAGE_TIMINGS.with(|timings| {
+        let mut current = timings.get();
+        update(&mut current);
+        timings.set(current);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn last_trusted_local_preparation_stage_timings() -> TrustedLocalPreparationStageTimings
+{
+    LAST_TRUSTED_LOCAL_PREPARATION_STAGE_TIMINGS.get()
+}
 
 struct ResumeBudget {
     remaining: usize,
@@ -1197,10 +1245,18 @@ impl OperationalCoordinator {
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
     ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
+        #[cfg(test)]
+        reset_trusted_local_preparation_stage_timings();
+        #[cfg(test)]
+        let parts_started = Instant::now();
         let (admission, engine, _database, _tail, bootstrap) =
             session.parts_with_bootstrap().map_err(|refusal| {
                 OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
             })?;
+        #[cfg(test)]
+        note_trusted_local_preparation_stage(|timings| {
+            timings.session_parts = parts_started.elapsed();
+        });
         prepare_local_inner(
             &admission,
             graph,
@@ -1385,6 +1441,8 @@ fn prepare_local_inner(
     binding: LocalPreparationBinding,
     transaction: &OperationTransaction,
 ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
+    #[cfg(test)]
+    let bindings_started = Instant::now();
     authorize_coordinator(admission, graph, engine)?;
     let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
         OperationalCoordinatorError::new(
@@ -1418,7 +1476,13 @@ fn prepare_local_inner(
         .map_err(|error| {
             OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
         })?;
+    #[cfg(test)]
+    note_trusted_local_preparation_stage(|timings| {
+        timings.bindings = bindings_started.elapsed();
+    });
 
+    #[cfg(test)]
+    let draft_started = Instant::now();
     let (batch_id, author_device_id, author_session_id, draft) = match source {
         LocalDraftSource::Promoted => {
             let authority = admission
@@ -1455,6 +1519,12 @@ fn prepare_local_inner(
         }
     };
     fault(OperationalFaultPoint::AfterDraft)?;
+    #[cfg(test)]
+    note_trusted_local_preparation_stage(|timings| {
+        timings.draft = draft_started.elapsed();
+    });
+    #[cfg(test)]
+    let capture_started = Instant::now();
     let captured = match engine
         .capture_local_author_transaction(draft, graph, receipts, endpoint, bootstrap)
         .map_err(|error| {
@@ -1469,6 +1539,12 @@ fn prepare_local_inner(
         }
     };
     fault(OperationalFaultPoint::AfterCapture)?;
+    #[cfg(test)]
+    note_trusted_local_preparation_stage(|timings| {
+        timings.capture = capture_started.elapsed();
+    });
+    #[cfg(test)]
+    let finalize_started = Instant::now();
     let prepared = engine
         .finalize_captured_author_transaction(captured, receipts)
         .map_err(|error| {
@@ -1486,6 +1562,10 @@ fn prepare_local_inner(
         ));
     }
     fault(OperationalFaultPoint::AfterFinalize)?;
+    #[cfg(test)]
+    note_trusted_local_preparation_stage(|timings| {
+        timings.finalize = finalize_started.elapsed();
+    });
     Ok(PreparedLocalMutationState::Prepared(
         PreparedLocalMutation {
             endpoint,

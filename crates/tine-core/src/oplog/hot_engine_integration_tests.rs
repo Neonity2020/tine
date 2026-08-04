@@ -6603,11 +6603,14 @@ struct WarmDraftWork {
     prospective_document_copies: usize,
     prospective_document_copy_ops: usize,
     prospective_catalog_document_copies: usize,
+    prospective_catalog_shape_entry_visits: usize,
     author_snapshot_clones: usize,
     author_snapshot_clone_ops: usize,
     prepare_document_head_visits: usize,
     catalog_page_entry_visits: usize,
-    scratch_page_reads: usize,
+    document_point_reads: usize,
+    external_point_reads: usize,
+    history_point_reads: usize,
 }
 
 fn warm_draft_work(fixture: &WarmCatalogFixture, batch: u128, content: &str) -> WarmDraftWork {
@@ -6629,6 +6632,8 @@ fn warm_draft_work(fixture: &WarmCatalogFixture, batch: u128, content: &str) -> 
             - before.prospective_document_copy_ops,
         prospective_catalog_document_copies: after.prospective_catalog_document_copies
             - before.prospective_catalog_document_copies,
+        prospective_catalog_shape_entry_visits: after.prospective_catalog_shape_entry_visits
+            - before.prospective_catalog_shape_entry_visits,
         author_snapshot_clones: after.author_snapshot_clones - before.author_snapshot_clones,
         author_snapshot_clone_ops: after.author_snapshot_clone_ops
             - before.author_snapshot_clone_ops,
@@ -6636,14 +6641,25 @@ fn warm_draft_work(fixture: &WarmCatalogFixture, batch: u128, content: &str) -> 
             - before.prepare_document_head_visits,
         catalog_page_entry_visits: crate::oplog::hot_engine::catalog_page_entry_visits()
             - before_entries,
-        scratch_page_reads: after.scratch_page_reads - before.scratch_page_reads,
+        document_point_reads: after.document_point_reads - before.document_point_reads,
+        external_point_reads: after.external_point_reads - before.external_point_reads,
+        history_point_reads: (after.external_history_page_reads
+            - before.external_history_page_reads)
+            + (after.external_history_blob_reads - before.external_history_blob_reads)
+            + (after.store.history_record_reads - before.store.history_record_reads)
+            + (after.store.history_index_reads - before.store.history_index_reads)
+            + (after.store.history_decodes - before.store.history_decodes),
     }
 }
 
 #[test]
 fn warm_one_page_content_edit_draft_is_independent_of_total_graph_pages() {
-    let small = WarmCatalogFixture::new("warm-draft-small", 4);
-    let large = WarmCatalogFixture::new("warm-draft-large", 40);
+    let mut small = WarmCatalogFixture::new("warm-draft-small", 4);
+    let mut large = WarmCatalogFixture::new("warm-draft-large", 40);
+    let small_base = small.content_edit("TODO accepted warm base");
+    let large_base = large.content_edit("TODO accepted warm base");
+    small.accept(94_800, &small_base);
+    large.accept(94_900, &large_base);
     let small_work = warm_draft_work(&small, 95_000, "TODO edited [[Warm 00001]]");
     let large_work = warm_draft_work(&large, 95_100, "TODO edited [[Warm 00001]]");
 
@@ -6659,6 +6675,8 @@ fn warm_one_page_content_edit_draft_is_independent_of_total_graph_pages() {
         "a warm one-page content edit must not reproduce the whole-graph catalog"
     );
     assert_eq!(large_work.prospective_catalog_document_copies, 0);
+    assert_eq!(small_work.prospective_catalog_shape_entry_visits, 0);
+    assert_eq!(large_work.prospective_catalog_shape_entry_visits, 0);
     assert_eq!(
         small_work.catalog_page_entry_visits, 0,
         "a warm one-page content edit must not enumerate every catalog page"
@@ -6669,8 +6687,20 @@ fn warm_one_page_content_edit_draft_is_independent_of_total_graph_pages() {
         "only the edited page's own shard is reproduced"
     );
     assert!(
-        small_work.scratch_page_reads > 0,
-        "the draft really does read authenticated durable state"
+        small_work.external_point_reads <= 4,
+        "the accepted-page proof may perform only constant-size point reads"
+    );
+    assert_eq!(
+        large_work.external_point_reads,
+        small_work.external_point_reads
+    );
+    assert!(
+        small_work.history_point_reads <= 12,
+        "the accepted-page proof may perform only constant-size history points"
+    );
+    assert_eq!(
+        large_work.history_point_reads,
+        small_work.history_point_reads
     );
 }
 
@@ -6696,6 +6726,13 @@ fn warm_draft_previous_derivation_still_reproduces_the_whole_catalog() {
     assert_eq!(large_observed.oracle_catalog_copies, 1);
     assert_eq!(small_observed.optimized_catalog_copies, 0);
     assert_eq!(large_observed.optimized_catalog_copies, 0);
+    assert!(
+        large_observed.oracle_catalog_shape_entry_visits
+            > small_observed.oracle_catalog_shape_entry_visits,
+        "the prior derivation's catalog shape proof must expose its graph-sized work"
+    );
+    assert_eq!(small_observed.optimized_catalog_shape_entry_visits, 0);
+    assert_eq!(large_observed.optimized_catalog_shape_entry_visits, 0);
 }
 
 #[test]
