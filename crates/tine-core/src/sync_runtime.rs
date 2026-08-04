@@ -16355,7 +16355,7 @@ mod tests {
         ) -> (
             serde_json::Value,
             Vec<u8>,
-            ManagedApplicationSavePageLocalReads,
+            Vec<ManagedApplicationSavePageLocalReads>,
             usize,
             usize,
         ) {
@@ -16399,45 +16399,60 @@ mod tests {
                 SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
                 other => panic!("scaled ordinary save was not direct: {other:?}"),
             };
-            saved.blocks[0].raw = "same bounded consecutive managed edit — Ω".into();
-            let before = handle
-                .managed_application_save_instrumentation()
-                .expect("consecutive save exposes foreground instrumentation");
-            let outcome = handle
-                .save_application_page(SyncApplicationPageSaveRequest {
-                    target: SyncApplicationPageSaveTarget::Existing {
-                        path: saved.path.clone(),
-                        revision: saved_revision,
-                    },
-                    page: saved,
-                })
-                .unwrap();
-            let after = handle
-                .managed_application_save_instrumentation()
-                .expect("consecutive save exposes post-save instrumentation");
-            let consecutive_reads =
-                assert_managed_application_save_foreground_counters(before, after, page_blocks);
-            let acquisition_head_visits = after.engine.projection_acquisition_durable_head_visits
-                - before.engine.projection_acquisition_durable_head_visits;
-            let ancestry_traversals =
-                after.engine.ancestry_traversals - before.engine.ancestry_traversals;
-            assert_eq!(consecutive_reads.external_points, 0);
-            assert_eq!(
-                consecutive_reads.history_points,
-                0,
-                "history components page={} blob={} record={} index={} decode={}",
-                after.engine.external_history_page_reads
-                    - before.engine.external_history_page_reads,
-                after.engine.external_history_blob_reads
-                    - before.engine.external_history_blob_reads,
-                after.engine.store.history_record_reads - before.engine.store.history_record_reads,
-                after.engine.store.history_index_reads - before.engine.store.history_index_reads,
-                after.engine.store.history_decodes - before.engine.store.history_decodes,
-            );
-            (saved, saved_revision) = match outcome {
-                SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
-                other => panic!("consecutive scaled ordinary save was not direct: {other:?}"),
-            };
+            let mut page_local_reads = vec![reads];
+            let mut acquisition_head_visits = 0;
+            let mut ancestry_traversals = 0;
+            for revision_number in 2..=12 {
+                saved.blocks[0].raw =
+                    format!("same bounded consecutive managed edit {revision_number} — Ω");
+                let before = handle
+                    .managed_application_save_instrumentation()
+                    .expect("consecutive save exposes foreground instrumentation");
+                let outcome = handle
+                    .save_application_page(SyncApplicationPageSaveRequest {
+                        target: SyncApplicationPageSaveTarget::Existing {
+                            path: saved.path.clone(),
+                            revision: saved_revision,
+                        },
+                        page: saved,
+                    })
+                    .unwrap();
+                let after = handle
+                    .managed_application_save_instrumentation()
+                    .expect("consecutive save exposes post-save instrumentation");
+                let consecutive_reads =
+                    assert_managed_application_save_foreground_counters(before, after, page_blocks);
+                acquisition_head_visits += after.engine.projection_acquisition_durable_head_visits
+                    - before.engine.projection_acquisition_durable_head_visits;
+                ancestry_traversals +=
+                    after.engine.ancestry_traversals - before.engine.ancestry_traversals;
+                assert_eq!(consecutive_reads.external_points, 0);
+                assert_eq!(
+                    consecutive_reads.history_points,
+                    0,
+                    "history components revision={revision_number} page={} blob={} record={} index={} decode={}",
+                    after.engine.external_history_page_reads
+                        - before.engine.external_history_page_reads,
+                    after.engine.external_history_blob_reads
+                        - before.engine.external_history_blob_reads,
+                    after.engine.store.history_record_reads
+                        - before.engine.store.history_record_reads,
+                    after.engine.store.history_index_reads
+                        - before.engine.store.history_index_reads,
+                    after.engine.store.history_decodes - before.engine.store.history_decodes,
+                );
+                (saved, saved_revision) = match outcome {
+                    SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => {
+                        (page, revision)
+                    }
+                    other => panic!(
+                        "consecutive scaled ordinary save {revision_number} was not direct: {other:?}"
+                    ),
+                };
+                page_local_reads.push(consecutive_reads);
+            }
+            assert_eq!(handle.status().unwrap().managed_local_pending, 12);
+            assert_eq!(managed_local_journal_frames(&request).len(), 12);
             let saved_bytes = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
             let parsed = Graph::open(&fixture.graph_root)
                 .load_by_path(&saved.path)
@@ -16495,7 +16510,7 @@ mod tests {
             (
                 semantic,
                 saved_bytes,
-                reads,
+                page_local_reads,
                 acquisition_head_visits,
                 ancestry_traversals,
             )

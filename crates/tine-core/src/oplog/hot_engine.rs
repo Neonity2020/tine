@@ -17576,14 +17576,22 @@ impl ShardedHotEngine {
                 {
                     continue;
                 }
-                if lifecycle_completion.as_ref().is_some_and(|completion| {
-                    intent.post_frontier() != completion.frontier()
-                        || intent
-                            .target()
-                            .description()
-                            .map(ProjectionWorkTarget::Present)
-                            != Some(completion.target())
-                }) {
+                // An accepted intent still needs the endpoint completion to
+                // select its exact historical projection. A managed-local
+                // intent instead comes from the exact committed journal entry
+                // named by the current hot frontier; its completion normally
+                // predates that undrained prefix and cannot supersede the
+                // journal authority.
+                if !managed_local
+                    && lifecycle_completion.as_ref().is_some_and(|completion| {
+                        intent.post_frontier() != completion.frontier()
+                            || intent
+                                .target()
+                                .description()
+                                .map(ProjectionWorkTarget::Present)
+                                != Some(completion.target())
+                    })
+                {
                     continue;
                 }
                 let candidate_non_catalog = intent
