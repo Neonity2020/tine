@@ -6204,6 +6204,10 @@ pub struct ShardedHotEngine {
     resume_observation: RuntimeResumeObservation,
     authenticated_replayed_batches: BTreeSet<BatchId>,
     authenticated_replayed_generations: BTreeMap<u64, BatchId>,
+    // Recovery already authenticates every durable history record before
+    // staging it. Retain only the exceptional bootstrap classification so
+    // projection preparation does not reopen the same record a second time.
+    recovery_bootstrap_projection_batches: BTreeSet<BatchId>,
     precommit_history_publication_failure: Option<EngineError>,
     archive_fingerprints: BTreeMap<BatchId, ContentDigest>,
     persisted_staged: BTreeSet<BatchId>,
@@ -6370,6 +6374,7 @@ impl ShardedHotEngine {
             resume_observation: RuntimeResumeObservation::default(),
             authenticated_replayed_batches: BTreeSet::new(),
             authenticated_replayed_generations: BTreeMap::new(),
+            recovery_bootstrap_projection_batches: BTreeSet::new(),
             precommit_history_publication_failure: None,
             archive_fingerprints: BTreeMap::new(),
             persisted_staged: BTreeSet::new(),
@@ -11784,7 +11789,14 @@ impl ShardedHotEngine {
             .as_ref()
             .ok()
             .and_then(Option::as_ref)
-            .is_some_and(is_bootstrap_generation);
+            .is_some_and(|record| {
+                matches!(record.status, ArchiveStatus::Accepted { .. })
+                    && is_bootstrap_generation(record)
+            });
+        if self.authenticated_history_replay && replaying_bootstrap_generation {
+            self.recovery_bootstrap_projection_batches
+                .insert(offered_batch_id);
+        }
         // Authenticated recovery replays durable accepted history into a fresh
         // scratch run and truthfully reports that reconstruction as Accepted.
         // Ordinary ingress seeing the same durable record is a duplicate even
@@ -15778,17 +15790,11 @@ impl ShardedHotEngine {
         Ok(evidence)
     }
 
-    fn prepare_projection_work(&self, batch_id: BatchId) -> Result<(), EngineError> {
-        let reconstructible_bootstrap = if self.authenticated_history_replay {
-            self.authenticated_recovery_history_record(batch_id)?
-                .as_ref()
-                .is_some_and(|record| {
-                    matches!(record.status, ArchiveStatus::Accepted { .. })
-                        && is_bootstrap_generation(record)
-                })
-        } else {
-            false
-        };
+    fn prepare_projection_work(&mut self, batch_id: BatchId) -> Result<(), EngineError> {
+        let reconstructible_bootstrap = self.authenticated_history_replay
+            && self
+                .recovery_bootstrap_projection_batches
+                .contains(&batch_id);
         self.prepare_projection_work_for_batch(&self.archive[&batch_id], reconstructible_bootstrap)
     }
 
