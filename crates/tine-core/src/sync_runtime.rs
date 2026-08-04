@@ -9500,16 +9500,14 @@ impl RuntimeActor {
         // Once the watcher callback is admitted, its on-disk bytes are the
         // authoritative local observation. Capture them before provider
         // projection can use or replace the same file as a remote base.
-        let startup_feed_waits_for_journal_recovery = self
-            .managed_local
-            .as_ref()
-            .is_some_and(|managed| managed.pending_count() != 0)
-            && self
-                .feed
-                .as_ref()
-                .zip(self.runtime.as_ref())
-                .is_some_and(|(feed, runtime)| feed.only_startup_catch_up_pending(runtime));
-        if self.last_watcher.pending && !startup_feed_waits_for_journal_recovery {
+        let local_derivative_precedes_watcher =
+            self.managed_local.as_ref().is_some_and(|managed| {
+                managed.pending_count() != 0
+                    && managed.continuation.as_ref().is_none_or(|continuation| {
+                        continuation.stage() != ManagedLocalDrainStage::ProviderPublication
+                    })
+            });
+        if self.last_watcher.pending && !local_derivative_precedes_watcher {
             return self.tick_external_feed();
         }
         let managed_waits_for_provider = self
@@ -17132,6 +17130,20 @@ mod tests {
         assert_eq!(echoed.managed_local_pending, 14);
         assert_eq!(fixture.manifest_count(), manifests_before);
         assert_eq!(fixture.applied_batch_count(), applied_before);
+
+        // A broad watcher rescan can be coalesced with Tine's own projection
+        // event. It must not starve an already-journaled local derivative: the
+        // authenticated local frame advances first, then the external feed
+        // gets its turn against the resulting accepted frontier.
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+        assert!(handle.status().unwrap().watcher.pending);
+        assert!(matches!(
+            handle.tick().unwrap(),
+            SyncRuntimeTick::Recovering
+        ));
+        assert!(handle.status().unwrap().watcher.pending);
 
         for _ in 0..512 {
             if handle.status().unwrap().managed_local_pending == 0 {
