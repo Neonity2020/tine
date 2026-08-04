@@ -2056,6 +2056,30 @@
         "failBefore": "proven"
       },
       "notes": "Fail-before: hosted Windows run 30507282266 at exact candidate 7792d3062936e28c2da2089693fd9f644e43305e failed to compile because projection_file_link_count used unstable std::os::windows::fs::MetadataExt::number_of_links and entry_file_identity resolved file_attributes on cap_std metadata to a private implementation method. Projection link count now comes from GetFileInformationByHandle on the already-held file handle, and capability metadata attributes use explicit public cap_fs_ext::OsMetadataExt dispatch. Existing no-follow opens, pre-open and held-handle reparse checks, single-link refusal, identity validation, and error classification remain unchanged."
+    },
+    {
+      "id": "REG-MANAGED-CRASH-REOPEN-PERFORMANCE-001",
+      "title": "Managed storage reopens promptly after an unclean shutdown even when its reconstructible resume accelerator is unavailable",
+      "family": "managed-storage-performance",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "92edd261"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::managed_crash_reopen_real_graph_manual_benchmark"
+        ],
+        "scenario": "managed-storage.crash-reopen-with-and-without-resume-accelerator",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before on 92edd261 against the permitted 1,045-file anonymized graph copy: ordinary pending-save crash takeover adopted its resume point in about 0.2 seconds, while forced accelerator unavailability replayed five bootstrap parts in 30.9 seconds locally (the user observed about 58 seconds on slower hardware), emitted about 338 MiB of filesystem output for a 1.3 MiB graph, and failed the 10-second gate. The visible requirement is prompt correct recovery, not any particular cache representation."
     }
   ]
 }
