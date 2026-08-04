@@ -23,15 +23,17 @@ with per-pane tabs/history and the TreeSheets grid nav model (spec
 in **v0.5.0**. **Multi-graph + multi-window workflow** (GH #55/#70/#56; ADR 0038)
 merged to master as `ad9bf67`.)_
 
-- **Experimental managed sync stabilization** (ADR 0048) — The operation-backed
-  compatible mode is implemented on the `sync` branch: immutable per-session Loro
-  chunks, durable block-ID migration, conservative external Markdown import,
-  receipt-proven conflict cleanup, operation-first save/rename/delete/restore,
-  startup/watcher projection, and an opt-in Settings control. Remaining before this
-  can leave experimental status: full desktop/mobile CI and deployment, real
-  two-device Syncthing/Dropbox soak tests, adversarial long-history performance
-  measurements, canonical private-mode projection policy, and provider-blind
-  encryption. Assets/config remain ordinary provider files in v1.
+- **Experimental managed sync stabilization** (ADR 0049) — The operation-backed
+  compatible mode is now on `master` and exposed only as a **Testing only** opt-in
+  under Settings → Backups & recovery → Storage & sync. It keeps Markdown/Org as
+  an editable projection, records managed history in `.tine-sync/`, supports
+  conservative external-file import and two-device shared-provider setup, and
+  leaves Direct files as the default for every graph. The current managed scope is
+  page and journal text; assets, PDF sidecars, and configuration remain ordinary
+  provider files. Remaining before it can leave experimental status: full
+  desktop/mobile CI and deployment, real two-device Syncthing/Dropbox soak tests,
+  adversarial long-history performance measurements, canonical private-mode
+  projection policy, and provider-blind encryption.
 
 - **Inline-code property lookalikes parse as properties** (Martin, Jul 8 2026:
   fix in Now, "should be treated as code"). A bullet whose text STARTS with an

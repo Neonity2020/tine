@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.90] - 2026-08-04
+
 ### Fixed
 
 - **Post-activation managed-storage reads and writes no longer freeze the app
@@ -43,6 +45,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   priority over remote ingestion. Safe reopen also republishes a completely
   missing provider namespace, and exact deletion of an accepted manifest repairs
   from authenticated local archive bytes.
+- **Eligible Markdown and Org files outside configured page roots stay
+  discoverable and exact-path load/save never exposes a blank writable substitute**
+  (GH #246). Lowercase `.markdown` files and external add/delete updates follow
+  the same graph-wide text scope without overwriting the original bytes.
+- **Page titles now map injectively to reversible, Windows-safe filenames**
+  (GH #249). Existing graph filenames remain readable as stored, while unsafe
+  create/rename/rescue identities and collisions are refused without overwriting
+  another page's bytes.
+- **A missing remembered graph no longer prevents Tine from starting** (GH #250).
+  Startup reaches the visible graph chooser instead of panicking during native
+  setup, without creating or changing the missing path.
+- **Configured default journal templates materialize once across local midnight**
+  (GH #260). Timer, focus, and visibility refreshes use one graph/day guard, so
+  a new day is initialized without duplicate template blocks or stale-graph writes.
 
 ### Changed
 
@@ -2576,7 +2592,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.4...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.6.90...HEAD
+[0.6.90]: https://github.com/martinkoutecky/tine/compare/v0.6.5...v0.6.90
 [0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0
 [0.5.10]: https://github.com/martinkoutecky/tine/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/martinkoutecky/tine/compare/v0.5.8...v0.5.9

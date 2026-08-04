@@ -9,6 +9,7 @@ icon:: 🧭
   - [[Features/Quick capture]] — set up a global capture box that files notes into your graph.
   - [[Features/PDF annotation]] — highlight PDFs and turn those highlights into linked note blocks.
   - [[Features/Plugins]] — install capability-limited extensions and token themes, review what they request, and keep them under your control.
+  - [[Features/Managed sync]] — understand the separate **Testing only** opt-in that can add operation-backed sync while keeping your Markdown/Org graph in place.
   - [[Features/Tips & shortcuts]] — learn Ctrl+K, slash commands, tabs, sidebars, focus mode, and daily shortcuts.
   - [[Feature showcase]] — inspect one live example of each supported Logseq rendering feature.
 - ## Create one yourself

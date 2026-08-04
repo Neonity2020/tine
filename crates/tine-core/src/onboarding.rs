@@ -69,6 +69,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         markdown: include_str!("templates/plugins.md"),
     },
     GuideTemplate {
+        title: "Features/Managed sync",
+        markdown: include_str!("templates/managed-sync.md"),
+    },
+    GuideTemplate {
         title: "Features/Tips & shortcuts",
         markdown: include_str!("templates/tips.md"),
     },
