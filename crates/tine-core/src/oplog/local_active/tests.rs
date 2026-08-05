@@ -69,6 +69,38 @@ use crate::oplog::{
 };
 
 #[test]
+fn promoted_recovery_debug_classifications_are_bounded_and_content_free() {
+    let retained = EngineScratchRetentionPlan::Retained { retained_runs: 2 };
+    assert_eq!(retention_plan_diagnostic(&retained), ("retained", 2));
+    assert_eq!(resume_candidate_diagnostic(&retained, None), "not_read");
+    assert_eq!(
+        resume_candidate_diagnostic(
+            &retained,
+            Some(&ResumeAdoptionCandidate::Unavailable(
+                ResumeAcceleratorUnavailable::NeverPublished,
+            )),
+        ),
+        "never_published"
+    );
+
+    let ephemeral = EngineScratchRetentionPlan::Ephemeral {
+        retained_runs: 3,
+        reason: crate::oplog::resume_point::ResumePointError::TooManyPoints(3),
+    };
+    assert_eq!(retention_plan_diagnostic(&ephemeral), ("ephemeral", 3));
+    assert_eq!(
+        resume_candidate_diagnostic(&ephemeral, None),
+        "not_read_ephemeral"
+    );
+    assert_eq!(
+        recovery_diagnostic_class(RuntimeRecoveryState::TookOverCrashedUnsafe {
+            previous_session: SessionId::new(),
+        }),
+        "crash_takeover"
+    );
+}
+
+#[test]
 fn activation_uses_the_enrollment_transitions_post_commit_reopen_without_repeating_it() {
     let source = include_str!("../local_active.rs");
     let start = source.find("fn activate_with_optional_cut(").unwrap();
