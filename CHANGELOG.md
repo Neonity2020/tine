@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **"System" appearance option.** The Appearance settings now offer Light /
+  System / Dark. System follows the OS/WebView `prefers-color-scheme` signal,
+  applying it immediately and tracking live changes while the app runs; manual
+  Light/Dark selections ignore system changes as before. Existing saved
+  Light/Dark preferences are untouched.
 - **"Open in new tab" in the block context menu.** Right-clicking a block now
   offers "Open in new tab", mirroring the existing page context-menu item and
   block-bullet middle-click. Works on both editable and read-only blocks.

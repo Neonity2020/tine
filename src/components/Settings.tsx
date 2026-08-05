@@ -10,7 +10,8 @@ import {
   setGraphTransitioning,
   bumpGraphEpoch,
   theme,
-  toggleTheme,
+  appearancePreference,
+  setAppearancePreference,
   workflow,
   changeWorkflow,
   timetrackingEnabled,
@@ -179,7 +180,7 @@ type SettingSearchEntry = {
   level?: "advanced" | "experimental";
 };
 const SETTING_SEARCH: SettingSearchEntry[] = [
-  { tab: "appearance", label: "Theme", description: "light dark gallery colors" },
+  { tab: "appearance", label: "Theme", description: "light dark system gallery colors" },
   { tab: "appearance", label: "Accent color", description: "interface highlight color" },
   { tab: "appearance", label: "Interface size", description: "zoom scale Ctrl scroll" },
   { tab: "appearance", label: "Wide mode", description: "reading width" },
@@ -1190,18 +1191,44 @@ function AppearanceTab(props: { search: string }): JSX.Element {
     <>
       <div class="settings-row">
         <span class="settings-label">Theme</span>
-        <button
-          class="theme-switch"
-          classList={{ "is-dark": theme() === "dark" }}
-          role="switch"
-          aria-checked={theme() === "dark"}
-          title="Toggle light / dark (t t)"
-          onClick={toggleTheme}
+        <div
+          class="theme-switch theme-switch3"
+          classList={{ "is-light": appearancePreference() === "light", "is-system": appearancePreference() === "system", "is-dark": appearancePreference() === "dark" }}
+          role="radiogroup"
+          aria-label="Appearance"
         >
-          <span class="theme-opt"><span class="theme-ico">☀</span>Light</span>
-          <span class="theme-opt"><span class="theme-ico">☾</span>Dark</span>
+          <button
+            type="button"
+            class="theme-opt"
+            role="radio"
+            aria-checked={appearancePreference() === "light"}
+            title="Light theme"
+            onClick={() => setAppearancePreference("light")}
+          >
+            <span class="theme-ico">☀</span>Light
+          </button>
+          <button
+            type="button"
+            class="theme-opt"
+            role="radio"
+            aria-checked={appearancePreference() === "system"}
+            title="Follow the OS light/dark setting"
+            onClick={() => setAppearancePreference("system")}
+          >
+            <span class="theme-ico">◐</span>System
+          </button>
+          <button
+            type="button"
+            class="theme-opt"
+            role="radio"
+            aria-checked={appearancePreference() === "dark"}
+            title="Dark theme"
+            onClick={() => setAppearancePreference("dark")}
+          >
+            <span class="theme-ico">☾</span>Dark
+          </button>
           <span class="theme-knob" />
-        </button>
+        </div>
       </div>
 
       <div class="settings-section">Themes</div>

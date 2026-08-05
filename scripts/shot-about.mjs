@@ -30,7 +30,7 @@ try {
     if (themeToggleFirst) {
       // flip to dark via the appearance tab, then back to About
       await page.locator(".settings-nav-item", { hasText: "Appearance" }).first().click();
-      await page.locator(".theme-switch").first().click();
+      await page.locator('.theme-opt[title="Dark theme"]').click();
       await sleep(200);
       await about.click();
       await page.waitForSelector(".about-tab", { timeout: 3000 });

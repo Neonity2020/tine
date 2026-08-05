@@ -84,8 +84,9 @@ try {
   await page.waitForSelector(".page-title");
   await openAppearance(page);
   await installAndUse(page, DEV_ROOT);
-  if (await page.locator('.theme-switch[aria-checked="false"]').count()) await page.locator(".theme-switch").click();
-  await page.locator('.theme-switch[aria-checked="true"]').waitFor();
+  if (!(await page.locator('.theme-opt[title="Dark theme"][aria-checked="true"]').count()))
+    await page.locator('.theme-opt[title="Dark theme"]').click();
+  await page.locator('.theme-opt[title="Dark theme"][aria-checked="true"]').waitFor();
   await page.locator(".settings-pane-head .icon-btn").click();
   await navigate(page, "Jun 14th, 2026");
   await closeToasts(page);
