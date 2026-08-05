@@ -139,8 +139,8 @@ use crate::oplog::trusted_local_commit::{
     last_commit_stage_timings, TrustedLocalCommitStageTimings,
 };
 use crate::oplog::trusted_local_commit::{
-    TrustedLocalCommitCoordinator, TrustedLocalCommitOutcome, TrustedLocalCommitted,
-    TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
+    TrustedLocalCommitCoordinator, TrustedLocalCommitError, TrustedLocalCommitOutcome,
+    TrustedLocalCommitted, TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
     TrustedLocalRestartProjectionOutcome,
 };
 use crate::oplog::watcher_queue::WatcherObservation;
@@ -1793,12 +1793,89 @@ pub enum SyncApplicationPageInvalidRequest {
     MalformedPage,
 }
 
+/// Stable, bounded diagnostics for refusals in the actor-owned managed-save
+/// transaction. These codes deliberately describe only the failed stage: they
+/// must never carry graph paths, page contents, identities, or nested errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncEditorRefusalCode {
+    TrustedLocalMissingBaseRevision,
+    TrustedLocalPreparationBindings,
+    TrustedLocalPreparationPlanning,
+    TrustedLocalPreparationDraft,
+    TrustedLocalPreparationCapture,
+    TrustedLocalPreparationFinalize,
+    TrustedLocalPreparationTailReservation,
+    TrustedLocalPreparationPublication,
+    TrustedLocalPreparationArchiveStage,
+    TrustedLocalPreparationTailAdmission,
+    TrustedLocalPreparationSqliteDrain,
+    TrustedLocalPreparationProjectionDrain,
+    TrustedLocalEngineAuthority,
+    TrustedLocalCommitInvalidPreparedInput,
+    TrustedLocalCommitManagedRecord,
+    TrustedLocalCommitPrecommitGraph,
+    FallbackReadmission,
+    PostCommitCurrentPageLookup,
+    TrustedOutcomeDeclined,
+    ManagedSequenceOverflow,
+    ManagedQueueMonotonicity,
+    ManagedRecordDecode,
+}
+
+impl SyncEditorRefusalCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrustedLocalMissingBaseRevision => "trusted_local.missing_base_revision",
+            Self::TrustedLocalPreparationBindings => "trusted_local.preparation.bindings",
+            Self::TrustedLocalPreparationPlanning => "trusted_local.preparation.planning",
+            Self::TrustedLocalPreparationDraft => "trusted_local.preparation.draft",
+            Self::TrustedLocalPreparationCapture => "trusted_local.preparation.capture",
+            Self::TrustedLocalPreparationFinalize => "trusted_local.preparation.finalize",
+            Self::TrustedLocalPreparationTailReservation => {
+                "trusted_local.preparation.tail_reservation"
+            }
+            Self::TrustedLocalPreparationPublication => "trusted_local.preparation.publication",
+            Self::TrustedLocalPreparationArchiveStage => "trusted_local.preparation.archive_stage",
+            Self::TrustedLocalPreparationTailAdmission => {
+                "trusted_local.preparation.tail_admission"
+            }
+            Self::TrustedLocalPreparationSqliteDrain => "trusted_local.preparation.sqlite_drain",
+            Self::TrustedLocalPreparationProjectionDrain => {
+                "trusted_local.preparation.projection_drain"
+            }
+            Self::TrustedLocalEngineAuthority => "trusted_local.engine_authority",
+            Self::TrustedLocalCommitInvalidPreparedInput => {
+                "trusted_local.commit.invalid_prepared_input"
+            }
+            Self::TrustedLocalCommitManagedRecord => "trusted_local.commit.managed_record",
+            Self::TrustedLocalCommitPrecommitGraph => "trusted_local.commit.precommit_graph",
+            Self::FallbackReadmission => "fallback.readmission",
+            Self::PostCommitCurrentPageLookup => "post_commit.current_page_lookup",
+            Self::TrustedOutcomeDeclined => "trusted_outcome.declined",
+            Self::ManagedSequenceOverflow => "managed_queue.sequence_overflow",
+            Self::ManagedQueueMonotonicity => "managed_queue.monotonicity",
+            Self::ManagedRecordDecode => "managed_record.decode",
+        }
+    }
+}
+
+impl fmt::Display for SyncEditorRefusalCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncApplicationPageRequestError {
     InvalidRequest(SyncApplicationPageInvalidRequest),
     RequestTooLarge(SyncEditorRequestSize),
     ActorRefused,
     ActorRefusedAt(&'static str),
+    ActorRefusedWithCode(SyncEditorRefusalCode),
+    ActorRefusedAtWithCode {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+    },
     ActorUnavailable,
 }
 
@@ -1817,6 +1894,14 @@ impl fmt::Display for SyncApplicationPageRequestError {
             Self::ActorRefusedAt(stage) => {
                 write!(formatter, "sync actor refused application page intent at {stage}")
             }
+            Self::ActorRefusedWithCode(code) => write!(
+                formatter,
+                "sync actor refused application page intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithCode { stage, code } => write!(
+                formatter,
+                "sync actor refused application page intent at {stage} (reason code: {code})"
+            ),
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
@@ -1849,6 +1934,11 @@ pub enum SyncEditorRequestError {
     RequestTooLarge(SyncEditorRequestSize),
     ActorRefused,
     ActorRefusedAt(&'static str),
+    ActorRefusedWithCode(SyncEditorRefusalCode),
+    ActorRefusedAtWithCode {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+    },
     ActorUnavailable,
 }
 
@@ -1865,6 +1955,14 @@ impl fmt::Display for SyncEditorRequestError {
             Self::ActorRefusedAt(stage) => {
                 write!(formatter, "sync actor refused editor intent at {stage}")
             }
+            Self::ActorRefusedWithCode(code) => write!(
+                formatter,
+                "sync actor refused editor intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithCode { stage, code } => write!(
+                formatter,
+                "sync actor refused editor intent at {stage} (reason code: {code})"
+            ),
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
@@ -5738,14 +5836,17 @@ fn prepare_trusted_local_runtime_commit(
     journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
     target_page: &PageDto,
     transaction: &OperationTransaction,
-) -> Result<TrustedLocalRuntimeAttempt, String> {
-    let base_revision = target_page
-        .rev
-        .as_deref()
-        .ok_or_else(|| "existing managed page has no exact graph revision".to_owned())?;
+) -> Result<TrustedLocalRuntimeAttempt, SyncEditorRequestError> {
+    let base_revision =
+        target_page
+            .rev
+            .as_deref()
+            .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::TrustedLocalMissingBaseRevision,
+            ))?;
     let prepared =
         OperationalCoordinator::prepare_trusted_local(session, graph, receipts, transaction)
-            .map_err(|error| format!("trusted-local preparation failed before append: {error}"))?;
+            .map_err(|error| trusted_local_preparation_refusal(error.phase()))?;
     let prepared = match prepared {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
@@ -5754,9 +5855,11 @@ fn prepare_trusted_local_runtime_commit(
             ));
         }
     };
-    let engine = session
-        .engine()
-        .map_err(|error| format!("trusted-local engine authority was refused: {error}"))?;
+    let engine = session.engine().map_err(|_| {
+        SyncEditorRequestError::ActorRefusedWithCode(
+            SyncEditorRefusalCode::TrustedLocalEngineAuthority,
+        )
+    })?;
     let outcome = TrustedLocalCommitCoordinator::commit(
         graph,
         journal,
@@ -5765,7 +5868,7 @@ fn prepare_trusted_local_runtime_commit(
         base_revision,
         prepared,
     )
-    .map_err(|error| format!("trusted-local commit failed before append: {error}"))?;
+    .map_err(trusted_local_commit_refusal)?;
     Ok(match outcome {
         TrustedLocalCommitOutcome::Declined { .. } => TrustedLocalRuntimeAttempt::Declined,
         committed => TrustedLocalRuntimeAttempt::Committed(committed),
@@ -8551,12 +8654,7 @@ impl RuntimeActor {
                         &mut managed.journal,
                         target_page,
                         &transaction,
-                    )
-                    .map_err(|_error| {
-                        #[cfg(test)]
-                        eprintln!("trusted-local runtime preparation refused: {_error}");
-                        SyncEditorRequestError::ActorRefused
-                    })?
+                    )?
                 }
                 None => TrustedLocalRuntimeAttempt::Declined,
             };
@@ -8645,7 +8743,11 @@ impl RuntimeActor {
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
                     let mut session = runtime
                         .admit_promoted_mutation(authority, &self.graph)
-                        .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                        .map_err(|_| {
+                            SyncEditorRequestError::ActorRefusedWithCode(
+                                SyncEditorRefusalCode::FallbackReadmission,
+                            )
+                        })?;
                     OperationalCoordinator::execute_local(
                         &mut session,
                         &self.graph,
@@ -8688,8 +8790,16 @@ impl RuntimeActor {
                     .runtime
                     .as_ref()
                     .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                let current = load_current_editor_page(runtime, page_id)?
-                    .ok_or(SyncEditorRequestError::ActorRefused)?;
+                let current = load_current_editor_page(runtime, page_id)
+                    .map_err(|error| {
+                        editor_refusal_with_code(
+                            error,
+                            SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+                        )
+                    })?
+                    .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
+                        SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+                    ))?;
                 Ok(SyncEditorSaveOutcome::Durable {
                     batch_id: completion.batch_id().to_string(),
                     page: current.dto,
@@ -8806,28 +8916,23 @@ impl RuntimeActor {
                 recovery.prepared_record().journal_payload().to_vec(),
             ),
             TrustedLocalCommitOutcome::Declined { .. } => {
-                return Err(SyncEditorRequestError::ActorRefused)
+                return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                    SyncEditorRefusalCode::TrustedOutcomeDeclined,
+                ))
             }
         };
         let managed = self
             .managed_local
             .as_mut()
             .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-        let expected_next = sequence
-            .checked_add(1)
-            .ok_or(SyncEditorRequestError::ActorRefused)?;
-        if managed.journal.next_sequence() != expected_next
-            || managed
-                .frames
-                .back()
-                .is_some_and(|frame| frame.sequence() >= sequence)
-        {
-            return Err(SyncEditorRequestError::ActorRefused);
-        }
+        validate_managed_editor_queue_admission(
+            managed.journal.next_sequence(),
+            sequence,
+            managed.frames.back().map(LocalJournalFrame::sequence),
+        )?;
         let queued_frame =
             LocalJournalFrame::new(managed.journal.device_id(), sequence, payload_kind, payload);
-        let queued_record = decode_managed_local_record(&queued_frame)
-            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+        let queued_record = decode_managed_editor_record(&queued_frame)?;
         managed.latest_projection_frames.insert(
             queued_record
                 .projection()
@@ -8894,7 +8999,9 @@ impl RuntimeActor {
                     }
                 }
                 TrustedLocalCommitOutcome::Declined { .. } => {
-                    return Err(SyncEditorRequestError::ActorRefused)
+                    return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                        SyncEditorRefusalCode::TrustedOutcomeDeclined,
+                    ))
                 }
             };
         }
@@ -8910,7 +9017,9 @@ impl RuntimeActor {
                 PendingManagedLocalCommit::Response(committed)
             }
             TrustedLocalCommitOutcome::Declined { .. } => {
-                return Err(SyncEditorRequestError::ActorRefused)
+                return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                    SyncEditorRefusalCode::TrustedOutcomeDeclined,
+                ))
             }
         };
         self.managed_local
@@ -13510,6 +13619,12 @@ fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicatio
         SyncEditorRequestError::ActorRefusedAt(stage) => {
             SyncApplicationPageRequestError::ActorRefusedAt(stage)
         }
+        SyncEditorRequestError::ActorRefusedWithCode(code) => {
+            SyncApplicationPageRequestError::ActorRefusedWithCode(code)
+        }
+        SyncEditorRequestError::ActorRefusedAtWithCode { stage, code } => {
+            SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage, code }
+        }
         SyncEditorRequestError::InvalidRequest(_) | SyncEditorRequestError::ActorRefused => {
             SyncApplicationPageRequestError::ActorRefused
         }
@@ -13519,8 +13634,92 @@ fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicatio
 fn editor_refusal_at(error: SyncEditorRequestError, stage: &'static str) -> SyncEditorRequestError {
     match error {
         SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),
+        SyncEditorRequestError::ActorRefusedWithCode(code) => {
+            SyncEditorRequestError::ActorRefusedAtWithCode { stage, code }
+        }
         other => other,
     }
+}
+
+fn editor_refusal_with_code(
+    error: SyncEditorRequestError,
+    code: SyncEditorRefusalCode,
+) -> SyncEditorRequestError {
+    match error {
+        SyncEditorRequestError::ActorRefused | SyncEditorRequestError::ActorRefusedAt(_) => {
+            SyncEditorRequestError::ActorRefusedWithCode(code)
+        }
+        other => other,
+    }
+}
+
+fn trusted_local_preparation_refusal(phase: OperationalPhase) -> SyncEditorRequestError {
+    let code = match phase {
+        OperationalPhase::Bindings => SyncEditorRefusalCode::TrustedLocalPreparationBindings,
+        OperationalPhase::Planning => SyncEditorRefusalCode::TrustedLocalPreparationPlanning,
+        OperationalPhase::Draft => SyncEditorRefusalCode::TrustedLocalPreparationDraft,
+        OperationalPhase::Capture => SyncEditorRefusalCode::TrustedLocalPreparationCapture,
+        OperationalPhase::Finalize => SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+        OperationalPhase::TailReservation => {
+            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation
+        }
+        OperationalPhase::Publication => SyncEditorRefusalCode::TrustedLocalPreparationPublication,
+        OperationalPhase::ArchiveStage => {
+            SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage
+        }
+        OperationalPhase::TailAdmission => {
+            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission
+        }
+        OperationalPhase::SqliteDrain => SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
+        OperationalPhase::ProjectionDrain => {
+            SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain
+        }
+    };
+    SyncEditorRequestError::ActorRefusedWithCode(code)
+}
+
+fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorRequestError {
+    let code = match error {
+        TrustedLocalCommitError::InvalidPreparedInput(_) => {
+            SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput
+        }
+        TrustedLocalCommitError::ManagedRecord(_) => {
+            SyncEditorRefusalCode::TrustedLocalCommitManagedRecord
+        }
+        TrustedLocalCommitError::PrecommitGraph(_) => {
+            SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph
+        }
+    };
+    SyncEditorRequestError::ActorRefusedWithCode(code)
+}
+
+fn decode_managed_editor_record(
+    frame: &LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+) -> Result<crate::oplog::ManagedLocalRecord, SyncEditorRequestError> {
+    decode_managed_local_record(frame).map_err(|_| {
+        SyncEditorRequestError::ActorRefusedWithCode(SyncEditorRefusalCode::ManagedRecordDecode)
+    })
+}
+
+fn validate_managed_editor_queue_admission(
+    journal_next_sequence: u64,
+    committed_sequence: u64,
+    queued_last_sequence: Option<u64>,
+) -> Result<(), SyncEditorRequestError> {
+    let expected_next =
+        committed_sequence
+            .checked_add(1)
+            .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedSequenceOverflow,
+            ))?;
+    if journal_next_sequence != expected_next
+        || queued_last_sequence.is_some_and(|sequence| sequence >= committed_sequence)
+    {
+        return Err(SyncEditorRequestError::ActorRefusedWithCode(
+            SyncEditorRefusalCode::ManagedQueueMonotonicity,
+        ));
+    }
+    Ok(())
 }
 
 fn map_application_conflict(reason: SyncEditorConflict) -> SyncApplicationPageConflict {
@@ -15131,6 +15330,274 @@ mod tests {
     }
 
     #[test]
+    fn managed_save_refusal_codes_are_bounded_and_render_through_application_error() {
+        const STAGE: &str = "committing the semantic page transaction";
+        let codes = [
+            SyncEditorRefusalCode::TrustedLocalMissingBaseRevision,
+            SyncEditorRefusalCode::TrustedLocalPreparationBindings,
+            SyncEditorRefusalCode::TrustedLocalPreparationPlanning,
+            SyncEditorRefusalCode::TrustedLocalPreparationDraft,
+            SyncEditorRefusalCode::TrustedLocalPreparationCapture,
+            SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+            SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
+            SyncEditorRefusalCode::TrustedLocalPreparationPublication,
+            SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
+            SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
+            SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
+            SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain,
+            SyncEditorRefusalCode::TrustedLocalEngineAuthority,
+            SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput,
+            SyncEditorRefusalCode::TrustedLocalCommitManagedRecord,
+            SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
+            SyncEditorRefusalCode::FallbackReadmission,
+            SyncEditorRefusalCode::PostCommitCurrentPageLookup,
+            SyncEditorRefusalCode::TrustedOutcomeDeclined,
+            SyncEditorRefusalCode::ManagedSequenceOverflow,
+            SyncEditorRefusalCode::ManagedQueueMonotonicity,
+            SyncEditorRefusalCode::ManagedRecordDecode,
+        ];
+        let mut unique = BTreeSet::new();
+        for code in codes {
+            assert!(unique.insert(code.as_str()), "refusal codes must be unique");
+            assert!(
+                code.as_str().bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_')
+                }),
+                "refusal codes must remain bounded identifiers: {code}"
+            );
+            assert!(code.as_str().len() <= 48);
+
+            let staged =
+                editor_refusal_at(SyncEditorRequestError::ActorRefusedWithCode(code), STAGE);
+            assert_eq!(
+                staged,
+                SyncEditorRequestError::ActorRefusedAtWithCode { stage: STAGE, code }
+            );
+            let application = map_editor_application_error(staged);
+            assert_eq!(
+                application,
+                SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage: STAGE, code }
+            );
+            assert_eq!(
+                application.to_string(),
+                format!(
+                    "sync actor refused application page intent at {STAGE} (reason code: {code})"
+                )
+            );
+        }
+
+        assert_eq!(
+            SyncApplicationPageRequestError::ActorRefusedAt(STAGE).to_string(),
+            "sync actor refused application page intent at committing the semantic page transaction",
+            "uncoded refusal rendering remains unchanged"
+        );
+    }
+
+    #[test]
+    fn managed_save_queue_refusals_distinguish_overflow_from_monotonicity() {
+        assert_eq!(
+            validate_managed_editor_queue_admission(u64::MAX, u64::MAX, None),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedSequenceOverflow,
+            ))
+        );
+        assert_eq!(
+            validate_managed_editor_queue_admission(8, 8, None),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedQueueMonotonicity,
+            ))
+        );
+        assert_eq!(
+            validate_managed_editor_queue_admission(8, 7, Some(7)),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedQueueMonotonicity,
+            ))
+        );
+        assert_eq!(
+            validate_managed_editor_queue_admission(8, 7, Some(6)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn trusted_local_preparation_and_commit_substages_map_without_nested_detail() {
+        let preparation = [
+            (
+                OperationalPhase::Bindings,
+                SyncEditorRefusalCode::TrustedLocalPreparationBindings,
+            ),
+            (
+                OperationalPhase::Planning,
+                SyncEditorRefusalCode::TrustedLocalPreparationPlanning,
+            ),
+            (
+                OperationalPhase::Draft,
+                SyncEditorRefusalCode::TrustedLocalPreparationDraft,
+            ),
+            (
+                OperationalPhase::Capture,
+                SyncEditorRefusalCode::TrustedLocalPreparationCapture,
+            ),
+            (
+                OperationalPhase::Finalize,
+                SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+            ),
+            (
+                OperationalPhase::TailReservation,
+                SyncEditorRefusalCode::TrustedLocalPreparationTailReservation,
+            ),
+            (
+                OperationalPhase::Publication,
+                SyncEditorRefusalCode::TrustedLocalPreparationPublication,
+            ),
+            (
+                OperationalPhase::ArchiveStage,
+                SyncEditorRefusalCode::TrustedLocalPreparationArchiveStage,
+            ),
+            (
+                OperationalPhase::TailAdmission,
+                SyncEditorRefusalCode::TrustedLocalPreparationTailAdmission,
+            ),
+            (
+                OperationalPhase::SqliteDrain,
+                SyncEditorRefusalCode::TrustedLocalPreparationSqliteDrain,
+            ),
+            (
+                OperationalPhase::ProjectionDrain,
+                SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain,
+            ),
+        ];
+        for (phase, code) in preparation {
+            assert_eq!(
+                trusted_local_preparation_refusal(phase),
+                SyncEditorRequestError::ActorRefusedWithCode(code)
+            );
+        }
+
+        let nested = "private/page.md user-id page text";
+        let commit_errors = [
+            (
+                TrustedLocalCommitError::InvalidPreparedInput(nested.into()),
+                SyncEditorRefusalCode::TrustedLocalCommitInvalidPreparedInput,
+            ),
+            (
+                TrustedLocalCommitError::ManagedRecord(
+                    crate::oplog::ManagedLocalRecordError::CorruptPayload(nested.into()),
+                ),
+                SyncEditorRefusalCode::TrustedLocalCommitManagedRecord,
+            ),
+            (
+                TrustedLocalCommitError::PrecommitGraph(std::io::Error::other(nested)),
+                SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
+            ),
+        ];
+        for (error, code) in commit_errors {
+            let mapped = trusted_local_commit_refusal(error);
+            assert_eq!(mapped, SyncEditorRequestError::ActorRefusedWithCode(code));
+            assert!(!mapped.to_string().contains(nested));
+        }
+    }
+
+    #[test]
+    fn managed_save_record_decode_has_an_exact_code() {
+        let invalid = LocalJournalFrame::new(
+            Uuid::new_v4(),
+            0,
+            ManagedLocalJournalPayloadKind::RecordV1,
+            vec![0xff],
+        );
+        assert!(matches!(
+            decode_managed_editor_record(&invalid),
+            Err(SyncEditorRequestError::ActorRefusedWithCode(
+                SyncEditorRefusalCode::ManagedRecordDecode
+            ))
+        ));
+    }
+
+    #[test]
+    fn managed_save_conflict_and_deferred_wire_classifications_are_unchanged() {
+        assert_eq!(
+            serde_json::to_string(&SyncApplicationPageSaveOutcome::Conflict {
+                reason: SyncApplicationPageConflict::StaleBase,
+            })
+            .unwrap(),
+            r#"{"status":"conflict","reason":"stale_base"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SyncApplicationPageSaveOutcome::Deferred {
+                state: SyncEditorDeferred::RetryableExternalWork,
+            })
+            .unwrap(),
+            r#"{"status":"deferred","state":{"status":"retryable_external_work"}}"#
+        );
+    }
+
+    #[test]
+    fn managed_save_refusal_origins_are_closed_over_the_permitted_slice() {
+        let source = include_str!("sync_runtime.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the runtime source has its test boundary");
+        let prepare = production
+            .split_once("fn prepare_trusted_local_runtime_commit(")
+            .and_then(|(_, tail)| tail.split_once("\nenum EditorTurnReadiness"))
+            .map(|(body, _)| body)
+            .expect("trusted-local preparation has a narrow source boundary");
+        for code in [
+            "TrustedLocalMissingBaseRevision",
+            "trusted_local_preparation_refusal",
+            "TrustedLocalEngineAuthority",
+            "trusted_local_commit_refusal",
+        ] {
+            assert!(
+                prepare.contains(code),
+                "preparation omits refusal code {code}"
+            );
+        }
+
+        let execute = production
+            .split_once("    fn execute_editor_transaction(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn finish_trusted_local_editor_outcome("))
+            .map(|(body, _)| body)
+            .expect("editor transaction has a narrow source boundary");
+        for code in ["FallbackReadmission", "PostCommitCurrentPageLookup"] {
+            assert!(
+                execute.contains(code),
+                "transaction omits refusal code {code}"
+            );
+        }
+
+        let finish = production
+            .split_once("    fn finish_trusted_local_editor_outcome(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn retry_managed_local_overlay("))
+            .map(|(body, _)| body)
+            .expect("trusted-local finish has a narrow source boundary");
+        for origin in [
+            "TrustedOutcomeDeclined",
+            "validate_managed_editor_queue_admission",
+            "decode_managed_editor_record",
+            "application_from_trusted_local_commit",
+        ] {
+            assert!(
+                finish.contains(origin),
+                "finish omits refusal origin {origin}"
+            );
+        }
+
+        let response = production
+            .split_once("    fn application_from_trusted_local_commit(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn tick_managed_local_derivative("))
+            .map(|(body, _)| body)
+            .expect("trusted-local response construction has a narrow source boundary");
+        assert!(response.contains("SyncEditorRequestError::ActorRefused"));
+        assert!(!response.contains("ActorRefusedWithCode"));
+        assert!(!response.contains("SyncEditorRefusalCode"));
+    }
+
+    #[test]
     fn legacy_and_absent_discovery_start_no_actor_and_create_nothing() {
         let (legacy_root, legacy_request) = empty_request(SyncStorageProfile::LegacyDefault);
         let legacy = SyncRuntimeHandle::open(legacy_request);
@@ -16524,6 +16991,231 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    /// Historical path spellings are each one isolated existing-page shape,
+    /// rather than a collision fixture. Every shape must remain the exact
+    /// projection owner across an unsafe takeover and a subsequent Safe reopen.
+    #[test]
+    fn managed_path_shapes_survive_activation_crash_and_safe_reopen() {
+        const CASES: [(&str, &str, &str, &[u8], &[u8], &[u8]); 5] = [
+            (
+                "encoded-colon",
+                "notes/2026-07-23_18%3A01%3A20.md",
+                "2026-07-23_18:01:20",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "raw-percent",
+                "notes/Literal 100% complete.md",
+                "Literal 100% complete",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "encoded-percent",
+                "notes/Literal 100%25 complete.md",
+                "Literal 100% complete",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "legacy-dot",
+                "notes/Release 1.0.md",
+                "Release 1.0",
+                b"- initial path shape\n",
+                b"- warm projected state\n",
+                b"- second durable state\n",
+            ),
+            (
+                "explicit-title-path-mismatch",
+                "notes/physical-mismatch.md",
+                "Explicit title survives physical mismatch",
+                b"title:: Explicit title survives physical mismatch\n\n- initial path shape\n",
+                b"title:: Explicit title survives physical mismatch\n\n- warm projected state\n",
+                b"title:: Explicit title survives physical mismatch\n\n- second durable state\n",
+            ),
+        ];
+
+        for (case_index, (label, path, name, initial, warm, second)) in
+            CASES.into_iter().enumerate()
+        {
+            // Do not co-locate legacy and encoded spellings: this regression
+            // covers the accepted exact owner for one historical shape at a
+            // time, not portable-collision policy.
+            let fixture = ActivationFixture::empty(
+                &format!("managed-path-shape-{label}"),
+                0xa160 + case_index as u128 * 0x10,
+            );
+            fs::write(fixture.graph_root.join(path), initial).unwrap();
+            let expected_user_paths = vec!["logseq/config.edn".to_owned(), (*path).to_owned()];
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: setup must contain only the exact historical source path"
+            );
+
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(
+                activated.status,
+                SyncLocalActivationStatus::Active,
+                "{label}"
+            );
+            let handle = activated
+                .handle
+                .expect("path-shape activation retains an actor");
+            drive_initial_feed(&handle);
+
+            let (page, revision) = load_application_exact(&handle, path);
+            assert_eq!(
+                page.path, path,
+                "{label}: activation changed exact path identity"
+            );
+            assert_eq!(page.name, name, "{label}: activation changed logical title");
+            let (warm_page, warm_revision) =
+                save_application_block_text(&handle, page, revision, "warm projected state");
+            assert_eq!(
+                warm_page.path, path,
+                "{label}: warm save changed exact path"
+            );
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                warm,
+                "{label}: warm save did not project the expected exact bytes"
+            );
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: warm save created an alternate document path"
+            );
+            assert_eq!(handle.status().unwrap().managed_local_pending, 1, "{label}");
+
+            // Intentionally omit both derivative draining and Safe shutdown:
+            // this is the actor-accepted local frame whose exact owner must
+            // survive the crash-style takeover.
+            drop(handle);
+            let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+            drive_initial_feed(&reopened);
+            assert_eq!(
+                reopened.status().unwrap().recovery,
+                Some(SyncRuntimeRecovery::TookOverCrashedUnsafe),
+                "{label}: pending exact-owner recovery was not an unsafe takeover"
+            );
+            let (recovered, recovered_revision) = load_application_exact(&reopened, path);
+            assert_eq!(
+                recovered.path, path,
+                "{label}: unsafe reopen changed exact path"
+            );
+            assert_eq!(
+                recovered.name, name,
+                "{label}: unsafe reopen changed logical title"
+            );
+            assert_parser_dto_semantics(&warm_page, &recovered);
+            assert_eq!(warm_revision, recovered_revision);
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                warm,
+                "{label}"
+            );
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: unsafe reopen created an alternate document path"
+            );
+
+            let (second_page, second_revision) = save_application_block_text(
+                &reopened,
+                recovered,
+                recovered_revision,
+                "second durable state",
+            );
+            assert_eq!(
+                second_page.path, path,
+                "{label}: second save changed exact path"
+            );
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                second,
+                "{label}: second save did not project the expected exact bytes"
+            );
+            drain_managed_local(&reopened);
+            assert!(matches!(
+                reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+
+            let safely_reopened =
+                active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+            drive_initial_feed(&safely_reopened);
+            let (safe_page, safe_revision) = load_application_exact(&safely_reopened, path);
+            assert_eq!(
+                safe_page.path, path,
+                "{label}: Safe reopen changed exact path"
+            );
+            assert_eq!(
+                safe_page.name, name,
+                "{label}: Safe reopen changed logical title"
+            );
+            assert_parser_dto_semantics(&second_page, &safe_page);
+            assert_eq!(second_revision, safe_revision);
+            assert_eq!(
+                fs::read(fixture.graph_root.join(path)).unwrap(),
+                second,
+                "{label}"
+            );
+            assert_eq!(
+                user_graph_bytes(&fixture.graph_root)
+                    .into_keys()
+                    .collect::<Vec<_>>(),
+                expected_user_paths,
+                "{label}: Safe reopen created an alternate document path"
+            );
+            assert!(matches!(
+                safely_reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+        }
+    }
+
+    /// A raw `:` is a deliberate source-path portability incompatibility before
+    /// any activation state is created. Keep that fact explicit instead of
+    /// mixing it with the supported historical-path recovery regression above.
+    #[test]
+    fn raw_colon_path_is_classified_incompatible_before_activation() {
+        const RAW_COLON_PATH: &str = "notes/2026-07-23_18:01:20.md";
+        let fixture = ActivationFixture::empty("managed-path-raw-colon-incompatible", 0xa1b0);
+        fs::write(
+            fixture.graph_root.join(RAW_COLON_PATH),
+            b"- externally named\n",
+        )
+        .unwrap();
+        let bytes_before = user_graph_bytes(&fixture.graph_root);
+
+        let activation = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        eprintln!(
+            "managed_raw_colon_preactivation status={:?} graph_bytes={bytes_before:?}",
+            activation.status
+        );
+        assert!(matches!(
+            activation.status,
+            SyncLocalActivationStatus::Retryable {
+                durable_stage: SyncLocalActivationStage::Absent,
+                ref detail,
+            } if detail.contains("source path is not portable")
+                && detail.contains(RAW_COLON_PATH)
+        ));
+        assert!(activation.handle.is_none());
+        assert_eq!(user_graph_bytes(&fixture.graph_root), bytes_before);
     }
 
     #[test]
@@ -30387,6 +31079,27 @@ mod tests {
         );
     }
 
+    fn remove_resume_points(root: &Path) -> usize {
+        let mut removed = 0;
+        let mut directories = vec![root.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "resume-point")
+                {
+                    fs::remove_file(entry.path()).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     #[test]
     #[ignore = "manual release benchmark: crash reopen of a real graph copy"]
     fn managed_crash_reopen_real_graph_manual_benchmark() {
@@ -30448,21 +31161,10 @@ mod tests {
         // calling clean_shutdown matches a killed process during a pending save.
         drop(handle);
         if std::env::var_os("TINE_MANAGED_CRASH_REOPEN_FORCE_FULL_REPLAY").is_some() {
-            let mut directories = vec![fixture.request.archive_root.clone()];
-            while let Some(directory) = directories.pop() {
-                for entry in fs::read_dir(directory).unwrap() {
-                    let entry = entry.unwrap();
-                    if entry.file_type().unwrap().is_dir() {
-                        directories.push(entry.path());
-                    } else if entry
-                        .path()
-                        .extension()
-                        .is_some_and(|extension| extension == "resume-point")
-                    {
-                        fs::remove_file(entry.path()).unwrap();
-                    }
-                }
-            }
+            assert!(
+                remove_resume_points(&fixture.request.archive_root) > 0,
+                "the manual cacheless comparison requires a published resume point"
+            );
         }
         reset_runtime_open_instrumentation(workspace_id);
         reset_promoted_runtime_open_instrumentation(workspace_id);
@@ -30495,6 +31197,135 @@ mod tests {
             "real-graph crash reopen exceeded 10 seconds"
         );
         drop(reopened.handle);
+    }
+
+    #[test]
+    fn managed_crash_reopen_synthetic_history_sweep_with_and_without_resume_point() {
+        const PATH: &str = "notes/Synthetic crash history.md";
+        const INITIAL: &[u8] = b"- initial synthetic history\n";
+
+        for accepted_edits in [1_u64, 2] {
+            assert!(
+                accepted_edits + 1 < MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD,
+                "the synthetic history sweep and final pending tail must remain below compaction"
+            );
+            for cacheless in [false, true] {
+                let fixture = ActivationFixture::empty(
+                    &format!(
+                        "managed-crash-history-{accepted_edits}-{}",
+                        if cacheless {
+                            "cacheless"
+                        } else {
+                            "accelerated"
+                        }
+                    ),
+                    0xa170 + accepted_edits as u128 * 0x20 + cacheless as u128,
+                );
+                fs::write(fixture.graph_root.join(PATH), INITIAL).unwrap();
+                let request = reopen_request(&fixture.request);
+                let workspace_id = fixture.request.identities.workspace_id;
+                let activated =
+                    SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+                assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+                let handle = activated
+                    .handle
+                    .expect("synthetic history fixture activates");
+                drive_initial_feed(&handle);
+
+                let (mut page, mut revision) = load_application_exact(&handle, PATH);
+                for edit in 1..=accepted_edits {
+                    (page, revision) = save_application_block_text(
+                        &handle,
+                        page,
+                        revision,
+                        &format!("accepted and drained synthetic edit {edit}"),
+                    );
+                }
+                drain_managed_local(&handle);
+                let drained = handle.status().unwrap();
+                assert_eq!(drained.managed_local_pending, 0);
+                assert_eq!(drained.managed_local_checkpointed_sequence, accepted_edits);
+                assert_eq!(drained.managed_local_next_sequence, accepted_edits);
+
+                let (tail_page, tail_revision) = save_application_block_text(
+                    &handle,
+                    page,
+                    revision,
+                    "actor-accepted undrained synthetic tail",
+                );
+                let tail_bytes = fs::read(fixture.graph_root.join(PATH)).unwrap();
+                let pending = handle.status().unwrap();
+                assert_eq!(pending.managed_local_pending, 1);
+                assert_eq!(pending.managed_local_checkpointed_sequence, accepted_edits);
+                assert_eq!(pending.managed_local_next_sequence, accepted_edits + 1);
+                let retained_frames = managed_local_journal_frames(&request);
+                assert_eq!(retained_frames.len(), accepted_edits as usize + 1);
+                assert_eq!(
+                    retained_frames.last().unwrap().sequence(),
+                    accepted_edits,
+                    "the sole undrained tail must be the final accepted sequence"
+                );
+
+                // The final tail is actor-accepted and projected, but its
+                // derivative journal frame has not been drained or handed off.
+                drop(handle);
+                if cacheless {
+                    assert!(
+                        remove_resume_points(&fixture.request.archive_root) > 0,
+                        "synthetic cacheless reopen requires a published resume point"
+                    );
+                }
+                reset_runtime_open_instrumentation(workspace_id);
+                reset_promoted_runtime_open_instrumentation(workspace_id);
+                let started = Instant::now();
+                let opened = SyncRuntimeHandle::open(request.clone());
+                let elapsed = started.elapsed();
+                assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+                let open = take_runtime_open_instrumentation(workspace_id);
+                let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+                if cacheless {
+                    assert!(
+                        promoted.reconstructed_bootstrap_resume,
+                        "cacheless synthetic reopen must reconstruct the detached bootstrap resume"
+                    );
+                }
+                eprintln!(
+                    "managed_crash_reopen_synthetic accepted_edits={accepted_edits} cacheless={cacheless} elapsed_ms={:.3} open_phases: {} promoted_phases: {}",
+                    startup_ms(elapsed),
+                    startup_open_phase_receipt(&open),
+                    startup_promoted_open_phase_receipt(&promoted),
+                );
+                assert!(
+                    elapsed < Duration::from_secs(10),
+                    "synthetic crash reopen exceeded 10 seconds: accepted_edits={accepted_edits} cacheless={cacheless}"
+                );
+
+                let reopened = opened.handle.expect("active synthetic reopen has an actor");
+                drive_initial_feed(&reopened);
+                let recovered_status = reopened.status().unwrap();
+                assert_eq!(
+                    recovered_status.recovery,
+                    Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+                );
+                assert_eq!(recovered_status.managed_local_pending, 0);
+                assert_eq!(
+                    recovered_status.managed_local_checkpointed_sequence,
+                    accepted_edits + 1
+                );
+                assert_eq!(
+                    recovered_status.managed_local_next_sequence,
+                    accepted_edits + 1
+                );
+                let (recovered, recovered_revision) = load_application_exact(&reopened, PATH);
+                assert_parser_dto_semantics(&tail_page, &recovered);
+                assert_eq!(tail_revision, recovered_revision);
+                assert_eq!(fs::read(fixture.graph_root.join(PATH)).unwrap(), tail_bytes);
+                assert!(matches!(
+                    reopened.clean_shutdown().unwrap(),
+                    SyncShutdownOutcome::Safe(_)
+                ));
+            }
+        }
     }
 
     #[test]

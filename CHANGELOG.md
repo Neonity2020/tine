@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Managed-storage save refusals now report a bounded internal reason code.**
+  This keeps graph content and filesystem details private while distinguishing
+  preparation, commit, queue, decode, and authority failures that previously
+  collapsed into one generic semantic-transaction message. Crash-reopen
+  coverage now also exercises accepted undrained history both with and without
+  the disposable resume accelerator.
+
 ## [0.6.90] - 2026-08-04
 
 ### Fixed

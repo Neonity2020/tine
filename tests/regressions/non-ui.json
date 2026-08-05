@@ -1359,7 +1359,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs",
@@ -1368,7 +1368,7 @@
         "scenario": "sync.editor-intent-actor-owned-frontier",
         "failBefore": "source-proven"
       },
-      "notes": "Covers OG-normalized name-and-kind lookup across nested .md/.markdown/.org paths, duplicate-owner ambiguity, actor-issued revisions, whole-outline edit/insert/move/reorder/delete, configured page and journal creation, pre-enqueue bounds and cycle checks, stale external-edit refusal, and retained-publication retry through the sole operational coordinator."
+      "notes": "Negative follow-up on 2026-08-05 revoked the prior evidence: deployed v0.6.90 refused an ordinary application-page save at the semantic page transaction and the edit was not durable. Reproduce the literal path before restoring covered status. Earlier coverage included OG-normalized name-and-kind lookup across nested .md/.markdown/.org paths, duplicate-owner ambiguity, actor-issued revisions, whole-outline edit/insert/move/reorder/delete, configured page and journal creation, pre-enqueue bounds and cycle checks, stale external-edit refusal, and retained-publication retry through the sole operational coordinator."
     },
     {
       "id": "REG-SYNC-SPARSE-V2-APP-AUTHORITY-001",
@@ -1433,7 +1433,7 @@
         "all"
       ],
       "layer": "native-app",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs",
@@ -1444,7 +1444,7 @@
         "scenario": "sync.sparse-v2-activation-responsive-progress-scaled",
         "failBefore": "proven"
       },
-      "notes": "The source-boundary regression requires the complete graph transition and every ordinary or explicit command that can wait on the managed actor to run behind spawn_blocking without carrying borrowed Tauri state across await. Each command captures its window label and binding generation, then re-resolves that exact authority inside the blocking operation so a queued command cannot act on a replacement graph. Core fixtures retain exact graph bytes and crash-resume stages while recording ordered semantic phases. Two nested Unicode synthetic scales retain ordinary references, properties, and tasks; instrumentation records source files, bytes, blocks, and per-phase elapsed time and rejects plainly superlinear shared construction."
+      "notes": "Negative follow-up on 2026-08-05 revoked the prior responsiveness evidence: the deployed v0.6.90 managed graph again spent roughly 60 seconds in recovery. Reproduce and classify actual recovery work versus an actor/request wait before restoring covered status. The earlier source-boundary regression required the complete graph transition and every ordinary or explicit command that can wait on the managed actor to run behind spawn_blocking without carrying borrowed Tauri state across await."
     },
     {
       "id": "REG-SYNC-SPARSE-V2-COLD-JOIN-DISCOVERY-001",
@@ -2129,7 +2129,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "reported",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs::managed_crash_reopen_real_graph_manual_benchmark"
@@ -2137,7 +2137,7 @@
         "scenario": "managed-storage.crash-reopen-with-and-without-resume-accelerator",
         "failBefore": "proven"
       },
-      "notes": "Fail-before on 92edd261 against the permitted 1,045-file anonymized graph copy: ordinary pending-save crash takeover adopted its resume point in about 0.2 seconds, while forced accelerator unavailability replayed five bootstrap parts in 30.9 seconds locally (the user observed about 58 seconds on slower hardware), emitted about 338 MiB of filesystem output for a 1.3 MiB graph, and failed the 10-second gate. Fixed on fe5dfb7f by reconstructing the immutable bootstrap once in the existing detached authoring engine, migrating that authenticated candidate into the resume path, and replaying only post-bootstrap history in the enrolled engine. The exact fail-before fixture then reopened in 2.36 seconds, adopted bootstrap generation 5, replayed zero bootstrap generations through enrolled recovery, and preserved the original accelerator-refusal reason."
+      "notes": "Negative follow-up on 2026-08-05 revoked the deployed-state evidence: v0.6.90 again took roughly 60 seconds to recover a managed graph. Current master still passes the original permitted 1,045-file anonymized fresh-copy receipt (ordinary pending-save crash takeover 0.19 seconds; forced resume-accelerator removal 6.85 seconds), so the missing regression fixture is accumulated or failed-transaction state rather than the original fresh activation alone. Historical fail-before on 92edd261 took 30.9 seconds locally and about 58 seconds on the user's slower machine; fe5dfb7f reconstructed the immutable bootstrap once and reduced that exact case to 2.36 seconds. Restore covered status only after the deployed state shape is represented and bounded."
     },
     {
       "id": "REG-MISSING-REMEMBERED-GRAPH-250",
