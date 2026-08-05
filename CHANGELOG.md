@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Managed Markdown saves now retain their authenticated projection predecessor
+  across drain, compaction, and unsafe reopen.** The next save and delayed
+  filesystem callback re-prove the exact completed-path receipt instead of
+  regenerating its historical base through the canonical serializer, so
+  empty-bullet and non-leading-heading layouts no longer strand the graph in a
+  global “updating” state. Exact live bytes, path, page, frontier, claim,
+  endpoint, and receipt bindings remain required; divergent external edits and
+  Org layout differences still fail closed.
+
 ### Changed
 
 - **Managed-storage save refusals now report a bounded internal reason code.**
