@@ -26122,6 +26122,11 @@ fn collect_bootstrap_source_pass(
         seal_chunks,
     )?;
     writers.sync_all()?;
+    // Sorting reopens and then removes the raw spools. Close every writer at
+    // the durable handoff boundary first: Windows rejects those operations
+    // while a write handle remains live, whereas Unix would merely mask the
+    // lifecycle error.
+    drop(writers);
     require_current_bootstrap_source_binding(graph, binding)?;
     for kind in [
         BootstrapSourceSpoolKind::Inventory,
