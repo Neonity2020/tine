@@ -57,35 +57,32 @@ try {
   const stable = check(stableCandidate, stableImmutable, stablePrevious);
   assert.equal(stable.status, 0, stable.stderr || stable.stdout);
 
-  // Exact reproduction of the former false-green shape: candidate scroll is
-  // stable while the immutable anchor contains the 34.6 -> 45.9 ms swing that
-  // flipped run 29395811537. Its median comparison is harmless, but reliability
-  // must fail independently.
+  // The immutable anchor may contain historical variance that cannot be
+  // remeasured. When candidate and previous are reliable and the candidate is
+  // within both budgets, baseline-only variance warns but does not fail.
   const unstableImmutable = measurement("immutable", [100, 101, 99], [75.4, 100, 100.2]);
   const unstable = check(stableCandidate, unstableImmutable, stablePrevious);
-  assert.notEqual(unstable.status, 0);
-  assert.match(`${unstable.stdout}\n${unstable.stderr}`, /immutable\/scrollBig: .*round spread exceeds/);
+  assert.equal(unstable.status, 0, unstable.stderr || unstable.stdout);
+  assert.match(
+    `${unstable.stdout}\n${unstable.stderr}`,
+    /warning: immutable\/scrollBig: .*immutable baseline-only variance accepted/,
+  );
 
-  // A fast outlier must not block a clearly favorable candidate. Full spread
-  // is still reported, and the candidate's slowest round must remain inside
-  // both regression budgets.
-  const favorableVariableCandidate = measurement(
+  // A candidate's favorable median does not waive its own reliability failure.
+  const fastOutlierCandidate = measurement(
     "candidate",
     [90, 92, 91],
     [80, 95, 80],
   );
-  const favorableVariable = check(favorableVariableCandidate, stableImmutable, stablePrevious);
-  assert.equal(favorableVariable.status, 0, favorableVariable.stderr || favorableVariable.stdout);
-  assert.match(
-    `${favorableVariable.stdout}\n${favorableVariable.stderr}`,
-    /warning: candidate\/scrollBig: .*candidate median beats both anchors/,
-  );
+  const fastOutlier = check(fastOutlierCandidate, stableImmutable, stablePrevious);
+  assert.notEqual(fastOutlier.status, 0);
+  assert.match(`${fastOutlier.stdout}\n${fastOutlier.stderr}`, /candidate\/scrollBig: .*round spread exceeds/);
 
-  // A favorable median cannot conceal an unsafe slow tail.
-  const unsafeTailCandidate = measurement("candidate", [90, 92, 91], [50, 50, 200]);
-  const unsafeTail = check(unsafeTailCandidate, stableImmutable, stablePrevious);
-  assert.notEqual(unsafeTail.status, 0);
-  assert.match(`${unsafeTail.stdout}\n${unsafeTail.stderr}`, /candidate\/scrollBig: .*round spread exceeds/);
+  // Previous-release variance remains a hard reliability blocker too.
+  const unstablePrevious = measurement("previous", [105, 106, 104], [80, 100, 100.2]);
+  const previousSpread = check(stableCandidate, stableImmutable, unstablePrevious);
+  assert.notEqual(previousSpread.status, 0);
+  assert.match(`${previousSpread.stdout}\n${previousSpread.stderr}`, /previous\/scrollBig: .*round spread exceeds/);
 
   const regressedCandidate = measurement("candidate", [140, 141, 139], [140, 141, 139]);
   const regressed = check(regressedCandidate, stableImmutable, stablePrevious);

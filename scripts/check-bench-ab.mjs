@@ -51,21 +51,11 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
   }
   const vsOld = ((value / old) - 1) * 100;
   const vsPrev = ((value / prev) - 1) * 100;
-  const candidateRoundMins = candidate.metrics?.[name]?.roundMins;
-  const candidateSlowest = Array.isArray(candidateRoundMins) && candidateRoundMins.length > 0
-    ? Math.max(...candidateRoundMins)
-    : Number.NaN;
-  const slowestVsOld = ((candidateSlowest / old) - 1) * 100;
-  const slowestVsPrev = ((candidateSlowest / prev) - 1) * 100;
-  // Full max/min spread is still useful diagnostic evidence, but it is
-  // symmetric: one unusually fast round can exceed the threshold even when
-  // every regression comparison is safe. Tolerate high spread only when the
-  // candidate median beats both anchors and even its slowest round remains
-  // inside both performance budgets. Slow or ambiguous variance still fails.
-  const favorableSafeEnvelope = vsOld <= 0 && vsPrev <= 0
-    && Number.isFinite(candidateSlowest)
-    && slowestVsOld <= budget.maxVsImmutablePct
-    && slowestVsPrev <= budget.maxVsPreviousPct;
+  const candidateSpread = candidate.metrics?.[name]?.roundSpreadPct;
+  const previousSpread = previous.metrics?.[name]?.roundSpreadPct;
+  const candidateAndPreviousReliable = [candidateSpread, previousSpread].every(
+    (spread) => Number.isFinite(spread) && spread <= budget.maxRoundSpreadPct,
+  );
   for (const [label, measurement] of Object.entries(measurements)) {
     const metric = measurement.metrics?.[name];
     const spread = metric?.roundSpreadPct;
@@ -77,9 +67,13 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
       );
       if (spread > budget.maxRoundSpreadPct) {
         const message = `${label}/${name}: ${spread.toFixed(1)}% round spread exceeds ${budget.maxRoundSpreadPct}% reliability limit`;
-        if (favorableSafeEnvelope) {
+        const immutableBaselineOnlyVariance = label === "immutable"
+          && candidateAndPreviousReliable
+          && vsOld <= budget.maxVsImmutablePct
+          && vsPrev <= budget.maxVsPreviousPct;
+        if (immutableBaselineOnlyVariance) {
           console.warn(
-            `warning: ${message}, but candidate median beats both anchors and its slowest round remains within both budgets`,
+            `warning: ${message}; immutable baseline-only variance accepted because candidate and previous-release spreads are within the reliability limit and candidate median is within both regression budgets`,
           );
         } else {
           failures.push(`${message}; investigate runner/metric variance`);
