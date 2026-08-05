@@ -5627,11 +5627,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             retained_run_count,
             resume_candidate,
             detached_bootstrap_reconstruction,
-            // A detached bootstrap candidate is only an accelerator. If its
-            // migrated resume is refused, engine open still falls back to the
-            // complete replay, so adoption—not reconstruction—distinguishes
-            // the full-replay outcome.
-            full_bootstrap_replay: !resume_observation.adopted,
+            // Retained resume adoption and the process-local ephemeral
+            // predecessor both skip the bootstrap prefix. `adopted` names only
+            // the retained case, so the authenticated replay base is the exact
+            // discriminator for a generation-zero full replay.
+            full_bootstrap_replay: resume_observation.replay_base_generation == 0,
             manifest_count,
             manifest_enumeration: manifest_enumeration.unwrap_or_default(),
             resume_selection: resume_selection.unwrap_or_default(),
