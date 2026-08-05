@@ -3177,7 +3177,7 @@ mod tests {
                 imported.intent().annotations(),
                 "{name} changed source annotations"
             );
-    }
+        }
     }
 
     #[test]
