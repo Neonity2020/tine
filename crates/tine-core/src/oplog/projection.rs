@@ -24,11 +24,11 @@ use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BatchInspection, BlockId, EngineError,
     LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition, ManifestProjectionTarget,
     ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
-    PageId, ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionPageState,
-    ProjectionPrecondition, ProjectionReceiptStore, ProjectionStoreError,
-    ProjectionTombstoneAuthorization, ProjectionWork, ProjectionWorkBlockAuthority,
-    ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget, ReceiptError,
-    ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
+    ProjectionEndpointId, ProjectionIntent, ProjectionPageState, ProjectionPrecondition,
+    ProjectionReceiptStore, ProjectionStoreError, ProjectionTombstoneAuthorization, ProjectionWork,
+    ProjectionWorkBlockAuthority, ProjectionWorkIndex, ProjectionWorkStatus, ProjectionWorkTarget,
+    ReceiptError, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
@@ -394,6 +394,93 @@ pub(crate) fn plan_projection_with_layout_annotations(
     }
     let rendered = render_projection(state, expected_base, expected_base_annotations)?;
     projection_plan_from_rendered(workspace_id, state, expected_base, rendered)
+}
+
+/// One current completed-path receipt whose immutable completion and the live
+/// graph bytes together prove the exact semantic predecessor for a new local
+/// projection. This is deliberately a *live* proof: an old receipt base is
+/// not reconstructed and compared with a newer serializer. The completed-path
+/// row authenticates which receipt is current, while the live target digest and
+/// layout-aware replay prove that those bytes still describe the accepted page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptBackedLiveProjectionPredecessor {
+    completed: ProjectionCompletedReceipt,
+    intent: ProjectionIntent,
+    completion: ProjectionCompletion,
+}
+
+impl ReceiptBackedLiveProjectionPredecessor {
+    pub(crate) const fn completed(&self) -> &ProjectionCompletedReceipt {
+        &self.completed
+    }
+
+    pub(crate) const fn intent(&self) -> &ProjectionIntent {
+        &self.intent
+    }
+
+    pub(crate) const fn completion(&self) -> &ProjectionCompletion {
+        &self.completion
+    }
+}
+
+/// Prove that `live_bytes` remain the current projection of `state` through
+/// the enrolled completed-path authority. `None` is an ordinary stale or
+/// externally-divergent observation and must enter reconciliation; an error
+/// denotes malformed or foreign durable authority.
+pub(crate) fn receipt_backed_live_projection_predecessor(
+    workspace_id: WorkspaceId,
+    endpoint: ProjectionEndpointBinding,
+    receipts: &ProjectionReceiptStore,
+    work_index: &ProjectionWorkIndex,
+    state: &ProjectionPageState,
+    live_bytes: &[u8],
+) -> Result<Option<ReceiptBackedLiveProjectionPredecessor>, ProjectionError> {
+    if receipts.workspace_id() != workspace_id
+        || receipts.endpoint_binding() != Some(endpoint)
+        || work_index.workspace_id() != workspace_id
+        || work_index.endpoint_id() != endpoint.endpoint_id()
+        || work_index.graph_resource_id() != endpoint.graph_resource_id()
+        || work_index.receipt_store_id() != receipts.store_id()
+    {
+        return Err(ProjectionError::EndpointBindingMismatch);
+    }
+
+    let completed = work_index
+        .completed_receipts_for_path(&state.page.path)
+        .map_err(|error| ProjectionError::Work(error.to_string()))?;
+    let [completed] = completed.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(completed.target(), ProjectionWorkTarget::Present(_)) {
+        return Ok(None);
+    }
+
+    let (intent, completion) = receipts.load_completed_receipt(completed)?;
+    if intent.workspace_id() != workspace_id
+        || intent.page_id() != state.page.page_id
+        || intent.path() != &state.page.path
+        || intent.frontier() != &state.frontier
+        || intent.claim_evidence() != state.claim_evidence
+        || intent.target() != super::BlobDescription::of(live_bytes)
+    {
+        return Ok(None);
+    }
+
+    let replay = plan_projection_with_layout_annotations(
+        workspace_id,
+        state,
+        Some(live_bytes),
+        Some(intent.annotations()),
+    )?;
+    if replay.target() != live_bytes || replay.intent().annotations() != intent.annotations() {
+        return Ok(None);
+    }
+
+    Ok(Some(ReceiptBackedLiveProjectionPredecessor {
+        completed: completed.clone(),
+        intent,
+        completion,
+    }))
 }
 
 fn projection_plan_from_rendered(
@@ -3005,6 +3092,28 @@ mod tests {
             next.intent().precondition(),
             &ProjectionPrecondition::Base(BlobDescription::of(source))
         );
+    }
+
+    #[test]
+    fn receipt_backed_layout_replay_preserves_a_nonleading_atx_heading_target() {
+        let state = structural_layout_state(
+            "pages/heading.md",
+            vec![(80_040, None, "a", "## Current plan".into(), None)],
+        );
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_041));
+        let source = b"## Current plan\n";
+
+        let rendered = render_projection(&state, Some(source), None).unwrap();
+        assert_eq!(rendered.target, source);
+        let replay = plan_projection_with_layout_annotations(
+            workspace,
+            &state,
+            Some(source),
+            Some(&rendered.annotations),
+        )
+        .unwrap();
+        assert_eq!(replay.target(), source);
+        assert_eq!(replay.intent().annotations(), rendered.annotations);
     }
 
     #[test]

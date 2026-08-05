@@ -3324,6 +3324,11 @@ struct CapabilityCapturedPriorProjection {
     pub(crate) completion: Option<ProjectionCompletion>,
     pub(crate) bootstrap_owner_binding: Option<ContentDigest>,
     pub(crate) managed_local_authority: Option<(u64, BatchId)>,
+    /// This predecessor was reproved from the authenticated completed-path
+    /// authority and the live file, rather than from an old receipt base.
+    /// Finalization repeats the same live-layout proof, not a canonical
+    /// historical re-render that could reject harmless preserved trivia.
+    pub(crate) receipt_backed_live_authority: bool,
 }
 
 impl CapabilityCapturedPriorProjection {
@@ -3332,11 +3337,12 @@ impl CapabilityCapturedPriorProjection {
             &self.completion,
             self.bootstrap_owner_binding,
             self.managed_local_authority,
+            self.receipt_backed_live_authority,
         ) {
-            (Some(completion), None, None) => completion
+            (Some(completion), None, None, _) => completion
                 .validate_against(&self.intent)
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
-            (None, Some(_), None) | (None, None, Some(_)) => Ok(()),
+            (None, Some(_), None, false) | (None, None, Some(_), false) => Ok(()),
             _ => Err(EngineError::ProjectionManifest(
                 "captured prior projection has ambiguous authority".into(),
             )),
@@ -3435,6 +3441,7 @@ impl CapabilityCapturedProjectionInput {
                     completion: Some(prior_completion.clone()),
                     bootstrap_owner_binding: None,
                     managed_local_authority: None,
+                    receipt_backed_live_authority: false,
                 }),
             },
         };
@@ -14200,6 +14207,7 @@ impl ShardedHotEngine {
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: Some((entry.sequence, entry.batch_id)),
+            receipt_backed_live_authority: false,
         }))
     }
 
@@ -14381,7 +14389,45 @@ impl ShardedHotEngine {
                 Some(prior)
             } else if let Some(requirement_index) = roles.semantic_predecessor {
                 let requirement = &draft.requirements[requirement_index];
-                let authority = match completed.as_slice() {
+                let before = draft.pages[&requirement.page_id]
+                    .before
+                    .as_ref()
+                    .expect("prior requirement was selected from a semantic pre-state");
+                let receipt_backed_live = current
+                    .as_deref()
+                    .map(|live_bytes| {
+                        super::projection::receipt_backed_live_projection_predecessor(
+                            self.workspace_id,
+                            source,
+                            receipts,
+                            &work_index,
+                            before,
+                            live_bytes,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                    .flatten();
+                if let Some(live) = receipt_backed_live {
+                    charge_preauthoring_receipt_bytes(
+                        &mut retained_bytes,
+                        live.intent(),
+                        live.completion(),
+                        "live semantic predecessor receipt",
+                    )?;
+                    let bytes = current
+                        .as_ref()
+                        .expect("live receipt predecessor requires a present graph file")
+                        .clone();
+                    Some(CapabilityCapturedPriorProjection {
+                        bytes,
+                        intent: live.intent().clone(),
+                        completion: Some(live.completion().clone()),
+                        bootstrap_owner_binding: None,
+                        managed_local_authority: None,
+                        receipt_backed_live_authority: true,
+                    })
+                } else if let Some(authority) = match completed.as_slice() {
                     [authority]
                         if matches!(authority.target(), ProjectionWorkTarget::Present(_)) =>
                     {
@@ -14391,8 +14437,7 @@ impl ShardedHotEngine {
                         authority_matches = false;
                         None
                     }
-                };
-                if let Some(authority) = authority {
+                } {
                     let (intent, completion) = receipts
                         .load_completed_receipt(authority)
                         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -14402,10 +14447,6 @@ impl ShardedHotEngine {
                         &completion,
                         "semantic predecessor receipt",
                     )?;
-                    let before = draft.pages[&requirement.page_id]
-                        .before
-                        .as_ref()
-                        .expect("prior requirement was selected from a semantic pre-state");
                     let base = receipts
                         .load_base(&intent)
                         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -14432,6 +14473,7 @@ impl ShardedHotEngine {
                             completion: Some(completion),
                             bootstrap_owner_binding: None,
                             managed_local_authority: None,
+                            receipt_backed_live_authority: false,
                         })
                     }
                 } else if completed.is_empty() {
@@ -14484,6 +14526,7 @@ impl ShardedHotEngine {
                                 completion: None,
                                 bootstrap_owner_binding: Some(baseline.owner_binding()),
                                 managed_local_authority: None,
+                                receipt_backed_live_authority: false,
                             })
                         }
                     } else {
@@ -14780,7 +14823,10 @@ impl ShardedHotEngine {
                     Some(prior.intent.annotations()),
                 )
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                if replay.target() != prior.bytes {
+                if replay.target() != prior.bytes
+                    || (prior.receipt_backed_live_authority
+                        && replay.intent().annotations() != prior.intent.annotations())
+                {
                     return Err(EngineError::ProjectionManifest(format!(
                         "captured path {path} prior bytes are not the exact semantic pre-state"
                     )));

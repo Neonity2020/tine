@@ -4613,6 +4613,36 @@ mod tests {
     }
 
     #[test]
+    fn formatting_receipt_survives_crash_reopen_late_callback_and_next_local_save() {
+        let mut fixture = Fixture::formatting_only("formatting-receipt-reopen");
+        let path = fixture.path.clone();
+        let formatted = b"- root\r\n\r\n\t- child\r\n";
+        fixture.overwrite(formatted);
+        assert!(matches!(
+            fixture.execute(&[&path]),
+            OperationalCoordinatorState::Noop
+        ));
+
+        // Model a process loss after the durable completion/path row exists,
+        // before its watcher callback. Reopen has no RAM predecessor to use.
+        fixture = fixture.restart_projection_runtime();
+
+        // The late callback must derive an authenticated no-op from retained
+        // inventory and the durable completed-path receipt, not reconcile its
+        // own exact projection as an external edit.
+        assert!(matches!(
+            fixture.execute(&[&path]),
+            OperationalCoordinatorState::Noop
+        ));
+        expect_local_active(fixture.local_edit(49_050, "after unsafe reopen"));
+        fixture.assert_drained();
+        assert_eq!(
+            fs::read(fixture.graph_root.join(&path)).unwrap(),
+            b"- after unsafe reopen\r\n\r\n\t- child\r\n"
+        );
+    }
+
+    #[test]
     fn formatting_only_intent_recovers_after_restart_before_the_next_real_edit() {
         let mut fixture = Fixture::formatting_only("formatting-only-restart");
         let path = fixture.path.clone();
