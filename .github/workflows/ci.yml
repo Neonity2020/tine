@@ -214,11 +214,11 @@ jobs:
 
   # Linux host tests do not see either platform branch: Windows has its own cfg
   # implementation, while Android's libc declarations differ from desktop Linux.
-  # Windows compiles every tine-core test target, runs the complete storage suite
-  # in isolated processes, and executes the declared core parity/durability smoke.
+  # Windows compiles every tine-core and tine-storage test target, then executes
+  # declared parity/durability smoke selections in isolated processes.
   # Full tine-core Windows parity remains deliberately deferred; see docs/CI.md.
   windows-compile:
-    name: Full CI / Windows compile, storage, and core smoke
+    name: Full CI / Windows compile + storage smoke + core smoke
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows' || (inputs.scope == 'full' && inputs.windows_test_name == ''))
     runs-on: windows-latest
     steps:
@@ -240,12 +240,12 @@ jobs:
       - name: Windows core test targets compile (all; release gate)
         if: inputs.windows_test_name == ''
         run: cargo test -p tine-core --no-run
-      - name: Windows core smoke (isolated contract selection; release gate)
+      - name: Windows storage test targets compile (all; release gate)
+        if: inputs.windows_test_name == ''
+        run: cargo test -p tine-storage --no-run
+      - name: Windows core + storage smoke (isolated contract selections; release gate)
         if: inputs.windows_test_name == ''
         run: node scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke
-      - name: Windows storage tests (full isolated nextest suite; release gate)
-        if: inputs.windows_test_name == ''
-        run: cargo nextest run --profile ci-windows --package tine-storage
       - name: Windows core test (focused exact serial) / ${{ inputs.windows_test_name }}
         if: inputs.scope == 'windows' && inputs.windows_test_name != ''
         shell: pwsh

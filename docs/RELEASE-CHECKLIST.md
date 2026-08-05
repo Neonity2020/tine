@@ -28,10 +28,13 @@ may tag, publish, comment, and close issues.
    Record and compare the staged/deployed SHA-256 so Martin can test the actual
    release candidate while the slower platform workflows run.
 7. The Windows x64 real-app smoke suite is advisory when available. Separately,
-   step 9's Windows CI evidence is blocking: it compiles all `tine-core` test
-   targets, runs full isolated `tine-storage`, and runs the contract-selected
-   core parity/durability/lifecycle smoke suite. See `docs/CI.md` for the
-   intentionally deferred full-core Windows parity boundary.
+   step 9's Windows CI evidence is blocking: it compiles all `tine-core` and
+   `tine-storage` test targets, then runs the contract-selected core and storage
+   parity/durability/lifecycle smoke suites. See `docs/CI.md` for the
+   intentionally deferred full-core Windows parity boundary. Once
+   `tine-storage` is independently versioned and pinned, require its full
+   cross-platform certification only for a new storage version or pin change;
+   ordinary Tine releases retain compile and integration-smoke coverage.
 8. Set `scripts/bench-policy.json`'s `previousRelease.ref` to the most recently
    published release (never the unshipped candidate). Do not advance the
    immutable baseline. Push the exact candidate and require the same-machine A/B
@@ -43,7 +46,7 @@ may tag, publish, comment, and close issues.
 9. Push the frozen exact candidate, manually dispatch `ci.yml` with
    `scope=full`, and require all nine full jobs to succeed on that SHA,
    including the Linux nextest inventory contract and all four hash shards plus
-   the blocking Windows compile/storage/core-smoke job. Record the Actions URL
+   the blocking Windows compile + storage-smoke + core-smoke job. Record the Actions URL
    and confirm it with `scripts/check-ci-evidence.mjs`.
    PR or focused CI is not release evidence. Any source/rebase/version change
    creates a new SHA and requires a new full run. See `docs/CI.md`.

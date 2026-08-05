@@ -7,6 +7,10 @@ import {
   WINDOWS_CORE_EXACT_TEST_NAMES,
   WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
   WINDOWS_CORE_SMOKE_FILTERSET,
+  WINDOWS_STORAGE_DEFERRED_WINDOWS_NAMED_TEST_NAMES,
+  WINDOWS_STORAGE_SMOKE_FILTERSET,
+  WINDOWS_STORAGE_SMOKE_TEST_NAMES,
+  WINDOWS_STORAGE_SELECTED_WINDOWS_NAMED_TEST_NAMES,
   inventoryFromNextestList,
   verifyLinuxShardCoverage,
   verifyWindowsCoreSmokeSelection,
@@ -83,21 +87,48 @@ const coreCaptureWitnesses = [
 ];
 assert.deepEqual(WINDOWS_CORE_CAPTURE_WITNESS_NAMES, coreCaptureWitnesses);
 
-const storageWitnesses = ["filesystem::tests::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit"];
+const storageSmokeTests = [
+  "filesystem::tests::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit",
+  "filesystem::tests::validated_real_directory_has_explicit_windows_durability_limit",
+  "filesystem::tests::windows_directory_validation_rejects_reparse_and_non_directory_handles",
+  "local_journal::tests::one_append_performs_exactly_one_durability_barrier",
+  "local_journal::tests::a_completed_append_survives_a_restart",
+  "local_journal::tests::a_duplicate_open_is_refused_while_the_first_is_live",
+];
+const deferredWindowsStorageTests = [
+  "packed_patricia::tests::pack_catalog_and_head_crash_windows_are_invisible_or_retry_exactly",
+];
+assert.deepEqual(WINDOWS_STORAGE_SMOKE_TEST_NAMES, storageSmokeTests);
+assert.deepEqual(WINDOWS_STORAGE_SELECTED_WINDOWS_NAMED_TEST_NAMES, [
+  "filesystem::tests::validated_real_directory_has_explicit_windows_durability_limit",
+  "filesystem::tests::windows_directory_validation_rejects_reparse_and_non_directory_handles",
+]);
+assert.deepEqual(WINDOWS_STORAGE_DEFERRED_WINDOWS_NAMED_TEST_NAMES, deferredWindowsStorageTests);
 const coreSmokeTests = [...new Set([...coreWindowsTests, ...coreLifecycleWitnesses, ...coreCaptureWitnesses])];
 assert.deepEqual(
   verifyWindowsCoreSmokeSelection(
     listedInventory("tine-core", [...coreSmokeTests, "unselected_platform_neutral_test"]),
     listedInventory("tine-core", coreSmokeTests),
-    listedInventory("tine-storage", storageWitnesses)
+    listedInventory("tine-storage", [...storageSmokeTests, ...deferredWindowsStorageTests]),
+    listedInventory("tine-storage", storageSmokeTests)
   ),
-  { coreTestCount: 30, coreSmokeTestCount: 29, storageTestCount: 1, windowsNamedCount: 13, bootstrapWitnessCount: 8 }
+  {
+    coreTestCount: 30,
+    coreSmokeTestCount: 29,
+    storageTestCount: 7,
+    storageSmokeTestCount: 6,
+    windowsNamedCount: 13,
+    windowsNamedStorageCount: 3,
+    deferredWindowsStorageCount: 1,
+    bootstrapWitnessCount: 8,
+  }
 );
 assert.throws(
   () => verifyWindowsCoreSmokeSelection(
     listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("windows_live_graph"))),
     listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("windows_live_graph"))),
-    listedInventory("tine-storage", storageWitnesses)
+    listedInventory("tine-storage", [...storageSmokeTests, ...deferredWindowsStorageTests]),
+    listedInventory("tine-storage", storageSmokeTests)
   ),
   /Windows-named tine-core test inventory changed/
 );
@@ -105,12 +136,42 @@ assert.throws(
   () => verifyWindowsCoreSmokeSelection(
     listedInventory("tine-core", coreSmokeTests),
     listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("inactive_bootstrap_capture_rejects_file_cap"))),
-    listedInventory("tine-storage", storageWitnesses)
+    listedInventory("tine-storage", [...storageSmokeTests, ...deferredWindowsStorageTests]),
+    listedInventory("tine-storage", storageSmokeTests)
   ),
   /Windows core smoke selection omitted required test/
 );
+assert.throws(
+  () => verifyWindowsCoreSmokeSelection(
+    listedInventory("tine-core", coreSmokeTests),
+    listedInventory("tine-core", coreSmokeTests),
+    listedInventory("tine-storage", [...storageSmokeTests, ...deferredWindowsStorageTests, "new_windows_storage_test"]),
+    listedInventory("tine-storage", storageSmokeTests)
+  ),
+  /Windows-named tine-storage test inventory changed/
+);
+assert.throws(
+  () => verifyWindowsCoreSmokeSelection(
+    listedInventory("tine-core", coreSmokeTests),
+    listedInventory("tine-core", coreSmokeTests),
+    listedInventory("tine-storage", [...storageSmokeTests, ...deferredWindowsStorageTests]),
+    listedInventory("tine-storage", storageSmokeTests.slice(0, -1))
+  ),
+  /Windows storage smoke selection omitted required test/
+);
+assert.throws(
+  () => verifyWindowsCoreSmokeSelection(
+    listedInventory("tine-core", coreSmokeTests),
+    listedInventory("tine-core", coreSmokeTests),
+    listedInventory("tine-storage", storageSmokeTests),
+    listedInventory("tine-storage", storageSmokeTests)
+  ),
+  /Windows-named tine-storage test inventory changed/
+);
 assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_live_graph_root_move_is_denied_without_rebinding\)/);
 assert.doesNotMatch(WINDOWS_CORE_SMOKE_FILTERSET, /all\(\)|fast_commit/);
+assert.match(WINDOWS_STORAGE_SMOKE_FILTERSET, /test\(=local_journal::tests::a_completed_append_survives_a_restart\)/);
+assert.doesNotMatch(WINDOWS_STORAGE_SMOKE_FILTERSET, /all\(\)|fast_commit/);
 assert.equal(LINUX_TINE_CORE_SHARD_COUNT, 4);
 
 console.log("tine-core nextest contract fixture tests passed.");

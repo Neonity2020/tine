@@ -50,8 +50,32 @@ export const WINDOWS_CORE_CAPTURE_WITNESS_NAMES = Object.freeze([
   "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
 ]);
 
-const STORAGE_EXACT_WITNESS_NAMES = Object.freeze([
+// Linux is the complete tine-storage semantic suite. Windows compiles every
+// storage target, then runs this bounded smoke: the durability, restart, and
+// nonblocking-lock contracts whose platform behavior is material to Tine.
+// Keep this exact and inventory-backed; a broad package filter would silently
+// promote known Windows-incompatible legacy tests into the Tine release gate.
+export const WINDOWS_STORAGE_SMOKE_TEST_NAMES = Object.freeze([
   "filesystem::tests::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit",
+  "filesystem::tests::validated_real_directory_has_explicit_windows_durability_limit",
+  "filesystem::tests::windows_directory_validation_rejects_reparse_and_non_directory_handles",
+  "local_journal::tests::one_append_performs_exactly_one_durability_barrier",
+  "local_journal::tests::a_completed_append_survives_a_restart",
+  "local_journal::tests::a_duplicate_open_is_refused_while_the_first_is_live",
+]);
+
+// Every explicitly Windows-named tine-storage test must be deliberately
+// classified. These two are executed by the storage smoke; the packed-Patricia
+// crash-window test below is a known incompatible legacy runtime test and is
+// deferred to tine-storage's own Windows certification. It is not masked,
+// retried, or claimed to have passed here.
+export const WINDOWS_STORAGE_SELECTED_WINDOWS_NAMED_TEST_NAMES = Object.freeze([
+  "filesystem::tests::validated_real_directory_has_explicit_windows_durability_limit",
+  "filesystem::tests::windows_directory_validation_rejects_reparse_and_non_directory_handles",
+]);
+
+export const WINDOWS_STORAGE_DEFERRED_WINDOWS_NAMED_TEST_NAMES = Object.freeze([
+  "packed_patricia::tests::pack_catalog_and_head_crash_windows_are_invisible_or_retry_exactly",
 ]);
 
 const WINDOWS_CORE_SMOKE_TEST_NAMES = Object.freeze([
@@ -67,6 +91,10 @@ const WINDOWS_CORE_SMOKE_TEST_NAMES = Object.freeze([
 // tests (including currently known Windows-incompatible ones) back into the
 // release gate without an intentional policy change.
 export const WINDOWS_CORE_SMOKE_FILTERSET = WINDOWS_CORE_SMOKE_TEST_NAMES
+  .map((testName) => `test(=${testName})`)
+  .join(" | ");
+
+export const WINDOWS_STORAGE_SMOKE_FILTERSET = WINDOWS_STORAGE_SMOKE_TEST_NAMES
   .map((testName) => `test(=${testName})`)
   .join(" | ");
 
@@ -165,10 +193,13 @@ function requireExactNameSet(actualNames, expectedNames, label) {
   }
 }
 
-export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, storageInventory) {
+export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, storageInventory, storageSmokeInventory) {
   if (coreInventory?.packageName !== "tine-core") fail("Windows core inventory is not tine-core");
   if (smokeInventory?.packageName !== "tine-core") fail("Windows core smoke inventory is not tine-core");
   if (storageInventory?.packageName !== "tine-storage") fail("Windows storage inventory is not tine-storage");
+  if (storageSmokeInventory?.packageName !== "tine-storage") {
+    fail("Windows storage smoke inventory is not tine-storage");
+  }
 
   const windowsNamed = [...coreInventory.tests.values()]
     .filter((test) => test.testName.toLowerCase().includes("windows"))
@@ -176,13 +207,43 @@ export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, s
   requireExactNameSet(windowsNamed, WINDOWS_CORE_EXACT_TEST_NAMES, "Windows-named tine-core test inventory");
   requireNamesSelected(coreInventory, smokeInventory, WINDOWS_CORE_SMOKE_TEST_NAMES, "Windows core smoke selection");
   requireExactNameSet(testNames(smokeInventory), WINDOWS_CORE_SMOKE_TEST_NAMES, "Windows core smoke selection");
-  for (const name of STORAGE_EXACT_WITNESS_NAMES) requireUniqueName(storageInventory, name);
+  const windowsNamedStorage = [...storageInventory.tests.values()]
+    .filter((test) => test.testName.toLowerCase().includes("windows"))
+    .map((test) => test.testName);
+  requireExactNameSet(
+    WINDOWS_STORAGE_SELECTED_WINDOWS_NAMED_TEST_NAMES,
+    WINDOWS_STORAGE_SMOKE_TEST_NAMES.filter((testName) => testName.toLowerCase().includes("windows")),
+    "Selected Windows-named tine-storage test declaration"
+  );
+  const classifiedWindowsStorage = [
+    ...WINDOWS_STORAGE_SELECTED_WINDOWS_NAMED_TEST_NAMES,
+    ...WINDOWS_STORAGE_DEFERRED_WINDOWS_NAMED_TEST_NAMES,
+  ];
+  requireExactNameSet(
+    windowsNamedStorage,
+    classifiedWindowsStorage,
+    "Windows-named tine-storage test inventory"
+  );
+  requireNamesSelected(
+    storageInventory,
+    storageSmokeInventory,
+    WINDOWS_STORAGE_SMOKE_TEST_NAMES,
+    "Windows storage smoke selection"
+  );
+  requireExactNameSet(
+    testNames(storageSmokeInventory),
+    WINDOWS_STORAGE_SMOKE_TEST_NAMES,
+    "Windows storage smoke selection"
+  );
 
   return {
     coreTestCount: coreInventory.tests.size,
     coreSmokeTestCount: smokeInventory.tests.size,
     storageTestCount: storageInventory.tests.size,
+    storageSmokeTestCount: storageSmokeInventory.tests.size,
     windowsNamedCount: windowsNamed.length,
+    windowsNamedStorageCount: windowsNamedStorage.length,
+    deferredWindowsStorageCount: WINDOWS_STORAGE_DEFERRED_WINDOWS_NAMED_TEST_NAMES.length,
     bootstrapWitnessCount: WINDOWS_CORE_CAPTURE_WITNESS_NAMES.length,
   };
 }
@@ -204,13 +265,13 @@ function nextestList(profile, packageName, { partition, filterset } = {}) {
   }
 }
 
-function runWindowsCoreSmoke() {
+function runWindowsSmoke(packageName, filterset, label) {
   const result = spawnSync(
     "cargo",
-    ["nextest", "run", "--profile", "ci-windows", "--package", "tine-core", "--filterset", WINDOWS_CORE_SMOKE_FILTERSET],
+    ["nextest", "run", "--profile", "ci-windows", "--package", packageName, "--filterset", filterset],
     { cwd: process.cwd(), stdio: "inherit" }
   );
-  if (result.error) fail(`could not start Windows core smoke: ${result.error.message}`);
+  if (result.error) fail(`could not start ${label}: ${result.error.message}`);
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
@@ -236,14 +297,18 @@ function main() {
     const core = nextestList("ci-windows", "tine-core");
     const smoke = nextestList("ci-windows", "tine-core", { filterset: WINDOWS_CORE_SMOKE_FILTERSET });
     const storage = nextestList("ci-windows", "tine-storage");
-    const result = verifyWindowsCoreSmokeSelection(core, smoke, storage);
+    const storageSmoke = nextestList("ci-windows", "tine-storage", { filterset: WINDOWS_STORAGE_SMOKE_FILTERSET });
+    const result = verifyWindowsCoreSmokeSelection(core, smoke, storage, storageSmoke);
     console.log(
-      `Windows nextest contract OK: ${result.coreTestCount} compiled tine-core tests, ${result.coreSmokeTestCount} contract-selected core smoke tests, ${result.storageTestCount} full tine-storage tests, ${result.windowsNamedCount} Windows-named tests, and ${result.bootstrapWitnessCount} bootstrap capture witnesses.`
+      `Windows nextest contract OK: ${result.coreTestCount} compiled tine-core tests, ${result.coreSmokeTestCount} contract-selected core smoke tests, ${result.storageTestCount} tine-storage inventory tests, ${result.storageSmokeTestCount} contract-selected storage smoke tests, ${result.windowsNamedCount} Windows-named core tests, ${result.windowsNamedStorageCount} classified Windows-named storage tests (${result.deferredWindowsStorageCount} explicitly deferred), and ${result.bootstrapWitnessCount} bootstrap capture witnesses.`
     );
-    if (process.argv.includes("--run-smoke")) runWindowsCoreSmoke();
+    if (process.argv.includes("--run-smoke")) {
+      runWindowsSmoke("tine-core", WINDOWS_CORE_SMOKE_FILTERSET, "Windows core smoke");
+      runWindowsSmoke("tine-storage", WINDOWS_STORAGE_SMOKE_FILTERSET, "Windows storage smoke");
+    }
     return;
   }
-  fail("pass --mode linux or --mode windows (add --run-smoke to execute the verified Windows core selection)");
+  fail("pass --mode linux or --mode windows (add --run-smoke to execute the verified Windows core and storage selections)");
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
