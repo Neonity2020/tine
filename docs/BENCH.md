@@ -68,10 +68,17 @@ three round minima**, not a single invocation. The artifact retains every round,
 its exact order, and its within-round samples.
 
 Reliability is checked at both levels: calibration spread across all nine
-measurements, and per-version/per-metric spread across rounds. A volatile
-`scrollBig` baseline therefore fails as unreliable even when its median would
-make the candidate pass. Rerunning a red job cannot erase the first attempt's
-evidence; every attempt uploads its complete distribution.
+measurements, and per-version/per-metric spread across rounds. Normally a
+volatile `scrollBig` baseline fails as unreliable even when its median would
+make the candidate pass. A noisy *reference anchor* is advisory only when the
+candidate and the other anchor are reliable, and both the candidate median and
+its slowest round remain within every applicable budget. Separately, a noisy
+candidate is advisory only for a directional fast-outlier shape: its median must
+beat both anchors and its slowest round must remain within both budgets. Neither
+exception can waive calibration instability, multiple noisy anchors, a slow
+candidate tail, or either median regression budget. Rerunning a red job cannot
+erase the first attempt's evidence; every attempt uploads its complete
+distribution.
 
 `scripts/bench-policy.json` is the contract:
 

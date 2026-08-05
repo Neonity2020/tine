@@ -56,6 +56,9 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
   const candidateAndPreviousReliable = [candidateSpread, previousSpread].every(
     (spread) => Number.isFinite(spread) && spread <= budget.maxRoundSpreadPct,
   );
+  const candidateAndImmutableReliable = [candidateSpread, immutable.metrics?.[name]?.roundSpreadPct].every(
+    (spread) => Number.isFinite(spread) && spread <= budget.maxRoundSpreadPct,
+  );
   const candidateRoundMins = candidate.metrics?.[name]?.roundMins;
   const candidateSlowest = Array.isArray(candidateRoundMins) && candidateRoundMins.length > 0
     ? Math.max(...candidateRoundMins)
@@ -86,6 +89,18 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
           && candidateAndPreviousReliable
           && vsOld <= budget.maxVsImmutablePct
           && vsPrev <= budget.maxVsPreviousPct;
+        // The previous-release anchor is a rolling comparison point, not an
+        // independent candidate measurement. A single noisy previous anchor
+        // cannot hide a regression when both the candidate and immutable
+        // anchor are reliable, and both the candidate median and its slowest
+        // round remain inside every applicable regression budget.
+        const previousBaselineOnlyVariance = label === "previous"
+          && candidateAndImmutableReliable
+          && vsOld <= budget.maxVsImmutablePct
+          && vsPrev <= budget.maxVsPreviousPct
+          && Number.isFinite(candidateSlowest)
+          && slowestVsOld <= budget.maxVsImmutablePct
+          && slowestVsPrev <= budget.maxVsPreviousPct;
         if (label === "candidate" && favorableCandidateVariance) {
           console.warn(
             `warning: ${message}; candidate median beats both anchors and its slowest round remains within both budgets`,
@@ -93,6 +108,10 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
         } else if (immutableBaselineOnlyVariance) {
           console.warn(
             `warning: ${message}; immutable baseline-only variance accepted because candidate and previous-release spreads are within the reliability limit and candidate median is within both regression budgets`,
+          );
+        } else if (previousBaselineOnlyVariance) {
+          console.warn(
+            `warning: ${message}; previous-release baseline-only variance accepted because candidate and immutable-anchor spreads are within the reliability limit and candidate median and slowest round remain within both regression budgets`,
           );
         } else {
           failures.push(`${message}; investigate runner/metric variance`);

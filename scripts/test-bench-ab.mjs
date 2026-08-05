@@ -122,13 +122,56 @@ try {
     "candidate variance requires a median no slower than both anchors",
   );
 
-  // Previous-release variance remains a hard reliability blocker too.
+  // The rolling previous-release anchor can be the one noisy measurement:
+  // accept it only when the candidate and immutable anchor are both reliable,
+  // and the candidate median plus slowest round stay inside both budgets.
   const unstablePrevious = measurement("previous", [105, 106, 104], [80, 100, 100.2]);
   const previousSpread = check(stableCandidate, stableImmutable, unstablePrevious);
+  assert.equal(previousSpread.status, 0, previousSpread.stderr || previousSpread.stdout);
+  assert.match(
+    `${previousSpread.stdout}\n${previousSpread.stderr}`,
+    /warning: previous\/scrollBig: .*previous-release baseline-only variance accepted/,
+  );
+
+  // The previous-anchor exception is not a multi-anchor exception: a noisy
+  // immutable anchor still blocks the run even when previous is the noisy
+  // rolling anchor too.
+  const previousAndImmutableVariable = check(
+    stableCandidate,
+    unstableImmutable,
+    unstablePrevious,
+  );
   assertFails(
-    previousSpread,
+    previousAndImmutableVariable,
+    /immutable\/scrollBig: .*round spread exceeds/,
+    "previous-anchor variance does not waive immutable-anchor variance",
+  );
+
+  // Candidate variance remains independently unsafe for the previous-anchor
+  // exception, even if the older candidate-only exception can explain a fast
+  // outlier on its own.
+  const previousAndCandidateVariable = check(
+    favorableVariableCandidate,
+    stableImmutable,
+    unstablePrevious,
+  );
+  assertFails(
+    previousAndCandidateVariable,
     /previous\/scrollBig: .*round spread exceeds/,
-    "previous-release variance remains a blocker",
+    "previous-anchor variance requires a reliable candidate",
+  );
+
+  // A previous-anchor waiver also cannot hide a candidate slow tail, even when
+  // the candidate median is favorable.
+  const previousVarianceUnsafeTail = check(
+    unsafeTailCandidate,
+    stableImmutable,
+    unstablePrevious,
+  );
+  assertFails(
+    previousVarianceUnsafeTail,
+    /candidate\/scrollBig: .*round spread exceeds/,
+    "previous-anchor variance does not waive a candidate slow tail",
   );
 
   // Neither variance waiver can excuse a candidate that breaches either
@@ -153,6 +196,19 @@ try {
     previousBudgetBreach,
     /scrollBig: 21\.0% slower than previous release/,
     "previous-release budget breach remains a blocker",
+  );
+
+  // Previous-anchor variance cannot conceal a candidate that breaches the
+  // rolling median budget.
+  const previousVarianceBudgetBreach = check(
+    measurement("candidate", [110, 111, 109], [121, 121, 121]),
+    measurement("immutable", [140, 141, 139], [140, 141, 139]),
+    unstablePrevious,
+  );
+  assertFails(
+    previousVarianceBudgetBreach,
+    /scrollBig: 21\.0% slower than previous release/,
+    "previous-anchor variance does not waive a candidate median budget breach",
   );
 
   // Global runner-load instability invalidates every comparison before either
