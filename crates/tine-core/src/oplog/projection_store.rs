@@ -2387,10 +2387,9 @@ impl ProjectionReceiptStore {
         let name = mutation_authority_lease_filename(intent_id);
         let file = open_mutation_authority_lease_file(&self.capability, &name)?;
         if let Err(error) = file.try_lock_exclusive() {
-            if matches!(
-                error.kind(),
-                ErrorKind::WouldBlock | ErrorKind::PermissionDenied
-            ) {
+            if error.kind() == ErrorKind::PermissionDenied
+                || tine_storage::nonblocking_lock_is_contended(&error)
+            {
                 return Err(ProjectionStoreError::MutationAuthorityPending);
             }
             return Err(error.into());

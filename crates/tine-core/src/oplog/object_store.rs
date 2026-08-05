@@ -8104,7 +8104,9 @@ impl<'a> AdvisoryTransitionGuard<'a> {
             if let Some(contention_hook) = contention_hook {
                 match fs2::FileExt::try_lock_exclusive(file) {
                     Ok(()) => return Ok(Self(file)),
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => contention_hook(),
+                    Err(error) if tine_storage::nonblocking_lock_is_contended(&error) => {
+                        contention_hook()
+                    }
                     Err(error) => return Err(error.into()),
                 }
             }

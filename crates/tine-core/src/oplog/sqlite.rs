@@ -6911,10 +6911,9 @@ fn lock_workspace_lease_file(
 
 fn lock_opened_lease_file(file: File, display_path: &Path) -> Result<File, ProjectionError> {
     if let Err(error) = file.try_lock_exclusive() {
-        if matches!(
-            error.kind(),
-            ErrorKind::WouldBlock | ErrorKind::PermissionDenied
-        ) {
+        if error.kind() == ErrorKind::PermissionDenied
+            || tine_storage::nonblocking_lock_is_contended(&error)
+        {
             return Err(ProjectionError::LeaseContended(display_path.to_path_buf()));
         }
         return Err(error.into());

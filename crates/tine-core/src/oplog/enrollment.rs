@@ -6272,10 +6272,9 @@ fn acquire_lease(
     };
     validate_authoritative_file(&file, "enrollment lease")?;
     if let Err(error) = file.try_lock_exclusive() {
-        if matches!(
-            error.kind(),
-            ErrorKind::WouldBlock | ErrorKind::PermissionDenied
-        ) {
+        if error.kind() == ErrorKind::PermissionDenied
+            || tine_storage::nonblocking_lock_is_contended(&error)
+        {
             return Err(EnrollmentError::LeaseContended(
                 directories.display_path.join(LEASE_FILE),
             ));
