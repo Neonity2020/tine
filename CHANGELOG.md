@@ -13,6 +13,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **"Open in new tab" in the block context menu.** Right-clicking a block now
   offers "Open in new tab", mirroring the existing page context-menu item and
   block-bullet middle-click. Works on both editable and read-only blocks.
+- **One-click copy on calculator results.** Hovering a successful ```calc
+  result shows a copy button that copies the displayed value to the clipboard
+  via Tine's existing clipboard facade. Error and blank result lines do not
+  offer the button. The button is available in both the rendered calculator
+  and the live editor's result column; clicking it does not mutate the block
+  or create an empty row.
 
 ### Changed
 
