@@ -27678,7 +27678,7 @@ fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
         if metadata.is_dir() {
             flush_bootstrap_source_prefix(&child)?;
         } else if metadata.is_file() {
-            fs::File::open(&child)?.sync_all()?;
+            sync_bootstrap_source_regular_file(&child)?;
         } else {
             return Err(bootstrap_source_capture_error(
                 "source capture prefix contains a non-file entry",
@@ -27686,6 +27686,19 @@ fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
         }
     }
     sync_bootstrap_source_directory(path)
+}
+
+#[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
+fn sync_bootstrap_source_regular_file(path: &Path) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    // Rust's Windows `File::sync_all` calls `FlushFileBuffers`, which requires
+    // a handle with write access. `File::open` supplies only `GENERIC_READ` and
+    // therefore reports `ERROR_ACCESS_DENIED` even for our writable capture
+    // artifacts. Keep the narrower read-only handle on other platforms.
+    #[cfg(windows)]
+    options.write(true);
+    options.open(path)?.sync_all()
 }
 
 fn verify_bootstrap_source_capture(
@@ -47152,6 +47165,18 @@ mod tests {
             .unwrap();
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&capture_scratch);
+    }
+
+    #[test]
+    fn bootstrap_source_regular_file_sync_uses_supported_handle_access() {
+        let root = scratch("bootstrap-source-file-sync");
+        let path = root.join("capture-artifact");
+        fs::write(&path, b"durable bootstrap artifact").unwrap();
+
+        sync_bootstrap_source_regular_file(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"durable bootstrap artifact");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
