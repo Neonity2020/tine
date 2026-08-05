@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
+use cap_std::{ambient_authority, fs::Dir};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -1924,7 +1925,7 @@ fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid_bootstrap_data("bootstrap path has no parent"))?;
-    File::open(parent)?.sync_all()
+    sync_bootstrap_preparation_directory(parent)
 }
 
 fn numbered_path(directory: &Path, ordinal: u32) -> PathBuf {
@@ -3783,14 +3784,31 @@ fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
         if metadata.is_dir() {
             flush_bootstrap_preparation_tree(&child)?;
         } else if metadata.is_file() {
-            File::open(&child)?.sync_all()?;
+            sync_bootstrap_preparation_regular_file(&child)?;
         } else {
             return Err(invalid_bootstrap_data(
                 "bootstrap preparation tree contains a non-file entry",
             ));
         }
     }
-    File::open(path)?.sync_all()
+    sync_bootstrap_preparation_directory(path)
+}
+
+#[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
+fn sync_bootstrap_preparation_regular_file(path: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // `sync_all` maps to `FlushFileBuffers` on Windows. That API requires a
+    // write-capable handle; a `File::open` read handle fails with
+    // `ERROR_ACCESS_DENIED` even when the artifact itself is writable.
+    #[cfg(windows)]
+    options.write(true);
+    options.open(path)?.sync_all()
+}
+
+fn sync_bootstrap_preparation_directory(path: &Path) -> io::Result<()> {
+    let directory = Dir::open_ambient_dir(path, ambient_authority())?;
+    tine_storage::sync_dir_required(&directory)
 }
 
 fn copy_bootstrap_tree_exact(
@@ -3814,7 +3832,7 @@ fn copy_bootstrap_tree_exact(
             create_private_directory(&destination_path)?;
             copy_bootstrap_tree_exact(&source_path, &destination_path)?;
             #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            File::open(&destination_path)?.sync_all()?;
+            sync_bootstrap_preparation_directory(&destination_path)?;
         } else if metadata.is_file() {
             copy_bootstrap_file_exact(&source_path, &destination_path)?;
         } else {
@@ -3824,7 +3842,7 @@ fn copy_bootstrap_tree_exact(
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    File::open(destination)?.sync_all()?;
+    sync_bootstrap_preparation_directory(destination)?;
     Ok(())
 }
 
@@ -8096,6 +8114,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn bootstrap_preparation_flush_handles_use_platform_durability_contracts() {
+        let root = TestRoot::new("bootstrap-preparation-flush-handles");
+        let directory = root.path().join("preparation");
+        fs::create_dir(&directory).unwrap();
+        let artifact = directory.join("artifact");
+        fs::write(&artifact, b"durable preparation artifact").unwrap();
+
+        sync_bootstrap_preparation_regular_file(&artifact).unwrap();
+        sync_bootstrap_preparation_directory(&directory).unwrap();
+
+        assert_eq!(
+            fs::read(&artifact).unwrap(),
+            b"durable preparation artifact"
+        );
     }
 
     struct SnapshotFixture {
