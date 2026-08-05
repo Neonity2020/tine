@@ -520,13 +520,46 @@ fn snapshot_file_digests_matching(
     root: &Path,
     include: impl Fn(&str, bool) -> bool,
 ) -> BTreeMap<String, ContentDigest> {
-    snapshot_file_digests_matching_with_reader(root, include, |path| fs::read(path).unwrap())
+    snapshot_file_digests_matching_with_reader(root, include, |path| {
+        fs::read(path).unwrap_or_else(|error| {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            panic!(
+                "failed to read snapshot file `{}` beneath `{}`: {error:?}",
+                relative.display(),
+                root.display()
+            )
+        })
+    })
 }
 
 fn in_top_level_namespace(path: &str, namespaces: &[&str]) -> bool {
     path.split('/')
         .next()
         .is_some_and(|component| namespaces.contains(&component))
+}
+
+fn is_enrollment_lease_path(path: &str) -> bool {
+    let mut components = path.split('/');
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (
+            Some("sparse-storage"),
+            Some("v2"),
+            Some("local"),
+            Some(_),
+            Some("enrollment"),
+            Some("lease"),
+            None
+        )
+    )
 }
 
 /// Durable byte identity of a SQLite database directory.
@@ -541,20 +574,36 @@ fn durable_sqlite_digests(directory: &Path) -> BTreeMap<String, ContentDigest> {
 }
 
 #[test]
-fn authoritative_snapshot_prunes_runtime_namespaces_before_reading_files() {
+fn authoritative_snapshot_prunes_lock_namespaces_before_reading_files() {
     let root = TestRoot::new("authoritative-snapshot-prunes-runtime");
     fs::create_dir(root.path().join(".tine-runtime")).unwrap();
     fs::create_dir(root.path().join("engine-scratch-v2")).unwrap();
     fs::create_dir(root.path().join("batches")).unwrap();
+    fs::create_dir_all(root.path().join("sparse-storage/v2/local/graph/enrollment")).unwrap();
     fs::write(root.path().join(".tine-runtime/locked"), b"live lease").unwrap();
     fs::write(root.path().join("engine-scratch-v2/run"), b"scratch").unwrap();
     fs::write(root.path().join("batches/authoritative"), b"durable").unwrap();
     fs::write(root.path().join("head"), b"authoritative head").unwrap();
+    fs::write(
+        root.path()
+            .join("sparse-storage/v2/local/graph/enrollment/lease"),
+        b"locked enrollment lease",
+    )
+    .unwrap();
+    fs::write(
+        root.path()
+            .join("sparse-storage/v2/local/graph/enrollment/head"),
+        b"authenticated enrollment head",
+    )
+    .unwrap();
 
     let mut opened = Vec::new();
     let snapshot = snapshot_file_digests_matching_with_reader(
         root.path(),
-        |path, _| !in_top_level_namespace(path, &[".tine-runtime", "engine-scratch-v2"]),
+        |path, _| {
+            !in_top_level_namespace(path, &[".tine-runtime", "engine-scratch-v2"])
+                && !is_enrollment_lease_path(path)
+        },
         |path| {
             let relative = path
                 .strip_prefix(root.path())
@@ -562,7 +611,8 @@ fn authoritative_snapshot_prunes_runtime_namespaces_before_reading_files() {
                 .to_string_lossy()
                 .replace('\\', "/");
             assert!(
-                !in_top_level_namespace(&relative, &[".tine-runtime", "engine-scratch-v2"]),
+                !in_top_level_namespace(&relative, &[".tine-runtime", "engine-scratch-v2"])
+                    && !is_enrollment_lease_path(&relative),
                 "an excluded runtime file must never reach the reader: {relative}"
             );
             opened.push(relative);
@@ -572,12 +622,20 @@ fn authoritative_snapshot_prunes_runtime_namespaces_before_reading_files() {
 
     assert_eq!(
         snapshot.keys().cloned().collect::<Vec<_>>(),
-        vec!["batches/authoritative".to_owned(), "head".to_owned()]
+        vec![
+            "batches/authoritative".to_owned(),
+            "head".to_owned(),
+            "sparse-storage/v2/local/graph/enrollment/head".to_owned()
+        ]
     );
     opened.sort();
     assert_eq!(
         opened,
-        vec!["batches/authoritative".to_owned(), "head".to_owned()]
+        vec![
+            "batches/authoritative".to_owned(),
+            "head".to_owned(),
+            "sparse-storage/v2/local/graph/enrollment/head".to_owned()
+        ]
     );
 }
 
@@ -4594,10 +4652,14 @@ impl Drop for HelperProcess {
 /// Every *authoritative* durable byte a takeover could touch: the enrollment
 /// journal and the archive.
 ///
-/// Three things are deliberately outside this set. The archive's
+/// Four things are deliberately outside this set. The archive's
 /// `.tine-runtime` namespace holds the workspace lease file, whose contents are
 /// diagnostic metadata that ownership is never decided by — taking the lease
-/// rewrites the recorded pid. The device-local SQLite projection is disposable
+/// rewrites the recorded pid. The device-local enrollment lease's bytes are
+/// likewise not authority: its stable file identity is bound into every
+/// authenticated enrollment record and is revalidated separately, while the
+/// empty file itself remains locked for the writer's lifetime. The device-local
+/// SQLite projection is disposable
 /// frontier-stamped materialization that can never authorize a write, so a
 /// recovery legitimately rebuilds it before it has earned the right to change
 /// anything authoritative. And the engine scratch namespace holds run-local
@@ -4618,6 +4680,7 @@ fn authoritative_world(
     ] {
         for (path, digest) in snapshot_file_digests_matching(directory, |path, _| {
             !in_top_level_namespace(path, &[".tine-runtime", "engine-scratch-v2"])
+                && (label != "enrollment" || !is_enrollment_lease_path(path))
         }) {
             digests.insert(format!("{label}/{path}"), digest);
         }
