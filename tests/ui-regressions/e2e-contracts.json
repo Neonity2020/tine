@@ -68,6 +68,18 @@
       "nonRequirements": ["Exact dialog appearance or host file-manager behavior."],
       "stability": "stable"
     },
+    "scripts/e2e-file-poll.mjs": {
+      "contracts": [{ "class": "core-operation", "userOutcome": "Disk-backed E2E journeys observe an atomically replaced file within a bounded wait without treating its transient absence as a product failure.", "blocking": true }],
+      "acceptableVariations": ["The number and timing of transient missing-file observations may vary within the bounded save window."],
+      "nonRequirements": ["Retrying permission errors, malformed paths, persistent absence, or content that never satisfies the journey predicate."],
+      "stability": "stable"
+    },
+    "scripts/e2e-file-poll.test.mjs": {
+      "contracts": [{ "class": "core-operation", "userOutcome": "The atomic-save polling contract retries only transient missing files and remains fail-closed for persistent absence and other I/O errors.", "blocking": true }],
+      "acceptableVariations": ["The helper implementation and test clock may evolve while the three error-class boundaries remain proved."],
+      "nonRequirements": ["Any product UI journey or exact polling interval by itself."],
+      "stability": "stable"
+    },
     "scripts/e2e-journal-format.mjs": {
       "contracts": [{ "class": "core-operation", "userOutcome": "Custom journal filename and title formats load and render the corresponding journal feed entries.", "blocking": true }],
       "acceptableVariations": ["Locale rendering and feed layout may vary while configured dates remain discoverable."],

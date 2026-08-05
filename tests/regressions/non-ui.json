@@ -2168,19 +2168,20 @@
     },
     {
       "id": "REG-BOOTSTRAP-SPOOL-WINDOWS-HANDLE-LIFECYCLE-001",
-      "title": "Bootstrap source capture closes raw spool writers before sorting and removal on Windows",
+      "title": "Bootstrap source capture completes on Windows without permission errors",
       "family": "sync-data-safety",
       "sources": {
         "issues": [],
         "commits": [
-          "bf112b71"
+          "bf112b71",
+          "3ed78e9f"
         ]
       },
       "platforms": [
         "windows"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "fixing",
       "coverage": {
         "tests": [
           "crates/tine-core/src/oplog/local_active/tests.rs::a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write",
@@ -2189,7 +2190,7 @@
         "scenario": "managed-storage.bootstrap-spool-writer-lifecycle",
         "failBefore": "proven"
       },
-      "notes": "Fail-before: exact serial hosted Windows run 30986757145 on a30f0de1625634d4ecf9b898d351786872b0e292 reached live-runtime bootstrap capture and failed with ERROR_ACCESS_DENIED at local_active/tests.rs:174. collect_bootstrap_source_pass synced all five raw spool writers but retained their open write handles while sort_bootstrap_source_spool reopened and removed the same files; Unix permitted the overlap and masked the portability defect. The durable handoff now closes the complete writer set before any sort/reopen/remove operation. The original lifecycle assertion remains unchanged, and the focused capture family covers the same bounded sort path."
+      "notes": "Fail-before: exact serial hosted Windows runs 30986757145 and 30992636156 reached live-runtime bootstrap capture and failed with ERROR_ACCESS_DENIED surfaced at local_active/tests.rs:174. Closing all five synced raw-spool writers before sorting is correct lifecycle hygiene but did not resolve the focused Windows witness; Rust's standard Windows file handles already request delete sharing, so writer lifetime is not a proven root cause. Test-only stage instrumentation at 3ed78e9f preserves the raw OS error and names the last capture I/O boundary so an exact focused Windows probe can identify the failing operation before another behavioral fix is attempted. The original lifecycle assertion remains unchanged."
     }
   ]
 }
