@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { waitForFileText as waitForPersistedFileText } from "./e2e-file-poll.mjs";
 
 if (process.platform !== "linux") throw new Error("sparse-v2 recovery native proof is Linux-only");
 if (!process.env.TINE_APP) throw new Error("HARNESS UNAVAILABLE: sparse-v2 recovery requires the exact candidate in TINE_APP");
@@ -233,8 +234,9 @@ async function openPageFromInventory(name) {
 }
 
 async function waitForFileText(file, text, label) {
-  await waitFor(() => fs.existsSync(file) && fs.readFileSync(file, "utf8").includes(text), 15_000,
-    `${label} did not durably save ${JSON.stringify(text)}`);
+  await waitForPersistedFileText(file, (body) => body.includes(text), `${label} did not durably save ${JSON.stringify(text)}`, {
+    timeoutMs: 15_000,
+  });
 }
 
 async function editCurrentPage(marker, file, label) {

@@ -14,6 +14,7 @@ import {
   tauriCapabilities,
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
+import { waitForFileText } from "./e2e-file-poll.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP = process.env.TINE_APP || path.join(ROOT, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine");
@@ -101,13 +102,7 @@ async function activeEditorReceipt(label) {
 }
 
 async function waitForFile(text, label) {
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    const body = fs.readFileSync(PAGE_FILE, "utf8");
-    if (body.includes(text)) return body;
-    await sleep(100);
-  }
-  throw new Error(`${label} did not persist: ${JSON.stringify(fs.readFileSync(PAGE_FILE, "utf8"))}`);
+  return waitForFileText(PAGE_FILE, (body) => body.includes(text), label);
 }
 
 async function target() {

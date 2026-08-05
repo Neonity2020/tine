@@ -14,6 +14,7 @@ import {
   tauriCapabilities,
   webdriverServerArgs,
 } from "./e2e-capabilities.mjs";
+import { waitForFileText } from "./e2e-file-poll.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP = process.env.TINE_APP || path.join(ROOT, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine");
@@ -144,13 +145,7 @@ async function setPagePropertyField(label, value) {
 }
 
 async function waitForFile(file, predicate, label) {
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    const text = fs.readFileSync(file, "utf8");
-    if (predicate(text)) return text;
-    await sleep(100);
-  }
-  throw new Error(`${label} was not persisted: ${fs.readFileSync(file, "utf8")}`);
+  return waitForFileText(file, predicate, label);
 }
 
 async function nativeTab({ shift = false } = {}) {
