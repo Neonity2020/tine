@@ -17,6 +17,7 @@ import {
   windowsWebviewProfileSnapshot,
 } from "./e2e-capabilities.mjs";
 import { candidateProblems, releaseLayout, RELEASE_LANES } from "./release-layout.mjs";
+import { LINUX_TINE_CORE_SHARD_COUNT } from "./tine-core-nextest-contract.mjs";
 
 const version = "0.5.6";
 const commit = "a".repeat(40);
@@ -24,6 +25,7 @@ const repository = "martinkoutecky/tine";
 const layout = releaseLayout(version);
 const releaseWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/release.yml"), "utf8");
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
+const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
 const flatpakWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/flatpak.yml"), "utf8");
 const flatpakMetadataWorkflow = fs.readFileSync(
@@ -166,8 +168,17 @@ assert.match(
   "docs-only pull requests still start app validation"
 );
 for (const name of REQUIRED_FULL_CI_JOBS) {
+  if (/Full CI \/ Linux tine-core nextest shard [1-4]\/4/.test(name)) continue;
   assert.ok(ciWorkflow.includes(`name: ${name}`), `CI workflow is missing stable evidence job ${name}`);
 }
+assert.deepEqual(
+  REQUIRED_FULL_CI_JOBS.filter((name) => name.includes("Linux tine-core nextest shard")),
+  Array.from(
+    { length: LINUX_TINE_CORE_SHARD_COUNT },
+    (_, index) => `Full CI / Linux tine-core nextest shard ${index + 1}/${LINUX_TINE_CORE_SHARD_COUNT}`
+  ),
+  "exact-SHA evidence does not enumerate every Linux nextest shard"
+);
 assert.match(
   ciWorkflow,
   /test:[\s\S]*?name: Full CI \/ Linux tests and release contracts[\s\S]*?inputs\.scope == 'full'/,
@@ -199,6 +210,30 @@ assert.equal(yamlScalar(ciPermissions, "contents", 2), "read");
 assert.doesNotMatch(ciPermissions.join("\n"), /write/, "CI must not request write permissions");
 
 const ciJobs = yamlBlock(ciYaml, "jobs", 0);
+assert.match(nextestConfig, /^nextest-version = "0\.9\.143"$/m, "nextest version is not pinned");
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?default-filter = "all\(\)"/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?fail-fast = false/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?retries = 0/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?flaky-result = "fail"/);
+assert.match(
+  nextestConfig,
+  /slow-timeout = \{ period = "5m", terminate-after = 2, grace-period = "30s", on-timeout = "fail" \}/,
+  "nextest CI profile does not fail on a finite per-test timeout"
+);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?global-timeout = "4h"/);
+assert.match(nextestConfig, /\[profile\.ci\][\s\S]*?status-level = "slow"[\s\S]*?final-status-level = "slow"/);
+const windowsNextestProfile = nextestConfig.match(
+  /^\[profile\.ci-windows\]\r?\n([\s\S]*?)(?=^\[|(?![\s\S]))/m
+)?.[1];
+assert.ok(windowsNextestProfile, "nextest config is missing the Windows profile");
+assert.match(windowsNextestProfile, /^inherits = "ci"$/m);
+assert.match(windowsNextestProfile, /^run-extra-args = \["--test-threads=1"\]$/m);
+assert.doesNotMatch(
+  windowsNextestProfile,
+  /^test-threads\s*=\s*1\s*$/m,
+  "Windows nextest profile globally serializes isolated test processes"
+);
+assert.doesNotMatch(nextestConfig, /on-timeout = "pass"|retries = [1-9]/, "nextest profile masks a failure");
 const scopeValidation = yamlBlock(ciJobs, "validate-windows-focused-test-input", 2);
 assert.equal(
   yamlScalar(scopeValidation, "if", 4),
@@ -226,9 +261,23 @@ const runsWindowsLane = (scope, testName) => scope === "windows" || (scope === "
 assert.equal(runsWindowsLane("full", ""), true);
 assert.equal(runsWindowsLane("full", "config::tests::focused"), false);
 assert.equal(runsWindowsLane("windows", "config::tests::focused"), true);
-const fullWindowsCore = yamlNamedStep(windowsCompile, "Windows core tests (full suite; release gate)");
+const nextestInstall = yamlNamedStep(windowsCompile, "Install cargo-nextest 0.9.143");
+assert.equal(yamlScalar(nextestInstall, "uses", 8), "taiki-e/install-action@v2");
+assert.equal(yamlScalar(yamlBlock(nextestInstall, "with", 8), "tool", 10), "nextest@0.9.143");
+const windowsInventory = yamlNamedStep(windowsCompile, "Verify Windows tine-core inventory and lifecycle witnesses");
+assert.equal(yamlScalar(windowsInventory, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(windowsInventory, "run", 8), "node scripts/tine-core-nextest-contract.mjs --mode windows");
+const fullWindowsCore = yamlNamedStep(windowsCompile, "Windows core tests (full isolated nextest suite; release gate)");
 assert.equal(yamlScalar(fullWindowsCore, "if", 8), "inputs.windows_test_name == ''");
-assert.equal(yamlScalar(fullWindowsCore, "run", 8), "cargo test -p tine-core");
+assert.equal(yamlScalar(fullWindowsCore, "run", 8), "cargo nextest run --profile ci-windows --package tine-core");
+const fullWindowsStorage = yamlNamedStep(windowsCompile, "Windows storage tests (full isolated nextest suite; release gate)");
+assert.equal(yamlScalar(fullWindowsStorage, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(fullWindowsStorage, "run", 8), "cargo nextest run --profile ci-windows --package tine-storage");
+assert.doesNotMatch(
+  [yamlScalar(fullWindowsCore, "run", 8), yamlScalar(fullWindowsStorage, "run", 8)].join("\n"),
+  /--lib|--test|--filterset|--partition|--skip|--exact/,
+  "Windows release coverage is no longer the full package inventory"
+);
 
 const focusedWindowsCore = yamlNamedStep(
   windowsCompile,
@@ -270,6 +319,54 @@ assert.equal(safeRustTestPath.test("model::tests::unknown; exit 0"), false);
 const tauriCompile = yamlNamedStep(windowsCompile, "Windows Tauri shell compiles");
 assert.equal(yamlScalar(tauriCompile, "run", 8), "cargo check -p tine --features custom-protocol");
 const fullLinux = yamlBlock(ciJobs, "test", 2);
+const linuxCoreContract = yamlBlock(ciJobs, "linux-core-nextest-contract", 2);
+assert.equal(yamlScalar(linuxCoreContract, "name", 4), "Full CI / Linux tine-core nextest contract");
+assert.equal(yamlScalar(linuxCoreContract, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
+assert.equal(
+  yamlScalar(yamlNamedStep(linuxCoreContract, "Install cargo-nextest 0.9.143"), "uses", 8),
+  "taiki-e/install-action@v2"
+);
+assert.equal(
+  yamlScalar(yamlBlock(yamlNamedStep(linuxCoreContract, "Install cargo-nextest 0.9.143"), "with", 8), "tool", 10),
+  "nextest@0.9.143"
+);
+assert.equal(
+  yamlScalar(yamlNamedStep(linuxCoreContract, "Verify Linux tine-core nextest inventory and deterministic shards"), "run", 8),
+  "node scripts/tine-core-nextest-contract.mjs --mode linux"
+);
+const linuxCoreShards = yamlBlock(ciJobs, "linux-core-nextest", 2);
+assert.equal(
+  yamlScalar(linuxCoreShards, "name", 4),
+  `Full CI / Linux tine-core nextest shard \${{ matrix.shard }}/${LINUX_TINE_CORE_SHARD_COUNT}`
+);
+assert.equal(yamlScalar(linuxCoreShards, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
+assert.match(
+  linuxCoreShards.join("\n"),
+  new RegExp(`strategy:[\\s\\S]*?fail-fast: false[\\s\\S]*?shard: \\[1, 2, 3, ${LINUX_TINE_CORE_SHARD_COUNT}\\]`),
+  "Linux nextest shard topology is not explicit and complete"
+);
+assert.equal(
+  yamlScalar(
+    yamlNamedStep(linuxCoreShards, "Linux tine-core nextest / deterministic hash shard ${{ matrix.shard }}/4"),
+    "run",
+    8
+  ),
+  "cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4"
+);
+assert.equal(
+  yamlScalar(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "uses", 8),
+  "taiki-e/install-action@v2"
+);
+assert.equal(
+  yamlScalar(yamlBlock(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "with", 8), "tool", 10),
+  "nextest@0.9.143"
+);
+assert.doesNotMatch(
+  [linuxCoreContract, linuxCoreShards, windowsCompile].map((job) => job.join("\n")).join("\n"),
+  /continue-on-error:/,
+  "nextest release evidence hides a failed contract or test job"
+);
+assert.doesNotMatch(fullLinux.join("\n"), /cargo test -p tine-core/, "Linux full evidence still has a monolithic core run");
 const androidCompile = yamlBlock(ciJobs, "android-core-compile", 2);
 const androidTestApk = yamlBlock(ciJobs, "android-test-apk", 2);
 const performanceBench = yamlBlock(ciJobs, "bench", 2);
@@ -416,9 +513,16 @@ assert.throws(
 assert.throws(
   () => selectExactCiEvidence(commit, [{
     run: successfulFullCiRun,
+    jobs: successfulFullCiJobs.filter((job) => job.name !== "Full CI / Linux tine-core nextest shard 4/4"),
+  }]),
+  /Full CI \/ Linux tine-core nextest shard 4\/4 concluded missing/
+);
+assert.throws(
+  () => selectExactCiEvidence(commit, [{
+    run: successfulFullCiRun,
     jobs: successfulFullCiJobs.map((job) => ({
       ...job,
-      conclusion: job.name === REQUIRED_FULL_CI_JOBS[3] ? "failure" : job.conclusion,
+      conclusion: job.name === "Full CI / performance A/B" ? "failure" : job.conclusion,
     })),
   }]),
   /Full CI \/ performance A\/B concluded failure/

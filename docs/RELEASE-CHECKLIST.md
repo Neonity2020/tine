@@ -38,10 +38,11 @@ may tag, publish, comment, and close issues.
    sequence, and inspect those frames for new blank, intermediate, or corrupt
    paints before shipping.
 9. Push the frozen exact candidate, manually dispatch `ci.yml` with
-   `scope=full`, and require all four full jobs to succeed on that SHA. Record
-   the Actions URL and confirm it with `scripts/check-ci-evidence.mjs`. PR or
-   focused CI is not release evidence. Any source/rebase/version change creates
-   a new SHA and requires a new full run. See `docs/CI.md`.
+   `scope=full`, and require all nine full jobs to succeed on that SHA,
+   including the Linux nextest inventory contract and all four hash shards.
+   Record the Actions URL and confirm it with `scripts/check-ci-evidence.mjs`.
+   PR or focused CI is not release evidence. Any source/rebase/version change
+   creates a new SHA and requires a new full run. See `docs/CI.md`.
 10. Manually dispatch `release.yml` on that same frozen ref. Its preflight must
     verify the exact-SHA CI evidence before packaging begins. Tag only after the
     exact commit's platform builds, Linux E2E, Android, real offline Flatpak job,

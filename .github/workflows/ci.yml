@@ -66,6 +66,7 @@ jobs:
           node scripts/check-flatpak-cargo-sources.mjs
           node scripts/test-release-readiness-lib.mjs
           node scripts/test-release-pipeline.mjs
+          node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
 
       - name: lsdoc generated artifacts are current
@@ -125,6 +126,7 @@ jobs:
         run: |
           node scripts/test-release-readiness-lib.mjs
           node scripts/test-release-pipeline.mjs
+          node scripts/test-tine-core-nextest-contract.mjs
           node scripts/test-env-toolchain-fallback.mjs
 
       - name: Performance baseline policy is current
@@ -160,9 +162,6 @@ jobs:
       - name: Frontend tests (vitest)
         run: npm test
 
-      - name: Rust core tests
-        run: cargo test -p tine-core
-
       - name: Standalone plugin template builds and conforms
         run: npm run plugin:template-check
 
@@ -171,6 +170,47 @@ jobs:
 
       - name: Launch plugins build and conform
         run: ./scripts/build-community-plugins.sh
+
+  # cargo-nextest lists and runs each test in its own process. The contract job
+  # uses those actual listings to prove that the stable hash shards collectively
+  # select every non-ignored tine-core test exactly once.
+  linux-core-nextest-contract:
+    name: Full CI / Linux tine-core nextest contract
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'full'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Install cargo-nextest 0.9.143
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
+      - name: Verify Linux tine-core nextest inventory and deterministic shards
+        run: node scripts/tine-core-nextest-contract.mjs --mode linux
+
+  linux-core-nextest:
+    name: Full CI / Linux tine-core nextest shard ${{ matrix.shard }}/4
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'full'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Install cargo-nextest 0.9.143
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
+      - name: Linux tine-core nextest / deterministic hash shard ${{ matrix.shard }}/4
+        run: cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4
 
   # Linux host tests do not see either platform branch: Windows has its own cfg
   # implementation, while Android's libc declarations differ from desktop Linux.
@@ -188,11 +228,21 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+      - name: Install cargo-nextest 0.9.143
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
       - run: npm ci
       - run: npm run build
-      - name: Windows core tests (full suite; release gate)
+      - name: Verify Windows tine-core inventory and lifecycle witnesses
         if: inputs.windows_test_name == ''
-        run: cargo test -p tine-core
+        run: node scripts/tine-core-nextest-contract.mjs --mode windows
+      - name: Windows core tests (full isolated nextest suite; release gate)
+        if: inputs.windows_test_name == ''
+        run: cargo nextest run --profile ci-windows --package tine-core
+      - name: Windows storage tests (full isolated nextest suite; release gate)
+        if: inputs.windows_test_name == ''
+        run: cargo nextest run --profile ci-windows --package tine-storage
       - name: Windows core test (focused exact serial) / ${{ inputs.windows_test_name }}
         if: inputs.scope == 'windows' && inputs.windows_test_name != ''
         shell: pwsh
