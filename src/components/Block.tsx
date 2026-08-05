@@ -129,7 +129,7 @@ import { MEDIA_EDITORS } from "../mediaEditors";
 import { resolveMediaEditorCommand } from "../mediaEditorSettings";
 import { refreshAssetOnReturn } from "../assetRefresh";
 import { isMobilePlatform } from "../nativeChrome";
-import { journalTitle } from "../journal";
+import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
 import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
@@ -2136,6 +2136,20 @@ export function Editor(props: { id: string }): JSX.Element {
         // format, or it points at a page that isn't the journal day.
         replaceTrigger(pageInsert(journalTitle(new Date())));
         return;
+      case "thatday": {
+        // GH #252: insert a ref to the CONTAINING journal page's date (not
+        // today's clock date), so a block moved away from its original journal
+        // page retains that date context.
+        const page = pageByName(doc.byId[props.id].page);
+        const date = page?.kind === "journal" ? parseJournalTitle(page.name) : null;
+        if (date) {
+          replaceTrigger(pageInsert(journalTitle(date)));
+        } else {
+          replaceTrigger("");
+          pushToast("/thatday is only available on journal pages.", "info");
+        }
+        return;
+      }
       case "upload-asset":
         replaceTrigger(""); // drop the "/upload" trigger text
         uploadAsset();

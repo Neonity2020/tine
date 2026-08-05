@@ -167,3 +167,14 @@ export function isJournalTitle(name: string): boolean {
   if (!name.trim()) return false;
   return [titleFormat, DEFAULT_TITLE_FORMAT, "yyyy-MM-dd"].some((f) => parseJournalWith(name, f) !== null);
 }
+
+/// Parse a journal page title back to a local-calendar `Date`, trying the
+/// graph's configured format, the default, and yyyy-MM-dd. Returns null if the
+/// title is not a recognizable journal date.
+export function parseJournalTitle(name: string): Date | null {
+  for (const fmt of [titleFormat, DEFAULT_TITLE_FORMAT, "yyyy-MM-dd"]) {
+    const parts = parseJournalWith(name, fmt);
+    if (parts) return new Date(parts.y, parts.m - 1, parts.d);
+  }
+  return null;
+}

@@ -19,6 +19,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   offer the button. The button is available in both the rendered calculator
   and the live editor's result column; clicking it does not mutate the block
   or create an empty row.
+- **`/That day` slash command.** Inserts a `[[date]]` reference to the
+  containing journal page's date (not today's clock date), using the
+  configured journal title format. On a non-journal page it does nothing and
+  shows a toast.
 
 ### Changed
 
