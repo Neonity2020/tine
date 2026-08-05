@@ -20,6 +20,7 @@ const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4491);
 const STALL_PORT = Number(process.env.E2E_PREVIEW_PORT || 4492);
 const TMP = process.env.E2E_TMP_DIR || "/tmp/tine-plugin-revocation-e2e";
 const GRAPH = path.join(TMP, "graph");
+const DECORATION_PAGE = "Plugin Revocation";
 const FIXTURE_ROOT = path.join(ROOT, "fixtures/plugin-revocation");
 const fixture = {
   controlIndex: process.env.TINE_E2E_CONTROL_INDEX || path.join(FIXTURE_ROOT, "control-index.json"),
@@ -68,7 +69,10 @@ fs.rmSync(TMP, { recursive: true, force: true });
 for (const dir of ["pages", "journals", "logseq"]) fs.mkdirSync(path.join(GRAPH, dir), { recursive: true });
 for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(TMP, "xdg", dir), { recursive: true });
 fs.writeFileSync(path.join(GRAPH, "logseq", "config.edn"), "{}\n");
-fs.writeFileSync(path.join(GRAPH, "pages", "Plugin Revocation.md"), "- Parent block\n  - Child block\n");
+// The fixture page has an ordinary parent/child outline. `thread-lines` is
+// meaningful only on that parent's child container; a journal leaf cannot
+// prove that a visual decoration activated.
+fs.writeFileSync(path.join(GRAPH, "pages", `${DECORATION_PAGE}.md`), "- Parent block\n  - Child block\n");
 const now = new Date();
 const journal = `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 fs.writeFileSync(path.join(GRAPH, "journals", `${journal}.md`), "- open [[Plugin Revocation]]\n");
@@ -95,6 +99,12 @@ async function assertNoContribution(browser, label) {
     identity: `${id}@${version}`,
   }), manifest.id, manifest.version, decorationKinds);
   if (state.threadDecorationVisible) throw new Error(`${label} contribution became visible: ${JSON.stringify(state)}`);
+  if (decorationKinds.includes("thread-lines")) {
+    const host = await threadLineHostState(browser);
+    if (host.outlineHostCount === 0 || host.decoratorClassCount !== 0) {
+      throw new Error(`${label} did not retain an undecorated real parent/child outline host: ${JSON.stringify(host)}`);
+    }
+  }
   if (commandLabels.length > 0) {
     await browser.keys(["Control", "Shift", "p"]);
     await browser.$(".switcher-input").waitForExist({ timeout: 5_000 });
@@ -104,6 +114,49 @@ async function assertNoContribution(browser, label) {
     await browser.keys(["Escape"]);
     await browser.$(".switcher").waitForExist({ reverse: true, timeout: 5_000 });
   }
+}
+
+async function openDecorationPage(browser) {
+  // The journal feed is only startup data, not the observation surface. Use
+  // the ordinary page-navigation path so this journey cannot accidentally
+  // prove a class on a startup leaf instead of the fixture's parent host.
+  await browser.keys(["Control", "k"]);
+  const input = await browser.$(".switcher-input");
+  await input.waitForExist({ timeout: 5_000 });
+  await input.setValue(DECORATION_PAGE);
+  await browser.waitUntil(async () => browser.execute((expected) => {
+    const active = document.querySelector(".switcher-row.active");
+    return active?.querySelector(".switcher-kind")?.textContent?.trim() === "page"
+      && active.querySelector(".switcher-name")?.textContent?.trim() === expected;
+  }, DECORATION_PAGE), { timeout: 10_000, timeoutMsg: `${DECORATION_PAGE} was not the active page result in the switcher` });
+  await browser.keys("Enter");
+  await browser.waitUntil(async () => browser.execute((expected) =>
+    document.querySelector("h1.page-title")?.textContent?.trim() === expected,
+  DECORATION_PAGE), { timeout: 10_000, timeoutMsg: `${DECORATION_PAGE} did not open through the normal page-navigation path` });
+}
+
+async function threadLineHostState(browser) {
+  return browser.execute(() => {
+    const outlineHosts = [...document.querySelectorAll(".ls-block")].filter((candidate) =>
+      Boolean(candidate.querySelector(":scope > .block-children-container > .block-children > .ls-block > .block-main")),
+    );
+    const decoratedHost = outlineHosts.find((candidate) => candidate.classList.contains("plugin-thread-lines"));
+    const childRow = decoratedHost?.querySelector(":scope > .block-children-container > .block-children > .ls-block > .block-main");
+    return {
+      outlineHostCount: outlineHosts.length,
+      decoratorClassCount: document.querySelectorAll(".ls-block.plugin-thread-lines").length,
+      decoratedOutlineHostCount: outlineHosts.filter((candidate) => candidate.classList.contains("plugin-thread-lines")).length,
+      hasDecoratedChild: Boolean(childRow),
+    };
+  });
+}
+
+function assertEnabledThreadLineHost(state, label) {
+  const enabled = state.outlineHostCount > 0
+    && state.decoratorClassCount > 0
+    && state.decoratedOutlineHostCount > 0
+    && state.hasDecoratedChild;
+  if (!enabled) throw new Error(`${label} thread-lines did not enable a real parent/child outline host: ${JSON.stringify(state)}`);
 }
 
 // A CONNECT proxy which accepts the TLS tunnel and then never forwards bytes.
@@ -173,7 +226,8 @@ try {
   seedEnabledSettings(controlIndexJson, controlSignature);
   await withAppSession("control", async (browser) => {
     if (decorationKinds.includes("thread-lines")) {
-      await browser.$(".plugin-thread-lines").waitForExist({ timeout: 10_000 });
+      await openDecorationPage(browser);
+      assertEnabledThreadLineHost(await threadLineHostState(browser), "positive-control");
     }
     if (commandLabels.length > 0) {
       await browser.keys(["Control", "Shift", "p"]);
@@ -183,10 +237,11 @@ try {
       if (missing) throw new Error(`positive-control command did not activate: ${missing}`);
     }
   });
-  console.log(`CONTROL PASS: ${manifest.id}@${manifest.version} visibly activated under the signed empty cache`);
+  console.log(`CONTROL PASS: ${manifest.id}@${manifest.version} activated on a real parent/child outline host under the signed empty cache`);
 
   seedEnabledSettings(revokedIndexJson, revokedSignature);
   await withAppSession("revoked", async (browser) => {
+    if (decorationKinds.includes("thread-lines")) await openDecorationPage(browser);
     await assertNoContribution(browser, "cached-revoked");
 
     await browser.$('[title="Settings (t s)"]').click();
@@ -218,6 +273,7 @@ try {
   delete persisted.plugin_registry_cache;
   fs.writeFileSync(settingsPath, `${JSON.stringify(persisted, null, 2)}\n`);
   await withAppSession("restart-without-cache", async (browser) => {
+    if (decorationKinds.includes("thread-lines")) await openDecorationPage(browser);
     await assertNoContribution(browser, "restart-without-cache");
     await browser.$('[title="Settings (t s)"]').click();
     await browser.$("button=Plugins").click();
