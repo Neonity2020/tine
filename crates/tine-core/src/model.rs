@@ -25413,6 +25413,25 @@ const BOOTSTRAP_SOURCE_ENTRIES: &str = "entries.sorted";
 const BOOTSTRAP_SOURCE_CHUNKS: &str = "chunks.sorted";
 const BOOTSTRAP_SOURCE_CHUNK_DIRECTORY: &str = "source-chunks";
 
+#[cfg(test)]
+thread_local! {
+    static BOOTSTRAP_SOURCE_IO_STAGE: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new("bootstrap source capture not started") };
+}
+
+#[cfg(test)]
+fn note_bootstrap_source_io_stage(stage: &'static str) {
+    BOOTSTRAP_SOURCE_IO_STAGE.with(|current| current.set(stage));
+}
+
+#[cfg(not(test))]
+fn note_bootstrap_source_io_stage(_stage: &'static str) {}
+
+#[cfg(test)]
+pub(crate) fn bootstrap_source_io_stage_for_test() -> &'static str {
+    BOOTSTRAP_SOURCE_IO_STAGE.with(std::cell::Cell::get)
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BootstrapSourceCaptureInstrumentation {
     pub(crate) physical_bytes: u64,
@@ -25941,23 +25960,33 @@ fn capture_inactive_bootstrap_sources(
     scratch: &Path,
 ) -> io::Result<BootstrapSourceCapture> {
     require_projection_platform()?;
+    note_bootstrap_source_io_stage("prepare bootstrap source scratch");
     let scratch = prepare_bootstrap_source_scratch(scratch)?;
+    note_bootstrap_source_io_stage("canonicalize bootstrap source graph root");
     let graph_root = fs::canonicalize(&graph.root)?;
     if scratch.starts_with(&graph_root) {
         return Err(bootstrap_source_capture_error(
             "bootstrap source scratch must be outside the graph capability root",
         ));
     }
+    note_bootstrap_source_io_stage("bind bootstrap source graph");
     let binding = bootstrap_source_binding(graph)?;
+    note_bootstrap_source_io_stage("revalidate bootstrap source binding before capture");
     require_current_bootstrap_source_binding(graph, &binding)?;
     let working = scratch.join(format!(".working-{}", Uuid::new_v4().simple()));
+    note_bootstrap_source_io_stage("create bootstrap source working directory");
     fs::create_dir(&working)?;
+    note_bootstrap_source_io_stage("create bootstrap source chunk directory");
     fs::create_dir(working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY))?;
 
+    note_bootstrap_source_io_stage("collect bootstrap source pass A");
     let first = collect_bootstrap_source_pass(graph, &working, "capture-a", &binding, true)?;
     bootstrap_source_capture_between_passes_hook()?;
+    note_bootstrap_source_io_stage("collect bootstrap source pass B");
     let second = collect_bootstrap_source_pass(graph, &working, "capture-b", &binding, false)?;
+    note_bootstrap_source_io_stage("compare bootstrap source passes");
     compare_bootstrap_source_passes(&first, &second)?;
+    note_bootstrap_source_io_stage("revalidate bootstrap source binding after capture");
     require_current_bootstrap_source_binding(graph, &binding)?;
 
     let inventory =
@@ -25979,6 +26008,7 @@ fn capture_inactive_bootstrap_sources(
         source_chunks: first.source_chunks,
         instrumentation,
     };
+    note_bootstrap_source_io_stage("seal bootstrap source capture");
     seal_bootstrap_source_capture(&working, capture)
 }
 
@@ -26069,9 +26099,13 @@ fn collect_bootstrap_source_pass(
     binding: &BootstrapSourceCaptureBinding,
     seal_chunks: bool,
 ) -> io::Result<BootstrapSourcePass> {
+    note_bootstrap_source_io_stage("revalidate bootstrap source binding before pass");
     require_current_bootstrap_source_binding(graph, binding)?;
+    note_bootstrap_source_io_stage("create bootstrap source pass directory");
     let paths = BootstrapSourcePassPaths::new(working, name)?;
+    note_bootstrap_source_io_stage("create bootstrap source raw spool writers");
     let mut writers = BootstrapSourcePassWriters::create(&paths)?;
+    note_bootstrap_source_io_stage("clone bootstrap source root capability");
     let root = graph
         .projection_root
         .as_ref()
@@ -26082,6 +26116,7 @@ fn collect_bootstrap_source_pass(
             )
         })?
         .try_clone()?;
+    note_bootstrap_source_io_stage("identify bootstrap source root capability");
     let root_resource = canonical_projection_directory_resource_id(&root)?;
     let mut state = BootstrapSourceWalkState {
         source_files: 0,
@@ -26098,12 +26133,14 @@ fn collect_bootstrap_source_pass(
             ..BootstrapSourceCaptureInstrumentation::default()
         },
     };
+    note_bootstrap_source_io_stage("write bootstrap source root inventory row");
     write_bootstrap_source_inventory_directory(
         &mut writers.inventory,
         "",
         root_resource,
         &mut state.instrumentation,
     )?;
+    note_bootstrap_source_io_stage("write bootstrap source root alias row");
     write_bootstrap_source_alias(
         &mut writers.aliases,
         0,
@@ -26111,6 +26148,7 @@ fn collect_bootstrap_source_pass(
         "",
         &mut state.instrumentation,
     )?;
+    note_bootstrap_source_io_stage("walk bootstrap source graph");
     walk_bootstrap_source_directory(
         graph,
         root,
@@ -26121,12 +26159,12 @@ fn collect_bootstrap_source_pass(
         &working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY),
         seal_chunks,
     )?;
+    note_bootstrap_source_io_stage("sync bootstrap source raw spool writers");
     writers.sync_all()?;
-    // Sorting reopens and then removes the raw spools. Close every writer at
-    // the durable handoff boundary first: Windows rejects those operations
-    // while a write handle remains live, whereas Unix would merely mask the
-    // lifecycle error.
+    // Sorting no longer needs the raw spool writers, so release them at the
+    // durable handoff before reopening and removing those files.
     drop(writers);
+    note_bootstrap_source_io_stage("revalidate bootstrap source binding before sort");
     require_current_bootstrap_source_binding(graph, binding)?;
     for kind in [
         BootstrapSourceSpoolKind::Inventory,
@@ -26135,17 +26173,28 @@ fn collect_bootstrap_source_pass(
         BootstrapSourceSpoolKind::Aliases,
         BootstrapSourceSpoolKind::Portable,
     ] {
+        note_bootstrap_source_io_stage(match kind {
+            BootstrapSourceSpoolKind::Inventory => "sort bootstrap source inventory spool",
+            BootstrapSourceSpoolKind::Entries => "sort bootstrap source entries spool",
+            BootstrapSourceSpoolKind::Chunks => "sort bootstrap source chunks spool",
+            BootstrapSourceSpoolKind::Aliases => "sort bootstrap source aliases spool",
+            BootstrapSourceSpoolKind::Portable => "sort bootstrap source portable spool",
+        });
         sort_bootstrap_source_spool(&paths, kind, &mut state.instrumentation)?;
     }
+    note_bootstrap_source_io_stage("validate bootstrap source sorted aliases");
     validate_bootstrap_source_unique_aliases(&paths.sorted(BootstrapSourceSpoolKind::Aliases))?;
+    note_bootstrap_source_io_stage("validate bootstrap source sorted entries");
     validate_bootstrap_source_sorted_entries(
         &paths.sorted(BootstrapSourceSpoolKind::Entries),
         state.source_files,
     )?;
+    note_bootstrap_source_io_stage("validate bootstrap source sorted chunks");
     validate_bootstrap_source_sorted_chunks(
         &paths.sorted(BootstrapSourceSpoolKind::Chunks),
         state.source_chunks,
     )?;
+    note_bootstrap_source_io_stage("revalidate bootstrap source binding after pass");
     require_current_bootstrap_source_binding(graph, binding)?;
     Ok(BootstrapSourcePass {
         binding: binding.clone(),
@@ -26166,6 +26215,7 @@ fn walk_bootstrap_source_directory(
     chunks_directory: &Path,
     seal_chunks: bool,
 ) -> io::Result<()> {
+    note_bootstrap_source_io_stage("open bootstrap source directory cursor");
     let entries = directory.entries()?;
     let mut stack = vec![BootstrapSourceWalkFrame {
         directory,
@@ -26186,6 +26236,7 @@ fn walk_bootstrap_source_directory(
                 "source directory-entry cap exceeded",
             ));
         }
+        note_bootstrap_source_io_stage("read bootstrap source directory entry");
         let entry = entry?;
         let name = entry.file_name();
         let name = name
@@ -26218,6 +26269,7 @@ fn walk_bootstrap_source_directory(
         } else {
             format!("{}/{name}", frame.relative)
         };
+        note_bootstrap_source_io_stage("read bootstrap source entry type");
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
             if graph.graph_text_scope.should_descend(&child_relative)
@@ -26250,8 +26302,11 @@ fn walk_bootstrap_source_directory(
                     "source directory cap exceeded",
                 ));
             }
+            note_bootstrap_source_io_stage("validate bootstrap source directory");
             projection_real_directory(&frame.directory, name)?;
+            note_bootstrap_source_io_stage("open bootstrap source directory no-follow");
             let child = open_projection_dir_nofollow(&frame.directory, name)?;
+            note_bootstrap_source_io_stage("identify bootstrap source directory");
             let resource = canonical_projection_directory_resource_id(&child)?;
             write_bootstrap_source_inventory_directory(
                 &mut writers.inventory,
@@ -26266,12 +26321,15 @@ fn walk_bootstrap_source_directory(
                 &child_relative,
                 &mut state.instrumentation,
             )?;
+            note_bootstrap_source_io_stage("reopen bootstrap source directory no-follow");
             let rebound = open_projection_dir_nofollow(&frame.directory, name)?;
+            note_bootstrap_source_io_stage("compare bootstrap source directory identities");
             if projection_dir_identity(&child)? != projection_dir_identity(&rebound)? {
                 return Err(bootstrap_source_capture_interrupted(format!(
                     "source directory changed during traversal: {child_relative}"
                 )));
             }
+            note_bootstrap_source_io_stage("open child bootstrap source directory cursor");
             let entries = child.entries()?;
             stack.push(BootstrapSourceWalkFrame {
                 directory: child,
@@ -26286,8 +26344,11 @@ fn walk_bootstrap_source_directory(
                 "source entry is not a regular file: {child_relative}"
             )));
         }
+        note_bootstrap_source_io_stage("open bootstrap source file no-follow");
         let file = open_projection_file_nofollow(&frame.directory, name)?;
+        note_bootstrap_source_io_stage("identify bootstrap source file");
         let resource = canonical_projection_file_resource_id(&file)?;
+        note_bootstrap_source_io_stage("read bootstrap source file link count");
         let link_count = projection_file_link_count(&file)?;
         if link_count != 1 {
             return Err(bootstrap_source_capture_error(format!(
@@ -26311,6 +26372,7 @@ fn walk_bootstrap_source_directory(
             source_path.is_some() && graph.graph_text_scope.is_eligible(&child_relative);
         if is_source {
             let path = source_path.expect("source path was just checked");
+            note_bootstrap_source_io_stage("capture bootstrap source file");
             let (logical_name, kind, description, chunk_count) = capture_bootstrap_source_file(
                 graph,
                 file,
@@ -26873,11 +26935,13 @@ fn sort_bootstrap_source_spool(
     instrumentation: &mut BootstrapSourceCaptureInstrumentation,
 ) -> io::Result<()> {
     let input = paths.raw(kind);
+    note_bootstrap_source_io_stage("open raw bootstrap source spool for sorting");
     let mut reader = BootstrapSourceFrameReader::open(input)?;
     let mut runs = Vec::new();
     let mut rows = Vec::<Vec<u8>>::new();
     let mut bytes = 0_usize;
     loop {
+        note_bootstrap_source_io_stage("read raw bootstrap source spool for sorting");
         let next = reader.next()?;
         let Some(frame) = next else {
             break;
@@ -26895,6 +26959,7 @@ fn sort_bootstrap_source_spool(
         if !rows.is_empty()
             && bytes.saturating_add(frame_bytes) > BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES
         {
+            note_bootstrap_source_io_stage("flush bootstrap source sort run");
             bootstrap_source_flush_sort_run(paths, kind, &mut rows, &mut runs, instrumentation)?;
             bytes = 0;
         }
@@ -26907,15 +26972,19 @@ fn sort_bootstrap_source_spool(
             instrumentation.peak_owned_buffer_bytes.max(bytes as u64);
     }
     if !rows.is_empty() {
+        note_bootstrap_source_io_stage("flush final bootstrap source sort run");
         bootstrap_source_flush_sort_run(paths, kind, &mut rows, &mut runs, instrumentation)?;
     }
+    note_bootstrap_source_io_stage("remove consumed raw bootstrap source spool");
     fs::remove_file(input)?;
     let sorted = paths.sorted(kind);
     if runs.is_empty() {
+        note_bootstrap_source_io_stage("create empty sorted bootstrap source spool");
         let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&sorted)?;
+        note_bootstrap_source_io_stage("sync empty sorted bootstrap source spool");
         file.sync_all()?;
         return Ok(());
     }
@@ -26928,8 +26997,10 @@ fn sort_bootstrap_source_spool(
                 kind.label(),
                 next.len()
             ));
+            note_bootstrap_source_io_stage("merge bootstrap source sort runs");
             merge_bootstrap_source_runs(group, &output, kind, instrumentation)?;
             for input in group {
+                note_bootstrap_source_io_stage("remove merged bootstrap source sort run");
                 fs::remove_file(input)?;
             }
             next.push(output);
@@ -26939,7 +27010,9 @@ fn sort_bootstrap_source_spool(
             .checked_add(1)
             .ok_or_else(|| bootstrap_source_capture_error("source sort generation overflow"))?;
     }
+    note_bootstrap_source_io_stage("publish sorted bootstrap source spool");
     move_file_noreplace(&runs[0], &sorted)?;
+    note_bootstrap_source_io_stage("sync sorted bootstrap source spool directory");
     sync_bootstrap_source_directory(&paths.directory)
 }
 
@@ -27392,22 +27465,28 @@ fn seal_bootstrap_source_capture(
         (BootstrapSourceSpoolKind::Entries, BOOTSTRAP_SOURCE_ENTRIES),
         (BootstrapSourceSpoolKind::Chunks, BOOTSTRAP_SOURCE_CHUNKS),
     ] {
+        note_bootstrap_source_io_stage("promote primary sorted bootstrap source spool");
         move_file_noreplace(
             &first.join(format!("{}.sorted", kind.label())),
             &working.join(destination),
         )?;
     }
+    note_bootstrap_source_io_stage("validate bootstrap source entry and chunk layout");
     validate_bootstrap_source_entry_chunk_layout(
         &working.join(BOOTSTRAP_SOURCE_ENTRIES),
         &working.join(BOOTSTRAP_SOURCE_CHUNKS),
     )?;
+    note_bootstrap_source_io_stage("validate sealed bootstrap source chunk files");
     validate_bootstrap_source_chunk_files(
         &working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY),
         &working.join(BOOTSTRAP_SOURCE_CHUNKS),
     )?;
+    note_bootstrap_source_io_stage("flush bootstrap source capture prefix");
     flush_bootstrap_source_prefix(working)?;
     let manifest = encode_bootstrap_source_manifest(&capture)?;
+    note_bootstrap_source_io_stage("publish bootstrap source capture manifest");
     atomic_write_new(&working.join(BOOTSTRAP_SOURCE_MANIFEST), &manifest)?;
+    note_bootstrap_source_io_stage("sync bootstrap source capture before sealing");
     sync_bootstrap_source_directory(working)?;
     let capture_id = bootstrap_source_capture_id(&capture)?;
     let sealed = capture
@@ -27422,12 +27501,17 @@ fn seal_bootstrap_source_capture(
                 "source sealed-capture parent is unsafe",
             ))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(sealed_parent)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            note_bootstrap_source_io_stage("create sealed bootstrap source parent");
+            fs::create_dir(sealed_parent)?
+        }
         Err(error) => return Err(error),
     }
     bootstrap_source_capture_before_seal_rename_hook()?;
+    note_bootstrap_source_io_stage("rename bootstrap source capture into sealed directory");
     match move_file_noreplace(working, &sealed) {
         Ok(()) => {
+            note_bootstrap_source_io_stage("sync sealed bootstrap source parent");
             sync_bootstrap_source_directory(sealed_parent)?;
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -27440,11 +27524,13 @@ fn seal_bootstrap_source_capture(
             // A prior attempt may have inserted the exact immutable directory
             // but reported the post-insertion directory sync failure.  Retrying
             // the required sync is safe only after the exact-manifest proof.
+            note_bootstrap_source_io_stage("resync existing sealed bootstrap source parent");
             sync_bootstrap_source_directory(sealed_parent)?;
         }
         Err(error) => return Err(error),
     }
     capture.sealed_directory = sealed;
+    note_bootstrap_source_io_stage("validate sealed bootstrap source capture");
     validate_sealed_bootstrap_source_capture(&capture)?;
     Ok(capture)
 }

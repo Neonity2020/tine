@@ -171,7 +171,12 @@ impl Fixture {
         fs::create_dir(&preparation_root).unwrap();
         let capture = graph
             .capture_inactive_bootstrap_sources(&capture_root)
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "bootstrap source capture failed during `{}`: {error:?}",
+                    crate::model::bootstrap_source_io_stage_for_test()
+                )
+            });
         // The bootstrap is authored for exactly this archive: its accepted cold
         // records bind reference-catalog roots that live in this archive's
         // durable authenticated store.
