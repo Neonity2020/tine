@@ -56,6 +56,21 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
   const candidateAndPreviousReliable = [candidateSpread, previousSpread].every(
     (spread) => Number.isFinite(spread) && spread <= budget.maxRoundSpreadPct,
   );
+  const candidateRoundMins = candidate.metrics?.[name]?.roundMins;
+  const candidateSlowest = Array.isArray(candidateRoundMins) && candidateRoundMins.length > 0
+    ? Math.max(...candidateRoundMins)
+    : Number.NaN;
+  const slowestVsOld = ((candidateSlowest / old) - 1) * 100;
+  const slowestVsPrev = ((candidateSlowest / prev) - 1) * 100;
+  // A full max/min spread is symmetric: a fast candidate round can exceed the
+  // threshold without masking a regression. Candidate-only variance is safe
+  // only when its median beats both anchors and its slowest round still stays
+  // within each respective regression budget.
+  const favorableCandidateVariance = vsOld <= 0
+    && vsPrev <= 0
+    && Number.isFinite(candidateSlowest)
+    && slowestVsOld <= budget.maxVsImmutablePct
+    && slowestVsPrev <= budget.maxVsPreviousPct;
   for (const [label, measurement] of Object.entries(measurements)) {
     const metric = measurement.metrics?.[name];
     const spread = metric?.roundSpreadPct;
@@ -71,7 +86,11 @@ for (const [name, budget] of Object.entries(policy.metrics)) {
           && candidateAndPreviousReliable
           && vsOld <= budget.maxVsImmutablePct
           && vsPrev <= budget.maxVsPreviousPct;
-        if (immutableBaselineOnlyVariance) {
+        if (label === "candidate" && favorableCandidateVariance) {
+          console.warn(
+            `warning: ${message}; candidate median beats both anchors and its slowest round remains within both budgets`,
+          );
+        } else if (immutableBaselineOnlyVariance) {
           console.warn(
             `warning: ${message}; immutable baseline-only variance accepted because candidate and previous-release spreads are within the reliability limit and candidate median is within both regression budgets`,
           );
