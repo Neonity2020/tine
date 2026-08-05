@@ -17,6 +17,7 @@ import type { BlockDto } from "./types";
 import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
+import { openConfiguredHomePage } from "./homePage";
 
 const GRAPH_KEY = "tine.graphPath";
 
@@ -175,6 +176,13 @@ export async function loadGraphPath(
     // Upgrade/first-bind fallback: main.tsx may have probed the old global
     // session before the backend knew which graph this webview would own.
     await restoreSession();
+  }
+  // GH #245: a configured home page wins over the ordinary landing on an
+  // ordinary open (first bind or graph switch) — not on a same-graph reload /
+  // watcher refresh. Later explicit intents (quick capture, deep link) still
+  // win by navigating after this.
+  if (result.kind === "loaded" && (switching || !hadGraph)) {
+    await openConfiguredHomePage(meta.root);
   }
   return { kind: result.kind, root: meta.root };
   } finally {

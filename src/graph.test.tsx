@@ -39,6 +39,8 @@ async function loadHarness(
     confirm: vi.fn(async () => confirm),
     loadGraph: vi.fn(async () => ({ kind: "loaded" as const, meta: META, binding_generation: 1 })),
     getPage: vi.fn(async () => existing),
+    getAppString: vi.fn(async (_key: string, fallback: string) => fallback),
+    setAppString: vi.fn(async (_key: string, _value: string) => {}),
     listTemplates: vi.fn(async () => [
       {
         name: "Daily",
@@ -417,5 +419,51 @@ describe("PDF graph ownership", () => {
       `activate-pdf:${META.root}`,
     ]);
     expect(harness.activatePdfOwnership).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("graph home page (GH #245)", () => {
+  const DIRECTORY: PageDto = { name: "Directory", kind: "page", title: "Directory", pre_block: null, format: "md", blocks: [] };
+
+  it("opens the configured home page in place on an ordinary first load", async () => {
+    const harness = await loadHarness(DIRECTORY);
+    harness.api.getAppString.mockResolvedValue("Directory");
+
+    await harness.loadGraphPath(META.root);
+
+    const router = await import("./router");
+    expect(router.openPage).toHaveBeenCalledWith("Directory", "page", { inPlace: true });
+  });
+
+  it("keeps the ordinary landing when the configured page no longer resolves — nothing is created", async () => {
+    const harness = await loadHarness(null);
+    harness.api.getAppString.mockResolvedValue("Ghost");
+
+    await harness.loadGraphPath(META.root);
+
+    const router = await import("./router");
+    expect(router.openPage).not.toHaveBeenCalled();
+  });
+
+  it("does not navigate when no home page is configured", async () => {
+    const harness = await loadHarness(DIRECTORY);
+
+    await harness.loadGraphPath(META.root);
+
+    const router = await import("./router");
+    expect(router.openPage).not.toHaveBeenCalled();
+  });
+
+  it("does not home-navigate on a same-graph force refresh", async () => {
+    const harness = await loadHarness(DIRECTORY);
+    harness.api.getAppString.mockResolvedValue("Directory");
+    await harness.loadGraphPath(META.root);
+    const router = await import("./router");
+    vi.mocked(router.openPage).mockClear();
+
+    await harness.loadGraphPath(META.root, { forceRefresh: true });
+
+    expect(router.openPage).not.toHaveBeenCalled();
+    expect(harness.api.getAppString).toHaveBeenCalledTimes(1); // only the first load read it
   });
 });

@@ -10,6 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Configurable graph home page.** The Graph settings tab can now pick an
+  existing page as the graph's home page; it opens in-place in the primary
+  tab whenever that graph is opened. A deleted or renamed page is skipped
+  silently at startup and surfaced in Settings with a Clear option. The
+  setting is stored per graph via the existing app-settings owner.
 - **"System" appearance option.** The Appearance settings now offer Light /
   System / Dark. System follows the OS/WebView `prefers-color-scheme` signal,
   applying it immediately and tracking live changes while the app runs; manual
