@@ -8,6 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Managed storage now saves Markdown pages whose exact source contains empty
+  bullets, non-leading headings, or harmless layout differences.** Authenticated
+  source layout is rederived consistently, Markdown projection accepts only
+  parser-proven semantic equality, non-leading ATX headings keep their original
+  outline shape, and content, ordering, properties, explicit-ID, and Org
+  differences still fail closed before any journal append.
+- **Unsafe managed-storage recovery no longer replays the complete bootstrap at
+  the retained-run ceiling.** The ephemeral path reconstructs bootstrap once in
+  process-local scratch and reuses it for the enrolled engine without creating
+  a retained run, rewriting unprovable residue, or publishing a resume point;
+  any proof or restore refusal still falls back to the authoritative full
+  replay.
+
 ### Changed
 
 - **Managed-storage save refusals now report a bounded internal reason code.**
