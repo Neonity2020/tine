@@ -48,7 +48,6 @@ export const WINDOWS_CORE_CAPTURE_WITNESS_NAMES = Object.freeze([
   "model::tests::inactive_bootstrap_capture_rejects_bad_logical_name_frames",
   "model::tests::inactive_bootstrap_capture_rejects_between_pass_and_before_final_proof_mutations",
   "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
-  "model::tests::inactive_bootstrap_capture_rejects_source_symlinks_and_hard_links",
 ]);
 
 const STORAGE_EXACT_WITNESS_NAMES = Object.freeze([

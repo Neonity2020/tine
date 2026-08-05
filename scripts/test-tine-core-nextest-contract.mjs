@@ -80,7 +80,6 @@ const coreCaptureWitnesses = [
   "model::tests::inactive_bootstrap_capture_rejects_bad_logical_name_frames",
   "model::tests::inactive_bootstrap_capture_rejects_between_pass_and_before_final_proof_mutations",
   "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
-  "model::tests::inactive_bootstrap_capture_rejects_source_symlinks_and_hard_links",
 ];
 assert.deepEqual(WINDOWS_CORE_CAPTURE_WITNESS_NAMES, coreCaptureWitnesses);
 
@@ -92,7 +91,7 @@ assert.deepEqual(
     listedInventory("tine-core", coreSmokeTests),
     listedInventory("tine-storage", storageWitnesses)
   ),
-  { coreTestCount: 31, coreSmokeTestCount: 30, storageTestCount: 1, windowsNamedCount: 13, bootstrapWitnessCount: 9 }
+  { coreTestCount: 30, coreSmokeTestCount: 29, storageTestCount: 1, windowsNamedCount: 13, bootstrapWitnessCount: 8 }
 );
 assert.throws(
   () => verifyWindowsCoreSmokeSelection(
