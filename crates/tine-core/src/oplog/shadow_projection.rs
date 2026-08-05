@@ -5729,6 +5729,25 @@ mod tests {
             accepted_path.split('/').count(),
             BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH + 1
         );
+        let capture_path = accepted_path.clone();
+        std::thread::Builder::new()
+            .name("maximum-depth-source-capture".into())
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let root = TestRoot::new("maximum-depth-source-capture");
+                let graph_root = root.path().join("graph");
+                let destination = graph_root.join(&capture_path);
+                fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                fs::write(destination, b"- deepest accepted source\n").unwrap();
+                let capture_root = root.path().join("capture");
+                fs::create_dir(&capture_root).unwrap();
+                Graph::open(&graph_root)
+                    .capture_inactive_bootstrap_sources(&capture_root)
+                    .unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
         let accepted = Fixture::new(
             "maximum-depth",
             None,

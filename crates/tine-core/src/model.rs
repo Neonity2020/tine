@@ -26,7 +26,7 @@ use crate::oplog::{
     ProjectionAttemptReservation, ProjectionEndpointBinding, ReceiptError, WorkspaceId,
 };
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions, ReadDir};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -26049,6 +26049,19 @@ struct BootstrapSourceWalkState {
     instrumentation: BootstrapSourceCaptureInstrumentation,
 }
 
+/// One retained directory cursor for the bounded bootstrap-source walk.
+///
+/// The source directory limit is intentionally high enough for real nested
+/// graphs. Keeping that depth on the Rust call stack overflowed a 1 MiB test
+/// worker at the documented maximum, so traversal state belongs on the heap
+/// instead.
+struct BootstrapSourceWalkFrame {
+    directory: Dir,
+    relative: String,
+    depth: usize,
+    entries: ReadDir,
+}
+
 fn collect_bootstrap_source_pass(
     graph: &Graph,
     working: &Path,
@@ -26100,7 +26113,7 @@ fn collect_bootstrap_source_pass(
     )?;
     walk_bootstrap_source_directory(
         graph,
-        &root,
+        root,
         "",
         0,
         &mut writers,
@@ -26140,7 +26153,7 @@ fn collect_bootstrap_source_pass(
 
 fn walk_bootstrap_source_directory(
     graph: &Graph,
-    directory: &Dir,
+    directory: Dir,
     relative: &str,
     depth: usize,
     writers: &mut BootstrapSourcePassWriters,
@@ -26148,7 +26161,18 @@ fn walk_bootstrap_source_directory(
     chunks_directory: &Path,
     seal_chunks: bool,
 ) -> io::Result<()> {
-    for entry in directory.entries()? {
+    let entries = directory.entries()?;
+    let mut stack = vec![BootstrapSourceWalkFrame {
+        directory,
+        relative: relative.to_owned(),
+        depth,
+        entries,
+    }];
+    while let Some(frame) = stack.last_mut() {
+        let Some(entry) = frame.entries.next() else {
+            stack.pop();
+            continue;
+        };
         state.all_entries = state.all_entries.checked_add(1).ok_or_else(|| {
             bootstrap_source_capture_error("source directory-entry counter overflow")
         })?;
@@ -26162,9 +26186,10 @@ fn walk_bootstrap_source_directory(
         let name = name
             .to_str()
             .ok_or_else(|| bootstrap_source_capture_error("source entry name is not UTF-8"))?;
-        let relative_len = relative
+        let relative_len = frame
+            .relative
             .len()
-            .checked_add(usize::from(!relative.is_empty()))
+            .checked_add(usize::from(!frame.relative.is_empty()))
             .and_then(|length| length.checked_add(name.len()))
             .ok_or_else(|| bootstrap_source_capture_error("source exact path length overflow"))?;
         if relative_len > BOOTSTRAP_SOURCE_MAX_PATH_BYTES {
@@ -26183,10 +26208,10 @@ fn walk_bootstrap_source_directory(
                 "source aggregate path-byte cap exceeded",
             ));
         }
-        let child_relative = if relative.is_empty() {
+        let child_relative = if frame.relative.is_empty() {
             name.to_owned()
         } else {
-            format!("{relative}/{name}")
+            format!("{}/{name}", frame.relative)
         };
         let file_type = entry.file_type()?;
         if file_type.is_symlink() {
@@ -26203,7 +26228,8 @@ fn walk_bootstrap_source_directory(
             if !graph.graph_text_scope.should_descend(&child_relative) {
                 continue;
             }
-            let child_depth = depth
+            let child_depth = frame
+                .depth
                 .checked_add(1)
                 .ok_or_else(|| bootstrap_source_capture_error("source directory depth overflow"))?;
             if child_depth > BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH {
@@ -26219,8 +26245,8 @@ fn walk_bootstrap_source_directory(
                     "source directory cap exceeded",
                 ));
             }
-            projection_real_directory(directory, name)?;
-            let child = open_projection_dir_nofollow(directory, name)?;
+            projection_real_directory(&frame.directory, name)?;
+            let child = open_projection_dir_nofollow(&frame.directory, name)?;
             let resource = canonical_projection_directory_resource_id(&child)?;
             write_bootstrap_source_inventory_directory(
                 &mut writers.inventory,
@@ -26235,22 +26261,19 @@ fn walk_bootstrap_source_directory(
                 &child_relative,
                 &mut state.instrumentation,
             )?;
-            let rebound = open_projection_dir_nofollow(directory, name)?;
+            let rebound = open_projection_dir_nofollow(&frame.directory, name)?;
             if projection_dir_identity(&child)? != projection_dir_identity(&rebound)? {
                 return Err(bootstrap_source_capture_interrupted(format!(
                     "source directory changed during traversal: {child_relative}"
                 )));
             }
-            walk_bootstrap_source_directory(
-                graph,
-                &child,
-                &child_relative,
-                child_depth,
-                writers,
-                state,
-                chunks_directory,
-                seal_chunks,
-            )?;
+            let entries = child.entries()?;
+            stack.push(BootstrapSourceWalkFrame {
+                directory: child,
+                relative: child_relative,
+                depth: child_depth,
+                entries,
+            });
             continue;
         }
         if !file_type.is_file() {
@@ -26258,7 +26281,7 @@ fn walk_bootstrap_source_directory(
                 "source entry is not a regular file: {child_relative}"
             )));
         }
-        let file = open_projection_file_nofollow(directory, name)?;
+        let file = open_projection_file_nofollow(&frame.directory, name)?;
         let resource = canonical_projection_file_resource_id(&file)?;
         let link_count = projection_file_link_count(&file)?;
         if link_count != 1 {
