@@ -18,7 +18,7 @@ import {
   type ContextMenuAction,
   type SheetCellRemoveCtx,
 } from "../ui";
-import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, pageTargetMatchesLoaded, type PageTarget } from "../router";
+import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, openInNewTab, pageTargetMatchesLoaded, type PageTarget } from "../router";
 import { removePageTargetAcrossPanes } from "../panes";
 import { refreshAfterRename } from "../graph";
 import { backend } from "../backend";
@@ -69,6 +69,20 @@ async function copyBlockRef(id: string, fmt: (uuid: string) => string, okMsg: st
   }
   await writeClipboardText(fmt(uuid));
   pushToast(okMsg, "success");
+}
+
+// Open the block's own page in a new background tab, pre-zoomed to the block —
+// same destination as middle-clicking its bullet (Block.tsx). persistentBlockRef
+// pins the uuid (writes id:: once) so the new tab survives a reload/restart.
+function openBlockInNewTab(id: string) {
+  const ref = persistentBlockRef(id);
+  openInNewTab({
+    kind: "page",
+    name: ref.page,
+    pageKind: ref.pageKind,
+    block: ref.uuid,
+    ...(ref.path ? { path: ref.path } : {}),
+  });
 }
 
 // Right-click context menu. Universal over its target: a block (full editing
@@ -1026,6 +1040,7 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
     return [
       { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
       { label: "Zoom into block", run: () => zoomInto(id) },
+      { label: "Open in new tab", run: () => openBlockInNewTab(id) },
       { label: "Copy block", run: () => { const text = blockSubtreeMarkdown(id, 0, true, copyStripCollapsed()); void copyBlockOutline("copy", text, buildClipboardPayload([id])); pushToast("Copied block", "success"); } },
       {
         label: "Copy / export as…",
@@ -1039,6 +1054,7 @@ function blockActions(id: string): { label: string; run: () => void; danger?: bo
   return [
     { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
     { label: "Zoom into block", run: () => zoomInto(id) },
+    { label: "Open in new tab", run: () => openBlockInNewTab(id) },
     { label: "Copy block ref", run: () => void copyBlockRef(id, (u) => `((${u}))`, "Copied block ref") },
     { label: "Copy block embed", run: () => void copyBlockRef(id, (u) => `{{embed ((${u}))}}`, "Copied block embed") },
     { label: "Copy block", run: () => { const text = blockSubtreeMarkdown(id, 0, true, copyStripCollapsed()); void copyBlockOutline("copy", text, buildClipboardPayload([id])); pushToast("Copied block", "success"); } },

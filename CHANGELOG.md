@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Added
+
+- **"Open in new tab" in the block context menu.** Right-clicking a block now
+  offers "Open in new tab", mirroring the existing page context-menu item and
+  block-bullet middle-click. Works on both editable and read-only blocks.
+
 ### Changed
 
 - **Managed-storage save refusals now report a bounded internal reason code.**

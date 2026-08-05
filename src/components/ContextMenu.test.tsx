@@ -14,6 +14,7 @@ import {
 import { clearTransientLayersForTest, dismissTopTransient } from "../transientLayers";
 import { backend } from "../backend";
 import { clearClipboardPayload, peekClipboardPayload } from "../clipboard";
+import { tabs } from "../router";
 
 describe("PageMenu page-kind availability", () => {
   it("keeps rename page-only but exposes delete for pages and journals", () => {
@@ -298,6 +299,46 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
     expect(labels).not.toContain("Collapse all");
     expect(labels).not.toContain("Numbered list");
     expect(document.querySelector(".ctx-headings")).toBeNull();
+    dispose();
+  });
+
+  it("offers 'Open in new tab' on an editable block after 'Zoom into block' and opens the block's page in a background tab", () => {
+    load();
+    setDoc("byId", "parent", "raw", "Parent\nid:: 11111111-1111-1111-1111-111111111111");
+    vi.spyOn(backend(), "writeRich").mockResolvedValue();
+    const dispose = mount(() => <ContextMenu />);
+    openContextMenu(10, 10, "parent");
+    const labels = menuLabels();
+    const zoomIdx = labels.indexOf("Zoom into block");
+    expect(zoomIdx).toBeGreaterThanOrEqual(0);
+    const newTabIdx = labels.indexOf("Open in new tab");
+    expect(newTabIdx).toBeGreaterThan(zoomIdx);
+
+    const before = tabs().length;
+    const item = [...document.querySelectorAll<HTMLElement>(".ctx-item")]
+      .find((el) => el.textContent?.trim() === "Open in new tab")!;
+    item.click();
+    expect(tabs().length).toBe(before + 1);
+    const newTab = tabs()[tabs().length - 1];
+    expect(newTab.history[0]).toMatchObject({
+      kind: "page",
+      name: "P",
+      pageKind: "page",
+      block: "11111111-1111-1111-1111-111111111111",
+    });
+    dispose();
+  });
+
+  it("offers 'Open in new tab' on a read-only block too (matches middle-click parity)", () => {
+    load(true);
+    setDoc("byId", "parent", "raw", "Parent\nid:: 11111111-1111-1111-1111-111111111111");
+    const dispose = mount(() => <ContextMenu />);
+    openContextMenu(10, 10, "parent");
+    const labels = menuLabels();
+    expect(labels).toContain("Open in new tab");
+    const zoomIdx = labels.indexOf("Zoom into block");
+    const newTabIdx = labels.indexOf("Open in new tab");
+    expect(newTabIdx).toBeGreaterThan(zoomIdx);
     dispose();
   });
 });
