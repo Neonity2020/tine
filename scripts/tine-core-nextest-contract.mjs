@@ -6,24 +6,70 @@ import { fileURLToPath } from "node:url";
 
 export const LINUX_TINE_CORE_SHARD_COUNT = 4;
 
-const CORE_EXACT_WITNESS_SUFFIXES = Object.freeze([
-  "a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write",
-  "bootstrap_source_regular_file_sync_uses_supported_handle_access",
-  "bootstrap_preparation_flush_handles_use_platform_durability_contracts",
-  "inactive_streaming_bootstrap_preseal_crash_retries_exactly",
-  "inactive_streaming_bootstrap_repeated_run_reuses_exact_seal",
-  "authoritative_snapshot_prunes_lock_namespaces_before_reading_files",
-  "a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
-  "separate_process_workspace_lease_contends_and_crash_releases",
+// Windows is deliberately not a second complete tine-core behavior matrix.
+// Linux carries that full inventory in four isolated shards. This exact list is
+// the Windows release contract: every explicitly Windows-named core test, plus
+// the bootstrap/durability/lifecycle witnesses that exercised the Windows
+// failures fixed for v0.6.90. Keep the names explicit so a rename, removal, or
+// newly added Windows test cannot silently shrink the release gate.
+export const WINDOWS_CORE_EXACT_TEST_NAMES = Object.freeze([
+  "fail_before_projection_crash_windows_recover_without_unauthorized_execution",
+  "model::tests::page_name_encoding_is_injective_reversible_and_windows_safe",
+  "model::tests::windows_handle_relative_noreplace_renames_the_exact_source",
+  "model::tests::windows_handle_relative_noreplace_moves_between_nonstandard_retained_directories_with_unicode",
+  "model::tests::windows_handle_relative_noreplace_preserves_occupied_destination",
+  "model::tests::windows_first_save_and_ordinary_rename_preserve_exact_projection",
+  "model::tests::windows_directory_durability_limit_does_not_block_save_or_rename",
+  "model::tests::checked_open_accepts_an_approved_windows_assets_junction",
+  "model::tests::projection_windows_held_handle_link_count_tracks_one_and_two_links",
+  "model::tests::windows_live_graph_root_move_is_denied_without_rebinding",
+  "oplog::sqlite::tests::windows_entry_file_identity_classifies_reparse_lease_as_replaced",
+  "windows_no_follow_publication_read_and_directory_flush_succeed",
+  "windows_reparse_files_and_directories_are_rejected",
 ]);
 
-const CORE_WITNESS_PREFIXES = Object.freeze([
-  "inactive_bootstrap_capture",
+export const WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES = Object.freeze([
+  "oplog::local_active::tests::a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write",
+  "model::tests::bootstrap_source_regular_file_sync_uses_supported_handle_access",
+  "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
+  "oplog::import::tests::inactive_streaming_bootstrap_preseal_crash_retries_exactly",
+  "oplog::import::tests::inactive_streaming_bootstrap_repeated_run_reuses_exact_seal",
+  "oplog::local_active::tests::authoritative_snapshot_prunes_lock_namespaces_before_reading_files",
+  "oplog::enrollment::tests::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
+  "oplog::sqlite::tests::separate_process_workspace_lease_contends_and_crash_releases",
 ]);
 
-const STORAGE_EXACT_WITNESS_SUFFIXES = Object.freeze([
-  "nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit",
+export const WINDOWS_CORE_CAPTURE_WITNESS_NAMES = Object.freeze([
+  "model::tests::inactive_bootstrap_capture_exact_64_mib_sparse_file_is_accepted",
+  "model::tests::inactive_bootstrap_capture_external_sort_has_fixed_rows_without_real_files",
+  "model::tests::inactive_bootstrap_capture_ignores_residue_is_idempotent_and_rejects_conflicting_seal",
+  "model::tests::inactive_bootstrap_capture_is_deterministic_and_chunks_zero_one_and_many_files",
+  "model::tests::inactive_bootstrap_capture_preserves_exact_nested_unicode_org_and_semantic_kinds",
+  "model::tests::inactive_bootstrap_capture_rejects_bad_logical_name_frames",
+  "model::tests::inactive_bootstrap_capture_rejects_between_pass_and_before_final_proof_mutations",
+  "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
+  "model::tests::inactive_bootstrap_capture_rejects_source_symlinks_and_hard_links",
 ]);
+
+const STORAGE_EXACT_WITNESS_NAMES = Object.freeze([
+  "filesystem::tests::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit",
+]);
+
+const WINDOWS_CORE_SMOKE_TEST_NAMES = Object.freeze([
+  ...new Set([
+    ...WINDOWS_CORE_EXACT_TEST_NAMES,
+    ...WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
+    ...WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
+  ]),
+]);
+
+// The same declared names drive nextest and the inventory verifier. Do not
+// replace this with a broad package filter: that would bring platform-neutral
+// tests (including currently known Windows-incompatible ones) back into the
+// release gate without an intentional policy change.
+export const WINDOWS_CORE_SMOKE_FILTERSET = WINDOWS_CORE_SMOKE_TEST_NAMES
+  .map((testName) => `test(=${testName})`)
+  .join(" | ");
 
 function fail(message) {
   throw new Error(`tine-core nextest contract: ${message}`);
@@ -87,50 +133,65 @@ export function verifyLinuxShardCoverage(fullInventory, shardInventories) {
   return { testCount: fullInventory.tests.size, shardCounts: shardInventories.map((shard) => shard.tests.size) };
 }
 
-function requireUniqueSuffix(inventory, suffix) {
-  const matching = [...inventory.tests.values()].filter(
-    (test) => test.binaryId === inventory.packageName && test.testName.endsWith(suffix)
-  );
+function testNames(inventory) {
+  return [...inventory.tests.values()].map((test) => test.testName).sort();
+}
+
+function requireUniqueName(inventory, name) {
+  const matching = [...inventory.tests.values()].filter((test) => test.testName === name);
   if (matching.length !== 1) {
-    fail(`${inventory.packageName} must contain exactly one required witness ending ${suffix}; found ${matching.length}`);
+    fail(`${inventory.packageName} must contain exactly one required test ${name}; found ${matching.length}`);
+  }
+  return matching[0];
+}
+
+function requireNamesSelected(fullInventory, selectedInventory, names, label) {
+  for (const name of names) {
+    const expected = requireUniqueName(fullInventory, name);
+    if (!selectedInventory.tests.has(testKey(expected.binaryId, expected.testName))) {
+      fail(`${label} omitted required test ${name}`);
+    }
   }
 }
 
-function requirePrefix(inventory, prefix) {
-  const matching = [...inventory.tests.values()].filter(
-    (test) => test.binaryId === inventory.packageName && test.testName.includes(prefix)
-  );
-  if (matching.length === 0) fail(`${inventory.packageName} omitted required witness family ${prefix}`);
-  return matching.length;
+function requireExactNameSet(actualNames, expectedNames, label) {
+  const actual = [...actualNames].sort();
+  const expected = [...expectedNames].sort();
+  if (actual.length !== expected.length || actual.some((name, index) => name !== expected[index])) {
+    const missing = expected.filter((name) => !actual.includes(name));
+    const unexpected = actual.filter((name) => !expected.includes(name));
+    fail(
+      `${label} changed; missing [${missing.join(", ") || "none"}], unexpected [${unexpected.join(", ") || "none"}]`
+    );
+  }
 }
 
-export function verifyWindowsFullSelection(coreInventory, storageInventory) {
+export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, storageInventory) {
   if (coreInventory?.packageName !== "tine-core") fail("Windows core inventory is not tine-core");
+  if (smokeInventory?.packageName !== "tine-core") fail("Windows core smoke inventory is not tine-core");
   if (storageInventory?.packageName !== "tine-storage") fail("Windows storage inventory is not tine-storage");
 
-  for (const suffix of CORE_EXACT_WITNESS_SUFFIXES) requireUniqueSuffix(coreInventory, suffix);
-  const bootstrapWitnessCount = CORE_WITNESS_PREFIXES.reduce(
-    (count, prefix) => count + requirePrefix(coreInventory, prefix),
-    0
-  );
-  for (const suffix of STORAGE_EXACT_WITNESS_SUFFIXES) requireUniqueSuffix(storageInventory, suffix);
-
-  const windowsNamedCount = [...coreInventory.tests.values()]
+  const windowsNamed = [...coreInventory.tests.values()]
     .filter((test) => test.testName.toLowerCase().includes("windows"))
-    .length;
-  if (windowsNamedCount === 0) fail("Windows core inventory contains no explicitly Windows-named tests");
+    .map((test) => test.testName);
+  requireExactNameSet(windowsNamed, WINDOWS_CORE_EXACT_TEST_NAMES, "Windows-named tine-core test inventory");
+  requireNamesSelected(coreInventory, smokeInventory, WINDOWS_CORE_SMOKE_TEST_NAMES, "Windows core smoke selection");
+  requireExactNameSet(testNames(smokeInventory), WINDOWS_CORE_SMOKE_TEST_NAMES, "Windows core smoke selection");
+  for (const name of STORAGE_EXACT_WITNESS_NAMES) requireUniqueName(storageInventory, name);
 
   return {
     coreTestCount: coreInventory.tests.size,
+    coreSmokeTestCount: smokeInventory.tests.size,
     storageTestCount: storageInventory.tests.size,
-    windowsNamedCount,
-    bootstrapWitnessCount,
+    windowsNamedCount: windowsNamed.length,
+    bootstrapWitnessCount: WINDOWS_CORE_CAPTURE_WITNESS_NAMES.length,
   };
 }
 
-function nextestList(profile, packageName, partition) {
+function nextestList(profile, packageName, { partition, filterset } = {}) {
   const args = ["nextest", "list", "--profile", profile, "--package", packageName, "--message-format", "json"];
   if (partition) args.push("--partition", partition);
+  if (filterset) args.push("--filterset", filterset);
   const result = spawnSync("cargo", args, { cwd: process.cwd(), encoding: "utf8" });
   if (result.error) fail(`could not start cargo nextest list: ${result.error.message}`);
   if (result.status !== 0) {
@@ -144,6 +205,16 @@ function nextestList(profile, packageName, partition) {
   }
 }
 
+function runWindowsCoreSmoke() {
+  const result = spawnSync(
+    "cargo",
+    ["nextest", "run", "--profile", "ci-windows", "--package", "tine-core", "--filterset", WINDOWS_CORE_SMOKE_FILTERSET],
+    { cwd: process.cwd(), stdio: "inherit" }
+  );
+  if (result.error) fail(`could not start Windows core smoke: ${result.error.message}`);
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+
 function option(name) {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -154,7 +225,7 @@ function main() {
   if (mode === "linux") {
     const full = nextestList("ci", "tine-core");
     const shards = Array.from({ length: LINUX_TINE_CORE_SHARD_COUNT }, (_, index) =>
-      nextestList("ci", "tine-core", `hash:${index + 1}/${LINUX_TINE_CORE_SHARD_COUNT}`)
+      nextestList("ci", "tine-core", { partition: `hash:${index + 1}/${LINUX_TINE_CORE_SHARD_COUNT}` })
     );
     const result = verifyLinuxShardCoverage(full, shards);
     console.log(
@@ -164,14 +235,16 @@ function main() {
   }
   if (mode === "windows") {
     const core = nextestList("ci-windows", "tine-core");
+    const smoke = nextestList("ci-windows", "tine-core", { filterset: WINDOWS_CORE_SMOKE_FILTERSET });
     const storage = nextestList("ci-windows", "tine-storage");
-    const result = verifyWindowsFullSelection(core, storage);
+    const result = verifyWindowsCoreSmokeSelection(core, smoke, storage);
     console.log(
-      `Windows nextest contract OK: ${result.coreTestCount} tine-core tests, ${result.storageTestCount} tine-storage tests, ${result.windowsNamedCount} Windows-named tests, and ${result.bootstrapWitnessCount} bootstrap witnesses selected.`
+      `Windows nextest contract OK: ${result.coreTestCount} compiled tine-core tests, ${result.coreSmokeTestCount} contract-selected core smoke tests, ${result.storageTestCount} full tine-storage tests, ${result.windowsNamedCount} Windows-named tests, and ${result.bootstrapWitnessCount} bootstrap capture witnesses.`
     );
+    if (process.argv.includes("--run-smoke")) runWindowsCoreSmoke();
     return;
   }
-  fail("pass --mode linux or --mode windows");
+  fail("pass --mode linux or --mode windows (add --run-smoke to execute the verified Windows core selection)");
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();

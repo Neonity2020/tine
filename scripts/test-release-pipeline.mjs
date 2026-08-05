@@ -264,19 +264,24 @@ assert.equal(runsWindowsLane("windows", "config::tests::focused"), true);
 const nextestInstall = yamlNamedStep(windowsCompile, "Install cargo-nextest 0.9.143");
 assert.equal(yamlScalar(nextestInstall, "uses", 8), "taiki-e/install-action@v2");
 assert.equal(yamlScalar(yamlBlock(nextestInstall, "with", 8), "tool", 10), "nextest@0.9.143");
-const windowsInventory = yamlNamedStep(windowsCompile, "Verify Windows tine-core inventory and lifecycle witnesses");
-assert.equal(yamlScalar(windowsInventory, "if", 8), "inputs.windows_test_name == ''");
-assert.equal(yamlScalar(windowsInventory, "run", 8), "node scripts/tine-core-nextest-contract.mjs --mode windows");
-const fullWindowsCore = yamlNamedStep(windowsCompile, "Windows core tests (full isolated nextest suite; release gate)");
-assert.equal(yamlScalar(fullWindowsCore, "if", 8), "inputs.windows_test_name == ''");
-assert.equal(yamlScalar(fullWindowsCore, "run", 8), "cargo nextest run --profile ci-windows --package tine-core");
+const windowsCoreCompile = yamlNamedStep(windowsCompile, "Windows core test targets compile (all; release gate)");
+assert.equal(yamlScalar(windowsCoreCompile, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(windowsCoreCompile, "run", 8), "cargo test -p tine-core --no-run");
+const windowsCoreSmoke = yamlNamedStep(windowsCompile, "Windows core smoke (isolated contract selection; release gate)");
+assert.equal(yamlScalar(windowsCoreSmoke, "if", 8), "inputs.windows_test_name == ''");
+assert.equal(yamlScalar(windowsCoreSmoke, "run", 8), "node scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke");
 const fullWindowsStorage = yamlNamedStep(windowsCompile, "Windows storage tests (full isolated nextest suite; release gate)");
 assert.equal(yamlScalar(fullWindowsStorage, "if", 8), "inputs.windows_test_name == ''");
 assert.equal(yamlScalar(fullWindowsStorage, "run", 8), "cargo nextest run --profile ci-windows --package tine-storage");
 assert.doesNotMatch(
-  [yamlScalar(fullWindowsCore, "run", 8), yamlScalar(fullWindowsStorage, "run", 8)].join("\n"),
-  /--lib|--test|--filterset|--partition|--skip|--exact/,
-  "Windows release coverage is no longer the full package inventory"
+  [yamlScalar(windowsCoreCompile, "run", 8), yamlScalar(windowsCoreSmoke, "run", 8), yamlScalar(fullWindowsStorage, "run", 8)].join("\n"),
+  /continue-on-error|retries|--skip/,
+  "Windows release coverage masks a failed compile, smoke, or storage test"
+);
+assert.doesNotMatch(
+  yamlScalar(windowsCoreSmoke, "run", 8),
+  /cargo nextest run --profile ci-windows --package tine-core$/,
+  "Windows release coverage accidentally restored the whole tine-core runtime suite"
 );
 
 const focusedWindowsCore = yamlNamedStep(
@@ -508,7 +513,7 @@ assert.throws(
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{ run: successfulFullCiRun, jobs: successfulFullCiJobs.slice(0, 1) }]),
-  /Full CI \/ Windows compile and core tests concluded missing/
+  /Full CI \/ Windows compile, storage, and core smoke concluded missing/
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{

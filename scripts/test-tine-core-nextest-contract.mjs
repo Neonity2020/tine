@@ -3,9 +3,13 @@
 import assert from "node:assert/strict";
 import {
   LINUX_TINE_CORE_SHARD_COUNT,
+  WINDOWS_CORE_CAPTURE_WITNESS_NAMES,
+  WINDOWS_CORE_EXACT_TEST_NAMES,
+  WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES,
+  WINDOWS_CORE_SMOKE_FILTERSET,
   inventoryFromNextestList,
   verifyLinuxShardCoverage,
-  verifyWindowsFullSelection,
+  verifyWindowsCoreSmokeSelection,
 } from "./tine-core-nextest-contract.mjs";
 
 function listedInventory(packageName, testNames) {
@@ -38,7 +42,24 @@ assert.throws(
   /both selected tine-core gamma/
 );
 
-const coreWitnesses = [
+const coreWindowsTests = [
+  "fail_before_projection_crash_windows_recover_without_unauthorized_execution",
+  "model::tests::page_name_encoding_is_injective_reversible_and_windows_safe",
+  "model::tests::windows_handle_relative_noreplace_renames_the_exact_source",
+  "model::tests::windows_handle_relative_noreplace_moves_between_nonstandard_retained_directories_with_unicode",
+  "model::tests::windows_handle_relative_noreplace_preserves_occupied_destination",
+  "model::tests::windows_first_save_and_ordinary_rename_preserve_exact_projection",
+  "model::tests::windows_directory_durability_limit_does_not_block_save_or_rename",
+  "model::tests::checked_open_accepts_an_approved_windows_assets_junction",
+  "model::tests::projection_windows_held_handle_link_count_tracks_one_and_two_links",
+  "model::tests::windows_live_graph_root_move_is_denied_without_rebinding",
+  "oplog::sqlite::tests::windows_entry_file_identity_classifies_reparse_lease_as_replaced",
+  "windows_no_follow_publication_read_and_directory_flush_succeed",
+  "windows_reparse_files_and_directories_are_rejected",
+];
+assert.deepEqual(WINDOWS_CORE_EXACT_TEST_NAMES, coreWindowsTests);
+
+const coreLifecycleWitnesses = [
   "oplog::local_active::tests::a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write",
   "model::tests::bootstrap_source_regular_file_sync_uses_supported_handle_access",
   "oplog::import::tests::bootstrap_preparation_flush_handles_use_platform_durability_contracts",
@@ -47,24 +68,50 @@ const coreWitnesses = [
   "oplog::local_active::tests::authoritative_snapshot_prunes_lock_namespaces_before_reading_files",
   "oplog::enrollment::tests::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
   "oplog::sqlite::tests::separate_process_workspace_lease_contends_and_crash_releases",
-  "model::tests::inactive_bootstrap_capture_preserves_exact_nested_unicode_org_and_semantic_kinds",
-  "model::tests::windows_live_graph_root_move_is_denied_without_rebinding",
 ];
+assert.deepEqual(WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES, coreLifecycleWitnesses);
+
+const coreCaptureWitnesses = [
+  "model::tests::inactive_bootstrap_capture_exact_64_mib_sparse_file_is_accepted",
+  "model::tests::inactive_bootstrap_capture_external_sort_has_fixed_rows_without_real_files",
+  "model::tests::inactive_bootstrap_capture_ignores_residue_is_idempotent_and_rejects_conflicting_seal",
+  "model::tests::inactive_bootstrap_capture_is_deterministic_and_chunks_zero_one_and_many_files",
+  "model::tests::inactive_bootstrap_capture_preserves_exact_nested_unicode_org_and_semantic_kinds",
+  "model::tests::inactive_bootstrap_capture_rejects_bad_logical_name_frames",
+  "model::tests::inactive_bootstrap_capture_rejects_between_pass_and_before_final_proof_mutations",
+  "model::tests::inactive_bootstrap_capture_rejects_file_cap_before_streaming",
+  "model::tests::inactive_bootstrap_capture_rejects_source_symlinks_and_hard_links",
+];
+assert.deepEqual(WINDOWS_CORE_CAPTURE_WITNESS_NAMES, coreCaptureWitnesses);
+
 const storageWitnesses = ["filesystem::tests::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit"];
+const coreSmokeTests = [...new Set([...coreWindowsTests, ...coreLifecycleWitnesses, ...coreCaptureWitnesses])];
 assert.deepEqual(
-  verifyWindowsFullSelection(
-    listedInventory("tine-core", coreWitnesses),
+  verifyWindowsCoreSmokeSelection(
+    listedInventory("tine-core", [...coreSmokeTests, "unselected_platform_neutral_test"]),
+    listedInventory("tine-core", coreSmokeTests),
     listedInventory("tine-storage", storageWitnesses)
   ),
-  { coreTestCount: 10, storageTestCount: 1, windowsNamedCount: 1, bootstrapWitnessCount: 1 }
+  { coreTestCount: 31, coreSmokeTestCount: 30, storageTestCount: 1, windowsNamedCount: 13, bootstrapWitnessCount: 9 }
 );
 assert.throws(
-  () => verifyWindowsFullSelection(
-    listedInventory("tine-core", coreWitnesses.filter((name) => !name.includes("windows_live_graph"))),
+  () => verifyWindowsCoreSmokeSelection(
+    listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("windows_live_graph"))),
+    listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("windows_live_graph"))),
     listedInventory("tine-storage", storageWitnesses)
   ),
-  /contains no explicitly Windows-named tests/
+  /Windows-named tine-core test inventory changed/
 );
+assert.throws(
+  () => verifyWindowsCoreSmokeSelection(
+    listedInventory("tine-core", coreSmokeTests),
+    listedInventory("tine-core", coreSmokeTests.filter((name) => !name.includes("inactive_bootstrap_capture_rejects_file_cap"))),
+    listedInventory("tine-storage", storageWitnesses)
+  ),
+  /Windows core smoke selection omitted required test/
+);
+assert.match(WINDOWS_CORE_SMOKE_FILTERSET, /test\(=model::tests::windows_live_graph_root_move_is_denied_without_rebinding\)/);
+assert.doesNotMatch(WINDOWS_CORE_SMOKE_FILTERSET, /all\(\)|fast_commit/);
 assert.equal(LINUX_TINE_CORE_SHARD_COUNT, 4);
 
 console.log("tine-core nextest contract fixture tests passed.");

@@ -12,7 +12,7 @@ The frozen release candidate receives the exhaustive pass.
 | Non-doc pull request | `ci` → `PR validation / Linux unit and contract checks` | TypeScript, frontend and Rust-core tests plus cheap generated-artifact/release contract guards. No Windows, Android, performance, Flatpak build, or release packaging. |
 | Docs/image-only pull request | No app CI | Avoid runner work for prose and image-only changes. A Flatpak/website metadata PR still gets its path-specific lightweight validator. |
 | Push to `master` | No app test/build workflow | Merging does not repeat CI after the reviewed commit. Website pushes may still deploy Pages; issue automation is separate from app CI. |
-| Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards, Windows compile/full process-isolated `tine-core` and `tine-storage` tests, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence. |
+| Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards, Windows compile-all-core-test-targets + contract-selected isolated core smoke + full isolated `tine-storage`, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence. |
 | Manual `ci`, focused scope | Only `windows`, `android`, or `performance` | Platform/performance proof while developing relevant changes. A focused run never satisfies the release gate. |
 | Manual `ui-e2e` | Complete or scenario-focused Linux/Windows real-app proof | UI/harness debugging between releases without starting ordinary full CI. |
 | Manual `Flatpak build test` | Real offline Flatpak build | Focused packaging proof. The release workflow calls the same workflow as a hard gate. |
@@ -55,6 +55,31 @@ skipped shard cannot satisfy the gate. PR runs, focused runs, skipped jobs,
 failed jobs, and merely green release runs cannot satisfy it.
 `scripts/test-release-pipeline.mjs` keeps this fail-closed contract under
 deterministic fixtures.
+
+## Windows release scope
+
+Linux is the complete `tine-core` behavior matrix: its nextest inventory
+contract proves every non-ignored core test runs exactly once across four
+isolated shards. Windows is a deliberately narrower, blocking compatibility
+gate: it compiles every `tine-core` test target, runs the whole `tine-storage`
+suite under nextest isolation, and runs a declared core smoke selection. That
+selection contains every explicitly Windows-named core test plus the
+bootstrap-capture, bootstrap-preparation, durability, and lifecycle witnesses
+that caught the v0.6.90 Windows failures.
+
+`scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke` lists the
+actual Windows inventory before executing the smoke. It fails if an explicitly
+Windows-named test or a declared witness is added, renamed, removed, or omitted
+from the smoke selection; it then runs that verified exact set with nextest's
+zero-retry, fail-on-timeout profile. This is neither an advisory subset nor a
+retry mask.
+
+Full runtime parity for all `tine-core` tests on Windows is explicitly deferred.
+Some platform-neutral test fixtures currently encode Unix-like file/identity
+assumptions; they remain fully blocking on Linux and do not become a Windows
+release requirement merely by being present in the core crate. Promoting a
+broader Windows matrix is a separate compatibility project, not a quiet gate
+expansion during a release.
 
 ## Between releases
 
