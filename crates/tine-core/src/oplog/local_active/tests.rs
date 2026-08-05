@@ -477,16 +477,108 @@ fn snapshot_file_digests(root: &Path) -> BTreeMap<String, ContentDigest> {
         .collect()
 }
 
+/// Hash only entries selected before their contents are opened.
+///
+/// The predicate receives the normalized relative path and whether the entry
+/// is a directory. Returning false for a directory prunes the whole subtree.
+fn snapshot_file_digests_matching_with_reader(
+    root: &Path,
+    include: impl Fn(&str, bool) -> bool,
+    mut read_file: impl FnMut(&Path) -> Vec<u8>,
+) -> BTreeMap<String, ContentDigest> {
+    let mut output = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let is_directory = metadata.is_dir();
+            if !include(&relative, is_directory) {
+                continue;
+            }
+            if is_directory {
+                stack.push(path);
+            } else {
+                output.insert(relative, ContentDigest::of(&read_file(&path)));
+            }
+        }
+    }
+    output
+}
+
+fn snapshot_file_digests_matching(
+    root: &Path,
+    include: impl Fn(&str, bool) -> bool,
+) -> BTreeMap<String, ContentDigest> {
+    snapshot_file_digests_matching_with_reader(root, include, |path| fs::read(path).unwrap())
+}
+
+fn in_top_level_namespace(path: &str, namespaces: &[&str]) -> bool {
+    path.split('/')
+        .next()
+        .is_some_and(|component| namespaces.contains(&component))
+}
+
 /// Durable byte identity of a SQLite database directory.
 ///
 /// The `-shm` sidecar is a volatile shared-memory index that ordinary read
 /// transactions legitimately update, so durable identity covers the database
 /// file and its write-ahead log, where every committed row actually lands.
 fn durable_sqlite_digests(directory: &Path) -> BTreeMap<String, ContentDigest> {
-    snapshot_file_digests(directory)
-        .into_iter()
-        .filter(|(name, _)| !name.ends_with("-shm"))
-        .collect()
+    snapshot_file_digests_matching(directory, |name, is_directory| {
+        is_directory || !name.ends_with("-shm")
+    })
+}
+
+#[test]
+fn authoritative_snapshot_prunes_runtime_namespaces_before_reading_files() {
+    let root = TestRoot::new("authoritative-snapshot-prunes-runtime");
+    fs::create_dir(root.path().join(".tine-runtime")).unwrap();
+    fs::create_dir(root.path().join("engine-scratch-v2")).unwrap();
+    fs::create_dir(root.path().join("batches")).unwrap();
+    fs::write(root.path().join(".tine-runtime/locked"), b"live lease").unwrap();
+    fs::write(root.path().join("engine-scratch-v2/run"), b"scratch").unwrap();
+    fs::write(root.path().join("batches/authoritative"), b"durable").unwrap();
+    fs::write(root.path().join("head"), b"authoritative head").unwrap();
+
+    let mut opened = Vec::new();
+    let snapshot = snapshot_file_digests_matching_with_reader(
+        root.path(),
+        |path, _| !in_top_level_namespace(path, &[".tine-runtime", "engine-scratch-v2"]),
+        |path| {
+            let relative = path
+                .strip_prefix(root.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            assert!(
+                !in_top_level_namespace(&relative, &[".tine-runtime", "engine-scratch-v2"]),
+                "an excluded runtime file must never reach the reader: {relative}"
+            );
+            opened.push(relative);
+            fs::read(path).unwrap()
+        },
+    );
+
+    assert_eq!(
+        snapshot.keys().cloned().collect::<Vec<_>>(),
+        vec!["batches/authoritative".to_owned(), "head".to_owned()]
+    );
+    opened.sort();
+    assert_eq!(
+        opened,
+        vec!["batches/authoritative".to_owned(), "head".to_owned()]
+    );
 }
 
 /// Nested, non-standard, Unicode, CRLF, BOM, and multi-chunk graph layout.
@@ -4524,10 +4616,9 @@ fn authoritative_world(
         ("enrollment", root.path()),
         ("archive", fixture.archive_root.as_path()),
     ] {
-        for (path, digest) in snapshot_file_digests(directory) {
-            if path.starts_with(".tine-runtime/") || path.starts_with("engine-scratch-v2/") {
-                continue;
-            }
+        for (path, digest) in snapshot_file_digests_matching(directory, |path, _| {
+            !in_top_level_namespace(path, &[".tine-runtime", "engine-scratch-v2"])
+        }) {
             digests.insert(format!("{label}/{path}"), digest);
         }
     }
@@ -5535,10 +5626,9 @@ fn workspace_lease_path(archive_root: &Path, workspace: WorkspaceId) -> PathBuf 
 fn archive_digests_outside_the_lease_namespace(
     archive_root: &Path,
 ) -> BTreeMap<String, ContentDigest> {
-    snapshot_file_digests(archive_root)
-        .into_iter()
-        .filter(|(path, _)| !path.starts_with(".tine-runtime/"))
-        .collect()
+    snapshot_file_digests_matching(archive_root, |path, _| {
+        !in_top_level_namespace(path, &[".tine-runtime"])
+    })
 }
 
 /// The workspace lock file lives *inside* the replicated archive, so an
@@ -5852,10 +5942,9 @@ fn a_missing_workspace_lease_path_latches_terminally_after_a_retryable_check_fai
 /// the archive root. What must not move when a publication boundary refuses is
 /// the immutable batch itself.
 fn published_immutable_digests(archive_root: &Path) -> BTreeMap<String, ContentDigest> {
-    snapshot_file_digests(archive_root)
-        .into_iter()
-        .filter(|(path, _)| path.starts_with("batches/") || path.starts_with("objects/"))
-        .collect()
+    snapshot_file_digests_matching(archive_root, |path, _| {
+        in_top_level_namespace(path, &["batches", "objects"])
+    })
 }
 
 /// Replace the exact lease pathname with a byte-identical file of a different
