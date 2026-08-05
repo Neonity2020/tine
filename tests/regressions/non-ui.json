@@ -2174,23 +2174,25 @@
         "issues": [],
         "commits": [
           "bf112b71",
-          "3ed78e9f"
+          "3ed78e9f",
+          "e04469c3"
         ]
       },
       "platforms": [
         "windows"
       ],
       "layer": "core-native",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "crates/tine-core/src/oplog/local_active/tests.rs::a_live_promoted_runtime_blocks_every_newcomer_before_any_durable_write",
-          "crates/tine-core/src/model.rs::inactive_bootstrap_capture"
+          "crates/tine-core/src/model.rs::inactive_bootstrap_capture",
+          "crates/tine-core/src/model.rs::bootstrap_source_regular_file_sync_uses_supported_handle_access"
         ],
-        "scenario": "managed-storage.bootstrap-spool-writer-lifecycle",
+        "scenario": "managed-storage.bootstrap-prefix-windows-file-flush",
         "failBefore": "proven"
       },
-      "notes": "Fail-before: exact serial hosted Windows runs 30986757145 and 30992636156 reached live-runtime bootstrap capture and failed with ERROR_ACCESS_DENIED surfaced at local_active/tests.rs:174. Closing all five synced raw-spool writers before sorting is correct lifecycle hygiene but did not resolve the focused Windows witness; Rust's standard Windows file handles already request delete sharing, so writer lifetime is not a proven root cause. Test-only stage instrumentation at 3ed78e9f preserves the raw OS error and names the last capture I/O boundary so an exact focused Windows probe can identify the failing operation before another behavioral fix is attempted. The original lifecycle assertion remains unchanged."
+      "notes": "Fail-before: exact serial hosted Windows runs 30986757145 and 30992636156 reached live-runtime bootstrap capture and failed with ERROR_ACCESS_DENIED. Instrumented run 30994134161 on cf2ca70f localized the failure to flush_bootstrap_source_prefix. On non-Linux targets that durability pass recursively opened each regular capture artifact with File::open (GENERIC_READ on Windows) and then called sync_all (FlushFileBuffers on Windows); FlushFileBuffers requires write access and therefore returned ERROR_ACCESS_DENIED on the valid read-only handle. This was not a directory-sharing conflict: recursive directory barriers already use Tine's validated platform sync contract, which validates the retained no-follow directory capability and explicitly treats Windows directory-entry crash durability as unsupported after validation. Fixed by e04469c3 using the established shadow-projection and migration-backup pattern: request write access only for the Windows regular-file flush handle, preserve read-only access elsewhere, and propagate every open or flush error. The focused helper test directly exercises the platform-specific handle contract; the unchanged full live-runtime witness and nine inactive-bootstrap-capture tests cover the surrounding fail-closed capture protocol. Linux and Android use syncfs for the prefix and never enter this recursive file-flush path."
     }
   ]
 }
