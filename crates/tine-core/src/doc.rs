@@ -1411,8 +1411,47 @@ mod promoted_heading_tests {
         assert_eq!(parse(&rendered), doc);
     }
 
+    /// A page mixing a bulleted heading with later UNBULLETED ones survives a
+    /// full parse/serialize round trip untouched.
+    ///
+    /// This is not a hypothetical layout: real Logseq journals contain it. A
+    /// journal page in Martin's graph opens with a bulleted `- # A` and then
+    /// carries unbulleted `# B` / `# C` siblings, each owning tab-indented
+    /// children — both forms in one file, written by Logseq itself. Managed
+    /// storage has to accept every shape Direct Markdown accepts, so a
+    /// canonicalisation that re-bulleted the later headings would both churn
+    /// those bytes and shrink managed storage to a subset of the graphs that
+    /// already work.
     #[test]
-    fn edited_promoted_heading_without_children_canonicalizes_before_later_sibling() {
+    fn a_page_mixing_bulleted_and_unbulleted_headings_round_trips_byte_for_byte() {
+        let source =
+            "- # A\n\t- first child\n# B\n\t- second child\n# C\n\t- third child\n\t- fourth child";
+        let mut doc = parse(source);
+        let identities = assign_layout_identities(&mut doc);
+        let opts = SerializeOpts::detect_with_layout_identities(Some(source), &identities);
+
+        assert_eq!(doc.roots.len(), 3);
+        assert_eq!(doc.roots[0].raw, "# A");
+        assert_eq!(doc.roots[1].raw, "# B");
+        assert_eq!(doc.roots[2].raw, "# C");
+        assert_eq!(doc.roots[2].children.len(), 2);
+
+        let rendered = serialize_with(&doc, &opts);
+        assert_eq!(rendered, source, "an untouched page must not be rewritten");
+        assert_eq!(parse(&rendered), doc);
+    }
+
+    /// Losing its children must not put a bullet in front of a leading heading.
+    ///
+    /// OG writes a leading Markdown heading WITHOUT a bullet
+    /// (`og@6e7afa8` `src/main/frontend/modules/file/core.cljs`
+    /// `transform-content`: `markdown-top-heading?` is
+    /// `(and markdown? (= parent page left) (number? heading))`, whose prefix is
+    /// `""`). That condition says nothing about children, so a childless
+    /// leading heading stays unbulleted. Adding one here would rewrite the
+    /// user's file on an edit that only deleted a child.
+    #[test]
+    fn edited_promoted_heading_without_children_stays_unbulleted_before_later_sibling() {
         let source = "# Project\n\t- only child\n- sibling";
         let mut doc = parse(source);
         let identities = assign_layout_identities(&mut doc);
@@ -1421,14 +1460,17 @@ mod promoted_heading_tests {
         let expected_locators = semantic_locators(&doc);
 
         let rendered = serialize_with(&doc, &opts);
-        assert_eq!(rendered, "- # Project\n- sibling");
+        assert_eq!(rendered, "# Project\n- sibling");
         let reparsed = parse(&rendered);
         assert_eq!(reparsed, doc);
         assert_eq!(semantic_locators(&reparsed), expected_locators);
     }
 
+    /// Same rule as
+    /// [`edited_promoted_heading_without_children_stays_unbulleted_before_later_sibling`],
+    /// with the heading as the page's only block.
     #[test]
-    fn edited_promoted_heading_without_children_canonicalizes_as_sole_root() {
+    fn edited_promoted_heading_without_children_stays_unbulleted_as_sole_root() {
         let source = "# Project\n\t- only child";
         let mut doc = parse(source);
         let identities = assign_layout_identities(&mut doc);
@@ -1437,7 +1479,7 @@ mod promoted_heading_tests {
         let expected_locators = semantic_locators(&doc);
 
         let rendered = serialize_with(&doc, &opts);
-        assert_eq!(rendered, "- # Project");
+        assert_eq!(rendered, "# Project");
         let reparsed = parse(&rendered);
         assert_eq!(reparsed, doc);
         assert_eq!(semantic_locators(&reparsed), expected_locators);

@@ -3417,6 +3417,24 @@ mod tests {
         );
     }
 
+    /// Inserting a root ABOVE an unbulleted heading keeps the heading's own
+    /// bytes; only the new root is added.
+    ///
+    /// This is a DELIBERATE divergence from OG's writer, which would re-bullet
+    /// the heading: `og@6e7afa8`
+    /// `src/main/frontend/modules/file/core.cljs` `transform-content` drops the
+    /// `-` only for `markdown-top-heading?` — `(and markdown? (= parent page
+    /// left) (number? heading))` — and `left` is the new root here, not the
+    /// page. Tine preserves the bytes instead, for two reasons:
+    ///
+    ///   * Real Logseq graphs already contain mid-file unbulleted headings that
+    ///     OG itself reads back correctly (a journal page in Martin's graph
+    ///     holds a bulleted `- # A` followed by unbulleted `# B` / `# C`, each
+    ///     owning tab-indented children). Re-bulleting on an unrelated edit
+    ///     would churn those files, and managed storage must accept every shape
+    ///     Direct Markdown accepts — not a subset of it.
+    ///   * The unbulleted form round-trips: the reparse below proves the
+    ///     projected bytes restore the exact sibling topology.
     #[test]
     fn collapsed_heading_projection_retains_parser_owned_sibling_topology() {
         let base = structural_layout_state(
@@ -3437,7 +3455,7 @@ mod tests {
         );
         let projection = reproject_with_source_identities(&base, source, &inserted_root);
         let projected = std::str::from_utf8(projection.target()).unwrap();
-        assert!(projected.starts_with("- new root\n- # Parent\n"));
+        assert!(projected.starts_with("- new root\n# Parent\n"));
         let reparsed = crate::doc::parse(projected);
         assert_eq!(reparsed.roots.len(), 3);
         assert_eq!(reparsed.roots[0].raw, "new root");
