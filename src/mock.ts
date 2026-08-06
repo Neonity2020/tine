@@ -1656,6 +1656,9 @@ export function mockBackend(): Backend {
     async onManagedSyncError(): Promise<() => void> {
       return () => {};
     },
+    async onGraphWatchError(): Promise<() => void> {
+      return () => {};
+    },
     async getBackupKeep(): Promise<number> {
       return 12;
     },

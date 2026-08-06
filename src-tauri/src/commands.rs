@@ -763,6 +763,56 @@ fn collect_graph_text(
     }
 }
 
+/// A Direct-Markdown save is slow enough to be worth a line above this. Chosen
+/// so ordinary saves stay silent (0.6.5 saved in single-digit milliseconds) while
+/// anything a user would notice as a hitch is on the record.
+const DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS: u128 = 150;
+
+/// Report what a slow or failed Direct-Markdown save actually did.
+///
+/// Always on. Every field is a duration, a count, or a bounded failure code --
+/// no page names, no paths, no content -- so the line is safe to paste into a
+/// public issue, which is the only way it helps the people reporting #266/#267
+/// from Windows machines we cannot reproduce.
+///
+/// The counters are the load-bearing part. `builds` distinguishes "the save was
+/// slow" from "the save rebuilt a whole-graph index to answer a filename
+/// question", and those have opposite fixes.
+fn report_direct_save_diagnostics(
+    graph: &tine_core::model::Graph,
+    elapsed: std::time::Duration,
+    error: Option<&std::io::Error>,
+) {
+    if error.is_none() && elapsed.as_millis() < DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS {
+        return;
+    }
+    let report = graph.guarded_graph_text_identity_report();
+    let outcome = match error {
+        Some(error) => tine_core::model::direct_save_failure_code(error),
+        None => "ok",
+    };
+    let build = report.last_build.map_or_else(
+        || " last_build=none".to_string(),
+        |build| {
+            format!(
+                " last_build_capture_ms={} last_build_index_ms={} last_build_parsed={} last_build_entries={} last_build_bytes={}",
+                build.capture.as_millis(),
+                build.index.as_millis(),
+                build.decode_semantics,
+                build.captured_entries,
+                build.captured_bytes,
+            )
+        },
+    );
+    crate::debug::diag(format!(
+        "direct save: outcome={outcome} total_ms={} guarded_index_builds={} guarded_index_exact_updates={} guarded_index_invalidated={}{build}",
+        elapsed.as_millis(),
+        report.complete_builds,
+        report.exact_updates,
+        report.invalidated,
+    ));
+}
+
 #[tauri::command]
 pub(crate) async fn save_page(
     page: PageDto,
@@ -800,19 +850,26 @@ pub(crate) async fn save_page(
                 }
                 None => {
                     let graph = slot.legacy_graph()?;
-                    let legacy_save_started = benchmark_started.map(|_| Instant::now());
+                    // Always timed, not just under the issue-248 benchmark env
+                    // var. A save that takes minutes is the thing users report,
+                    // and a measurement that only exists when someone thought to
+                    // set an environment variable beforehand is not available at
+                    // the moment it is needed.
+                    let started = Instant::now();
                     let result = if force.unwrap_or(false) {
                         graph.force_save_page(&page)
                     } else {
                         graph.save_page(&page, base_rev.as_deref())
                     };
-                    if let Some(started) = legacy_save_started {
+                    let elapsed = started.elapsed();
+                    if benchmark_started.is_some() {
                         let _ = app.emit_to(
                             &label,
                             "issue-248-legacy-save-page-ms",
-                            started.elapsed().as_secs_f64() * 1_000.0,
+                            elapsed.as_secs_f64() * 1_000.0,
                         );
                     }
+                    report_direct_save_diagnostics(&graph, elapsed, result.as_ref().err());
                     result.map_err(|error| {
                         if error.kind() == std::io::ErrorKind::AlreadyExists {
                             "conflict".to_string()

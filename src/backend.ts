@@ -468,6 +468,10 @@ export interface Backend {
   onSparseV2Changed(cb: () => void): Promise<() => void>;
   /** Subscribe to deduplicated managed-sync reconciliation failures. */
   onManagedSyncError(cb: (message: string) => void): Promise<() => void>;
+  /** Direct Markdown folder-watch reconcile failure. Distinct from
+   *  onManagedSyncError: managed graphs never emit it, so its copy must not
+   *  talk about managed storage. */
+  onGraphWatchError(cb: (message: string) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
   getBackupKeep(): Promise<number>;
   setBackupKeep(keep: number): Promise<void>;
@@ -1098,6 +1102,10 @@ class TauriBackend implements Backend {
   async onManagedSyncError(cb: (message: string) => void): Promise<() => void> {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<string>("managed-sync-error", (e) => cb(e.payload));
+  }
+  async onGraphWatchError(cb: (message: string) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<string>("graph-watch-error", (e) => cb(e.payload));
   }
   getBackupKeep() {
     return this.call<number>("get_backup_keep");

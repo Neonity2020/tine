@@ -683,6 +683,19 @@ export function App(): JSX.Element {
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
+  // A plain Markdown graph whose folder watch failed a reconcile cycle. Says
+  // only what is known: Tine may miss outside changes until it recovers. It
+  // deliberately makes no claim about whether saving still works — the guarded
+  // write path has its own failure modes and this event does not measure them.
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onGraphWatchError(() =>
+        pushToast("Tine couldn't finish checking the graph folder for outside changes. It will keep retrying.", "error"),
+      )
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
   // Load the asset-filename format template (Settings → Backups → Asset names).
   onMount(() => void initAssetSettings());
   // Load external media-editor command templates (Settings → Files; GH #38).

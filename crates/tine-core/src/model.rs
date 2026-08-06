@@ -2138,10 +2138,41 @@ struct GuardedGraphTextIdentityState {
     /// warm cache is reusable only if no sibling transition intervened.
     observed_resource_epoch: Option<u64>,
     generation: u64,
-    #[cfg(test)]
+    /// Always recorded, NOT `#[cfg(test)]`. A complete rebuild of this index is
+    /// the dominant cost of a save on a large graph, and "how many times did it
+    /// rebuild?" is the first question any slow-save report raises. A counter
+    /// that exists only in the test binary cannot answer that question on the
+    /// machine that has the problem -- which is exactly how the managed-recovery
+    /// lane burned a full diagnostic cycle on 2026-08-05/06.
     complete_builds: usize,
-    #[cfg(test)]
     exact_updates: usize,
+    /// Cost of the most recent complete rebuild, split into its two phases.
+    /// Durations and counts only -- never a path and never file content, so this
+    /// is safe to surface from a user's own graph.
+    last_build: Option<GuardedGraphTextIdentityBuild>,
+}
+
+/// One complete rebuild of the guarded graph-text admission index, measured.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuardedGraphTextIdentityBuild {
+    /// Two-pass whole-graph retained capture.
+    pub capture: std::time::Duration,
+    /// Admission-index construction, including the per-document parse when
+    /// `decode_semantics` is set.
+    pub index: std::time::Duration,
+    pub decode_semantics: bool,
+    pub captured_entries: usize,
+    pub captured_bytes: u64,
+}
+
+/// Always-on report of what the guarded graph-text identity index has cost.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GuardedGraphTextIdentityReport {
+    pub complete_builds: usize,
+    pub exact_updates: usize,
+    pub invalidated: bool,
+    pub generation: u64,
+    pub last_build: Option<GuardedGraphTextIdentityBuild>,
 }
 
 impl std::ops::Deref for GraphTextAdmissionControl {
@@ -5452,6 +5483,7 @@ impl Graph {
                 state.invalidated || state.observed_resource_epoch != Some(resource_epoch),
             )
         };
+        let capture_started = std::time::Instant::now();
         let (capture, combined_capture_bytes) = self
             .capture_retained_graph_text_identity_with_limits(INITIAL_SHADOW_LIMITS)
             .map_err(|error| {
@@ -5460,9 +5492,12 @@ impl Graph {
                     format!("guarded graph-text identity capture failed: {error}"),
                 )
             })?;
+        let capture_elapsed = capture_started.elapsed();
+        let captured_entries = capture.entries.len();
         let replacement_peak = prior.as_ref().map_or(combined_capture_bytes, |index| {
             combined_capture_bytes.saturating_add(index.permanent_bytes)
         });
+        let index_started = std::time::Instant::now();
         let mut replacement = build_graph_text_admission_index(
             self,
             &capture,
@@ -5477,6 +5512,7 @@ impl Graph {
                 format!("guarded graph-text identity construction failed: {error}"),
             )
         })?;
+        let index_elapsed = index_started.elapsed();
 
         if binding.gate.identity_mutation_epoch_under_authority() != resource_epoch {
             return Err(graph_text_admission_unavailable(
@@ -5494,10 +5530,14 @@ impl Graph {
         state.observed_resource_epoch = Some(resource_epoch);
         state.invalidated = false;
         state.invalidation_cause = None;
-        #[cfg(test)]
-        {
-            state.complete_builds = state.complete_builds.saturating_add(1);
-        }
+        state.complete_builds = state.complete_builds.saturating_add(1);
+        state.last_build = Some(GuardedGraphTextIdentityBuild {
+            capture: capture_elapsed,
+            index: index_elapsed,
+            decode_semantics,
+            captured_entries,
+            captured_bytes: combined_capture_bytes,
+        });
         Ok(replacement)
     }
 
@@ -5663,7 +5703,6 @@ impl Graph {
         state.observed_resource_epoch = Some(resource_epoch);
         state.invalidated = false;
         state.invalidation_cause = None;
-        #[cfg(test)]
         {
             state.exact_updates = state.exact_updates.saturating_add(1);
         }
@@ -5706,13 +5745,28 @@ impl Graph {
 
     #[cfg(test)]
     pub(crate) fn guarded_graph_text_identity_stats(&self) -> (usize, usize, bool, u64) {
-        let state = self.guarded_graph_text_identity.read().unwrap();
+        let report = self.guarded_graph_text_identity_report();
         (
-            state.complete_builds,
-            state.exact_updates,
-            state.invalidated,
-            state.generation,
+            report.complete_builds,
+            report.exact_updates,
+            report.invalidated,
+            report.generation,
         )
+    }
+
+    /// Always available, including in a release build. The whole point is that a
+    /// user reporting a slow save can be answered from the binary they are
+    /// running, without a debug build or an environment variable. Carries
+    /// durations and counts only -- no paths, no content.
+    pub fn guarded_graph_text_identity_report(&self) -> GuardedGraphTextIdentityReport {
+        let state = self.guarded_graph_text_identity.read().unwrap();
+        GuardedGraphTextIdentityReport {
+            complete_builds: state.complete_builds,
+            exact_updates: state.exact_updates,
+            invalidated: state.invalidated,
+            generation: state.generation,
+            last_build: state.last_build,
+        }
     }
 
     #[cfg(test)]
@@ -29561,6 +29615,50 @@ fn graph_text_admission_unavailable(cause: &str) -> io::Error {
     )
 }
 
+/// Classify a Direct-Markdown save failure into a BOUNDED code.
+///
+/// Two reasons this exists rather than logging the error itself. First, the
+/// error messages carry graph-relative paths, and a user's page titles are their
+/// private data -- a diagnostic that cannot be pasted into a bug report is not a
+/// diagnostic. Second, "the save failed" is useless triage: the failure classes
+/// behind it (a symlink somewhere in the walk, ambient filesystem churn between
+/// the capture's two passes, a same-bytes external replace that moved the inode,
+/// a rejected reparse point) have completely different fixes, and today they are
+/// indistinguishable from outside the process.
+///
+/// The strings matched here are produced by this module, so this is internal
+/// consistency rather than parsing a foreign format. `direct_save_failure_codes_
+/// are_stable` pins each code to the site that produces it.
+pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
+    let message = error.to_string();
+    let has = |needle: &str| message.contains(needle);
+    if has("is a symlink or reparse point") {
+        "precheck.symlink"
+    } else if has("changed during retained identity capture") || has("changed during capture") {
+        "precheck.interrupted"
+    } else if has("share one portable case/NFC identity") {
+        "precheck.portable_collision"
+    } else if has("alias one physical resource") {
+        "precheck.resource_alias"
+    } else if has("is not portable") {
+        "precheck.not_portable"
+    } else if has("not a real no-follow directory") || has("no retained no-follow") {
+        "precheck.nofollow"
+    } else if has("bound exceeded") {
+        "precheck.limit"
+    } else if has("existing page identity changed since load") {
+        "identity.changed_since_load"
+    } else if has("owns this effective page identity") {
+        "identity.owned_elsewhere"
+    } else if message == "conflict" {
+        "conflict.base_rev"
+    } else if error.kind() == io::ErrorKind::AlreadyExists {
+        "conflict.other"
+    } else {
+        "unknown"
+    }
+}
+
 fn initial_shadow_limit_error(resource: &'static str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -38464,6 +38562,145 @@ mod tests {
         });
         assert!(!graph.recent_writes.lock().unwrap().contains_key(&path));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Pins every bounded save-failure code to the exact message its production
+    /// site emits. If someone rewords one of those messages, this fails and they
+    /// have to update the classifier deliberately -- which is the point, because
+    /// a silently-reclassified failure reads as `unknown` in a user's report and
+    /// tells us nothing.
+    #[test]
+    fn direct_save_failure_codes_are_stable() {
+        use std::io::{Error, ErrorKind};
+        for (code, error) in [
+            // model.rs `capture_managed_text_entries` symlink arm.
+            (
+                "precheck.symlink",
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "managed text entry is a symlink or reparse point: pages/Note.md",
+                ),
+            ),
+            // `capture_retained_graph_text_identity_with_limits` two-pass equality.
+            (
+                "precheck.interrupted",
+                Error::new(
+                    ErrorKind::Interrupted,
+                    "managed inventory changed during retained identity capture",
+                ),
+            ),
+            // `validate_current_graph_text_collision_strict`, portable-key arm.
+            (
+                "precheck.portable_collision",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "graph text paths share one portable case/NFC identity: pages/a.md and pages/A.md",
+                ),
+            ),
+            // `validate_current_graph_text_collision_strict`, resource arm.
+            (
+                "precheck.resource_alias",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "graph text files alias one physical resource: pages/a.md and pages/b.md",
+                ),
+            ),
+            (
+                "precheck.not_portable",
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "guarded graph-text target is not portable: reserved name",
+                ),
+            ),
+            (
+                "precheck.nofollow",
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    "projection parent is not a real no-follow directory",
+                ),
+            ),
+            (
+                "precheck.limit",
+                initial_shadow_limit_error("peak build memory"),
+            ),
+            // `save_page`, retained-identity arm -- the F4 class.
+            (
+                "identity.changed_since_load",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "existing page identity changed since load",
+                ),
+            ),
+            (
+                "identity.owned_elsewhere",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "another graph document owns this effective page identity",
+                ),
+            ),
+            // `save_page`, base-rev arm.
+            (
+                "conflict.base_rev",
+                Error::new(ErrorKind::AlreadyExists, "conflict"),
+            ),
+            (
+                "unknown",
+                Error::new(ErrorKind::PermissionDenied, "permission denied"),
+            ),
+        ] {
+            assert_eq!(
+                direct_save_failure_code(&error),
+                code,
+                "classifier drifted for: {error}"
+            );
+        }
+    }
+
+    /// A symlink in a DESCENDED scope aborts the whole guarded capture, so it
+    /// takes down saves of unrelated pages. That is the real F3a class.
+    ///
+    /// It also settles an error in the 2026-08-06 Direct Files audit, which used
+    /// `assets/` as its exemplar and proposed it as the repro: `assets` is
+    /// fixed-excluded (`graph_text_scope.rs`, `fixed_excluded`), so the walk
+    /// skips it and the save succeeds. Both halves are asserted here so nobody
+    /// re-runs the wrong experiment and retires a real finding.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_blocks_saves_only_inside_a_descended_scope() {
+        use std::os::unix::fs::symlink;
+
+        // (a) assets/ is excluded from the walk -- a symlink there is harmless.
+        let dir = scratch("symlink-scope-assets");
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        symlink(dir.join("pages/Target.md"), dir.join("assets/link.md")).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        let base = content_rev("- before\n");
+        assert!(
+            graph.save_page(&page, Some(&base)).is_ok(),
+            "a symlink under assets/ must not block saves -- assets is fixed-excluded"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // (b) a symlink in pages/ IS in scope, and takes down an unrelated save.
+        let dir = scratch("symlink-scope-pages");
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        symlink(dir.join("pages/Target.md"), dir.join("pages/Alias.md")).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        let base = content_rev("- before\n");
+        let error = graph
+            .save_page(&page, Some(&base))
+            .expect_err("a symlink inside pages/ currently aborts the guarded capture");
+        assert_eq!(
+            direct_save_failure_code(&error),
+            "precheck.symlink",
+            "unexpected failure class: {error}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

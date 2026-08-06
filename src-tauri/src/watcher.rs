@@ -971,7 +971,16 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         cycle_failed = true;
                         let message = errors.join("; ");
                         if graph.last_sync_error.as_deref() != Some(&message) {
-                            let _ = app.emit_to(label, "managed-sync-error", &message);
+                            // NOT `managed-sync-error`. This loop is the legacy
+                            // (Direct Markdown) lane -- a graph with a sparse
+                            // runtime is removed from `graphs` and handled in
+                            // `sparse_graphs`, so managed graphs never reach
+                            // here. Telling a Direct-mode user "Tine-managed
+                            // storage stopped, open Storage & sync to retry
+                            // setup" during a write incident pointed them at a
+                            // feature they are not using. This is a plain
+                            // reconcile failure of the folder watch.
+                            let _ = app.emit_to(label, "graph-watch-error", &message);
                             graph.last_sync_error = Some(message);
                         }
                     }
