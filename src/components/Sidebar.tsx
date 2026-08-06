@@ -1,6 +1,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, type JSX } from "solid-js";
 import { openJournals, openPage, openPageInNewTab, openFile, openInNewTab, openPageTarget, openPageTargetInNewTab, route, type PageTarget } from "../router";
-import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection } from "../ui";
+import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, openPageInSidebar, pushToast, resolveAlias, favoritesSectionExpanded, recentSectionExpanded, toggleFavoritesSection, toggleRecentSection, moveFavorite } from "../ui";
+import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, type LoadGraphPathOutcome } from "../graph";
 import { backend } from "../backend";
 import { allPages as allGraphPages, pageListLabel } from "../pages";
@@ -32,6 +33,16 @@ const sidebarPageOpenDeps: SidebarPageOpenDeps = {
   newTab: openPageInNewTab,
   context: openPageContextMenu,
 };
+
+// Live drop target while a favorites reorder drag is in progress (GH #211).
+// Module scope: Sidebar renders once per window.
+const [favDropTarget, setFavDropTarget] = createSignal<RowDropTarget | null>(null);
+/** Pointerdown on a favorites row starts a reorder drag — never from an
+ *  interactive child. */
+function startFavoriteDrag(index: number, event: PointerEvent) {
+  if ((event.target as HTMLElement | null)?.closest("button, a, input, [contenteditable=\"true\"]")) return;
+  beginRowReorderDrag(event, index, "#sidebar-favorites-list .nav-page", setFavDropTarget, moveFavorite);
+}
 
 export function openSidebarPageTarget(
   name: string,
@@ -149,14 +160,19 @@ export function Sidebar(props: {
             <Show when={favoritesSectionExpanded()}>
               <div id="sidebar-favorites-list">
                 <For each={favorites()}>
-                  {(fav) => {
+                  {(fav, i) => {
                     const target = () => sidebarPageTarget(fav.name, fav.kind);
                     return (
                       <div
                         class="nav-page"
-                        classList={{ active: isActive(target().name) }}
+                        data-row-index={i()}
+                        classList={{ active: isActive(target().name), "row-drop-before": favDropTarget()?.index === i() && favDropTarget()!.before, "row-drop-after": favDropTarget()?.index === i() && !favDropTarget()!.before }}
+                        onPointerDown={(e) => startFavoriteDrag(i(), e)}
                         onMouseDown={shiftGuard}
-                        onClick={(e) => openSidebarPageTarget(fav.name, fav.kind, e.shiftKey ? "sidebar" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete)}
+                        onClick={(e) => {
+                          if (rowReorderClickSuppressed()) return;
+                          openSidebarPageTarget(fav.name, fav.kind, e.shiftKey ? "sidebar" : "normal", { x: 0, y: 0 }, sidebarPageOpenDeps, props.onActiveNavigationComplete);
+                        }}
                         onAuxClick={(e) => {
                           if (e.button === 1) {
                             e.preventDefault();

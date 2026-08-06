@@ -802,6 +802,17 @@ export function toggleFavorite(name: string, kind: "page" | "journal" = "page") 
   setFavorites(next);
   persistFavorites(next);
 }
+/** Move a favorite to a new position (GH #211 drag-reorder). Order persists
+ *  through the same config.edn :favorites owner as add/remove. */
+export function moveFavorite(from: number, to: number) {
+  const favs = favorites();
+  if (from === to || from < 0 || to < 0 || from >= favs.length || to >= favs.length) return;
+  const next = [...favs];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  setFavorites(next);
+  persistFavorites(next);
+}
 export function removeDeletedPageFromNavigation(target: PageTarget): void;
 export function removeDeletedPageFromNavigation(name: string, kind: PageKind): void;
 export function removeDeletedPageFromNavigation(targetOrName: PageTarget | string, kind?: PageKind) {
@@ -1237,9 +1248,19 @@ export function setRightSidebar(items: SidebarItem[]) {
   }
   scheduleSessionSave(); // durable right-sidebar items (localStorage isn't kept)
 }
+/** Move a right-sidebar item to a new position (GH #211 drag-reorder). Order
+ *  persists through the same setRightSidebar owner (localStorage + session). */
+export function moveRightSidebarItem(from: number, to: number) {
+  const items = rightSidebar();
+  if (from === to || from < 0 || to < 0 || from >= items.length || to >= items.length) return;
+  const next = [...items];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  setRightSidebar(next);
+}
 
 /** History captures the same sidebar-open/item app state as OG does at
- * `src/main/frontend/modules/editor/undo_redo.cljs:261-272`
+ *  `src/main/frontend/modules/editor/undo_redo.cljs:261-272`
  * (OG commit 6e7afa8eb). */
 export function captureHistorySidebarContext(): HistorySidebarContext {
   return { open: rightSidebarOpen(), items: rightSidebar().map((item) => ({ ...item })) };

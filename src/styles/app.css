@@ -8067,6 +8067,20 @@ img.emoji {
   gap: 5px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border-color);
+  cursor: grab;
+}
+/* GH #211: insertion line while a sidebar row reorder drag is in progress.
+ *  Shared by the right sidebar (.rs-item) and the favorites list (.nav-page). */
+.rs-item.row-drop-before,
+.nav-page.row-drop-before {
+  box-shadow: inset 0 2px 0 var(--link-color);
+}
+.rs-item.row-drop-after,
+.nav-page.row-drop-after {
+  box-shadow: inset 0 -2px 0 var(--link-color);
+}
+#sidebar-favorites-list .nav-page {
+  cursor: grab;
 }
 .rs-item.collapsed .rs-item-head {
   border-bottom: 0;

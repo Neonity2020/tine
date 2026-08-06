@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Drag-reorder for sidebar lists.** Right-sidebar open items and
+  left-sidebar favorites can be reordered by dragging the row (right sidebar:
+  the header area). Sub-threshold presses stay ordinary clicks and the click
+  that ends a drag is swallowed, so navigation, middle-click, context menus,
+  close buttons and scrolling are unaffected. Order persists through the
+  existing owners (right-sidebar session state; favorites in the graph's
+  `config.edn`).
 - **Configurable graph home page.** The Graph settings tab can now pick an
   existing page as the graph's home page; it opens in-place in the primary
   tab whenever that graph is opened. A deleted or renamed page is skipped

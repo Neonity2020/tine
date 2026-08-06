@@ -14,8 +14,10 @@ import {
   sidebarItemKey,
   renamePageInNavigation,
   registerRightSidebarClosePreparation,
+  moveRightSidebarItem,
   type SidebarItem,
 } from "../ui";
+import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { mobileDrawerMode } from "../mobileDrawers";
 import { registerTransientLayer } from "../transientLayers";
 import { MobileDrawerPanel, dismissDrawerAndRestore } from "./MobileDrawerShell";
@@ -31,6 +33,15 @@ import { endEditForSurface } from "../editorController";
 
 function surfaceKey(item: SidebarItem): string {
   return `sidebar:${sidebarItemKey(item)}`;
+}
+
+// Live drop target while a row reorder drag is in progress (GH #211).
+const [rsDropTarget, setRsDropTarget] = createSignal<RowDropTarget | null>(null);
+/** Pointerdown on a row head starts a reorder drag, unless it landed on an
+ *  interactive child (toggle/close button, title link). */
+function startRowDrag(index: number, event: PointerEvent) {
+  if ((event.target as HTMLElement | null)?.closest("button, a, input, textarea, [contenteditable=\"true\"]")) return;
+  beginRowReorderDrag(event, index, ".right-sidebar-body .rs-item", setRsDropTarget, moveRightSidebarItem);
 }
 
 /** Commit the active textarea synchronously through its blur handler before a
@@ -181,7 +192,7 @@ export function RightSidebar(): JSX.Element {
                 // Each sidebar item is its own editing surface, so a block that
                 // also shows in the main pane doesn't fight it for the caret.
                 <SurfaceContext.Provider value={key}>
-                  <SidebarItemView item={item} surfaceKey={key} collapsed={!!item.collapsed} onToggle={collapse} onClose={close} />
+                  <SidebarItemView item={item} surfaceKey={key} collapsed={!!item.collapsed} onToggle={collapse} onClose={close} rowIndex={i()} onHeadPointerDown={(e) => startRowDrag(i(), e)} />
                 </SurfaceContext.Provider>
                 );
               }}
@@ -241,13 +252,15 @@ function SidebarItemView(props: {
   collapsed: boolean;
   onToggle: (control: HTMLButtonElement) => void;
   onClose: () => void;
+  rowIndex: number;
+  onHeadPointerDown: (event: PointerEvent) => void;
 }): JSX.Element {
   return (
     <Show
       when={props.item.kind === "page"}
-      fallback={<BlockItem item={props.item as Extract<SidebarItem, { kind: "block" }>} surfaceKey={props.surfaceKey} collapsed={props.collapsed} onToggle={props.onToggle} onClose={props.onClose} />}
+      fallback={<BlockItem item={props.item as Extract<SidebarItem, { kind: "block" }>} surfaceKey={props.surfaceKey} collapsed={props.collapsed} onToggle={props.onToggle} onClose={props.onClose} rowIndex={props.rowIndex} onHeadPointerDown={props.onHeadPointerDown} />}
     >
-      <PageItem item={props.item as Extract<SidebarItem, { kind: "page" }>} surfaceKey={props.surfaceKey} collapsed={props.collapsed} onToggle={props.onToggle} onClose={props.onClose} />
+      <PageItem item={props.item as Extract<SidebarItem, { kind: "page" }>} surfaceKey={props.surfaceKey} collapsed={props.collapsed} onToggle={props.onToggle} onClose={props.onClose} rowIndex={props.rowIndex} onHeadPointerDown={props.onHeadPointerDown} />
     </Show>
   );
 }
@@ -258,6 +271,8 @@ function PageItem(props: {
   collapsed: boolean;
   onToggle: (control: HTMLButtonElement) => void;
   onClose: () => void;
+  rowIndex: number;
+  onHeadPointerDown: (event: PointerEvent) => void;
 }): JSX.Element {
   useEnsurePage(
     () => props.item.name,
@@ -271,12 +286,18 @@ function PageItem(props: {
   };
   const bodyId = `rs-item-body-${createUniqueId()}`;
   return (
-    <div class="rs-item" data-sidebar-surface={props.surfaceKey} classList={{ collapsed: props.collapsed }}>
-      <div class="rs-item-head">
+    <div
+      class="rs-item"
+      data-sidebar-surface={props.surfaceKey}
+      data-row-index={props.rowIndex}
+      classList={{ collapsed: props.collapsed, "row-drop-before": rsDropTarget()?.index === props.rowIndex && rsDropTarget()!.before, "row-drop-after": rsDropTarget()?.index === props.rowIndex && !rsDropTarget()!.before }}
+    >
+      <div class="rs-item-head" onPointerDown={props.onHeadPointerDown}>
         <button class="rs-item-toggle" type="button" aria-label={props.collapsed ? "Expand sidebar item" : "Collapse sidebar item"} aria-expanded={!props.collapsed} aria-controls={bodyId} data-right-sidebar-item-toggle onClick={(event) => props.onToggle(event.currentTarget)}>
           <span aria-hidden="true">▸</span>
         </button>
         <a class="rs-item-title" onClick={() => {
+          if (rowReorderClickSuppressed()) return;
           openPageTarget({ name: props.item.name, pageKind: props.item.pageKind, path: props.item.path });
         }}>
           <EmojiText text={props.item.name} />
@@ -306,6 +327,8 @@ function BlockItem(props: {
   collapsed: boolean;
   onToggle: (control: HTMLButtonElement) => void;
   onClose: () => void;
+  rowIndex: number;
+  onHeadPointerDown: (event: PointerEvent) => void;
 }): JSX.Element {
   useEnsurePage(
     () => props.item.page,
@@ -329,19 +352,27 @@ function BlockItem(props: {
   };
   const bodyId = `rs-item-body-${createUniqueId()}`;
   return (
-    <div class="rs-item" data-sidebar-surface={props.surfaceKey} classList={{ collapsed: props.collapsed }}>
-      <div class="rs-item-head">
+    <div
+      class="rs-item"
+      data-sidebar-surface={props.surfaceKey}
+      data-row-index={props.rowIndex}
+      classList={{ collapsed: props.collapsed, "row-drop-before": rsDropTarget()?.index === props.rowIndex && rsDropTarget()!.before, "row-drop-after": rsDropTarget()?.index === props.rowIndex && !rsDropTarget()!.before }}
+    >
+      <div class="rs-item-head" onPointerDown={props.onHeadPointerDown}>
         <button class="rs-item-toggle" type="button" aria-label={props.collapsed ? "Expand sidebar item" : "Collapse sidebar item"} aria-expanded={!props.collapsed} aria-controls={bodyId} data-right-sidebar-item-toggle onClick={(event) => props.onToggle(event.currentTarget)}>
           <span aria-hidden="true">▸</span>
         </button>
         <a
           class="rs-item-title"
-          onClick={() => openPageAtBlock({
-            name: props.item.page,
-            pageKind: props.item.pageKind,
-            block: props.item.uuid,
-            path: props.item.path,
-          })}
+          onClick={() => {
+            if (rowReorderClickSuppressed()) return;
+            openPageAtBlock({
+              name: props.item.page,
+              pageKind: props.item.pageKind,
+              block: props.item.uuid,
+              path: props.item.path,
+            });
+          }}
           title={`On ${props.item.page}`}
         >
           {title()}
