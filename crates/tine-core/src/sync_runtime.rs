@@ -31472,6 +31472,141 @@ mod tests {
         drop(reopened.handle);
     }
 
+    /// Unsafe reopen of a real-scale graph whose managed history has been AGED:
+    /// many accepted saves across many pages, each drained so the local journal
+    /// compacts, before the final pending save and the unsafe drop.
+    ///
+    /// `managed_crash_reopen_real_graph_manual_benchmark` reopens a graph that was
+    /// activated moments earlier, so its oplog holds one generation and recovery is
+    /// trivially fast. That is not the state Martin's ~63 s reopen came from: his is
+    /// a graph lived in for days, with accumulated generations, retained runs and
+    /// manifests. This benchmark exists to find out which of those quantities the
+    /// recovery cost actually tracks — graph size is already known not to explain it.
+    ///
+    /// `TINE_MANAGED_CRASH_REOPEN_ROUNDS` sets the number of accepted+drained saves
+    /// (default 32; the test-build compaction threshold is 4 frames, so 32 rounds
+    /// crosses it repeatedly). Sweep it to get the shape of the curve.
+    #[test]
+    #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
+    fn managed_crash_reopen_aged_history_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_crash_reopen_aged_history_manual_benchmark -- --ignored --nocapture"
+        );
+        let source = PathBuf::from(
+            std::env::var("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY")
+                .expect("TINE_MANAGED_CRASH_REOPEN_GRAPH_COPY must name a disposable graph copy"),
+        );
+        let rounds: usize = std::env::var("TINE_MANAGED_CRASH_REOPEN_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32);
+        let fixture = ActivationFixture::copied_graph("managed-crash-reopen-aged", 0xa0e7, &source);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("real graph copy activates");
+        drive_initial_feed(&handle);
+
+        let mut directories = vec![fixture.graph_root.clone()];
+        let mut managed_paths = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if matches!(
+                    entry.path().extension().and_then(|value| value.to_str()),
+                    Some("md" | "org")
+                ) {
+                    managed_paths.push(
+                        entry
+                            .path()
+                            .strip_prefix(&fixture.graph_root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        managed_paths.sort();
+        let editable = managed_paths
+            .into_iter()
+            .filter(|path| {
+                let (page, _) = load_application_exact(&handle, path);
+                !page.blocks.is_empty()
+            })
+            .take(rounds.max(1))
+            .collect::<Vec<_>>();
+        assert!(
+            !editable.is_empty(),
+            "real graph copy has an editable managed page"
+        );
+
+        // Age the history: each round is an accepted save that is then fully
+        // drained, so the local journal reaches and crosses its compaction
+        // threshold repeatedly rather than staying in one generation.
+        let aging_started = Instant::now();
+        for round in 0..rounds {
+            let path = &editable[round % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("aged-history benchmark edit {round}"),
+            );
+            for _ in 0..512 {
+                if handle.status().unwrap().managed_local_pending == 0 {
+                    break;
+                }
+                handle.tick().unwrap();
+            }
+            assert_eq!(
+                handle.status().unwrap().managed_local_pending,
+                0,
+                "aging round {round} did not drain"
+            );
+        }
+        let aging = aging_started.elapsed();
+
+        // One final UNDRAINED save, then drop the live actor without
+        // clean_shutdown: a killed process during a pending save.
+        let path = &editable[rounds % editable.len()];
+        let (page, revision) = load_application_exact(&handle, path);
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "aged-history benchmark pending edit",
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+        drop(handle);
+
+        reset_runtime_open_instrumentation(workspace_id);
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let elapsed = started.elapsed();
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let open = take_runtime_open_instrumentation(workspace_id);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        let resume = reopened
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.engine_instrumentation().ok())
+            .map(|instrumentation| instrumentation.resume);
+        eprintln!(
+            "managed_crash_reopen_aged rounds={rounds} aging_ms={:.3} elapsed_ms={:.3} resume={resume:?} open_phases: {} promoted_phases: {}",
+            startup_ms(aging),
+            startup_ms(elapsed),
+            startup_open_phase_receipt(&open),
+            startup_promoted_open_phase_receipt(&promoted),
+        );
+        drop(reopened.handle);
+    }
+
     #[test]
     fn managed_crash_reopen_synthetic_history_sweep_with_and_without_resume_point() {
         const PATH: &str = "notes/Synthetic crash history.md";
