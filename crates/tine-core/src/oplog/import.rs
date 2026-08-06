@@ -4901,6 +4901,7 @@ pub(crate) fn plan_affected_import_with_bootstrap(
         receipts,
         engine,
         &paths,
+        &inventory,
         catalog,
         &mut instrumentation,
     ) {
@@ -5332,6 +5333,7 @@ fn capture_import_scope(
     receipts: &ProjectionReceiptStore,
     engine: &ShardedHotEngine,
     requested_paths: &[ManagedPath],
+    inventory: &RawInventory,
     catalog: AffectedReceiptCatalog,
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ImportScopeSnapshot, ImportBlock> {
@@ -5359,6 +5361,13 @@ fn capture_import_scope(
             "graph, engine, receipt workspace, or endpoint binding differs",
         ));
     }
+    let (_, work_index) = engine.enrolled_projection_runtime().map_err(|error| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            format!("import authority has no enrolled completed-path index: {error}"),
+        )
+    })?;
 
     let mut paths = BTreeMap::new();
     let mut path_identities = BTreeMap::new();
@@ -5544,6 +5553,74 @@ fn capture_import_scope(
                 kind: current.state().page.kind,
             },
         );
+
+        // A late watcher callback may observe the exact bytes Tine itself
+        // projected after its journal record was drained and compacted.  Do
+        // not reconstruct an old receipt base with the current serializer:
+        // the immutable completed-path row plus this retained raw inventory
+        // can prove the live bytes are still the accepted projection directly.
+        let live_predecessor = match inventory.entries().get(path) {
+            Some(RawObservation::Present(live)) => {
+                super::projection::receipt_backed_live_projection_predecessor(
+                    engine.workspace_id(),
+                    endpoint,
+                    receipts,
+                    &work_index,
+                    current.state(),
+                    live.bytes(),
+                )
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        format!("live completed-path predecessor is invalid: {error}"),
+                    )
+                })?
+            }
+            Some(RawObservation::Absent) => None,
+            None => {
+                return Err(authority_block(
+                    ImportBlockReason::StaleScope,
+                    Some(path),
+                    "requested path is absent from the retained raw inventory",
+                ));
+            }
+        };
+        if let Some(live) = live_predecessor {
+            let matching = catalog_entries
+                .iter()
+                .filter(|entry| {
+                    entry.completed.as_ref() == Some(live.completed())
+                        && entry.intent == *live.intent()
+                        && entry.completion == *live.completion()
+                })
+                .count();
+            if matching != 1 {
+                return Err(authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    "live completed-path predecessor is not uniquely present in the sealed receipt catalog",
+                ));
+            }
+            let bytes = inventory
+                .entries()
+                .get(path)
+                .and_then(|observation| match observation {
+                    RawObservation::Present(bytes) => Some(bytes.bytes().to_vec()),
+                    RawObservation::Absent => None,
+                })
+                .expect("live completed-path predecessor requires a present retained observation");
+            paths.insert(
+                path.clone(),
+                ScopedPathEvidence::Existing(ReceiptBackedPage {
+                    intent: live.intent().clone(),
+                    completion: live.completion().clone(),
+                    replayed_target: ExactBytes::from_description(bytes, live.intent().target()),
+                    page: current.state().page.clone(),
+                }),
+            );
+            continue;
+        }
 
         let mut exact = None;
         let mut replay_cache =

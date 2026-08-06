@@ -77,7 +77,7 @@ use crate::oplog::local_active::{
     reopen_promoted_local_runtime_existing_projection, seal_local_runtime_promotion,
     take_over_promoted_local_runtime_recovering_projection, InactiveBootstrapRuntimeSession,
     LocalActiveAuthority, LocalActiveRuntime, PromotedLocalRuntime, PromotedRuntimeOpen,
-    RuntimeRecoveryState,
+    PromotedRuntimeRecoveryDiagnostics, RuntimeRecoveryState,
 };
 #[cfg(test)]
 use crate::oplog::local_active::{
@@ -1360,6 +1360,47 @@ pub enum SyncRuntimeOpenPhase {
     AssemblingActor,
 }
 
+/// Content-free detail for a debug-enabled promoted-runtime recovery.  It is
+/// observational only: no field grants recovery, scan, or mutation authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyncRuntimeRecoveryDiagnostics {
+    pub recovery: &'static str,
+    pub retention_plan: &'static str,
+    pub retained_run_count: usize,
+    pub resume_candidate: &'static str,
+    pub detached_bootstrap_reconstruction: bool,
+    pub full_bootstrap_replay: bool,
+    pub manifest_count: usize,
+    pub manifest_enumeration: Duration,
+    pub resume_selection: Duration,
+    pub bootstrap_reconstruction: Option<Duration>,
+    pub engine_open: Duration,
+    pub sqlite_open: Duration,
+    pub tail_construction: Duration,
+    pub total: Duration,
+}
+
+fn map_promoted_runtime_recovery_diagnostics(
+    value: PromotedRuntimeRecoveryDiagnostics,
+) -> SyncRuntimeRecoveryDiagnostics {
+    SyncRuntimeRecoveryDiagnostics {
+        recovery: value.recovery,
+        retention_plan: value.retention_plan,
+        retained_run_count: value.retained_run_count,
+        resume_candidate: value.resume_candidate,
+        detached_bootstrap_reconstruction: value.detached_bootstrap_reconstruction,
+        full_bootstrap_replay: value.full_bootstrap_replay,
+        manifest_count: value.manifest_count,
+        manifest_enumeration: value.manifest_enumeration,
+        resume_selection: value.resume_selection,
+        bootstrap_reconstruction: value.bootstrap_reconstruction,
+        engine_open: value.engine_open,
+        sqlite_open: value.sqlite_open,
+        tail_construction: value.tail_construction,
+        total: value.total,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeOpenProgress {
     Phase {
@@ -1369,6 +1410,9 @@ pub enum SyncRuntimeOpenProgress {
     Waiting {
         phase: SyncRuntimeOpenPhase,
         elapsed: Duration,
+    },
+    RecoveryDiagnostics {
+        diagnostics: SyncRuntimeRecoveryDiagnostics,
     },
 }
 
@@ -1865,7 +1909,7 @@ impl fmt::Display for SyncEditorRefusalCode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncApplicationPageRequestError {
     InvalidRequest(SyncApplicationPageInvalidRequest),
     RequestTooLarge(SyncEditorRequestSize),
@@ -1875,6 +1919,19 @@ pub enum SyncApplicationPageRequestError {
     ActorRefusedAtWithCode {
         stage: &'static str,
         code: SyncEditorRefusalCode,
+    },
+    ActorRefusedWithDebugDetail {
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
+    },
+    /// A diagnostic-only carrier for a bounded public refusal.  The detail is
+    /// constructed only when TINE_DEBUG/--debug is active and is never used by
+    /// `Display`, so application toasts retain their stable, non-sensitive
+    /// reason-code contract.
+    ActorRefusedAtWithDebugDetail {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
     },
     ActorUnavailable,
 }
@@ -1902,12 +1959,32 @@ impl fmt::Display for SyncApplicationPageRequestError {
                 formatter,
                 "sync actor refused application page intent at {stage} (reason code: {code})"
             ),
+            Self::ActorRefusedWithDebugDetail { code, .. } => write!(
+                formatter,
+                "sync actor refused application page intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithDebugDetail { stage, code, .. } => write!(
+                formatter,
+                "sync actor refused application page intent at {stage} (reason code: {code})"
+            ),
             Self::ActorUnavailable => formatter.write_str("sync actor is unavailable"),
         }
     }
 }
 
 impl std::error::Error for SyncApplicationPageRequestError {}
+
+impl SyncApplicationPageRequestError {
+    /// Exact inner failure text for a locally enabled diagnostic trace.  This
+    /// must never be shown through the normal application-error display path.
+    pub fn debug_detail(&self) -> Option<&str> {
+        match self {
+            Self::ActorRefusedWithDebugDetail { debug_detail, .. }
+            | Self::ActorRefusedAtWithDebugDetail { debug_detail, .. } => Some(debug_detail),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SyncEditorRequestSize {
@@ -1928,7 +2005,7 @@ pub enum SyncEditorInvalidRequest {
     InvalidName,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncEditorRequestError {
     InvalidRequest(SyncEditorInvalidRequest),
     RequestTooLarge(SyncEditorRequestSize),
@@ -1938,6 +2015,17 @@ pub enum SyncEditorRequestError {
     ActorRefusedAtWithCode {
         stage: &'static str,
         code: SyncEditorRefusalCode,
+    },
+    /// See the application-level equivalent.  This is a transport-only
+    /// diagnostic carrier; normal `Display` deliberately omits the detail.
+    ActorRefusedWithDebugDetail {
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
+    },
+    ActorRefusedAtWithDebugDetail {
+        stage: &'static str,
+        code: SyncEditorRefusalCode,
+        debug_detail: String,
     },
     ActorUnavailable,
 }
@@ -1960,6 +2048,14 @@ impl fmt::Display for SyncEditorRequestError {
                 "sync actor refused editor intent (reason code: {code})"
             ),
             Self::ActorRefusedAtWithCode { stage, code } => write!(
+                formatter,
+                "sync actor refused editor intent at {stage} (reason code: {code})"
+            ),
+            Self::ActorRefusedWithDebugDetail { code, .. } => write!(
+                formatter,
+                "sync actor refused editor intent (reason code: {code})"
+            ),
+            Self::ActorRefusedAtWithDebugDetail { stage, code, .. } => write!(
                 formatter,
                 "sync actor refused editor intent at {stage} (reason code: {code})"
             ),
@@ -2425,6 +2521,9 @@ impl SyncRuntimeHandle {
                         elapsed: open_started.elapsed(),
                     });
                 }
+                Ok(ActorStartupEvent::RecoveryDiagnostics(diagnostics)) => {
+                    progress(SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics });
+                }
                 Ok(ActorStartupEvent::Finished(Ok(snapshot))) => {
                     *status.write().unwrap() = snapshot;
                     #[cfg(test)]
@@ -2566,6 +2665,13 @@ impl SyncRuntimeHandle {
                 drop(sender);
                 let _ = join.join();
                 refused("same-process sync actor reported an unexpected cold-open phase".into())
+            }
+            Ok(ActorStartupEvent::RecoveryDiagnostics(_)) => {
+                drop(sender);
+                let _ = join.join();
+                refused(
+                    "same-process sync actor reported an unexpected cold-open diagnostic".into(),
+                )
             }
             Err(_) => {
                 drop(sender);
@@ -5384,6 +5490,7 @@ fn map_component(component: DiscoveryComponent) -> SyncRuntimeComponent {
 
 enum ActorStartupEvent {
     Phase(SyncRuntimeOpenPhase),
+    RecoveryDiagnostics(SyncRuntimeRecoveryDiagnostics),
     Finished(Result<SyncRuntimeStatusSnapshot, String>),
 }
 
@@ -5477,7 +5584,7 @@ fn actor_thread(
     shared_status: &RwLock<SyncRuntimeStatusSnapshot>,
 ) {
     let phases = started.clone();
-    let actor = match RuntimeActor::open(request, advisory, session_id, |phase| {
+    let mut actor = match RuntimeActor::open(request, advisory, session_id, |phase| {
         let _ = phases.send(ActorStartupEvent::Phase(phase));
     }) {
         Ok(actor) => actor,
@@ -5486,6 +5593,9 @@ fn actor_thread(
             return;
         }
     };
+    if let Some(diagnostics) = actor.take_startup_recovery_diagnostics() {
+        let _ = started.send(ActorStartupEvent::RecoveryDiagnostics(diagnostics));
+    }
     run_actor_loop(actor, receiver, started, shared_status);
 }
 
@@ -5846,7 +5956,7 @@ fn prepare_trusted_local_runtime_commit(
             ))?;
     let prepared =
         OperationalCoordinator::prepare_trusted_local(session, graph, receipts, transaction)
-            .map_err(|error| trusted_local_preparation_refusal(error.phase()))?;
+            .map_err(trusted_local_preparation_refusal)?;
     let prepared = match prepared {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
@@ -6191,6 +6301,7 @@ struct RuntimeActor {
     local_mutation: Option<PendingLocalMutation>,
     managed_local: Option<ManagedLocalRuntimeState>,
     prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
+    startup_recovery_diagnostics: Option<SyncRuntimeRecoveryDiagnostics>,
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
     last_tick: Option<SyncRuntimeTick>,
@@ -6919,6 +7030,9 @@ impl RuntimeActor {
         #[cfg(test)]
         let workspace_id = binding.workspace_id();
         let recovery = map_recovery(runtime.recovery());
+        let startup_recovery_diagnostics = runtime
+            .recovery_diagnostics()
+            .map(map_promoted_runtime_recovery_diagnostics);
         let managed_local = open_managed_local_runtime(
             &request.application_runtime_root,
             &binding,
@@ -7010,6 +7124,7 @@ impl RuntimeActor {
             local_mutation: None,
             managed_local: Some(managed_local),
             prepared_application_reply: None,
+            startup_recovery_diagnostics,
             recovery,
             last_watcher,
             last_tick: None,
@@ -7089,6 +7204,10 @@ impl RuntimeActor {
             },
         );
         Ok(actor)
+    }
+
+    fn take_startup_recovery_diagnostics(&mut self) -> Option<SyncRuntimeRecoveryDiagnostics> {
+        self.startup_recovery_diagnostics.take()
     }
 
     fn observe(
@@ -13625,6 +13744,18 @@ fn map_editor_application_error(error: SyncEditorRequestError) -> SyncApplicatio
         SyncEditorRequestError::ActorRefusedAtWithCode { stage, code } => {
             SyncApplicationPageRequestError::ActorRefusedAtWithCode { stage, code }
         }
+        SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
+            stage,
+            code,
+            debug_detail,
+        } => SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+            stage,
+            code,
+            debug_detail,
+        },
+        SyncEditorRequestError::ActorRefusedWithDebugDetail { code, debug_detail } => {
+            SyncApplicationPageRequestError::ActorRefusedWithDebugDetail { code, debug_detail }
+        }
         SyncEditorRequestError::InvalidRequest(_) | SyncEditorRequestError::ActorRefused => {
             SyncApplicationPageRequestError::ActorRefused
         }
@@ -13636,6 +13767,13 @@ fn editor_refusal_at(error: SyncEditorRequestError, stage: &'static str) -> Sync
         SyncEditorRequestError::ActorRefused => SyncEditorRequestError::ActorRefusedAt(stage),
         SyncEditorRequestError::ActorRefusedWithCode(code) => {
             SyncEditorRequestError::ActorRefusedAtWithCode { stage, code }
+        }
+        SyncEditorRequestError::ActorRefusedWithDebugDetail { code, debug_detail } => {
+            SyncEditorRequestError::ActorRefusedAtWithDebugDetail {
+                stage,
+                code,
+                debug_detail,
+            }
         }
         other => other,
     }
@@ -13653,8 +13791,22 @@ fn editor_refusal_with_code(
     }
 }
 
-fn trusted_local_preparation_refusal(phase: OperationalPhase) -> SyncEditorRequestError {
-    let code = match phase {
+fn trusted_local_preparation_refusal(
+    error: crate::oplog::operational_coordinator::OperationalCoordinatorError,
+) -> SyncEditorRequestError {
+    let code = trusted_local_preparation_refusal_code(error.phase());
+    if runtime_debug_diagnostics_enabled() {
+        SyncEditorRequestError::ActorRefusedWithDebugDetail {
+            code,
+            debug_detail: error.to_string(),
+        }
+    } else {
+        SyncEditorRequestError::ActorRefusedWithCode(code)
+    }
+}
+
+fn trusted_local_preparation_refusal_code(phase: OperationalPhase) -> SyncEditorRefusalCode {
+    match phase {
         OperationalPhase::Bindings => SyncEditorRefusalCode::TrustedLocalPreparationBindings,
         OperationalPhase::Planning => SyncEditorRefusalCode::TrustedLocalPreparationPlanning,
         OperationalPhase::Draft => SyncEditorRefusalCode::TrustedLocalPreparationDraft,
@@ -13674,8 +13826,12 @@ fn trusted_local_preparation_refusal(phase: OperationalPhase) -> SyncEditorReque
         OperationalPhase::ProjectionDrain => {
             SyncEditorRefusalCode::TrustedLocalPreparationProjectionDrain
         }
-    };
-    SyncEditorRequestError::ActorRefusedWithCode(code)
+    }
+}
+
+fn runtime_debug_diagnostics_enabled() -> bool {
+    matches!(std::env::var("TINE_DEBUG"), Ok(value) if !value.is_empty() && value != "0")
+        || std::env::args().any(|argument| argument == "--debug")
 }
 
 fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorRequestError {
@@ -15470,10 +15626,7 @@ mod tests {
             ),
         ];
         for (phase, code) in preparation {
-            assert_eq!(
-                trusted_local_preparation_refusal(phase),
-                SyncEditorRequestError::ActorRefusedWithCode(code)
-            );
+            assert_eq!(trusted_local_preparation_refusal_code(phase), code);
         }
 
         let nested = "private/page.md user-id page text";
@@ -15498,6 +15651,32 @@ mod tests {
             assert_eq!(mapped, SyncEditorRequestError::ActorRefusedWithCode(code));
             assert!(!mapped.to_string().contains(nested));
         }
+    }
+
+    #[test]
+    fn managed_save_debug_detail_preserves_the_bounded_public_refusal_contract() {
+        const STAGE: &str = "committing the semantic page transaction";
+        let nested = "Finalize: private/path.md and opaque user content";
+        let editor = editor_refusal_at(
+            SyncEditorRequestError::ActorRefusedWithDebugDetail {
+                code: SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+                debug_detail: nested.into(),
+            },
+            STAGE,
+        );
+        assert_eq!(
+            editor.to_string(),
+            "sync actor refused editor intent at committing the semantic page transaction (reason code: trusted_local.preparation.finalize)"
+        );
+        assert!(!editor.to_string().contains(nested));
+
+        let application = map_editor_application_error(editor);
+        assert_eq!(
+            application.to_string(),
+            "sync actor refused application page intent at committing the semantic page transaction (reason code: trusted_local.preparation.finalize)"
+        );
+        assert!(!application.to_string().contains(nested));
+        assert_eq!(application.debug_detail(), Some(nested));
     }
 
     #[test]
@@ -20301,6 +20480,99 @@ mod tests {
     }
 
     #[test]
+    fn fresh_activation_application_save_preserves_empty_markdown_bullet_layout() {
+        let fixture = ActivationFixture::empty("managed-empty-markdown-bullet-save", 0xd1a6);
+        fs::write(fixture.graph_root.join("Tine.md"), b"- \n")
+            .expect("fixture source page must be written before activation");
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("fresh activation must retain an actor");
+        drive_initial_feed(&handle);
+        let (mut page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
+        assert_eq!(page.blocks[0].raw, "");
+        page.blocks[0].raw = "saved after empty Markdown bullet".into();
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .expect("an application save after an empty Markdown bullet must commit");
+        assert!(matches!(
+            outcome,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Tine.md")).unwrap(),
+            b"- saved after empty Markdown bullet\n"
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn fresh_activation_save_preserves_nonleading_atx_headings_across_restart() {
+        let fixture = ActivationFixture::empty("managed-nonleading-atx-heading-save", 0xd1a7);
+        fs::write(
+            fixture.graph_root.join("Tine.md"),
+            b"- editable root\n## first section\n### second section\n- trailing root\n",
+        )
+        .expect("fixture source page must be written before activation");
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated
+            .handle
+            .expect("fresh activation must retain an actor");
+        drive_initial_feed(&handle);
+        let (mut page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
+        page.blocks[0].raw = "edited root".into();
+        let outcome = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .expect("an unrelated application edit must commit");
+        assert!(matches!(
+            outcome,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        const EXPECTED: &[u8] =
+            b"- edited root\n## first section\n### second section\n- trailing root\n";
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Tine.md")).unwrap(),
+            EXPECTED
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request(&fixture.request)));
+        drive_initial_feed(&reopened);
+        let (reloaded, _) = load_application_logical(&reopened, "Tine", SyncPageKind::Page);
+        assert_eq!(reloaded.blocks[0].raw, "edited root");
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Tine.md")).unwrap(),
+            EXPECTED
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     fn public_queries_are_bounded_serialized_and_read_the_exact_materialized_frontier() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-public-query");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
@@ -20938,7 +21210,8 @@ mod tests {
                 .iter()
                 .filter_map(|update| match update {
                     SyncRuntimeOpenProgress::Phase { phase, .. } => Some(*phase),
-                    SyncRuntimeOpenProgress::Waiting { .. } => None,
+                    SyncRuntimeOpenProgress::Waiting { .. }
+                    | SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => None,
                 })
                 .collect::<Vec<_>>(),
             vec![

@@ -340,6 +340,18 @@ where
     map_sparse_page_save(outcome)
 }
 
+/// Keep the user-facing save error bounded, while allowing an opt-in local
+/// diagnostic trace to carry the exact core refusal that led to it.  The core
+/// only constructs this detail under TINE_DEBUG/--debug; this helper is a
+/// second gate before the text reaches the debug log.
+fn managed_save_debug_detail_line(
+    error: &tine_core::sync_runtime::SyncApplicationPageRequestError,
+) -> Option<String> {
+    error
+        .debug_detail()
+        .map(|detail| format!("managed storage save refusal detail: {detail}"))
+}
+
 #[tauri::command]
 pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -768,7 +780,15 @@ pub(crate) async fn save_page(
                 Some(handle) => {
                     let result =
                         save_sparse_page_with(page, base_rev, force.unwrap_or(false), |request| {
-                            handle.save_application_page(request)
+                            let saved = handle.save_application_page(request);
+                            if crate::debug::debug_enabled() {
+                                if let Err(error) = &saved {
+                                    if let Some(line) = managed_save_debug_detail_line(error) {
+                                        crate::debug::diag(line);
+                                    }
+                                }
+                            }
+                            saved
                         });
                     // A successful managed save has already made its exact user
                     // projection durable, but archive/checkpoint derivatives are
@@ -2517,7 +2537,10 @@ mod application_page_authority_tests {
     use std::cell::Cell;
     use tempfile::TempDir;
     use tine_core::model::Graph;
-    use tine_core::sync_runtime::{SyncApplicationPageConflict, SyncEditorDeferred, SyncPageKind};
+    use tine_core::sync_runtime::{
+        SyncApplicationPageConflict, SyncApplicationPageRequestError, SyncEditorDeferred,
+        SyncEditorRefusalCode, SyncPageKind,
+    };
 
     fn page(name: &str, kind: PageKind, path: &str, raw: &str) -> PageDto {
         let mut block = BlockDto::default();
@@ -2674,6 +2697,27 @@ mod application_page_authority_tests {
         .unwrap_err();
         assert!(refused.contains("Force save is unavailable"));
         assert!(!called.get());
+    }
+
+    #[test]
+    fn managed_save_debug_line_keeps_private_detail_out_of_public_error_rendering() {
+        let detail = "Finalize: exact internal coordinator refusal";
+        let error = SyncApplicationPageRequestError::ActorRefusedAtWithDebugDetail {
+            stage: "committing the semantic page transaction",
+            code: SyncEditorRefusalCode::TrustedLocalPreparationFinalize,
+            debug_detail: detail.into(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "sync actor refused application page intent at committing the semantic page transaction (reason code: trusted_local.preparation.finalize)"
+        );
+        assert!(!error.to_string().contains(detail));
+        assert_eq!(
+            managed_save_debug_detail_line(&error).as_deref(),
+            Some(
+                "managed storage save refusal detail: Finalize: exact internal coordinator refusal"
+            )
+        );
     }
 
     #[test]
