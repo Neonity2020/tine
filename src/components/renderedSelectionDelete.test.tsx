@@ -6,6 +6,7 @@ import { editingId } from "../editorController";
 import { installKeybindings } from "../keybindings";
 import { deleteRenderedTextSelection } from "../editor/renderedSelectionDelete";
 import { Block } from "./Block";
+import { RefBlocks } from "./RefBlocks";
 
 // Delete/Backspace pressed while a RENDERED (not-editing) block's text is
 // selected must delete that text (OG contenteditable parity). Without the
@@ -177,6 +178,51 @@ describe("rendered-text selection delete (OG parity)", () => {
     const disposeKeys = installKeybindings();
     try {
       expect(selectRenderedText("a", "hello world sample text", 0, 5)).toBe(true);
+      keydown("Delete");
+      expect(doc.byId["a"].raw).toBe("hello world sample text");
+      expect(editingId()).toBeNull();
+    } finally {
+      disposeKeys();
+      dispose();
+    }
+  });
+
+  // Linked/unlinked references, embeds and query results render through
+  // RefBlocks, which emits the SAME .ls-block > .block-main >
+  // .block-content-wrapper shape and carries the SOURCE block's id. It is a
+  // deliberately read-only renderer over a query result, so a rendered
+  // selection there must not splice the live block's source — the offsets would
+  // come from a different renderer's tree than the raw being cut.
+  //
+  // NOT causal today: this already no-ops because RefBlocks emits no inline
+  // span metadata, so editorOffsetFromRenderedRange returns null. That is an
+  // accident of the ref renderer, not a decision — the explicit .ref-block
+  // guard states the boundary, and this test pins it so a future span-emitting
+  // ref renderer cannot silently turn read-only surfaces into editable ones.
+  it("refuses a selection inside a reference/embed/query rendering of a live block", () => {
+    setDoc({
+      byId: { a: node("a", "hello world sample text", null) },
+      pages: [page(["a"])],
+      feed: [PAGE_NAME],
+      loaded: true,
+    });
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const dispose = render(
+      () => (
+        <RefBlocks
+          blocks={[{ id: "a", raw: "hello world sample text", collapsed: false, children: [] }]}
+          page={PAGE_NAME}
+          pageKind="page"
+        />
+      ),
+      host,
+    );
+    const disposeKeys = installKeybindings();
+    try {
+      expect(document.querySelector('[data-block-id="a"]')?.classList.contains("ref-block")).toBe(true);
+      expect(selectRenderedText("a", "hello world sample text", 6, 11)).toBe(true);
+      expect(deleteRenderedTextSelection()).toBe(false);
       keydown("Delete");
       expect(doc.byId["a"].raw).toBe("hello world sample text");
       expect(editingId()).toBeNull();

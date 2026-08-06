@@ -42,6 +42,13 @@ export function deleteRenderedTextSelection(): boolean {
 
   const row = blockRowOf(range.startContainer);
   if (!row || row !== blockRowOf(range.endContainer)) return false;
+  // Linked/unlinked references, embeds and query results (RefBlocks) render the
+  // SAME `.ls-block > .block-main > .block-content-wrapper` shape and carry the
+  // source block's id, but they are a different renderer over a query result and
+  // are deliberately not edited in place. Mapping their DOM onto the live
+  // `doc.byId` raw would splice bytes computed from a tree that can legitimately
+  // differ from it. Only the live outline owns this gesture.
+  if (row.classList.contains("ref-block")) return false;
   const wrapper = row.querySelector(":scope > .block-main .block-content-wrapper");
   if (!wrapper || !wrapper.contains(range.startContainer) || !wrapper.contains(range.endContainer)) {
     return false;
