@@ -512,13 +512,33 @@ fn legacy_graph_text_observation(
         return observation;
     }
 
-    let explicit_file_event = matches!(
+    // Windows ReadDirectoryChangesW cannot report a sub-kind: notify maps every
+    // non-rename Windows event to `Create(Any)` / `Modify(Any)` / `Remove(Any)`.
+    // Those fell to the catch-all below and marked the observation uncertain,
+    // which invalidates the ENTIRE guarded graph-text identity index -- so on
+    // Windows any external file event made the next save rebuild the whole
+    // graph. The event does carry exact paths; only the sub-kind is missing.
+    //
+    // Create/Modify are recoverable because the path still exists, so the arm
+    // below discriminates file from directory against the live filesystem
+    // exactly as it does for an explicit kind.
+    //
+    // `Remove(Any)` is NOT recoverable and deliberately stays uncertain: once
+    // the entry is gone we cannot prove it was a file rather than a directory
+    // of pages, and treating a removed directory as "not a page file" would
+    // silently drop every page under it.
+    let ambiguous_but_resolvable = matches!(
         event.kind,
-        EventKind::Create(CreateKind::File)
-            | EventKind::Modify(ModifyKind::Data(_))
-            | EventKind::Modify(ModifyKind::Metadata(_))
-            | EventKind::Remove(RemoveKind::File)
+        EventKind::Create(CreateKind::Any) | EventKind::Modify(ModifyKind::Any)
     );
+    let explicit_file_event = ambiguous_but_resolvable
+        || matches!(
+            event.kind,
+            EventKind::Create(CreateKind::File)
+                | EventKind::Modify(ModifyKind::Data(_))
+                | EventKind::Modify(ModifyKind::Metadata(_))
+                | EventKind::Remove(RemoveKind::File)
+        );
     let rename_event = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
     let rename_has_file_witness = rename_event
         && event
@@ -1730,6 +1750,76 @@ mod tests {
             ));
             assert_new_page_refused(&guarded, &format!("Epoch {case}"));
         }
+    }
+
+    /// Windows ReadDirectoryChangesW reports no sub-kind, so notify emits
+    /// `Create(Any)` / `Modify(Any)` / `Remove(Any)` for everything except a
+    /// rename. Those used to fall to the catch-all and mark the observation
+    /// uncertain, which invalidates the whole guarded identity index -- meaning
+    /// every external file event on Windows made the next save rebuild the
+    /// entire graph. With an active sync client that is every save.
+    ///
+    /// Create/Modify are resolvable (the path still exists) and must now take
+    /// the exact-path arm. `Remove(Any)` must stay uncertain: the entry is gone,
+    /// so we cannot prove it was a file rather than a directory of pages.
+    #[test]
+    fn ambiguous_windows_event_kinds_take_the_exact_path_arm_except_removal() {
+        use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
+
+        let graph_dir = TempGraph::new("windows-any-kinds");
+        graph_dir.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&graph_dir.root);
+        warm_guarded_identity(&graph);
+
+        graph_dir.write("pages/External.md", "- external\n");
+        let path = graph_dir.path("pages/External.md");
+
+        for kind in [
+            EventKind::Create(CreateKind::Any),
+            EventKind::Modify(ModifyKind::Any),
+        ] {
+            let observation = legacy_graph_text_observation(
+                &graph,
+                &graph_dir.root,
+                Some(&event(kind, vec![path.clone()])),
+            );
+            assert!(observation.relevant, "{kind:?}");
+            assert!(
+                !observation.uncertain,
+                "{kind:?} carries an exact path and must not poison the whole index"
+            );
+            assert_eq!(observation.exact_paths, vec![path.clone()], "{kind:?}");
+        }
+
+        // A directory event still cannot be treated as a page file, even when
+        // the sub-kind is missing -- the arm discriminates against the live
+        // filesystem, not against the event kind.
+        std::fs::create_dir_all(graph_dir.path("pages/sub")).unwrap();
+        let directory = legacy_graph_text_observation(
+            &graph,
+            &graph_dir.root,
+            Some(&event(
+                EventKind::Create(CreateKind::Any),
+                vec![graph_dir.path("pages/sub")],
+            )),
+        );
+        assert!(
+            directory.uncertain,
+            "an ambiguous event on a directory is not provably a page file"
+        );
+
+        // Removal stays conservative: the path is gone, so its kind is unknowable.
+        std::fs::remove_file(&path).unwrap();
+        let removed = legacy_graph_text_observation(
+            &graph,
+            &graph_dir.root,
+            Some(&event(EventKind::Remove(RemoveKind::Any), vec![path])),
+        );
+        assert!(
+            removed.uncertain,
+            "Remove(Any) must stay uncertain -- a removed directory of pages must not be \
+             mistaken for a non-page path"
+        );
     }
 
     #[test]
