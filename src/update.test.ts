@@ -7,6 +7,7 @@ async function loadUpdate(opts: {
   platform?: Platform;
   platformReject?: boolean;
   version?: string;
+  updaterReject?: Error;
 }) {
   vi.resetModules();
   const isTauriMock = vi.fn(() => opts.tauri ?? true);
@@ -18,7 +19,9 @@ async function loadUpdate(opts: {
   const pushToastMock = vi.fn(() => 1);
   const dismissToastMock = vi.fn();
   const getVersionMock = vi.fn(async () => opts.version ?? "0.5.3");
-  const updaterCheckMock = vi.fn(async () => null);
+  const updaterCheckMock = opts.updaterReject
+    ? vi.fn(async () => { throw opts.updaterReject; })
+    : vi.fn(async () => null);
 
   vi.doMock("./backend", () => ({
     isTauri: isTauriMock,
@@ -111,6 +114,26 @@ describe("update checks", () => {
     const { update } = await loadUpdate({ platform: "desktop", version: "0.5.3" });
 
     await expect(update.checkForUpdateNow()).resolves.toEqual({ kind: "current", version: "0.5.3" });
+  });
+
+  it("surfaces a self-update failure instead of failing silently (GH #241)", async () => {
+    mockLatest("v0.6.0");
+    const consoleErr = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { update, pushToastMock, openExternalMock } = await loadUpdate({
+      platform: "desktop",
+      version: "0.5.3",
+      updaterReject: new Error("minisign signature verification failed"),
+    });
+
+    await update.checkForUpdateNow();
+    await new Promise((r) => setTimeout(r, 10)); // let the detached applyUpdateOrOpen settle
+
+    expect(consoleErr).toHaveBeenCalledWith("[update] self-update failed:", expect.any(Error));
+    expect(pushToastMock).toHaveBeenCalledWith(
+      expect.stringMatching(/Couldn't apply the update/),
+      "error",
+    );
+    expect(openExternalMock).toHaveBeenCalled(); // releases page still opens as the safe fallback
   });
 
   it("keeps browser/dev checks inert without probing the native platform", async () => {

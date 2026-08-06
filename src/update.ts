@@ -84,8 +84,15 @@ async function applyUpdateOrOpen(): Promise<void> {
     await update.downloadAndInstall();
     const { relaunch } = await import("@tauri-apps/plugin-process");
     await relaunch(); // process restarts into the new version (this toast goes with it)
-  } catch {
+  } catch (err) {
     if (progressId != null) dismissToast(progressId);
+    // GH #241: never fail silently here. A swallowed error made every updater
+    // failure (signature/verify/download/install) indistinguishable from the
+    // manual fallback, so Windows failures were undiagnosable. Log the real
+    // error (it lands in the debug log) and tell the user; the releases page
+    // still opens as the safe fallback — it can never brick the app.
+    console.error("[update] self-update failed:", err);
+    pushToast("Couldn't apply the update — opening the releases page instead. The debug log has the error.", "error");
     openReleases(); // signature/verify/network failure → never brick, just offer the page
   }
 }
