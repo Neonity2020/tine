@@ -3594,7 +3594,7 @@ pub struct AcceptedBatchEvidence {
     reference_catalog_delta: ReferenceCatalogDeltaV2,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// Device-local evidence for a derived accepted-frontier projection.
 ///
@@ -3619,6 +3619,32 @@ pub struct AcceptedFrontierRoot {
     reference_catalog_root: ReferenceCatalogRootV2,
     state_digest: ContentDigest,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
+}
+
+/// Two accepted frontier roots are equal when they are the same accepted
+/// frontier -- not when they additionally happen to live at the same place in
+/// this process.
+///
+/// `scratch_root` is a run-local address for the frontier's maps. It is
+/// deliberately absent from `state_digest`, so it carries no authenticated
+/// meaning, and reopening a graph moves it as a matter of course. Including it
+/// here made an up-to-date SQLite projection compare unequal to the very
+/// frontier it was already at, which the recovery path could only read as
+/// corruption -- and answer by rebuilding the entire graph. Dereferencing still
+/// uses the field directly; only identity ignores it.
+impl PartialEq for AcceptedFrontierRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.acceptance_sequence == other.acceptance_sequence
+            && self.document_count == other.document_count
+            && self.retained_bytes_total == other.retained_bytes_total
+            && self.document_map_root_key == other.document_map_root_key
+            && self.document_map_root_digest == other.document_map_root_digest
+            && self.batch_map_root_key == other.batch_map_root_key
+            && self.batch_map_root_digest == other.batch_map_root_digest
+            && self.reference_catalog_root == other.reference_catalog_root
+            && self.state_digest == other.state_digest
+    }
 }
 
 impl AcceptedBatchEvidence {
@@ -3787,6 +3813,20 @@ impl AcceptedFrontierRoot {
 
     pub const fn state_digest(&self) -> ContentDigest {
         self.state_digest
+    }
+
+    /// This root without its run-local scratch-store reference.
+    ///
+    /// `scratch_root` says *where* this run keeps the frontier's maps; it is
+    /// never hashed into `state_digest` and carries no authenticated meaning.
+    /// It therefore must not appear in anything persisted, or in any comparison
+    /// asking whether two roots are the same accepted version -- reopening a
+    /// graph legitimately moves the scratch store, and a durable identity that
+    /// moved with it would declare an up-to-date projection stale.
+    pub(crate) fn without_scratch_root(&self) -> Self {
+        let mut normalized = self.clone();
+        normalized.scratch_root = None;
+        normalized
     }
 
     pub const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV2 {

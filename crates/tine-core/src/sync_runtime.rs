@@ -31491,6 +31491,67 @@ mod tests {
     /// `TINE_MANAGED_CRASH_REOPEN_ROUNDS` sets the number of accepted+drained saves
     /// (default 32; the test-build compaction threshold is 4 frames, so 32 rounds
     /// crosses it repeatedly). Sweep it to get the shape of the curve.
+    /// An unsafe reopen after an aged managed history must OPEN the projection
+    /// it already has, not rebuild it.
+    ///
+    /// The projection was at the accepted frontier the whole time; only the
+    /// engine's run-local scratch address had moved, and that used to make the
+    /// two roots compare unequal. Recovery could read that only as corruption,
+    /// so it discarded a correct database and replayed the entire accepted
+    /// history to reproduce it -- 72 s on a 1,046-file graph, and worse as the
+    /// graph grows. This asserts on counters rather than elapsed time: a return
+    /// of the defect means batches applied or pages materialized, which is
+    /// visible whatever the machine's speed.
+    #[test]
+    fn managed_unsafe_reopen_at_the_accepted_frontier_opens_without_rebuilding() {
+        let fixture = ActivationFixture::nested_unicode("managed-reopen-no-rebuild", 0xa0e8);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        // Age the local journal well past its compaction threshold, draining
+        // every round, so the reopen faces a compacted multi-generation history
+        // rather than the single generation a freshly activated graph has.
+        for round in 0..6 {
+            let (page, revision) = load_application_exact(&handle, "Root.md");
+            let _ =
+                save_application_block_text(&handle, page, revision, &format!("aged edit {round}"));
+            for _ in 0..512 {
+                if handle.status().unwrap().managed_local_pending == 0 {
+                    break;
+                }
+                handle.tick().unwrap();
+            }
+            assert_eq!(
+                handle.status().unwrap().managed_local_pending,
+                0,
+                "aging round {round} did not drain"
+            );
+        }
+        // Drop the live actor without a clean shutdown: a killed process.
+        drop(handle);
+
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        assert_eq!(
+            promoted.projection_recovery, "opened-existing",
+            "a projection already at the accepted frontier was not opened as-is (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+        assert_eq!(
+            promoted.projection_applied_batches, 0,
+            "an unsafe reopen at the accepted frontier replayed accepted batches"
+        );
+        assert_eq!(
+            promoted.projection_bulk_pages_materialized, 0,
+            "an unsafe reopen at the accepted frontier re-materialized pages"
+        );
+    }
+
     #[test]
     #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
     fn managed_crash_reopen_aged_history_manual_benchmark() {
