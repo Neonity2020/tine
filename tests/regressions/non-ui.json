@@ -2343,6 +2343,35 @@
     "failBefore": "proven"
    },
    "notes": "When the watcher runs in poll mode (a network share, or TINE_WATCH=poll), every 3 s cycle invalidated the guarded graph-text admission index unconditionally before reconciling. Since a Direct save consults that index and rebuilds it when invalid -- a two-pass byte-retaining walk of the whole graph -- such a user could never hold a warm index and paid a full-graph rebuild on essentially every save. The blanket invalidation was compensating for the poll rescan being narrower than the index (journals/+pages/ vs graph-wide); once REG-EXTERNAL-GRAPH-WIDE-EVENTS-268 widened the rescan to the same scope, the rescan's own result became a complete account of what changed and is published as exact observations instead. Ordering is load-bearing and asserted: the observation happens after the scan and BEFORE any reconcile, so the index is never staler than the scan that produced it -- the same window the inotify callback lane already had, not a wider one. A scan that could not read part of the graph reports itself incomplete and still invalidates. Fail-before proven by restoring the blanket invalidation in place: the quiet-cycle test then reported invalidated: true with complete_builds unchanged at 1."
+  },
+  {
+   "id": "REG-DIRECT-SAVE-WHOLE-GRAPH-REPARSE-267",
+   "title": "Saving a page does not reparse every document in the graph",
+   "family": "direct-save-performance",
+   "sources": {
+    "issues": [
+     267
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "macos",
+    "windows"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::a_rebuild_parses_only_the_documents_whose_bytes_changed",
+     "crates/tine-core/src/model.rs::reused_semantics_follow_the_bytes_not_the_file",
+     "crates/tine-core/src/model.rs::steady_state_direct_saves_do_not_rebuild_the_graph_index",
+     "crates/tine-core/src/model.rs::direct_save_latency_manual_benchmark"
+    ],
+    "scenario": "direct-markdown.save-latency",
+    "failBefore": "proven"
+   },
+   "notes": "A Direct save validates its target against a guarded graph-wide admission index. Whenever the exact-observation chain had broken -- which on Windows and in poll mode was permanent before REG-EXTERNAL-GRAPH-WIDE-EVENTS-268 and REG-POLL-MODE-ADMISSION-INDEX-REBUILD-001 -- rebuilding that index PARSED EVERY DOCUMENT IN THE GRAPH, on every save. An invalidation means 'we lost track of the filesystem', not 'everything changed': the capture already carries a per-file BlobDescription (SHA-256 of the content plus its length), so a rebuild now reuses the prior index's parsed semantics for every file whose digest is unchanged and parses only what actually moved. Soundness rests on a new per-record `semantic_parsed` flag: a record whose semantic came from the page cache or from its filename is a guess and is never reused, so the reuse cannot launder a guess into something later builds treat as parsed. Fail-before proven by disabling the reuse in place: a rebuild then parsed 27 documents whether or not anything had changed, against 3 (nothing changed) and 4 (one document changed) with it. Measured on a synthetic 1,001-page / 12 MB graph, release build, local ext4: a save that rebuilds went 81 ms -> 62 ms, with the index-construction phase 29 ms -> 9 ms and decode_semantics still true (authority preserved). The remaining ~50 ms is the two-pass capture, which still reads every file; that cut is not in this change. Two simpler designs were tried and rejected with evidence, both recorded in the handoff: threading a `need_semantics` flag into the cache-hit test forced an index rebuild MID-WRITE, when the save's own .editor-recovery file still aliases the target's inode, and failed the save outright; and skipping the parse for saves alone opened a real hole where a page creation could be admitted over an externally retitled document. Also note the codebase's standing contract, asserted by generation_bound_identity_validation_avoids_save_time_graph_reparse, that name-only creation must not run a per-document parse pass -- any future cut here has to keep it."
   }
  ]
 }

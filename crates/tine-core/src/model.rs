@@ -2768,6 +2768,15 @@ struct GraphTextAdmissionRecord {
     link_count: u64,
     semantic: PageEntry,
     format: Format,
+    /// Whether `semantic` came from parsing this file's bytes, rather than from
+    /// the page cache or from the filename alone.
+    ///
+    /// A rebuild reuses a prior record's `semantic` when this is set and the
+    /// prior `description` (a SHA-256 of the content, plus its length) equals
+    /// the freshly captured one — the bytes are identical, so the parse result
+    /// is too. Without the flag the reuse would launder a cache-derived guess
+    /// into something later builds treat as parsed.
+    semantic_parsed: bool,
 }
 
 #[derive(Clone)]
@@ -5505,6 +5514,7 @@ impl Graph {
             INITIAL_SHADOW_LIMITS,
             replacement_peak,
             decode_semantics,
+            prior.as_deref(),
         )
         .map_err(|error| {
             io::Error::new(
@@ -7690,6 +7700,7 @@ impl Graph {
                 limits,
                 combined_capture_bytes,
                 true,
+                None,
             )?;
             let collision = initial_shadow_global_collision(&index);
             Ok((first, index, collision))
@@ -8162,6 +8173,7 @@ impl Graph {
             INITIAL_SHADOW_LIMITS,
             replacement_peak_base,
             true,
+            Some(&current),
         )?;
         if let Some(error) = initial_shadow_global_collision(&replacement) {
             return Err(error);
@@ -9665,6 +9677,7 @@ impl Graph {
                     link_count,
                     semantic,
                     format,
+                    semantic_parsed: decode_semantics,
                 },
             ))
         } else {
@@ -28387,6 +28400,7 @@ fn build_graph_text_admission_index(
     limits: InitialShadowLimits,
     combined_capture_bytes: u64,
     decode_semantics: bool,
+    prior: Option<&CompleteGraphTextAdmissionIndex>,
 ) -> io::Result<CompleteGraphTextAdmissionIndex> {
     let (scope_binding, graph_resource) = if decode_semantics {
         (
@@ -28489,7 +28503,24 @@ fn build_graph_text_admission_index(
             .bytes
             .as_deref()
             .expect("the first initial-shadow pass retains bytes");
-        let (semantic, format) = if decode_semantics {
+        // THE cut (GH #267). A rebuild used to parse EVERY document in the graph
+        // whenever the exact-observation chain had broken -- on every save, and
+        // on Windows or a network share that was essentially always. But an
+        // invalidation says "we lost track", not "everything changed": almost
+        // every file still holds byte-for-byte the same content it held when we
+        // last parsed it, and `description` (a SHA-256 of the content plus its
+        // length) proves which. Reuse those, and parse only what actually moved.
+        //
+        // `semantic_parsed` is what makes the reuse sound: a record whose
+        // semantic came from the page cache or from its filename is a guess, and
+        // carrying it forward would let later builds treat it as parsed.
+        let reused = decode_semantics
+            .then(|| prior?.files_by_exact_path.get(&entry.path))
+            .flatten()
+            .filter(|record| record.semantic_parsed && record.description == entry.description);
+        let (semantic, format) = if let Some(record) = reused {
+            (record.semantic.clone(), record.format)
+        } else if decode_semantics {
             let content = std::str::from_utf8(bytes).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -28523,6 +28554,7 @@ fn build_graph_text_admission_index(
             link_count: entry.link_count,
             semantic,
             format,
+            semantic_parsed: decode_semantics,
         };
         index
             .file_is_graph_text_by_exact_relative
@@ -38766,6 +38798,280 @@ mod tests {
             "unexpected failure class: {error}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Build a Direct-mode graph of `pages` ordinary pages plus one target.
+    fn direct_save_bench_graph(tag: &str, pages: usize) -> (PathBuf, Graph) {
+        let dir = scratch(tag);
+        for index in 0..pages {
+            let body = (0..24)
+                .map(|line| format!("- block {line} of page {index} with some ordinary text\n"))
+                .collect::<String>();
+            fs::write(
+                dir.join(format!("pages/Page {index:05}.md")),
+                format!("title:: Page {index:05}\n\n{body}"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        (dir, graph)
+    }
+
+    fn direct_save_bench_once(graph: &Graph, marker: &str) -> std::time::Duration {
+        let mut page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        page.blocks[0].raw = marker.to_owned();
+        let started = std::time::Instant::now();
+        graph
+            .save_page(&page, page.rev.as_deref())
+            .expect("direct save");
+        started.elapsed()
+    }
+
+    /// The Direct-save admission gate, stated as counters rather than a
+    /// stopwatch — a stopwatch on shared CI measures the machine, not the code.
+    ///
+    /// This is the gate that never existed. #267 ("saving takes about a minute,
+    /// then a red toast") is a whole-graph rebuild happening per save, and
+    /// nothing in the suite would have noticed it appear.
+    #[test]
+    fn steady_state_direct_saves_do_not_rebuild_the_graph_index() {
+        let (dir, graph) = direct_save_bench_graph("direct-save-steady", 40);
+
+        direct_save_bench_once(&graph, "- warm");
+        let warm = graph.guarded_graph_text_identity_report();
+        assert!(
+            warm.complete_builds >= 1 && !warm.invalidated,
+            "the first save should have built and kept an index: {warm:?}"
+        );
+
+        for round in 0..8 {
+            direct_save_bench_once(&graph, &format!("- round {round}"));
+        }
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert_eq!(
+            after.complete_builds, warm.complete_builds,
+            "a steady-state Direct save must not rebuild the whole-graph admission index"
+        );
+        assert!(
+            !after.invalidated,
+            "a steady-state Direct save must not leave the index invalidated: {after:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// THE cut (GH #267). An invalidation means "we lost track of the
+    /// filesystem", not "every document changed" — yet a rebuild used to reparse
+    /// the whole graph, on every save, in the condition Windows and network
+    /// shares were permanently in.
+    #[test]
+    fn a_rebuild_parses_only_the_documents_whose_bytes_changed() {
+        let dir = scratch("rebuild-reuses-parsed-semantics");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("title:: Unrelated {index}\n\n- body {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        // Reach the state where the index holds parsed semantics: one save after
+        // an invalidation pays for the whole graph, once.
+        direct_save_bench_once(&graph, "- warm");
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        direct_save_bench_once(&graph, "- first rebuild");
+        let full = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+        assert!(
+            full >= 24,
+            "the first rebuild after a cache-derived build still reads the graph: {full}"
+        );
+
+        // Control: nothing in the graph changed, but we lost track again. Every
+        // document's semantics must be reused; whatever this costs is the save's
+        // own irreducible work, not the graph's.
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        direct_save_bench_once(&graph, "- unchanged rebuild");
+        let unchanged = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+
+        // Now exactly one document changes, and we lose track again.
+        fs::write(
+            dir.join("pages/Unrelated 7.md"),
+            b"title:: Unrelated 7\n\n- externally edited\n",
+        )
+        .unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        direct_save_bench_once(&graph, "- one changed document");
+        let incremental = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+
+        assert_eq!(
+            incremental,
+            unchanged + 1,
+            "a rebuild must parse exactly the documents whose bytes changed \
+             (unchanged rebuild {unchanged}, one-change rebuild {incremental}, graph of 25)"
+        );
+        assert!(
+            incremental < full,
+            "a rebuild after one external edit must cost far less than the full pass \
+             ({incremental} vs {full})"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The reuse is keyed on a content digest, so it must survive a rewrite that
+    /// leaves the bytes identical — and must NOT survive one that does not, even
+    /// when the file keeps its length.
+    #[test]
+    fn reused_semantics_follow_the_bytes_not_the_file() {
+        let dir = scratch("rebuild-reuse-follows-bytes");
+        fs::write(dir.join("pages/Owner.md"), b"title:: Alpha Name\n\n- o\n").unwrap();
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        direct_save_bench_once(&graph, "- warm");
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        direct_save_bench_once(&graph, "- parsed rebuild");
+
+        // Same length, different bytes: a digest notices, a stat does not.
+        fs::write(dir.join("pages/Owner.md"), b"title:: Omega Name\n\n- o\n").unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        direct_save_bench_once(&graph, "- after retitle");
+
+        // The retitled document must own its NEW identity. This is the direction
+        // the reuse could get wrong: a stale parse would still say "Alpha Name",
+        // and creating "Omega Name" would be admitted over a file that already
+        // holds it.
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Omega Name"), None)
+            .expect_err("the retitled document owns this effective page identity");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+
+        // The opposite direction is deliberately NOT asserted here. Creating
+        // "Alpha Name" is still refused, and for a reason that predates this
+        // reuse: the page cache has not seen the external retitle either, and
+        // `validate_name_only_effective_identity` fails closed on the identity it
+        // last knew. Verified by disabling the reuse entirely -- the refusal is
+        // unchanged. Fail-closed is the safe direction, so it stays a separate
+        // question from this one.
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn direct_save_bench_new_page(name: &str) -> PageDto {
+        PageDto {
+            name: name.to_owned(),
+            kind: PageKind::Page,
+            title: name.to_owned(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                id: "created".into(),
+                raw: "created".into(),
+                ..Default::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        }
+    }
+
+    /// The measured receipt behind that gate. Release-only and `--ignored`:
+    /// it prints the shape of a Direct save, split into the phases D0 added, in
+    /// both the warm and the rebuild condition. Point it at a real graph copy
+    /// with TINE_DIRECT_SAVE_BENCH_GRAPH_COPY, or let it synthesise one.
+    #[test]
+    #[ignore = "manual benchmark: Direct-mode save latency, warm vs rebuilding"]
+    fn direct_save_latency_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "release-only; run cargo test -p tine-core --release direct_save_latency_manual_benchmark -- --ignored --nocapture"
+        );
+        let rounds: usize = std::env::var("TINE_DIRECT_SAVE_BENCH_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let (dir, graph) = match std::env::var("TINE_DIRECT_SAVE_BENCH_GRAPH_COPY") {
+            Ok(source) => {
+                let dir = scratch("direct-save-bench-copy");
+                copy_directory_tree(Path::new(&source), &dir);
+                fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+                let graph = Graph::open(&dir);
+                graph.warm_cache();
+                (dir, graph)
+            }
+            Err(_) => {
+                let pages: usize = std::env::var("TINE_DIRECT_SAVE_BENCH_PAGES")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1_000);
+                direct_save_bench_graph("direct-save-bench", pages)
+            }
+        };
+
+        let describe = |label: &str, samples: &mut Vec<std::time::Duration>, graph: &Graph| {
+            samples.sort();
+            let report = graph.guarded_graph_text_identity_report();
+            println!(
+                "{label}: median {:?} p95 {:?} max {:?} over {} rounds; builds {} exact {} last {:?}",
+                samples[samples.len() / 2],
+                samples[samples.len() * 95 / 100],
+                samples[samples.len() - 1],
+                samples.len(),
+                report.complete_builds,
+                report.exact_updates,
+                report.last_build,
+            );
+        };
+
+        direct_save_bench_once(&graph, "- prime");
+        let mut warm = Vec::new();
+        for round in 0..rounds {
+            warm.push(direct_save_bench_once(&graph, &format!("- warm {round}")));
+        }
+        describe("warm index", &mut warm, &graph);
+
+        let mut cold = Vec::new();
+        for round in 0..rounds {
+            graph
+                .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+                .unwrap();
+            cold.push(direct_save_bench_once(&graph, &format!("- cold {round}")));
+        }
+        describe("rebuilding index", &mut cold, &graph);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn copy_directory_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_directory_tree(&entry.path(), &target);
+            } else if entry.file_type().unwrap().is_file() {
+                let _ = fs::copy(entry.path(), target);
+            }
+        }
     }
 
     /// The watcher's routing predicates must admit exactly what discovery

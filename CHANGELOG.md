@@ -57,6 +57,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Saving a page no longer re-reads and re-analyses your whole graph
+  (GH #267).** Before writing, Tine checks that no other file in the graph is
+  about to collide with the one you are saving. Whenever it had lost track of
+  what was on disk — which, on Windows or a graph on a network drive, was
+  essentially all the time — that check re-analysed every single document you
+  own, on every save. On a large graph that is the difference between a save you
+  don't notice and a save that takes long enough to give up and show an error.
+  Losing track means Tine doesn't know what changed, not that everything did, so
+  it now re-reads only the documents whose contents actually differ from what it
+  last saw, and reuses what it already knew about the rest. Measured on a
+  1,000-page graph: the documents examined per save dropped from all of them to
+  three. Nothing about the safety check itself was relaxed.
 - **Edits made outside Tine to pages that are not in `journals/` or `pages/`
   now show up while Tine is open (GH #268).** If you keep pages at the top level
   of your graph or in your own folders, Tine listed them correctly when it
