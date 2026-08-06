@@ -48,6 +48,12 @@ describe("save failure classification", () => {
       "identity.owned_elsewhere",
       // A name collision is real, but no number of retries frees the name.
       "identity.name_taken",
+      // Managed storage refused the save because the page moved underneath it.
+      // This used to arrive as "conflict: {Reason}", which matched neither the
+      // conflict banner (an exact comparison) nor any bounded code, so it
+      // retried silently forever and the user could quit believing the page
+      // had been written.
+      "managed.conflict",
     ]) {
       expect(isRetryableSaveFailure(`${code}: something specific`)).toBe(false);
     }

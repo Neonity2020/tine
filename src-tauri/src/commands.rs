@@ -319,7 +319,28 @@ fn map_sparse_page_save(outcome: SyncApplicationPageSaveOutcome) -> Result<Strin
     match outcome {
         SyncApplicationPageSaveOutcome::Saved { revision, .. }
         | SyncApplicationPageSaveOutcome::Unchanged { revision, .. } => Ok(revision),
-        SyncApplicationPageSaveOutcome::Conflict { reason } => Err(format!("conflict: {reason:?}")),
+        // NOT the bare `"conflict"` the frontend matches to raise the keep-mine
+        // banner, and deliberately so: `save_sparse_page_with` hard-refuses
+        // `force` while managed storage is active, so that banner's "Keep mine"
+        // button cannot do anything here. Offering it would repeat the Direct
+        // mode trap of a prompt whose only working option discards the user's
+        // edits.
+        //
+        // What this DOES fix is the silent loop. `"conflict: {reason}"` matched
+        // neither the banner (which compares exactly) nor any bounded code, so
+        // it landed in the transient-retry path and retried forever without
+        // ever telling the user their save was refused — they could quit
+        // believing the page was written. A managed conflict is permanent until
+        // the page is reloaded, so it now carries a code the frontend knows is
+        // not worth retrying, and says what to do.
+        //
+        // Giving managed mode a real resolution path is a product decision
+        // (what "keep mine" means when the oplog is the source of truth) and is
+        // tracked as audit M2's remaining half.
+        SyncApplicationPageSaveOutcome::Conflict { reason } => Err(format!(
+            "managed.conflict: this page changed in Tine-managed storage ({reason:?}). \
+             Reload the page to see the current version, then reapply your edit."
+        )),
         SyncApplicationPageSaveOutcome::Deferred { state: _ } => Err(
             "Tine-managed storage is updating this page. Try saving again when it finishes.".into(),
         ),

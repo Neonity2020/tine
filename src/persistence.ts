@@ -246,6 +246,9 @@ export function isRetryableSaveFailure(error: unknown): boolean {
     "precheck.limit",
     "identity.owned_elsewhere",
     "identity.name_taken",
+    // Managed storage refused the save because the page moved underneath it.
+    // Permanent until the page is reloaded — retrying just hides it.
+    "managed.conflict",
   ].some((code) => message.includes(code));
 }
 

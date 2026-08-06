@@ -817,6 +817,21 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let original_mode = std::fs::metadata(temp.path()).unwrap().permissions().mode();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory permissions, so the cut this test depends on is
+        // not established for every user. Probe it rather than assert against a
+        // boundary that was never created — a vacuous pass here would stop
+        // proving that a failed publication preserves the last good bytes.
+        let enforced = {
+            let probe = temp.path().join(".write-enforcement-probe");
+            let denied = std::fs::write(&probe, b"x").is_err();
+            let _ = std::fs::remove_file(&probe);
+            denied
+        };
+        if !enforced {
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(original_mode))
+                .unwrap();
+            return;
+        }
         let result = store_plugin_registry_cache_at(
             &path,
             SIGNED_CONTROL_INDEX.to_string(),
