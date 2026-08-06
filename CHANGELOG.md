@@ -59,6 +59,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **"Keep mine" now works.** When Tine found that a page had changed on disk
+  behind your back, it offered you two ways out — keep your edits, or take the
+  disk version. Keeping your edits could never succeed for any page opened from
+  a file: it failed every time with an internal message about a "captured exact
+  owner", leaving discarding your own work as the only exit that did anything.
+  It now writes your version, including after a genuine external change, which
+  is the whole situation the prompt exists for.
+- **Errors that are not conflicts no longer pretend to be.** Any unrecognised
+  save failure was reported as a conflict, which put up that same two-button
+  prompt — and neither button could resolve, say, a filename collision or an
+  internal storage failure. It also replaced the real error text, so in the one
+  case where Tine had safely set your unsaved bytes aside under a recovery file,
+  the message telling you where they were is what got thrown away. Unrecognised
+  failures now report what actually happened.
+- **A "keep mine" during a cross-page move can no longer lose the moved block.**
+  While a block moved between pages is being written to its destination, Tine
+  holds back the source page so the block is never briefly in neither place.
+  Resolving a conflict used to walk straight through that hold; it now waits and
+  is applied the moment the destination is safely written.
+- **The "couldn't save" message no longer promises a retry it wasn't making.**
+  After three failed attempts Tine said it would retry and then scheduled
+  nothing. The page was still saved on your next edit — which is what it now
+  says.
+- **External edits reach Tine-managed storage again.** Every reconcile of a
+  change made outside Tine was refused with an internal mismatch and retried to
+  the limit, so edits made by another program to a managed graph never came in.
+  Two internal descriptions of the same unchanged bytes disagreed about a
+  detail neither of them needed to agree on.
+- **A refused save in Tine-managed storage now tells you.** A managed save that
+  could not proceed retried quietly forever without ever surfacing; you could
+  close the app believing the page had been written. It now reports the refusal
+  and what resolves it.
+- **Windows: a managed page rename no longer overwrites a file that appears
+  underneath it.** The rename was documented and implemented as
+  never-replace everywhere except Windows, where it would overwrite a file that
+  arrived in the moment between the check and the rename.
 - **A sync client working in the background no longer fails your save.** Before
   writing, Tine looks over the graph twice and requires the two looks to agree.
   Any file changing anywhere in the graph in between makes them disagree — which
