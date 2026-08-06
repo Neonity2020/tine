@@ -242,52 +242,68 @@ fn metadata_stamp(md: &std::fs::Metadata) -> Option<FileStamp> {
     })
 }
 
-/// Recursively collect every `.md`/`.org` page file under `dir` with its
-/// (mtime, len) — the watcher's diff snapshot. Descends sub-directories so a page
-/// in a sub-folder (#21) is reconciled like a top-level one; mirrors the core's
-/// `list_md` walk: match page files by extension (the metadata read is needed for
-/// mtime/len anyway), skip hidden dirs and symlinked dirs (no cycles, no escaping
-/// the watched tree). Scoped to the dir passed in (journals/ or pages/).
-fn collect_page_files(dir: &std::path::Path, out: &mut HashMap<PathBuf, FileStamp>) {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
+/// The watcher's diff snapshot: every eligible graph-text file under the graph
+/// root with its (mtime, len).
+///
+/// Scope authority is the core's `GraphTextScope` — the same one discovery
+/// (`graph_text_inventory`) walks. Before GH #268 this scanned `journals/` and
+/// `pages/` only, so a page at the graph root or in a custom folder was
+/// discovered at open but never reconciled afterwards: the full-diff snapshot
+/// it would have to differ against did not contain it.
+/// `complete` is false when any part of the walk could not be read. A partial
+/// snapshot would otherwise read as "every page under that directory was
+/// deleted", and in poll mode it is also what decides whether the guarded
+/// admission index may be updated from exact paths or has to be invalidated.
+struct GraphTextSnapshot {
+    files: HashMap<PathBuf, FileStamp>,
+    complete: bool,
+}
+
+fn collect_graph_text_files(graph: &Graph) -> GraphTextSnapshot {
+    let mut files: HashMap<PathBuf, FileStamp> = HashMap::new();
+    let mut complete = true;
+    let mut stack = vec![graph.root.clone()];
+    while let Some(directory) = stack.pop() {
+        let Ok(read_dir) = std::fs::read_dir(&directory) else {
+            complete = false;
             continue;
         };
-        for e in rd.flatten() {
-            let p = e.path();
-            let Ok(file_type) = e.file_type() else {
+        for entry in read_dir {
+            let Ok(entry) = entry else {
+                complete = false;
                 continue;
             };
-            if is_page_file_path(&p) {
-                // Never follow a page-looking symlink. Besides cycles, a
-                // `secret.md` symlink could otherwise expose outside bytes.
-                if file_type.is_file() {
-                    let Ok(md) = e.metadata() else { continue };
-                    if let Some(stamp) = metadata_stamp(&md) {
-                        out.insert(p, stamp);
-                    }
+            let path = entry.path();
+            // `file_type`/`metadata` on a DirEntry do not traverse a symlink, so
+            // a symlinked directory is never descended (no cycles, no escaping
+            // the watched tree) and a `secret.md` symlink never contributes
+            // outside bytes.
+            let Ok(file_type) = entry.file_type() else {
+                complete = false;
+                continue;
+            };
+            if file_type.is_dir() {
+                if graph.graph_text_watch_descend(&path) {
+                    stack.push(path);
                 }
                 continue;
             }
-            let hidden = p
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.starts_with('.'))
-                .unwrap_or(true);
-            if !hidden && file_type.is_dir() {
-                stack.push(p);
+            if !file_type.is_file() || !graph.graph_text_watch_relevant(&path) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                complete = false;
+                continue;
+            };
+            match metadata_stamp(&metadata) {
+                Some(stamp) => {
+                    files.insert(path, stamp);
+                }
+                None => complete = false,
             }
         }
     }
-}
-
-fn collect_graph_page_files(dirs: &[PathBuf; 2]) -> HashMap<PathBuf, FileStamp> {
-    let mut current: HashMap<PathBuf, FileStamp> = HashMap::new();
-    for dir in dirs {
-        collect_page_files(dir, &mut current);
-    }
-    current
+    GraphTextSnapshot { files, complete }
 }
 
 fn file_snapshot(path: &Path) -> Option<FileStamp> {
@@ -430,16 +446,64 @@ fn incremental_reconcile(
     (changes, conflicts_dirty, errors)
 }
 
+/// Every path whose on-disk stamp differs from the snapshot, in either
+/// direction. This is what a completed graph-wide scan learned.
+fn changed_since_snapshot(
+    snap: &HashMap<PathBuf, FileStamp>,
+    current: &HashMap<PathBuf, FileStamp>,
+) -> Vec<PathBuf> {
+    let mut changed: Vec<PathBuf> = current
+        .iter()
+        .filter(|(path, stamp)| snap.get(*path) != Some(*stamp))
+        .map(|(path, _)| path.clone())
+        .collect();
+    changed.extend(
+        snap.keys()
+            .filter(|path| !current.contains_key(*path))
+            .cloned(),
+    );
+    changed
+}
+
+/// Tell the guarded admission index what a poll-mode rescan just learned.
+///
+/// Poll mode has no per-event callback to keep that index current, so it used to
+/// invalidate the whole thing at the top of every 3 s cycle. A poll-mode user
+/// (NFS, SMB) could therefore never hold a warm index, and paid a full graph
+/// rebuild on the next save — forever.
+///
+/// The rescan now covers exactly the scope the index covers (GH #268), so what
+/// it found IS a complete account of what changed and can be applied as exact
+/// observations. Publishing them here — after the scan, before reconciling
+/// anything — keeps the index no staler than the scan that produced it, which is
+/// the same window the inotify callback lane already has. A scan that could not
+/// read part of the graph learned nothing complete, so it falls back to
+/// invalidating, exactly as before.
+fn publish_poll_observation(
+    graph: &Graph,
+    snap: &HashMap<PathBuf, FileStamp>,
+    snapshot: &GraphTextSnapshot,
+) {
+    let changed = changed_since_snapshot(snap, &snapshot.files);
+    let _ = graph.observe_graph_text_external_paths(
+        changed.iter().map(PathBuf::as_path),
+        !snapshot.complete,
+    );
+}
+
 fn reconcile_pending(
     graph: &Graph,
-    dirs: &[PathBuf; 2],
     snap: &mut HashMap<PathBuf, FileStamp>,
     paths: &HashSet<PathBuf>,
     need_full: bool,
+    poll_mode: bool,
 ) -> (Vec<GraphChange>, bool, bool, Vec<String>) {
     if need_full || paths.is_empty() {
-        let current = collect_graph_page_files(dirs);
-        let (changes, conflicts_dirty, errors) = full_diff_reconcile(graph, snap, current);
+        let snapshot = collect_graph_text_files(graph);
+        if poll_mode {
+            publish_poll_observation(graph, snap, &snapshot);
+        }
+        let (changes, conflicts_dirty, errors) = full_diff_reconcile(graph, snap, snapshot.files);
         (changes, conflicts_dirty, true, errors)
     } else {
         let (changes, conflicts_dirty, errors) = incremental_reconcile(graph, snap, paths);
@@ -447,10 +511,28 @@ fn reconcile_pending(
     }
 }
 
-fn pending_for_graph(paths: &HashSet<PathBuf>, dirs: &[PathBuf; 2]) -> HashSet<PathBuf> {
+/// Which pending event paths this graph should reconcile incrementally.
+///
+/// The predicate is the core's graph-wide text scope, not `journals/` +
+/// `pages/`. Discovery went graph-wide in the #246 fix; event routing did not
+/// follow, so an external edit to a page at the graph root or in a custom folder
+/// was watched and delivered and then dropped here (GH #268).
+fn pending_for_graph(paths: &HashSet<PathBuf>, graph: &Graph) -> HashSet<PathBuf> {
     paths
         .iter()
-        .filter(|path| dirs.iter().any(|dir| path.starts_with(dir)))
+        .filter(|path| graph.graph_text_watch_relevant(path))
+        .cloned()
+        .collect()
+}
+
+/// Which pending *unclassified* paths this graph owns — directory moves and
+/// event kinds the watcher cannot resolve. These force a full diff, so the
+/// question is only whether anything eligible could live at or under the path;
+/// an excluded tree (`assets/`, a dot-directory) answers no and costs nothing.
+fn full_scan_owner_for_graph(paths: &HashSet<PathBuf>, graph: &Graph) -> HashSet<PathBuf> {
+    paths
+        .iter()
+        .filter(|path| graph.graph_text_watch_could_contain(path))
         .cloned()
         .collect()
 }
@@ -799,6 +881,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         let mut sparse_graphs: HashMap<String, WatchedSparse> = HashMap::new();
         let mut watcher: Option<notify::RecommendedWatcher> = None;
         let mut watched: HashSet<PathBuf> = HashSet::new();
+        // Last surfaced `watch()` failure per graph root, so a root that keeps
+        // failing reports once instead of every cycle.
+        let mut watch_failures: HashMap<PathBuf, String> = HashMap::new();
         let mut forced_sparse_tick = false;
         loop {
             let force_sparse_tick = std::mem::take(&mut forced_sparse_tick);
@@ -862,10 +947,18 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 }
             }
 
-            let desired: HashSet<PathBuf> = graphs
-                .values()
-                .map(|graph| graph.root.clone())
-                .chain(sparse_graphs.values().map(|graph| graph.root.clone()))
+            let labels_by_root: Vec<(String, PathBuf)> = graphs
+                .iter()
+                .map(|(label, graph)| (label.clone(), graph.root.clone()))
+                .chain(
+                    sparse_graphs
+                        .iter()
+                        .map(|(label, graph)| (label.clone(), graph.root.clone())),
+                )
+                .collect();
+            let desired: HashSet<PathBuf> = labels_by_root
+                .iter()
+                .map(|(_, root)| root.clone())
                 .collect();
 
             // Bring the OS watcher in line with the current mode + graph roots.
@@ -899,15 +992,38 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     for dir in desired.difference(&watched).cloned().collect::<Vec<_>>() {
                         // Recursive so the guarded-identity boundary includes
                         // eligible graph text outside configured cache roots.
-                        if w.watch(&dir, notify::RecursiveMode::Recursive).is_ok() {
-                            watched.insert(dir);
+                        match w.watch(&dir, notify::RecursiveMode::Recursive) {
+                            Ok(()) => {
+                                watch_failures.remove(&dir);
+                                watched.insert(dir);
+                            }
+                            Err(error) => {
+                                // A failure here is retried next cycle (the root
+                                // is never inserted into `watched`), so this is
+                                // not permanent -- but it was completely silent,
+                                // and until it succeeds every external change to
+                                // that graph is invisible. Surface it once per
+                                // distinct message so a retry loop cannot spam.
+                                let message = error.to_string();
+                                if watch_failures.get(&dir) != Some(&message) {
+                                    for (label, root) in labels_by_root.iter() {
+                                        if root == &dir {
+                                            let _ =
+                                                app.emit_to(label, "graph-watch-error", &message);
+                                        }
+                                    }
+                                    watch_failures.insert(dir, message);
+                                }
+                            }
                         }
                     }
                 }
             } else if watcher.is_some() {
                 watcher = None; // poll mode → release the OS watcher
                 watched.clear();
+                watch_failures.clear();
             }
+            watch_failures.retain(|dir, _| desired.contains(dir));
 
             // --- reconcile (identical in both modes) ---
             let (paths, full_paths, event_need_full, notify_error) = if inotify {
@@ -927,18 +1043,18 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             };
             for (label, graph) in graphs.iter_mut() {
                 let initial_cycle = !graph.baseline;
-                if initial_cycle || !inotify {
+                if initial_cycle {
+                    // No baseline yet, so nothing about the graph's text identity
+                    // is known. Once per graph, not once per cycle.
                     let _ = graph
                         .legacy_graph
                         .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true);
-                }
-                if initial_cycle {
-                    graph.snap = collect_graph_page_files(&graph.dirs);
+                    graph.snap = collect_graph_text_files(&graph.legacy_graph).files;
                     graph.baseline = true;
                 }
                 let retry_due = graph.retry.take_due(Instant::now());
-                let owned = pending_for_graph(&paths, &graph.dirs);
-                let full_owned = pending_for_graph(&full_paths, &graph.dirs);
+                let owned = pending_for_graph(&paths, &graph.legacy_graph);
+                let full_owned = full_scan_owner_for_graph(&full_paths, &graph.legacy_graph);
                 let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
                 let sync_dirty = initial_cycle
                     || need_full
@@ -979,10 +1095,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     attempted = true;
                     let (changes, conflicts_dirty, _, errors) = reconcile_pending(
                         &graph.legacy_graph,
-                        &graph.dirs,
                         &mut graph.snap,
                         &owned,
                         need_full,
+                        !inotify,
                     );
                     for change in changes {
                         let _ = app.emit_to(label, "graph-changed", change);
@@ -1482,23 +1598,18 @@ mod tests {
 
     #[test]
     fn pending_paths_are_dispatched_only_to_the_owning_graph() {
-        let paths = HashSet::from([
-            PathBuf::from("/graphs/a/pages/one.md"),
-            PathBuf::from("/graphs/b/journals/2026_07_10.md"),
-        ]);
-        let a = [
-            PathBuf::from("/graphs/a/journals"),
-            PathBuf::from("/graphs/a/pages"),
-        ];
-        let b = [
-            PathBuf::from("/graphs/b/journals"),
-            PathBuf::from("/graphs/b/pages"),
-        ];
-        assert_eq!(pending_for_graph(&paths, &a).len(), 1);
-        assert_eq!(pending_for_graph(&paths, &b).len(), 1);
-        assert!(pending_for_graph(&paths, &a)
+        let a = TempGraph::new("owner-a");
+        let b = TempGraph::new("owner-b");
+        a.write("pages/one.md", "- one\n");
+        b.write("journals/2026_07_10.md", "- two\n");
+        let graph_a = Graph::open(&a.root);
+        let graph_b = Graph::open(&b.root);
+        let paths = HashSet::from([a.path("pages/one.md"), b.path("journals/2026_07_10.md")]);
+        assert_eq!(pending_for_graph(&paths, &graph_a).len(), 1);
+        assert_eq!(pending_for_graph(&paths, &graph_b).len(), 1);
+        assert!(pending_for_graph(&paths, &graph_a)
             .iter()
-            .all(|path| path.starts_with("/graphs/a")));
+            .all(|path| path.starts_with(&a.root)));
     }
 
     struct TempGraph {
@@ -1596,6 +1707,120 @@ mod tests {
         graph
             .save_page(&anchor, anchor.rev.as_deref())
             .expect("warm guarded identity save");
+    }
+
+    /// F2, poll half. A poll-mode cycle used to invalidate the whole guarded
+    /// admission index unconditionally, so a user on NFS/SMB could never hold a
+    /// warm index: every save rebuilt it from the entire graph, every time.
+    #[test]
+    fn quiet_poll_cycles_keep_the_admission_index_warm() {
+        let tg = TempGraph::new("poll-warm");
+        tg.write("pages/Anchor.md", "- anchor\n");
+        tg.write("Root note.md", "- root\n");
+        let graph = Graph::open(&tg.root);
+        warm_guarded_identity(&graph);
+
+        let before = graph.guarded_graph_text_identity_report();
+        assert!(
+            !before.invalidated && before.complete_builds >= 1,
+            "the save should have left a live index: {before:?}"
+        );
+
+        let mut snap = collect_graph_text_files(&graph).files;
+        for _ in 0..3 {
+            reconcile_pending(&graph, &mut snap, &HashSet::new(), true, true);
+        }
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert!(
+            !after.invalidated,
+            "a poll cycle that found nothing must not invalidate the index: {after:?}"
+        );
+        assert_eq!(
+            after.complete_builds, before.complete_builds,
+            "a poll cycle must not force the next save to rebuild the whole graph"
+        );
+    }
+
+    /// The other half of the same policy: a poll cycle that DID observe an
+    /// external change must publish it, or the index would still claim a page
+    /// exists after it was deleted.
+    #[test]
+    fn a_poll_cycle_publishes_what_it_actually_observed() {
+        let tg = TempGraph::new("poll-observe");
+        tg.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&tg.root);
+        warm_guarded_identity(&graph);
+        let before = graph.guarded_graph_text_identity_report();
+
+        // An external creation the poll cycle is about to find.
+        tg.write("Root note.md", "title:: Root note\n\n- external\n");
+        let mut snap = collect_graph_text_files(&graph).files;
+        snap.remove(&tg.path("Root note.md"));
+        reconcile_pending(&graph, &mut snap, &HashSet::new(), true, true);
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert!(
+            !after.invalidated,
+            "an exactly-observed change must not fall back to invalidation: {after:?}"
+        );
+        assert!(
+            after.exact_updates > before.exact_updates,
+            "the observed path must reach the index as an exact update: {after:?}"
+        );
+        // And the index now owns that name, so a colliding create is refused.
+        assert_new_page_refused(&graph, "Root note");
+    }
+
+    /// The fallback half. If the rescan could not read part of the graph, what
+    /// it found is NOT a complete account of what changed, and the index must be
+    /// invalidated rather than exactly updated -- otherwise a save would trust
+    /// an index that is missing whatever lives behind the unreadable directory.
+    #[test]
+    fn an_incomplete_poll_scan_invalidates_instead_of_publishing() {
+        let tg = TempGraph::new("poll-incomplete");
+        tg.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&tg.root);
+        warm_guarded_identity(&graph);
+        assert!(!graph.guarded_graph_text_identity_report().invalidated);
+
+        let mut complete = collect_graph_text_files(&graph);
+        complete.complete = false;
+        publish_poll_observation(&graph, &complete.files.clone(), &complete);
+
+        assert!(
+            graph.guarded_graph_text_identity_report().invalidated,
+            "a scan that could not read the whole graph must not leave the index trusted"
+        );
+    }
+
+    /// The same thing end to end, where the walk itself decides. Root ignores
+    /// directory permissions, so this can only be demonstrated when the test
+    /// user is not root; it self-skips rather than passing vacuously.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_makes_the_scan_report_itself_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tg = TempGraph::new("poll-unreadable");
+        tg.write("Archive/Filed.md", "- filed\n");
+        tg.write("pages/Anchor.md", "- anchor\n");
+        let graph = Graph::open(&tg.root);
+        assert!(collect_graph_text_files(&graph).complete);
+
+        let blocked = tg.path("Archive");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_dir(&blocked).is_ok();
+        let observed = collect_graph_text_files(&graph);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if readable_anyway {
+            return; // running as root; permissions prove nothing here
+        }
+        assert!(
+            !observed.complete,
+            "a directory the scan could not read must make the scan report itself incomplete"
+        );
     }
 
     fn assert_new_page_refused(graph: &Graph, name: &str) {
@@ -1959,15 +2184,14 @@ mod tests {
         warm_cache(&inc_graph);
         warm_cache(&full_graph);
 
-        let dirs = graph_dirs(&inc_graph);
-        let mut inc_snap = collect_graph_page_files(&dirs);
+        let mut inc_snap = collect_graph_text_files(&inc_graph).files;
         let mut full_snap = inc_snap.clone();
 
         let paths = mutate(&tg);
 
         let (inc_changes, inc_conflicts_dirty, inc_errors) =
             incremental_reconcile(&inc_graph, &mut inc_snap, &paths);
-        let fresh = collect_graph_page_files(&dirs);
+        let fresh = collect_graph_text_files(&inc_graph).files;
         let (full_changes, full_conflicts_dirty, full_errors) =
             full_diff_reconcile(&full_graph, &mut full_snap, fresh.clone());
 
@@ -1983,59 +2207,139 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collect_page_files_descends_subdirectories() {
-        // #21: the watcher snapshot must include page files in sub-folders, so an
-        // edit/create there is reconciled (not invisible until a graph reopen).
-        let dir = std::env::temp_dir().join(format!("tine-watch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("Archive/Deep/Deeper")).unwrap();
-        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
-        std::fs::write(dir.join("top.md"), "- t\n").unwrap();
-        std::fs::write(dir.join("Archive/mid.org"), "* m\n").unwrap();
-        std::fs::write(dir.join("Archive/Deep/Deeper/deep.md"), "- d\n").unwrap();
-        std::fs::write(dir.join("Archive/notes.txt"), "ignored\n").unwrap();
-        std::fs::write(dir.join(".hidden/skip.md"), "- s\n").unwrap();
-
-        let mut out: HashMap<PathBuf, FileStamp> = HashMap::new();
-        collect_page_files(&dir, &mut out);
-        let mut names: Vec<String> = out
+    fn snapshot_relative_names(tg: &TempGraph, graph: &Graph) -> Vec<String> {
+        let mut names: Vec<String> = collect_graph_text_files(graph)
+            .files
             .keys()
-            .map(|p| {
-                p.strip_prefix(&dir)
+            .map(|path| {
+                path.strip_prefix(&tg.root)
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/")
             })
             .collect();
         names.sort();
+        names
+    }
+
+    #[test]
+    fn snapshot_covers_exactly_what_discovery_covers() {
+        // #21: page files in sub-folders must be in the snapshot, so an edit
+        // there is reconciled rather than invisible until a graph reopen.
+        // GH #268: so must a page at the graph ROOT or in a custom folder --
+        // `graph_text_inventory` walks graph-wide through `GraphTextScope`, and
+        // a snapshot narrower than discovery makes those pages permanently
+        // unreconcilable. Excluded trees stay excluded, by the same authority.
+        let tg = TempGraph::new("snapshot-scope");
+        tg.write("top.md", "- t\n");
+        tg.write("pages/Page.md", "- p\n");
+        tg.write("journals/2026_08_06.md", "- j\n");
+        tg.write("Archive/mid.org", "* m\n");
+        tg.write("Archive/Deep/Deeper/deep.md", "- d\n");
+        tg.write("Archive/notes.txt", "ignored\n");
+        tg.write(".hidden/skip.md", "- s\n");
+        tg.write("assets/embedded.md", "- a\n");
+        tg.write("logseq/bak/old.md", "- b\n");
+
         assert_eq!(
-            names,
-            vec!["Archive/Deep/Deeper/deep.md", "Archive/mid.org", "top.md"]
+            snapshot_relative_names(&tg, &Graph::open(&tg.root)),
+            vec![
+                "Archive/Deep/Deeper/deep.md",
+                "Archive/mid.org",
+                "journals/2026_08_06.md",
+                "pages/Page.md",
+                "top.md",
+            ]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn collect_page_files_does_not_follow_page_symlinks() {
+    fn snapshot_does_not_follow_page_symlinks() {
         use std::os::unix::fs::symlink;
 
-        let dir = std::env::temp_dir().join(format!("tine-watch-link-{}", std::process::id()));
+        let tg = TempGraph::new("snapshot-symlink");
         let outside =
             std::env::temp_dir().join(format!("tine-watch-outside-{}.md", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&outside);
-        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&outside, "- outside\n").unwrap();
-        symlink(&outside, dir.join("secret.md")).unwrap();
+        symlink(&outside, tg.path("pages/secret.md")).unwrap();
 
-        let mut out = HashMap::new();
-        collect_page_files(&dir, &mut out);
-        assert!(out.is_empty());
+        assert!(snapshot_relative_names(&tg, &Graph::open(&tg.root)).is_empty());
 
-        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&outside).ok();
+    }
+
+    #[test]
+    fn graph_wide_external_paths_are_routed_like_discovery_routes_them() {
+        // GH #268, the event-routing half. The watch is installed recursively on
+        // the graph ROOT, so these events all arrive; the reconcile lane used to
+        // filter them against `journals/` + `pages/` and silently drop the rest.
+        let tg = TempGraph::new("event-scope");
+        tg.write("top.md", "- t\n");
+        tg.write("Archive/mid.md", "- m\n");
+        tg.write("pages/Page.md", "- p\n");
+        tg.write("assets/embedded.md", "- a\n");
+        tg.write(".hidden/skip.md", "- s\n");
+        let graph = Graph::open(&tg.root);
+
+        use notify::event::{DataChange, EventKind, ModifyKind};
+        let mut pending = Pending::default();
+        for relative in [
+            "top.md",
+            "Archive/mid.md",
+            "pages/Page.md",
+            "assets/embedded.md",
+            ".hidden/skip.md",
+        ] {
+            pending.add_event(event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                vec![tg.path(relative)],
+            ));
+        }
+
+        let mut routed: Vec<String> = pending_for_graph(&pending.paths, &graph)
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tg.root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        routed.sort();
+        assert_eq!(routed, vec!["Archive/mid.md", "pages/Page.md", "top.md"]);
+    }
+
+    #[test]
+    fn unclassified_paths_force_a_full_scan_only_where_pages_could_live() {
+        // A directory move reports a path whose nature we cannot know, so it
+        // forces a full diff. Excluded trees must not: dropping an image into
+        // `assets/` cannot change the text inventory, and rescanning the graph
+        // for it is the amplification this program exists to remove.
+        let tg = TempGraph::new("full-scan-owner");
+        let graph = Graph::open(&tg.root);
+        let owned = full_scan_owner_for_graph(
+            &HashSet::from([
+                tg.path("pages/Moved"),
+                tg.path("Archive"),
+                tg.path("assets"),
+                tg.path("assets/pictures"),
+                tg.path(".git/objects"),
+                PathBuf::from("/somewhere/else/pages"),
+            ]),
+            &graph,
+        );
+        let mut owned: Vec<String> = owned
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&tg.root)
+                    .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+            })
+            .collect();
+        owned.sort();
+        assert_eq!(owned, vec!["Archive", "pages/Moved"]);
     }
 
     #[test]
@@ -2056,8 +2360,7 @@ mod tests {
         tg.write("pages/Seed.md", "- seed\n");
         let graph = Graph::open(&tg.root);
         warm_cache(&graph);
-        let dirs = graph_dirs(&graph);
-        let mut snap = collect_graph_page_files(&dirs);
+        let mut snap = collect_graph_text_files(&graph).files;
         let path = tg.path("pages/New.md");
         tg.write("pages/New.md", "- new\n");
 
@@ -2224,8 +2527,7 @@ mod tests {
         warm_cache(&inc_graph);
         warm_cache(&full_graph);
 
-        let dirs = graph_dirs(&inc_graph);
-        let mut inc_snap = collect_graph_page_files(&dirs);
+        let mut inc_snap = collect_graph_text_files(&inc_graph).files;
         let mut full_snap = inc_snap.clone();
 
         tg.write(
@@ -2234,8 +2536,8 @@ mod tests {
         );
         let incomplete_paths = rel_paths(&tg, &["pages/Seed.md"]);
         let (inc_changes, inc_conflicts_dirty, used_full, inc_errors) =
-            reconcile_pending(&inc_graph, &dirs, &mut inc_snap, &incomplete_paths, true);
-        let fresh = collect_graph_page_files(&dirs);
+            reconcile_pending(&inc_graph, &mut inc_snap, &incomplete_paths, true, false);
+        let fresh = collect_graph_text_files(&inc_graph).files;
         let (full_changes, full_conflicts_dirty, full_errors) =
             full_diff_reconcile(&full_graph, &mut full_snap, fresh.clone());
 

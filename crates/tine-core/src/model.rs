@@ -16015,6 +16015,70 @@ impl Graph {
         self.managed_entry_for_path(path).ok().flatten()
     }
 
+    /// True when an external filesystem event at `path` can change this graph's
+    /// text inventory or its conflict list.
+    ///
+    /// Purely lexical and cheap, and deliberately so: the path need not exist,
+    /// which lets the watcher route deletions through the same predicate it
+    /// uses for creations.
+    ///
+    /// This exists to give the reconcile lane the *same* scope authority that
+    /// discovery uses. `graph_text_inventory` walks graph-wide through
+    /// `GraphTextScope`, but the watcher used to filter events against
+    /// `journals/` + `pages/` alone, so an external edit to a page at the graph
+    /// root or in a custom folder was watched, delivered, and then silently
+    /// discarded before reconciliation (GH #268).
+    pub fn graph_text_watch_relevant(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let relative = slash_path(relative);
+        if relative.is_empty() {
+            return false;
+        }
+        if self.graph_text_scope.is_eligible(&relative) {
+            return true;
+        }
+        // A provider conflict copy is deliberately NOT eligible text — it is
+        // never cached as a page — but its appearance or removal still has to
+        // refresh the conflicts panel, so the watcher must be able to see one
+        // wherever an eligible document could live.
+        if !path_is_sync_conflict(path) {
+            return false;
+        }
+        let (parent, filename) = match relative.rsplit_once('/') {
+            Some((parent, filename)) => (parent, filename),
+            None => ("", relative.as_str()),
+        };
+        self.graph_text_scope.should_descend(parent)
+            && filename.rsplit_once('.').is_some_and(|(_, extension)| {
+                extension.eq_ignore_ascii_case("md")
+                    || extension.eq_ignore_ascii_case("markdown")
+                    || extension.eq_ignore_ascii_case("org")
+            })
+    }
+
+    /// True when the watcher's snapshot walk may descend into the directory at
+    /// `path`. Companion to [`Graph::graph_text_watch_relevant`], same authority
+    /// (`GraphTextScope`), same reason: the snapshot has to cover exactly what
+    /// discovery covers or a graph-wide event has nothing to reconcile against.
+    pub fn graph_text_watch_descend(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        self.graph_text_scope.should_descend(&slash_path(relative))
+    }
+
+    /// Ownership test for an event path whose file-or-directory nature we do not
+    /// know — a directory move, or a kind the watcher cannot classify. Such an
+    /// event forces a full diff for the owning graph, so the only question is
+    /// whether anything eligible could live *at or under* the path. Excluded
+    /// trees (`assets/`, `node_modules/`, dot-directories, `logseq/bak/`) answer
+    /// no, which is what keeps an image drop from rescanning the graph.
+    pub fn graph_text_watch_could_contain(&self, path: &Path) -> bool {
+        self.graph_text_watch_relevant(path) || self.graph_text_watch_descend(path)
+    }
+
     /// Record that Tine just wrote content with rev `rev` to `path`, so the file
     /// watcher recognizes the write as ours (see `sync_file_content`). The map is
     /// consumed on first match; this hard cap is a backstop so a write that the
@@ -38701,6 +38765,73 @@ mod tests {
             "precheck.symlink",
             "unexpected failure class: {error}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The watcher's routing predicates must admit exactly what discovery
+    /// admits, plus conflict copies (which are never cached as pages but must
+    /// still refresh the conflicts panel). GH #268 was the gap between the two.
+    #[test]
+    fn watch_predicates_track_the_same_scope_discovery_walks() {
+        let dir = scratch("watch-predicate-scope");
+        fs::create_dir_all(dir.join("Archive/Deep")).unwrap();
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::create_dir_all(dir.join(".hidden")).unwrap();
+        fs::write(dir.join("pages/Page.md"), b"- p\n").unwrap();
+        fs::write(dir.join("top.md"), b"- t\n").unwrap();
+        fs::write(dir.join("Archive/Deep/deep.org"), b"* d\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        for relative in [
+            "pages/Page.md",
+            "journals/2026_08_06.md",
+            "top.md",
+            "Archive/Deep/deep.org",
+            // Not present on disk: the predicate is lexical on purpose, so a
+            // deletion routes through exactly the same test as a creation.
+            "Archive/Gone.md",
+            // A Syncthing conflict copy is not eligible text, but its arrival
+            // still has to reach the conflicts panel.
+            "pages/Page.sync-conflict-20260806-101500-ABCDEFG.md",
+        ] {
+            assert!(
+                graph.graph_text_watch_relevant(&dir.join(relative)),
+                "{relative} must be routed to its graph"
+            );
+        }
+
+        for relative in [
+            "assets/image.md",
+            ".hidden/skip.md",
+            "logseq/bak/old.md",
+            "pages/notes.txt",
+            "pages",
+        ] {
+            assert!(
+                !graph.graph_text_watch_relevant(&dir.join(relative)),
+                "{relative} must not be routed as graph text"
+            );
+        }
+        assert!(
+            !graph.graph_text_watch_relevant(Path::new("/elsewhere/pages/Other.md")),
+            "a path outside the graph root belongs to another graph, or none"
+        );
+
+        // Unclassified paths (directory moves) force a full scan, but only where
+        // eligible text could live.
+        for relative in ["pages/Moved", "Archive", "top.md"] {
+            assert!(
+                graph.graph_text_watch_could_contain(&dir.join(relative)),
+                "{relative} could contain graph text"
+            );
+        }
+        for relative in ["assets", "assets/pictures", ".git/objects", "logseq/bak"] {
+            assert!(
+                !graph.graph_text_watch_could_contain(&dir.join(relative)),
+                "{relative} is excluded -- a move there must not rescan the graph"
+            );
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 

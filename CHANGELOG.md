@@ -57,6 +57,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Edits made outside Tine to pages that are not in `journals/` or `pages/`
+  now show up while Tine is open (GH #268).** If you keep pages at the top level
+  of your graph or in your own folders, Tine listed them correctly when it
+  opened the graph, but then never noticed another editor or a sync client
+  changing them — the page you were looking at simply stayed stale until you
+  reopened the graph. Tine watched the whole graph folder all along; the part
+  that decides which of those changes to act on had been left looking only at
+  `journals/` and `pages/`. It now uses the same rule the rest of Tine uses to
+  decide what counts as a page, so external edits, creations and deletions
+  anywhere in your graph arrive the same way they already did under `pages/`.
+  Folders Tine deliberately ignores (`assets/`, hidden folders, `logseq/bak/`)
+  stay ignored, so dropping in an image still costs nothing.
+- **Graphs on a network share no longer re-examine the whole graph on every
+  save.** When Tine cannot use the operating system's file-change notifications
+  — typically a graph on a network drive — it checks the folder every few
+  seconds instead. Each of those checks was throwing away everything Tine knew
+  about the graph's files, so the very next save had to walk and read the entire
+  graph again before it could write. Saving got slower the bigger your graph
+  was, permanently. The periodic check now records what it actually found, so an
+  ordinary save no longer pays for it. If a check cannot read part of the graph,
+  Tine still starts over from scratch rather than trusting an incomplete
+  picture.
+- **A folder Tine cannot watch is no longer a silent failure.** If the operating
+  system refuses to install the folder watch — too many watches, a permission
+  problem, an unavailable network share — Tine kept retrying quietly while every
+  outside change went unnoticed. It now tells you once per distinct problem, and
+  keeps retrying.
 - **Reopening a lived-in graph after a crash no longer rebuilds it.** Opening a
   managed graph that had been edited over many sessions could stall for over a
   minute after an unclean shutdown while it rebuilt its search/index database

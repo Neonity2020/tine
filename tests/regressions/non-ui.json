@@ -2285,6 +2285,64 @@
     "failBefore": "proven"
    },
    "notes": "Unsafe reopen of a lived-in managed graph rebuilt the ENTIRE SQLite projection even though that projection was already exactly at the oplog's accepted frontier. Established by evidence, not inference: the single rebuild reason string in validate_projection_checkpoint collapsed three independent bindings into one message; split apart, the one that fired was 'checkpoint names a different frontier root'. A field-by-field probe of the two AcceptedFrontierRoot values then showed exactly ONE differing field: scratch_root. Every authenticated field -- acceptance_sequence, document_map_root_digest, batch_map_root_digest, reference_catalog_root, state_digest -- was identical. scratch_root is a run-local address for where THIS process keeps the frontier's maps; next_accepted_frontier_root never hashes it into state_digest, and the type's own doc comment calls it a run-local scratch-store reference. Reopening a graph moves it as a matter of course. Because it sat inside the derived PartialEq and inside canonical_frontier_root_bytes (postcard of the whole struct), it also propagated into every durable identity derived from those bytes -- the projection checkpoint, the materialization stamp, the stored frontier row -- so a correct, up-to-date projection compared unequal to the very frontier it was already at, and recovery could only read that as corruption and answer by discarding the database and replaying the whole accepted history. Fixed by CUTTING the pointer out of identity rather than by making the rebuild faster: a hand-written PartialEq for AcceptedFrontierRoot that compares the authenticated fields only, and canonical_frontier_root_bytes stripping scratch_root so no persisted digest can depend on where this process happened to put things. Measured on the same commit pair, full anonymized 1,046-file graph: total reopen 72,229 ms -> 2,138 ms, sqlite_open 69,911 ms -> 3.1 ms, projection_recovery rebuilt-preserving-evidence -> opened-existing with 0 batches applied and 0 pages materialized. 350 files 12,230 -> 1,261; 100 files 2,101 -> 598. sqlite_open is now flat (about 3-6 ms) at every graph size instead of about n^1.6. Also landed, diagnosis-only: the three checkpoint bindings now report separately, and validate_existing validates the database against its OWN sequence and distinguishes 'behind the oplog' from 'diverged from the oplog' (both still rebuild; they are no longer reported with the same words). A catch-up path that would apply only the missing batches was written and then REMOVED before landing: with the identity cut in place it never runs (applied_batches=0), and shipping an unexercised recovery posture on the data-safety path is the opposite of cutting. Guard: managed_unsafe_reopen_at_the_accepted_frontier_opens_without_rebuilding is a NON-ignored CI test asserting on counters (projection_recovery == opened-existing, 0 applied batches, 0 materialized pages) rather than elapsed time, so a return of the defect fails on any machine. Fail-before proven by reverting ONLY the two production hunks: the gate failed with 'a projection already at the accepted frontier was not opened as-is (reason: SQLite frontier is stale)'. tine-core release suite 2031 passed with exactly the same 15 pre-existing failures as master (failure sets diffed, byte-identical). Note on suite noise: the oplog::local_active ephemeral-retention test family is load-flaky on master too (reproduced on unmodified master under CPU load); the new gate adds contention and raises how often it is seen. STILL OPEN: the remaining 2.1 s is engine_open, not the projection; per-document scratch LSM lookups in load_external_exact still run without a ScratchLookupSession."
+  },
+  {
+   "id": "REG-EXTERNAL-GRAPH-WIDE-EVENTS-268",
+   "title": "External edits to pages outside journals/ and pages/ reach the open app instead of staying invisible until reopen",
+   "family": "external-change-reconciliation",
+   "sources": {
+    "issues": [
+     268
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "macos",
+    "windows"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/watcher.rs::graph_wide_external_paths_are_routed_like_discovery_routes_them",
+     "src-tauri/src/watcher.rs::snapshot_covers_exactly_what_discovery_covers",
+     "src-tauri/src/watcher.rs::unclassified_paths_force_a_full_scan_only_where_pages_could_live",
+     "crates/tine-core/src/model.rs::watch_predicates_track_the_same_scope_discovery_walks"
+    ],
+    "scenario": "direct-markdown.external-change-graph-wide",
+    "failBefore": "proven"
+   },
+   "notes": "Discovery went graph-wide in the #246 fix; watcher event routing did not follow. The OS watch was already installed recursively on the graph ROOT, so events for a page at the root or in a custom folder arrived correctly -- and were then discarded by the reconcile lane, which filtered pending paths against [journals/, pages/] and built its diff snapshot from those two directories only. Such a page was therefore listed at open and never updated again while the app stayed open. Fixed by giving the watcher the same authority discovery uses (GraphTextScope), via Graph::graph_text_watch_relevant / _descend / _could_contain. Fail-before proven by restoring the two pre-fix predicates in place: the snapshot returned only [journals/2026_08_06.md, pages/Page.md] against an expected five, and event routing returned only [pages/Page.md] against an expected three. Conflict copies stay routed (they are not eligible text but must refresh the conflicts panel); excluded trees (assets/, dot-directories, logseq/bak/) stay excluded on both the routing and the force-a-full-scan paths, so dropping an image into assets/ still cannot trigger a graph rescan. Freshness defect only, not write-safety: the pre-debounce write-guard lane always saw every event and stayed fail-closed."
+  },
+  {
+   "id": "REG-POLL-MODE-ADMISSION-INDEX-REBUILD-001",
+   "title": "A network-share (poll-mode) graph keeps its save-time admission index warm instead of rebuilding the whole graph on every save",
+   "family": "direct-save-performance",
+   "sources": {
+    "issues": [
+     267
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "macos",
+    "windows"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/watcher.rs::quiet_poll_cycles_keep_the_admission_index_warm",
+     "src-tauri/src/watcher.rs::a_poll_cycle_publishes_what_it_actually_observed",
+     "src-tauri/src/watcher.rs::an_incomplete_poll_scan_invalidates_instead_of_publishing",
+     "src-tauri/src/watcher.rs::an_unreadable_directory_makes_the_scan_report_itself_incomplete"
+    ],
+    "scenario": "direct-markdown.poll-mode-save-latency",
+    "failBefore": "proven"
+   },
+   "notes": "When the watcher runs in poll mode (a network share, or TINE_WATCH=poll), every 3 s cycle invalidated the guarded graph-text admission index unconditionally before reconciling. Since a Direct save consults that index and rebuilds it when invalid -- a two-pass byte-retaining walk of the whole graph -- such a user could never hold a warm index and paid a full-graph rebuild on essentially every save. The blanket invalidation was compensating for the poll rescan being narrower than the index (journals/+pages/ vs graph-wide); once REG-EXTERNAL-GRAPH-WIDE-EVENTS-268 widened the rescan to the same scope, the rescan's own result became a complete account of what changed and is published as exact observations instead. Ordering is load-bearing and asserted: the observation happens after the scan and BEFORE any reconcile, so the index is never staler than the scan that produced it -- the same window the inotify callback lane already had, not a wider one. A scan that could not read part of the graph reports itself incomplete and still invalidates. Fail-before proven by restoring the blanket invalidation in place: the quiet-cycle test then reported invalidated: true with complete_builds unchanged at 1."
   }
  ]
 }
