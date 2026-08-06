@@ -36629,11 +36629,32 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Make `dir` read-only and report whether the restriction is actually
+    /// enforced for this process. Root ignores directory permissions, so a test
+    /// that needs a write to FAIL cannot demonstrate anything when running as
+    /// uid 0 — it must skip rather than pass vacuously or fail spuriously.
+    #[cfg(unix)]
+    fn deny_writes_if_enforced(dir: &Path) -> Option<fs::Permissions> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let original = fs::metadata(dir).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o555);
+        fs::set_permissions(dir, read_only).unwrap();
+        let probe = dir.join(".write-enforcement-probe");
+        match fs::write(&probe, b"x") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+                fs::set_permissions(dir, original).unwrap();
+                None
+            }
+            Err(_) => Some(original),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_highlights_rolls_back_sidecar_when_notes_page_commit_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = scratch("highlights-page-commit-rollback");
         let g = Graph::open(&dir);
         let key = crate::pdf::asset_key("paper.pdf");
@@ -36647,10 +36668,10 @@ mod tests {
         let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
 
         let pages = dir.join("pages");
-        let original_permissions = fs::metadata(&pages).unwrap().permissions();
-        let mut read_only = original_permissions.clone();
-        read_only.set_mode(0o555);
-        fs::set_permissions(&pages, read_only).unwrap();
+        let Some(original_permissions) = deny_writes_if_enforced(&pages) else {
+            let _ = fs::remove_dir_all(&dir);
+            return; // running as root: a read-only directory proves nothing
+        };
         let result = g.write_highlights("paper.pdf", "Paper", &[h], &[]);
         fs::set_permissions(&pages, original_permissions).unwrap();
 
@@ -36670,8 +36691,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_highlights_quarantines_new_sidecar_when_notes_page_commit_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = scratch("highlights-new-sidecar-page-failure");
         let g = Graph::open(&dir);
         let key = crate::pdf::asset_key("paper.pdf");
@@ -36683,10 +36702,10 @@ mod tests {
         let h = mkhl("11111111-1111-1111-1111-111111111111", 1, Some("text"));
 
         let pages = dir.join("pages");
-        let original_permissions = fs::metadata(&pages).unwrap().permissions();
-        let mut read_only = original_permissions.clone();
-        read_only.set_mode(0o555);
-        fs::set_permissions(&pages, read_only).unwrap();
+        let Some(original_permissions) = deny_writes_if_enforced(&pages) else {
+            let _ = fs::remove_dir_all(&dir);
+            return; // running as root: a read-only directory proves nothing
+        };
         let result = g.write_highlights("paper.pdf", "Paper", &[h], &[]);
         fs::set_permissions(&pages, original_permissions).unwrap();
 
