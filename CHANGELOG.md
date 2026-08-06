@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Block-boundary keyboard navigation and forward merge.** At the exact end
+  of a block, Delete now merges the next visible block's text and children in
+  (mirroring Backspace's merge into the previous block at offset 0), and
+  ArrowRight moves into the start of the next block; ArrowLeft at the very
+  start moves into the end of the previous block. Annotation and calc blocks
+  are never merged in either direction, and a single undo restores both
+  blocks after a forward merge.
 - **Drag-reorder for sidebar lists.** Right-sidebar open items and
   left-sidebar favorites can be reordered by dragging the row (right sidebar:
   the header area). Sub-threshold presses stay ordinary clicks and the click

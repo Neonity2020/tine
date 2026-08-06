@@ -40,6 +40,7 @@ import {
   indentBlock,
   outdentBlock,
   mergeWithPrev,
+  mergeWithNext,
   toggleCollapse,
   setCollapsed,
   prevVisible,
@@ -3059,6 +3060,47 @@ export function Editor(props: { id: string }): JSX.Element {
         if (n && splitProps(n.raw, hideFn(), pageFmt()).visible.trim() === "" && n.children.length === 0 && next && doc.byId[next]?.page === n.page) {
           e.preventDefault();
           deleteBlock(props.id);
+          startEditing(next, 0, null, editSurface());
+        }
+      }
+    } else if (e.key === "Delete" && end === start && start === raw.length) {
+      // GH #213: forward-delete merges with the NEXT block — the mirror of
+      // Backspace's merge with the previous one. Never merge a highlight or
+      // calc block itself (same rule as Backspace), and never absorb an
+      // annotation/calc block's raw text into this one.
+      if (isAnnot() || isCalc()) return;
+      const next = nextVisible(props.id, outlineScope);
+      if (next) {
+        const nextRaw = doc.byId[next]?.raw ?? "";
+        if (isAnnotationBlock(nextRaw) || calcSource(nextRaw) !== null) return;
+        commit(raw);
+        if (mergeWithNext(props.id, outlineScope, editSurface())) {
+          e.preventDefault();
+          const caretAt = start; // join point = the block's pre-merge end
+          queueMicrotask(() => {
+            ref.setSelectionRange(caretAt, caretAt);
+            autosize();
+          });
+        }
+      }
+    } else if (e.key === "ArrowLeft" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // GH #213: at the very start, move into the END of the previous visible
+      // editor. Shift keeps native selection; Ctrl/Meta keep native word/line jumps.
+      if (start === end && start === 0) {
+        const prev = prevVisible(props.id, outlineScope);
+        if (prev) {
+          e.preventDefault();
+          // "End of the previous block": a number caret clamps to the new editor's
+          // full text length at mount (focusNow Math.min), whichever it is.
+          startEditing(prev, Number.MAX_SAFE_INTEGER, null, editSurface());
+        }
+      }
+    } else if (e.key === "ArrowRight" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // GH #213: at the very end, move into the START of the next visible editor.
+      if (start === end && start === raw.length) {
+        const next = nextVisible(props.id, outlineScope);
+        if (next) {
+          e.preventDefault();
           startEditing(next, 0, null, editSurface());
         }
       }

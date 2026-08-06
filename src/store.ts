@@ -1642,6 +1642,60 @@ export function mergeWithPrev(
   return true;
 }
 
+/** Forward-merge (Delete at the END of a block): absorb the NEXT visible block's
+ *  text into the current one, so caret stays at the join point in the current
+ *  block. Exact structural mirror of mergeWithPrev: visible concatenation with
+ *  no separator, current block keeps its identity and hidden props, the absorbed
+ *  block's id:: line attaches only if the survivor has none (inbound ((id))
+ *  references to the absorbed block must not orphan), absorbed children append to
+ *  the current block's, one "merge" undo snapshot, same-page only (GH #213). */
+export function mergeWithNext(
+  id: string,
+  scope: OutlineScope | null = null,
+  editingSurface: string | null = null,
+): boolean {
+  if (!blockWritable(id)) return false;
+  const next = nextVisible(id, scope);
+  if (next === null) return false;
+  const node = doc.byId[id];
+  const nextNode = doc.byId[next];
+  if (nextNode.page !== node.page) return false; // don't merge across pages
+  pushUndo("merge", [node.page]);
+  const fmt = formatForBlock(id); // next is same page (checked above) → same format
+  // Merge visible content only; keep the current block's hidden props (it keeps
+  // its identity) and drop the absorbed block's hidden props.
+  const curSplit = splitProps(node.raw, isBuiltinHidden, fmt);
+  const nextSplit = splitProps(nextNode.raw, isBuiltinHidden, fmt);
+  const nextVisibleText = nextSplit.visible;
+  const joinOffset = curSplit.visible.length;
+  const pageName = node.page;
+
+  let hidden = curSplit.hidden;
+  const idPresent = fmt === "org" ? /(?:^|\n):id:\s/i : /(?:^|\n)id:: /i;
+  const idLine = fmt === "org" ? /(?:^|\n)(:id:\s*\S+)/i : /(?:^|\n)(id:: \S+)/i;
+  const survivorHasId = idPresent.test(curSplit.hidden);
+  const absorbedId = idLine.exec(nextSplit.hidden)?.[1];
+  if (!survivorHasId && absorbedId) {
+    hidden = hidden ? `${hidden}\n${absorbedId}` : absorbedId;
+  }
+
+  setDoc(
+    produce((s) => {
+      s.byId[id].raw = joinProps(curSplit.visible + nextVisibleText, hidden, fmt);
+      for (const c of nextNode.children) s.byId[c].parent = id;
+      s.byId[id].children.push(...nextNode.children);
+      const arr = nextNode.parent === null
+        ? s.pages[s.pages.findIndex((p) => p.name === pageName)].roots
+        : s.byId[nextNode.parent].children;
+      arr.splice(arr.indexOf(next), 1);
+      delete s.byId[next];
+    })
+  );
+  startEditing(id, joinOffset, null, editingSurface);
+  markDirty(pageName);
+  return true;
+}
+
 /** Insert a parsed outline (from a paste) as siblings right after `afterId`.
  *  Returns the last top-level inserted block id (to focus). */
 export function insertOutlineAfter(afterId: string, nodes: OutlineNode[]): string {
