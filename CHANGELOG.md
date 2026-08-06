@@ -134,6 +134,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   problem, an unavailable network share — Tine kept retrying quietly while every
   outside change went unnoticed. It now tells you once per distinct problem, and
   keeps retrying.
+- **App now starts on macOS 12 with an older Safari/WebKit (GH #256).** A JS
+  regex lookbehind shipped in the eagerly loaded bundle; pre-16.4 WebKit can't
+  parse it and the app died with "SyntaxError: invalid group specifier name"
+  and a white screen. The regex was rewritten lookbehind-free (byte-identical
+  behavior) and a source guard test now rejects any lookbehind in `src/`.
+- **Ctrl+F now scrolls to the exact occurrence, not just its block (GH #253).**
+  In a block taller than the viewport, in-page find previously only centered
+  the block, leaving off-screen matches invisible; the reveal now centers the
+  active occurrence inside the pane (falling back to block-centering while the
+  block is being edited).
+- **Update failures are no longer silent (GH #241).** When the desktop
+  self-update fails (signature, download, or install), the error is now written
+  to the debug log and shown in a toast instead of indistinguishably opening
+  the releases page; the releases page still opens as the safe fallback. The
+  underlying Windows update failure reported in #241 is not yet diagnosed —
+  the now-visible error message is exactly what a Windows repro needs.
+
 - **Reopening a lived-in graph after a crash no longer rebuilds it.** Opening a
   managed graph that had been edited over many sessions could stall for over a
   minute after an unclean shutdown while it rebuilt its search/index database
