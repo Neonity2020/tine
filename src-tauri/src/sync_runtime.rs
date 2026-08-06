@@ -766,6 +766,22 @@ impl SyncRuntimeFacade {
                             diagnostics.total.as_millis(),
                         ));
                     crate::debug::diag(format!(
+                            "managed storage open: projection recovery={} reason={:?} sidecar_shape_ms={} checkpoint_auth_ms={} read_only_open_ms={} schema_claim_ms={} structural_ms={} materialization_stamp_ms={} forensics_ms={} rebuild_ms={} applied_batches={} bulk_pages_materialized={} ancestry_full_scans={}",
+                            diagnostics.projection_recovery,
+                            diagnostics.projection_reason,
+                            diagnostics.projection_sidecar_shape.as_millis(),
+                            diagnostics.projection_checkpoint_authentication.as_millis(),
+                            diagnostics.projection_read_only_open.as_millis(),
+                            diagnostics.projection_schema_and_claim.as_millis(),
+                            diagnostics.projection_structural_validation.as_millis(),
+                            diagnostics.projection_materialization_stamp.as_millis(),
+                            diagnostics.projection_forensics_preservation.as_millis(),
+                            diagnostics.projection_rebuild.as_millis(),
+                            diagnostics.projection_applied_batches,
+                            diagnostics.projection_bulk_pages_materialized,
+                            diagnostics.projection_ancestry_full_scans,
+                        ));
+                    crate::debug::diag(format!(
                             "managed storage open: engine stages prepare_replay_ms={} predecessor_restore_ms={} bootstrap_part_replay_ms={} archived_tail_replay_ms={} finish_replay_ms={} bootstrap_parts_replayed={} archived_manifests_offered={} archived_manifests_replayed={} resume_adopted={} resume_refused={} replay_base_generation={} live_history_generation={} replayed_generations={}",
                             diagnostics.prepare_replay.as_millis(),
                             diagnostics.predecessor_restore.as_millis(),

@@ -2204,7 +2204,7 @@ pub(crate) enum RuntimeRecoveryState {
 /// application may write this to its local TINE_DEBUG trace, but it contains no
 /// graph paths, page/block names, identifiers, payloads, or opaque nested
 /// errors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PromotedRuntimeRecoveryDiagnostics {
     pub(crate) recovery: &'static str,
     pub(crate) retention_plan: &'static str,
@@ -2220,6 +2220,8 @@ pub(crate) struct PromotedRuntimeRecoveryDiagnostics {
     pub(crate) sqlite_open: Duration,
     pub(crate) tail_construction: Duration,
     pub(crate) total: Duration,
+    /// Which branch the SQLite projection open took, and where its time went.
+    pub(crate) projection: super::sqlite::ProjectionOpenBreakdown,
     /// Which stage inside `engine_open` the time actually went to.
     pub(crate) engine_stages: super::hot_engine::EngineOpenStageBreakdown,
     /// What the resume accelerator actually did, which decides how much
@@ -3652,8 +3654,8 @@ impl PromotedLocalRuntime {
     /// The bounded startup receipt is deliberately separate from the runtime's
     /// authority and is absent unless debug diagnostics were enabled before
     /// construction.
-    pub(crate) const fn recovery_diagnostics(&self) -> Option<PromotedRuntimeRecoveryDiagnostics> {
-        self.recovery_diagnostics
+    pub(crate) fn recovery_diagnostics(&self) -> Option<PromotedRuntimeRecoveryDiagnostics> {
+        self.recovery_diagnostics.clone()
     }
 
     /// The last quiescent publication attempt's status, if one has run.
@@ -5603,6 +5605,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         timing.projection_ancestry_full_scans = opened.rebuild.ancestry_full_scans;
     }
     let sqlite_open = sqlite_open_started.map(|started| started.elapsed());
+    let projection_breakdown = super::sqlite::take_projection_open_breakdown();
 
     // The lease now lives inside `projection`, so a failure has to close the
     // database to get it back — which releases the database-adjacent lock and
@@ -5691,6 +5694,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             sqlite_open: sqlite_open.unwrap_or_default(),
             tail_construction: tail_construction.unwrap_or_default(),
             total: started.elapsed(),
+            projection: projection_breakdown.clone(),
             engine_stages,
             resume_adopted: resume_observation.adopted,
             resume_refused: resume_observation.refused,

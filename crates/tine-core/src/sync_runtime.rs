@@ -1362,7 +1362,7 @@ pub enum SyncRuntimeOpenPhase {
 
 /// Content-free detail for a debug-enabled promoted-runtime recovery.  It is
 /// observational only: no field grants recovery, scan, or mutation authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncRuntimeRecoveryDiagnostics {
     pub recovery: &'static str,
     pub retention_plan: &'static str,
@@ -1378,6 +1378,19 @@ pub struct SyncRuntimeRecoveryDiagnostics {
     pub sqlite_open: Duration,
     pub tail_construction: Duration,
     pub total: Duration,
+    pub projection_recovery: &'static str,
+    pub projection_reason: String,
+    pub projection_sidecar_shape: Duration,
+    pub projection_checkpoint_authentication: Duration,
+    pub projection_read_only_open: Duration,
+    pub projection_schema_and_claim: Duration,
+    pub projection_structural_validation: Duration,
+    pub projection_materialization_stamp: Duration,
+    pub projection_forensics_preservation: Duration,
+    pub projection_rebuild: Duration,
+    pub projection_applied_batches: usize,
+    pub projection_bulk_pages_materialized: usize,
+    pub projection_ancestry_full_scans: usize,
     pub prepare_replay: Duration,
     pub predecessor_restore: Duration,
     pub bootstrap_part_replay: Duration,
@@ -1411,6 +1424,19 @@ fn map_promoted_runtime_recovery_diagnostics(
         sqlite_open: value.sqlite_open,
         tail_construction: value.tail_construction,
         total: value.total,
+        projection_recovery: value.projection.recovery,
+        projection_reason: value.projection.reason.clone(),
+        projection_sidecar_shape: value.projection.sidecar_shape,
+        projection_checkpoint_authentication: value.projection.checkpoint_authentication,
+        projection_read_only_open: value.projection.read_only_open,
+        projection_schema_and_claim: value.projection.schema_and_claim,
+        projection_structural_validation: value.projection.structural_validation,
+        projection_materialization_stamp: value.projection.materialization_stamp,
+        projection_forensics_preservation: value.projection.forensics_preservation,
+        projection_rebuild: value.projection.rebuild,
+        projection_applied_batches: value.projection.applied_batches,
+        projection_bulk_pages_materialized: value.projection.bulk_pages_materialized,
+        projection_ancestry_full_scans: value.projection.ancestry_full_scans,
         prepare_replay: value.engine_stages.prepare_replay,
         predecessor_restore: value.engine_stages.predecessor_restore,
         bootstrap_part_replay: value.engine_stages.bootstrap_part_replay,
@@ -1427,7 +1453,7 @@ fn map_promoted_runtime_recovery_diagnostics(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SyncRuntimeOpenProgress {
     Phase {
         phase: SyncRuntimeOpenPhase,

@@ -20,6 +20,7 @@
 //! file replaced out of band inside the replicated archive would otherwise let
 //! the old holder and a new opener both believe they own the workspace.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::ffi::CString;
@@ -37,6 +38,7 @@ use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OsMetadataExt as CapOsMetadataExt};
@@ -1726,6 +1728,65 @@ struct ProjectionCheckpointEnvelope {
     digest: ContentDigest,
 }
 
+fn record_projection_rebuild(
+    class: &'static str,
+    reason: &str,
+    elapsed: std::time::Duration,
+    rebuild: &RebuildInstrumentation,
+) {
+    update_projection_open_breakdown(|breakdown| {
+        breakdown.recovery = class;
+        breakdown.reason = reason.to_owned();
+        breakdown.rebuild = elapsed;
+        breakdown.applied_batches = rebuild.accepted_events_applied;
+        breakdown.bulk_pages_materialized = rebuild.bulk_pages_materialized;
+        breakdown.ancestry_full_scans = rebuild.ancestry_full_scans;
+    });
+}
+
+/// Always-recorded breakdown of one SQLite projection open.
+///
+/// `sqlite_open_ms` on its own cannot distinguish "opened a valid projection
+/// slowly" from "threw the graph away and rebuilt it", and those have opposite
+/// fixes. The recovery class and reason existed only under `#[cfg(test)]`, so on
+/// a real user's graph the single most important fact about a slow open was
+/// unreadable. Durations, counts and fixed reason strings only -- no page
+/// content, no paths.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProjectionOpenBreakdown {
+    pub recovery: &'static str,
+    pub reason: String,
+    pub sidecar_shape: std::time::Duration,
+    pub checkpoint_authentication: std::time::Duration,
+    pub read_only_open: std::time::Duration,
+    pub schema_and_claim: std::time::Duration,
+    pub structural_validation: std::time::Duration,
+    pub materialization_stamp: std::time::Duration,
+    pub forensics_preservation: std::time::Duration,
+    pub rebuild: std::time::Duration,
+    pub applied_batches: usize,
+    pub bulk_pages_materialized: usize,
+    pub ancestry_full_scans: usize,
+}
+
+thread_local! {
+    static PROJECTION_OPEN_BREAKDOWN: RefCell<ProjectionOpenBreakdown> =
+        RefCell::new(ProjectionOpenBreakdown::default());
+}
+
+fn reset_projection_open_breakdown() {
+    PROJECTION_OPEN_BREAKDOWN.with(|slot| *slot.borrow_mut() = ProjectionOpenBreakdown::default());
+}
+
+fn update_projection_open_breakdown(update: impl FnOnce(&mut ProjectionOpenBreakdown)) {
+    PROJECTION_OPEN_BREAKDOWN.with(|slot| update(&mut slot.borrow_mut()));
+}
+
+/// Take the breakdown recorded by the most recent projection open on this thread.
+pub(crate) fn take_projection_open_breakdown() -> ProjectionOpenBreakdown {
+    PROJECTION_OPEN_BREAKDOWN.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectionRecovery {
     OpenedExisting,
@@ -3236,6 +3297,7 @@ impl SqliteFrontier {
         authorization: &ApplierAuthorization<'_, '_>,
         terminal: Option<&TerminalBootstrapConstructionMaterial>,
     ) -> Result<(OpenProjection, BootstrapSqliteRebuildInstrumentation), ProjectionError> {
+        reset_projection_open_breakdown();
         validate_source(claim, &source)?;
         source.authenticate_exact_frontier()?;
         let path = prepare_database_path(path)?;
@@ -3387,10 +3449,16 @@ impl SqliteFrontier {
                     // same words as a projection that disagrees with the oplog.
                     let reason =
                         format!("SQLite projection is behind at sequence {applied_through}");
+                    let stage = Instant::now();
                     pending_forensics.extend(preserve_forensics(&path)?);
+                    update_projection_open_breakdown(|b| {
+                        b.forensics_preservation = stage.elapsed()
+                    });
                     maybe_abort_forensic_test("before-rebuild", 0);
+                    let stage = Instant::now();
                     let (database, rebuild, _) =
                         Self::build_candidate_and_publish(&path, claim, lease, &source, None)?;
+                    record_projection_rebuild("rebuilt-behind", &reason, stage.elapsed(), &rebuild);
                     mark_rebuild_complete(&pending_forensics)?;
                     return Ok(OpenProjection {
                         database,
@@ -3445,15 +3513,29 @@ impl SqliteFrontier {
                             reference_coverage: None,
                             _lease: lease,
                         },
-                        recovery: ProjectionRecovery::OpenedExisting,
+                        recovery: {
+                            update_projection_open_breakdown(|b| b.recovery = "opened-existing");
+                            ProjectionRecovery::OpenedExisting
+                        },
                         rebuild: RebuildInstrumentation::default(),
                     });
                 }
                 Err(reason) => {
+                    let stage = Instant::now();
                     pending_forensics.extend(preserve_forensics(&path)?);
+                    update_projection_open_breakdown(|b| {
+                        b.forensics_preservation = stage.elapsed()
+                    });
                     maybe_abort_forensic_test("before-rebuild", 0);
+                    let stage = Instant::now();
                     let (database, rebuild, _) =
                         Self::build_candidate_and_publish(&path, claim, lease, &source, None)?;
+                    record_projection_rebuild(
+                        "rebuilt-preserving-evidence",
+                        &reason,
+                        stage.elapsed(),
+                        &rebuild,
+                    );
                     mark_rebuild_complete(&pending_forensics)?;
                     return Ok(OpenProjection {
                         database,
@@ -4925,17 +5007,26 @@ fn validate_existing(
     claim: ProjectionClaim,
     source: &RebuildSource<'_>,
 ) -> Result<ExistingProjection, String> {
+    let stage = Instant::now();
     validate_sidecar_shape(path).map_err(|error| error.to_string())?;
+    update_projection_open_breakdown(|b| b.sidecar_shape = stage.elapsed());
+    let stage = Instant::now();
     // Authenticate the bytes on disk BEFORE opening them, exactly as before.
     // What is deferred is only the comparison against the version we expect,
     // which cannot be decided until the database's own root has been read.
     let checkpointed_root_digest =
         authenticate_projection_checkpoint(path, claim).map_err(|error| error.to_string())?;
+    update_projection_open_breakdown(|b| b.checkpoint_authentication = stage.elapsed());
+    let stage = Instant::now();
     let physical = PhysicalSqliteDatabase::open_read_only(path)
         .map_err(|error| format!("cannot open SQLite projection read-only: {error}"))?;
+    update_projection_open_breakdown(|b| b.read_only_open = stage.elapsed());
+    let stage = Instant::now();
     physical
         .validate_schema_and_claim(lower_physical_claim(claim))
         .map_err(|error| ProjectionError::from(error).to_string())?;
+    update_projection_open_breakdown(|b| b.schema_and_claim = stage.elapsed());
+    let stage = Instant::now();
     let found_frontier = read_frontier_root(&physical).map_err(|error| error.to_string())?;
     let found_root_bytes =
         canonical_frontier_root_bytes(&found_frontier).map_err(|error| error.to_string())?;
@@ -5005,12 +5096,15 @@ fn validate_existing(
             return Err("SQLite final accepted row is absent from its authenticated map".into());
         }
     }
+    update_projection_open_breakdown(|b| b.structural_validation = stage.elapsed());
+    let stage = Instant::now();
     physical
         .ensure_materialization_stamp(
             found_frontier.acceptance_sequence(),
             ContentDigest::of(&found_root_bytes),
         )
         .map_err(|error| error.to_string())?;
+    update_projection_open_breakdown(|b| b.materialization_stamp = stage.elapsed());
     if found_frontier == source.exact_frontier_root && found_count == expected_count {
         return Ok(ExistingProjection::Current);
     }
