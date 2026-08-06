@@ -604,8 +604,35 @@ fn plan_exact_source_projection(
         expected_base_annotations,
         metadata,
     )?;
-    let rendered_annotations_match = expected_base_annotations
-        .is_none_or(|expected| expected == rendered.annotations.as_slice());
+    // Retain the rendered plan when ordinary rendering reproduces the source
+    // bytes AND binds the same blocks to the same outline positions.
+    //
+    // This deliberately compares identities, not whole annotations. Two
+    // annotation sets over ONE byte sequence are produced here by two different
+    // routes: `rendered.annotations` comes from marker instrumentation over the
+    // rendered document and ends a block before its line terminator, while the
+    // fall-through below derives spans from the parser's block tiling, which
+    // runs to the start of the next block and so includes it. Demanding `==`
+    // therefore compared a span convention, not the authenticated binding, and
+    // it was self-perpetuating: one save that took the fall-through wrote
+    // tiling spans into the receipt, those became the next save's authenticated
+    // base annotations, they could never equal freshly rendered annotations,
+    // and every later save took the fall-through too. A replay computed without
+    // authenticated annotations always takes the rendered route, so its intent
+    // could never match the durable receipt again and the drain refused with
+    // `no durable completion/base exactly matches the current accepted affected
+    // frontier`.
+    //
+    // Identity comparison keeps what authentication is for — the same blocks,
+    // in the same outline positions — while letting spans be re-derived from
+    // bytes that are, by the equality on the same line, identical.
+    let rendered_annotations_match = expected_base_annotations.is_none_or(|expected| {
+        expected.len() == rendered.annotations.len()
+            && expected
+                .iter()
+                .zip(&rendered.annotations)
+                .all(|(expected, rendered)| expected.binds_same_identity_as(rendered))
+    });
     if rendered.target == source && rendered_annotations_match {
         return projection_plan_from_rendered(workspace_id, state, Some(source), rendered)
             .map_err(ExactSourceProjectionError::Projection);
@@ -3009,6 +3036,58 @@ mod tests {
             Some(base.intent().annotations()),
         )
         .unwrap()
+    }
+
+    /// Planning the same state over the same bytes must yield the same intent
+    /// annotations whether or not authenticated base annotations are supplied.
+    ///
+    /// The managed drain proves a durable receipt still describes the accepted
+    /// state by replaying it and comparing intents. The receipt was written
+    /// WITH authenticated annotations; the replay runs WITHOUT them. If those
+    /// two routes can disagree, no receipt ever matches and every
+    /// external-change reconcile refuses with `no durable completion/base
+    /// exactly matches the current accepted affected frontier`.
+    ///
+    /// The authenticated annotations here use the parser's block tiling, whose
+    /// span runs to the start of the next block and so includes the line
+    /// terminator — the convention a receipt written through the fall-through
+    /// branch carries. Rendering ends a block before its terminator. Comparing
+    /// whole annotations therefore compared conventions, sent this plan down
+    /// the fall-through branch, and made the disagreement permanent.
+    #[test]
+    fn authenticated_annotations_do_not_change_the_planned_annotations() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
+        let state = structural_layout_state(
+            "pages/legacy-spans.md",
+            vec![(80_011, None, "a", "alpha".into(), None)],
+        );
+        let source = b"- alpha\n";
+
+        let replayed = plan_projection(workspace, &state, Some(source)).unwrap();
+        assert_eq!(replayed.target(), source);
+        let rendered_annotations = replayed.intent().annotations().to_vec();
+        assert_eq!(rendered_annotations.len(), 1);
+
+        // The same binding, but spanning the terminator as block tiling does.
+        let rendered_span = rendered_annotations[0].span();
+        let legacy = vec![AnnotatedIdentity::new(
+            rendered_annotations[0].locator().clone(),
+            StructuralSpan::new(rendered_span.start(), rendered_span.end() + 1).unwrap(),
+            rendered_annotations[0].block_id(),
+            rendered_annotations[0].logseq_uuid(),
+        )];
+        assert_eq!(u64::from(rendered_span.end()) + 1, source.len() as u64);
+        assert_ne!(legacy.as_slice(), rendered_annotations.as_slice());
+
+        let written =
+            plan_projection_with_layout_annotations(workspace, &state, Some(source), Some(&legacy))
+                .unwrap();
+        assert_eq!(written.target(), source);
+        assert_eq!(
+            written.intent().annotations(),
+            rendered_annotations.as_slice(),
+            "a receipt written with legacy tiling spans must replay to the same annotations"
+        );
     }
 
     #[test]

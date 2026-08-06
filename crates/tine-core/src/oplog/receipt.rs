@@ -941,6 +941,21 @@ impl AnnotatedIdentity {
     pub const fn logseq_uuid(&self) -> Option<LogseqUuid> {
         self.logseq_uuid
     }
+
+    /// Do these two annotations bind the same block to the same place in the
+    /// outline, ignoring the byte span?
+    ///
+    /// The span is derived positional data: over one fixed byte sequence, two
+    /// correct producers can still disagree about whether a block's range
+    /// includes its line terminator. The identity binding — locator, block id,
+    /// Logseq uuid — is what authentication is actually about, so comparisons
+    /// that only need "the same blocks in the same order" must use this rather
+    /// than `==`, which would also demand one span convention.
+    pub fn binds_same_identity_as(&self, other: &Self) -> bool {
+        self.locator == other.locator
+            && self.block_id == other.block_id
+            && self.logseq_uuid == other.logseq_uuid
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
