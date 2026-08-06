@@ -2263,6 +2263,25 @@ fn restore_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Does clearing a directory's write bits actually deny writes to THIS user?
+///
+/// Root ignores directory permissions, so a `set_readonly` cut silently
+/// succeeds instead of failing and the case asserts against a boundary that was
+/// never established. Probe the real behaviour rather than testing for uid 0:
+/// the same answer is what capability-restricted and unusual-filesystem
+/// environments need, and a vacuous pass here would quietly stop proving the
+/// durability contract.
+#[cfg(unix)]
+fn directory_permissions_are_enforced() -> bool {
+    let probe = CorpusDir::new("permission-probe");
+    let directory = probe.path().join("denied");
+    fs::create_dir(&directory).unwrap();
+    let mode = set_readonly(&directory);
+    let denied = fs::write(directory.join("probe"), b"probe").is_err();
+    restore_mode(&directory, mode);
+    denied
+}
+
 fn deleted_fixture_page(manifest: &CorpusManifest) -> &SemanticFixturePage {
     let pages = manifest
         .pages
@@ -3029,6 +3048,18 @@ fn is_unix_only_case(id: &str) -> bool {
     UNIX_ONLY_CASE_IDS.contains(&id)
 }
 
+/// The Unix-only cases whose cut is established by removing a directory's write
+/// bits. They are undemonstrable wherever those bits are not enforced; the
+/// SIGKILL case is not, so it keeps running everywhere Unix does.
+const PERMISSION_CUT_CASE_IDS: &[&str] = &[
+    "deletion_completion_publication",
+    "deletion_catalog_publication",
+];
+
+fn is_permission_cut_case(id: &str) -> bool {
+    PERMISSION_CUT_CASE_IDS.contains(&id)
+}
+
 fn run_portable_case(case: &CorpusCase) -> CaseReceipt {
     match case.id.as_str() {
         "attempt_authority_publication" => run_attempt_authority_publication(case),
@@ -3141,8 +3172,9 @@ fn crash_corpus_v2_executes_every_declared_cut() {
     assert_fixture_semantics(&manifest);
     let mut seen = BTreeSet::new();
     let mut receipts = Vec::new();
-    #[cfg(not(unix))]
-    let mut unexecuted_unix = Vec::new();
+    let mut unexecuted_unix: Vec<&str> = Vec::new();
+    #[cfg(unix)]
+    let permissions_enforced = directory_permissions_are_enforced();
 
     let manifest_unix = manifest
         .cases
@@ -3163,17 +3195,29 @@ fn crash_corpus_v2_executes_every_declared_cut() {
         assert_eq!(case.cut, cut, "cut drift for {}", case.id);
         if is_unix_only_case(&case.id) {
             #[cfg(unix)]
-            let receipt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_unix_only_case(case)
-            }))
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{}",
-                    assertion_receipt(case, "runner-start", "interrupted", Measurements::default())
-                )
-            });
-            #[cfg(unix)]
             {
+                if is_permission_cut_case(&case.id) && !permissions_enforced {
+                    eprintln!(
+                        "case={} execution=unexecuted reason=this user is not denied by directory write bits, so the cut cannot be established",
+                        case.id
+                    );
+                    unexecuted_unix.push(case.id.as_str());
+                    continue;
+                }
+                let receipt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_unix_only_case(case)
+                }))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{}",
+                        assertion_receipt(
+                            case,
+                            "runner-start",
+                            "interrupted",
+                            Measurements::default()
+                        )
+                    )
+                });
                 eprintln!("{}", receipt.render());
                 receipts.push(receipt);
             }
@@ -3201,10 +3245,22 @@ fn crash_corpus_v2_executes_every_declared_cut() {
         receipts.push(receipt);
     }
     #[cfg(unix)]
-    assert_eq!(receipts.len(), manifest.cases.len());
-    #[cfg(not(unix))]
     {
-        assert_eq!(unexecuted_unix, UNIX_ONLY_CASE_IDS);
-        assert_eq!(receipts.len() + unexecuted_unix.len(), manifest.cases.len());
+        // A case may only go unexecuted here for the one reason the runner can
+        // prove: a permission cut this user is not subject to. Anything else
+        // silently shrinking the corpus is the failure mode to guard against.
+        assert!(
+            unexecuted_unix
+                .iter()
+                .all(|id| is_permission_cut_case(id)),
+            "only permission cuts may go unexecuted on Unix, got {unexecuted_unix:?}"
+        );
+        assert!(
+            unexecuted_unix.is_empty() || !permissions_enforced,
+            "a permission cut was skipped even though directory write bits are enforced"
+        );
     }
+    #[cfg(not(unix))]
+    assert_eq!(unexecuted_unix, UNIX_ONLY_CASE_IDS);
+    assert_eq!(receipts.len() + unexecuted_unix.len(), manifest.cases.len());
 }
