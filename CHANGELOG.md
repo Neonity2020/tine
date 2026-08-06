@@ -81,6 +81,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   is left to its own base-revision guard. Genuine external edits, and a file
   deleted out from under an unsaved edit, still raise the banner exactly as
   before.
+- **Journal carry-over buttons now switch correctly at midnight.** The buttons
+  under a journal title were chosen once at mount from a bare wall-clock
+  comparison, so after the calendar rolled over, yesterday's journal kept
+  today's pull-in buttons ("Carry from previous day", "Carry last N days")
+  instead of switching to "Carry unfinished tasks → today". The choice now
+  follows a reactive day tick (DST-safe, re-synced on focus/wake), so an
+  already-open app swaps the button sets the moment the day changes.
+- **Delete/Backspace over text selected in a rendered (not-editing) block now
+  deletes that text.** Selecting a block's text with the mouse and pressing
+  Delete or Backspace did nothing — the keypress reached no editor, the
+  highlight stayed, and nothing changed (OG deletes it, since its rendered
+  view is the editor). The key now maps the rendered selection back to source
+  and deletes it through the normal store path (one undo step), then opens the
+  block in the editor at the deletion point. Conservative no-ops remain for
+  cross-block selections, selections wholly inside atomic constructs (links,
+  chips), annotation/calc blocks, and read-only pages.
 - **Managed Markdown saves now retain their authenticated projection predecessor
   across drain, compaction, and unsafe reopen.** The next save and delayed
   filesystem callback re-prove the exact completed-path receipt instead of
