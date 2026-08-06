@@ -19122,9 +19122,7 @@ impl Graph {
         page: &PageDto,
         path: &Path,
         loaded: Option<&ExactGraphLoadedPage>,
-        // Ordinary frontend saves carry their load revision in the separate
-        // base_rev argument; PageDto.rev is not part of the working-store DTO.
-        loaded_rev: Option<&str>,
+        authority: PinnedSaveAuthority<'_>,
     ) -> io::Result<()> {
         if page.path.is_empty() {
             return Ok(());
@@ -19135,17 +19133,22 @@ impl Graph {
                 "a path-pinned page requires its existing retained file owner",
             )
         })?;
-        let retained = self.loaded_file_identities.read().unwrap();
-        let retained_matches = loaded_rev.is_some_and(|revision| {
-            retained
-                .get(path)
-                .is_some_and(|(captured_revision, captured_identity)| {
-                    captured_revision == revision
-                        && *captured_identity == loaded.file_identity
-                        && loaded.entry.path == path
+        let owner_matches = match authority {
+            PinnedSaveAuthority::UserOverride => loaded.entry.path == path,
+            PinnedSaveAuthority::LoadedRevision(loaded_rev) => {
+                let retained = self.loaded_file_identities.read().unwrap();
+                loaded_rev.is_some_and(|revision| {
+                    retained
+                        .get(path)
+                        .is_some_and(|(captured_revision, captured_identity)| {
+                            captured_revision == revision
+                                && *captured_identity == loaded.file_identity
+                                && loaded.entry.path == path
+                        })
                 })
-        });
-        if !retained_matches {
+            }
+        };
+        if !owner_matches {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "path-pinned page does not match its captured exact owner",
@@ -19427,7 +19430,12 @@ impl Graph {
 
         let validation =
             self.validate_graph_text_target(write, &path, Some((page.kind, &page.name)))?;
-        self.require_pinned_save_owner(page, &path, validation.target.as_ref(), Some(base_rev))?;
+        self.require_pinned_save_owner(
+            page,
+            &path,
+            validation.target.as_ref(),
+            PinnedSaveAuthority::LoadedRevision(Some(base_rev)),
+        )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -19713,7 +19721,12 @@ impl Graph {
         // avoids re-reading the file 2-3× per save, which is felt on NFS.
         let validation =
             self.validate_graph_text_target(&write, &path, Some((page.kind, &page.name)))?;
-        self.require_pinned_save_owner(page, &path, validation.target.as_ref(), base_rev)?;
+        self.require_pinned_save_owner(
+            page,
+            &path,
+            validation.target.as_ref(),
+            PinnedSaveAuthority::LoadedRevision(base_rev),
+        )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -19813,7 +19826,7 @@ impl Graph {
             page,
             &path,
             validation.target.as_ref(),
-            page.rev.as_deref(),
+            PinnedSaveAuthority::UserOverride,
         )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
@@ -24967,6 +24980,26 @@ struct ManagedLoadedPage {
     baseline: String,
     baseline_reservation: RetainedContentReservation,
     page_reservation: RetainedContentReservation,
+}
+
+/// What entitles a save to write the file its page is pinned to.
+enum PinnedSaveAuthority<'a> {
+    /// The revision the editor loaded. The retained pin must still agree with
+    /// it: a change nobody observed between load and save is a conflict to
+    /// report, not bytes to overwrite.
+    ///
+    /// Ordinary frontend saves carry this in the separate `base_rev` argument;
+    /// `PageDto.rev` is NOT part of the working-store DTO that `pageToDto`
+    /// builds, so it must never be read as one.
+    LoadedRevision(Option<&'a str>),
+    /// The user was shown the conflict and chose to keep their own edits.
+    ///
+    /// A stale revision and a stale identity ARE the conflict being resolved —
+    /// requiring either to match makes "keep mine" refuse exactly when it is
+    /// needed, leaving discard-my-work as the only exit the app offers. The pin
+    /// must still resolve to a retained file owner at the validated path, so an
+    /// override cannot be redirected onto a file this page never came from.
+    UserOverride,
 }
 
 struct ExactGraphLoadedPage {
@@ -35206,6 +35239,54 @@ mod tests {
             fs::read_to_string(dir.join("pages").join("Weird.org")).unwrap(),
             src
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "Keep mine" must work on the DTO the frontend actually sends.
+    ///
+    /// `pageToDto` (`src/store.ts`) builds every saved page without a `rev`
+    /// field — ordinary saves carry their load revision in the separate
+    /// `base_rev` argument instead. Every Rust test, though, force-saves a DTO
+    /// straight from `load_named`/`load_by_path`, which DOES carry
+    /// `rev: Some(..)`. So the whole suite exercised a shape the wire never
+    /// produces, and the one exit offered to a user in a conflict — keep my
+    /// edits — could not succeed for any page loaded from disk.
+    #[test]
+    fn force_save_succeeds_on_the_revless_dto_the_frontend_sends() {
+        let dir = scratch("force-save-wire-shape");
+        let path = dir.join("pages").join("A.md");
+        fs::write(&path, "- original\n").unwrap();
+        let g = Graph::open(&dir);
+        let mut dto = g.load_named("A", PageKind::Page).unwrap().unwrap();
+        assert!(!dto.path.is_empty(), "a loaded page is path-pinned");
+        dto.blocks[0].raw = "mine".into();
+        // The wire shape: the working store has no revision to send.
+        dto.rev = None;
+
+        g.force_save_page(&dto).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same override after a real external change — the situation that
+    /// actually raises the conflict banner. The load-time identity pin is stale
+    /// by construction here, because a foreign writer replaced the file; that
+    /// staleness is the conflict, not a reason to refuse the resolution.
+    #[test]
+    fn force_save_overrides_a_real_external_change_with_the_wire_dto() {
+        let dir = scratch("force-save-wire-shape-external");
+        let path = dir.join("pages").join("A.md");
+        fs::write(&path, "- original\n").unwrap();
+        let g = Graph::open(&dir);
+        let mut dto = g.load_named("A", PageKind::Page).unwrap().unwrap();
+        dto.blocks[0].raw = "mine".into();
+        dto.rev = None;
+        fs::write(&path, "- theirs\n").unwrap();
+
+        g.force_save_page(&dto).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
