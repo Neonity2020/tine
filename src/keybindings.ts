@@ -67,6 +67,7 @@ import {
 } from "./store";
 import { editingId, startEditing } from "./editorController";
 import { copyBlockOutline } from "./clipboard";
+import { deleteRenderedTextSelection } from "./editor/renderedSelectionDelete";
 import { openInPageFind } from "./inpageFind";
 import { cellSel, enterGridSelection, handleCellSelectionKey, handleSheetPasteEvent, outlinedGridSelectionId } from "./sheet/selection";
 import { decodeNavIntent } from "./navProtocol";
@@ -965,6 +966,21 @@ export function installKeybindings(overrides: Record<string, string> = {}): () =
     // Block-selection mode keys (no editor focused).
     if (!editing && hasSelection()) {
       if (handleSelectionKey(e)) {
+        e.preventDefault();
+        resetSeq();
+        return;
+      }
+    }
+
+    // OG contenteditable parity: Delete/Backspace over a RENDERED (not-editing)
+    // text selection deletes that text from the block's source. Without this the
+    // keypress reaches no editor and dies silently — selection stays, nothing
+    // happens ("select text quickly, hit delete, nothing happens" report).
+    if (
+      !editing && (e.key === "Delete" || e.key === "Backspace") &&
+      !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey
+    ) {
+      if (deleteRenderedTextSelection()) {
         e.preventDefault();
         resetSeq();
         return;

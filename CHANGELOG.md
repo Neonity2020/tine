@@ -57,6 +57,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Delete/Backspace over text selected in a rendered (not-editing) block now
+  deletes that text.** Selecting a block's text with the mouse and pressing
+  Delete or Backspace did nothing — the keypress reached no editor, the
+  highlight stayed, and nothing changed (OG deletes it, since its rendered
+  view is the editor). The key now maps the rendered selection back to source
+  and deletes it through the normal store path (one undo step), then opens the
+  block in the editor at the deletion point. Conservative no-ops remain for
+  cross-block selections, selections wholly inside atomic constructs (links,
+  chips), annotation/calc blocks, and read-only pages.
 - **Managed Markdown saves now retain their authenticated projection predecessor
   across drain, compaction, and unsafe reopen.** The next save and delayed
   filesystem callback re-prove the exact completed-path receipt instead of
