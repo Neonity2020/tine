@@ -30,7 +30,14 @@ const check = (name, got, want) => {
 async function gesture(page, content, selStart, selEnd, keys) {
   await page.locator(".ls-block .block-content").first().click();
   await page.waitForSelector("textarea.block-editor", { timeout: 3000 });
-  await page.keyboard.press("Control+a");
+  // Replace the field's contents directly rather than via Ctrl+A. This scenario
+  // is about selection WRAPPING; Ctrl+A is only being used here to clear the
+  // field. Since GH #262 it is also the block-selection ladder, and its first
+  // press in an EMPTY block deliberately escalates out of the editor (see
+  // src/components/Block.selectAll.test.tsx) -- which removed the textarea this
+  // scenario then typed into. select() states the intent and is a no-op when
+  // the block is already empty.
+  await page.evaluate(() => document.querySelector("textarea.block-editor")?.select());
   await page.keyboard.type(content);
   await sleep(120);
   await page.evaluate(([s, e]) => {
@@ -50,7 +57,14 @@ async function gesture(page, content, selStart, selEnd, keys) {
 async function formatGesture(page, content, selStart, selEnd, key, direction = "backward") {
   await page.locator(".ls-block .block-content").first().click();
   await page.waitForSelector("textarea.block-editor", { timeout: 3000 });
-  await page.keyboard.press("Control+a");
+  // Replace the field's contents directly rather than via Ctrl+A. This scenario
+  // is about selection WRAPPING; Ctrl+A is only being used here to clear the
+  // field. Since GH #262 it is also the block-selection ladder, and its first
+  // press in an EMPTY block deliberately escalates out of the editor (see
+  // src/components/Block.selectAll.test.tsx) -- which removed the textarea this
+  // scenario then typed into. select() states the intent and is a no-op when
+  // the block is already empty.
+  await page.evaluate(() => document.querySelector("textarea.block-editor")?.select());
   await page.keyboard.type(content);
   await sleep(120);
   await page.evaluate(([s, e, dir]) => {
