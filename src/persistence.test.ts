@@ -46,6 +46,8 @@ describe("save failure classification", () => {
       "precheck.nofollow",
       "precheck.limit",
       "identity.owned_elsewhere",
+      // A name collision is real, but no number of retries frees the name.
+      "identity.name_taken",
     ]) {
       expect(isRetryableSaveFailure(`${code}: something specific`)).toBe(false);
     }

@@ -48,6 +48,14 @@ const assetWriteChain = new Set<Promise<boolean>>();
 // it, released the moment that dest saves durably (immediately, or after a conflict is
 // resolved). Until then the source keeps the block on disk, so it's never lost.
 const heldSources = new Set<string>();
+// Sources whose "keep mine" arrived DURING the dest-write window. The barrier
+// below is absolute — including for a forced save — because the two rules guard
+// different things: a conflict is about not clobbering someone else's bytes,
+// while the barrier is about not writing a moved block out of existence. An
+// override of the first must not override the second. Dropping the resolution
+// would strand the page (a conflicted page is skipped by the ordinary save
+// path), so remember it and re-issue it the moment the dest is durable.
+const heldForcedSaves = new Set<string>();
 const heldByDest = new Map<string, string[]>();
 
 // ---------------------------------------------------------------------------
@@ -145,10 +153,17 @@ function releaseSourcesFor(dest: string) {
   heldByDest.delete(dest);
   let any = false;
   for (const s of srcs) {
-    if (heldSources.delete(s)) {
-      dirty.add(s); // its removal (and any held edit) can write now
-      any = true;
+    if (!heldSources.delete(s)) continue;
+    if (heldForcedSaves.delete(s)) {
+      // A "keep mine" the barrier deferred. Re-issue it now rather than letting
+      // `scheduleSave` pick it up: the page is still marked conflicted, and the
+      // ordinary path skips a conflicted page, so this resolution would
+      // otherwise be silently lost.
+      void forceSave(s);
+      continue;
     }
+    dirty.add(s); // its removal (and any held edit) can write now
+    any = true;
   }
   if (any) scheduleSave();
 }
@@ -315,7 +330,10 @@ async function doSave(
   if (isConflicted(name) && !force) return false;
   // A cross-page move source: hold its save until the destination is durable (C#1).
   // Stays dirty, so it writes the moment `releaseSourcesFor(dest)` frees it.
-  if (heldSources.has(name) && !force) return false;
+  if (heldSources.has(name)) {
+    if (force) heldForcedSaves.add(name);
+    return false;
+  }
   const token = graphToken;
   const dto = measureIssue248("frontend.pageToDtoMs", () => pageToDto(name));
   if (!dto) return false;
