@@ -6014,6 +6014,61 @@ pub(crate) struct EnrolledProjectionOpenInstrumentation {
     pub(crate) bootstrap_parts_examined: usize,
 }
 
+/// Always-recorded stage breakdown of a promoted engine open.
+///
+/// `engine_open_ms` alone cannot say WHICH part of recovery is slow, and the
+/// existing breakdown is `#[cfg(test)]` -- so a slow startup on a real graph
+/// was, until now, unanswerable anywhere except a benchmark. That is how a
+/// reproduction gets mistaken for a diagnosis. This costs a handful of
+/// `Instant::now()` calls per startup, holds only durations and counts, and
+/// never touches page content or paths.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EngineOpenStageBreakdown {
+    pub prepare_replay: std::time::Duration,
+    pub predecessor_restore: std::time::Duration,
+    pub bootstrap_part_replay: std::time::Duration,
+    pub archived_tail_replay: std::time::Duration,
+    pub finish_replay: std::time::Duration,
+    pub bootstrap_parts_replayed: usize,
+    pub archived_manifests_offered: usize,
+    pub archived_manifests_replayed: usize,
+}
+
+thread_local! {
+    static ENGINE_OPEN_STAGES: Cell<EngineOpenStageBreakdown> =
+        const { Cell::new(EngineOpenStageBreakdown {
+            prepare_replay: std::time::Duration::ZERO,
+            predecessor_restore: std::time::Duration::ZERO,
+            bootstrap_part_replay: std::time::Duration::ZERO,
+            archived_tail_replay: std::time::Duration::ZERO,
+            finish_replay: std::time::Duration::ZERO,
+            bootstrap_parts_replayed: 0,
+            archived_manifests_offered: 0,
+            archived_manifests_replayed: 0,
+        }) };
+}
+
+fn reset_engine_open_stages() {
+    ENGINE_OPEN_STAGES.with(|slot| slot.set(EngineOpenStageBreakdown::default()));
+}
+
+fn update_engine_open_stages(update: impl FnOnce(&mut EngineOpenStageBreakdown)) {
+    ENGINE_OPEN_STAGES.with(|slot| {
+        let mut current = slot.get();
+        update(&mut current);
+        slot.set(current);
+    });
+}
+
+/// Take the breakdown recorded by the most recent engine open on this thread.
+pub(crate) fn take_engine_open_stage_breakdown() -> EngineOpenStageBreakdown {
+    ENGINE_OPEN_STAGES.with(|slot| {
+        let current = slot.get();
+        slot.set(EngineOpenStageBreakdown::default());
+        current
+    })
+}
+
 #[cfg(test)]
 thread_local! {
     static ENROLLED_PROJECTION_OPEN_INSTRUMENTATION:
@@ -7280,6 +7335,7 @@ impl ShardedHotEngine {
         retention: EngineOpenRetention<'_>,
         bootstrap_publication: Option<Arc<super::object_store::ValidatedBootstrapPublicationV1>>,
     ) -> Result<(Self, RuntimeResumeReceipt, Vec<StageOutcome>), EngineError> {
+        reset_engine_open_stages();
         #[cfg(test)]
         reset_enrolled_projection_open_instrumentation();
         #[cfg(test)]
@@ -7853,7 +7909,9 @@ impl ShardedHotEngine {
             Err(error) => return Err(EngineError::ReferenceCatalog(error.to_string())),
         }
 
+        let prepare_started = Instant::now();
         self.prepare_operational_recovery_replay()?;
+        update_engine_open_stages(|stages| stages.prepare_replay = prepare_started.elapsed());
         let mut rotation = None;
         if let Some(predecessor) = predecessor {
             let (snapshot, kind) = match &predecessor {
@@ -7864,7 +7922,12 @@ impl ShardedHotEngine {
             };
             #[cfg(test)]
             let phase_started = Instant::now();
-            if let Err(refusal) = self.restore_predecessor_state(snapshot, kind) {
+            let restore_started = Instant::now();
+            let restore_result = self.restore_predecessor_state(snapshot, kind);
+            update_engine_open_stages(|stages| {
+                stages.predecessor_restore = restore_started.elapsed();
+            });
+            if let Err(refusal) = restore_result {
                 // The restore is all-or-nothing: it validates everything before
                 // it installs anything, so the engine is still exactly at the
                 // baseline `prepare_operational_recovery_replay` produced. All
@@ -7915,6 +7978,7 @@ impl ShardedHotEngine {
         // conflict with `&mut self` staging. Each part is then loaded, staged,
         // and dropped before the next ordinal is read, so restart resident
         // memory is one bootstrap part rather than the whole graph.
+        let bootstrap_started = Instant::now();
         #[cfg(test)]
         let phase_started = Instant::now();
         if let Some(plan) = self.retained_bootstrap_recovery_plan()? {
@@ -7959,6 +8023,13 @@ impl ShardedHotEngine {
                 timing.bootstrap_part_recovery = phase_started.elapsed();
             });
         }
+        let bootstrap_replayed = outcomes.len();
+        update_engine_open_stages(|stages| {
+            stages.bootstrap_part_replay = bootstrap_started.elapsed();
+            stages.bootstrap_parts_replayed = bootstrap_replayed;
+            stages.archived_manifests_offered = committed_manifests.len();
+        });
+        let tail_started = Instant::now();
         for manifest in committed_manifests {
             if self.covered_by_predecessor_state(manifest.batch_id())? {
                 continue;
@@ -7970,7 +8041,14 @@ impl ShardedHotEngine {
             }
             outcomes.push(outcome);
         }
+        let tail_replayed = outcomes.len().saturating_sub(bootstrap_replayed);
+        update_engine_open_stages(|stages| {
+            stages.archived_tail_replay = tail_started.elapsed();
+            stages.archived_manifests_replayed = tail_replayed;
+        });
+        let finish_started = Instant::now();
         self.finish_operational_recovery_replay()?;
+        update_engine_open_stages(|stages| stages.finish_replay = finish_started.elapsed());
         Ok(outcomes)
     }
 

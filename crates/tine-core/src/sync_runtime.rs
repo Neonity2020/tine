@@ -1378,6 +1378,19 @@ pub struct SyncRuntimeRecoveryDiagnostics {
     pub sqlite_open: Duration,
     pub tail_construction: Duration,
     pub total: Duration,
+    pub prepare_replay: Duration,
+    pub predecessor_restore: Duration,
+    pub bootstrap_part_replay: Duration,
+    pub archived_tail_replay: Duration,
+    pub finish_replay: Duration,
+    pub bootstrap_parts_replayed: usize,
+    pub archived_manifests_offered: usize,
+    pub archived_manifests_replayed: usize,
+    pub resume_adopted: bool,
+    pub resume_refused: bool,
+    pub replay_base_generation: u64,
+    pub live_history_generation: u64,
+    pub replayed_generations: u64,
 }
 
 fn map_promoted_runtime_recovery_diagnostics(
@@ -1398,6 +1411,19 @@ fn map_promoted_runtime_recovery_diagnostics(
         sqlite_open: value.sqlite_open,
         tail_construction: value.tail_construction,
         total: value.total,
+        prepare_replay: value.engine_stages.prepare_replay,
+        predecessor_restore: value.engine_stages.predecessor_restore,
+        bootstrap_part_replay: value.engine_stages.bootstrap_part_replay,
+        archived_tail_replay: value.engine_stages.archived_tail_replay,
+        finish_replay: value.engine_stages.finish_replay,
+        bootstrap_parts_replayed: value.engine_stages.bootstrap_parts_replayed,
+        archived_manifests_offered: value.engine_stages.archived_manifests_offered,
+        archived_manifests_replayed: value.engine_stages.archived_manifests_replayed,
+        resume_adopted: value.resume_adopted,
+        resume_refused: value.resume_refused,
+        replay_base_generation: value.replay_base_generation,
+        live_history_generation: value.live_history_generation,
+        replayed_generations: value.replayed_generations,
     }
 }
 

@@ -765,6 +765,22 @@ impl SyncRuntimeFacade {
                             diagnostics.tail_construction.as_millis(),
                             diagnostics.total.as_millis(),
                         ));
+                    crate::debug::diag(format!(
+                            "managed storage open: engine stages prepare_replay_ms={} predecessor_restore_ms={} bootstrap_part_replay_ms={} archived_tail_replay_ms={} finish_replay_ms={} bootstrap_parts_replayed={} archived_manifests_offered={} archived_manifests_replayed={} resume_adopted={} resume_refused={} replay_base_generation={} live_history_generation={} replayed_generations={}",
+                            diagnostics.prepare_replay.as_millis(),
+                            diagnostics.predecessor_restore.as_millis(),
+                            diagnostics.bootstrap_part_replay.as_millis(),
+                            diagnostics.archived_tail_replay.as_millis(),
+                            diagnostics.finish_replay.as_millis(),
+                            diagnostics.bootstrap_parts_replayed,
+                            diagnostics.archived_manifests_offered,
+                            diagnostics.archived_manifests_replayed,
+                            diagnostics.resume_adopted,
+                            diagnostics.resume_refused,
+                            diagnostics.replay_base_generation,
+                            diagnostics.live_history_generation,
+                            diagnostics.replayed_generations,
+                        ));
                 }
             }
         });

@@ -2220,6 +2220,15 @@ pub(crate) struct PromotedRuntimeRecoveryDiagnostics {
     pub(crate) sqlite_open: Duration,
     pub(crate) tail_construction: Duration,
     pub(crate) total: Duration,
+    /// Which stage inside `engine_open` the time actually went to.
+    pub(crate) engine_stages: super::hot_engine::EngineOpenStageBreakdown,
+    /// What the resume accelerator actually did, which decides how much
+    /// history has to be replayed at all.
+    pub(crate) resume_adopted: bool,
+    pub(crate) resume_refused: bool,
+    pub(crate) replay_base_generation: u64,
+    pub(crate) live_history_generation: u64,
+    pub(crate) replayed_generations: u64,
 }
 
 /// Whether this runtime may run automatic external Markdown/Org import.
@@ -5037,7 +5046,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     projection_open: PromotedProjectionOpen,
     same_process: Option<SameProcessPromotionToken>,
 ) -> Result<PromotedLocalRuntime, W::Refusal> {
-    let diagnostic_started = promoted_runtime_debug_enabled().then(Instant::now);
+    // Always recorded. A startup breakdown that only exists when someone
+    // remembered to set an environment variable is not available at the moment
+    // it is needed -- the first time a user reports a slow open.
+    let diagnostic_started = Some(Instant::now());
+    let _ = promoted_runtime_debug_enabled();
     #[cfg(test)]
     let workspace_id = state.workspace_id;
     #[cfg(test)]
@@ -5436,6 +5449,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         timing.engine = super::hot_engine::take_enrolled_projection_open_instrumentation();
     }
     let engine_open = engine_open_started.map(|started| started.elapsed());
+    let engine_stages = super::hot_engine::take_engine_open_stage_breakdown();
     if let Some(error) = receipt.refusal.as_ref() {
         resume_candidate = "engine_refused";
         unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(
@@ -5677,6 +5691,12 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             sqlite_open: sqlite_open.unwrap_or_default(),
             tail_construction: tail_construction.unwrap_or_default(),
             total: started.elapsed(),
+            engine_stages,
+            resume_adopted: resume_observation.adopted,
+            resume_refused: resume_observation.refused,
+            replay_base_generation: resume_observation.replay_base_generation,
+            live_history_generation: resume_observation.live_history_generation,
+            replayed_generations: resume_observation.replayed_generations,
         });
     let mut runtime = Box::new(PromotedLocalRuntime {
         state,
