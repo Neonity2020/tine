@@ -2,7 +2,7 @@
 // select-all-text gesture, a press with the text fully selected escalates to
 // a block subtree selection; later presses live in selection mode and are
 // covered by src/selectionExpand.test.ts.
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { For, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { startEditing, editingId } from "../editorController";
@@ -16,6 +16,10 @@ let disposeKeys: (() => void) | null = null;
 beforeAll(async () => {
   await initParser();
   disposeKeys = installKeybindings();
+});
+
+afterAll(() => {
+  disposeKeys?.();
 });
 
 afterEach(() => {
