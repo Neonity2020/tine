@@ -10,6 +10,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Added
 
+- **Hierarchical Ctrl/Cmd+A and symmetric Shift+Up block selection.** In the
+  editor, Ctrl/Cmd+A still selects the block's text first; a further press
+  selects the block's subtree, then each ancestor's subtree, then the whole
+  visible outline, where it stays. Shift+ArrowUp extended onto a parent no
+  longer leaves the parent's later children behind: a selection that includes
+  an ancestor of its anchor covers that ancestor's whole visible subtree,
+  mirroring Shift+ArrowDown.
 - **Block-boundary keyboard navigation and forward merge.** At the exact end
   of a block, Delete now merges the next visible block's text and children in
   (mirroring Backspace's merge into the previous block at offset 0), and

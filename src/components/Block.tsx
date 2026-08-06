@@ -58,6 +58,7 @@ import {
   moveBlockFeed,
   moveItem,
   selectBlock,
+  selectBlockSubtree,
   extendSelectionTo,
   clearSelection,
   moveSelection,
@@ -636,6 +637,9 @@ const SHEET_CELL_BLOCKED_EDITOR_COMMANDS = new Set([
   "editor/move-block-down",
   "editor/select-block-up",
   "editor/select-block-down",
+  // The grid owns mod+a (whole-grid selection) — a cell editor must not
+  // escalate into outline block selection.
+  "editor/select-all",
 ]);
 
 interface EditGesture {
@@ -2546,6 +2550,18 @@ export function Editor(props: { id: string }): JSX.Element {
     "editor/expand": (e) => { e.preventDefault(); setCollapsed(props.id, false); return true; },
     "editor/select-block-up": (e) => selectBlockCmd(e, -1),
     "editor/select-block-down": (e) => selectBlockCmd(e, 1),
+    "editor/select-all": (e) => {
+      // GH #262: first press keeps the native select-all-text behaviour
+      // (return false without preventDefault). A press with the text already
+      // fully selected escalates to a block-level subtree selection; later
+      // presses climb ancestors in selection mode (keybindings.ts).
+      const fullySelected = ref.selectionStart === 0 && ref.selectionEnd === ref.value.length;
+      if (!fullySelected) return false;
+      e.preventDefault();
+      commit(ref.value);
+      selectBlockSubtree(props.id, outlineScope);
+      return true;
+    },
     "editor/cycle-todo": (e) => { e.preventDefault(); cycleTodoCmd(); return true; },
     "editor/indent": (e) => {
       e.preventDefault();
