@@ -57,6 +57,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A page whose file was replaced behind Tine's back is no longer stranded.**
+  Some tools replace a file wholesale even when its contents don't change —
+  OneDrive filling in a file it had only been holding a placeholder for, a sync
+  client landing the same bytes, a plain copy over the top. Tine checks both that
+  the contents are what you started from *and* that it is the same file it read,
+  so these left a page it refused to save: "existing page identity changed since
+  load". Worse, the conflict prompt that followed had no working way out —
+  "Keep mine" hit the same check and failed, and the only button that did
+  anything threw your edit away. When the contents on disk are still exactly what
+  you started from, Tine now accepts the replacement quietly. A file whose
+  contents really did change is still a genuine conflict and still asks you.
+- **One symlink no longer makes your whole graph read-only.** A symbolic link
+  anywhere Tine looks — at the top of the graph, in `pages/`, in a folder of your
+  own — made *every* save fail, including saves of completely unrelated pages.
+  Tine never followed symlinks anyway; the pre-save check was the only place that
+  treated finding one as fatal rather than as something to step over. It now
+  steps over it. (Importing a graph into managed storage still stops, because
+  quietly leaving a file out of an import is worse than refusing it.)
+- **Errors that a conflict prompt can't fix no longer pretend to be conflicts.**
+  Several unrelated save failures — two files whose names collide on
+  case-insensitive filesystems, two paths pointing at the same physical file,
+  another page already holding the title — all surfaced as "this page changed on
+  disk", offering you a choice between two options that could not resolve any of
+  them. Whichever you picked, the page was then marked as conflicted and silently
+  stopped saving. Each now reports what actually happened.
 - **Saving a page no longer re-reads and re-analyses your whole graph
   (GH #267).** Before writing, Tine checks that no other file in the graph is
   about to collide with the one you are saving. Whenever it had lost track of

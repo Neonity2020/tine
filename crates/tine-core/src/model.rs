@@ -7759,7 +7759,7 @@ impl Graph {
         require_projection_platform()?;
         let permit = self.admit_managed_text_writer()?;
         let first = collect_initial_shadow_managed_inventory_with_limits_inner(
-            self, &permit, true, limits, 0, false,
+            self, &permit, true, limits, 0, false, true,
         )?;
         initial_shadow_revalidation_hook(&self.root)?;
         let second = collect_initial_shadow_managed_inventory_with_limits_inner(
@@ -7769,6 +7769,7 @@ impl Graph {
             limits,
             first.peak_build_charge,
             false,
+            true,
         )?;
         if !initial_shadow_captures_match(&first, &second) {
             return Err(io::Error::new(
@@ -18199,6 +18200,7 @@ impl Graph {
                 "managed text watcher snapshot changed before reconciliation",
             ));
         }
+        self.repin_retained_identity_at_equal_bytes(path, &content, identity);
         // The watcher consumes the self-write marker (one-shot) so the map stays
         // bounded to in-flight writes.
         let reconciled = match self.sync_file_content(Some(&write), path, &content, true) {
@@ -19044,6 +19046,42 @@ impl Graph {
         // journal overlay. Publishing an exact pinned target must not warm or
         // maintain the legacy parsed-Graph cache on the foreground save path.
         Ok((path, false))
+    }
+
+    /// Re-pin a loaded page's retained file identity when the file was replaced
+    /// atomically with **byte-identical** content.
+    ///
+    /// A save proves it is not clobbering someone else's work two ways: the
+    /// editor's `base_rev` must still match the bytes on disk, and the file must
+    /// still be the same physical file that was read at load. External tools
+    /// break the second without touching the first — OneDrive rehydrating a
+    /// Files-On-Demand placeholder, a Syncthing pull that lands the same bytes,
+    /// a `cp` over a hardlink. The path then holds exactly the bytes the editor
+    /// started from, but a different inode.
+    ///
+    /// Before this, every later save of that page failed with "existing page
+    /// identity changed since load", and both exits from the resulting conflict
+    /// prompt were dead ends: "Keep mine (overwrite)" re-ran the same check and
+    /// failed too, and "Use disk version" discarded the user's edit. The user
+    /// could not save, and the only button that worked lost their work.
+    ///
+    /// This re-pins the identity **only** when the retained revision still
+    /// matches the bytes now on disk, so the proof it stands on is unchanged.
+    /// A file whose content differs is a real external change and still
+    /// conflicts.
+    fn repin_retained_identity_at_equal_bytes(
+        &self,
+        path: &Path,
+        content: &str,
+        identity: ContentDigest,
+    ) {
+        let revision = content_rev(content);
+        let mut retained = self.loaded_file_identities.write().unwrap();
+        if let Some((captured_revision, captured_identity)) = retained.get_mut(path) {
+            if *captured_revision == revision {
+                *captured_identity = identity;
+            }
+        }
     }
 
     fn require_pinned_save_owner(
@@ -27988,6 +28026,7 @@ fn collect_initial_shadow_managed_inventory_with_limits(
         limits,
         simultaneous_capture_bytes,
         true,
+        false,
     )
 }
 
@@ -27998,6 +28037,7 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
     limits: InitialShadowLimits,
     simultaneous_capture_bytes: u64,
     require_ambient_binding: bool,
+    skip_symlinks: bool,
 ) -> io::Result<InitialShadowCapture> {
     struct PendingDirectory {
         directory: Dir,
@@ -28103,9 +28143,27 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
             };
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
-                if !graph.graph_text_scope.should_descend(&child_relative)
-                    && !graph.graph_text_scope.is_eligible(&child_relative)
+                if skip_symlinks
+                    || (!graph.graph_text_scope.should_descend(&child_relative)
+                        && !graph.graph_text_scope.is_eligible(&child_relative))
                 {
+                    // GH #267 / F3. A symlink anywhere in a descended scope used
+                    // to abort this capture, and because the save path takes the
+                    // capture to answer a filename question, that made the whole
+                    // graph permanently unsaveable -- one symlink in `pages/`
+                    // and none of the user's OTHER pages could be written.
+                    //
+                    // Skipping is what the rest of Tine already does: every
+                    // traversal here is no-follow, the watcher's snapshot walk
+                    // never descends a symlinked directory, and
+                    // `graph_inventory_entry` never admits a symlinked file. A
+                    // symlink is not a graph-text document on any other path, so
+                    // the capture stops being the one place that escalates it to
+                    // an error that costs the user their other pages.
+                    //
+                    // `skip_symlinks` is false for the shadow-import bootstrap,
+                    // which still refuses: importing a graph must not silently
+                    // leave out a file the user considers part of it.
                     continue;
                 }
                 return Err(io::Error::new(
@@ -38781,21 +38839,55 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
 
-        // (b) a symlink in pages/ IS in scope, and takes down an unrelated save.
-        let dir = scratch("symlink-scope-pages");
+        // (b) a symlink in pages/ IS in a descended scope. It used to abort the
+        // guarded capture and therefore take down every OTHER page's save --
+        // "one symlink and my graph is read-only". It is now skipped, exactly as
+        // every other traversal in Tine already skips it.
+        for (tag, link, target) in [
+            (
+                "symlink-scope-pages-file",
+                "pages/Alias.md",
+                "pages/Target.md",
+            ),
+            ("symlink-scope-pages-dir", "pages/Linked", "pages"),
+            ("symlink-scope-root-dir", "Linked", "pages"),
+        ] {
+            let dir = scratch(tag);
+            fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+            symlink(dir.join(target), dir.join(link)).unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+            let base = content_rev("- before\n");
+            graph.save_page(&page, Some(&base)).unwrap_or_else(|error| {
+                panic!("a symlink at {link} must not block an unrelated save: {error}")
+            });
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The symlink skip is scoped to the save-time admission capture. Importing
+    /// a graph into managed storage still refuses, because an import that
+    /// silently leaves out a file the user considers part of their graph is a
+    /// different and worse failure than a refused import.
+    #[cfg(unix)]
+    #[test]
+    fn the_shadow_import_capture_still_refuses_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("symlink-import-refuses");
         fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
         symlink(dir.join("pages/Target.md"), dir.join("pages/Alias.md")).unwrap();
         let graph = Graph::open(&dir);
-        graph.warm_cache();
-        let page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
-        let base = content_rev("- before\n");
-        let error = graph
-            .save_page(&page, Some(&base))
-            .expect_err("a symlink inside pages/ currently aborts the guarded capture");
-        assert_eq!(
-            direct_save_failure_code(&error),
-            "precheck.symlink",
-            "unexpected failure class: {error}"
+        let permit = graph.admit_managed_text_writer().unwrap();
+        let error = match collect_initial_shadow_managed_inventory(&graph, &permit, true) {
+            Ok(_) => panic!("the import capture must still refuse a symlink in scope"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert!(
+            error.to_string().contains("symlink or reparse point"),
+            "{error}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -38929,6 +39021,73 @@ mod tests {
              ({incremental} vs {full})"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replace `relative` atomically with `content`, giving the path a NEW inode
+    /// while its bytes may be unchanged. This is what OneDrive rehydration, a
+    /// Syncthing pull and a plain `cp` into place all look like from Tine.
+    fn replace_file_with_a_new_inode(dir: &Path, relative: &str, content: &[u8]) {
+        let target = dir.join(relative);
+        let staged = dir.join(format!("{relative}.replacement"));
+        fs::write(&staged, content).unwrap();
+        fs::rename(&staged, &target).unwrap();
+    }
+
+    /// GH #267 / F4. An external tool replacing a file with byte-identical
+    /// content used to strand the page: the save refused with "existing page
+    /// identity changed since load", "Keep mine (overwrite)" hit the same check,
+    /// and the only working button discarded the user's edit.
+    #[test]
+    fn a_same_bytes_external_replace_does_not_strand_the_editor() {
+        let dir = scratch("same-bytes-replace");
+        fs::write(dir.join("pages/Foo.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut page = graph.load_by_path("pages/Foo.md").unwrap().unwrap();
+        let base_rev = page.rev.clone().expect("loaded page carries its revision");
+
+        // Same bytes, new inode.
+        replace_file_with_a_new_inode(&dir, "pages/Foo.md", b"- before\n");
+        graph.sync_file_checked(&dir.join("pages/Foo.md")).unwrap();
+
+        page.blocks[0].raw = "edited after the replace".into();
+        graph
+            .save_page(&page, Some(&base_rev))
+            .expect("the path holds exactly the bytes the editor loaded");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Foo.md")).unwrap(),
+            "- edited after the replace\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction, which must NOT change: a replace that also changes
+    /// the bytes is a real external edit and still conflicts.
+    #[test]
+    fn a_changed_bytes_external_replace_still_conflicts() {
+        let dir = scratch("changed-bytes-replace");
+        fs::write(dir.join("pages/Foo.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut page = graph.load_by_path("pages/Foo.md").unwrap().unwrap();
+        let base_rev = page.rev.clone().expect("loaded page carries its revision");
+
+        replace_file_with_a_new_inode(&dir, "pages/Foo.md", b"- changed elsewhere\n");
+        graph.sync_file_checked(&dir.join("pages/Foo.md")).unwrap();
+
+        page.blocks[0].raw = "edited after the replace".into();
+        let error = graph
+            .save_page(&page, Some(&base_rev))
+            .expect_err("an external edit must still raise a conflict");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Foo.md")).unwrap(),
+            "- changed elsewhere\n",
+            "the refused save must not have written anything"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

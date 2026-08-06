@@ -315,7 +315,15 @@ async function doSave(
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
-    if (String(e).includes("conflict")) {
+    // The backend says "conflict" and nothing else for a real base-revision
+    // conflict. Match it exactly: a substring test used to catch every other
+    // backend `AlreadyExists` too -- a portable-filename collision, a
+    // physical-resource alias, "another document owns this page identity" --
+    // and mark the page conflicted, which puts up a prompt whose only two
+    // options cannot resolve any of them AND stops the page saving from then on.
+    // Those now arrive with their own bounded code and fall through to the
+    // retry/toast path below.
+    if (String(e) === "conflict" || String(e) === "Error: conflict") {
       clearTransientRetry(name);
       markConflict(name);
     } else if (token === graphToken) {

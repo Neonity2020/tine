@@ -2372,6 +2372,83 @@
     "failBefore": "proven"
    },
    "notes": "A Direct save validates its target against a guarded graph-wide admission index. Whenever the exact-observation chain had broken -- which on Windows and in poll mode was permanent before REG-EXTERNAL-GRAPH-WIDE-EVENTS-268 and REG-POLL-MODE-ADMISSION-INDEX-REBUILD-001 -- rebuilding that index PARSED EVERY DOCUMENT IN THE GRAPH, on every save. An invalidation means 'we lost track of the filesystem', not 'everything changed': the capture already carries a per-file BlobDescription (SHA-256 of the content plus its length), so a rebuild now reuses the prior index's parsed semantics for every file whose digest is unchanged and parses only what actually moved. Soundness rests on a new per-record `semantic_parsed` flag: a record whose semantic came from the page cache or from its filename is a guess and is never reused, so the reuse cannot launder a guess into something later builds treat as parsed. Fail-before proven by disabling the reuse in place: a rebuild then parsed 27 documents whether or not anything had changed, against 3 (nothing changed) and 4 (one document changed) with it. Measured on a synthetic 1,001-page / 12 MB graph, release build, local ext4: a save that rebuilds went 81 ms -> 62 ms, with the index-construction phase 29 ms -> 9 ms and decode_semantics still true (authority preserved). The remaining ~50 ms is the two-pass capture, which still reads every file; that cut is not in this change. Two simpler designs were tried and rejected with evidence, both recorded in the handoff: threading a `need_semantics` flag into the cache-hit test forced an index rebuild MID-WRITE, when the save's own .editor-recovery file still aliases the target's inode, and failed the save outright; and skipping the parse for saves alone opened a real hole where a page creation could be admitted over an externally retitled document. Also note the codebase's standing contract, asserted by generation_bound_identity_validation_avoids_save_time_graph_reparse, that name-only creation must not run a per-document parse pass -- any future cut here has to keep it."
+  },
+  {
+   "id": "REG-SAME-BYTES-EXTERNAL-REPLACE-STRANDS-EDITOR-001",
+   "title": "A page whose file was replaced with identical content can still be saved instead of stranding the edit",
+   "family": "direct-save-data-safety",
+   "sources": {
+    "issues": [
+     267
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "macos",
+    "windows"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::a_same_bytes_external_replace_does_not_strand_the_editor",
+     "crates/tine-core/src/model.rs::a_changed_bytes_external_replace_still_conflicts"
+    ],
+    "scenario": "direct-markdown.external-atomic-replace",
+    "failBefore": "proven"
+   },
+   "notes": "A save proves it is not clobbering someone else's work two ways: base_rev must still match the bytes on disk, AND the file must still be the same physical file read at load. External tools break the second without touching the first -- OneDrive rehydrating a Files-On-Demand placeholder, a Syncthing pull landing identical bytes, cp over a hardlink. Every later save then failed with 'existing page identity changed since load', and BOTH exits from the resulting conflict prompt were dead ends: Keep-mine re-ran the same check and failed too, and Use-disk-version discarded the user's edit. The watcher now re-pins the retained identity when, and only when, the retained revision still matches the bytes now on disk, so the proof it stands on is unchanged. Fail-before proven by disabling the re-pin in place. The control (a replace that also changes the bytes) still conflicts and still writes nothing, and is asserted alongside."
+  },
+  {
+   "id": "REG-SYMLINK-BLOCKS-ALL-SAVES-001",
+   "title": "A symlink inside the graph does not make every other page unsaveable",
+   "family": "direct-save-data-safety",
+   "sources": {
+    "issues": [
+     267
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "macos"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::a_symlink_blocks_saves_only_inside_a_descended_scope",
+     "crates/tine-core/src/model.rs::the_shadow_import_capture_still_refuses_a_symlink"
+    ],
+    "scenario": "direct-markdown.symlink-in-scope",
+    "failBefore": "proven"
+   },
+   "notes": "One symlink in a descended, non-excluded scope (graph root, pages/, journals/, a custom folder) aborted the save-time admission capture, and because every Direct save takes that capture to answer a filename question, the whole graph became read-only -- the user's OTHER pages could not be saved either. Skipping is what the rest of Tine already does: every traversal is no-follow, the watcher snapshot never descends a symlinked directory, and graph_inventory_entry never admits a symlinked file, so the capture was the only place escalating a non-entity to a fatal error. The shadow-import bootstrap capture still refuses, asserted separately: an import that silently leaves out a file the user considers part of their graph is a worse failure than a refused import. NOTE the audit's own repro for this finding is WRONG -- it used assets/, which is fixed-excluded, so that experiment goes green and would retire a real finding; both halves are asserted in one test so nobody re-runs it. Known bounded gap: a symlink is no longer a member of the portable-key collision group, matching discovery, which never knew about it either."
+  },
+  {
+   "id": "REG-SAVE-ERROR-MISCLASSIFIED-AS-CONFLICT-001",
+   "title": "Save failures that a conflict prompt cannot resolve are reported as themselves, not as a content conflict",
+   "family": "direct-save-data-safety",
+   "sources": {
+    "issues": [
+     267
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src-tauri/src/commands.rs::only_a_real_base_revision_conflict_raises_the_conflict_prompt"
+    ],
+    "scenario": "direct-markdown.save-error-classification",
+    "failBefore": "proven"
+   },
+   "notes": "The backend collapsed EVERY io::ErrorKind::AlreadyExists to the literal string 'conflict', and the frontend recognised a conflict by testing whether the message CONTAINED that substring. A portable-filename collision, a physical-resource alias, a symlink refusal and 'another document owns this page identity' therefore all raised the content-conflict prompt, whose only options are Keep-mine and Use-disk-version -- neither of which can resolve any of them. Choosing either left the page marked conflicted, and a conflicted page silently refuses to save from then on, so the user's page was stranded by an error message. Only a real base-revision conflict carries the 'conflict' contract now; everything else carries its bounded D0 failure code as a stable prefix and falls through to the retryable path. The frontend match is exact rather than substring. Fail-before is structural and asserted directly on the mapping function."
   }
  ]
 }

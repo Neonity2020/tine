@@ -768,6 +768,29 @@ fn collect_graph_text(
 /// anything a user would notice as a hitch is on the record.
 const DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS: u128 = 150;
 
+/// Turn a failed Direct save into a message the frontend can act on.
+///
+/// The old mapping collapsed EVERY `AlreadyExists` to the literal string
+/// "conflict", and the frontend recognised a conflict by testing whether the
+/// message contained that substring. So a portable-filename collision, a
+/// physical-resource alias, or "another document owns this page identity" all
+/// raised the content-conflict prompt — whose two buttons are "Keep mine
+/// (overwrite)" and "Use disk version", neither of which can resolve any of
+/// them. Choosing either left the page marked conflicted, and a conflicted page
+/// silently refuses to save from then on.
+///
+/// Only a real base-revision conflict gets the "conflict" contract now. Every
+/// other failure carries its bounded code as a stable prefix, so the frontend
+/// can classify it without sniffing prose and the user gets an error they can
+/// read instead of a prompt that cannot help.
+fn direct_save_error_message(error: std::io::Error) -> String {
+    let code = tine_core::model::direct_save_failure_code(&error);
+    match code {
+        "conflict.base_rev" | "conflict.other" => "conflict".to_string(),
+        _ => format!("{code}: {error}"),
+    }
+}
+
 /// Report what a slow or failed Direct-Markdown save actually did.
 ///
 /// Always on. Every field is a duration, a count, or a bounded failure code --
@@ -870,13 +893,7 @@ pub(crate) async fn save_page(
                         );
                     }
                     report_direct_save_diagnostics(&graph, elapsed, result.as_ref().err());
-                    result.map_err(|error| {
-                        if error.kind() == std::io::ErrorKind::AlreadyExists {
-                            "conflict".to_string()
-                        } else {
-                            error.to_string()
-                        }
-                    })
+                    result.map_err(direct_save_error_message)
                 }
             }
         };
@@ -2984,4 +3001,58 @@ pub(crate) fn save_pdf_area_image(
         g.write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
             .map_err(|e| e.to_string())
     })
+}
+
+#[cfg(test)]
+mod direct_save_error_tests {
+    use super::direct_save_error_message;
+    use std::io;
+
+    /// The frontend puts up a conflict prompt ("Keep mine" / "Use disk version")
+    /// for exactly one message, and a page it marks conflicted stops saving until
+    /// the user resolves it. So the set of failures that produce that message is
+    /// a contract, not a formatting detail: anything in it that the two buttons
+    /// cannot resolve strands the page.
+    #[test]
+    fn only_a_real_base_revision_conflict_raises_the_conflict_prompt() {
+        assert_eq!(
+            direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, "conflict")),
+            "conflict"
+        );
+
+        for (message, expected_code) in [
+            (
+                "graph text paths share one portable case/NFC identity: pages/foo.md and pages/Foo.md",
+                "precheck.portable_collision",
+            ),
+            (
+                "graph text files alias one physical resource: pages/a.md and pages/b.md",
+                "precheck.resource_alias",
+            ),
+            (
+                "managed text entry is a symlink or reparse point: pages/Alias.md",
+                "precheck.symlink",
+            ),
+            (
+                "existing page identity changed since load",
+                "identity.changed_since_load",
+            ),
+            (
+                "another graph document owns this effective page identity",
+                "identity.owned_elsewhere",
+            ),
+        ] {
+            let reported =
+                direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, message));
+            assert!(
+                reported.starts_with(expected_code),
+                "{message} should report as {expected_code}, got {reported}"
+            );
+            assert_ne!(
+                reported, "conflict",
+                "{message} cannot be resolved by keep-mine or use-disk, so it must not \
+                 raise the conflict prompt"
+            );
+        }
+    }
 }
