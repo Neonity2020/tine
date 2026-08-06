@@ -61,11 +61,16 @@ function planningOf(raw: string, tag: "SCHEDULED" | "DEADLINE"): string | undefi
 }
 function tagsOf(raw: string): string[] {
   const out: string[] = [];
-  // (?<!\[) keeps the [#A] priority token from leaking a fake #A tag.
-  const re = /#\[\[([^\]]+)\]\]|(?<!\[)#([\w/_.-]+)/g;
+  // Group 2 (start-of-string or a non-"[" char) keeps the [#A] priority token
+  // from leaking a fake #A tag — the same job a negative lookbehind would do.
+  // Lookbehind is NOT used on purpose: pre-16.4 Safari/WKWebView cannot parse
+  // it and this module ships in the eagerly preloaded bundle, which gave a
+  // white screen at startup on macOS 12 (GH #256, guarded by
+  // src/webkitCompat.test.ts).
+  const re = /#\[\[([^\]]+)\]\]|(^|[^\[])#([\w/_.-]+)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(raw))) {
-    const tag = (m[1] ?? m[2]).trim();
+    const tag = (m[1] ?? m[3]).trim();
     if (tag && !out.some((t) => t.toLowerCase() === tag.toLowerCase())) out.push(tag);
   }
   return out;
