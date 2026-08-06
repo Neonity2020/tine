@@ -10146,9 +10146,18 @@ mod tests {
         assert_eq!(plan.status(), ImportPlanStatus::Reconcile);
         let counters = projection_store_test_counters();
         assert_eq!(counters.catalog_directory_entries, 0);
+        // Three point loads, none of which may grow with the 32 unrelated pages
+        // this fixture also holds: one per snapshot pass in
+        // `capture_affected_catalog`, plus one in
+        // `receipt_backed_live_projection_predecessor`, which proves the
+        // durable semantic predecessor across an unsafe reopen. That third load
+        // arrived with `7e4d11ee` ("Repair durable managed projection
+        // predecessors") ten days after this assertion was written; the
+        // invariant it guards — point loads only, never a scan, which
+        // `catalog_directory_entries == 0` above states directly — is unchanged.
         assert_eq!(
-            counters.completion_lookups, 2,
-            "only the requested receipt is point-loaded in each snapshot pass"
+            counters.completion_lookups, 3,
+            "only the requested receipt is point-loaded, once per snapshot pass and once for the predecessor proof"
         );
         assert_eq!(plan.instrumentation().catalog_entries, 2);
     }
