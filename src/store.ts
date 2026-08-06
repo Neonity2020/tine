@@ -3076,9 +3076,9 @@ export function selectedIds(): string[] {
   // the slice [parent … anchor], omitting the parent's later children — a
   // partial-subtree selection that copy/cut/move received as "parent without
   // its children". (Shift+Down is the semantic reverse and never produces it:
-  // a parent's children all follow it in visible order.) When the slice's top
-  // any member of the slice that is an ancestor of the anchor may hold a
-  // partial subtree inside the slice; complete its visible subtree.
+  // a parent's children all follow it in visible order.) In a reverse slice,
+  // any member that is an ancestor of the anchor may hold a partial subtree
+  // inside the slice; complete its visible subtree.
   if (i > j) {
     for (let k = lo; k <= hi; k++) {
       if (isAncestorId(order[k], a)) {
