@@ -30474,7 +30474,20 @@ fn rename_managed_noreplace(
     destination_dir: &Dir,
     destination: &str,
 ) -> io::Result<()> {
-    source_dir.rename(source, destination_dir, destination)
+    // Every other platform gives this function a real no-replace primitive
+    // (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(RENAME_EXCL)`). Windows used
+    // `Dir::rename`, which cap-std implements with replace semantics — so the
+    // one guarantee the name promises was the one Windows did not provide, and
+    // an external file landing in the check-to-rename window was clobbered.
+    //
+    // `rename_projection_between_noreplace` is the same operation done properly:
+    // it opens the source with DELETE access through the retained directory
+    // capability and renames that exact handle with
+    // `FileRenameInformation`/`ReplaceIfExists = FALSE`, rejecting filesystems
+    // that cannot provide the primitive BEFORE the live source name is retired.
+    // It already takes separate source and destination directories, so this is
+    // the cross-directory case it was written for.
+    rename_projection_between_noreplace(source_dir, source, destination_dir, destination)
 }
 
 #[cfg(not(any(
