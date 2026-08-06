@@ -785,10 +785,15 @@ const DIRECT_SAVE_DIAGNOSTIC_THRESHOLD_MS: u128 = 150;
 /// read instead of a prompt that cannot help.
 fn direct_save_error_message(error: std::io::Error) -> String {
     let code = tine_core::model::direct_save_failure_code(&error);
-    match code {
-        "conflict.base_rev" | "conflict.other" => "conflict".to_string(),
-        _ => format!("{code}: {error}"),
+    // `conflict.*` is the one family the frontend turns into the keep-mine /
+    // use-disk banner, so membership is decided in `direct_save_failure_code`
+    // by naming the condition, never by a catch-all on an error kind. Matching
+    // the prefix keeps that set open to new named conflicts without this arm
+    // silently widening to cover unclassified failures.
+    if code.starts_with("conflict.") {
+        return "conflict".to_string();
     }
+    format!("{code}: {error}")
 }
 
 /// Report what a slow or failed Direct-Markdown save actually did.
@@ -3041,6 +3046,24 @@ mod direct_save_error_tests {
                 "another graph document owns this effective page identity",
                 "identity.owned_elsewhere",
             ),
+            (
+                "a page with that name already exists",
+                "identity.name_taken",
+            ),
+            (
+                "target page exists in another supported text extension",
+                "identity.name_taken",
+            ),
+            // The class this contract exists to keep out: an unclassified
+            // AlreadyExists. It used to reach a `conflict.other` catch-all, so
+            // a failure that had PRESERVED the user's bytes under a recovery
+            // name was reported as a bare "conflict" -- the one message that
+            // both hides the retention text and offers a "use disk" button
+            // that throws those very edits away.
+            (
+                "displaced target retained as pages/Note.md.editor-recovery",
+                "unknown",
+            ),
         ] {
             let reported =
                 direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, message));
@@ -3054,5 +3077,19 @@ mod direct_save_error_tests {
                  raise the conflict prompt"
             );
         }
+    }
+
+    /// The counterpart: a page whose file moved between load and save IS a
+    /// content conflict, and since `011658a9` "keep mine" can actually resolve
+    /// it. It must reach the prompt.
+    #[test]
+    fn an_unobserved_external_change_still_raises_the_conflict_prompt() {
+        assert_eq!(
+            direct_save_error_message(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "path-pinned page does not match its captured exact owner",
+            )),
+            "conflict"
+        );
     }
 }

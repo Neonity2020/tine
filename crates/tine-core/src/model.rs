@@ -29870,11 +29870,33 @@ pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
         "identity.changed_since_load"
     } else if has("owns this effective page identity") {
         "identity.owned_elsewhere"
+    } else if has("does not match its captured exact owner") {
+        // The file changed between load and save without the watcher seeing it.
+        // A genuine content conflict, and one "keep mine" can now resolve.
+        "conflict.pinned_owner"
     } else if message == "conflict" {
         "conflict.base_rev"
-    } else if error.kind() == io::ErrorKind::AlreadyExists {
-        "conflict.other"
+    } else if has("a page with that name already exists")
+        || has("target page exists")
+        || has("target page identity already exists elsewhere")
+    {
+        "identity.name_taken"
     } else {
+        // Deliberately NOT a `conflict.*` catch-all on AlreadyExists.
+        //
+        // Every `conflict.*` code becomes the literal string the frontend
+        // matches to raise the keep-mine/use-disk banner, and that banner can
+        // only resolve a content conflict. `AlreadyExists` is raised by roughly
+        // forty-five other conditions in this module -- managed and projection
+        // internals, reservation-name collisions, recovery-name collisions --
+        // for which the banner offers two buttons that cannot help and whose
+        // "use disk" arm discards the user's edits. Worse, the catch-all
+        // replaced the message text, so a failure that RETAINED the user's
+        // bytes under a recovery name reached them as an unexplained conflict.
+        //
+        // An unclassified failure now reports its real message. If a new
+        // condition genuinely is a resolvable conflict, give it its own
+        // `conflict.*` code above, where the decision is visible.
         "unknown"
     }
 }
@@ -38930,6 +38952,43 @@ mod tests {
             (
                 "conflict.base_rev",
                 Error::new(ErrorKind::AlreadyExists, "conflict"),
+            ),
+            // `require_pinned_save_owner`, LoadedRevision arm: the file moved
+            // between load and save without the watcher seeing it. A real
+            // conflict, and one "keep mine" resolves.
+            (
+                "conflict.pinned_owner",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "path-pinned page does not match its captured exact owner",
+                ),
+            ),
+            // Name collisions are real but are NOT content conflicts: the
+            // keep-mine/use-disk prompt cannot resolve one.
+            (
+                "identity.name_taken",
+                Error::new(ErrorKind::AlreadyExists, "a page with that name already exists"),
+            ),
+            (
+                "identity.name_taken",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "target page exists in another supported text extension",
+                ),
+            ),
+            // The inversion this classifier exists for: an UNCLASSIFIED
+            // AlreadyExists must not become a conflict. It used to fall into a
+            // `conflict.other` catch-all, which raised a prompt whose two
+            // options could not resolve it and whose "use disk" arm discards
+            // the user's edits -- and which replaced the message text, so a
+            // failure that had RETAINED those edits under a recovery name
+            // reached the user as an unexplained conflict.
+            (
+                "unknown",
+                Error::new(
+                    ErrorKind::AlreadyExists,
+                    "displaced target retained as pages/Note.md.editor-recovery",
+                ),
             ),
             (
                 "unknown",

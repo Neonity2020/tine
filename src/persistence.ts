@@ -230,6 +230,7 @@ export function isRetryableSaveFailure(error: unknown): boolean {
     "precheck.nofollow",
     "precheck.limit",
     "identity.owned_elsewhere",
+    "identity.name_taken",
   ].some((code) => message.includes(code));
 }
 
@@ -242,8 +243,15 @@ function scheduleTransientRetry(name: string, token: number, error: unknown) {
   const failures = (transientFailures.get(name) ?? 0) + 1;
   transientFailures.set(name, failures);
   if (failures >= 3) {
+    // Automatic retries stop here. The caller has already put the page back in
+    // `dirty`, so it still saves on the next edit or flush — but nothing is
+    // scheduled, and the old copy ("will retry") implied a timer that does not
+    // exist. Say what actually happens.
     transientFailures.delete(name);
-    pushToast(`Couldn't save “${name}” — will retry. (${String(error)})`, "error");
+    pushToast(
+      `Couldn't save “${name}” after 3 tries — it will be retried when you next edit it. (${String(error)})`,
+      "error"
+    );
     return;
   }
   const prior = retryTimers.get(name);
