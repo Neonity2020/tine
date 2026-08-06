@@ -394,6 +394,15 @@ pub(crate) struct PromotedRuntimeOpenInstrumentation {
     pub(crate) engine_open: Duration,
     pub(crate) sqlite_open: Duration,
     pub(crate) tail_construction: Duration,
+    /// Which branch the disposable SQLite projection actually took at open, and
+    /// what the rebuild did if it rebuilt. `sqlite_open` alone cannot distinguish
+    /// "reopened a valid projection slowly" from "threw it away and rebuilt the
+    /// whole graph", and those have opposite fixes.
+    pub(crate) projection_recovery: &'static str,
+    pub(crate) projection_rebuild_reason: String,
+    pub(crate) projection_applied_batches: usize,
+    pub(crate) projection_bulk_pages_materialized: usize,
+    pub(crate) projection_ancestry_full_scans: usize,
     pub(crate) engine: super::hot_engine::EnrolledProjectionOpenInstrumentation,
 }
 
@@ -436,6 +445,11 @@ fn record_promoted_runtime_mint(
     record.engine_open = timing.engine_open;
     record.sqlite_open = timing.sqlite_open;
     record.tail_construction = timing.tail_construction;
+    record.projection_recovery = timing.projection_recovery;
+    record.projection_rebuild_reason = timing.projection_rebuild_reason;
+    record.projection_applied_batches = timing.projection_applied_batches;
+    record.projection_bulk_pages_materialized = timing.projection_bulk_pages_materialized;
+    record.projection_ancestry_full_scans = timing.projection_ancestry_full_scans;
     record.engine = timing.engine;
 }
 
@@ -5550,6 +5564,29 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     #[cfg(test)]
     {
         timing.sqlite_open = phase_started.elapsed();
+        let opened = projection.projection();
+        let (recovery, reason, applied) = match &opened.recovery {
+            super::sqlite::ProjectionRecovery::OpenedExisting => {
+                ("opened-existing", String::new(), 0)
+            }
+            super::sqlite::ProjectionRecovery::RebuiltMissing { applied_batches } => {
+                ("rebuilt-missing", String::new(), *applied_batches)
+            }
+            super::sqlite::ProjectionRecovery::RebuiltPreservingEvidence {
+                reason,
+                applied_batches,
+                ..
+            } => (
+                "rebuilt-preserving-evidence",
+                reason.clone(),
+                *applied_batches,
+            ),
+        };
+        timing.projection_recovery = recovery;
+        timing.projection_rebuild_reason = reason;
+        timing.projection_applied_batches = applied;
+        timing.projection_bulk_pages_materialized = opened.rebuild.bulk_pages_materialized;
+        timing.projection_ancestry_full_scans = opened.rebuild.ancestry_full_scans;
     }
     let sqlite_open = sqlite_open_started.map(|started| started.elapsed());
 

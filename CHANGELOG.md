@@ -57,6 +57,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Reopening a lived-in graph after a crash is dramatically faster.** Opening a
+  managed graph that had been edited over many sessions could stall for over a
+  minute after an unclean shutdown while it rebuilt its search/index database.
+  Almost all of that time was spent re-reading one whole-graph manifest — and
+  re-scanning it — once per page, so the delay grew far faster than the graph
+  did. Each page's checkpoint is still individually verified against exactly the
+  same evidence; that evidence is now resolved once per batch instead of once
+  per page. Measured on a 1,046-file graph: 72 s to 20 s, and the same reopen on
+  a 350-file graph fell from 12 s to 3 s.
 - **A page you are editing is no longer falsely reported as “changed on disk.”**
   Editing a block and immediately moving it could raise the “changed on disk
   (edited elsewhere or synced in)” banner with no external editor or sync

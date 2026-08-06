@@ -6673,6 +6673,30 @@ pub struct ShardedHotEngine {
     status_point_cache: RefCell<BTreeMap<BatchId, Option<ColdHistoryRecord>>>,
     external_anchor_point_cache:
         RefCell<BTreeSet<(DocumentId, BatchId, ContentDigest, ContentDigest)>>,
+    // Observed manifests memoized for the SAME public operation as the two
+    // point caches above, and cleared with them.
+    //
+    // A manifest is immutable content addressed by its batch id, but resolving
+    // one is not cheap: it may clone a manifest carrying a descriptor per
+    // document, or reload and revalidate an entire retained bootstrap part off
+    // disk. Anchor validation needs the manifest *per document*, and every
+    // document of one bootstrap batch names that same batch — so without this
+    // memo a rebuild reloads one whole-graph manifest once per page, which is
+    // quadratic in graph size and was the dominant cost of crash reopen.
+    //
+    // This memoizes only WHERE the manifest was found, never WHETHER the
+    // record matches it: each document still proves its own descriptor digest
+    // and manifest fingerprint against the manifest below.
+    observed_manifest_point_cache: RefCell<BTreeMap<BatchId, Arc<OperationBatch>>>,
+    // The retained bootstrap part behind those manifests, memoized under the
+    // same operation scope, together with its document -> CrdtUpdate index.
+    //
+    // Resolving one document's archive object otherwise reloaded the entire
+    // retained part from disk AND scanned every object in it — the second
+    // per-document whole-graph cost in the same anchor validation. The index is
+    // built once per memoized part so the per-document step is a lookup.
+    retained_bootstrap_part_point_cache:
+        RefCell<BTreeMap<BatchId, Arc<BTreeMap<DocumentId, OperationObject>>>>,
     // At most one decoded page catalog, reused across accepted events by
     // content identity alone. Unlike the two point caches above this is *not*
     // cleared per operation: a content-only save leaves the catalog's causal
@@ -6822,6 +6846,8 @@ impl ShardedHotEngine {
             terminal_document_heads: BTreeMap::new(),
             status_point_cache: RefCell::new(BTreeMap::new()),
             external_anchor_point_cache: RefCell::new(BTreeSet::new()),
+            observed_manifest_point_cache: RefCell::new(BTreeMap::new()),
+            retained_bootstrap_part_point_cache: RefCell::new(BTreeMap::new()),
             retained_accepted_catalog: RefCell::new(None),
             retained_catalog_dependency_anchor: Cell::new(None),
             #[cfg(test)]
@@ -19443,6 +19469,33 @@ impl ShardedHotEngine {
     fn begin_point_operation(&self) {
         self.status_point_cache.borrow_mut().clear();
         self.external_anchor_point_cache.borrow_mut().clear();
+        self.observed_manifest_point_cache.borrow_mut().clear();
+        self.retained_bootstrap_part_point_cache
+            .borrow_mut()
+            .clear();
+    }
+
+    /// [`Self::load_observed_manifest`], memoized for this public operation.
+    ///
+    /// Bounded so a pathological operation spanning many batches cannot retain
+    /// an unbounded number of manifests: at the cap the whole memo is dropped
+    /// rather than evicting by policy, because correctness never depends on a
+    /// hit and a cleared memo simply pays the ordinary load again.
+    fn observed_manifest_for_point_operation(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Arc<OperationBatch>, EngineError> {
+        const OBSERVED_MANIFEST_POINT_CACHE_BATCHES: usize = 4;
+        if let Some(manifest) = self.observed_manifest_point_cache.borrow().get(&batch_id) {
+            return Ok(Arc::clone(manifest));
+        }
+        let manifest = Arc::new(self.load_observed_manifest(batch_id)?);
+        let mut cache = self.observed_manifest_point_cache.borrow_mut();
+        if cache.len() >= OBSERVED_MANIFEST_POINT_CACHE_BATCHES {
+            cache.clear();
+        }
+        cache.insert(batch_id, Arc::clone(&manifest));
+        Ok(manifest)
     }
 
     /// Reuse the retained decode of `document_id` at this exact causal state,
@@ -22965,7 +23018,7 @@ impl ShardedHotEngine {
             self.external_anchor_point_cache.borrow_mut().insert(anchor);
             return Ok(());
         }
-        let manifest = self.load_observed_manifest(record.latest_source_batch())?;
+        let manifest = self.observed_manifest_for_point_operation(record.latest_source_batch())?;
         let object = self.load_archive_document_object(
             record.latest_source_batch(),
             &manifest,
@@ -23388,6 +23441,40 @@ impl ShardedHotEngine {
         Ok(true)
     }
 
+    /// The retained bootstrap part's CrdtUpdate objects, indexed by document and
+    /// memoized for this public operation. Returns `None` exactly when
+    /// [`Self::load_retained_bootstrap_part`] finds no retained part, so the
+    /// caller's branch structure is unchanged.
+    fn retained_bootstrap_document_updates_for_point_operation(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<Arc<BTreeMap<DocumentId, OperationObject>>>, EngineError> {
+        const RETAINED_BOOTSTRAP_POINT_CACHE_BATCHES: usize = 4;
+        if let Some(index) = self
+            .retained_bootstrap_part_point_cache
+            .borrow()
+            .get(&batch_id)
+        {
+            return Ok(Some(Arc::clone(index)));
+        }
+        let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? else {
+            return Ok(None);
+        };
+        let mut index = BTreeMap::new();
+        for object in loaded.objects() {
+            if object.kind() == ObjectKind::CrdtUpdate {
+                index.insert(object.document_id(), object.clone());
+            }
+        }
+        let index = Arc::new(index);
+        let mut cache = self.retained_bootstrap_part_point_cache.borrow_mut();
+        if cache.len() >= RETAINED_BOOTSTRAP_POINT_CACHE_BATCHES {
+            cache.clear();
+        }
+        cache.insert(batch_id, Arc::clone(&index));
+        Ok(Some(index))
+    }
+
     fn load_archive_document_object(
         &self,
         batch_id: BatchId,
@@ -23407,13 +23494,11 @@ impl ShardedHotEngine {
                     dependency: batch_id,
                 });
         }
-        if let Some(loaded) = self.load_retained_bootstrap_part(batch_id)? {
-            return loaded
-                .objects()
-                .iter()
-                .find(|object| {
-                    object.kind() == ObjectKind::CrdtUpdate && object.document_id() == document_id
-                })
+        if let Some(index) =
+            self.retained_bootstrap_document_updates_for_point_operation(batch_id)?
+        {
+            return index
+                .get(&document_id)
                 .cloned()
                 .ok_or(EngineError::MissingDocumentUpdate {
                     document_id,

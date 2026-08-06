@@ -31166,7 +31166,7 @@ mod tests {
     ) -> String {
         let engine = &promoted.engine;
         format!(
-            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={}",
+            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={} projection_recovery={} projection_rebuild_reason={:?} projection_applied_batches={} projection_bulk_pages_materialized={} projection_ancestry_full_scans={}",
             startup_ms(promoted.total),
             startup_ms(promoted.bootstrap_anchor),
             startup_ms(promoted.enrollment_session),
@@ -31185,6 +31185,11 @@ mod tests {
             startup_ms(engine.resume_restore),
             startup_ms(engine.bootstrap_part_recovery),
             engine.bootstrap_parts_examined,
+            promoted.projection_recovery,
+            promoted.projection_rebuild_reason,
+            promoted.projection_applied_batches,
+            promoted.projection_bulk_pages_materialized,
+            promoted.projection_ancestry_full_scans,
         )
     }
 
@@ -31603,6 +31608,13 @@ mod tests {
             startup_ms(elapsed),
             startup_open_phase_receipt(&open),
             startup_promoted_open_phase_receipt(&promoted),
+        );
+        // Not a tuned budget: a tripwire far above the measured cost, so a
+        // return of the per-document whole-graph anchor work (which put this
+        // same case at 72 s) fails loudly instead of being read as "slow today".
+        assert!(
+            elapsed < Duration::from_secs(45),
+            "aged-history crash reopen exceeded 45 seconds"
         );
         drop(reopened.handle);
     }
