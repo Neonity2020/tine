@@ -218,6 +218,11 @@ describe("in-page find model", () => {
       </main>`;
     const scroller = document.querySelector(".scroller") as HTMLElement;
     Object.defineProperty(scroller, "clientHeight", { value: 800, configurable: true });
+    // A pane that does not overflow scrolls nowhere, and the reveal deliberately
+    // refuses to claim success on one (it would skip the block-level fallback and
+    // leave the occurrence off-screen). jsdom reports scrollHeight 0, so the
+    // fixture has to say that this scroller really does have somewhere to go.
+    Object.defineProperty(scroller, "scrollHeight", { value: 4000, configurable: true });
     let st = 0;
     // Mirror the DOM clamp (scrollTop never goes negative) so sequential
     // reveals accumulate exactly like a real scroller.
@@ -250,4 +255,5 @@ describe("in-page find model", () => {
     delete (Range.prototype as unknown as { getClientRects?: unknown }).getClientRects;
     delete (Element.prototype as unknown as { scrollIntoView?: unknown }).scrollIntoView;
   });
+
 });

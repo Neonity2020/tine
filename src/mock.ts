@@ -59,18 +59,27 @@ function planningOf(raw: string, tag: "SCHEDULED" | "DEADLINE"): string | undefi
   const m = new RegExp(`^${tag}:\\s*<([^>]+)>`, "m").exec(raw);
   return m?.[1];
 }
-function tagsOf(raw: string): string[] {
+/** Exported for src/mockTags.test.ts: the GH #256 lookbehind removal had to
+ *  preserve this function's exact match behaviour, so the guard has to call the
+ *  real thing rather than a copy of its regex. */
+export function tagsOf(raw: string): string[] {
   const out: string[] = [];
-  // Group 2 (start-of-string or a non-"[" char) keeps the [#A] priority token
-  // from leaking a fake #A tag — the same job a negative lookbehind would do.
-  // Lookbehind is NOT used on purpose: pre-16.4 Safari/WKWebView cannot parse
-  // it and this module ships in the eagerly preloaded bundle, which gave a
-  // white screen at startup on macOS 12 (GH #256, guarded by
+  // No lookbehind on purpose: pre-16.4 Safari/WKWebView cannot PARSE one, and
+  // this module ships in the eagerly preloaded bundle, so a lookbehind here was
+  // a white screen at startup on macOS 12 (GH #256, guarded by
   // src/webkitCompat.test.ts).
-  const re = /#\[\[([^\]]+)\]\]|(^|[^\[])#([\w/_.-]+)/g;
+  //
+  // The `[#A]` priority token must not leak a fake `#A` tag, which is what the
+  // lookbehind did. Checking the preceding character after the match keeps that
+  // test ZERO-WIDTH. Encoding it as a leading group instead — `(^|[^\[])#...` —
+  // looks equivalent but CONSUMES that character, so a tag immediately after
+  // another (`#a#b`, `#[[x]]#y`) is silently dropped: the next match has no
+  // character left to match its prefix against.
+  const re = /#\[\[([^\]]+)\]\]|#([\w/_.-]+)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(raw))) {
-    const tag = (m[1] ?? m[3]).trim();
+    if (m[2] !== undefined && m.index > 0 && raw[m.index - 1] === "[") continue;
+    const tag = (m[1] ?? m[2]).trim();
     if (tag && !out.some((t) => t.toLowerCase() === tag.toLowerCase())) out.push(tag);
   }
   return out;

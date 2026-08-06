@@ -366,7 +366,12 @@ export async function revealInPageFindMatch(match: InPageFindMatch): Promise<boo
 function nearestVerticalScroller(el: HTMLElement): HTMLElement | null {
   for (let cur = el.parentElement; cur; cur = cur.parentElement) {
     const overflowY = window.getComputedStyle(cur).overflowY;
-    if (overflowY === "auto" || overflowY === "scroll") return cur;
+    // `overflow-y: auto` on an element that does not actually overflow scrolls
+    // nowhere. Accepting one would make the adjustment below a no-op while
+    // still reporting success, so the caller would skip its block-level
+    // fallback and the occurrence would stay off-screen — worse than before.
+    const scrolls = cur.scrollHeight > cur.clientHeight;
+    if ((overflowY === "auto" || overflowY === "scroll") && scrolls) return cur;
   }
   return null;
 }
