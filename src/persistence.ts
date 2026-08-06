@@ -81,6 +81,39 @@ export function dirtyPages(): Iterable<string> {
 export function isSaving(name: string): boolean {
   return saveChain.has(name);
 }
+/** What the store currently holds for a page: whether it exists at all, and its
+ *  revision (the content hash) if it does. */
+export interface StoredPageState {
+  exists: boolean;
+  rev: string | null;
+}
+
+/** Has the stored page actually diverged from the baseline this editor loaded or
+ *  last saved? This is the per-page proof that a change NOTIFICATION does not carry.
+ *
+ *  The managed runtime's `sparse-v2-changed` tick is a bare aggregate epoch — it
+ *  names no page, carries no origin, and fires even for an admission that changed
+ *  nothing. The legacy watcher event names a page but still cannot distinguish our
+ *  own write echoing back from someone else's. So "a notification arrived while this
+ *  page was dirty" is not evidence of a conflict, and treating it as one is a false
+ *  positive the user pays for: `doSave` refuses a conflicted page, which makes the
+ *  banner's own claim ("your unsaved changes weren't written") true only BECAUSE of
+ *  the banner, and blocks the very save whose `base_rev` guard would have decided
+ *  the question correctly.
+ *
+ *  All four quadrants matter:
+ *  - stored revision equals the baseline → byte-for-byte what we already hold; the
+ *    wake-up was our own echo (or another page's). NOT diverged.
+ *  - stored revision differs → a genuine external change. Diverged.
+ *  - gone from the store, but we had a baseline → the file we loaded was deleted
+ *    under us. Diverged.
+ *  - gone, and we never had a baseline → a brand-new page that was never written;
+ *    there is nothing on disk to diverge from. NOT diverged. */
+export function divergedFromBaseline(name: string, stored: StoredPageState): boolean {
+  const baseline = baseRev.get(name) ?? null;
+  if (!stored.exists) return baseline !== null;
+  return stored.rev !== baseline;
+}
 /** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
  *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
 export function holdSourcesForDest(dest: string, sources: string[]) {

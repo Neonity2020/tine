@@ -57,6 +57,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A page you are editing is no longer falsely reported as “changed on disk.”**
+  Editing a block and immediately moving it could raise the “changed on disk
+  (edited elsewhere or synced in)” banner with no external editor or sync
+  involved — and because a page with an open conflict refuses to save, the
+  banner's own warning that your unsaved changes weren't written became true
+  only because the banner appeared. Tine now requires proof that the page
+  actually diverged — its stored revision no longer matches the one the editor
+  holds — before declaring a conflict, instead of treating any change
+  notification arriving during an unsaved edit as one. A save already in flight
+  is left to its own base-revision guard. Genuine external edits, and a file
+  deleted out from under an unsaved edit, still raise the banner exactly as
+  before.
 - **Managed Markdown saves now retain their authenticated projection predecessor
   across drain, compaction, and unsafe reopen.** The next save and delayed
   filesystem callback re-prove the exact completed-path receipt instead of

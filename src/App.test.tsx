@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { backend } from "./backend";
 import { handleGraphChange, handleSparseV2Changed, installMobileExternalLinkHandler } from "./App";
 import { resetPaneLayoutToSingle, restorePaneLayout } from "./panes";
-import { pageByName, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "./store";
-import { pageInventoryRev } from "./ui";
+import { pageByName, reloadPage, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "./store";
+import { clearConflict, isConflicted, pageInventoryRev } from "./ui";
+import { flushPage, isDirty, markDirty, resetSaveState } from "./persistence";
 
 function addAnchor(href: string): HTMLAnchorElement {
   const a = document.createElement("a");
@@ -145,5 +146,121 @@ describe("managed watcher reconciliation", () => {
     expect(getPage).toHaveBeenCalledWith(name, "page");
     expect(pageInventoryRev()).toBeGreaterThan(before);
     expect(pageByName(name)?.roots).toEqual(["one", "two"]);
+  });
+});
+
+// A change notification is not per-page divergence evidence. The managed runtime's
+// `sparse-v2-changed` tick is a bare aggregate epoch (no page, no origin, fires even
+// for an admission that changed nothing); the legacy watcher event names a page but
+// still cannot tell our own write's echo from someone else's. Declaring a conflict
+// on the notification alone blocks `doSave` for that page, so the banner's claim —
+// "your unsaved changes weren't written" — comes true only BECAUSE of the banner.
+// These cover both directions: a false conflict must not appear, and a REAL external
+// change must still surface one.
+describe("conflict requires per-page divergence, not just a notification", () => {
+  const name = "Managed Racing Edit";
+
+  function liveDirtyPage(rev: string | null) {
+    resetPaneLayoutToSingle({
+      tabs: [{ history: [{ kind: "page", name, pageKind: "page" }], pos: 0, pinned: false }],
+      activeIndex: 0,
+    });
+    setDoc({ byId: {}, pages: [], feed: [], loaded: true });
+    // Seed the save baseline exactly as a real load does, then dirty the page:
+    // the user typed and the debounced save has not landed yet.
+    reloadPage({
+      name,
+      kind: "page",
+      title: name,
+      pre_block: null,
+      rev,
+      blocks: [{ id: "one", raw: "typed by the user", collapsed: false, children: [] }],
+    });
+    markDirty(name);
+  }
+
+  function storedPage(rev: string | null) {
+    return {
+      name,
+      kind: "page" as const,
+      title: name,
+      pre_block: null,
+      rev,
+      blocks: [{ id: "one", raw: "stored content", collapsed: false, children: [] }],
+    };
+  }
+
+  afterEach(() => {
+    resetSaveState();
+    clearConflict(name);
+  });
+
+  it("does not conflict a dirty page when the admitted epoch left it unchanged", async () => {
+    liveDirtyPage("rev-1");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-1"));
+
+    await handleSparseV2Changed();
+
+    expect(isConflicted(name)).toBe(false);
+    // The unsaved edit is still live AND still savable — not replaced by the
+    // stored copy, and not frozen behind a conflict.
+    expect(isDirty(name)).toBe(true);
+    expect(pageByName(name)?.roots).toEqual(["one"]);
+  });
+
+  it("still conflicts a dirty page when the stored revision genuinely moved", async () => {
+    liveDirtyPage("rev-1");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+
+    await handleSparseV2Changed();
+
+    expect(isConflicted(name)).toBe(true);
+  });
+
+  it("still conflicts a dirty page whose file was deleted under it", async () => {
+    liveDirtyPage("rev-1");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(null);
+
+    await handleSparseV2Changed();
+
+    expect(isConflicted(name)).toBe(true);
+  });
+
+  it("leaves an in-flight save alone — its own base_rev guard is the authority", async () => {
+    liveDirtyPage("rev-1");
+    let release: (rev: string) => void = () => {};
+    vi.spyOn(backend(), "savePage").mockReturnValue(
+      new Promise<string>((resolve) => {
+        release = resolve;
+      })
+    );
+    const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+    const saving = flushPage(name); // in flight: not yet durable, baseline not yet advanced
+
+    await handleSparseV2Changed();
+
+    expect(isConflicted(name)).toBe(false);
+    expect(getPage).not.toHaveBeenCalled();
+    release("rev-2");
+    await saving;
+  });
+
+  it("does not conflict a dirty page on a legacy watcher echo of our own write", async () => {
+    liveDirtyPage("rev-1");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-1"));
+
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+
+    expect(isConflicted(name)).toBe(false);
+    expect(isDirty(name)).toBe(true);
+  });
+
+  it("still conflicts a dirty page on a legacy watcher event that really changed it", async () => {
+    liveDirtyPage("rev-1");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+
+    expect(isConflicted(name)).toBe(true);
   });
 });
