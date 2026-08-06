@@ -214,7 +214,31 @@ function clearTransientRetry(name: string) {
   retryTimers.delete(name);
 }
 
+/** Save failures the backend reports with a bounded code that a retry cannot
+ *  change: the graph has two files whose names collide on case-insensitive
+ *  filesystems, two paths pointing at one physical file, a symlink where a page
+ *  was expected, or another page already holding this title. Retrying re-runs
+ *  the whole pre-save check — on a large graph the expensive part — to arrive at
+ *  the same answer, three times, per dirty page. Report it once instead. */
+export function isRetryableSaveFailure(error: unknown): boolean {
+  const message = String(error);
+  return ![
+    "precheck.symlink",
+    "precheck.portable_collision",
+    "precheck.resource_alias",
+    "precheck.not_portable",
+    "precheck.nofollow",
+    "precheck.limit",
+    "identity.owned_elsewhere",
+  ].some((code) => message.includes(code));
+}
+
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
+  if (!isRetryableSaveFailure(error)) {
+    transientFailures.delete(name);
+    pushToast(`Couldn't save “${name}”. (${String(error)})`, "error");
+    return;
+  }
   const failures = (transientFailures.get(name) ?? 0) + 1;
   transientFailures.set(name, failures);
   if (failures >= 3) {

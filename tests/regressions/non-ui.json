@@ -2449,6 +2449,56 @@
     "failBefore": "proven"
    },
    "notes": "The backend collapsed EVERY io::ErrorKind::AlreadyExists to the literal string 'conflict', and the frontend recognised a conflict by testing whether the message CONTAINED that substring. A portable-filename collision, a physical-resource alias, a symlink refusal and 'another document owns this page identity' therefore all raised the content-conflict prompt, whose only options are Keep-mine and Use-disk-version -- neither of which can resolve any of them. Choosing either left the page marked conflicted, and a conflicted page silently refuses to save from then on, so the user's page was stranded by an error message. Only a real base-revision conflict carries the 'conflict' contract now; everything else carries its bounded D0 failure code as a stable prefix and falls through to the retryable path. The frontend match is exact rather than substring. Fail-before is structural and asserted directly on the mapping function."
+  },
+  {
+   "id": "REG-CAPTURE-TWO-PASS-CONCURRENCY-001",
+   "title": "A sync client touching an unrelated file does not fail the save in progress",
+   "family": "direct-save-data-safety",
+   "sources": {
+    "issues": [
+     267
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "linux",
+    "macos",
+    "windows"
+   ],
+   "layer": "core-native",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "crates/tine-core/src/model.rs::a_concurrent_change_during_capture_is_retried_not_surfaced"
+    ],
+    "scenario": "direct-markdown.capture-concurrency",
+    "failBefore": "proven"
+   },
+   "notes": "The save-time admission capture runs two full-graph passes that must agree exactly, and ANY concurrent filesystem activity anywhere in the graph makes them disagree. On a Syncthing / Dropbox / OneDrive folder that is not an anomaly, it is the steady state -- and a single disagreement surfaced as a failed save. Disagreement means 'something moved while we looked', not 'the graph is broken', so it is now retried in place up to 4 attempts; every other error still surfaces immediately, and the caller holds the identity-mutation authority across all attempts so this cannot interleave with one of our own writes. Fail-before proven by setting CAPTURE_ATTEMPTS to 1."
+  },
+  {
+   "id": "REG-SAVE-RETRY-AMPLIFICATION-001",
+   "title": "A save failure a retry cannot change is reported once instead of re-running the whole check three times",
+   "family": "direct-save-performance",
+   "sources": {
+    "issues": [
+     267
+    ],
+    "commits": []
+   },
+   "platforms": [
+    "all"
+   ],
+   "layer": "frontend",
+   "status": "covered",
+   "coverage": {
+    "tests": [
+     "src/persistence.test.ts::does not retry failures a retry cannot change"
+    ],
+    "scenario": "direct-markdown.save-retry-policy",
+    "failBefore": "proven"
+   },
+   "notes": "scheduleTransientRetry re-ran a failed save at 100 ms and 300 ms before toasting -- three full attempts per dirty page. Each attempt re-runs the whole pre-save admission check, which on a large graph is the expensive part, only to reach the same answer for a failure class that cannot change on retry: a portable-filename collision, a physical-resource alias, a symlink in scope, a non-portable path, a nofollow refusal, a limit breach, or another page already owning the title. #267's 'about a minute, then a red toast' is that multiplier on top of an already slow check. Those classes now report once; genuinely transient ones (precheck.interrupted, identity.changed_since_load, unclassified I/O) still retry. Depends on REG-SAVE-ERROR-MISCLASSIFIED-AS-CONFLICT-001 for the bounded codes that make the distinction possible."
   }
  ]
 }

@@ -57,6 +57,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **A sync client working in the background no longer fails your save.** Before
+  writing, Tine looks over the graph twice and requires the two looks to agree.
+  Any file changing anywhere in the graph in between makes them disagree — which
+  on a Syncthing, Dropbox or OneDrive folder is simply what a normal minute looks
+  like — and a single disagreement failed the save outright. Disagreeing means
+  something moved while Tine was looking, not that anything is wrong, so it now
+  simply looks again.
+- **A save that cannot succeed says so once, instead of trying twice more
+  first.** When a save failed for a reason no retry could change, Tine retried it
+  anyway, twice, each time redoing the whole (potentially slow) pre-save check
+  before finally showing the error. That multiplier is a large part of why
+  #267 reported "about a minute, then a red toast". Genuinely temporary failures
+  still retry.
 - **A page whose file was replaced behind Tine's back is no longer stranded.**
   Some tools replace a file wholesale even when its contents don't change —
   OneDrive filling in a file it had only been holding a placeholder for, a sync

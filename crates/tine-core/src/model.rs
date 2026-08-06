@@ -7756,6 +7756,39 @@ impl Graph {
         &self,
         limits: InitialShadowLimits,
     ) -> io::Result<(InitialShadowCapture, u64)> {
+        // GH #267 / F3. The two passes must agree, and ANY concurrent filesystem
+        // activity anywhere in the graph makes them disagree -- which on a
+        // Syncthing, Dropbox or OneDrive folder is not an anomaly, it is the
+        // steady state. A single disagreement used to surface as a failed save.
+        //
+        // Disagreement means "something moved while we looked", not "the graph
+        // is broken", so retry it in place a bounded number of times. Only that
+        // one outcome is retried; every other error still surfaces at once.
+        // The caller holds the identity-mutation authority across all attempts,
+        // so this cannot interleave with one of our own writes.
+        const CAPTURE_ATTEMPTS: usize = 4;
+        let mut last_disagreement = None;
+        for _ in 0..CAPTURE_ATTEMPTS {
+            match self.attempt_retained_graph_text_identity_capture(limits) {
+                Ok(captured) => return Ok(captured),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    last_disagreement = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_disagreement.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "managed inventory changed during retained identity capture",
+            )
+        }))
+    }
+
+    fn attempt_retained_graph_text_identity_capture(
+        &self,
+        limits: InitialShadowLimits,
+    ) -> io::Result<(InitialShadowCapture, u64)> {
         require_projection_platform()?;
         let permit = self.admit_managed_text_writer()?;
         let first = collect_initial_shadow_managed_inventory_with_limits_inner(
@@ -39021,6 +39054,39 @@ mod tests {
              ({incremental} vs {full})"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GH #267 / F3. The save-time capture runs two passes that must agree, and
+    /// any concurrent filesystem activity anywhere in the graph makes them
+    /// disagree. On a Syncthing / Dropbox / OneDrive folder that is not an
+    /// anomaly, it is the steady state — and one disagreement failed the save.
+    #[test]
+    fn a_concurrent_change_during_capture_is_retried_not_surfaced() {
+        let dir = scratch("capture-retry");
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        fs::write(dir.join("pages/Other.md"), b"- other\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        // One disturbance between the two passes — the hook is one-shot, so the
+        // next attempt sees a quiet graph, which is exactly the bounded-retry
+        // premise: "something moved while we looked", not "the graph is broken".
+        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+            let other = dir.join("pages/Other.md");
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(&other, b"- other, pulled in\n")));
+        });
+
+        let mut page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        let base = page.rev.clone().expect("loaded page carries its revision");
+        page.blocks[0].raw = "saved during sync activity".into();
+        graph
+            .save_page(&page, Some(&base))
+            .expect("a sync client touching an unrelated file must not fail this save");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Target.md")).unwrap(),
+            "- saved during sync activity\n"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
