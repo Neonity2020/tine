@@ -8,6 +8,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.91] - 2026-08-06
+
 ### Added
 
 - **Hierarchical Ctrl/Cmd+A and symmetric Shift+Up block selection.** In the
