@@ -19,7 +19,7 @@ import { NamespaceCrumb, NamespaceHierarchy } from "./Namespace";
 import { pageProperties, aliasNames, visibleBody } from "../render/block";
 import { InlineText, PageRef } from "../render/inline";
 import { EmojiText } from "../render/emoji";
-import { journalTitle, localDayKey, localDayRolloverDelay } from "../journal";
+import { journalTitle, localDayKey, localDayRolloverDelay, currentDayKey, localDateFromDayKey } from "../journal";
 import { editingId, endEditForSurface, startEditing } from "../editorController";
 import type { JournalFeedPage, PageDto, RefGroup } from "../types";
 import { tagRef } from "../tags";
@@ -954,10 +954,15 @@ export function TagPageTable(props: { pageName: string }): JSX.Element {
 // Discoverable carry-over actions under a journal's title (replaces having to
 // right-click → "Carry…"). Today gets pull-in buttons (from the previous
 // non-empty day, and from the last N days); a past day gets a push-to-today
-// button. Named pages show nothing.
-function CarryActions(props: { page: FeedPage }): JSX.Element {
+// button. Named pages show nothing. The today/past-day choice reads the
+// REACTIVE day key (ticking at local midnight, re-synced on focus/wake): a
+// bare `new Date()` comparison is computed once at mount and keeps yesterday's
+// page on today's pull-in buttons forever — Martin's midnight-rollover report.
+// The compared title is derived from the SAME day key, not a second clock read.
+export function CarryActions(props: { page: FeedPage }): JSX.Element {
   const isJournal = () => props.page.kind === "journal";
-  const isToday = () => isJournal() && props.page.name === journalTitle(new Date());
+  const isToday = () =>
+    isJournal() && props.page.name === journalTitle(localDateFromDayKey(currentDayKey()));
   return (
     <Show when={isJournal() && showCarryButtons()}>
       <div class="page-carry-actions">
