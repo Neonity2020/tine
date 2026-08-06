@@ -44,7 +44,6 @@ describe("horizontal boundary navigation and forward merge (GH #213)", () => {
   it("ArrowLeft at block start moves to the end of the previous block", () => {
     loadSingle(page([block("first"), block("second"), block("third")]));
     const secondId = pageByName("Caret")!.roots[1];
-    const firstId = pageByName("Caret")!.roots[0];
     startEditing(secondId, 0);
     const m = mountPage();
     try {
