@@ -31219,6 +31219,43 @@ mod tests {
         )
     }
 
+    /// The rebuild's own work counters. A rebuild that is superlinear in graph
+    /// size is superlinear in one of these, and elapsed time alone cannot say
+    /// which -- so the receipt names the quantities rather than the duration.
+    fn startup_projection_rebuild_receipt(
+        rebuild: &crate::oplog::sqlite::RebuildInstrumentation,
+    ) -> String {
+        format!(
+            " rebuild_events_validated={} rebuild_events_applied={} rebuild_root_authentications={} rebuild_exact_document_loads={} rebuild_exact_catalog_loads={} rebuild_exact_catalog_decodes={} rebuild_bulk_chunks={} rebuild_peak_bulk_pages={} rebuild_sequence_page_reads={} rebuild_sequence_bytes_read={} rebuild_cleanup_page_attempts={} rebuild_cleanup_existing_pages={} rebuild_cleanup_owned_rows={} rebuild_cleanup_fts_rowids={} rebuild_reference_inductive_checks={} rebuild_reference_full_scans={} rebuild_semantic_proofs={} rebuild_row_digest_proofs={} rebuild_frontier_session_hits={} rebuild_frontier_session_misses={} rebuild_external_session_hits={} rebuild_external_session_misses={} rebuild_candidate_transactions={} rebuild_candidate_barriers={} rebuild_ordinary_transactions={} rebuild_ordinary_barriers={}",
+            rebuild.accepted_events_validated,
+            rebuild.accepted_events_applied,
+            rebuild.accepted_root_authentications,
+            rebuild.exact_document_loads,
+            rebuild.exact_catalog_loads,
+            rebuild.exact_catalog_decodes,
+            rebuild.bulk_materialization_chunks,
+            rebuild.peak_bulk_pages,
+            rebuild.accepted_sequence_page_reads,
+            rebuild.accepted_sequence_bytes_read,
+            rebuild.cleanup_page_attempts,
+            rebuild.cleanup_existing_pages,
+            rebuild.cleanup_owned_rows,
+            rebuild.cleanup_fts_rowids,
+            rebuild.reference_coverage_inductive_checks,
+            rebuild.reference_coverage_full_scans,
+            rebuild.final_semantic_equivalence_proofs,
+            rebuild.final_row_digest_equivalence_proofs,
+            rebuild.accepted_frontier_session_hits,
+            rebuild.accepted_frontier_session_misses,
+            rebuild.external_exact_session_hits,
+            rebuild.external_exact_session_misses,
+            rebuild.physical_candidate_transactions,
+            rebuild.physical_candidate_durability_barriers,
+            rebuild.physical_ordinary_transactions,
+            rebuild.physical_ordinary_durability_barriers,
+        )
+    }
+
     fn startup_promoted_open_phase_receipt(
         promoted: &PromotedRuntimeOpenInstrumentation,
     ) -> String {
@@ -31248,7 +31285,7 @@ mod tests {
             promoted.projection_applied_batches,
             promoted.projection_bulk_pages_materialized,
             promoted.projection_ancestry_full_scans,
-        )
+        ) + &startup_projection_rebuild_receipt(&promoted.projection_rebuild_counters)
     }
 
     #[test]
@@ -31844,6 +31881,70 @@ mod tests {
         drop(reopened.handle);
     }
 
+    /// A rebuild must resolve documents through its root-bound lookup sessions.
+    ///
+    /// This asserts the mechanism, not a duration, because the defect it guards
+    /// is invisible in a single measurement: with the sessions unthreaded every
+    /// document resolution re-walked the scratch LSM from the top, so
+    /// per-document cost grew with the graph and a rebuild visiting a linear
+    /// number of documents came out at about n^1.6 -- 15 s on a 1,045-file
+    /// graph against Martin's 10-s ceiling. A wall-clock budget would pass on a
+    /// small CI fixture no matter how the lookups are routed; session reuse is
+    /// the property that actually holds the curve down, and it is checkable at
+    /// any scale.
+    #[test]
+    fn managed_projection_rebuild_resolves_documents_through_lookup_sessions() {
+        let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 60);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("scaled graph activates");
+        drive_initial_feed(&handle);
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the fixture must reach a Safe handoff before its projection is discarded"
+        );
+        drop(handle);
+
+        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
+            .remove()
+            .expect("the projection file set is removable");
+
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        assert_eq!(
+            promoted.projection_recovery, "rebuilt-missing",
+            "this test only says something if a rebuild actually ran (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+        let rebuild = &promoted.projection_rebuild_counters;
+        assert!(
+            rebuild.exact_document_loads > 1,
+            "a rebuild that loaded {} document(s) is too small to show reuse",
+            rebuild.exact_document_loads
+        );
+        // Sessions must exist AND be reused. A session that is constructed and
+        // then consulted once per document would report only misses, which is
+        // the same cost as having none.
+        assert!(
+            rebuild.accepted_frontier_session_hits > rebuild.accepted_frontier_session_misses,
+            "accepted-frontier lookups did not reuse their session ({} hits, {} misses over {} document loads)",
+            rebuild.accepted_frontier_session_hits,
+            rebuild.accepted_frontier_session_misses,
+            rebuild.exact_document_loads
+        );
+        assert!(
+            rebuild.external_exact_session_hits > rebuild.external_exact_session_misses,
+            "external-exact document loads did not reuse their session ({} hits, {} misses over {} document loads)",
+            rebuild.external_exact_session_hits,
+            rebuild.external_exact_session_misses,
+            rebuild.exact_document_loads
+        );
+        drop(reopened.handle);
+    }
+
     /// Cost of a FULL projection rebuild on a real-scale graph.
     ///
     /// Every other managed benchmark measures a reopen that is *allowed to keep*
@@ -31987,8 +32088,8 @@ mod tests {
             promoted.projection_rebuild_reason
         );
         assert!(
-            promoted.projection_bulk_pages_materialized > 0,
-            "a rebuild that materialized no pages did not reconstruct the graph"
+            promoted.projection_applied_batches > 0,
+            "a rebuild that applied no accepted batches did not reconstruct anything"
         );
         drop(reopened.handle);
     }

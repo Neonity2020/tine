@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Rebuilding a managed graph's internal cache is much faster, and now scales
+  with the graph instead of against it.** On a 1,045-file graph the rebuild went
+  from about 15 seconds to about 2.6 seconds, and the cost is now roughly
+  proportional to graph size rather than growing faster than it — so the saving
+  gets larger, not smaller, as a graph grows. This is the recovery a graph
+  reaches after corruption or an internal format change, so it is rare, but when
+  it happens it is the whole wait before the app is usable.
+
 ### Fixed
 
 - **A managed graph that was closed cleanly now reopens even if its internal

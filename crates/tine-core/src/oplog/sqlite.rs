@@ -1259,6 +1259,19 @@ fn materialize_accepted_event_with_stats(
         instrumentation.exact_document_loads = materializer.exact_document_loads();
         instrumentation.exact_catalog_loads = materializer.exact_catalog_loads();
         instrumentation.exact_catalog_decodes = materializer.exact_catalog_decodes();
+        let (accepted_frontier, external_exact) = materializer.lookup_session_stats();
+        instrumentation.accepted_frontier_session_hits = accepted_frontier.hits;
+        instrumentation.accepted_frontier_session_misses = accepted_frontier.misses;
+        instrumentation.accepted_frontier_session_evictions = accepted_frontier.evictions;
+        instrumentation.accepted_frontier_session_oversize = accepted_frontier.oversize;
+        instrumentation.accepted_frontier_session_peak_resident_bytes =
+            accepted_frontier.peak_resident_bytes;
+        instrumentation.external_exact_session_hits = external_exact.hits;
+        instrumentation.external_exact_session_misses = external_exact.misses;
+        instrumentation.external_exact_session_evictions = external_exact.evictions;
+        instrumentation.external_exact_session_oversize = external_exact.oversize;
+        instrumentation.external_exact_session_peak_resident_bytes =
+            external_exact.peak_resident_bytes;
     }
     let change = super::MaterializationChange::new(event.batch_id(), replacements, deletions)?;
     Ok((change, instrumentation))

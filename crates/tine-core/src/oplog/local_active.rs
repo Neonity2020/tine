@@ -403,6 +403,10 @@ pub(crate) struct PromotedRuntimeOpenInstrumentation {
     pub(crate) projection_applied_batches: usize,
     pub(crate) projection_bulk_pages_materialized: usize,
     pub(crate) projection_ancestry_full_scans: usize,
+    /// The rebuild's own counters, carried whole rather than field by field.
+    /// Which term carries a superlinear rebuild is not known in advance, so
+    /// copying three of them forces a source change every time the search moves.
+    pub(crate) projection_rebuild_counters: super::sqlite::RebuildInstrumentation,
     pub(crate) engine: super::hot_engine::EnrolledProjectionOpenInstrumentation,
 }
 
@@ -450,6 +454,7 @@ fn record_promoted_runtime_mint(
     record.projection_applied_batches = timing.projection_applied_batches;
     record.projection_bulk_pages_materialized = timing.projection_bulk_pages_materialized;
     record.projection_ancestry_full_scans = timing.projection_ancestry_full_scans;
+    record.projection_rebuild_counters = timing.projection_rebuild_counters;
     record.engine = timing.engine;
 }
 
@@ -5588,6 +5593,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         timing.projection_applied_batches = applied;
         timing.projection_bulk_pages_materialized = opened.rebuild.bulk_pages_materialized;
         timing.projection_ancestry_full_scans = opened.rebuild.ancestry_full_scans;
+        timing.projection_rebuild_counters = opened.rebuild;
     }
     let sqlite_open = sqlite_open_started.map(|started| started.elapsed());
     let projection_breakdown = super::sqlite::take_projection_open_breakdown();

@@ -4450,6 +4450,13 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
     /// counter that separates "this event resolved the catalog" from "this
     /// event read the whole catalog checkpoint off disk again".
     exact_catalog_decodes: usize,
+    /// Root/kind-bound decoded-segment sessions, held for the materializer's
+    /// whole life exactly as the bootstrap bulk materializer holds them.
+    /// Without them every document resolution re-walked the scratch LSM from
+    /// the top, so per-document cost grew with the graph and a rebuild that
+    /// visits a linear number of documents came out superlinear overall.
+    accepted_frontier_session: Option<ScratchLookupSession>,
+    external_exact_session: Option<ScratchLookupSession>,
 }
 
 /// Maximum page residency of one private bootstrap materialization step.
@@ -4458,6 +4465,11 @@ pub(crate) struct AcceptedRootMaterializer<'engine> {
 /// home checkpoints live only for one chunk and are dropped before the next.
 pub(crate) const BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES: usize = 64;
 pub(crate) const BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT: usize = 32 * 1024 * 1024;
+/// Residency budget for an accepted-root materializer's two sessions. It is a
+/// cap on retained decoded segments, not a target: the sessions exist to stop
+/// repeated LSM descent, and a session that never reaches this bound has
+/// already done its job.
+pub(crate) const ACCEPTED_ROOT_LOOKUP_SESSION_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 struct BootstrapBulkPage {
@@ -4941,6 +4953,25 @@ impl AcceptedRootMaterializer<'_> {
         self.exact_catalog_decodes
     }
 
+    /// Accepted-frontier and external-exact session statistics, in that order.
+    /// A materializer with no scratch-backed root reports defaults, which is
+    /// how "there was nothing to bind a session to" stays distinguishable from
+    /// "a session existed and was never consulted".
+    pub(crate) fn lookup_session_stats(
+        &self,
+    ) -> (ScratchLookupSessionStats, ScratchLookupSessionStats) {
+        (
+            self.accepted_frontier_session.as_ref().map_or_else(
+                ScratchLookupSessionStats::default,
+                ScratchLookupSession::stats,
+            ),
+            self.external_exact_session.as_ref().map_or_else(
+                ScratchLookupSessionStats::default,
+                ScratchLookupSession::stats,
+            ),
+        )
+    }
+
     fn load_document(
         &mut self,
         document_id: DocumentId,
@@ -4950,9 +4981,20 @@ impl AcceptedRootMaterializer<'_> {
         // causal state is the one *this* accepted root selects for this
         // document, and it refuses a blocked engine, an unauthenticated root
         // and an absent document before any reuse is even considered.
+        // `accepted_frontier_documents_many_authenticated_with_session` assumes
+        // its caller already authenticated, so the blocked-engine refusal that
+        // the single-point entry performs must stay explicit here: it is
+        // supposed to run on every resolution, hit or miss.
+        self.engine.ensure_not_blocked()?;
         let Some(dependencies) = self
             .engine
-            .accepted_frontier_document(&self.root, document_id)?
+            .accepted_frontier_documents_many_authenticated_with_session(
+                &self.root,
+                &[document_id],
+                self.accepted_frontier_session.as_mut(),
+            )?
+            .pop()
+            .flatten()
         else {
             return Ok(None);
         };
@@ -4981,7 +5023,10 @@ impl AcceptedRootMaterializer<'_> {
             }
         }
         let frontier = FrontierV2::new(vec![dependencies.clone()]).map_err(EngineError::from)?;
-        let mut reconstructed = self.engine.reconstruct_projection_frontier(&frontier)?;
+        let mut reconstructed = self.engine.reconstruct_projection_frontier_with_session(
+            &frontier,
+            self.external_exact_session.as_mut(),
+        )?;
         let document = reconstructed
             .remove(&document_id)
             .ok_or(EngineError::MissingDocument(document_id))?;
@@ -10765,6 +10810,8 @@ impl ShardedHotEngine {
     ) -> Result<AcceptedRootMaterializer<'_>, EngineError> {
         self.begin_point_operation();
         self.authenticate_accepted_frontier_root(root)?;
+        let (accepted_frontier_session, external_exact_session) =
+            self.accepted_root_lookup_sessions(root, ACCEPTED_ROOT_LOOKUP_SESSION_BYTES)?;
         Ok(AcceptedRootMaterializer {
             engine: self,
             root: root.clone(),
@@ -10773,7 +10820,37 @@ impl ShardedHotEngine {
             exact_document_loads: 0,
             exact_catalog_loads: 0,
             exact_catalog_decodes: 0,
+            accepted_frontier_session,
+            external_exact_session,
         })
+    }
+
+    /// The two decoded-segment sessions a root-bound materializer reuses.
+    /// Absent scratch, or a root with no scratch address, has nothing to bind
+    /// to and resolves through the in-memory frontier instead.
+    fn accepted_root_lookup_sessions(
+        &self,
+        root: &AcceptedFrontierRoot,
+        budget_bytes: usize,
+    ) -> Result<(Option<ScratchLookupSession>, Option<ScratchLookupSession>), EngineError> {
+        let (Some(store), Some(scratch_root)) = (&self.scratch, &root.scratch_root) else {
+            return Ok((None, None));
+        };
+        let accepted_frontier = store
+            .lookup_session(
+                scratch_root,
+                super::scratch_store::ScratchPageKind::AcceptedFrontier,
+                budget_bytes,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let external_exact = store
+            .lookup_session(
+                &self.scratch_roots.external_document_state_root,
+                super::scratch_store::ScratchPageKind::DocumentExternalExact,
+                budget_bytes,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        Ok((Some(accepted_frontier), Some(external_exact)))
     }
 
     pub(crate) fn bootstrap_bulk_materializer(
@@ -22887,22 +22964,48 @@ impl ShardedHotEngine {
         &self,
         frontier: &FrontierV2,
     ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
+        self.reconstruct_projection_frontier_with_session(frontier, None)
+    }
+
+    /// The same reconstruction, optionally reusing a caller-held
+    /// `DocumentExternalExact` session. The session changes only how the bytes
+    /// are reached: every record still proves its own anchor and its peer
+    /// counters and heads against the frontier below.
+    fn reconstruct_projection_frontier_with_session(
+        &self,
+        frontier: &FrontierV2,
+        mut external_exact_session: Option<&mut ScratchLookupSession>,
+    ) -> Result<BTreeMap<DocumentId, LoroDoc>, EngineError> {
         let Some(store) = &self.scratch else {
             return self.reconstruct_frontier(frontier);
         };
         let mut documents = BTreeMap::new();
         for dependencies in frontier.documents() {
-            let (record, document, state_work) = super::document_state::load_external_exact(
-                store,
-                &self.scratch_roots,
-                super::document_state::DocumentLane::Visible,
-                dependencies.document_id(),
-                dependencies.causal_state_digest(),
-            )
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .ok_or(EngineError::FrontierVectorMismatch(
-                dependencies.document_id(),
-            ))?;
+            let loaded = match external_exact_session.as_deref_mut() {
+                Some(session) => super::document_state::load_external_exact_many_with_session(
+                    store,
+                    &self.scratch_roots,
+                    super::document_state::DocumentLane::Visible,
+                    &[(
+                        dependencies.document_id(),
+                        dependencies.causal_state_digest(),
+                    )],
+                    Some(session),
+                )
+                .map(|mut loaded| loaded.pop().flatten()),
+                None => super::document_state::load_external_exact(
+                    store,
+                    &self.scratch_roots,
+                    super::document_state::DocumentLane::Visible,
+                    dependencies.document_id(),
+                    dependencies.causal_state_digest(),
+                ),
+            };
+            let (record, document, state_work) = loaded
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or(EngineError::FrontierVectorMismatch(
+                    dependencies.document_id(),
+                ))?;
             self.record_document_state_work(state_work);
             self.validate_external_record_anchor(dependencies.document_id(), &record)?;
             if record.peer_counters() != dependencies.peer_counters()

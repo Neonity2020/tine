@@ -2665,6 +2665,30 @@
         "failBefore": "proven"
       },
       "notes": "A Safe (clean-shutdown) reopen used reopen_promoted_local_runtime_existing_projection, which refused a missing or invalid projection instead of rebuilding it, while the crash path already rebuilt the same state. So the tidier lifecycle was the unrecoverable one: deleting the cache (cleared cache directory, sweeper, restore that skipped it) or leaving it unreadable (corruption, schema-version bump) left the graph permanently unopenable, reported to the frontend as Retryable -- a retry button that can never succeed. The projection is a frontier-stamped disposable cache of an authoritative oplog per ADR 0049, so losing it is recoverable by definition. The Safe path now uses reopen_promoted_local_runtime (AllowRebuild) and the existing-only entry point is deleted; ExistingOnly survives only for the same-process handoff, where the projection is held open by this very process. A present, current projection still opens as-is. Fail-before: both tests fail on the parent commit with OpenRefused."
+    },
+    {
+      "id": "REG-MANAGED-PROJECTION-REBUILD-SUPERLINEAR-001",
+      "title": "Rebuilding a managed graph's projection cost about n^1.6, so a large graph spent minutes on a recovery a small one did in a second",
+      "family": "managed-storage-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::managed_projection_rebuild_resolves_documents_through_lookup_sessions"
+        ],
+        "scenario": "managed.projection-rebuild-cost",
+        "failBefore": "proven"
+      },
+      "notes": "AcceptedRootMaterializer -- the materializer a projection rebuild actually uses -- held no scratch lookup sessions, while BootstrapBulkMaterializer held two. Every document resolution therefore re-walked the scratch LSM from the top, and the LSM grows with the graph, so per-document cost rose with graph size even though the number of document loads stayed linear (2.17, 2.04, 1.96 loads per file at 100/350/1045 files). Measured on the anonymized corpus: 388 ms / 2,214 ms / 14,976 ms, i.e. exponent 1.46 then 1.76, against Martin's stated ceiling of 10 s and truly linear. After giving the materializer the same two root-bound sessions: 271 ms / 796 ms / 2,627 ms, exponent 0.86 then 1.09. Sessions change only how bytes are reached; every record still proves its own anchor, peer counters and direct heads. The guard asserts session hits exceed misses rather than a wall-clock budget, because a small CI fixture is fast whatever the routing -- which is how this went unnoticed. Fail-before: 0 hits, 0 misses over 128 document loads."
     }
   ]
 }
