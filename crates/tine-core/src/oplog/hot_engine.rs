@@ -2727,40 +2727,41 @@ impl DetachedBootstrapAuthoringSession {
                 ));
             }
 
-            #[cfg(test)]
-            let trace_enabled = std::env::var_os("TINE_ACTIVATION_TRACE").is_some();
-            #[cfg(test)]
+            let trace_enabled = candidate.activation_trace_enabled;
             let before_prepare =
                 trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
-            #[cfg(test)]
-            let prepare_started = std::time::Instant::now();
+            let prepare_started = trace_enabled.then(std::time::Instant::now);
             let prepared = candidate.prepare_bootstrap_transaction(author, transaction)?;
-            #[cfg(test)]
             if trace_enabled {
                 let after_prepare = BootstrapAuthoringTraceSnapshot::new(&candidate);
                 eprintln!(
                     "bootstrap prepare transaction: ordinal={} operations={} elapsed_ms={:.3} {}",
                     evidence.ordinal(),
                     operation_count,
-                    prepare_started.elapsed().as_secs_f64() * 1_000.0,
+                    prepare_started
+                        .expect("trace clock exists")
+                        .elapsed()
+                        .as_secs_f64()
+                        * 1_000.0,
                     after_prepare.delta(before_prepare.as_ref().expect("trace snapshot exists")),
                 );
             }
-            #[cfg(test)]
             let before_advance =
                 trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
-            #[cfg(test)]
-            let advance_started = std::time::Instant::now();
+            let advance_started = trace_enabled.then(std::time::Instant::now);
             let (no_op, accepted_evidence) =
                 candidate.advance_detached_bootstrap_candidate(prepared.clone())?;
-            #[cfg(test)]
             if trace_enabled {
                 let after_advance = BootstrapAuthoringTraceSnapshot::new(&candidate);
                 eprintln!(
                     "bootstrap advance candidate: ordinal={} operations={} elapsed_ms={:.3} {}",
                     evidence.ordinal(),
                     operation_count,
-                    advance_started.elapsed().as_secs_f64() * 1_000.0,
+                    advance_started
+                        .expect("trace clock exists")
+                        .elapsed()
+                        .as_secs_f64()
+                        * 1_000.0,
                     after_advance.delta(before_advance.as_ref().expect("trace snapshot exists")),
                 );
             }
@@ -5238,9 +5239,9 @@ struct HistoryWorkStats {
     block_claim_insert_nanos: usize,
 }
 
-/// Test-only causal accounting for the million-block replay receipt. Keeping
-/// this state off the production engine makes the probes zero-cost there.
-#[cfg(test)]
+/// Opt-in causal accounting for managed activation replay. Test builds keep
+/// this enabled for their structural receipts; production builds record it
+/// only when `TINE_ACTIVATION_TRACE` was present when the engine was created.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ReplayTimingStats {
     identity_portable_paths_nanos: u128,
@@ -5277,7 +5278,6 @@ struct ReplayTimingStats {
     external_current_map_insert_nanos: u128,
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct BootstrapAuthoringTraceSnapshot {
     validation_phase_nanos: [u128; 10],
@@ -5287,10 +5287,10 @@ struct BootstrapAuthoringTraceSnapshot {
     accepted_documents: u64,
     visible_document_heads: usize,
     detached_manifests: usize,
+    #[cfg(test)]
     catalog_work: BootstrapCatalogWorkStats,
 }
 
-#[cfg(test)]
 impl BootstrapAuthoringTraceSnapshot {
     fn new(engine: &ShardedHotEngine) -> Self {
         Self {
@@ -5301,6 +5301,7 @@ impl BootstrapAuthoringTraceSnapshot {
             accepted_documents: engine.accepted_frontier_root.document_count(),
             visible_document_heads: engine.visible_document_heads.len(),
             detached_manifests: engine.detached_accepted_manifests.len(),
+            #[cfg(test)]
             catalog_work: bootstrap_catalog_work_stats(engine),
         }
     }
@@ -5311,11 +5312,10 @@ impl BootstrapAuthoringTraceSnapshot {
                 / 1_000
         });
         let replay = self.replay_timing.delta_since(before.replay_timing);
-        let before_catalog_work = before.catalog_work;
         let after = self.instrumentation;
         let before_instrumentation = before.instrumentation;
-        format!(
-            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} block_claim_validation_us={} block_claim_lookup_us={} block_claim_encode_us={} block_claim_insert_us={} page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} reference_extraction_us={} reference_posting_transition_publication_us={} reference_facts_coverage_patricia_us={} reference_reverse_patricia_us={} reference_facts_coverage_reads={} reference_reverse_reads={} reference_sources={} reference_fact_updates={} reference_reverse_updates={} reference_persistent_node_reads={} reference_persistent_node_writes={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
+        let delta = format!(
+            "phases_us={phase_micros:?} replay={replay:?} prepare_transactions={} prepare_head_visits={} author_clones={} author_clone_ops={} stage_clones={} stage_clone_ops={} structural_reuses={} point_reads={} state_read_bytes={} state_written_bytes={} external_flushes={} external_point_reads={} external_range_scans={} scratch_reads={} scratch_read_bytes={} scratch_syncs={} block_claim_validation_us={} block_claim_lookup_us={} block_claim_encode_us={} block_claim_insert_us={} accepted_sequence={} accepted_documents={} visible_document_heads={} detached_manifests={}",
             after.prepare_transactions.saturating_sub(before_instrumentation.prepare_transactions),
             after.prepare_document_head_visits.saturating_sub(before_instrumentation.prepare_document_head_visits),
             after.author_snapshot_clones.saturating_sub(before_instrumentation.author_snapshot_clones),
@@ -5348,6 +5348,17 @@ impl BootstrapAuthoringTraceSnapshot {
                 .block_claim_insert_nanos
                 .saturating_sub(before_instrumentation.block_claim_insert_nanos)
                 / 1_000,
+            self.acceptance_sequence,
+            self.accepted_documents,
+            self.visible_document_heads,
+            self.detached_manifests,
+        );
+        #[cfg(test)]
+        let delta = {
+            let mut delta = delta;
+            let before_catalog_work = before.catalog_work;
+            delta.push_str(&format!(
+                " page_identity_lookups={} full_catalog_author_clones={} reference_fallback_reconstructions={} reference_extraction_us={} reference_posting_transition_publication_us={} reference_facts_coverage_patricia_us={} reference_reverse_patricia_us={} reference_facts_coverage_reads={} reference_reverse_reads={} reference_sources={} reference_fact_updates={} reference_reverse_updates={} reference_persistent_node_reads={} reference_persistent_node_writes={}",
             self.catalog_work
                 .authenticated_page_identity_lookups
                 .saturating_sub(before_catalog_work.authenticated_page_identity_lookups),
@@ -5402,11 +5413,10 @@ impl BootstrapAuthoringTraceSnapshot {
             self.catalog_work
                 .reference_catalog_persistent_node_writes
                 .saturating_sub(before_catalog_work.reference_catalog_persistent_node_writes),
-            self.acceptance_sequence,
-            self.accepted_documents,
-            self.visible_document_heads,
-            self.detached_manifests,
-        )
+            ));
+            delta
+        };
+        delta
     }
 }
 
@@ -5428,7 +5438,6 @@ struct ReferenceSourceObservationStats {
     authenticated_page_identity_lookups: usize,
 }
 
-#[cfg(test)]
 impl ReplayTimingStats {
     fn delta_since(self, before: Self) -> Self {
         macro_rules! delta {
@@ -5474,6 +5483,7 @@ impl ReplayTimingStats {
         }
     }
 
+    #[cfg(test)]
     fn add_document_state_work(&mut self, work: &super::document_state::DocumentStateWork) {
         self.external_checkpoint_phase_calls = self
             .external_checkpoint_phase_calls
@@ -6899,9 +6909,10 @@ pub struct ShardedHotEngine {
     current_path_cursor_book: RefCell<CurrentPathCursorBook>,
     #[cfg(test)]
     current_path_cursor_rows_visited: Cell<usize>,
-    #[cfg(test)]
+    /// Captured once at engine construction so the disabled path never checks
+    /// the process environment inside replay loops.
+    activation_trace_enabled: bool,
     validation_phase_nanos: [u128; 10],
-    #[cfg(test)]
     replay_timing: Cell<ReplayTimingStats>,
     #[cfg(test)]
     catalog_checkpoint_loads: Cell<CatalogCheckpointLoadStats>,
@@ -7038,9 +7049,8 @@ impl ShardedHotEngine {
             current_path_cursor_book: RefCell::new(CurrentPathCursorBook::default()),
             #[cfg(test)]
             current_path_cursor_rows_visited: Cell::new(0),
-            #[cfg(test)]
+            activation_trace_enabled: std::env::var_os("TINE_ACTIVATION_TRACE").is_some(),
             validation_phase_nanos: [0; 10],
-            #[cfg(test)]
             replay_timing: Cell::new(ReplayTimingStats::default()),
             #[cfg(test)]
             catalog_checkpoint_loads: Cell::new(CatalogCheckpointLoadStats::default()),
@@ -9700,11 +9710,44 @@ impl ShardedHotEngine {
         self.catalog_document_id
     }
 
-    #[cfg(test)]
+    fn replay_timing_enabled(&self) -> bool {
+        cfg!(test) || self.activation_trace_enabled
+    }
+
+    fn replay_timing_started(&self) -> Option<Instant> {
+        self.replay_timing_enabled().then(Instant::now)
+    }
+
+    fn record_validation_phase(
+        phases: &mut [u128; 10],
+        phase: usize,
+        started: &mut Option<Instant>,
+    ) {
+        let Some(phase_started) = started.take() else {
+            return;
+        };
+        phases[phase] = phases[phase].saturating_add(phase_started.elapsed().as_nanos());
+        *started = Some(Instant::now());
+    }
+
     fn record_replay_timing(&self, update: impl FnOnce(&mut ReplayTimingStats)) {
+        if !self.replay_timing_enabled() {
+            return;
+        }
         let mut timing = self.replay_timing.get();
         update(&mut timing);
         self.replay_timing.set(timing);
+    }
+
+    fn record_replay_timing_elapsed(
+        &self,
+        started: Option<Instant>,
+        update: impl FnOnce(&mut ReplayTimingStats, u128),
+    ) {
+        let Some(started) = started else {
+            return;
+        };
+        self.record_replay_timing(|timing| update(timing, started.elapsed().as_nanos()));
     }
 
     #[cfg(test)]
@@ -20023,11 +20066,9 @@ impl ShardedHotEngine {
             .saturating_add(document.external_history_blob_reads);
         self.history_work.set(work);
         #[cfg(test)]
-        {
-            let mut timing = self.replay_timing.get();
+        self.record_replay_timing(|timing| {
             timing.add_document_state_work(&document);
-            self.replay_timing.set(timing);
-        }
+        });
     }
 
     fn record_author_snapshot_clone(&self, document: &LoroDoc) {
@@ -20431,8 +20472,7 @@ impl ShardedHotEngine {
         candidate_roots: Option<ScratchRoots>,
         event_binding_digest: Option<ContentDigest>,
     ) -> Result<BatchApplication, EngineError> {
-        #[cfg(test)]
-        let mut phase_started = Instant::now();
+        let mut phase_started = self.replay_timing_started();
         let batch = self
             .archive
             .get(&batch_id)
@@ -20463,11 +20503,7 @@ impl ShardedHotEngine {
         self.validate_dependency_witnesses(&frontier, &updates)?;
         let semantic_payload = semantic_payload.expect("Ready batch has one semantic effect");
         let declared_effect = SemanticEffect::decode(&semantic_payload)?;
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[0] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 0, &mut phase_started);
         let manifest_fingerprint = self.archive_fingerprints.get(&batch_id).copied();
         let pending_documents = self
             .scratch
@@ -20553,11 +20589,7 @@ impl ShardedHotEngine {
                 ));
             }
         };
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[1] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 1, &mut phase_started);
         for document_id in updates.keys() {
             if !before.contains_key(document_id) {
                 let document = if let Some(store) = &self.scratch {
@@ -20607,11 +20639,7 @@ impl ShardedHotEngine {
             false,
             &new_exact_shard_candidates,
         )?;
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[2] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 2, &mut phase_started);
         let mut after = BTreeMap::new();
         if self.scratch.is_some() {
             for (document_id, document) in std::mem::take(&mut before) {
@@ -20644,11 +20672,7 @@ impl ShardedHotEngine {
                 after.insert(*document_id, EngineDocument::InMemory(document));
             }
         }
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[3] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 3, &mut phase_started);
         let validated_new_shards = validate_new_exact_shards_against_declared(
             self.catalog_document_id,
             &after,
@@ -20661,11 +20685,7 @@ impl ShardedHotEngine {
             true,
             &validated_new_shards.documents,
         )?;
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[4] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 4, &mut phase_started);
         let derived_catalog_pages =
             compare_declared_effect_against_snapshots_with_catalog_skipping(
                 &declared_effect,
@@ -20679,11 +20699,7 @@ impl ShardedHotEngine {
             &after,
             &updates,
         )?;
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[5] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 5, &mut phase_started);
         // Prepare every current-state replacement first. No visible document is
         // changed until all imports and structural checks have succeeded.
         let mut replacements = BTreeMap::new();
@@ -20845,11 +20861,7 @@ impl ShardedHotEngine {
             &new_exact_shards,
             validated_catalog_pages,
         )?;
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[6] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 6, &mut phase_started);
         let dependencies = if self.scratch.is_none()
             && declared_effect
                 .blocks()
@@ -20863,8 +20875,7 @@ impl ShardedHotEngine {
             BTreeSet::new()
         };
         let starting_roots = candidate_roots.unwrap_or_else(|| self.scratch_roots.clone());
-        #[cfg(test)]
-        let portable_paths_started = Instant::now();
+        let portable_paths_started = self.replay_timing_started();
         let portable_paths = self.prepare_portable_path_updates(
             &starting_roots,
             batch_id,
@@ -20874,14 +20885,12 @@ impl ShardedHotEngine {
             validated_catalog_pages,
             true,
         )?;
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(portable_paths_started, |timing, elapsed| {
             timing.identity_portable_paths_nanos = timing
                 .identity_portable_paths_nanos
-                .saturating_add(portable_paths_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
-        #[cfg(test)]
-        let page_names_started = Instant::now();
+        let page_names_started = self.replay_timing_started();
         let page_names = if declared_effect.pages().is_empty() {
             None
         } else {
@@ -20907,28 +20916,24 @@ impl ShardedHotEngine {
                 &prospective_page_names,
             )?
         };
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(page_names_started, |timing, elapsed| {
             timing.identity_page_names_nanos = timing
                 .identity_page_names_nanos
-                .saturating_add(page_names_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
-        #[cfg(test)]
-        let identity_binding_started = Instant::now();
+        let identity_binding_started = self.replay_timing_started();
         self.validate_manifested_portable_path_binding(
             batch_id,
             &frontier,
             &portable_paths,
             !portable_paths.conflicts.is_empty(),
         )?;
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(identity_binding_started, |timing, elapsed| {
             timing.identity_binding_nanos = timing
                 .identity_binding_nanos
-                .saturating_add(identity_binding_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
-        #[cfg(test)]
-        let identity_roles_started = Instant::now();
+        let identity_roles_started = self.replay_timing_started();
         let identity = self.validate_and_prepare_semantic_roles_and_block_homes(
             &starting_roots,
             batch_id,
@@ -20936,20 +20941,14 @@ impl ShardedHotEngine {
             &dependencies,
             &declared_effect,
         )?;
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(identity_roles_started, |timing, elapsed| {
             timing.identity_roles_nanos = timing
                 .identity_roles_nanos
-                .saturating_add(identity_roles_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
-        #[cfg(test)]
-        {
-            self.validation_phase_nanos[7] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 7, &mut phase_started);
         let portable_path_blocked = !portable_paths.conflicts.is_empty();
-        #[cfg(test)]
-        let conflict_terminal_started = Instant::now();
+        let conflict_terminal_started = self.replay_timing_started();
         let page_name_blocked = page_names
             .as_ref()
             .is_some_and(|candidate| !candidate.conflicts.is_empty());
@@ -20974,14 +20973,12 @@ impl ShardedHotEngine {
             view.apply_to_snapshots(&mut after_snapshots)?;
             Some(view)
         };
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(conflict_terminal_started, |timing, elapsed| {
             timing.post_identity_conflict_terminal_nanos = timing
                 .post_identity_conflict_terminal_nanos
-                .saturating_add(conflict_terminal_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
-        #[cfg(test)]
-        let claim_and_catalog_started = Instant::now();
+        let claim_and_catalog_started = self.replay_timing_started();
         let logseq_claim_candidate = if quarantined {
             None
         } else {
@@ -21032,11 +21029,10 @@ impl ShardedHotEngine {
                 )?,
             )
         };
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(claim_and_catalog_started, |timing, elapsed| {
             timing.claim_and_catalog_preparation_nanos = timing
                 .claim_and_catalog_preparation_nanos
-                .saturating_add(claim_and_catalog_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
         let lane = if quarantined {
             super::document_state::DocumentLane::Terminal
@@ -21046,8 +21042,7 @@ impl ShardedHotEngine {
         // Divergent exact-frontier records and selected current records compose
         // on one local candidate. No engine-visible root advances until every
         // external flush, witness, and LSM publication has succeeded.
-        #[cfg(test)]
-        let exact_checkpoint_started = Instant::now();
+        let exact_checkpoint_started = self.replay_timing_started();
         let candidate_roots = self.prepare_exact_document_checkpoints(
             &identity.scratch_roots,
             batch_id,
@@ -21055,18 +21050,13 @@ impl ShardedHotEngine {
             &after,
             lane,
         )?;
-        #[cfg(test)]
-        {
-            self.record_replay_timing(|timing| {
-                timing.exact_checkpoint_preparation_nanos = timing
-                    .exact_checkpoint_preparation_nanos
-                    .saturating_add(exact_checkpoint_started.elapsed().as_nanos());
-            });
-            self.validation_phase_nanos[8] += phase_started.elapsed().as_nanos();
-            phase_started = Instant::now();
-        }
-        #[cfg(test)]
-        let current_checkpoint_started = Instant::now();
+        self.record_replay_timing_elapsed(exact_checkpoint_started, |timing, elapsed| {
+            timing.exact_checkpoint_preparation_nanos = timing
+                .exact_checkpoint_preparation_nanos
+                .saturating_add(elapsed);
+        });
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 8, &mut phase_started);
+        let current_checkpoint_started = self.replay_timing_started();
         let candidate_roots = self.prepare_external_document_checkpoints(
             &candidate_roots,
             batch_id,
@@ -21074,15 +21064,12 @@ impl ShardedHotEngine {
             &replacement_heads,
             lane,
         )?;
-        #[cfg(test)]
-        {
-            self.record_replay_timing(|timing| {
-                timing.current_checkpoint_preparation_nanos = timing
-                    .current_checkpoint_preparation_nanos
-                    .saturating_add(current_checkpoint_started.elapsed().as_nanos());
-            });
-            self.validation_phase_nanos[9] += phase_started.elapsed().as_nanos();
-        }
+        self.record_replay_timing_elapsed(current_checkpoint_started, |timing, elapsed| {
+            timing.current_checkpoint_preparation_nanos = timing
+                .current_checkpoint_preparation_nanos
+                .saturating_add(elapsed);
+        });
+        Self::record_validation_phase(&mut self.validation_phase_nanos, 9, &mut phase_started);
         if quarantined {
             let page_name_binding =
                 self.page_name_durable_candidate(None, page_name_conflicts.as_ref())?;
@@ -21171,8 +21158,7 @@ impl ShardedHotEngine {
         let prepared_reference_catalog = reference_catalog
             .as_ref()
             .and_then(ReferenceCatalogCandidateV2::prepared_candidate);
-        #[cfg(test)]
-        let durable_history_started = Instant::now();
+        let durable_history_started = self.replay_timing_started();
         if let Err(error) = self.persist_durable_final_status_with_binding(
             batch_id,
             fingerprint,
@@ -21191,11 +21177,10 @@ impl ShardedHotEngine {
             self.precommit_history_publication_failure = Some(error.clone());
             return Err(error);
         }
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
             timing.durable_history_nanos = timing
                 .durable_history_nanos
-                .saturating_add(durable_history_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
         let projection_preparation_error = self.prepare_projection_work(batch_id).err();
         self.commit_identity_publication(identity);
@@ -22050,8 +22035,7 @@ impl ShardedHotEngine {
         page_name_root: &PageNameOwnershipRootV1,
         logseq_claim_root: LogseqClaimIndexRoot,
     ) -> Result<ReferenceCatalogCandidateV2, EngineError> {
-        #[cfg(test)]
-        let source_started = Instant::now();
+        let source_started = self.replay_timing_started();
         let affected = affected_reference_sources(effect);
         let authenticated_catalog_rows = if observations.catalog_pages.is_none()
             && self.scratch.is_some()
@@ -22145,23 +22129,20 @@ impl ShardedHotEngine {
                 }),
             );
         }
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(source_started, |timing, elapsed| {
             timing.reference_catalog_source_nanos = timing
                 .reference_catalog_source_nanos
-                .saturating_add(source_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
-        #[cfg(test)]
-        let postings_patricia_started = Instant::now();
+        let postings_patricia_started = self.replay_timing_started();
         let candidate = self
             .reference_catalog
             .prepare(sources, page_name_root, logseq_claim_root.digest())
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()));
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
+        self.record_replay_timing_elapsed(postings_patricia_started, |timing, elapsed| {
             timing.reference_catalog_postings_patricia_nanos = timing
                 .reference_catalog_postings_patricia_nanos
-                .saturating_add(postings_patricia_started.elapsed().as_nanos());
+                .saturating_add(elapsed);
         });
         candidate
     }

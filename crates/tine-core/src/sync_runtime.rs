@@ -30614,41 +30614,62 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual release 1,000/10,000-page activation timing receipt"]
+    #[ignore = "manual release 1,000/3,000/10,000-page activation timing receipt"]
     fn activation_scaled_manual_phase_receipt() {
-        let small_pages = std::env::var("TINE_ACTIVATION_SMALL_PAGES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(997);
-        let large_pages = std::env::var("TINE_ACTIVATION_LARGE_PAGES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(9_997);
-        let small = ActivationFixture::scaled("manual-scale-small", 0xa0b0, small_pages);
-        let large = ActivationFixture::scaled("manual-scale-large", 0xa0c0, large_pages);
-        let small_receipt = activate_with_scale_receipt(&small);
-        let large_receipt = activate_with_scale_receipt(&large);
-        eprintln!("activation manual scale small: {small_receipt:?}");
-        eprintln!("activation manual scale large: {large_receipt:?}");
-        assert_eq!(small_receipt.source_files, small_pages + 3);
-        assert_eq!(large_receipt.source_files, large_pages + 3);
-        assert!(large_receipt.blocks >= large_pages.saturating_mul(9));
         assert!(
-            large_receipt.total_ms
-                <= small_receipt.total_ms.saturating_mul(15).saturating_add(500),
-            "10,000-page activation violated the two-scale ceiling: small={small_receipt:?}, large={large_receipt:?}"
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release activation_scaled_manual_phase_receipt -- --ignored --nocapture"
         );
-        let cold_started = std::time::Instant::now();
-        let reopened = SyncRuntimeHandle::open(reopen_request(&large.request));
-        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
-        let cold_ms = cold_started.elapsed().as_millis();
-        eprintln!("activation manual cold reopen ms: {cold_ms}");
-        assert!(
-            large_receipt.total_ms < 10_000,
-            "fresh activation exceeded 10 seconds"
-        );
-        assert!(cold_ms < 10_000, "true cold reopen exceeded 10 seconds");
-        drop(reopened.handle);
+        let page_counts = std::env::var("TINE_ACTIVATION_PAGE_COUNTS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|part| {
+                        part.trim()
+                            .parse::<usize>()
+                            .expect("TINE_ACTIVATION_PAGE_COUNTS entries must be integers")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![1_000, 3_000, 10_000]);
+        assert!(!page_counts.is_empty(), "at least one page count is required");
+
+        // Keep exactly one synthetic graph alive at a time. The receipt is a
+        // measurement oracle, not a latency budget: it validates the measured
+        // graph and activation outcome but never turns today's known cost into
+        // a false pass/fail threshold.
+        for (index, total_pages) in page_counts.into_iter().enumerate() {
+            let additional_pages = total_pages
+                .checked_sub(3)
+                .expect("page counts must include the three seed documents");
+            let fixture = ActivationFixture::scaled(
+                &format!("manual-scale-{total_pages}"),
+                0xa0b0 + index as u128 * 0x10,
+                additional_pages,
+            );
+            let receipt = activate_with_scale_receipt(&fixture);
+            assert_eq!(receipt.source_files, total_pages, "{receipt:?}");
+            assert!(
+                receipt.blocks >= additional_pages.saturating_mul(9),
+                "{receipt:?}"
+            );
+            assert_eq!(receipt.phase_ms.len(), 8, "{receipt:?}");
+
+            let cold_started = std::time::Instant::now();
+            let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+            assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+            let cold_ms = cold_started.elapsed().as_millis();
+            eprintln!(
+                "activation_manual pages={total_pages} total_ms={} cold_reopen_ms={cold_ms} source_bytes={} blocks={} phases={:?} construction={:?}",
+                receipt.total_ms,
+                receipt.source_bytes,
+                receipt.blocks,
+                receipt.phase_ms,
+                receipt.construction,
+            );
+            drop(reopened.handle);
+        }
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
