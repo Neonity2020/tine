@@ -141,7 +141,15 @@ impl Deref for ReadGraphLease {
 pub(crate) struct GraphSlot {
     authority: GraphAuthority,
     legacy_leases: Option<Arc<LegacyLeaseTracker>>,
-    graph_meta: tine_core::model::GraphMeta,
+    /// The configuration snapshot `load_graph` hands the frontend. Replaceable
+    /// because a settings change under managed storage has to update it: the
+    /// legacy path publishes a whole replacement slot after a reopen, and
+    /// without this a managed graph would report the settings it activated with
+    /// the next time the same window loads the same root.
+    graph_meta: RwLock<tine_core::model::GraphMeta>,
+    /// The graph root this slot answers for, as the meta first reported it.
+    /// Fixed for the life of the slot, so refreshing the meta can never move it.
+    graph_root: PathBuf,
     pub(crate) root_key: PathBuf,
     /// Unique lease for this exact window→graph binding. Frontend mutations carry
     /// it so an IPC queued before an in-place graph switch cannot execute against
@@ -173,7 +181,8 @@ impl GraphSlot {
         Self {
             authority: GraphAuthority::Legacy(Arc::new(graph)),
             legacy_leases: Some(Arc::new(LegacyLeaseTracker::default())),
-            graph_meta,
+            graph_root: PathBuf::from(&graph_meta.root),
+            graph_meta: RwLock::new(graph_meta),
             root_key,
             binding_generation: NEXT_BINDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             warm_done: AtomicBool::new(false),
@@ -193,7 +202,8 @@ impl GraphSlot {
         Self {
             authority: GraphAuthority::SparseV2(binding),
             legacy_leases: None,
-            graph_meta,
+            graph_root: PathBuf::from(&graph_meta.root),
+            graph_meta: RwLock::new(graph_meta),
             root_key,
             binding_generation: NEXT_BINDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             warm_done: AtomicBool::new(false),
@@ -311,11 +321,9 @@ impl GraphSlot {
             return Arc::clone(graph);
         }
         let mut slot = self.derived_read_graph.write().unwrap();
-        Arc::clone(slot.get_or_insert_with(|| {
-            Arc::new(Graph::open_derived_read_only(Path::new(
-                &self.graph_meta.root,
-            )))
-        }))
+        Arc::clone(
+            slot.get_or_insert_with(|| Arc::new(Graph::open_derived_read_only(&self.graph_root))),
+        )
     }
 
     /// Drop the managed read-only view's cached parse of the graph.
@@ -330,18 +338,24 @@ impl GraphSlot {
         }
     }
 
-    /// Discard the managed read-only view entirely, so the next read reopens it.
+    /// Rebuild the managed read-only view and the configuration snapshot the
+    /// frontend is given, after a settings change.
     ///
     /// A `Graph` reads `logseq/config.edn` when it opens and keeps the result,
-    /// so invalidating the parse is not enough after a settings change: the view
-    /// has to be rebuilt or it keeps answering with the previous journal title
-    /// format, preferred format, hidden paths and so on.
+    /// so invalidating the parse is not enough: the view has to be rebuilt or it
+    /// keeps answering with the previous journal title format, preferred format,
+    /// hidden paths and so on. The stored `GraphMeta` is refreshed for the same
+    /// reason -- `load_graph` returns it verbatim when a window reloads the root
+    /// it already holds, so a stale copy makes a saved setting look reverted.
+    /// This is what the legacy path gets by publishing a replacement slot.
     pub(crate) fn reopen_derived_read_graph(&self) {
         *self.derived_read_graph.write().unwrap() = None;
+        let refreshed = self.derived_read_graph().meta();
+        *self.graph_meta.write().unwrap() = refreshed;
     }
 
     pub(crate) fn graph_meta(&self) -> tine_core::model::GraphMeta {
-        self.graph_meta.clone()
+        self.graph_meta.read().unwrap().clone()
     }
 
     /// Borrow the actor only through the graph slot that owns it.
@@ -427,7 +441,8 @@ impl GraphSlot {
         Ok(Self {
             authority: GraphAuthority::Legacy(Arc::new(graph)),
             legacy_leases: old.legacy_leases.clone(),
-            graph_meta,
+            graph_root: PathBuf::from(&graph_meta.root),
+            graph_meta: RwLock::new(graph_meta),
             root_key: old.root_key.clone(),
             binding_generation: old.binding_generation,
             warm_done: AtomicBool::new(old.warm_done.load(std::sync::atomic::Ordering::Acquire)),
@@ -943,12 +958,23 @@ mod tests {
             "the already-open view still holds the configuration it opened with"
         );
 
+        assert_eq!(
+            slot.graph_meta().start_of_week,
+            before,
+            "and so does the snapshot load_graph hands back"
+        );
+
         slot.reopen_derived_read_graph();
         assert_eq!(
             slot.with_read_graph(|graph| Ok(graph.config.start_of_week))
                 .unwrap(),
             3,
             "after the reopen the view must answer with the new configuration"
+        );
+        assert_eq!(
+            slot.graph_meta().start_of_week,
+            3,
+            "a window reloading this root must not be told the old setting"
         );
 
         let _ = std::fs::remove_dir_all(&root);
