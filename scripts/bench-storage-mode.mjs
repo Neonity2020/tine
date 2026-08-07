@@ -44,6 +44,17 @@ const PERIOD_MS = positiveInt("TINE_STORAGE_MODE_PERIOD_MS", 35);
 const PAGES = positiveInt("TINE_STORAGE_MODE_PAGES", 120);
 const BLOCKS = positiveInt("TINE_STORAGE_MODE_BLOCKS", 80);
 const TARGET_PAGE = "Storage Bench Target";
+// Optional real-corpus mode: point at an existing graph (e.g.
+// ~/research/logseq-anonymized) instead of generating a synthetic one. The graph
+// is COPIED into the run's scratch root, never edited in place, because the
+// benchmark mutates its target page. A synthetic fixture cannot answer "is
+// managed slower than direct on my graph" — see AGENTS.md §4 corpus discipline.
+const SEED_GRAPH = process.env.TINE_STORAGE_MODE_SEED_GRAPH
+  ? path.resolve(process.env.TINE_STORAGE_MODE_SEED_GRAPH)
+  : null;
+if (SEED_GRAPH && !fs.existsSync(SEED_GRAPH)) {
+  throw new Error(`TINE_STORAGE_MODE_SEED_GRAPH does not exist: ${SEED_GRAPH}`);
+}
 
 if (!fs.existsSync(APP)) throw new Error(`native app binary is missing: ${APP}`);
 if (!process.env.DISPLAY) throw new Error("HARNESS UNAVAILABLE: run under an X display (for example xvfb-run -a dbus-run-session)");
@@ -106,11 +117,41 @@ function journalStem() {
   return `${now.getFullYear()}_${String(now.getMonth() + 1).padStart(2, "0")}_${String(now.getDate()).padStart(2, "0")}`;
 }
 
+function countTextFiles(dir) {
+  let n = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true, recursive: true })) {
+    if (entry.isFile() && /\.(md|markdown|org)$/i.test(entry.name)) n += 1;
+  }
+  return n;
+}
+
 function seedGraph(root) {
   const graph = path.join(root, "graph");
   const pages = path.join(graph, "pages");
   const journals = path.join(graph, "journals");
   const target = path.join(pages, `${TARGET_PAGE}.md`);
+  if (SEED_GRAPH) {
+    // Copy the real corpus in; the source is read-only as far as this run is
+    // concerned. The target page and today's journal are then added on top so
+    // the save and keystroke phases have the same edit surface as the synthetic
+    // fixture, making the two fixtures' numbers comparable per operation.
+    fs.cpSync(SEED_GRAPH, graph, { recursive: true });
+    fs.mkdirSync(pages, { recursive: true });
+    fs.mkdirSync(journals, { recursive: true });
+    fs.mkdirSync(path.join(graph, "logseq"), { recursive: true });
+    const config = path.join(graph, "logseq", "config.edn");
+    if (!fs.existsSync(config)) fs.writeFileSync(config, '{:preferred-format "Markdown"}\n');
+    fs.writeFileSync(
+      target,
+      [
+        "- storage mode active block",
+        ...Array.from({ length: BLOCKS - 1 }, (_, index) => `- bench filler ${String(index + 1).padStart(3, "0")} stable content`),
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(path.join(journals, `${journalStem()}.md`), `- [[${TARGET_PAGE}]]\n`);
+    return { graph, target, fileCount: countTextFiles(graph) };
+  }
   fs.mkdirSync(pages, { recursive: true });
   fs.mkdirSync(journals, { recursive: true });
   fs.mkdirSync(path.join(graph, "logseq"), { recursive: true });
@@ -127,7 +168,7 @@ function seedGraph(root) {
     fs.writeFileSync(path.join(pages, `Storage Bench Unrelated ${String(index).padStart(3, "0")}.md`), `- unrelated bench page ${index}\n`);
   }
   fs.writeFileSync(path.join(journals, `${journalStem()}.md`), `- [[${TARGET_PAGE}]]\n`);
-  return { graph, target };
+  return { graph, target, fileCount: countTextFiles(graph) };
 }
 
 async function waitFor(predicate, label, timeoutMs = 30_000) {
@@ -403,7 +444,7 @@ function classifyFailure(error) {
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "tine-storage-mode-bench-"));
 const runDir = path.join(root, "artifacts");
 const xdg = path.join(root, "xdg");
-const { graph, target } = seedGraph(root);
+const { graph, target, fileCount } = seedGraph(root);
 for (const directory of ["data", "config", "cache"]) fs.mkdirSync(path.join(xdg, directory), { recursive: true });
 fs.mkdirSync(runDir, { recursive: true });
 const receipt = {
@@ -412,11 +453,21 @@ const receipt = {
   testedCommit: gitRevision(),
   app: APP,
   modeOrder: MODE_ORDER,
-  fixture: {
-    name: "synthetic storage-mode fixture",
-    graph: `${PAGES} Markdown pages; ${BLOCKS}-block edited page`,
-    target: `pages/${TARGET_PAGE}.md`,
-  },
+  // Provenance is load-bearing: a storage-mode number is meaningless without the
+  // graph it came from, and the synthetic and real corpora give very different
+  // answers. Never quote a figure from this receipt without this block.
+  fixture: SEED_GRAPH
+    ? {
+        name: "real-corpus storage-mode fixture",
+        source: SEED_GRAPH,
+        graph: `${fileCount} text files copied from ${path.basename(SEED_GRAPH)}; ${BLOCKS}-block edited page added`,
+        target: `pages/${TARGET_PAGE}.md`,
+      }
+    : {
+        name: "synthetic storage-mode fixture",
+        graph: `${PAGES} Markdown pages; ${BLOCKS}-block edited page (${fileCount} text files)`,
+        target: `pages/${TARGET_PAGE}.md`,
+      },
   machine: `${os.hostname()} (${os.platform()}-${os.release()}-${os.arch()})`,
   pulses: PULSES,
   periodMs: PERIOD_MS,
