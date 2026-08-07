@@ -2100,6 +2100,7 @@ pub(crate) mod simulator_harness {
         act_once_at, fail_once_at, ExternalPublishedContinuation, LocalRuntimeAdmission,
         OperationalCoordinator, OperationalCoordinatorState, OperationalFaultPoint,
     };
+    use crate::oplog::hot_engine::AcceptedFrontierRoot;
     use crate::oplog::simulator::{
         publish_bootstrap_prepared_for_simulator_fixture, CoordinatorAction,
         CoordinatorDurableBoundary, CoordinatorExpectedState, CoordinatorFailureWitness,
@@ -3238,8 +3239,17 @@ pub(crate) mod simulator_harness {
         Ok(ready.saturating_add(pending))
     }
 
-    fn frontier_digest(root: &impl serde::Serialize) -> Result<String, String> {
-        let bytes = postcard::to_allocvec(root).map_err(display)?;
+    /// Names a frontier by its identity, so that "same digest" and "compares
+    /// equal" cannot disagree.
+    ///
+    /// Every use of this digest in the harness and the simulator oracles is
+    /// relational -- it asks whether the SQLite projection sits at the accepted
+    /// frontier. Digesting the whole struct instead answered a different
+    /// question, because the run-local `scratch_root` moves on reopen: the read
+    /// gate would (correctly) be Open with the two roots equal, while the
+    /// oracle read the two digests and reported the projection as stale.
+    fn frontier_digest(root: &AcceptedFrontierRoot) -> Result<String, String> {
+        let bytes = postcard::to_allocvec(&root.identity()).map_err(display)?;
         Ok(hex(ContentDigest::of(&bytes).as_bytes()))
     }
 

@@ -3621,29 +3621,62 @@ pub struct AcceptedFrontierRoot {
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
 }
 
+/// Exactly the fields that make two accepted frontier roots the *same accepted
+/// frontier*, borrowed from one.
+///
+/// This exists so that identity has a single definition. Comparing two roots
+/// and digesting one are the same question asked two ways, and they used to be
+/// answered by two independently maintained field lists -- `PartialEq` below
+/// and a whole-struct `postcard` encoding. That divergence is a live defect
+/// class here, not a hypothetical: `scratch_root` is a run-local address, so a
+/// digest that includes it reports two names for one frontier the moment a
+/// reopen moves the scratch store. Both answers now come from this one view.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AcceptedFrontierIdentity<'a> {
+    schema_version: u32,
+    acceptance_sequence: u64,
+    document_count: u64,
+    retained_bytes_total: u64,
+    document_map_root_key: Option<[u8; 16]>,
+    document_map_root_digest: &'a ContentDigest,
+    batch_map_root_key: Option<[u8; 16]>,
+    batch_map_root_digest: &'a ContentDigest,
+    reference_catalog_root: &'a ReferenceCatalogRootV2,
+    state_digest: &'a ContentDigest,
+}
+
+impl AcceptedFrontierRoot {
+    /// The frontier's identity, with the run-local `scratch_root` left out.
+    ///
+    /// `scratch_root` is a run-local address for the frontier's maps. It is
+    /// deliberately absent from `state_digest`, so it carries no authenticated
+    /// meaning, and reopening a graph moves it as a matter of course. Counting
+    /// it as identity made an up-to-date SQLite projection compare unequal to
+    /// the very frontier it was already at, which the recovery path could only
+    /// read as corruption -- and answer by rebuilding the entire graph.
+    /// Dereferencing still uses the field directly; only identity ignores it.
+    pub(crate) const fn identity(&self) -> AcceptedFrontierIdentity<'_> {
+        AcceptedFrontierIdentity {
+            schema_version: self.schema_version,
+            acceptance_sequence: self.acceptance_sequence,
+            document_count: self.document_count,
+            retained_bytes_total: self.retained_bytes_total,
+            document_map_root_key: self.document_map_root_key,
+            document_map_root_digest: &self.document_map_root_digest,
+            batch_map_root_key: self.batch_map_root_key,
+            batch_map_root_digest: &self.batch_map_root_digest,
+            reference_catalog_root: &self.reference_catalog_root,
+            state_digest: &self.state_digest,
+        }
+    }
+}
+
 /// Two accepted frontier roots are equal when they are the same accepted
 /// frontier -- not when they additionally happen to live at the same place in
-/// this process.
-///
-/// `scratch_root` is a run-local address for the frontier's maps. It is
-/// deliberately absent from `state_digest`, so it carries no authenticated
-/// meaning, and reopening a graph moves it as a matter of course. Including it
-/// here made an up-to-date SQLite projection compare unequal to the very
-/// frontier it was already at, which the recovery path could only read as
-/// corruption -- and answer by rebuilding the entire graph. Dereferencing still
-/// uses the field directly; only identity ignores it.
+/// this process. See [`AcceptedFrontierRoot::identity`].
 impl PartialEq for AcceptedFrontierRoot {
     fn eq(&self, other: &Self) -> bool {
-        self.schema_version == other.schema_version
-            && self.acceptance_sequence == other.acceptance_sequence
-            && self.document_count == other.document_count
-            && self.retained_bytes_total == other.retained_bytes_total
-            && self.document_map_root_key == other.document_map_root_key
-            && self.document_map_root_digest == other.document_map_root_digest
-            && self.batch_map_root_key == other.batch_map_root_key
-            && self.batch_map_root_digest == other.batch_map_root_digest
-            && self.reference_catalog_root == other.reference_catalog_root
-            && self.state_digest == other.state_digest
+        self.identity() == other.identity()
     }
 }
 
@@ -42467,5 +42500,45 @@ mod replay_benchmark {
             status.pending
         );
         assert_eq!(restored.get_deep_value(), expected.get_deep_value());
+    }
+}
+
+#[cfg(test)]
+mod frontier_identity_tests {
+    use super::*;
+
+    /// A frontier must answer "which frontier are you?" the same way however
+    /// the question is asked -- by comparison or by digest.
+    ///
+    /// The two answers were once maintained separately, and drifted: `PartialEq`
+    /// excluded the run-local `scratch_root` while the simulator harness named a
+    /// frontier by encoding the whole struct. A reopen moves the scratch store,
+    /// so the SQLite projection sitting exactly at the accepted frontier
+    /// compared equal (read gate open) and digested differently (oracle: stale
+    /// projection) at the same instant. Fifteen coordinator scenarios failed on
+    /// that contradiction.
+    #[test]
+    fn a_frontier_keeps_one_identity_when_the_scratch_store_moves_under_it() {
+        let key_bytes = crate::oplog::scratch_store::MAX_CARRIED_SCRATCH_KEY_BYTES;
+        let before_reopen = AcceptedFrontierRoot::saturated_for_test(key_bytes);
+        let mut after_reopen = before_reopen.clone();
+        after_reopen.scratch_root = None;
+
+        assert_eq!(
+            before_reopen, after_reopen,
+            "scratch_root is a run-local address, so it cannot make two frontiers different"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&before_reopen.identity()).unwrap(),
+            postcard::to_allocvec(&after_reopen.identity()).unwrap(),
+            "frontiers that compare equal must digest equal, or an up-to-date \
+             projection reads as stale"
+        );
+        assert_ne!(
+            postcard::to_allocvec(&before_reopen).unwrap(),
+            postcard::to_allocvec(&after_reopen).unwrap(),
+            "the whole-struct encoding still differs -- which is precisely why \
+             identity may not be taken from it"
+        );
     }
 }
