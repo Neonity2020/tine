@@ -247,9 +247,18 @@ async function closeSession(session) {
 }
 
 async function openTarget(browser) {
+  // The sidebar inventory is truncated on a real-scale graph -- at 1,045 files it
+  // renders a few hundred rows and then "+643 more - search to open...", so the
+  // target is simply not in the DOM to be clicked. Every path here therefore
+  // falls back to the `[[target]]` reference seeded into today's journal, which
+  // is rendered regardless of how many pages the graph has.
   const clickInventoryTarget = () => browser.execute((targetPage) => {
-    const row = [...document.querySelectorAll(".nav-page")]
-      .find((node) => (node.textContent ?? "").includes(targetPage));
+    const rows = [
+      ...document.querySelectorAll(".nav-page"),
+      ...document.querySelectorAll(".page-ref"),
+    ];
+    const row = rows.find((node) => (node.textContent ?? "").trim() === targetPage)
+      ?? rows.find((node) => (node.textContent ?? "").includes(targetPage));
     if (!row) return false;
     for (const type of ["mousedown", "mouseup", "click"]) {
       row.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, button: 0 }));
