@@ -13,32 +13,6 @@ global-timeout = "4h"
 status-level = "slow"
 final-status-level = "slow"
 
-# One test does not fit the 10-minute default, and has not for some time.
-#
-# `authenticated_history_extension_revalidation_is_bounded_per_step` publishes
-# 11,001 durable history records (1 + 1,000 + 10,000) and authenticates after
-# every one. Its scale is load-bearing: the closing assertions require the
-# full-walk cost at 10,000 to be at least 5x the cost at 1,000, and at least
-# 100x the worst incremental step, which is how the memo's removal of per-step
-# growth is actually demonstrated rather than asserted.
-#
-# It took 460.8s of the 600s budget in run 31021553477 (607f7d20, the last green
-# full CI) and was already reported SLOW there; in run 31153262155 it crossed
-# 600s and failed the shard. Measured locally at 36.82s on 607f7d20 and 37.62s
-# on 735cbab2 -- unchanged, so this is a budget that was never calibrated for
-# this test, not a regression. The gap is the runner: the work is fsync-bound
-# (29.6s of the 37.6s is sys time).
-#
-# 15 minutes leaves real headroom over the observed 460s while still failing on
-# a genuine slowdown, and `period` stays at 5m so the SLOW warning keeps
-# reporting the trend. HARNESS DEBT, not a fix: this test proves a *node-read*
-# bound but pays for *durability* on every one of 11,001 publishes. Decoupling
-# those is the actual repair, and it needs its own design -- adding an
-# fsync-bypass knob to ObjectStore for a test's benefit is not it.
-[[profile.ci.overrides]]
-filter = 'test(=oplog::object_store::history_index_tests::authenticated_history_extension_revalidation_is_bounded_per_step)'
-slow-timeout = { period = "5m", terminate-after = 3, grace-period = "30s", on-timeout = "fail" }
-
 # The Windows fixture families use process isolation. Nextest can schedule
 # those processes concurrently, while each selected test runs on one libtest
 # thread so same-process fixture leases cannot contend.

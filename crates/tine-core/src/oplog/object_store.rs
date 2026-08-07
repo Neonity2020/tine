@@ -9102,8 +9102,15 @@ mod history_index_tests {
             store.instrumentation().history_index_reads
         }
 
+        // Post-anchor history sizes. Every assertion below is a statement about
+        // *node reads*, and the memoized step is constant by construction, so
+        // these only have to be large enough for each comparison to be decided
+        // with real margin -- see the measured table on the closing assertion.
+        // They used to be 1/1,000/10,000, which published 11,001 durable
+        // records to decide those same comparisons and made this the slowest
+        // test in the suite by an order of magnitude.
         let mut full_walks = Vec::new();
-        for (run, size) in [1_usize, 1_000, 10_000].into_iter().enumerate() {
+        for (run, size) in [1_usize, 64, 512].into_iter().enumerate() {
             let root = test_root(&format!("bounded-revalidation-{size}"));
             let archive = root.join("archive");
             let workspace = WorkspaceId::from_uuid(Uuid::from_u128(46_000 + run as u128));
@@ -9180,7 +9187,7 @@ mod history_index_tests {
                 .unwrap();
             assert_eq!(node_reads(&reopened_store) - before, 1);
 
-            if size >= 1_000 {
+            if size >= 512 {
                 assert!(
                     full_walk >= 100 * worst_incremental_step,
                     "full walk {full_walk} is not dominated by the {worst_incremental_step}-read \
@@ -9196,6 +9203,18 @@ mod history_index_tests {
 
         // The unmemoized proof cost tracks the post-anchor history — which is
         // exactly the growth the memo removes from every step above.
+        //
+        // Measured here, one row per post-anchor size (worst memoized step /
+        // full walk): 2 -> 35/65, 32 -> 36/1009, 64 -> 36/2001, 128 -> 36/3985,
+        // 256 -> 37/7919, 512 -> 37/15633. The full walk is 31*size, the
+        // memoized step is flat, and the separation is already two orders of
+        // magnitude at 512. Growing the history further re-measures those same
+        // two shapes at greater cost; it does not make either claim stronger.
+        // Detection is immediate rather than asymptotic: with the memo removed
+        // every step becomes its own full walk, and the per-step bound above is
+        // breached by the third record (97 reads against 68), so the size that
+        // catches a regression is small even though the size that makes the
+        // contrast *legible* is 512.
         assert!(
             full_walks[2] >= 5 * full_walks[1],
             "full-walk cost {full_walks:?} did not scale with the post-anchor history"
