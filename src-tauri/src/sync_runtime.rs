@@ -383,6 +383,17 @@ impl SparseV2Binding {
         self.handle.as_ref()
     }
 
+    /// A managed binding with no live actor, for tests that only need the slot
+    /// to *be* sparse -- e.g. proving that a read command is routed to the
+    /// read-only view instead of being refused for lacking legacy authority.
+    #[cfg(test)]
+    pub(crate) fn without_actor_for_test() -> Self {
+        Self {
+            availability: SparseV2Availability::Active,
+            handle: None,
+        }
+    }
+
     pub(crate) fn availability(&self) -> &SparseV2Availability {
         &self.availability
     }

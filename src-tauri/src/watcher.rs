@@ -1210,6 +1210,19 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             crate::sync_runtime::tick_dto(tick),
                         );
                         if changed {
+                            // The oplog committed a batch and projected it onto
+                            // the tree. Any read-only view this binding opened
+                            // for backlinks/search/query is now parsed from
+                            // superseded bytes, so drop its cache before the
+                            // frontend refetches on `sparse-v2-changed`.
+                            if let Some(slot) = crate::state::slot_for_window(
+                                &app.state::<crate::state::AppState>(),
+                                label,
+                            )
+                            .ok()
+                            {
+                                slot.invalidate_derived_read_graph();
+                            }
                             let _ = app.emit_to(label, "sparse-v2-changed", ());
                         }
                         if let Ok(status) = graph.handle.status() {

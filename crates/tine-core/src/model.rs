@@ -1339,6 +1339,17 @@ fn managed_write_identity_mismatch_error() -> io::Error {
     )
 }
 
+/// Refusal for any graph-text write attempted through a read-only view. It is
+/// deliberately a hard error rather than a silent no-op: a caller that reached
+/// here is routed wrongly, and the write it wanted must go through the managed
+/// runtime instead. See [`Graph::derived_read_only`].
+fn derived_read_only_write_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "this graph view is read-only: graph text is owned by Tine-managed storage",
+    )
+}
+
 /// An active managed-text writer admission. Its only job is to keep the graph
 /// handoff mint from observing a false quiescent point.
 struct ManagedTextWritePermit {
@@ -1957,6 +1968,20 @@ fn verify_handoff_binding(
 
 pub struct Graph {
     pub root: PathBuf,
+    /// This instance may only ever *read* graph text.
+    ///
+    /// Tine-managed storage keeps the oplog as the sole authority and projects
+    /// it onto the ordinary Markdown/Org tree. Whole-graph reads -- backlinks,
+    /// search, `{{query}}`, aliases -- want that tree, but nothing outside the
+    /// managed runtime may write it, or a write would land behind the oplog's
+    /// back and be reverted (or worse, survive) at the next reconciliation.
+    ///
+    /// Rather than promise per caller that a command only reads, this flag fails
+    /// the *single* graph-text write admission (`admit_managed_text_writer`) and
+    /// the in-root write-containment check closed for the whole instance. Asset
+    /// writes keep their own capability and are deliberately still permitted:
+    /// `assets/` is outside the oplog's document domain.
+    derived_read_only: bool,
     /// Retained no-follow identity of the graph root. Sparse projection writes
     /// fail closed when this capability could not be established at graph open.
     projection_root: Option<Dir>,
@@ -4930,6 +4955,20 @@ impl Graph {
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
+        // Config, publish and trash writes reach the tree without a graph-text
+        // writer permit, so the read-only view has to refuse them here too.
+        if self.derived_read_only {
+            return Err(derived_read_only_write_error());
+        }
+        self.ensure_within_graph_root(target)
+    }
+
+    /// Pure containment: the target must resolve inside this graph root. Split
+    /// out of `ensure_write_target` so the asset capability can reuse the check
+    /// without inheriting the graph-text read-only refusal -- `assets/` is
+    /// outside the oplog's document domain and stays writable in a read-only
+    /// view.
+    fn ensure_within_graph_root(&self, target: &Path) -> io::Result<()> {
         if path_stays_within_root(&self.root, target)
             && !path_uses_managed_alias(&self.root, target)
         {
@@ -4947,7 +4986,7 @@ impl Graph {
     /// page/config/publish write into the same directory.
     fn ensure_asset_write_target(&self, target: &Path) -> io::Result<()> {
         if self.assets_root == self.root.join("assets") {
-            return self.ensure_write_target(target);
+            return self.ensure_within_graph_root(target);
         }
         if path_stays_within_root(&self.assets_root, target)
             && !path_uses_managed_alias(&self.assets_root, target)
@@ -4966,6 +5005,21 @@ impl Graph {
 
     /// Open a graph directory, reading `logseq/config.edn` if present.
     pub fn open(root: impl AsRef<Path>) -> Graph {
+        Self::open_inner(root, false)
+    }
+
+    /// Open the same directory as a **read-only view of graph text**.
+    ///
+    /// This is what Tine-managed storage hands to whole-graph read commands.
+    /// The projected Markdown/Org tree is the managed runtime's own output, so
+    /// reading it answers backlinks/search/query questions from the oplog's
+    /// materialization -- but this instance can never write graph text back.
+    /// See [`Graph::derived_read_only`].
+    pub fn open_derived_read_only(root: impl AsRef<Path>) -> Graph {
+        Self::open_inner(root, true)
+    }
+
+    fn open_inner(root: impl AsRef<Path>, derived_read_only: bool) -> Graph {
         let root = root.as_ref().to_path_buf();
         let projection_root = open_projection_root_nofollow(&root).ok();
         let managed_write_binding =
@@ -4989,6 +5043,7 @@ impl Graph {
         let graph_text_admission_instance = Arc::new(GraphTextAdmissionInstance);
         Graph {
             assets_root: root.join("assets"),
+            derived_read_only,
             projection_root,
             root,
             config,
@@ -5094,6 +5149,12 @@ impl Graph {
     }
 
     fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
+        // Every graph-text write in this file passes through here, which is why
+        // the read-only view is enforced at this one point rather than trusted
+        // to each of the ~28 callers.
+        if self.derived_read_only {
+            return Err(derived_read_only_write_error());
+        }
         let binding = self.managed_write_binding()?;
         let mut permit = binding.gate.admit_writer()?;
         if let Err(error) = managed_write_after_admission_hook() {
@@ -32811,6 +32872,88 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    /// The read-only view exists so managed storage can answer whole-graph
+    /// questions from its own projected tree. It must answer them -- and it must
+    /// not be able to write that tree back, because the oplog owns it.
+    #[test]
+    fn a_derived_read_only_graph_reads_the_tree_but_cannot_write_it() {
+        let dir = scratch("derived-read-only-graph");
+        fs::write(
+            dir.join("pages/Alpha.md"),
+            "- alpha mentions [[Target]]\n- and again [[Target]]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages/Target.md"), "- the target page\n").unwrap();
+
+        let view = Graph::open_derived_read_only(&dir);
+
+        // Reads: the whole point. Backlinks are the query that was dead in
+        // managed mode, so assert that one specifically.
+        let groups = view.backlinks("Target");
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.page.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha"],
+            "the read-only view must resolve backlinks from the projected tree"
+        );
+        assert!(
+            view.list_pages().iter().any(|entry| entry.name == "Alpha"),
+            "the read-only view must enumerate pages"
+        );
+
+        // Writes: refused at the single graph-text admission, whatever the
+        // caller. A command routed here by mistake fails loudly rather than
+        // leaving a file behind the oplog's back.
+        let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
+        let base_rev = page.rev.clone();
+        page.blocks[0].raw = "- alpha edited behind the oplog".into();
+        let refused = view.save_page(&page, base_rev.as_deref()).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied,
+            "a graph-text write through the read-only view must be refused: {refused}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Alpha.md")).unwrap(),
+            "- alpha mentions [[Target]]\n- and again [[Target]]\n",
+            "the refused save must not have touched the file"
+        );
+
+        // Control: the same directory opened normally still saves, so the test
+        // proves the flag and not some unrelated breakage in the fixture.
+        let writable = Graph::open(&dir);
+        let mut page = writable.load_by_path("pages/Alpha.md").unwrap().unwrap();
+        let base_rev = page.rev.clone();
+        page.blocks[0].raw = "- alpha edited by the owner".into();
+        writable
+            .save_page(&page, base_rev.as_deref())
+            .expect("an ordinary graph still writes");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `assets/` is outside the oplog's document domain, so importing an image
+    /// while managed storage owns graph text must keep working.
+    #[test]
+    fn a_derived_read_only_graph_still_accepts_asset_writes() {
+        let dir = scratch("derived-read-only-assets");
+        let source = dir.join("incoming.png");
+        fs::write(&source, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let view = Graph::open_derived_read_only(&dir);
+        let stored = view
+            .import_asset(&source, Some("picture.png"))
+            .expect("asset writes are outside the graph-text boundary");
+        assert!(
+            dir.join("assets").join(&stored).exists(),
+            "the imported asset must land in assets/"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

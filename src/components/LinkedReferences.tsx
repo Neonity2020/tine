@@ -6,6 +6,11 @@ import { LiveRefGroup } from "./LiveRefGroup";
 import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
+import {
+  classifyReferenceLoadError,
+  referenceLoadErrorMessage,
+  type ReferenceLoadError,
+} from "../lib/referenceLoadError";
 
 const norm = (s: string) => s.trim().toLowerCase();
 const pageIdentity = (s: string) => {
@@ -33,13 +38,6 @@ function mergeReferenceGroups(groups: RefGroup[]): RefGroup[] {
     }
   }
   return [...merged.values()];
-}
-
-type ReferenceLoadError = "bounded" | "backend";
-
-function classifyReferenceLoadError(error: unknown): ReferenceLoadError {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith("result-too-large:") ? "bounded" : "backend";
 }
 
 // Persist the per-page include/exclude reference filter so it survives reload.
@@ -286,9 +284,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
         <div class="linked-references reference-error" role="alert">
           <div class="references-header">Linked References</div>
           <div class="reference-filter-error">
-            {loadError() === "bounded"
-              ? "Couldn’t load references: the bounded result limit was exceeded."
-              : "Couldn’t load references because the backend request failed."}
+            {referenceLoadErrorMessage(loadError()!)}
           </div>
         </div>
       }

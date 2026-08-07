@@ -25,6 +25,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Linked References, search, quick switch, queries and most of the rest of the
+  app now work while Tine-managed storage is active.** Every page showed
+  "Couldn't load references because the backend request failed", and the same
+  refusal silently disabled search, quick switch, `{{query}}`, aliases,
+  templates, page icons, block references, asset browsing and more: only page
+  loading, saving and the journal feed had been given a managed path, and
+  everything else was refused for not holding the older storage mode's
+  authority. Reading and writing are now separate permissions, so whole-graph
+  *reads* are answered from the managed graph's own files while writes stay with
+  managed storage. Actions that change many pages at once — renaming, deleting
+  and merging pages, editing graph settings, and resolving sync conflicts — are
+  still unavailable under managed storage and now say so plainly instead of
+  reporting a failed request.
+- **Error messages from the references panels no longer hide what went wrong.**
+  Both panels replaced every backend message with a generic "the backend request
+  failed", including messages that explained the cause exactly. They now show
+  what the backend actually reported.
 - **Fewer false "changed on disk" warnings while editing a managed graph.** The
   background sync loop announced a change after every completed pass, including
   passes that committed nothing. Arriving while a page had unsaved edits, that

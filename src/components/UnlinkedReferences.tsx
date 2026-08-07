@@ -3,6 +3,11 @@ import { backend } from "../backend";
 import { openPage } from "../router";
 import { ReferenceExcerptBlocks } from "./ReferenceEvidence";
 import type { RefGroup } from "../types";
+import {
+  classifyReferenceLoadError,
+  referenceLoadErrorMessage,
+  type ReferenceLoadError,
+} from "../lib/referenceLoadError";
 
 const pageIdentity = (name: string) => {
   const lowered = name.trim().toLowerCase();
@@ -29,13 +34,6 @@ function mergeReferenceGroups(groups: RefGroup[]): RefGroup[] {
     }
   }
   return [...merged.values()];
-}
-
-type ReferenceLoadError = "bounded" | "backend";
-
-function classifyReferenceLoadError(error: unknown): ReferenceLoadError {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.startsWith("result-too-large:") ? "bounded" : "backend";
 }
 
 // "Unlinked References" — plain-text mentions of the page, collapsed by default.
@@ -94,9 +92,7 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
       <Show when={open()}>
         <Show when={loadError()}>
           <div class="reference-filter-error reference-error" role="alert">
-            {loadError() === "bounded"
-              ? "Couldn’t load references: the bounded result limit was exceeded."
-              : "Couldn’t load references because the backend request failed."}
+            {referenceLoadErrorMessage(loadError()!)}
           </div>
         </Show>
         <Show when={occurrenceLimit().truncated}>

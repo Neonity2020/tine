@@ -2715,6 +2715,29 @@
         "failBefore": "proven"
       },
       "notes": "reference_alias_bindings carried a catalog_root_digest column that every write path set and no read path ever consulted -- both production reads select resolved_page_id filtered by normalized_alias only. Because it sat in the primary key and the row digest, it made an incrementally drained database and a rebuilt one disagree on a page they resolved identically: the drain stamps the catalog root current when the alias was last touched, a rebuild stamps the root it resolved at. Dumped rows confirmed same alias, same ordinal, same resolved page, different stamp, while both databases carried the same materialization_stamp. Column dropped from the table, its primary key, its index and the digested column list; SQLITE_SCHEMA_VERSION 11 -> 12, so each managed graph rebuilds its projection once. The projection's own materialization_stamp already records the catalog root the whole database is at, which is the question anyone actually asks. Fail-before: format_identity_is_pinned caught the version change immediately, which is what it is for."
+    },
+    {
+      "id": "REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001",
+      "title": "Linked/Unlinked References, search, quick switch, {{query}}, aliases, templates and asset reads work while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/state.rs::tests::a_managed_binding_answers_whole_graph_reads_and_still_refuses_writes",
+          "src-tauri/src/state.rs::tests::a_legacy_binding_serves_reads_through_its_lease",
+          "crates/tine-core/src/model.rs::a_derived_read_only_graph_reads_the_tree_but_cannot_write_it",
+          "crates/tine-core/src/model.rs::a_derived_read_only_graph_still_accepts_asset_writes"
+        ]
+      },
+      "notes": "Martin reported \"Couldn't load references because the backend request failed.\" on every page of a managed graph. Root cause was authority, not references: GraphSlot exposed only legacy write authority, so with_graph refused all ~50 read-only commands under managed storage and only six page-path commands worked. Reads now go through with_read_graph, served for managed bindings by a Graph opened with open_derived_read_only over the projected tree. That view fails every graph-text write at admit_managed_text_writer and ensure_write_target, so a misrouted write command errors instead of writing behind the oplog; assets stay writable because assets/ is outside the oplog's document domain. Writes (rename, delete, merge, config setters, conflict resolution) remain refused under managed storage and still need real oplog implementations."
     }
   ]
 }

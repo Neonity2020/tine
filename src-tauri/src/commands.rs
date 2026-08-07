@@ -4,7 +4,7 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_graph, AppState, GraphContext,
+    slot_for_context, with_graph, with_read_graph, AppState, GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -390,7 +390,7 @@ pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>
 
 #[tauri::command]
 pub(crate) fn referenced_page_names(state: GraphContext<'_>) -> Result<Vec<String>, String> {
-    with_graph(&state, |g| Ok(g.referenced_page_names()))
+    with_read_graph(&state, |g| Ok(g.referenced_page_names()))
 }
 
 #[derive(Serialize)]
@@ -732,7 +732,7 @@ pub(crate) fn graph_source_files(
     state: GraphContext<'_>,
 ) -> Result<Vec<GraphSourceFile>, String> {
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let mut out: Vec<GraphSourceFile> = Vec::new();
         let mut roots = vec![g.pages_path()];
         if include_journals {
@@ -996,7 +996,7 @@ pub(crate) async fn get_backlinks(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         bounded_groups_or_error(graph.backlinks_bounded(
             &name,
@@ -1020,7 +1020,7 @@ pub(crate) async fn get_backlink_filter_context(
             targets.len()
         ));
     }
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         Ok(tine_core::query::backlink_filter_context(
             &graph, &name, &targets,
@@ -1035,7 +1035,7 @@ pub(crate) async fn get_unlinked_refs(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || {
         bounded_groups_or_error(graph.unlinked_refs_bounded(
             &name,
@@ -1054,7 +1054,7 @@ pub(crate) async fn get_unlinked_refs(
 pub(crate) async fn block_ref_counts(
     state: GraphContext<'_>,
 ) -> Result<Arc<std::collections::HashMap<String, usize>>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     tauri::async_runtime::spawn_blocking(move || graph.block_ref_counts())
         .await
         .map_err(|error| error.to_string())?
@@ -1068,7 +1068,7 @@ pub(crate) fn block_referrers(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         bounded_groups_or_error(g.block_referrers_bounded(
             &uuid,
             RESULT_BRIDGE_MAX_ROWS,
@@ -1176,7 +1176,7 @@ pub(crate) fn page_print_html(
     opts: tine_core::publish::PrintOpts,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.page_print_html(&name, opts)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "no-page".to_string())
@@ -1189,7 +1189,7 @@ pub(crate) fn run_query(
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     validate_query_source(&query)?;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         bounded_groups_or_error(g.run_query_bounded(
             &query,
             RESULT_BRIDGE_MAX_ROWS,
@@ -1222,7 +1222,7 @@ pub(crate) fn export_query_subtrees(
             QUERY_EXPORT_MAX_QUERIES,
         ));
     }
-    with_graph(&state, |graph| {
+    with_read_graph(&state, |graph| {
         let batch = tine_core::query::export_query_subtrees(
             graph,
             &specs,
@@ -1267,7 +1267,7 @@ pub(crate) async fn run_graph_search(
     scope: Option<tine_core::query_plan::QueryPageScope>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
     // QueryExecution carries backward-defaulted per-category `has_more` bits;
@@ -1296,7 +1296,7 @@ pub(crate) fn run_advanced_query(
     state: GraphContext<'_>,
 ) -> Result<tine_core::query::AdvancedResult, String> {
     validate_query_source(&query)?;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let (result, exceeded, total) = g.run_advanced_query_bounded_cached(
             &query,
             current_page.as_deref(),
@@ -1317,7 +1317,7 @@ pub(crate) fn query_facets(
     state: GraphContext<'_>,
     autocomplete: Option<bool>,
 ) -> Result<Vec<(String, Vec<String>)>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         if autocomplete.unwrap_or(false) {
             // The editor's OG policy intentionally differs from query-builder
             // facets; use a separately bounded collector without changing the
@@ -1344,7 +1344,7 @@ pub(crate) fn query_facets(
 
 #[tauri::command]
 pub(crate) fn page_aliases(state: GraphContext<'_>) -> Result<Vec<(String, String)>, String> {
-    with_graph(&state, |g| Ok(g.page_aliases()))
+    with_read_graph(&state, |g| Ok(g.page_aliases()))
 }
 
 #[tauri::command]
@@ -1352,7 +1352,7 @@ pub(crate) fn page_icons(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    with_graph(&state, |g| Ok(g.page_icons(&names)))
+    with_read_graph(&state, |g| Ok(g.page_icons(&names)))
 }
 
 #[tauri::command]
@@ -1476,7 +1476,7 @@ pub(crate) fn set_journal_title_format(
 
 #[tauri::command]
 pub(crate) fn read_custom_css(state: GraphContext<'_>) -> Result<String, String> {
-    with_graph(&state, |g| Ok(g.custom_css()))
+    with_read_graph(&state, |g| Ok(g.custom_css()))
 }
 
 #[tauri::command]
@@ -1486,7 +1486,7 @@ pub(crate) async fn search(
     lane: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<RefGroup>, String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let limit = limit.min(RESULT_BRIDGE_MAX_ROWS);
     let groups = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
         Some(lane) => graph.search_latest(lane, &query, limit),
@@ -1504,7 +1504,7 @@ pub(crate) fn quick_switch(
     limit: usize,
     state: GraphContext<'_>,
 ) -> Result<Vec<PageEntry>, String> {
-    with_graph(&state, |g| Ok(g.quick_switch(&query, limit)))
+    with_read_graph(&state, |g| Ok(g.quick_switch(&query, limit)))
 }
 
 fn capture_quick_switch_for(
@@ -1648,7 +1648,7 @@ mod capture_quick_switch_tests {
 pub(crate) fn list_templates(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::TemplateDto>, String> {
-    with_graph(&state, |g| Ok(g.templates()))
+    with_read_graph(&state, |g| Ok(g.templates()))
 }
 
 fn application_property_line(line: &str) -> bool {
@@ -1715,7 +1715,7 @@ pub(crate) fn resolve_block(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Option<RefGroup>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let group = g.resolve_block(&uuid);
         if let Some(group) = &group {
             enforce_result_bridge_budget(std::slice::from_ref(group))?;
@@ -1735,7 +1735,7 @@ pub(crate) fn resolve_blocks(
             uuids.len()
         ));
     }
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         let (groups, exceeded, total) = tine_core::query::resolve_blocks_bounded(
             g,
             &uuids,
@@ -1760,7 +1760,7 @@ pub(crate) fn preview_block(
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::BlockPreview>, String> {
     const MAX_PREVIEW_NODES: usize = 2_000;
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         // Leave room for RefGroup/page/serializer overhead, then assert the
         // shared bridge invariant as a second line of defense.
         let preview = g.preview_block_with_budget(
@@ -1784,7 +1784,7 @@ pub(crate) fn read_asset(
     // Return RAW bytes (not a JSON number[]), so a multi-MB PDF/image isn't
     // serialized element-by-element and re-parsed on the JS side — the frontend
     // receives an ArrayBuffer directly.
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         max_bytes
             .map_or_else(
                 || g.read_asset(&name),
@@ -1948,7 +1948,7 @@ pub(crate) fn import_asset(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.import_asset(std::path::Path::new(&path), name.as_deref())
             .map_err(|e| e.to_string())
     })
@@ -2022,7 +2022,7 @@ pub(crate) fn import_native_capture(
         ));
     }
     let mut capture = capture.into_std();
-    let stored = with_graph(&state, |graph| {
+    let stored = with_read_graph(&state, |graph| {
         graph
             .import_asset_file(&mut capture, &name, max_bytes)
             .map_err(|error| error.to_string())
@@ -2072,7 +2072,7 @@ pub(crate) fn read_text_file(path: String) -> Result<String, String> {
 /// (canonicalized) so a crafted name can't open a file outside the graph.
 #[tauri::command]
 pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    let target = with_graph(&state, |g| {
+    let target = with_read_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -2112,7 +2112,7 @@ pub(crate) fn open_page_file(
     reveal: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_graph(&state, |graph| {
+    let target = with_read_graph(&state, |graph| {
         graph
             .page_source_file(&name, kind, path.as_deref())
             .map_err(|error| error.to_string())
@@ -2150,7 +2150,7 @@ pub(crate) fn edit_asset_external(
     command: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_graph(&state, |g| {
+    let target = with_read_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -2491,7 +2491,7 @@ mod editor_argv_tests {
 pub(crate) fn list_orphan_assets(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::AssetInfo>, String> {
-    with_graph(&state, |g| Ok(g.orphan_assets()))
+    with_read_graph(&state, |g| Ok(g.orphan_assets()))
 }
 
 /// Move an orphaned asset to the recoverable trash.
@@ -2505,7 +2505,7 @@ pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), S
 pub(crate) fn asset_trash_stats(
     state: GraphContext<'_>,
 ) -> Result<tine_core::model::TrashStats, String> {
-    with_graph(&state, |g| Ok(g.asset_trash_stats()))
+    with_read_graph(&state, |g| Ok(g.asset_trash_stats()))
 }
 
 /// Permanently delete everything in the asset trash; returns files removed.
@@ -2520,7 +2520,7 @@ pub(crate) fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, String> 
 pub(crate) fn list_journal_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::JournalConflict>, String> {
-    with_graph(&state, |g| Ok(g.journal_conflicts()))
+    with_read_graph(&state, |g| Ok(g.journal_conflicts()))
 }
 
 /// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
@@ -2529,7 +2529,7 @@ pub(crate) fn list_journal_conflicts(
 pub(crate) fn list_sync_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::SyncConflict>, String> {
-    with_graph(&state, |g| Ok(g.list_sync_conflicts()))
+    with_read_graph(&state, |g| Ok(g.list_sync_conflicts()))
 }
 
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
@@ -2540,7 +2540,7 @@ pub(crate) fn sync_conflict_diff(
     conflict: String,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.sync_conflict_diff(&winner, &conflict)
             .map_err(|e| e.to_string())
     })
@@ -2600,7 +2600,7 @@ pub(crate) fn trash_journal_file(name: String, state: GraphContext<'_>) -> Resul
 /// duplicate day's files before reconciling.
 #[tauri::command]
 pub(crate) fn read_journal_file(name: String, state: GraphContext<'_>) -> Result<String, String> {
-    with_graph(&state, |g| {
+    with_read_graph(&state, |g| {
         g.read_journal_file(&name).map_err(|e| e.to_string())
     })
 }
