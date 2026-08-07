@@ -8,69 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
-### Changed
-
-- **Rebuilding a managed graph's internal cache is much faster, and now scales
-  with the graph instead of against it.** On a 1,045-file graph the rebuild went
-  from about 15 seconds to about 2.6 seconds, and the cost is now roughly
-  proportional to graph size rather than growing faster than it — so the saving
-  gets larger, not smaller, as a graph grows. This is the recovery a graph
-  reaches after corruption or an internal format change, so it is rare, but when
-  it happens it is the whole wait before the app is usable.
-- **Managed graphs rebuild their internal cache once on first launch after this
-  update.** A field that was recorded but never used has been removed from the
-  cache's page-alias table, which changes its internal format. Nothing in your
-  graph changes; the rebuild is the faster one described above, and it happens
-  only once.
-
-### Fixed
-
-- **Linked References, search, quick switch, queries and most of the rest of the
-  app now work while Tine-managed storage is active.** Every page showed
-  "Couldn't load references because the backend request failed", and the same
-  refusal silently disabled search, quick switch, `{{query}}`, aliases,
-  templates, page icons, block references, asset browsing and more: only page
-  loading, saving and the journal feed had been given a managed path, and
-  everything else was refused for not holding the older storage mode's
-  authority. Reading and writing are now separate permissions, so whole-graph
-  *reads* are answered from the managed graph's own files while writes stay with
-  managed storage. Actions that change many pages at once — renaming, deleting
-  and merging pages, and resolving sync conflicts — are still unavailable under
-  managed storage and now say so plainly instead of reporting a failed request.
-- **Settings changes save again while Tine-managed storage is active.** Every
-  toggle in Settings was dead: favourites, task workflow, file format for new
-  pages, journal title format, first day of the week, showing brackets, logical
-  outdenting, Enter behaviour in document mode, time tracking and the default
-  journal template all appeared to work and were forgotten on the next launch.
-  Settings live in the graph's own `logseq/config.edn`, which managed storage
-  does not own, so writing them never needed the permission that was being
-  asked for. One exception remains: changing the journal title format no longer
-  renames existing journal files under managed storage.
-- **Cleaning up orphaned assets works again while Tine-managed storage is
-  active.** Moving an unused image to the recoverable trash, and emptying that
-  trash, were both refused — not because either touches your pages, but because
-  the trash folder was covered by the same permission as page text. Deleting a
-  page, journal or conflict copy is still unavailable.
-- **Error messages from the references panels no longer hide what went wrong.**
-  Both panels replaced every backend message with a generic "the backend request
-  failed", including messages that explained the cause exactly. They now show
-  what the backend actually reported.
-- **Fewer false "changed on disk" warnings while editing a managed graph.** The
-  background sync loop announced a change after every completed pass, including
-  passes that committed nothing. Arriving while a page had unsaved edits, that
-  contentless signal could be read as a conflict — which then blocked the very
-  save that would have resolved it. Only a pass that actually committed
-  something now reports a change.
-- **A managed graph that was closed cleanly now reopens even if its internal
-  cache database was deleted or damaged.** That cache is rebuildable from the
-  graph's own history, and a graph closed by a crash already rebuilt it — but a
-  graph closed *properly* refused to open at all, and the error offered a retry
-  that could never succeed. Clearing a cache directory, a backup that skipped
-  the file, or on-disk corruption could therefore make a graph permanently
-  unopenable. Both cases now rebuild. A cache that is present and current still
-  opens directly, so ordinary startup is unchanged.
-
-## [0.6.91] - 2026-08-06
+## [0.6.91] - 2026-08-07
 
 ### Added
 
@@ -120,6 +58,51 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   shows a toast.
 
 ### Fixed
+
+- **Linked References, search, quick switch, queries and most of the rest of the
+  app now work while Tine-managed storage is active.** Every page showed
+  "Couldn't load references because the backend request failed", and the same
+  refusal silently disabled search, quick switch, `{{query}}`, aliases,
+  templates, page icons, block references, asset browsing and more: only page
+  loading, saving and the journal feed had been given a managed path, and
+  everything else was refused for not holding the older storage mode's
+  authority. Reading and writing are now separate permissions, so whole-graph
+  *reads* are answered from the managed graph's own files while writes stay with
+  managed storage. Actions that change many pages at once — renaming, deleting
+  and merging pages, and resolving sync conflicts — are still unavailable under
+  managed storage and now say so plainly instead of reporting a failed request.
+- **Settings changes save again while Tine-managed storage is active.** Every
+  toggle in Settings was dead: favourites, task workflow, file format for new
+  pages, journal title format, first day of the week, showing brackets, logical
+  outdenting, Enter behaviour in document mode, time tracking and the default
+  journal template all appeared to work and were forgotten on the next launch.
+  Settings live in the graph's own `logseq/config.edn`, which managed storage
+  does not own, so writing them never needed the permission that was being
+  asked for. One exception remains: changing the journal title format no longer
+  renames existing journal files under managed storage.
+- **Cleaning up orphaned assets works again while Tine-managed storage is
+  active.** Moving an unused image to the recoverable trash, and emptying that
+  trash, were both refused — not because either touches your pages, but because
+  the trash folder was covered by the same permission as page text. Deleting a
+  page, journal or conflict copy is still unavailable.
+- **Error messages from the references panels no longer hide what went wrong.**
+  Both panels replaced every backend message with a generic "the backend request
+  failed", including messages that explained the cause exactly. They now show
+  what the backend actually reported.
+- **Fewer false "changed on disk" warnings while editing a managed graph.** The
+  background sync loop announced a change after every completed pass, including
+  passes that committed nothing. Arriving while a page had unsaved edits, that
+  contentless signal could be read as a conflict — which then blocked the very
+  save that would have resolved it. Only a pass that actually committed
+  something now reports a change.
+- **A managed graph that was closed cleanly now reopens even if its internal
+  cache database was deleted or damaged.** That cache is rebuildable from the
+  graph's own history, and a graph closed by a crash already rebuilt it — but a
+  graph closed *properly* refused to open at all, and the error offered a retry
+  that could never succeed. Clearing a cache directory, a backup that skipped
+  the file, or on-disk corruption could therefore make a graph permanently
+  unopenable. Both cases now rebuild. A cache that is present and current still
+  opens directly, so ordinary startup is unchanged.
 
 - **"Keep mine" now works.** When Tine found that a page had changed on disk
   behind your back, it offered you two ways out — keep your edits, or take the
@@ -301,6 +284,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   Org layout differences still fail closed.
 
 ### Changed
+
+- **Rebuilding a managed graph's internal cache is much faster, and now scales
+  with the graph instead of against it.** On a 1,045-file graph the rebuild went
+  from about 15 seconds to about 2.6 seconds, and the cost is now roughly
+  proportional to graph size rather than growing faster than it — so the saving
+  gets larger, not smaller, as a graph grows. This is the recovery a graph
+  reaches after corruption or an internal format change, so it is rare, but when
+  it happens it is the whole wait before the app is usable.
+- **Managed graphs rebuild their internal cache once on first launch after this
+  update.** A field that was recorded but never used has been removed from the
+  cache's page-alias table, which changes its internal format. Nothing in your
+  graph changes; the rebuild is the faster one described above, and it happens
+  only once.
 
 - **Managed-storage save refusals now report a bounded internal reason code.**
   This keeps graph content and filesystem details private while distinguishing
