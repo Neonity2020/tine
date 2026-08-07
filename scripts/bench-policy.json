@@ -13,6 +13,14 @@
     "runsPerRound": 4,
     "maxCalibrationSpreadPct": 25
   },
+  "storageMode": {
+    "modes": ["direct", "managed"],
+    "operations": {
+      "coldOpenMs": { "label": "cold open" },
+      "saveMs": { "label": "edited-page save" },
+      "keystrokeP95Ms": { "label": "steady keystroke p95" }
+    }
+  },
   "metrics": {
     "bigLoad": {
       "maxVsImmutablePct": 25,

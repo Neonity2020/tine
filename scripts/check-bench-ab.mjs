@@ -6,7 +6,61 @@ function arg(name) {
   return process.argv[i + 1];
 }
 
+function optionalArg(name) {
+  const i = process.argv.indexOf(name);
+  return i < 0 ? undefined : process.argv[i + 1];
+}
+
 const policy = JSON.parse(readFileSync(arg("--policy"), "utf8"));
+
+// Storage mode is an informational, paired axis. It intentionally has no
+// regression threshold until Martin has reviewed real measurements. Reusing
+// this checker keeps its table and receipt shape beside the release A/B gate
+// without allowing an unreviewed number to fail or pass a release.
+const storageModePath = optionalArg("--storage-mode");
+if (storageModePath) {
+  const report = JSON.parse(readFileSync(storageModePath, "utf8"));
+  const failures = [];
+  const storage = policy.storageMode;
+  if (!storage || !Array.isArray(storage.modes) || !storage.operations) {
+    failures.push("policy does not define the storage-mode report contract");
+  }
+  if (report.schemaVersion !== 1 || report.kind !== "storage-mode") {
+    failures.push("expected a schema-1 storage-mode measurement");
+  }
+  if (!Array.isArray(report.rounds) || report.rounds.length < policy.reliability?.rounds) {
+    failures.push(`storage-mode report has fewer than ${policy.reliability?.rounds ?? "the required"} rounds`);
+  }
+  const operations = Object.keys(storage?.operations ?? {});
+  console.log("operation                 direct ms  managed ms  managed delta  direct spread  managed spread");
+  for (const name of operations) {
+    const direct = report.modes?.direct?.metrics?.[name];
+    const managed = report.modes?.managed?.metrics?.[name];
+    const directValue = direct?.rawMedianOfRoundMins;
+    const managedValue = managed?.rawMedianOfRoundMins;
+    const directSpread = direct?.roundSpreadPct;
+    const managedSpread = managed?.roundSpreadPct;
+    if (![directValue, managedValue, directSpread, managedSpread].every(Number.isFinite)) {
+      failures.push(`${name}: missing paired direct/managed measurement or round spread`);
+      continue;
+    }
+    const delta = ((managedValue / directValue) - 1) * 100;
+    console.log(
+      `${(storage.operations[name].label ?? name).padEnd(25)} ` +
+      `${directValue.toFixed(1).padStart(9)}  ${managedValue.toFixed(1).padStart(10)}  ` +
+      `${`${delta.toFixed(1)}%`.padStart(13)}  ${`${directSpread.toFixed(1)}%`.padStart(13)}  ` +
+      `${`${managedSpread.toFixed(1)}%`.padStart(14)}`,
+    );
+  }
+  if (failures.length) {
+    console.error("\nStorage-mode report is incomplete:");
+    for (const failure of failures) console.error(`- ${failure}`);
+    process.exit(1);
+  }
+  console.log("Storage-mode comparison reported (informational; no pass/fail performance budget).");
+  process.exit(0);
+}
+
 const candidate = JSON.parse(readFileSync(arg("--candidate"), "utf8"));
 const immutable = JSON.parse(readFileSync(arg("--immutable"), "utf8"));
 const previous = JSON.parse(readFileSync(arg("--previous"), "utf8"));
