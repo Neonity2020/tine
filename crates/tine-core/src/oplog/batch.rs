@@ -8,9 +8,11 @@ use super::{
     MANAGED_ENTITY_SET_VERSION,
 };
 
-pub use tine_storage::{
-    ContentDigest, LineageDigest, ObjectKind, SemanticEffectDigest, MANIFEST_ENCODING_VERSION,
-    MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES, OBJECT_ENVELOPE_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
+pub use tine_storage::{ContentDigest, LineageDigest, ObjectKind, SemanticEffectDigest};
+// Persistent-format constants have exactly one export path in `tine-storage`.
+pub use tine_storage::formats::{
+    MANIFEST_ENCODING_VERSION, MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES,
+    OBJECT_ENVELOPE_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
 pub const OPERATION_SCHEMA_VERSION: u32 = 7;

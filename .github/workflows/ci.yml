@@ -139,6 +139,12 @@ jobs:
       - name: Performance A/B multi-round reliability fixtures
         run: node scripts/test-bench-ab.mjs
 
+      # Resolves the app's real feature graph, so a manifest edit that would ship
+      # tine-storage's corruption/fault-injection seams fails here rather than in
+      # a release binary.
+      - name: Storage test-support stays out of release builds
+        run: node scripts/check-storage-test-support.mjs
+
       - name: UI regression catalog and release evidence contracts
         run: |
           npm run check:regressions

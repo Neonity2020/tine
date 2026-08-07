@@ -12,19 +12,19 @@ use uuid::Uuid;
 
 use super::{BatchId, ContentDigest, WorkspaceId};
 
-pub(crate) const SCRATCH_DIR: &str = tine_storage::SCRATCH_DIR;
+pub(crate) const SCRATCH_DIR: &str = tine_storage::formats::SCRATCH_DIR;
 #[cfg(test)]
-const MARKER_FILE: &str = tine_storage::SCRATCH_MARKER_FILE;
+const MARKER_FILE: &str = tine_storage::formats::SCRATCH_MARKER_FILE;
 #[cfg(test)]
-const LEASE_FILE: &str = tine_storage::SCRATCH_LEASE_FILE;
+const LEASE_FILE: &str = tine_storage::formats::SCRATCH_LEASE_FILE;
 #[cfg(test)]
-const PAGES_FILE: &str = tine_storage::SCRATCH_PAGES_FILE;
+const PAGES_FILE: &str = tine_storage::formats::SCRATCH_PAGES_FILE;
 #[cfg(test)]
-const BLOBS_FILE: &str = tine_storage::SCRATCH_BLOBS_FILE;
+const BLOBS_FILE: &str = tine_storage::formats::SCRATCH_BLOBS_FILE;
 #[cfg(test)]
-pub(crate) const SCRATCH_SCHEMA_VERSION: u32 = tine_storage::SCRATCH_SCHEMA_VERSION;
+pub(crate) const SCRATCH_SCHEMA_VERSION: u32 = tine_storage::formats::SCRATCH_SCHEMA_VERSION;
 #[cfg(test)]
-const SCRATCH_LSM_LEVELS: usize = tine_storage::SCRATCH_LSM_LEVELS;
+const SCRATCH_LSM_LEVELS: usize = tine_storage::formats::SCRATCH_LSM_LEVELS;
 const ACCEPTED_SEQUENCE_SCHEMA_VERSION: u32 = 1;
 const ACCEPTED_SEQUENCE_LEAF_CAPACITY: usize = 1;
 const ACCEPTED_SEQUENCE_NODE_FANOUT: usize = 32;
@@ -62,7 +62,7 @@ const MAX_COVERED_BLOB_DEDUP_ROOTS: usize = 256;
 /// high would make the leak permanent, and a pass that deleted to satisfy a
 /// count would be deleting evidence it had not proved unreachable.
 pub(crate) const MAX_RETAINED_SCRATCH_RUNS: usize = 2;
-const MAX_PAGE_BYTES: usize = tine_storage::MAX_SCRATCH_PAGE_BYTES;
+const MAX_PAGE_BYTES: usize = tine_storage::formats::MAX_SCRATCH_PAGE_BYTES;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ScratchStats {

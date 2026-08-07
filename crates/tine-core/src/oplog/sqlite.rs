@@ -73,8 +73,8 @@ use super::{
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
 };
 
-pub const SQLITE_APPLICATION_ID: u32 = storage_frontier::SQLITE_APPLICATION_ID;
-pub const SQLITE_SCHEMA_VERSION: u32 = storage_frontier::SQLITE_SCHEMA_VERSION;
+pub const SQLITE_APPLICATION_ID: u32 = tine_storage::formats::SQLITE_APPLICATION_ID;
+pub const SQLITE_SCHEMA_VERSION: u32 = tine_storage::formats::SQLITE_SCHEMA_VERSION;
 pub const TAIL_MAX_BYTES: usize = 16 * 1024 * 1024;
 pub const TAIL_MAX_BATCHES: usize = 10_000;
 
@@ -5228,7 +5228,7 @@ fn authenticate_projection_checkpoint(
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() == 0
-        || metadata.len() > storage_frontier::MAX_SQLITE_CHECKPOINT_BYTES as u64
+        || metadata.len() > tine_storage::formats::MAX_SQLITE_CHECKPOINT_BYTES as u64
     {
         return Err(ProjectionError::Corrupt(
             "SQLite projection checkpoint is not a bounded regular file".into(),
@@ -8516,14 +8516,14 @@ fn corrupt_equal_length_interior_block_payload_with_coverage(
 
     let mut bytes = fs::read(database_path).unwrap();
     assert!(
-        bytes.len() > storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES * 2,
+        bytes.len() > tine_storage::formats::SQLITE_CHECKPOINT_EDGE_BYTES * 2,
         "fixture database is too small to have an edge-excluded interior"
     );
     let mut patched = 0;
     let sampled_ranges =
         storage_frontier::physical_checkpoint_interior_ranges_for_test(bytes.len() as u64);
-    let interior_start = storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES;
-    let interior_end = bytes.len() - storage_frontier::SQLITE_CHECKPOINT_EDGE_BYTES;
+    let interior_start = tine_storage::formats::SQLITE_CHECKPOINT_EDGE_BYTES;
+    let interior_end = bytes.len() - tine_storage::formats::SQLITE_CHECKPOINT_EDGE_BYTES;
     for page in block_pages {
         let page_start = page.saturating_sub(1).saturating_mul(page_size);
         let start = page_start.max(interior_start);

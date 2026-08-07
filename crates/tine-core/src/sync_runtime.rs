@@ -18285,7 +18285,7 @@ mod tests {
             .sum::<u64>();
         let retained_bound = 2
             * (MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD
-                + tine_storage::MAX_LOCAL_JOURNAL_FRAME_BYTES as u64)
+                + tine_storage::formats::MAX_LOCAL_JOURNAL_FRAME_BYTES as u64)
             + 64 * 1024;
         assert!(retained_bytes < retained_bound);
 
