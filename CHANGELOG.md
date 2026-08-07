@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **A managed graph that was closed cleanly now reopens even if its internal
+  cache database was deleted or damaged.** That cache is rebuildable from the
+  graph's own history, and a graph closed by a crash already rebuilt it — but a
+  graph closed *properly* refused to open at all, and the error offered a retry
+  that could never succeed. Clearing a cache directory, a backup that skipped
+  the file, or on-disk corruption could therefore make a graph permanently
+  unopenable. Both cases now rebuild. A cache that is present and current still
+  opens directly, so ordinary startup is unchanged.
+
 ## [0.6.91] - 2026-08-06
 
 ### Added

@@ -2640,6 +2640,31 @@
         "failBefore": "not-required"
       },
       "notes": "rename_managed_noreplace used renameat2(RENAME_NOREPLACE) on Linux/Android and renameatx_np(RENAME_EXCL) on macOS/BSD, but Dir::rename on Windows -- which cap-std implements with replace semantics, so the one guarantee its name makes was the one Windows did not provide. Now delegates to rename_projection_between_noreplace, which renames an opened DELETE-access handle with FileRenameInformation and ReplaceIfExists=FALSE and rejects filesystems lacking the primitive before retiring the live source name. Compile-verified for x86_64-pc-windows-gnu locally; behaviour is proved by the Windows CI job, so confidence is partial by design. Audit 2026-08-06 M3."
+    },
+    {
+      "id": "REG-MANAGED-SAFE-REOPEN-DISPOSABLE-PROJECTION-001",
+      "title": "A cleanly shut down managed graph never opens again if its disposable SQLite projection is lost or damaged",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::managed_safe_reopen_rebuilds_a_deleted_disposable_projection",
+          "crates/tine-core/src/sync_runtime.rs::managed_safe_reopen_rebuilds_an_unreadable_disposable_projection"
+        ],
+        "scenario": "managed.safe-reopen-projection-recovery",
+        "failBefore": "proven"
+      },
+      "notes": "A Safe (clean-shutdown) reopen used reopen_promoted_local_runtime_existing_projection, which refused a missing or invalid projection instead of rebuilding it, while the crash path already rebuilt the same state. So the tidier lifecycle was the unrecoverable one: deleting the cache (cleared cache directory, sweeper, restore that skipped it) or leaving it unreadable (corruption, schema-version bump) left the graph permanently unopenable, reported to the frontend as Retryable -- a retry button that can never succeed. The projection is a frontier-stamped disposable cache of an authoritative oplog per ADR 0049, so losing it is recoverable by definition. The Safe path now uses reopen_promoted_local_runtime (AllowRebuild) and the existing-only entry point is deleted; ExistingOnly survives only for the same-process handoff, where the projection is held open by this very process. A present, current projection still opens as-is. Fail-before: both tests fail on the parent commit with OpenRefused."
     }
   ]
 }

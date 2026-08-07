@@ -4300,25 +4300,6 @@ pub(crate) fn reopen_promoted_local_runtime(
     )
 }
 
-/// Runtime-host reopen which refuses a missing or invalid disposable
-/// projection instead of repairing it during startup.
-pub(crate) fn reopen_promoted_local_runtime_existing_projection(
-    root: &EnrollmentApplicationRoot,
-    binding: &EnrollmentBindingV1,
-    session_id: SessionId,
-    open: &PromotedRuntimeOpen<'_>,
-) -> Result<(LocalActiveAuthority, PromotedLocalRuntime), RuntimePromotionError> {
-    reopen_promoted_local_runtime_with_adoption(
-        root,
-        binding,
-        session_id,
-        open,
-        HandoffAdoption::OwnSessionOrSafe,
-        TakeoverPublication::Durable,
-        PromotedProjectionOpen::ExistingOnly,
-    )
-}
-
 /// The sole archive-lease-proved `LocalActive` crash-takeover boundary.
 ///
 /// A new process may adopt a *different* session's committed
@@ -5531,6 +5512,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     // namespace rather than the ordinary object namespace. The publication
     // identity comes from the authorized promotion state.
     let publication = Arc::clone(&bootstrap_runtime_authority.publication);
+    // Same-process handoff: this very process already verified and is still
+    // holding that projection, so "it must already exist" is a fact here rather
+    // than a startup policy. Across processes the projection is a disposable
+    // cache and a rebuild is the correct answer to losing it.
     let projection_open = if verified_same_process_sqlite.is_some() {
         PromotedProjectionOpen::ExistingOnly
     } else {

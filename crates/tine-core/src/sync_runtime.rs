@@ -73,11 +73,11 @@ use crate::oplog::import::{
     BootstrapStreamingImportInstrumentation, InactiveBootstrapOrchestrationInstrumentation,
 };
 use crate::oplog::local_active::{
-    activate_verified_local_with_retained_validation,
-    reopen_promoted_local_runtime_existing_projection, seal_local_runtime_promotion,
-    take_over_promoted_local_runtime_recovering_projection, InactiveBootstrapRuntimeSession,
-    LocalActiveAuthority, LocalActiveRuntime, PromotedLocalRuntime, PromotedRuntimeOpen,
-    PromotedRuntimeRecoveryDiagnostics, RuntimeRecoveryState,
+    activate_verified_local_with_retained_validation, reopen_promoted_local_runtime,
+    seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
+    InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
+    PromotedLocalRuntime, PromotedRuntimeOpen, PromotedRuntimeRecoveryDiagnostics,
+    RuntimeRecoveryState,
 };
 #[cfg(test)]
 use crate::oplog::local_active::{
@@ -6959,7 +6959,13 @@ impl RuntimeActor {
         #[cfg(test)]
         let phase_started = Instant::now();
         let (authority, runtime) = match advisory.handoff {
-            EnrollmentDiscoveryHandoff::Safe => reopen_promoted_local_runtime_existing_projection(
+            // Both handoffs may rebuild the disposable projection. It is a
+            // frontier-stamped cache of an authoritative oplog, so its loss is
+            // recoverable by definition -- and refusing it here made the
+            // *cleanly* shut down graph the unrecoverable one while a crashed
+            // one repaired itself. A present, current projection still opens
+            // as-is; only the previously fatal states change.
+            EnrollmentDiscoveryHandoff::Safe => reopen_promoted_local_runtime(
                 &enrollment_root,
                 &advisory.binding,
                 session_id,
@@ -31604,6 +31610,112 @@ mod tests {
         );
     }
 
+    /// Age a graph, shut it down cleanly, then damage only the disposable
+    /// SQLite projection. The oplog is untouched and authoritative, so the
+    /// graph must still open.
+    ///
+    /// `damage` runs with the runtime stopped and returns what the projection
+    /// recovery is expected to report.
+    fn managed_safe_reopen_after_projection_damage(
+        name: &str,
+        seed: u128,
+        damage: impl FnOnce(&Path),
+        expected_recovery: &str,
+    ) {
+        let fixture = ActivationFixture::nested_unicode(name, seed);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(&handle, page, revision, "edit before the damage");
+        for _ in 0..512 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        assert_eq!(
+            handle.status().unwrap().managed_local_pending,
+            0,
+            "the pre-damage edit must drain, so the projection is current at shutdown"
+        );
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the graph must reach a Safe handoff, which is the case this covers"
+        );
+        drop(handle);
+
+        damage(&fixture.request.database_path);
+
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(
+            reopened.status,
+            SyncRuntimeOpenStatus::Active,
+            "a damaged disposable projection must not make an authoritative oplog unopenable"
+        );
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        assert_eq!(
+            promoted.projection_recovery, expected_recovery,
+            "recovery took the wrong branch (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+
+        // Opening is not the whole claim: the rebuilt projection must actually
+        // answer for the graph, including the edit made before the damage.
+        let handle = reopened
+            .handle
+            .expect("the reopened runtime retains a handle");
+        let (page, _) = load_application_exact(&handle, "Root.md");
+        assert!(
+            page.blocks
+                .iter()
+                .any(|block| block.raw.contains("edit before the damage")),
+            "the rebuilt projection lost an accepted, drained edit"
+        );
+        drop(handle);
+    }
+
+    /// A cleanly shut down graph whose disposable projection has been deleted
+    /// -- a cleared cache directory, a sweeper, a restore that skipped it.
+    ///
+    /// The crash path already rebuilds this exact state. Refusing it after a
+    /// *clean* shutdown made the tidier lifecycle the unrecoverable one, and
+    /// the refusal is reported to the frontend as `Retryable`, so the user gets
+    /// a retry button that cannot ever succeed.
+    #[test]
+    fn managed_safe_reopen_rebuilds_a_deleted_disposable_projection() {
+        managed_safe_reopen_after_projection_damage(
+            "managed-safe-reopen-deleted-projection",
+            0xa0ea,
+            |database_path| {
+                tine_storage::sqlite::SqliteFileSet::new(database_path)
+                    .remove()
+                    .expect("the projection file set is removable");
+            },
+            "rebuilt-missing",
+        );
+    }
+
+    /// The same graph whose projection file is present but unreadable. This is
+    /// the shape a schema-version bump or genuine corruption takes, and unlike
+    /// deletion it also has forensic evidence to preserve.
+    #[test]
+    fn managed_safe_reopen_rebuilds_an_unreadable_disposable_projection() {
+        managed_safe_reopen_after_projection_damage(
+            "managed-safe-reopen-unreadable-projection",
+            0xa0eb,
+            |database_path| {
+                fs::write(database_path, b"this is not a SQLite database")
+                    .expect("the projection file is writable");
+            },
+            "rebuilt-preserving-evidence",
+        );
+    }
+
     #[test]
     #[ignore = "manual release benchmark: unsafe reopen after an aged managed history"]
     fn managed_crash_reopen_aged_history_manual_benchmark() {
@@ -31728,6 +31840,155 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(45),
             "aged-history crash reopen exceeded 45 seconds"
+        );
+        drop(reopened.handle);
+    }
+
+    /// Cost of a FULL projection rebuild on a real-scale graph.
+    ///
+    /// Every other managed benchmark measures a reopen that is *allowed to keep*
+    /// its projection, so none of them price the rebuild itself. Since the
+    /// frontier-identity cut, an ordinary reopen never rebuilds -- but a rebuild
+    /// is still legitimately reachable through genuine corruption, a schema
+    /// change, or a persisted identity-format change, and on that day it is the
+    /// user's whole experience of the product. Martin's requirement is that it
+    /// stay under 10 s and be truly linear, because other graphs are 10x this
+    /// one.
+    ///
+    /// The trigger here is deliberately the cheapest legitimate one: the
+    /// projection file set is deleted after a clean shutdown, so recovery takes
+    /// `RebuiltMissing` and no forensic preservation is charged to the number.
+    /// A corruption trigger would rebuild the same way plus evidence capture.
+    ///
+    /// `TINE_MANAGED_REBUILD_GRAPH_COPY` names a disposable graph copy;
+    /// `TINE_MANAGED_REBUILD_ROUNDS` sets how many accepted+drained saves age
+    /// the history first (compacted generations carry whole-graph slices, so an
+    /// aged history is what a rebuild actually has to replay).
+    #[test]
+    #[ignore = "manual release benchmark: full projection rebuild on a real-scale graph"]
+    fn managed_projection_rebuild_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_projection_rebuild_manual_benchmark -- --ignored --nocapture"
+        );
+        let source = PathBuf::from(
+            std::env::var("TINE_MANAGED_REBUILD_GRAPH_COPY")
+                .expect("TINE_MANAGED_REBUILD_GRAPH_COPY must name a disposable graph copy"),
+        );
+        let rounds: usize = std::env::var("TINE_MANAGED_REBUILD_ROUNDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let fixture =
+            ActivationFixture::copied_graph("managed-projection-rebuild", 0xa0e9, &source);
+        let workspace_id = fixture.request.identities.workspace_id;
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("real graph copy activates");
+        drive_initial_feed(&handle);
+
+        let mut directories = vec![fixture.graph_root.clone()];
+        let mut managed_paths = Vec::new();
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else if matches!(
+                    entry.path().extension().and_then(|value| value.to_str()),
+                    Some("md" | "org")
+                ) {
+                    managed_paths.push(
+                        entry
+                            .path()
+                            .strip_prefix(&fixture.graph_root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        managed_paths.sort();
+        let graph_files = managed_paths.len();
+        let editable = managed_paths
+            .into_iter()
+            .filter(|path| {
+                let (page, _) = load_application_exact(&handle, path);
+                !page.blocks.is_empty()
+            })
+            .take(rounds.max(1))
+            .collect::<Vec<_>>();
+        assert!(
+            !editable.is_empty(),
+            "real graph copy has an editable managed page"
+        );
+
+        for round in 0..rounds {
+            let path = &editable[round % editable.len()];
+            let (page, revision) = load_application_exact(&handle, path);
+            let _ = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("projection-rebuild benchmark edit {round}"),
+            );
+            for _ in 0..512 {
+                if handle.status().unwrap().managed_local_pending == 0 {
+                    break;
+                }
+                handle.tick().unwrap();
+            }
+            assert_eq!(
+                handle.status().unwrap().managed_local_pending,
+                0,
+                "aging round {round} did not drain"
+            );
+        }
+
+        // A clean shutdown, so the number below prices the rebuild and not a
+        // crash recovery that happens to rebuild.
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the aged graph must reach a Safe handoff before the projection is discarded"
+        );
+        drop(handle);
+
+        // The trigger: the disposable projection is gone. Recovery must
+        // reconstruct it from authoritative history alone.
+        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
+            .remove()
+            .expect("the projection file set is removable");
+        assert!(
+            !tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path).any_exists(),
+            "the benchmark must actually discard the projection it means to price"
+        );
+
+        reset_runtime_open_instrumentation(workspace_id);
+        reset_promoted_runtime_open_instrumentation(workspace_id);
+        let started = Instant::now();
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        let elapsed = started.elapsed();
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let open = take_runtime_open_instrumentation(workspace_id);
+        let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        eprintln!(
+            "managed_projection_rebuild files={graph_files} rounds={rounds} elapsed_ms={:.3} open_phases: {} promoted_phases: {}",
+            startup_ms(elapsed),
+            startup_open_phase_receipt(&open),
+            startup_promoted_open_phase_receipt(&promoted),
+        );
+        // Reading the branch off the run, not inferring it from the timing:
+        // a number that turned out to price "opened an existing projection"
+        // would be measuring the opposite of this benchmark's subject.
+        assert_eq!(
+            promoted.projection_recovery, "rebuilt-missing",
+            "the benchmark must price a real rebuild (reason: {})",
+            promoted.projection_rebuild_reason
+        );
+        assert!(
+            promoted.projection_bulk_pages_materialized > 0,
+            "a rebuild that materialized no pages did not reconstruct the graph"
         );
         drop(reopened.handle);
     }
