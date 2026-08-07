@@ -35704,6 +35704,70 @@ mod tests {
         (graph_a, graph_b)
     }
 
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// Falsification probe for the 2026-08-07 invariant inventory, which
+    /// concluded that a warm Direct save of an existing page does no O(graph)
+    /// work. That verdict rests on reading the code, not on running it against a
+    /// graph with real scale and shape. If `complete_builds` climbs while
+    /// repeatedly saving one page, the verdict is wrong and the whole-graph
+    /// identity rebuild returns to the top of the cut-list.
+    ///
+    /// Opt-in, because it needs a corpus this repository does not ship:
+    /// `TINE_REAL_GRAPH=~/research/logseq-anonymized`. The corpus is copied, so
+    /// the source is never mutated.
+    #[test]
+    #[ignore]
+    fn real_graph_direct_save_does_not_rebuild_the_identity_index() {
+        let Some(source) = std::env::var_os("TINE_REAL_GRAPH") else {
+            eprintln!("skipped: set TINE_REAL_GRAPH to a graph directory");
+            return;
+        };
+        let dir = scratch("realgraph-identity-probe");
+        copy_tree(Path::new(&source), &dir);
+        fs::create_dir_all(dir.join("pages")).unwrap();
+        fs::write(dir.join("pages/Identity Probe.md"), "- probe\n").unwrap();
+
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        guarded_test_prime_identity(&graph);
+        let mut page = graph
+            .load_by_path("pages/Identity Probe.md")
+            .unwrap()
+            .unwrap();
+
+        let (builds_before, updates_before, _, generation_before) =
+            graph.guarded_graph_text_identity_stats();
+        for round in 0..10 {
+            guarded_test_resave(&graph, &mut page, &format!("probe {round}")).unwrap();
+        }
+        let (builds_after, updates_after, invalidated, generation_after) =
+            graph.guarded_graph_text_identity_stats();
+
+        println!(
+            "REAL-GRAPH IDENTITY PROBE over 10 saves: complete_builds {builds_before} -> \
+             {builds_after}, exact_updates {updates_before} -> {updates_after}, \
+             invalidated={invalidated}, generation {generation_before} -> {generation_after}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            builds_before, builds_after,
+            "a warm Direct save rebuilt the whole-graph identity index on a real graph; \
+             the inventory's Direct-path verdict is wrong"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resource_epoch_makes_a_sibling_rebuild_and_refuse_every_collision_class() {
