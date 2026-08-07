@@ -17,9 +17,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   gets larger, not smaller, as a graph grows. This is the recovery a graph
   reaches after corruption or an internal format change, so it is rare, but when
   it happens it is the whole wait before the app is usable.
+- **Managed graphs rebuild their internal cache once on first launch after this
+  update.** A field that was recorded but never used has been removed from the
+  cache's page-alias table, which changes its internal format. Nothing in your
+  graph changes; the rebuild is the faster one described above, and it happens
+  only once.
 
 ### Fixed
 
+- **Fewer false "changed on disk" warnings while editing a managed graph.** The
+  background sync loop announced a change after every completed pass, including
+  passes that committed nothing. Arriving while a page had unsaved edits, that
+  contentless signal could be read as a conflict — which then blocked the very
+  save that would have resolved it. Only a pass that actually committed
+  something now reports a change.
 - **A managed graph that was closed cleanly now reopens even if its internal
   cache database was deleted or damaged.** That cache is rebuildable from the
   graph's own history, and a graph closed by a crash already rebuilt it — but a

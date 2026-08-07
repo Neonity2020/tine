@@ -10053,9 +10053,9 @@ mod tests {
             .physical
             .execute_corrupting_statement_for_test(
                 "INSERT INTO reference_alias_bindings (
-                     normalized_alias, candidate_ordinal, resolved_page_id, catalog_root_digest
+                     normalized_alias, candidate_ordinal, resolved_page_id
                  )
-                 SELECT normalized_alias, candidate_ordinal + 1000000, ?1, catalog_root_digest
+                 SELECT normalized_alias, candidate_ordinal + 1000000, ?1
                  FROM reference_alias_bindings WHERE normalized_alias = ?2 LIMIT 1",
                 params![
                     inserted_source.as_uuid().as_bytes().as_slice(),
