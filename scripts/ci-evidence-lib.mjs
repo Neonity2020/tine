@@ -5,6 +5,7 @@ export const REQUIRED_FULL_CI_JOBS = Object.freeze([
   "Full CI / Linux tine-core nextest shard 2/4",
   "Full CI / Linux tine-core nextest shard 3/4",
   "Full CI / Linux tine-core nextest shard 4/4",
+  "Full CI / Linux tine-storage nextest",
   "Full CI / Windows compile + storage smoke + core smoke",
   "Full CI / Android core compile",
   "Full CI / performance A/B",

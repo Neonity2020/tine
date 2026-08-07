@@ -12,7 +12,7 @@ The frozen release candidate receives the exhaustive pass.
 | Non-doc pull request | `ci` → `PR validation / Linux unit and contract checks` | TypeScript, frontend and Rust-core tests plus cheap generated-artifact/release contract guards. No Windows, Android, performance, Flatpak build, or release packaging. |
 | Docs/image-only pull request | No app CI | Avoid runner work for prose and image-only changes. A Flatpak/website metadata PR still gets its path-specific lightweight validator. |
 | Push to `master` | No app test/build workflow | Merging does not repeat CI after the reviewed commit. Website pushes may still deploy Pages; issue automation is separate from app CI. |
-| Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards, Windows compile-all `tine-core` and `tine-storage` test targets + contract-selected isolated core/storage smoke, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence. |
+| Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards and the complete unpartitioned `tine-storage` suite, Windows compile-all `tine-core` and `tine-storage` test targets + contract-selected isolated core/storage smoke, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence. |
 | Manual `ci`, focused scope | Only `windows`, `android`, or `performance` | Platform/performance proof while developing relevant changes. A focused run never satisfies the release gate. |
 | Manual `ui-e2e` | Complete or scenario-focused Linux/Windows real-app proof | UI/harness debugging between releases without starting ordinary full CI. |
 | Manual `Flatpak build test` | Real offline Flatpak build | Focused packaging proof. The release workflow calls the same workflow as a hard gate. |
@@ -58,9 +58,16 @@ deterministic fixtures.
 
 ## Windows release scope
 
-Linux is the complete `tine-core` behavior matrix: its nextest inventory
-contract proves every non-ignored core test runs exactly once across four
-isolated shards. Windows is a deliberately narrower, blocking compatibility
+Linux is the complete behavior matrix for both crates: its nextest inventory
+contract proves every non-ignored `tine-core` test runs exactly once across four
+isolated shards, and every non-ignored `tine-storage` test runs in one
+unpartitioned job. The storage half is newer than the rest of this document —
+until 2026-08-07 no job on any platform executed the storage suite, because
+Linux ran only `--package tine-core` while Windows compiled the storage targets
+with `--no-run`. The contract now also asserts that the tests Windows defers are
+executed on Linux, so a deferral cannot quietly mean "covered nowhere".
+
+Windows is a deliberately narrower, blocking compatibility
 gate: it compiles every `tine-core` and `tine-storage` test target and runs
 declared core and storage smoke selections under nextest isolation. The core
 selection contains every explicitly Windows-named core test plus the

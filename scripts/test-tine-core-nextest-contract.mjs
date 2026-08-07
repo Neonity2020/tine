@@ -13,6 +13,7 @@ import {
   WINDOWS_STORAGE_SELECTED_WINDOWS_NAMED_TEST_NAMES,
   inventoryFromNextestList,
   verifyLinuxShardCoverage,
+  verifyLinuxStorageCoverage,
   verifyWindowsCoreSmokeSelection,
 } from "./tine-core-nextest-contract.mjs";
 
@@ -44,6 +45,24 @@ assert.throws(
 assert.throws(
   () => verifyLinuxShardCoverage(fullCore, [shards[0], shards[1], shards[2], shards[2]]),
   /both selected tine-core gamma/
+);
+
+// The Linux storage run is unpartitioned, so its contract is not coverage-by-
+// shard but "nothing narrowed it, and the Windows-deferred tests are actually
+// executed here". A deferred test that has been renamed away must fail rather
+// than keep a deferral that now covers nothing.
+const fullStorage = listedInventory("tine-storage", ["alpha", "deferred_on_windows"]);
+assert.deepEqual(
+  verifyLinuxStorageCoverage(fullStorage, ["deferred_on_windows"]),
+  { testCount: 2, deferredWindowsCount: 1 }
+);
+assert.throws(
+  () => verifyLinuxStorageCoverage(fullStorage, ["renamed_away"]),
+  /exactly one required test renamed_away/
+);
+assert.throws(
+  () => verifyLinuxStorageCoverage(fullCore, []),
+  /Linux storage inventory is not tine-storage/
 );
 
 const coreWindowsTests = [

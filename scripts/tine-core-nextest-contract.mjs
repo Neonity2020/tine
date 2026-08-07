@@ -193,6 +193,27 @@ function requireExactNameSet(actualNames, expectedNames, label) {
   }
 }
 
+// Linux runs the whole tine-storage suite in one job — no partitioning, so the
+// coverage question is different from tine-core's. What has to hold is that the
+// job is not silently narrowed, and that the tests Windows explicitly defers are
+// actually executed *somewhere*. Without this, `WINDOWS_STORAGE_DEFERRED_...`
+// would read as "covered on Linux" while being covered nowhere.
+export function verifyLinuxStorageCoverage(inventory, deferredWindowsNames) {
+  if (inventory?.packageName !== "tine-storage") fail("Linux storage inventory is not tine-storage");
+  if (inventory.tests.size === 0) fail("Linux storage inventory selected no tests");
+
+  for (const name of deferredWindowsNames) {
+    // requireUniqueName also proves the name still exists: a deferred test that
+    // was renamed or deleted must not keep its deferral silently.
+    requireUniqueName(inventory, name);
+  }
+
+  return {
+    testCount: inventory.tests.size,
+    deferredWindowsCount: deferredWindowsNames.length,
+  };
+}
+
 export function verifyWindowsCoreSmokeSelection(coreInventory, smokeInventory, storageInventory, storageSmokeInventory) {
   if (coreInventory?.packageName !== "tine-core") fail("Windows core inventory is not tine-core");
   if (smokeInventory?.packageName !== "tine-core") fail("Windows core smoke inventory is not tine-core");
@@ -288,8 +309,10 @@ function main() {
       nextestList("ci", "tine-core", { partition: `hash:${index + 1}/${LINUX_TINE_CORE_SHARD_COUNT}` })
     );
     const result = verifyLinuxShardCoverage(full, shards);
+    const storage = nextestList("ci", "tine-storage");
+    const storageResult = verifyLinuxStorageCoverage(storage, WINDOWS_STORAGE_DEFERRED_WINDOWS_NAMED_TEST_NAMES);
     console.log(
-      `Linux nextest contract OK: ${result.testCount} tine-core tests exactly once across ${LINUX_TINE_CORE_SHARD_COUNT} hash shards (${result.shardCounts.join(", ")}).`
+      `Linux nextest contract OK: ${result.testCount} tine-core tests exactly once across ${LINUX_TINE_CORE_SHARD_COUNT} hash shards (${result.shardCounts.join(", ")}), and ${storageResult.testCount} tine-storage tests in one unpartitioned run including ${storageResult.deferredWindowsCount} Windows-deferred test(s).`
     );
     return;
   }

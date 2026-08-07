@@ -218,6 +218,30 @@ jobs:
       - name: Linux tine-core nextest / deterministic hash shard ${{ matrix.shard }}/4
         run: cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4
 
+  # tine-storage owns the physical durability layer, and until 2026-08-07 no job
+  # on any platform executed its suite: Linux ran only `--package tine-core`, and
+  # Windows compiled the storage targets with `--no-run` plus a deliberately
+  # bounded six-test smoke. `scripts/tine-core-nextest-contract.mjs` already said
+  # "Linux is the complete tine-storage semantic suite" — this is that sentence
+  # made true. The package is small enough to run unpartitioned; when it becomes
+  # an independently versioned package this job is what its certification runs.
+  linux-storage-nextest:
+    name: Full CI / Linux tine-storage nextest
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'full'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Install cargo-nextest 0.9.143
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
+      - name: Linux tine-storage nextest / complete semantic suite
+        run: cargo nextest run --profile ci --package tine-storage
+
   # Linux host tests do not see either platform branch: Windows has its own cfg
   # implementation, while Android's libc declarations differ from desktop Linux.
   # Windows compiles every tine-core and tine-storage test target, then executes

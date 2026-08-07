@@ -374,8 +374,23 @@ assert.equal(
   yamlScalar(yamlBlock(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "with", 8), "tool", 10),
   "nextest@0.9.143"
 );
+// tine-storage's suite was compiled but never executed by any job until
+// 2026-08-07. Assert the job exists, runs the whole package unpartitioned, and
+// is release-required — a job outside REQUIRED_FULL_CI_JOBS can go red without
+// blocking a tag, which is the same coverage hole in a different place.
+const linuxStorage = yamlBlock(ciJobs, "linux-storage-nextest", 2);
+assert.equal(yamlScalar(linuxStorage, "name", 4), "Full CI / Linux tine-storage nextest");
+assert.equal(yamlScalar(linuxStorage, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
+assert.equal(
+  yamlScalar(yamlNamedStep(linuxStorage, "Linux tine-storage nextest / complete semantic suite"), "run", 8),
+  "cargo nextest run --profile ci --package tine-storage"
+);
+assert.ok(
+  REQUIRED_FULL_CI_JOBS.includes("Full CI / Linux tine-storage nextest"),
+  "the Linux storage suite runs but is not required for exact-SHA release evidence"
+);
 assert.doesNotMatch(
-  [linuxCoreContract, linuxCoreShards, windowsCompile].map((job) => job.join("\n")).join("\n"),
+  [linuxCoreContract, linuxCoreShards, linuxStorage, windowsCompile].map((job) => job.join("\n")).join("\n"),
   /continue-on-error:/,
   "nextest release evidence hides a failed contract or test job"
 );
