@@ -1176,11 +1176,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 })();
                 match result {
                     Ok(tick) => {
-                        let completed = matches!(
-                            tick,
-                            SyncRuntimeTick::AdmittedNoop { .. }
-                                | SyncRuntimeTick::AdmittedComplete { .. }
-                        );
+                        // Only an admission that actually committed a batch is
+                        // a content change. `AdmittedNoop` is, by its own name,
+                        // the step that took no completed batch.
+                        let changed = tick.committed_observable_change();
                         match &tick {
                             SyncRuntimeTick::LocalMutation(_)
                             | SyncRuntimeTick::Recovering
@@ -1210,7 +1209,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             "sparse-v2-tick",
                             crate::sync_runtime::tick_dto(tick),
                         );
-                        if completed {
+                        if changed {
                             let _ = app.emit_to(label, "sparse-v2-changed", ());
                         }
                         if let Ok(status) = graph.handle.status() {

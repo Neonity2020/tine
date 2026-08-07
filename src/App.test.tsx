@@ -150,8 +150,9 @@ describe("managed watcher reconciliation", () => {
 });
 
 // A change notification is not per-page divergence evidence. The managed runtime's
-// `sparse-v2-changed` tick is a bare aggregate epoch (no page, no origin, fires even
-// for an admission that changed nothing); the legacy watcher event names a page but
+// `sparse-v2-changed` tick is a bare aggregate epoch (no page, no origin — it no
+// longer fires for an admission that committed nothing, but which page and whose
+// write it was are still unknown); the legacy watcher event names a page but
 // still cannot tell our own write's echo from someone else's. Declaring a conflict
 // on the notification alone blocks `doSave` for that page, so the banner's claim —
 // "your unsaved changes weren't written" — comes true only BECAUSE of the banner.

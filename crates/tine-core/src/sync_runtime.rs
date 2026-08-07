@@ -1502,6 +1502,24 @@ pub enum SyncRuntimeTick {
     Terminal(String),
 }
 
+impl SyncRuntimeTick {
+    /// Did this tick commit anything a reader could observe?
+    ///
+    /// Only `AdmittedComplete` did: it is the variant produced when the drain
+    /// took a completed batch, while `AdmittedNoop` is the same step with no
+    /// batch to take. Both were previously treated as "the graph changed", so
+    /// every quiet admission woke the frontend with a contentless signal, and a
+    /// wake-up arriving while a page was dirty was read as a conflict against
+    /// nothing.
+    ///
+    /// This is a claim about content, not about progress: a noop tick is still
+    /// real progress for the queue epoch and still updates status.
+    #[must_use]
+    pub const fn committed_observable_change(&self) -> bool {
+        matches!(self, Self::AdmittedComplete { .. })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SyncRuntimeStatusSnapshot {
     pub lifecycle: SyncRuntimeLifecycle,
@@ -21814,24 +21832,40 @@ mod tests {
     }
 
     #[test]
-    fn missing_existing_projection_is_refused_without_rebuild() {
+    fn missing_projection_is_rebuilt_rather_than_refused() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-existing-only");
         let mut request = fixture.request();
         request.database_path = fixture.graph_root().join("missing.sqlite");
         let opened = SyncRuntimeHandle::open(request.clone());
-        assert!(matches!(
+        assert_eq!(
             opened.status,
-            SyncRuntimeOpenStatus::OpenRefused { .. }
-        ));
-        assert!(opened.handle.is_none());
-        assert!(!request.database_path.exists());
+            SyncRuntimeOpenStatus::Active,
+            "a missing disposable projection is rebuildable from the oplog, so it must not refuse the open"
+        );
+        assert!(opened.handle.is_some());
+        assert!(
+            request.database_path.exists(),
+            "the rebuild must leave a projection where the request asked for one"
+        );
+        drop(opened.handle);
     }
 
     #[test]
-    fn interrupted_forensics_is_refused_without_moving_the_existing_projection() {
+    /// An interrupted forensic preservation is finished, not left half-done.
+    ///
+    /// This used to refuse the open outright, which left the user with an
+    /// unopenable graph *and* an incomplete evidence directory -- the worst of
+    /// both. The rebuild path already knows how to resume a cut-short
+    /// preservation; what must not happen is the evidence being discarded, so
+    /// that is what this asserts.
+    fn interrupted_forensics_is_resumed_and_completed_rather_than_refused() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-forensics-existing-only");
         let request = fixture.request();
         let database_bytes = fs::read(&request.database_path).unwrap();
+        assert!(
+            !database_bytes.is_empty(),
+            "the fixture must start with real projection bytes for their survival to mean anything"
+        );
         let file_name = request.database_path.file_name().unwrap().to_str().unwrap();
         let forensic = request
             .database_path
@@ -21841,14 +21875,21 @@ mod tests {
         fs::create_dir(&forensic).unwrap();
 
         let opened = SyncRuntimeHandle::open(request.clone());
-        assert!(matches!(
+        assert_eq!(
             opened.status,
-            SyncRuntimeOpenStatus::OpenRefused { .. }
-        ));
-        assert!(opened.handle.is_none());
-        assert_eq!(fs::read(&request.database_path).unwrap(), database_bytes);
-        assert!(!forensic.join("database").exists());
-        assert!(!forensic.join("EVIDENCE_COMPLETE").exists());
+            SyncRuntimeOpenStatus::Active,
+            "an interrupted preservation is resumable, so it must not strand the graph"
+        );
+        assert!(opened.handle.is_some());
+        assert!(
+            forensic.join("EVIDENCE_COMPLETE").exists(),
+            "the resumed preservation must finish, leaving no second interrupted directory behind"
+        );
+        assert!(
+            request.database_path.exists(),
+            "the rebuild must leave a usable projection in place"
+        );
+        drop(opened.handle);
     }
 
     /// Drive the feed until the watcher queue settles, reporting every tick so
@@ -31879,6 +31920,35 @@ mod tests {
             "aged-history crash reopen exceeded 45 seconds"
         );
         drop(reopened.handle);
+    }
+
+    /// Only a tick that committed a batch may be reported as a content change.
+    ///
+    /// The two admitted variants were treated alike, so a drain that took no
+    /// completed batch still told the frontend the graph had changed. That
+    /// contentless signal, arriving while a page was dirty, is what produced a
+    /// conflict against nothing -- the false-conflict incident of 2026-08-06.
+    #[test]
+    fn only_a_committing_tick_reports_an_observable_change() {
+        assert!(SyncRuntimeTick::AdmittedComplete { epoch: 7 }.committed_observable_change());
+        assert!(
+            !SyncRuntimeTick::AdmittedNoop { epoch: 7 }.committed_observable_change(),
+            "an admission that took no completed batch is not a content change"
+        );
+        for quiet in [
+            SyncRuntimeTick::Idle,
+            SyncRuntimeTick::Recovering,
+            SyncRuntimeTick::RetryFull,
+            SyncRuntimeTick::Blocked("blocked".into()),
+            SyncRuntimeTick::RecoveryBlocked("blocked".into()),
+            SyncRuntimeTick::Failed("failed".into()),
+            SyncRuntimeTick::Terminal("terminal".into()),
+        ] {
+            assert!(
+                !quiet.committed_observable_change(),
+                "{quiet:?} committed nothing and must not be reported as a change"
+            );
+        }
     }
 
     /// A rebuild must resolve documents through its root-bound lookup sessions.

@@ -100,8 +100,10 @@ export interface StoredPageState {
  *  last saved? This is the per-page proof that a change NOTIFICATION does not carry.
  *
  *  The managed runtime's `sparse-v2-changed` tick is a bare aggregate epoch — it
- *  names no page, carries no origin, and fires even for an admission that changed
- *  nothing. The legacy watcher event names a page but still cannot distinguish our
+ *  names no page and carries no origin. (It no longer fires for an admission that
+ *  committed nothing, which removed one source of spurious wake-ups, but a tick
+ *  still cannot say WHICH page changed or whose write it was.)
+ *  The legacy watcher event names a page but still cannot distinguish our
  *  own write echoing back from someone else's. So "a notification arrived while this
  *  page was dirty" is not evidence of a conflict, and treating it as one is a false
  *  positive the user pays for: `doSave` refuses a conflicted page, which makes the
