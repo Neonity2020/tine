@@ -2655,10 +2655,41 @@ fn completion_namespace_replacement_blocks_recovery_of_exact_target() {
     );
 }
 
+/// Does clearing a directory's write bits actually deny writes to THIS user?
+///
+/// Both publication-cut tests below establish their boundary by making a
+/// receipt directory read-only and requiring the write to fail. Root ignores
+/// directory permissions, so under a root test runner the cut never happens,
+/// the call succeeds, and the assertion fails against a boundary that was never
+/// established. Probe the real behaviour rather than testing for uid 0 -- the
+/// same answer is what capability-restricted and unusual filesystems need.
+#[cfg(unix)]
+fn directory_permissions_are_enforced() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let probe = TestDir::new("permission-probe");
+    let directory = probe.path().join("denied");
+    fs::create_dir(&directory).unwrap();
+    let mode = fs::metadata(&directory).unwrap().permissions().mode();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+    let denied = fs::write(directory.join("probe"), b"probe").is_err();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+    denied
+}
+
 #[cfg(unix)]
 #[test]
 fn manifested_present_target_recovers_across_completion_and_status_publication_cuts() {
     use std::os::unix::fs::PermissionsExt;
+
+    if !directory_permissions_are_enforced() {
+        eprintln!(
+            "SKIPPED manifested_present_target_recovers_across_completion_and_status_publication_cuts: \
+             this runner can write through cleared directory write bits, so the publication cut \
+             cannot be established. The durability contract is UNPROVEN here, not satisfied."
+        );
+        return;
+    }
 
     let (dir, graph, receipts, writer, mut engine, binding, page_id, _prior_intent, base) =
         manifested_fixture(
@@ -2760,6 +2791,15 @@ fn manifested_present_target_recovers_across_completion_and_status_publication_c
 #[test]
 fn manifested_absence_recovers_from_retained_base_across_both_publication_cuts() {
     use std::os::unix::fs::PermissionsExt;
+
+    if !directory_permissions_are_enforced() {
+        eprintln!(
+            "SKIPPED manifested_absence_recovers_from_retained_base_across_both_publication_cuts: \
+             this runner can write through cleared directory write bits, so the publication cut \
+             cannot be established. The durability contract is UNPROVEN here, not satisfied."
+        );
+        return;
+    }
 
     let (dir, graph, receipts, writer, mut engine, binding, page_id, _prior_intent, _) =
         manifested_fixture(
