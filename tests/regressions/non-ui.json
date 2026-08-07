@@ -2738,6 +2738,24 @@
         ]
       },
       "notes": "Martin reported \"Couldn't load references because the backend request failed.\" on every page of a managed graph. Root cause was authority, not references: GraphSlot exposed only legacy write authority, so with_graph refused all ~50 read-only commands under managed storage and only six page-path commands worked. Reads now go through with_read_graph, served for managed bindings by a Graph opened with open_derived_read_only over the projected tree. That view fails every graph-text write at admit_managed_text_writer and ensure_write_target, so a misrouted write command errors instead of writing behind the oplog; assets stay writable because assets/ is outside the oplog's document domain. Writes (rename, delete, merge, config setters, conflict resolution) remain refused under managed storage and still need real oplog implementations."
+    },
+    {
+      "id": "REG-MANAGED-WHOLE-GRAPH-WRITES-REFUSED-001",
+      "title": "Settings changes, page rename/delete/merge, conflict resolution and trash work while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "reproduced",
+      "coverage": {
+        "tests": []
+      },
+      "notes": "Open half of the 2026-08-07 authority defect; the read half is REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001, fixed in 25f36f16. Under managed storage these still fail with SPARSE_V2_UNSUPPORTED and need oplog implementations: all set_* config writers (every Settings toggle), rename_page, delete_page, merge_pages, rename_file_to_page, resolve_sync_conflict, trash_sync_conflict, trash_journal_file, trash_asset, empty_asset_trash, copy_guide_into_graph, import_native_capture. Open design question before the config writers: sync_runtime.rs:17310 lists logseq/config.edn in expected_user_paths, so config may be inside the oplog's domain rather than an ordinary file write. The asset trash pair is refused only incidentally (it writes the trash dir via ensure_write_target) and a trash capability separate from graph text would restore it cheaply. Tracked as M5 in specs/handoffs/2026-08-06-direct-files-program.md. This gap existed because the six sparse-routed commands were added one at a time and nothing ever enumerated the remaining command surface; coverage for this row should assert the COMPLETE set of commands refused under managed storage, so the next gap appears as a diff rather than a user report."
     }
   ]
 }
