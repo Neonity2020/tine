@@ -4,7 +4,8 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_graph, with_read_graph, AppState, GraphContext,
+    slot_for_context, with_config_graph, with_graph, with_read_graph, with_trash_graph, AppState,
+    GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -1357,7 +1358,7 @@ pub(crate) fn page_icons(
 
 #[tauri::command]
 pub(crate) fn set_favorites(names: Vec<String>, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_favorites(&names).map_err(|e| e.to_string())
     })
 }
@@ -1367,7 +1368,7 @@ pub(crate) fn set_preferred_workflow(
     workflow: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_preferred_workflow(&workflow)
             .map_err(|e| e.to_string())
     })
@@ -1378,7 +1379,7 @@ pub(crate) fn set_timetracking_enabled(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_timetracking_enabled(enabled)
             .map_err(|e| e.to_string())
     })?;
@@ -1388,7 +1389,7 @@ pub(crate) fn set_timetracking_enabled(
 
 #[tauri::command]
 pub(crate) fn set_show_brackets(enabled: bool, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_show_brackets(enabled).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?;
@@ -1400,7 +1401,7 @@ pub(crate) fn set_doc_mode_enter_for_new_block(
     enabled: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_doc_mode_enter_for_new_block(enabled)
             .map_err(|e| e.to_string())
     })?;
@@ -1410,7 +1411,7 @@ pub(crate) fn set_doc_mode_enter_for_new_block(
 
 #[tauri::command]
 pub(crate) fn set_logical_outdenting(enabled: bool, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_logical_outdenting(enabled).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?;
@@ -1419,7 +1420,7 @@ pub(crate) fn set_logical_outdenting(enabled: bool, state: GraphContext<'_>) -> 
 
 #[tauri::command]
 pub(crate) fn set_guide_announced(announced: bool, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_guide_announced(announced).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?;
@@ -1431,7 +1432,7 @@ pub(crate) fn set_default_journal_template(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_default_journal_template(name.as_deref())
             .map_err(|e| e.to_string())
     })
@@ -1439,7 +1440,7 @@ pub(crate) fn set_default_journal_template(
 
 #[tauri::command]
 pub(crate) fn set_start_of_week(n: u32, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_start_of_week(n).map_err(|e| e.to_string())
     })
 }
@@ -1452,7 +1453,7 @@ pub(crate) fn set_preferred_format(format: String, state: GraphContext<'_>) -> R
     } else {
         tine_core::model::Format::Md
     };
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_preferred_format(fmt).map_err(|e| e.to_string())
     })?;
     refresh_graph(&state)?; // so new pages/journals use the new extension immediately
@@ -1466,7 +1467,7 @@ pub(crate) fn set_journal_title_format(
     format: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_config_graph(&state, |g| {
         g.set_journal_page_title_format(&format)
             .map_err(|e| e.to_string())
     })?;
@@ -2497,7 +2498,7 @@ pub(crate) fn list_orphan_assets(
 /// Move an orphaned asset to the recoverable trash.
 #[tauri::command]
 pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| g.trash_asset(&name).map_err(|e| e.to_string()))
+    with_trash_graph(&state, |g| g.trash_asset(&name).map_err(|e| e.to_string()))
 }
 
 /// Count + total bytes in the recoverable asset trash.
@@ -2511,7 +2512,7 @@ pub(crate) fn asset_trash_stats(
 /// Permanently delete everything in the asset trash; returns files removed.
 #[tauri::command]
 pub(crate) fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, String> {
-    with_graph(&state, |g| g.empty_asset_trash().map_err(|e| e.to_string()))
+    with_trash_graph(&state, |g| g.empty_asset_trash().map_err(|e| e.to_string()))
 }
 
 /// Journal days that resolve to more than one file (e.g. a date-stem file plus a

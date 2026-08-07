@@ -4955,8 +4955,10 @@ impl Graph {
     }
 
     pub(crate) fn ensure_write_target(&self, target: &Path) -> io::Result<()> {
-        // Config, publish and trash writes reach the tree without a graph-text
-        // writer permit, so the read-only view has to refuse them here too.
+        // Publish writes reach the tree without a graph-text writer permit, so
+        // the read-only view has to refuse them here too. Configuration and the
+        // recoverable trash have their own capabilities below: both are outside
+        // the oplog's document domain and stay writable in a read-only view.
         if self.derived_read_only {
             return Err(derived_read_only_write_error());
         }
@@ -4979,6 +4981,56 @@ impl Graph {
                 format!("write target escapes graph root: {}", target.display()),
             ))
         }
+    }
+
+    /// Graph configuration has its own capability boundary.
+    ///
+    /// `logseq/config.edn` is **not** oplog-owned. The managed reconciliation
+    /// scanner classifies it `GraphTextScanPathClass::Configuration`
+    /// (`model.rs`, `capture_reconciliation_scan_pass`) and the baseline adapter
+    /// drops every such row as "not managed content" that "cannot be represented
+    /// as a `ManagedPath`" (`oplog/reconciliation_baseline_adapter.rs`), so no
+    /// import, expected-path row or projection ever covers it. Configuration is
+    /// therefore writable in a read-only view — a Settings toggle is not a
+    /// write behind the oplog's back.
+    ///
+    /// Narrowed to that one exact path so the capability can never widen into a
+    /// general `logseq/` write.
+    pub(crate) fn ensure_config_write_target(&self, target: &Path) -> io::Result<()> {
+        if target != self.root.join("logseq").join("config.edn") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write target is not this graph's configuration: {}",
+                    target.display()
+                ),
+            ));
+        }
+        self.ensure_within_graph_root(target)
+    }
+
+    /// The recoverable trash tree has its own capability boundary.
+    ///
+    /// `logseq/.tine-trash` sits beside `assets`, `publish` and `.tine-sync` in
+    /// `graph_text_scope::fixed_excluded`, so nothing under it is ever scanned,
+    /// imported or projected: it is outside the oplog's document domain exactly
+    /// the way `assets/` is. Only the *destination* is covered here. Page,
+    /// journal and conflict trashing still passes through
+    /// [`Graph::admit_managed_text_writer`] because its **source** is graph
+    /// text; this capability restores the asset-side trash writes that were
+    /// refused only incidentally.
+    fn ensure_trash_write_target(&self, target: &Path) -> io::Result<()> {
+        let trash = trash_root(&self.root);
+        if target != trash && !target.starts_with(&trash) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write target is not inside the recoverable trash: {}",
+                    target.display()
+                ),
+            ));
+        }
+        self.ensure_within_graph_root(target)
     }
 
     /// Asset writes have their own capability boundary. Keeping this separate
@@ -15238,7 +15290,7 @@ impl Graph {
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Asset);
         self.ensure_asset_write_target(&src)?;
-        self.ensure_write_target(&trash)?;
+        self.ensure_trash_write_target(&trash)?;
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
         move_to_trash(&src, &dest, &trash)?;
         Ok(())
@@ -15256,7 +15308,7 @@ impl Graph {
     /// entries stay recoverable in `logseq/.tine-trash`.
     pub fn empty_asset_trash(&self) -> io::Result<u64> {
         let trash = trash_root(&self.root);
-        self.ensure_write_target(&trash)?;
+        self.ensure_trash_write_target(&trash)?;
         let mut removed = 0;
         match fs::read_dir(&trash) {
             Ok(rd) => {
@@ -15522,7 +15574,7 @@ impl Graph {
             let source = self.assets_path().join(source_key).join(&name);
             if !source.is_file()
                 || self.ensure_asset_write_target(&source).is_err()
-                || self.ensure_write_target(&trash).is_err()
+                || self.ensure_trash_write_target(&trash).is_err()
                 || fs::create_dir_all(&trash).is_err()
             {
                 continue;
@@ -18041,7 +18093,7 @@ impl Graph {
         }
 
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        self.ensure_write_target(&trash)?;
+        self.ensure_trash_write_target(&trash)?;
         fs::create_dir_all(&trash)?;
         let name = path
             .file_name()
@@ -32951,6 +33003,98 @@ mod tests {
         assert!(
             dir.join("assets").join(&stored).exists(),
             "the imported asset must land in assets/"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every Settings toggle writes `logseq/config.edn`, and configuration is
+    /// **not** oplog-owned: the managed scanner classifies it
+    /// `GraphTextScanPathClass::Configuration` and the baseline adapter drops
+    /// those rows as "not managed content", so no managed path, import or
+    /// projection ever covers it. Persisting a setting must therefore keep
+    /// working while managed storage owns graph text.
+    #[test]
+    fn a_derived_read_only_graph_still_writes_graph_configuration() {
+        let dir = scratch("derived-read-only-config");
+        let view = Graph::open_derived_read_only(&dir);
+
+        view.set_favorites(&["Alpha".to_owned(), "Beta".to_owned()])
+            .expect("configuration is outside the graph-text boundary");
+        view.set_start_of_week(3)
+            .expect("configuration is outside the graph-text boundary");
+
+        let written = fs::read_to_string(dir.join("logseq/config.edn"))
+            .expect("the setting must have been persisted");
+        assert!(
+            written.contains(":favorites [\"Alpha\" \"Beta\"]"),
+            "favorites must round-trip into config.edn: {written}"
+        );
+        assert!(
+            written.contains(":start-of-week 3"),
+            "start of week must round-trip into config.edn: {written}"
+        );
+
+        // The same view still cannot touch graph text, so the config capability
+        // did not widen into the oplog's domain.
+        fs::write(dir.join("pages/Alpha.md"), "- alpha\n").unwrap();
+        let view = Graph::open_derived_read_only(&dir);
+        let mut page = view.load_by_path("pages/Alpha.md").unwrap().unwrap();
+        let base_rev = page.rev.clone();
+        page.blocks[0].raw = "- alpha edited behind the oplog".into();
+        assert_eq!(
+            view.save_page(&page, base_rev.as_deref())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+            "a config write must not have widened the graph-text boundary"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `logseq/.tine-trash` sits next to `assets`, `publish` and `.tine-sync` in
+    /// `graph_text_scope::fixed_excluded`, so nothing under it is scanned,
+    /// imported or projected. Trashing an orphaned asset is an asset-side write
+    /// into that tree and must stay available under managed storage; trashing a
+    /// journal file is a graph-text deletion and must not.
+    #[test]
+    fn a_derived_read_only_graph_trashes_assets_but_not_journals() {
+        let dir = scratch("derived-read-only-trash");
+        fs::create_dir_all(dir.join("assets")).unwrap();
+        fs::write(dir.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(dir.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
+
+        let view = Graph::open_derived_read_only(&dir);
+
+        view.trash_asset("orphan.png")
+            .expect("the trash tree is outside the graph-text boundary");
+        assert!(
+            !dir.join("assets/orphan.png").exists(),
+            "the orphaned asset must have left assets/"
+        );
+        assert_eq!(
+            view.asset_trash_stats().count,
+            1,
+            "the orphaned asset must be recoverable from the trash"
+        );
+
+        let removed = view
+            .empty_asset_trash()
+            .expect("emptying the asset trash is an asset-side write");
+        assert_eq!(removed, 1, "the emptied entry must be counted");
+
+        // A journal file is graph text. Its deletion belongs to the oplog and
+        // stays refused at the single graph-text admission.
+        let refused = view.trash_journal_file("2026_08_07.md").unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied,
+            "a journal deletion must stay refused under managed storage: {refused}"
+        );
+        assert!(
+            dir.join("journals/2026_08_07.md").exists(),
+            "the refused journal deletion must not have touched the file"
         );
 
         let _ = fs::remove_dir_all(&dir);

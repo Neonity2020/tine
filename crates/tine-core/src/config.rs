@@ -274,7 +274,7 @@ static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn config_path_for_write(graph: &Graph) -> io::Result<std::path::PathBuf> {
     let path = graph.root.join("logseq").join("config.edn");
-    graph.ensure_write_target(&path)?;
+    graph.ensure_config_write_target(&path)?;
     Ok(path)
 }
 

@@ -35,9 +35,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
   authority. Reading and writing are now separate permissions, so whole-graph
   *reads* are answered from the managed graph's own files while writes stay with
   managed storage. Actions that change many pages at once — renaming, deleting
-  and merging pages, editing graph settings, and resolving sync conflicts — are
-  still unavailable under managed storage and now say so plainly instead of
-  reporting a failed request.
+  and merging pages, and resolving sync conflicts — are still unavailable under
+  managed storage and now say so plainly instead of reporting a failed request.
+- **Settings changes save again while Tine-managed storage is active.** Every
+  toggle in Settings was dead: favourites, task workflow, file format for new
+  pages, journal title format, first day of the week, showing brackets, logical
+  outdenting, Enter behaviour in document mode, time tracking and the default
+  journal template all appeared to work and were forgotten on the next launch.
+  Settings live in the graph's own `logseq/config.edn`, which managed storage
+  does not own, so writing them never needed the permission that was being
+  asked for. One exception remains: changing the journal title format no longer
+  renames existing journal files under managed storage.
+- **Cleaning up orphaned assets works again while Tine-managed storage is
+  active.** Moving an unused image to the recoverable trash, and emptying that
+  trash, were both refused — not because either touches your pages, but because
+  the trash folder was covered by the same permission as page text. Deleting a
+  page, journal or conflict copy is still unavailable.
 - **Error messages from the references panels no longer hide what went wrong.**
   Both panels replaced every backend message with a generic "the backend request
   failed", including messages that explained the cause exactly. They now show

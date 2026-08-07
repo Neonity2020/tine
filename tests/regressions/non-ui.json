@@ -2740,8 +2740,53 @@
       "notes": "Martin reported \"Couldn't load references because the backend request failed.\" on every page of a managed graph. Root cause was authority, not references: GraphSlot exposed only legacy write authority, so with_graph refused all ~50 read-only commands under managed storage and only six page-path commands worked. Reads now go through with_read_graph, served for managed bindings by a Graph opened with open_derived_read_only over the projected tree. That view fails every graph-text write at admit_managed_text_writer and ensure_write_target, so a misrouted write command errors instead of writing behind the oplog; assets stay writable because assets/ is outside the oplog's document domain. Writes (rename, delete, merge, config setters, conflict resolution) remain refused under managed storage and still need real oplog implementations."
     },
     {
+      "id": "REG-MANAGED-SETTINGS-WRITES-REFUSED-001",
+      "title": "Every Settings toggle persists while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::a_derived_read_only_graph_still_writes_graph_configuration",
+          "src-tauri/src/state.rs::tests::a_managed_binding_persists_settings_and_trash_but_not_graph_text",
+          "src-tauri/src/state.rs::tests::a_managed_settings_change_rebuilds_the_read_only_view",
+          "src-tauri/src/managed_command_surface.rs::tests::settings_and_asset_trash_are_not_refused_under_managed_storage"
+        ]
+      },
+      "notes": "Favorites, preferred workflow, preferred format, journal title format, start of week, show brackets, logical outdenting, doc-mode Enter, time tracking, default journal template and the guide-announced flag all silently failed under Tine-managed storage: the eleven set_* commands went through with_graph, the authority that answers \"may this caller write graph text\", and a managed binding correctly says no. Settled from source that graph configuration is NOT oplog-owned: the reconciliation scanner classifies logseq/config.edn as GraphTextScanPathClass::Configuration (model.rs, capture_reconciliation_scan_pass) and reconciliation_baseline_adapter.rs::scan_file_row drops those rows as \"not managed content\" that \"cannot be represented as a ManagedPath\", so nothing imports, projects or reconciles it; config bytes only join the within-scan two-pass stability digest. sync_runtime.rs:17310, the line that raised the question, is a test fixture's filesystem walk and says nothing about the oplog's domain. Fix: a Graph::ensure_config_write_target capability narrowed to that one exact path, and a with_config_graph route at the command layer. refresh_graph now takes a managed branch that rebuilds the read-only view instead of reopening a legacy graph, because a Graph reads config.edn when it opens. Still not done under managed storage: set_journal_title_format does not migrate journal filenames, since that is a rename the oplog owns."
+    },
+    {
+      "id": "REG-MANAGED-ASSET-TRASH-REFUSED-001",
+      "title": "Orphaned assets can be trashed and the asset trash emptied while Tine-managed storage is active",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::tests::a_derived_read_only_graph_trashes_assets_but_not_journals",
+          "src-tauri/src/state.rs::tests::a_managed_binding_persists_settings_and_trash_but_not_graph_text",
+          "src-tauri/src/managed_command_surface.rs::tests::settings_and_asset_trash_are_not_refused_under_managed_storage"
+        ]
+      },
+      "notes": "trash_asset and empty_asset_trash were refused under managed storage only incidentally: the asset itself passed ensure_asset_write_target, but the destination directory went through ensure_write_target, which the read-only view refuses along with graph text. Settled from source that the trash tree is outside the oplog's document domain: graph_text_scope.rs::fixed_excluded lists logseq/.tine-trash beside assets, publish and .tine-sync, so nothing under it is scanned, imported or projected. Fix: Graph::ensure_trash_write_target, used by the four asset-side trash destinations, plus a with_trash_graph route. Page, journal and conflict trashing is unaffected and still refused, because its SOURCE is graph text and it goes through admit_managed_text_writer."
+    },
+    {
       "id": "REG-MANAGED-WHOLE-GRAPH-WRITES-REFUSED-001",
-      "title": "Settings changes, page rename/delete/merge, conflict resolution and trash work while Tine-managed storage is active",
+      "title": "Page rename/delete/merge, conflict resolution, guide copy and native capture work while Tine-managed storage is active",
       "family": "managed-storage",
       "sources": {
         "issues": [],
@@ -2753,9 +2798,13 @@
       "layer": "core-native",
       "status": "reproduced",
       "coverage": {
-        "tests": []
+        "tests": [
+          "src-tauri/src/managed_command_surface.rs::tests::every_graph_command_declares_what_managed_storage_can_do_with_it",
+          "src-tauri/src/managed_command_surface.rs::tests::the_refused_surface_is_exactly_the_commands_still_on_the_legacy_authority",
+          "src-tauri/src/managed_command_surface.rs::tests::no_graph_routing_hides_in_the_unscanned_sources"
+        ]
       },
-      "notes": "Open half of the 2026-08-07 authority defect; the read half is REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001, fixed in 25f36f16. Under managed storage these still fail with SPARSE_V2_UNSUPPORTED and need oplog implementations: all set_* config writers (every Settings toggle), rename_page, delete_page, merge_pages, rename_file_to_page, resolve_sync_conflict, trash_sync_conflict, trash_journal_file, trash_asset, empty_asset_trash, copy_guide_into_graph, import_native_capture. Open design question before the config writers: sync_runtime.rs:17310 lists logseq/config.edn in expected_user_paths, so config may be inside the oplog's domain rather than an ordinary file write. The asset trash pair is refused only incidentally (it writes the trash dir via ensure_write_target) and a trash capability separate from graph text would restore it cheaply. Tracked as M5 in specs/handoffs/2026-08-06-direct-files-program.md. This gap existed because the six sparse-routed commands were added one at a time and nothing ever enumerated the remaining command surface; coverage for this row should assert the COMPLETE set of commands refused under managed storage, so the next gap appears as a diff rather than a user report."
+      "notes": "Remaining half of the 2026-08-07 authority defect. The read half is REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001 (25f36f16); settings and the asset trash are REG-MANAGED-SETTINGS-WRITES-REFUSED-001 and REG-MANAGED-ASSET-TRASH-REFUSED-001. Still refused under managed storage, needing real oplog transactions: rename_page, delete_page, merge_pages, rename_file_to_page, resolve_sync_conflict, trash_sync_conflict, trash_journal_file, copy_guide_into_graph. The enumeration this row asked for now exists: src-tauri/src/managed_command_surface.rs lists all 141 Tauri commands with the routing each one uses, re-derives that routing from the sources, and fails when the refused set changes -- so a new command that cannot work under managed storage is a failing diff rather than a user report. That enumeration surfaced a group nobody had listed: publish_html, open_pdf, read_highlights, write_highlights, write_pdf_view_state, save_pdf_area_image, save_asset and stream_asset_path are all asset/publish-domain work, outside the oplog's document domain, still sitting on the legacy write authority. They are the cheapest remaining slice. Tracked as M5 in specs/handoffs/2026-08-06-direct-files-program.md."
     }
   ]
 }
