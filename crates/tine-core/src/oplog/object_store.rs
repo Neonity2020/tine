@@ -419,6 +419,16 @@ pub(crate) struct AcceptedReadStats {
     pub object_reads: usize,
 }
 
+/// Process-wide `inspect_batch` cost, for the F49 quadratic probe only.
+///
+/// The per-store `counters` are reset with the store; these are not, so an
+/// import's *total* re-read volume can be read once at the end of a run.
+/// Diagnostic only — nothing reads these outside the probe.
+pub static INSPECT_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static INSPECT_BATCH_OBJECT_READS: AtomicUsize = AtomicUsize::new(0);
+pub static INSPECT_BATCH_OBJECT_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static INSPECT_BATCH_DIGEST_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObjectStoreStats {
     pub directory_enumerations: usize,
@@ -2481,6 +2491,7 @@ impl ObjectStore {
     /// Inspect a single manifest and validate every present required object.
     /// Missing objects stage the batch; corrupt or mismatched objects reject it.
     pub fn inspect_batch(&self, batch_id: BatchId) -> Result<BatchInspection, StoreError> {
+        INSPECT_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
         let batches = self.open_namespace(BATCHES_DIR)?;
         let filename = manifest_filename(batch_id);
         let manifest_bytes =
@@ -2529,6 +2540,9 @@ impl ObjectStore {
             self.counters
                 .inspected_object_bytes
                 .fetch_add(bytes.len(), Ordering::Relaxed);
+            INSPECT_BATCH_OBJECT_READS.fetch_add(1, Ordering::Relaxed);
+            INSPECT_BATCH_OBJECT_BYTES.fetch_add(bytes.len(), Ordering::Relaxed);
+            INSPECT_BATCH_DIGEST_BYTES.fetch_add(bytes.len(), Ordering::Relaxed);
             let content_digest = ContentDigest::of(&bytes);
             if content_digest != descriptor.content_digest() {
                 return Err(StoreError::ObjectPathMismatch(descriptor.content_digest()));

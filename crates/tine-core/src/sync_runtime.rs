@@ -21732,6 +21732,33 @@ mod tests {
             pick(0.0), pick(0.5), pick(0.9), pick(0.99), pick(1.0),
             if total > 0.0 { 100.0 * top10 / total } else { 0.0 },
         );
+        // F49: is the per-document cost O(batch)? `inspect_batch` re-reads,
+        // re-hashes and re-decodes every object of the batch it is asked about,
+        // and the projection executor calls it once per document. If that is the
+        // quadratic, these totals are ~n x the batch, not ~the batch.
+        {
+            use crate::oplog::object_store::{
+                INSPECT_BATCH_CALLS, INSPECT_BATCH_DIGEST_BYTES, INSPECT_BATCH_OBJECT_BYTES,
+                INSPECT_BATCH_OBJECT_READS,
+            };
+            use std::sync::atomic::Ordering as AtomicOrdering;
+            let calls = INSPECT_BATCH_CALLS.load(AtomicOrdering::Relaxed);
+            let reads = INSPECT_BATCH_OBJECT_READS.load(AtomicOrdering::Relaxed);
+            let bytes = INSPECT_BATCH_OBJECT_BYTES.load(AtomicOrdering::Relaxed);
+            let hashed = INSPECT_BATCH_DIGEST_BYTES.load(AtomicOrdering::Relaxed);
+            println!(
+                "INSPECT_BATCH: calls={calls} object_reads={reads} \
+                 object_bytes={bytes} sha256_bytes={hashed} \
+                 | per_call_objects={:.0} per_call_MB={:.2} total_GB={:.2}",
+                if calls > 0 { reads as f64 / calls as f64 } else { 0.0 },
+                if calls > 0 {
+                    bytes as f64 / calls as f64 / 1_048_576.0
+                } else {
+                    0.0
+                },
+                bytes as f64 / 1_073_741_824.0,
+            );
+        }
         if !settled {
             println!(
                 "FEED DID NOT CONVERGE within {}s of paced ticking -- this is the \
