@@ -407,6 +407,15 @@ impl PatriciaIndexStore {
             .map_err(map_storage_error)
     }
 
+    pub(crate) fn derive_complete_root(
+        &self,
+        records: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> Result<PatriciaIndexRoot, StoreError> {
+        self.storage
+            .derive_complete_root(records)
+            .map_err(map_storage_error)
+    }
+
     pub(crate) fn construction_lookup(
         &self,
         construction: &PatriciaIndexConstruction,

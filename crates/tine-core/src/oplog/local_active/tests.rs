@@ -268,7 +268,6 @@ impl Fixture {
             &verified,
             &backup,
             &authority,
-            sqlite.projection(),
             sqlite.sqlite_proof(),
         )
         .unwrap();

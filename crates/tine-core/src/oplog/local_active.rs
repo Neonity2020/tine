@@ -6088,7 +6088,6 @@ mod bounded_admission {
                 &verified,
                 &backup,
                 &authority,
-                sqlite.projection(),
                 sqlite.sqlite_proof(),
             )
             .unwrap();

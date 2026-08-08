@@ -5131,7 +5131,6 @@ fn freshly_validate_verified_local(
         proofs.verified_publication,
         &fresh_backup,
         proofs.accepted_authority,
-        proofs.sqlite,
         proofs.sqlite_projection,
     )?;
     if &fresh_shadow != proofs.shadow_projection {

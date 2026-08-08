@@ -3826,7 +3826,6 @@ fn activate_non_active_local(
         &verified,
         &source_backup,
         &accepted_authority,
-        inactive.projection(),
         inactive.sqlite_proof(),
     )
     .map_err(display)?;

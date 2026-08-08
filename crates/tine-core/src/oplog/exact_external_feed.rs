@@ -1271,7 +1271,6 @@ pub(crate) mod tests {
                 &verified,
                 &backup,
                 &accepted,
-                bootstrap.projection(),
                 bootstrap.sqlite_proof(),
             )
             .unwrap();

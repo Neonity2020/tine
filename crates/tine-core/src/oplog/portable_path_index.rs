@@ -282,11 +282,21 @@ impl PortablePathIndexStore {
         &self,
         records: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
     ) -> Result<PortablePathIndexRoot, StoreError> {
-        let chunk_limit = self
-            .patricia
-            .detached_construction_bulk_record_limit()?
-            .ok_or(StoreError::MalformedLogseqClaimIndex)?
-            .max(1);
+        let chunk_limit = self.patricia.detached_construction_bulk_record_limit()?;
+        if chunk_limit.is_none() {
+            let encoded = records
+                .iter()
+                .map(|(key, record)| {
+                    record.validate(*key)?;
+                    Ok((key.as_bytes().to_vec(), encode_record(record)?))
+                })
+                .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
+            return self
+                .patricia
+                .derive_complete_root(&encoded)
+                .map(PortablePathIndexRoot);
+        }
+        let chunk_limit = chunk_limit.expect("checked detached construction").max(1);
         let mut root = PortablePathIndexRoot::empty();
         let mut chunk = BTreeMap::new();
         for (key, record) in records {

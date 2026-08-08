@@ -16,6 +16,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -40,7 +41,9 @@ use super::projection::{
     plan_projection_adopting_exact_source, ExactSourceProjectionError,
     ExactSourceSemanticDifference, ProjectionPlan,
 };
-use super::sqlite::{OpenProjection, VerifiedBootstrapSqliteProjection};
+#[cfg(test)]
+use super::sqlite::OpenProjection;
+use super::sqlite::VerifiedBootstrapSqliteProjection;
 use super::{
     BlobDescription, CanonicalGraphResourceId, ContentDigest, DeviceId, LineageDigest, ManagedPath,
     ManagedTextKind, PageId, ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition,
@@ -1599,8 +1602,9 @@ struct PublicationPaths {
 }
 
 /// Build or resume the exact-source inactive shadow projection and return a
-/// typed proof only after semantic equivalence plus fresh source, backup,
-/// SQLite, authority, root, and committed-byte rereads.
+/// typed proof after semantic equivalence, durable private publication, and a
+/// final live-source revalidation. Existing staged/final data is fully
+/// reverified on resume; freshly constructed data carries its adjacent proof.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     graph: &Graph,
@@ -1609,7 +1613,6 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     verified_publication: &InactiveBootstrapVerifiedPublication,
     source_backup: &VerifiedSourceBackup,
     authority: &InactiveBootstrapAcceptedAuthority,
-    sqlite: &OpenProjection,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
     verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
@@ -1619,7 +1622,6 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         verified_publication,
         source_backup,
         authority,
-        sqlite,
         sqlite_projection,
         super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
     )
@@ -1633,10 +1635,22 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
     verified_publication: &InactiveBootstrapVerifiedPublication,
     source_backup: &VerifiedSourceBackup,
     authority: &InactiveBootstrapAcceptedAuthority,
-    sqlite: &OpenProjection,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
     session_budget_bytes_per_root: usize,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
+    let shadow_started = Instant::now();
+    let mut shadow_lap = shadow_started;
+    let trace_lap = |label: &str, lap: &mut Instant| {
+        if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+            let now = Instant::now();
+            eprintln!(
+                "shadow projection: {label} took {} ms ({} ms cumulative)",
+                now.duration_since(*lap).as_millis(),
+                now.duration_since(shadow_started).as_millis(),
+            );
+            *lap = now;
+        }
+    };
     #[cfg(test)]
     {
         let mut calls = complete_shadow_verification_calls().lock().unwrap();
@@ -1650,9 +1664,9 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         verified_publication,
         source_backup,
         authority,
-        sqlite,
         sqlite_projection,
     )?;
+    trace_lap("input binding validation", &mut shadow_lap);
     let capture = prepared.source_capture();
     let authoritative_paths = bootstrap_authoritative_source_paths(capture).map_err(|_| {
         ShadowProjectionError::CorruptOrConflicting(
@@ -1660,7 +1674,9 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         )
     })?;
     let summary = summarize_source(capture, &authoritative_paths)?;
+    trace_lap("source selection and summary", &mut shadow_lap);
     let catalog = traverse_complete_catalog(authority, &authoritative_paths)?;
+    trace_lap("accepted catalog traversal", &mut shadow_lap);
     let catalog_binding = catalog.binding;
     let publication_id = shadow_publication_id(
         roots,
@@ -1675,6 +1691,7 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
 
     // This is deliberately the last live-source action before staging.
     capture.verify_before_inactive_bootstrap_authoring(graph)?;
+    trace_lap("pre-construction source revalidation", &mut shadow_lap);
 
     ensure_publication_parent(roots, authority.binding(), &paths)?;
     let mut instrumentation = ShadowProjectionInstrumentation {
@@ -1715,23 +1732,31 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
             &mut instrumentation,
             session_budget_bytes_per_root,
         )?;
+        trace_lap("payload and manifest construction", &mut shadow_lap);
         sync_tree(
             &paths.stage.join(PAYLOAD_DIRECTORY),
             summary,
             &mut instrumentation,
         )?;
+        trace_lap("payload durability", &mut shadow_lap);
         inject_crash_cut(ShadowProjectionCrashCut::AfterPayloadPublication)?;
         sync_file_and_parent(&paths.stage.join(MANIFEST_FILE))?;
         inject_crash_cut(ShadowProjectionCrashCut::AfterManifestPublication)?;
-        validate_projection_root_entries(&paths.stage, false)?;
-        verify_projection_directory_against_proof(
-            &paths.stage,
-            false,
-            &header,
-            summary,
-            constructed,
-            &mut instrumentation,
-        )?;
+        // A retained stage came from an interrupted earlier process and must
+        // earn fresh trust. A stage created by this call already has exact
+        // per-file construction evidence; rereading it would only defend
+        // against same-process substitution in the private runtime root.
+        if stage_exists {
+            verify_projection_directory_against_proof(
+                &paths.stage,
+                false,
+                &header,
+                summary,
+                constructed,
+                &mut instrumentation,
+            )?;
+            trace_lap("resumed staging tree verification", &mut shadow_lap);
+        }
         sync_directory(&paths.stage)?;
         move_file_noreplace(&paths.stage, &paths.final_directory).map_err(|_| {
             ShadowProjectionError::CorruptOrConflicting(
@@ -1745,19 +1770,12 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         &paths.parent,
         ShadowProjectionDurabilityBarrier::PublicationParentAfterFinal,
     )?;
+    trace_lap("final rename and parent durability", &mut shadow_lap);
 
     let (manifest, staged) = if let Some(constructed) = adjacent_construction {
-        verify_projection_directory_against_proof(
-            &paths.final_directory,
-            true,
-            &header,
-            summary,
-            constructed,
-            &mut instrumentation,
-        )?;
         constructed
     } else {
-        verify_projection_directory(
+        let verified = verify_projection_directory(
             &paths.final_directory,
             true,
             &header,
@@ -1767,7 +1785,9 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
             summary,
             &mut instrumentation,
             session_budget_bytes_per_root,
-        )?
+        )?;
+        trace_lap("resumed semantic tree verification", &mut shadow_lap);
+        verified
     };
     let proof_bytes = proof_bytes(
         roots,
@@ -1789,6 +1809,7 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         ShadowProjectionCrashCut::PartialProofWrite,
         "shadow proof conflicts with existing evidence",
     )?;
+    trace_lap("proof publication", &mut shadow_lap);
     inject_crash_cut(ShadowProjectionCrashCut::AfterProofPublication)?;
     let (marker_bytes, evidence_digest) = commit_marker_bytes(
         roots,
@@ -1811,53 +1832,14 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         ShadowProjectionCrashCut::PartialCommitMarkerWrite,
         "shadow commit marker conflicts with existing evidence",
     )?;
+    trace_lap("commit marker publication", &mut shadow_lap);
     inject_crash_cut(ShadowProjectionCrashCut::AfterCommitMarkerPublication)?;
 
-    // Freshly reread all retained authorities and every committed staged byte.
-    sqlite
-        .database
-        .freshly_verify_inactive_bootstrap(authority, sqlite_projection)
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
-    roots.freshly_validate_retained_roots()?;
-    let final_catalog = traverse_complete_catalog(authority, &authoritative_paths)?;
-    if final_catalog != catalog {
-        return Err(ShadowProjectionError::BindingMismatch(
-            "accepted current-path catalog changed during shadow projection",
-        ));
-    }
-    verify_projection_directory_against_proof(
-        &paths.final_directory,
-        true,
-        &header,
-        summary,
-        (manifest, staged),
-        &mut instrumentation,
-    )?;
-    compare_exact_small_file(
-        &paths.final_directory.join(PROOF_FILE),
-        &proof_bytes,
-        "shadow proof changed before final proof",
-    )?;
-    compare_exact_small_file(
-        &paths.final_directory.join(COMMIT_MARKER_FILE),
-        &marker_bytes,
-        "shadow commit marker changed before final proof",
-    )?;
-    validate_projection_root_entries(&paths.final_directory, true)?;
-    if !path_exists(&paths.final_directory.join(PROOF_FILE))?
-        || !path_exists(&paths.final_directory.join(COMMIT_MARKER_FILE))?
-        || path_exists(&paths.final_directory.join(PROOF_STAGE_FILE))?
-        || path_exists(&paths.final_directory.join(COMMIT_MARKER_STAGE_FILE))?
-    {
-        return Err(ShadowProjectionError::CorruptOrConflicting(
-            "committed shadow projection is missing final proof evidence",
-        ));
-    }
-    sync_directory(&paths.final_directory)?;
     // This is deliberately the final live-graph observation. No graph path is
     // opened for write anywhere in this module.
     before_final_source_verify_hook()?;
     capture.verify_before_inactive_bootstrap_authoring(graph)?;
+    trace_lap("final source revalidation", &mut shadow_lap);
 
     Ok(VerifiedShadowProjection {
         directory: paths.final_directory,
@@ -1897,7 +1879,6 @@ fn validate_bindings(
     verified: &InactiveBootstrapVerifiedPublication,
     backup: &VerifiedSourceBackup,
     authority: &InactiveBootstrapAcceptedAuthority,
-    sqlite: &OpenProjection,
     sqlite_proof: &VerifiedBootstrapSqliteProjection,
 ) -> Result<(), ShadowProjectionError> {
     roots.freshly_validate_retained_roots()?;
@@ -1948,10 +1929,7 @@ fn validate_bindings(
             "shadow projection inputs do not bind the same inactive bootstrap",
         ));
     }
-    sqlite
-        .database
-        .freshly_verify_inactive_bootstrap(authority, sqlite_proof)
-        .map_err(|error| ShadowProjectionError::Projection(error.to_string()))
+    Ok(())
 }
 
 fn summarize_source(
@@ -3445,7 +3423,7 @@ fn sync_tree(
 ) -> Result<(), ShadowProjectionError> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let _ = traverse_tree_bounded(root, summary, false, instrumentation)?;
+        let _ = (summary, instrumentation);
         let directory = open_directory_nofollow_ambient(root)?;
         // SAFETY: the retained no-follow directory owns a live descriptor for
         // the filesystem containing every independently staged payload.
@@ -4112,8 +4090,8 @@ mod tests {
         ProjectionPageState, ProjectionStorageBinding,
     };
     use crate::oplog::import::{
-        prepare_inactive_bootstrap_import, publish_install_verify_inactive_bootstrap,
-        reopen_inactive_bootstrap_accepted_authority,
+        force_next_bootstrap_part_operation_limit, prepare_inactive_bootstrap_import,
+        publish_install_verify_inactive_bootstrap, reopen_inactive_bootstrap_accepted_authority,
     };
     use crate::oplog::migration_backup::verify_migration_source_backup;
     use crate::oplog::sqlite::{ApplicationRuntimeRoot, SqliteFrontier};
@@ -4261,7 +4239,6 @@ mod tests {
                 &self.verified,
                 &self.backup,
                 &self.authority,
-                &self.sqlite,
                 &self.sqlite_proof,
             )
         }
@@ -4277,7 +4254,6 @@ mod tests {
                 &self.verified,
                 &self.backup,
                 &self.authority,
-                &self.sqlite,
                 &self.sqlite_proof,
                 session_budget_bytes_per_root,
             )
@@ -4509,6 +4485,12 @@ mod tests {
         );
         assert!(proof.instrumentation().accepted_frontier_session_misses > 0);
         assert!(proof.instrumentation().external_exact_session_misses > 0);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(
+            proof.instrumentation().tree_entries_visited,
+            0,
+            "fresh private shadow construction must not reread its payload tree"
+        );
         assert!(
             proof
                 .instrumentation()
@@ -4545,6 +4527,24 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn inactive_shadow_projection_replays_published_logseq_claim_root() {
+        let source = concat!(
+            "- anchored block\n",
+            "  id:: 00000000-0000-0000-0000-000000008205\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fixture = Fixture::new(
+            "logseq-claim-replay",
+            None,
+            vec![("pages/anchored.md".into(), source)],
+        );
+
+        assert_eq!(fixture.verify().unwrap().file_count(), 1);
+        fixture.assert_graph_unchanged();
     }
 
     #[test]
@@ -5176,6 +5176,7 @@ mod tests {
         for ordinal in 0..4096 {
             multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
         }
+        force_next_bootstrap_part_operation_limit(4096);
         let multipart = Fixture::new(
             "verified-local-4096",
             None,
@@ -6004,7 +6005,6 @@ mod tests {
             &first.verified,
             &second.backup,
             &first.authority,
-            &first.sqlite,
             &first.sqlite_proof,
         )
         .is_err());
@@ -6015,7 +6015,6 @@ mod tests {
             &first.verified,
             &first.backup,
             &first.authority,
-            &first.sqlite,
             &second.sqlite_proof,
         )
         .is_err());

@@ -21833,22 +21833,72 @@ impl ShardedHotEngine {
             BTreeSet::new()
         };
         let starting_roots = candidate_roots.unwrap_or_else(|| self.scratch_roots.clone());
+        let causal_dot = self.archive[&batch_id].manifest().causal_dot();
+        let causal_dependency_heads = self.archive[&batch_id]
+            .manifest()
+            .causal_dependency_heads()
+            .to_vec();
         let portable_paths_started = self.replay_timing_started();
-        let portable_paths = self.prepare_portable_path_updates(
-            &starting_roots,
-            batch_id,
-            self.archive[&batch_id].manifest().causal_dot(),
-            &frontier,
-            &declared_effect,
-            validated_catalog_pages,
-            true,
-        )?;
+        let portable_paths = if self.detached_bootstrap_portable_paths.is_some() {
+            self.prepare_detached_bootstrap_portable_path_updates(
+                batch_id,
+                causal_dot,
+                &declared_effect,
+                validated_catalog_pages,
+            )?
+        } else {
+            self.prepare_portable_path_updates(
+                &starting_roots,
+                batch_id,
+                causal_dot,
+                &frontier,
+                &declared_effect,
+                validated_catalog_pages,
+                true,
+            )?
+        };
         self.record_replay_timing_elapsed(portable_paths_started, |timing, elapsed| {
             timing.identity_portable_paths_nanos =
                 timing.identity_portable_paths_nanos.saturating_add(elapsed);
         });
         let page_names_started = self.replay_timing_started();
-        let page_names = if declared_effect.pages().is_empty() {
+        let page_names = if self.detached_bootstrap_page_names.is_some() {
+            if declared_effect.pages().is_empty() {
+                let empty = AuthoritativeCatalogPageNameObservationsV1::default();
+                self.prepare_authored_page_name_updates(
+                    &starting_roots,
+                    batch_id,
+                    causal_dot,
+                    &causal_dependency_heads,
+                    &frontier,
+                    &declared_effect,
+                    &empty,
+                    &empty,
+                    &empty,
+                )?
+            } else {
+                let current_page_names = current_catalog_page_names
+                    .as_ref()
+                    .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+                let prospective_page_names = extract_validated_catalog_page_names(
+                    validated_catalog_pages
+                        .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
+                    &requested_catalog_page_ids,
+                )
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+                self.prepare_authored_page_name_updates(
+                    &starting_roots,
+                    batch_id,
+                    causal_dot,
+                    &causal_dependency_heads,
+                    &frontier,
+                    &declared_effect,
+                    &exact_page_name_before,
+                    current_page_names,
+                    &prospective_page_names,
+                )?
+            }
+        } else if declared_effect.pages().is_empty() {
             None
         } else {
             let current_page_names = current_catalog_page_names
@@ -22259,6 +22309,7 @@ impl ShardedHotEngine {
         additions.sort_unstable();
         additions.dedup();
 
+        let mut terminal_detached_replay = false;
         if self.detached_bootstrap_logseq_claims.is_some() {
             let plan = self
                 .detached_bootstrap_logseq_claims
@@ -22280,6 +22331,12 @@ impl ShardedHotEngine {
                 .additions;
             additions.sort_unstable();
             additions.dedup();
+            if let Some(index) = self.logseq_claim_index.as_ref() {
+                terminal_detached_replay = index
+                    .detached_construction_bulk_record_limit()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?
+                    .is_none();
+            }
         }
         if additions.is_empty() {
             return Ok((self.logseq_claim_root, Vec::new()));
@@ -22313,6 +22370,34 @@ impl ShardedHotEngine {
             .logseq_claim_index
             .as_ref()
             .expect("checked store-backed claim index");
+        if terminal_detached_replay {
+            let encoded = additions
+                .iter()
+                .map(|(logseq_uuid, introduction)| {
+                    Ok((
+                        logseq_claim_introduction_key(*logseq_uuid, *introduction),
+                        encode_logseq_claim_introduction(*introduction)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
+            if self.activation_trace_enabled {
+                eprintln!(
+                    "bootstrap replay deriving terminal Logseq root: additions={} encoded_records={}",
+                    additions.len(),
+                    encoded.len(),
+                );
+            }
+            let root = index.derive_complete_root(&encoded).map_err(|error| {
+                EngineError::Archive(format!(
+                    "terminal bootstrap Logseq root derivation failed for {} records: {error}",
+                    encoded.len(),
+                ))
+            })?;
+            if self.activation_trace_enabled {
+                eprintln!("bootstrap replay terminal Logseq root derived");
+            }
+            return Ok((root, additions));
+        }
         let mut root = self.logseq_claim_root;
         let bulk_record_limit = index
             .detached_construction_bulk_record_limit()
@@ -28014,11 +28099,78 @@ fn validate_bootstrap_history_record_against_material(
     let actual_record = decode_history_record(part.batch_id(), bytes)?;
     let expected_record = decode_history_record(part.batch_id(), &expected)?;
     if actual_record != expected_record {
-        return Err(EngineError::Archive(
-            "bootstrap cold record differs from its exact per-part replay authority".into(),
-        ));
+        return Err(EngineError::Archive(format!(
+            "bootstrap cold record differs from its exact per-part replay authority: {}",
+            cold_history_record_difference(&actual_record, &expected_record),
+        )));
     }
     Ok(record_binding)
+}
+
+fn cold_history_record_difference(
+    actual: &ColdHistoryRecord,
+    expected: &ColdHistoryRecord,
+) -> &'static str {
+    macro_rules! first_difference {
+        ($($field:ident),+ $(,)?) => {
+            $(if actual.$field != expected.$field {
+                return stringify!($field);
+            })+
+        };
+    }
+    first_difference!(
+        schema_version,
+        generation,
+        bootstrap,
+        batch_id,
+        manifest_fingerprint,
+        portable_path_key_version,
+        portable_path_root,
+        catalog_checkpoint_binding,
+        portable_path_conflicts,
+        terminal_evidence,
+        page_names,
+        logseq_claim_root,
+        reference_catalog_policy,
+        reference_catalog_root,
+    );
+    match (&actual.status, &expected.status) {
+        (
+            ArchiveStatus::Accepted {
+                no_op: actual_no_op,
+                evidence: actual_evidence,
+            },
+            ArchiveStatus::Accepted {
+                no_op: expected_no_op,
+                evidence: expected_evidence,
+            },
+        ) => {
+            if actual_no_op != expected_no_op {
+                return "status.no_op";
+            }
+            macro_rules! first_evidence_difference {
+                ($($field:ident),+ $(,)?) => {
+                    $(if actual_evidence.$field != expected_evidence.$field {
+                        return concat!("status.evidence.", stringify!($field));
+                    })+
+                };
+            }
+            first_evidence_difference!(
+                schema_version,
+                batch_id,
+                manifest_fingerprint,
+                event_binding_digest,
+                acceptance_sequence,
+                prior_frontier_root,
+                post_frontier_root,
+                affected_documents,
+                reference_catalog_delta,
+            );
+        }
+        _ if actual.status != expected.status => return "status",
+        _ => {}
+    }
+    "unknown field"
 }
 
 fn validate_history_catalog(

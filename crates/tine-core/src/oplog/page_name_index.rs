@@ -1888,15 +1888,7 @@ impl PageNameOwnershipStore {
         &self,
         creations: &BTreeMap<PageNameKeyDigest, DetachedBootstrapPageNameCreation>,
     ) -> Result<PageNameOwnershipRootV1, StoreError> {
-        if self.detached_publisher.is_none() {
-            return Err(StoreError::MalformedPageNameIndex);
-        }
-        let chunk_limit = self
-            .patricia
-            .detached_construction_bulk_record_limit()?
-            .ok_or(StoreError::MalformedPageNameIndex)?
-            .max(1)
-            .min(MAX_PAGE_NAME_POINT_BATCH);
+        let chunk_limit = self.patricia.detached_construction_bulk_record_limit()?;
         let mut root = PageNameOwnershipRootV1::empty();
         let mut encoded = BTreeMap::new();
         for (key, creation) in creations {
@@ -1918,7 +1910,9 @@ impl PageNameOwnershipStore {
                 None,
             )?;
             encoded.insert(key.as_bytes().to_vec(), encode_canonical(&record)?);
-            if encoded.len() == chunk_limit {
+            if chunk_limit
+                .is_some_and(|limit| encoded.len() == limit.max(1).min(MAX_PAGE_NAME_POINT_BATCH))
+            {
                 root.patricia_root = self.patricia.insert_many(root.patricia_root, &encoded)?;
                 root.entry_count = root
                     .entry_count
@@ -1928,7 +1922,11 @@ impl PageNameOwnershipStore {
             }
         }
         if !encoded.is_empty() {
-            root.patricia_root = self.patricia.insert_many(root.patricia_root, &encoded)?;
+            root.patricia_root = if chunk_limit.is_some() {
+                self.patricia.insert_many(root.patricia_root, &encoded)?
+            } else {
+                self.patricia.derive_complete_root(&encoded)?
+            };
             root.entry_count = root
                 .entry_count
                 .checked_add(encoded.len() as u64)
