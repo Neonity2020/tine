@@ -1446,10 +1446,23 @@ fn execute_manifested_projection_work_with_runtime(
         description,
         annotations,
     )?;
+    // Projecting one document costs ~95ms uniformly (F46), which is far too slow
+    // for ~1.2KB of bytes and points at durable-write barriers rather than work.
+    // This is the first of several durable receipt steps per document; time it to
+    // test that hypothesis instead of assuming it.
+    let intent_started = std::env::var_os("TINE_PHASE_TRACE")
+        .is_some()
+        .then(std::time::Instant::now);
     receipts.publish_intent(
         &local_attempt_intent,
         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
     )?;
+    if let Some(started) = intent_started {
+        eprintln!(
+            "PHASE TIME Projection.publish_intent {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
     if receipts.load_completion(&local_attempt_intent)?.is_some() {
         retire_completed_projection_recovery(graph, receipts, &local_attempt_intent)?;
         let authority = receipts.completed_work_authority(work, &local_attempt_intent)?;
