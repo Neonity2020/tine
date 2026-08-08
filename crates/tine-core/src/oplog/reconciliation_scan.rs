@@ -35,7 +35,25 @@ use std::time::{Duration, Instant};
 
 pub(crate) const GRAPH_TEXT_SCAN_READ_BUFFER_BYTES: usize = 64 * 1024;
 pub(crate) const GRAPH_TEXT_EXPECTED_PAGE_ROWS: usize = 256;
-pub(crate) const GRAPH_TEXT_EXPECTED_PAGE_BYTES: u64 = 1024 * 1024;
+/// Retained-memory grant for one expected-path page read.
+///
+/// This is NOT a page-size budget: measurement shows a page retains almost
+/// nothing (5,544 bytes across 3 rows). The grant is consumed almost entirely by
+/// the decode chain of a *single* row, so it must be sized to the worst-case
+/// single row, and page size is irrelevant to it.
+///
+/// Derivation. A row's canonical decode allocates
+/// `BOUNDED_CANONICAL_DECODE_ALLOCATION_FACTOR` (3x) the encoded object. On a
+/// real graph an object of ~214 KiB was observed, needing ~642 KB, on top of
+/// ~529 KB already reserved earlier in the same chain: ~1.17 MB for one row.
+/// The previous 1 MiB grant sat just under that floor, so every managed import
+/// of a real graph failed by ~12% -- while passing on small fixtures, where
+/// objects are far smaller.
+///
+/// 4 MiB gives roughly 3.4x the observed single-row requirement, i.e. headroom
+/// for an encoded object around 1.1 MiB rather than the 214 KiB seen here.
+/// Chosen from that derivation rather than by doubling until tests passed.
+pub(crate) const GRAPH_TEXT_EXPECTED_PAGE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SCAN_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCAN_EXPECTED_PATHS: usize = 1_000_000;
 const MAX_SCAN_EXACT_PATH_BYTES: usize = 4096;
@@ -1516,6 +1534,18 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                         .ok_or_else(|| bound_exceeded_at(1506))?,
                 )
                 .map_err(map_projection_expected_failure)?;
+        }
+        if std::env::var_os("TINE_BOUND_TRACE").is_some() {
+            // The three components of retained_bytes have never been observed
+            // separately, and one fix attempt already failed by guessing which
+            // dominates. Measure the split before touching any of them.
+            eprintln!(
+                "PAGE RETAINED SPLIT: rows={} semantic={semantic_retained_bytes} \
+                 output_capacity={output_capacity_bytes} aggregate_path={aggregate_path_bytes} \
+                 (grant={})",
+                semantic_rows.len(),
+                request.maximum_retained_bytes
+            );
         }
         let retained_bytes = semantic_retained_bytes
             .checked_add(output_capacity_bytes)
