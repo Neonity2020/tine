@@ -33,11 +33,12 @@ use super::object_store::{
 };
 use super::page_name_index::{
     extract_authenticated_catalog_page_names, extract_authoritative_catalog_page_names,
-    extract_validated_catalog_page_names, prepare_ephemeral_page_name_transition,
-    prepare_page_name_transition, AuthenticatedCatalogPageNameCheckpointV1,
-    AuthenticatedPageNameExactStateV1, AuthoritativeCatalogPageNameObservationsV1,
-    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1, PageNameOwnershipRootV1,
-    PageNameOwnershipStore, PageNamePublicationCandidateV1, PageNameTransitionError,
+    extract_validated_catalog_page_names, prepare_authored_page_name_transition,
+    prepare_ephemeral_page_name_transition, prepare_page_name_transition,
+    AuthenticatedCatalogPageNameCheckpointV1, AuthenticatedPageNameExactStateV1,
+    AuthoritativeCatalogPageNameObservationsV1, EphemeralPageNameOwnershipStateV1,
+    PageNameConflictEvidenceV1, PageNameOwnershipRootV1, PageNameOwnershipStore,
+    PageNamePublicationCandidateV1, PageNameTransitionError,
 };
 use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathIndexStore, PortablePathOccupied, PortablePathRecord,
@@ -408,6 +409,23 @@ struct CrdtUpdatePayload {
     raw_update: Vec<u8>,
 }
 
+trait DocumentUpdateDependencies {
+    fn dependency_heads(&self, document_id: DocumentId) -> Option<&[BatchId]>;
+}
+
+impl DocumentUpdateDependencies for BTreeMap<DocumentId, CrdtUpdatePayload> {
+    fn dependency_heads(&self, document_id: DocumentId) -> Option<&[BatchId]> {
+        self.get(&document_id)
+            .map(|update| update.dependency_heads.as_slice())
+    }
+}
+
+impl DocumentUpdateDependencies for BTreeMap<DocumentId, Vec<BatchId>> {
+    fn dependency_heads(&self, document_id: DocumentId) -> Option<&[BatchId]> {
+        self.get(&document_id).map(Vec::as_slice)
+    }
+}
+
 #[derive(Debug)]
 struct PendingAuthorDocuments {
     batch_id: BatchId,
@@ -421,8 +439,24 @@ struct PreparedTransactionParts {
     prepared: PreparedBatch,
     semantic_effect: SemanticEffect,
     prospective_documents: BTreeMap<DocumentId, LoroDoc>,
+    detached_bootstrap: Option<DetachedBootstrapAuthoredState>,
     portable_path_root: PortablePathIndexRoot,
     external_observation: Option<ExternalImportObservationMaterial>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionCapture {
+    None,
+    Projection,
+    DetachedBootstrap,
+}
+
+struct DetachedBootstrapAuthoredState {
+    documents: BTreeMap<DocumentId, EngineDocument>,
+    before_snapshots: BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    after_snapshots: BTreeMap<DocumentId, SemanticDocumentSnapshot>,
+    before_vectors: BTreeMap<DocumentId, VersionVector>,
+    dependency_heads: BTreeMap<DocumentId, Vec<BatchId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2735,7 +2769,12 @@ impl DetachedBootstrapAuthoringSession {
             let before_prepare =
                 trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
             let prepare_started = trace_enabled.then(std::time::Instant::now);
-            let prepared = candidate.prepare_bootstrap_transaction(author, transaction)?;
+            let PreparedTransactionParts {
+                prepared,
+                semantic_effect,
+                detached_bootstrap,
+                ..
+            } = candidate.prepare_detached_bootstrap_transaction(author, transaction)?;
             if trace_enabled {
                 let after_prepare = BootstrapAuthoringTraceSnapshot::new(&candidate);
                 eprintln!(
@@ -2754,8 +2793,12 @@ impl DetachedBootstrapAuthoringSession {
                 trace_enabled.then(|| BootstrapAuthoringTraceSnapshot::new(&candidate));
             let advance_started = trace_enabled.then(std::time::Instant::now);
             candidate.configure_detached_bootstrap_reference_catalog(evidence)?;
-            let (no_op, accepted_evidence) =
-                candidate.advance_detached_bootstrap_candidate(prepared.clone())?;
+            let (prepared, no_op, accepted_evidence) = candidate
+                .advance_authored_detached_bootstrap_candidate(
+                    prepared,
+                    detached_bootstrap.expect("detached preparation returns authored state"),
+                    semantic_effect,
+                )?;
             if trace_enabled {
                 let after_advance = BootstrapAuthoringTraceSnapshot::new(&candidate);
                 eprintln!(
@@ -11118,11 +11161,11 @@ impl ShardedHotEngine {
         Ok(evidence)
     }
 
-    fn prepare_acceptance_evidence(
+    fn prepare_acceptance_evidence<D: DocumentUpdateDependencies>(
         &self,
         batch_id: BatchId,
         precomputed_event_binding_digest: Option<ContentDigest>,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        updates: &D,
         replacements: &BTreeMap<DocumentId, EngineDocument>,
         replacement_heads: &BTreeMap<DocumentId, BTreeSet<BatchId>>,
         candidate_roots: &ScratchRoots,
@@ -11156,7 +11199,12 @@ impl ShardedHotEngine {
                     .map(|document| document.direct_dependency_heads().iter().copied().collect())
                     .unwrap_or_default()
             };
-            for dependency in &updates[document_id].dependency_heads {
+            let dependencies = updates.dependency_heads(*document_id).ok_or_else(|| {
+                EngineError::Archive(
+                    "accepted replacement has no update dependency metadata".into(),
+                )
+            })?;
+            for dependency in dependencies {
                 heads.remove(dependency);
             }
             heads.insert(batch_id);
@@ -13367,10 +13415,24 @@ impl ShardedHotEngine {
                 author,
                 super::BatchOrigin::BootstrapImport,
                 transaction,
-                false,
+                TransactionCapture::None,
                 None,
             )?
             .prepared)
+    }
+
+    fn prepare_detached_bootstrap_transaction(
+        &self,
+        author: AuthorBatch,
+        transaction: &OperationTransaction,
+    ) -> Result<PreparedTransactionParts, EngineError> {
+        self.prepare_transaction_core(
+            author,
+            super::BatchOrigin::BootstrapImport,
+            transaction,
+            TransactionCapture::DetachedBootstrap,
+            None,
+        )
     }
 
     fn configure_detached_bootstrap_reference_catalog(
@@ -13510,6 +13572,426 @@ impl ShardedHotEngine {
         self.detached_accepted_manifest_fingerprints
             .insert(batch_id, manifest_fingerprint);
         Ok((no_op, evidence))
+    }
+
+    fn advance_authored_detached_bootstrap_candidate(
+        &mut self,
+        prepared: PreparedBatch,
+        authored: DetachedBootstrapAuthoredState,
+        declared_effect: SemanticEffect,
+    ) -> Result<(PreparedBatch, bool, AcceptedBatchEvidence), EngineError> {
+        debug_assert!(self.archive_store.is_none());
+        debug_assert!(self.history_store.is_none());
+        debug_assert!(self.projection_work_index.is_none());
+        self.begin_point_operation();
+        self.advance_author_mutation_generation();
+        if let Some(error) = &self.history_failure {
+            return Err(error.clone());
+        }
+        self.reference_catalog
+            .ensure_ready()
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
+        let batch = ValidatedBatch::new(prepared);
+        self.check_batch_namespace(&batch)?;
+        if batch.manifest().origin() != BatchOrigin::BootstrapImport {
+            return Err(EngineError::InvalidTransaction(
+                "detached authored admission requires bootstrap-import origin".into(),
+            ));
+        }
+        let batch_id = batch.manifest().batch_id();
+        let manifest = batch.manifest().clone();
+        let manifest_fingerprint = batch_fingerprint_from_manifest(&manifest);
+        if self.cold_history_record(batch_id)?.is_some()
+            || self.archive_fingerprints.contains_key(&batch_id)
+        {
+            return Err(EngineError::BatchCollision(batch_id));
+        }
+
+        let store = Arc::clone(
+            self.scratch
+                .as_ref()
+                .expect("detached bootstrap engine owns scratch"),
+        );
+        let mut accumulated = BTreeMap::<CausalPeerId, u64>::new();
+        for parent in manifest.causal_dependency_heads() {
+            let record = super::causal_index::batch_record(&store, &self.scratch_roots, *parent)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+                .ok_or(EngineError::MissingDependency(*parent))?;
+            for (peer, counter) in record.clock() {
+                accumulated
+                    .entry(*peer)
+                    .and_modify(|current| *current = (*current).max(*counter))
+                    .or_insert(*counter);
+            }
+        }
+        let causal_roots = super::causal_index::insert_batch_accumulated(
+            &store,
+            &self.scratch_roots,
+            &manifest,
+            &accumulated.into_iter().collect::<Vec<_>>(),
+        )
+        .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        let event_binding_digest = AcceptedBatchEvidence::binding_digest_for(
+            batch_id,
+            manifest_fingerprint,
+            manifest.semantic_effect_digest(),
+            manifest.dependency_frontier(),
+            manifest.causal_dependency_heads(),
+        )?;
+        self.archive_fingerprints
+            .insert(batch_id, manifest_fingerprint);
+        self.archive.insert(batch_id, batch);
+        self.statuses.insert(batch_id, ArchiveStatus::Staged);
+
+        let evidence = self.apply_authored_detached_bootstrap(
+            batch_id,
+            event_binding_digest,
+            causal_roots,
+            authored,
+            &declared_effect,
+        )?;
+        let no_op = declared_effect.is_empty();
+        let final_status = ArchiveStatus::Accepted {
+            no_op,
+            evidence: evidence.clone(),
+        };
+        self.scratch_roots = super::dependency_queue::record_ordered_final(
+            &store,
+            &self.scratch_roots,
+            batch_id,
+            manifest_fingerprint,
+            event_binding_digest,
+            rejected_dependency_set_commitment(manifest.causal_dependency_heads()),
+            manifest.causal_dependency_heads().len(),
+            encode_archive_status(&final_status)?,
+            super::dependency_queue::FinalDependencyStatus::Satisfied,
+        )
+        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.statuses.remove(&batch_id);
+        self.archive_fingerprints.remove(&batch_id);
+        let prepared = self
+            .archive
+            .remove(&batch_id)
+            .expect("authored detached batch remains staged until finalization")
+            .into_prepared();
+        self.detached_accepted_manifests.insert(batch_id, manifest);
+        self.detached_accepted_manifest_fingerprints
+            .insert(batch_id, manifest_fingerprint);
+        Ok((prepared, no_op, evidence))
+    }
+
+    fn apply_authored_detached_bootstrap(
+        &mut self,
+        batch_id: BatchId,
+        event_binding_digest: ContentDigest,
+        causal_roots: ScratchRoots,
+        authored: DetachedBootstrapAuthoredState,
+        effect: &SemanticEffect,
+    ) -> Result<AcceptedBatchEvidence, EngineError> {
+        let DetachedBootstrapAuthoredState {
+            documents: mut replacements,
+            before_snapshots,
+            mut after_snapshots,
+            before_vectors,
+            dependency_heads,
+        } = authored;
+        let manifest = self.archive[&batch_id].manifest().clone();
+        let frontier = manifest.dependency_frontier();
+        if replacements
+            .keys()
+            .copied()
+            .ne(dependency_heads.keys().copied())
+            || replacements
+                .keys()
+                .copied()
+                .ne(before_vectors.keys().copied())
+        {
+            return Err(EngineError::Archive(
+                "authored bootstrap document metadata is incomplete".into(),
+            ));
+        }
+        let new_exact_shards = before_vectors
+            .iter()
+            .filter_map(|(document_id, vector)| {
+                (*document_id != self.catalog_document_id && vector.is_empty())
+                    .then_some(*document_id)
+            })
+            .collect::<BTreeSet<_>>();
+        let catalog_pages = after_snapshots
+            .values()
+            .find_map(|snapshot| match snapshot {
+                SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
+                SemanticDocumentSnapshot::Shard { .. } => None,
+            });
+        let validation_started = self.replay_timing_started();
+        self.validate_prospective_references(
+            &replacements,
+            effect,
+            &new_exact_shards,
+            catalog_pages,
+        )?;
+        self.record_replay_timing_elapsed(validation_started, |timing, elapsed| {
+            timing.identity_binding_nanos = timing.identity_binding_nanos.saturating_add(elapsed);
+        });
+
+        let portable_paths_started = self.replay_timing_started();
+        let portable_paths = self.prepare_portable_path_updates(
+            &causal_roots,
+            batch_id,
+            manifest.causal_dot(),
+            frontier,
+            effect,
+            catalog_pages,
+            true,
+        )?;
+        self.validate_manifested_portable_path_binding(
+            batch_id,
+            frontier,
+            &portable_paths,
+            !portable_paths.conflicts.is_empty(),
+        )?;
+        self.record_replay_timing_elapsed(portable_paths_started, |timing, elapsed| {
+            timing.identity_portable_paths_nanos =
+                timing.identity_portable_paths_nanos.saturating_add(elapsed);
+        });
+        let page_names_started = self.replay_timing_started();
+        let page_names = if effect.pages().is_empty() {
+            None
+        } else {
+            let requested_page_ids = effect
+                .pages()
+                .iter()
+                .map(|delta| delta.page_id)
+                .collect::<Vec<_>>();
+            let before_catalog = before_snapshots
+                .values()
+                .find_map(|snapshot| match snapshot {
+                    SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
+                    SemanticDocumentSnapshot::Shard { .. } => None,
+                })
+                .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+            let after_catalog =
+                catalog_pages.ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+            let exact_before =
+                extract_validated_catalog_page_names(before_catalog, &requested_page_ids)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+            let prospective =
+                extract_validated_catalog_page_names(after_catalog, &requested_page_ids)
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+            self.prepare_authored_page_name_updates(
+                &causal_roots,
+                batch_id,
+                manifest.causal_dot(),
+                manifest.causal_dependency_heads(),
+                frontier,
+                effect,
+                &exact_before,
+                &exact_before,
+                &prospective,
+            )?
+        };
+        self.record_replay_timing_elapsed(page_names_started, |timing, elapsed| {
+            timing.identity_page_names_nanos =
+                timing.identity_page_names_nanos.saturating_add(elapsed);
+        });
+        let identity_started = self.replay_timing_started();
+        let identity = self.validate_and_prepare_semantic_roles_and_block_homes(
+            &causal_roots,
+            batch_id,
+            manifest.causal_dot(),
+            &BTreeSet::new(),
+            effect,
+        )?;
+        self.record_replay_timing_elapsed(identity_started, |timing, elapsed| {
+            timing.identity_roles_nanos = timing.identity_roles_nanos.saturating_add(elapsed);
+        });
+        if identity.blocked
+            || !portable_paths.conflicts.is_empty()
+            || page_names
+                .as_ref()
+                .is_some_and(|candidate| !candidate.conflicts.is_empty())
+            || self.is_blocked()
+        {
+            return Err(EngineError::InvalidTransaction(
+                "authored bootstrap transition conflicts with existing graph identity".into(),
+            ));
+        }
+
+        let semantic_view_started = self.replay_timing_started();
+        let effective_view =
+            self.proposed_effective_semantic_view(batch_id, effect, page_names.as_ref())?;
+        effective_view.apply_to_snapshots(&mut after_snapshots)?;
+        self.record_replay_timing_elapsed(semantic_view_started, |timing, elapsed| {
+            timing.post_identity_conflict_terminal_nanos = timing
+                .post_identity_conflict_terminal_nanos
+                .saturating_add(elapsed);
+        });
+        let claims_started = self.replay_timing_started();
+        let logseq_claim_candidate = self.prepare_logseq_claim_updates(
+            batch_id,
+            manifest.causal_dot(),
+            effective_view.effect(),
+        )?;
+        let exact_current_documents = replacements.keys().copied().collect::<BTreeSet<_>>();
+        let validated_new_shards = ValidatedNewShardEffects::default();
+        let catalog_pages = after_snapshots
+            .values()
+            .find_map(|snapshot| match snapshot {
+                SemanticDocumentSnapshot::Catalog(pages) => Some(pages),
+                SemanticDocumentSnapshot::Shard { .. } => None,
+            });
+        let observations = ValidatedReferenceSourceObservations {
+            catalog_pages,
+            exact_current_documents: &exact_current_documents,
+            after_snapshots: &after_snapshots,
+            new_shards: &validated_new_shards,
+        };
+        let post_page_name_root = page_names
+            .as_ref()
+            .map(|candidate| candidate.root.clone())
+            .unwrap_or_else(|| self.page_name_root.clone());
+        let reference_catalog = self.prepare_reference_catalog_updates(
+            effective_view.effect(),
+            &replacements,
+            &observations,
+            &post_page_name_root,
+            logseq_claim_candidate.0,
+        )?;
+        self.record_replay_timing_elapsed(claims_started, |timing, elapsed| {
+            timing.claim_and_catalog_preparation_nanos = timing
+                .claim_and_catalog_preparation_nanos
+                .saturating_add(elapsed);
+        });
+
+        let replacement_heads = replacements
+            .keys()
+            .map(|document_id| (*document_id, BTreeSet::from([batch_id])))
+            .collect::<BTreeMap<_, _>>();
+        let checkpoint_started = self.replay_timing_started();
+        let candidate_roots = self.prepare_external_document_checkpoints(
+            &identity.scratch_roots,
+            batch_id,
+            &replacements,
+            &replacement_heads,
+            super::document_state::DocumentLane::Visible,
+        )?;
+        self.record_replay_timing_elapsed(checkpoint_started, |timing, elapsed| {
+            timing.exact_checkpoint_preparation_nanos = timing
+                .exact_checkpoint_preparation_nanos
+                .saturating_add(elapsed);
+        });
+        let acceptance_started = self.replay_timing_started();
+        let (post_documents, accepted_evidence, candidate_roots) = self
+            .prepare_acceptance_evidence(
+                batch_id,
+                Some(event_binding_digest),
+                &dependency_heads,
+                &replacements,
+                &replacement_heads,
+                &candidate_roots,
+                reference_catalog.delta(),
+            )?;
+        self.record_replay_timing_elapsed(acceptance_started, |timing, elapsed| {
+            timing.current_checkpoint_preparation_nanos = timing
+                .current_checkpoint_preparation_nanos
+                .saturating_add(elapsed);
+        });
+        let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
+            effective_view.effect(),
+            catalog_pages,
+            &post_page_name_root,
+            accepted_evidence.post_frontier_root.clone(),
+        )?;
+        let page_name_binding = self.page_name_durable_candidate(page_names.as_ref(), None)?;
+        let catalog_heads = if replacements.contains_key(&self.catalog_document_id) {
+            BTreeSet::from([batch_id])
+        } else {
+            self.visible_document_heads
+                .get(&self.catalog_document_id)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let catalog_binding =
+            self.catalog_checkpoint_binding_for(&candidate_roots, Some(&catalog_heads));
+        let mut binding =
+            self.durable_history_binding_with_page_names(catalog_binding, page_name_binding);
+        binding.portable_path_root = portable_paths.root.digest();
+        let fingerprint = self.archive_fingerprints[&batch_id];
+        let durable_history_started = self.replay_timing_started();
+        self.persist_durable_final_status_with_binding(
+            batch_id,
+            fingerprint,
+            ArchiveStatus::Accepted {
+                no_op: effect.is_empty(),
+                evidence: accepted_evidence.clone(),
+            },
+            binding,
+            logseq_claim_candidate.0,
+            reference_catalog.root().clone(),
+            reference_catalog.prepared_candidate(),
+        )?;
+        self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
+            timing.durable_history_nanos = timing.durable_history_nanos.saturating_add(elapsed);
+        });
+
+        self.commit_identity_publication(identity);
+        self.commit_logseq_claim_updates(logseq_claim_candidate);
+        self.commit_portable_path_updates(portable_paths);
+        self.commit_page_name_updates(page_names);
+        self.commit_reference_catalog_updates(reference_catalog);
+        self.commit_acceptance_evidence(post_documents, accepted_evidence.clone(), candidate_roots);
+        self.commit_current_path_catalog_transition(current_path_catalog_transition);
+
+        let non_catalog = replacements
+            .keys()
+            .copied()
+            .filter(|document_id| *document_id != self.catalog_document_id)
+            .collect::<Vec<_>>();
+        let keep_hot = (non_catalog.len() >= MAX_HOT_NON_CATALOG_DOCUMENTS).then(|| {
+            non_catalog
+                .into_iter()
+                .rev()
+                .take(MAX_HOT_NON_CATALOG_DOCUMENTS)
+                .collect::<BTreeSet<_>>()
+        });
+        if let Some(keep_hot) = keep_hot {
+            self.visible_documents.retain(|document_id, _| {
+                *document_id == self.catalog_document_id || keep_hot.contains(document_id)
+            });
+            self.visible_document_heads.retain(|document_id, _| {
+                *document_id == self.catalog_document_id || keep_hot.contains(document_id)
+            });
+            self.terminal_documents
+                .retain(|document_id, _| *document_id == self.catalog_document_id);
+            self.terminal_document_heads
+                .retain(|document_id, _| *document_id == self.catalog_document_id);
+            self.spare_documents
+                .borrow_mut()
+                .retain(|document_id, _| keep_hot.contains(document_id));
+            self.visible_document_lru.clear();
+            for (document_id, document) in replacements {
+                if document_id != self.catalog_document_id && !keep_hot.contains(&document_id) {
+                    continue;
+                }
+                self.visible_documents
+                    .insert(document_id, document.into_document());
+                self.visible_document_heads
+                    .insert(document_id, BTreeSet::from([batch_id]));
+                if document_id != self.catalog_document_id {
+                    self.visible_document_lru.push_back(document_id);
+                }
+            }
+        } else {
+            for (document_id, document) in std::mem::take(&mut replacements) {
+                self.visible_documents
+                    .insert(document_id, document.into_document());
+                self.visible_document_heads
+                    .insert(document_id, BTreeSet::from([batch_id]));
+                self.retain_hot_document(document_id);
+            }
+        }
+        self.remember_effective_semantic_view(batch_id, &effective_view);
+        Ok(accepted_evidence)
     }
 
     /// Draft one local mutation using identity minted by the live promoted
@@ -14510,8 +14992,13 @@ impl ShardedHotEngine {
         }
         let generation = self.history_generation;
         let mutation_token = self.author_mutation_generation();
-        let parts =
-            self.prepare_transaction_core(author, origin, transaction, true, observation)?;
+        let parts = self.prepare_transaction_core(
+            author,
+            origin,
+            transaction,
+            TransactionCapture::Projection,
+            observation,
+        )?;
         let affected_pages = affected_projection_pages(&parts.semantic_effect);
         let mut pages = BTreeMap::new();
         for page_id in affected_pages {
@@ -15521,7 +16008,7 @@ impl ShardedHotEngine {
         author: AuthorBatch,
         origin: super::BatchOrigin,
         transaction: &OperationTransaction,
-        capture_prospective_documents: bool,
+        capture: TransactionCapture,
         observation: Option<ExternalImportObservationMaterial>,
     ) -> Result<PreparedTransactionParts, EngineError> {
         self.begin_point_operation();
@@ -15559,33 +16046,37 @@ impl ShardedHotEngine {
                 ));
             }
         }
-        validate_logseq_identity_mutation_shape(transaction)?;
+        if capture != TransactionCapture::DetachedBootstrap {
+            validate_logseq_identity_mutation_shape(transaction)?;
+        }
 
-        let mut created_block_ids = BTreeSet::new();
-        let mut created_blocks = Vec::new();
-        for operation in &transaction.operations {
-            if let SemanticOperation::CreateBlock { block, .. } = operation {
-                let block_key = block.block_id.as_uuid().as_u128();
-                if !created_block_ids.insert(block_key) {
-                    return Err(EngineError::BlockAlreadyExists(block.block_id));
+        if capture != TransactionCapture::DetachedBootstrap {
+            let mut created_block_ids = BTreeSet::new();
+            let mut created_blocks = Vec::new();
+            for operation in &transaction.operations {
+                if let SemanticOperation::CreateBlock { block, .. } = operation {
+                    let block_key = block.block_id.as_uuid().as_u128();
+                    if !created_block_ids.insert(block_key) {
+                        return Err(EngineError::BlockAlreadyExists(block.block_id));
+                    }
+                    created_blocks.push(block.block_id);
                 }
-                created_blocks.push(block.block_id);
             }
-        }
-        for (block_key, claims) in self.block_home_claims_many(&created_blocks)? {
-            if !claims.is_empty() {
-                let block_id = BlockId::from_uuid(uuid::Uuid::from_u128(block_key));
-                return Err(EngineError::BlockAlreadyExists(block_id));
+            for (block_key, claims) in self.block_home_claims_many(&created_blocks)? {
+                if !claims.is_empty() {
+                    let block_id = BlockId::from_uuid(uuid::Uuid::from_u128(block_key));
+                    return Err(EngineError::BlockAlreadyExists(block_id));
+                }
             }
-        }
-        for block_id in &created_blocks {
-            if self
-                .local_overlay
-                .block_claims
-                .get(&block_id.as_uuid().as_u128())
-                .is_some_and(|claims| !claims.is_empty())
-            {
-                return Err(EngineError::BlockAlreadyExists(*block_id));
+            for block_id in &created_blocks {
+                if self
+                    .local_overlay
+                    .block_claims
+                    .get(&block_id.as_uuid().as_u128())
+                    .is_some_and(|claims| !claims.is_empty())
+                {
+                    return Err(EngineError::BlockAlreadyExists(*block_id));
+                }
             }
         }
 
@@ -15927,37 +16418,52 @@ impl ShardedHotEngine {
             )?;
         }
         let prepared = PreparedBatch::new(manifest, objects).map_err(EngineError::from)?;
-        let prospective_documents = if capture_prospective_documents {
-            working
-                .iter()
-                .map(|(document_id, document)| {
-                    clone_doc(document.document(), 1).map(|copy| (*document_id, copy))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?
-        } else {
-            BTreeMap::new()
-        };
-        if self.scratch.is_none() && !capture_prospective_documents {
-            *self.pending_author_documents.borrow_mut() = Some(PendingAuthorDocuments {
-                batch_id: author.batch_id,
-                manifest_fingerprint: prepared_manifest_fingerprint(&prepared),
-                generation: self.history_generation,
-                mutation_token: self.author_mutation_generation(),
-                documents: working
-                    .into_iter()
+        let (prospective_documents, detached_bootstrap) = match capture {
+            TransactionCapture::Projection => (
+                working
+                    .iter()
                     .map(|(document_id, document)| {
-                        let EngineDocument::InMemory(document) = document else {
-                            unreachable!("no-store authoring created an external document")
-                        };
-                        (document_id, document)
+                        clone_doc(document.document(), 1).map(|copy| (*document_id, copy))
                     })
-                    .collect(),
-            });
-        }
+                    .collect::<Result<BTreeMap<_, _>, _>>()?,
+                None,
+            ),
+            TransactionCapture::DetachedBootstrap => (
+                BTreeMap::new(),
+                Some(DetachedBootstrapAuthoredState {
+                    documents: working,
+                    before_snapshots,
+                    after_snapshots,
+                    before_vectors,
+                    dependency_heads: affected_heads,
+                }),
+            ),
+            TransactionCapture::None => {
+                if self.scratch.is_none() {
+                    *self.pending_author_documents.borrow_mut() = Some(PendingAuthorDocuments {
+                        batch_id: author.batch_id,
+                        manifest_fingerprint: prepared_manifest_fingerprint(&prepared),
+                        generation: self.history_generation,
+                        mutation_token: self.author_mutation_generation(),
+                        documents: working
+                            .into_iter()
+                            .map(|(document_id, document)| {
+                                let EngineDocument::InMemory(document) = document else {
+                                    unreachable!("no-store authoring created an external document")
+                                };
+                                (document_id, document)
+                            })
+                            .collect(),
+                    });
+                }
+                (BTreeMap::new(), None)
+            }
+        };
         Ok(PreparedTransactionParts {
             prepared,
             semantic_effect: effect,
             prospective_documents,
+            detached_bootstrap,
             portable_path_root,
             external_observation,
         })
@@ -16041,18 +16547,18 @@ impl ShardedHotEngine {
         binding
     }
 
-    fn prospective_catalog_heads(
+    fn prospective_catalog_heads<D: DocumentUpdateDependencies>(
         &self,
         batch_id: BatchId,
-        updates: &BTreeMap<DocumentId, CrdtUpdatePayload>,
+        updates: &D,
     ) -> BTreeSet<BatchId> {
         let mut heads = self
             .visible_document_heads
             .get(&self.catalog_document_id)
             .cloned()
             .unwrap_or_default();
-        if let Some(update) = updates.get(&self.catalog_document_id) {
-            heads.retain(|head| update.dependency_heads.binary_search(head).is_err());
+        if let Some(dependencies) = updates.dependency_heads(self.catalog_document_id) {
+            heads.retain(|head| dependencies.binary_search(head).is_err());
             heads.insert(batch_id);
         }
         heads
@@ -21719,6 +22225,86 @@ impl ShardedHotEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_authored_page_name_updates(
+        &self,
+        scratch_roots: &ScratchRoots,
+        batch_id: BatchId,
+        causal_dot: BatchCausalDot,
+        causal_dependency_heads: &[BatchId],
+        frontier: &FrontierV2,
+        effect: &SemanticEffect,
+        exact_before: &AuthoritativeCatalogPageNameObservationsV1,
+        current_pages: &AuthoritativeCatalogPageNameObservationsV1,
+        prospective_pages: &AuthoritativeCatalogPageNameObservationsV1,
+    ) -> Result<Option<PageNamePublicationCandidateV1>, EngineError> {
+        if effect.pages().is_empty() {
+            return Ok(None);
+        }
+        let candidate_clock = self
+            .scratch
+            .as_ref()
+            .map(|store| super::causal_index::batch_record(store, scratch_roots, batch_id))
+            .transpose()
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .flatten();
+        let candidate_clock = if let Some(record) = candidate_clock {
+            record.clock().to_vec()
+        } else {
+            self.derive_inline_causal_clock(scratch_roots, causal_dot, causal_dependency_heads)?
+        };
+        let contains = |dot: BatchCausalDot, introducing_batch: BatchId| {
+            candidate_clock
+                .binary_search_by_key(&dot.peer_id(), |(peer, _)| *peer)
+                .ok()
+                .is_some_and(|index| candidate_clock[index].1 >= dot.counter())
+                || introducing_batch == batch_id
+        };
+        let frontier_for_batch = |introducing_batch: BatchId| {
+            if introducing_batch == batch_id {
+                Some(frontier.clone())
+            } else {
+                self.load_observed_manifest(introducing_batch)
+                    .ok()
+                    .map(|manifest| manifest.dependency_frontier().clone())
+            }
+        };
+        let candidate = if let Some(index) = &self.page_name_index {
+            prepare_authored_page_name_transition(
+                index,
+                &self.page_name_root,
+                batch_id,
+                causal_dot,
+                frontier,
+                exact_before,
+                effect.pages(),
+                current_pages.entries(),
+                prospective_pages.entries(),
+                contains,
+                frontier_for_batch,
+            )
+        } else {
+            prepare_ephemeral_page_name_transition(
+                &self.ephemeral_page_names,
+                batch_id,
+                causal_dot,
+                frontier,
+                exact_before,
+                effect.pages(),
+                current_pages.entries(),
+                prospective_pages.entries(),
+                contains,
+                frontier_for_batch,
+            )
+        };
+        candidate.map(Some).map_err(|error| match error {
+            PageNameTransitionError::Store(error) => EngineError::Archive(error.to_string()),
+            PageNameTransitionError::MalformedBatch(reason) => {
+                EngineError::InvalidTransaction(reason.into())
+            }
+        })
+    }
+
     fn commit_page_name_updates(&mut self, candidate: Option<PageNamePublicationCandidateV1>) {
         let Some(candidate) = candidate else {
             return;
@@ -25146,20 +25732,6 @@ impl ShardedHotEngine {
         working: &BTreeMap<DocumentId, EngineDocument>,
         read_only_catalog: &mut AuthorCatalogLookup,
     ) -> Result<(), EngineError> {
-        let mut content_blocks = BTreeSet::new();
-        for operation in &transaction.operations {
-            if let SemanticOperation::RenamePagesAndRewriteReferrers { block_rewrites, .. } =
-                operation
-            {
-                content_blocks.extend(
-                    block_rewrites
-                        .iter()
-                        .map(|rewrite| (rewrite.block.home_document_id, rewrite.block.block_id)),
-                );
-            } else if let Some(block) = operation_content_block(operation) {
-                content_blocks.insert((block.home_document_id, block.block_id));
-            }
-        }
         let has_typed_trigger = transaction.operations.iter().any(|operation| {
             matches!(
                 operation,
@@ -25176,7 +25748,20 @@ impl ShardedHotEngine {
         if !has_typed_trigger {
             return Ok(());
         }
-
+        let mut content_blocks = BTreeSet::new();
+        for operation in &transaction.operations {
+            if let SemanticOperation::RenamePagesAndRewriteReferrers { block_rewrites, .. } =
+                operation
+            {
+                content_blocks.extend(
+                    block_rewrites
+                        .iter()
+                        .map(|rewrite| (rewrite.block.home_document_id, rewrite.block.block_id)),
+                );
+            } else if let Some(block) = operation_content_block(operation) {
+                content_blocks.insert((block.home_document_id, block.block_id));
+            }
+        }
         let catalog = if let Some(catalog) = working.get(&self.catalog_document_id) {
             catalog.document()
         } else {
@@ -26895,14 +27480,16 @@ fn validate_bootstrap_history_record_against_material(
 ) -> Result<super::object_store::EngineHistoryBinding, EngineError> {
     let record_binding = validate_bootstrap_history_record(part, bytes, binding)?;
     let mut expected_material = material.clone();
-    // Scratch checkpoint page references are freshly allocated on replay.
-    // The retained checkpoint binding remains authenticated by the exact
-    // verified history root; every replay-stable field is derived from this
-    // descriptor's material before the next descriptor is admitted.
+    // Scratch checkpoint and accepted-frontier page references are freshly
+    // allocated on replay. The catalog binding is normalized explicitly;
+    // `AcceptedFrontierRoot` equality already excludes its run-local scratch
+    // address while comparing every authenticated identity field.
     expected_material.history_binding.catalog_checkpoint_binding =
         record_binding.catalog_checkpoint_binding;
     let expected = expected_material.encode_history_record(part, binding)?;
-    if bytes != expected {
+    let actual_record = decode_history_record(part.batch_id(), bytes)?;
+    let expected_record = decode_history_record(part.batch_id(), &expected)?;
+    if actual_record != expected_record {
         return Err(EngineError::Archive(
             "bootstrap cold record differs from its exact per-part replay authority".into(),
         ));

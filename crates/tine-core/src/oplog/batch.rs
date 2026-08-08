@@ -227,6 +227,10 @@ impl ValidatedBatch {
     pub fn objects(&self) -> &[OperationObject] {
         self.0.objects()
     }
+
+    pub(crate) fn into_prepared(self) -> PreparedBatch {
+        self.0
+    }
 }
 
 #[cfg(test)]

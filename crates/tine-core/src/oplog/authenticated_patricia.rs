@@ -361,7 +361,7 @@ impl PatriciaIndexStore {
                 construction.set_live_roots([root]);
                 let next = self
                     .storage
-                    .construction_insert_many(construction, root, records)
+                    .construction_insert_many_bulk(construction, root, records)
                     .map_err(map_storage_error)?;
                 construction.set_live_roots([next]);
                 construction.checkpoint([next]);

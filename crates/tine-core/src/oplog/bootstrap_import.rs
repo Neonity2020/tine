@@ -801,10 +801,7 @@ impl BootstrapPartitionProfileV1 {
         }
     }
 
-    /// Current authoring profile. V3 retains terminal reference construction
-    /// and replaces redundant small count limits with the actual encoded-byte,
-    /// document, and transaction resource boundaries.
-    pub(crate) fn current() -> Self {
+    fn v3() -> Self {
         let current_constants = profile_digest_from_constants(PROFILE_CONSTANTS_CURRENT);
         Self {
             digest: BootstrapProfileDigestV1::digest(
@@ -818,6 +815,21 @@ impl BootstrapPartitionProfileV1 {
         }
     }
 
+    /// Current authoring profile. V4 keeps each page declaration with its
+    /// content capsule. This avoids publishing and immediately reopening an
+    /// empty home document while retaining every V3 resource boundary.
+    pub(crate) fn current() -> Self {
+        Self {
+            digest: BootstrapProfileDigestV1::digest(
+                b"tine/bootstrap-import/partition-profile/v4\0",
+                &[
+                    Self::v3().digest.as_bytes(),
+                    b"page-capsule-declarations/v1",
+                ],
+            ),
+        }
+    }
+
     pub(crate) const fn digest(self) -> BootstrapProfileDigestV1 {
         self.digest
     }
@@ -826,12 +838,15 @@ impl BootstrapPartitionProfileV1 {
         digest: BootstrapProfileDigestV1,
     ) -> Result<bool, BootstrapImportError> {
         Self::validate_digest(digest)?;
-        Ok(digest == Self::v2().digest || digest == Self::current().digest)
+        Ok(digest == Self::v2().digest
+            || digest == Self::v3().digest
+            || digest == Self::current().digest)
     }
 
     fn validate_digest(digest: BootstrapProfileDigestV1) -> Result<(), BootstrapImportError> {
         if digest != Self::v1().digest
             && digest != Self::v2().digest
+            && digest != Self::v3().digest
             && digest != Self::current().digest
         {
             return Err(BootstrapImportError::ProfileMismatch);

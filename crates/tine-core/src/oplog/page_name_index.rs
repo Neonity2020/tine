@@ -1090,6 +1090,49 @@ pub(crate) fn prepare_page_name_transition(
     })
 }
 
+/// Persistent transition for a private construction that already owns the
+/// exact prior catalog state. Unlike received-batch admission, bootstrap
+/// authoring does not need to re-open and re-authenticate its own immediately
+/// preceding checkpoint before updating the derived ownership index.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_authored_page_name_transition(
+    store: &PageNameOwnershipStore,
+    root: &PageNameOwnershipRootV1,
+    batch_id: BatchId,
+    causal_dot: BatchCausalDot,
+    declared_frontier: &FrontierV2,
+    exact_before: &AuthoritativeCatalogPageNameObservationsV1,
+    deltas: &[PageDelta],
+    current_pages: &BTreeMap<PageId, Option<PageState>>,
+    prospective_pages: &BTreeMap<PageId, Option<PageState>>,
+    contains: impl Fn(BatchCausalDot, BatchId) -> bool,
+    frontier_for_batch: impl Fn(BatchId) -> Option<FrontierV2>,
+) -> Result<PageNamePublicationCandidateV1, PageNameTransitionError> {
+    let access = PersistentPageNameTransitionAccess { store, root };
+    let candidate = prepare_page_name_transition_core(
+        &access,
+        batch_id,
+        causal_dot,
+        declared_frontier,
+        &exact_before.entries,
+        deltas,
+        current_pages,
+        prospective_pages,
+        contains,
+        frontier_for_batch,
+    )?;
+    let next_root = if candidate.conflicts.is_empty() {
+        store.insert_many(root, &candidate.changed)?
+    } else {
+        root.clone()
+    };
+    Ok(PageNamePublicationCandidateV1 {
+        root: next_root,
+        conflicts: candidate.conflicts,
+        ephemeral: None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_ephemeral_page_name_transition(
     state: &EphemeralPageNameOwnershipStateV1,

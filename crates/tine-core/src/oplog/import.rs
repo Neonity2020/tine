@@ -2499,12 +2499,10 @@ fn spool_bootstrap_operations(
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
     let authoritative_paths = bootstrap_authoritative_source_paths(capture)?;
-    let page_path = working.join("phase-page.sorted");
     let content_path = working.join("phase-content.sorted");
     let capsule_path = working.join("phase-capsule.sorted");
     let identity_candidates_path = working.join("identity-candidates.sorted");
     let identity_path = working.join("phase-identity.sorted");
-    let mut page_sort = ExternalSort::new(working, "phase-page")?;
     let mut content_sort = ExternalSort::new(working, "phase-content")?;
     let mut identity_candidates = ExternalSort::new(working, "identity-candidates")?;
     let mut source_reader = BootstrapSourceReader::new(capture)?;
@@ -2569,8 +2567,8 @@ fn spool_bootstrap_operations(
             source_leaf,
             full_span,
         )?;
-        page_sort.push(
-            entry.path().as_str().as_bytes().to_vec(),
+        content_sort.push(
+            page_capsule_sort_key(entry.path(), 0),
             page_operation.encode()?,
         )?;
         operation_count = checked_bootstrap_operation_count(operation_count)?;
@@ -2595,7 +2593,7 @@ fn spool_bootstrap_operations(
                 source_leaf,
                 full_span,
             )?;
-            content_sort.push(page_capsule_sort_key(entry.path(), 0), preamble.encode()?)?;
+            content_sort.push(page_capsule_sort_key(entry.path(), 1), preamble.encode()?)?;
             operation_count = checked_bootstrap_operation_count(operation_count)?;
         }
         let mut node_ids = Vec::with_capacity(tree.nodes.len());
@@ -2628,7 +2626,7 @@ fn spool_bootstrap_operations(
                 source_leaf,
                 span,
             )?;
-            let block_sequence = 1_u64.saturating_add((index as u64).saturating_mul(2));
+            let block_sequence = 2_u64.saturating_add((index as u64).saturating_mul(2));
             content_sort.push(
                 page_capsule_sort_key(entry.path(), block_sequence),
                 operation.encode()?,
@@ -2667,7 +2665,6 @@ fn spool_bootstrap_operations(
     source_reader.finish()?;
 
     for (sort, destination) in [
-        (page_sort, &page_path),
         (content_sort, &content_path),
         (identity_candidates, &identity_candidates_path),
     ] {
@@ -2691,10 +2688,8 @@ fn spool_bootstrap_operations(
 
     let operation_path = working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
     let mut output = BufWriter::new(create_new_file(&operation_path)?);
-    for phase in [&page_path, &capsule_path] {
-        let mut input = File::open(phase)?;
-        io::copy(&mut input, &mut output)?;
-    }
+    let mut input = File::open(&capsule_path)?;
+    io::copy(&mut input, &mut output)?;
     output.flush()?;
     instrumentation.operations = operation_count;
     instrumentation.operation_spool_bytes = instrumentation
@@ -2847,7 +2842,8 @@ fn partition_bootstrap_operation_spool(
         operations: u32,
         semantic_bytes: u64,
         spans: u32,
-        declarations: bool,
+        declarations: u32,
+        has_content: bool,
         split_continuation: bool,
     }
 
@@ -2870,13 +2866,9 @@ fn partition_bootstrap_operation_spool(
                 "semantic-effect bytes",
             ));
         }
-        let declarations = observed_operations < operations.declaration_count;
+        let declaration = matches!(operation.operation, SemanticOperation::CreatePage { .. });
         let source_span = operation.source_span()?;
-        let same_capsule = current.is_some_and(|unit| {
-            unit.declarations == declarations
-                && !declarations
-                && unit.source_leaf == operation.source_leaf
-        });
+        let same_capsule = current.is_some_and(|unit| unit.source_leaf == operation.source_leaf);
         if !same_capsule {
             if let Some(mut unit) = current.take() {
                 unit.spans = current_spans.len() as u32;
@@ -2888,7 +2880,8 @@ fn partition_bootstrap_operation_spool(
                 operations: 0,
                 semantic_bytes: 0,
                 spans: 0,
-                declarations,
+                declarations: 0,
+                has_content: false,
                 split_continuation: false,
             });
         }
@@ -2914,13 +2907,19 @@ fn partition_bootstrap_operation_spool(
                 operations: 0,
                 semantic_bytes: 0,
                 spans: 0,
-                declarations,
+                declarations: 0,
+                has_content: false,
                 split_continuation: true,
             });
         }
         let unit = current.as_mut().expect("partition unit exists");
         unit.operations += 1;
         unit.semantic_bytes += partition_bytes;
+        if declaration {
+            unit.declarations += 1;
+        } else {
+            unit.has_content = true;
+        }
         if let Some(span) = source_span {
             current_spans.insert(span);
         }
@@ -2938,13 +2937,11 @@ fn partition_bootstrap_operation_spool(
     let mut part_semantic_bytes = 0_u64;
     let mut part_spans = 0_u32;
     let mut part_documents = BTreeSet::new();
-    let mut part_declarations = None;
     let flush = |writer: &mut BufWriter<File>,
                  part_operations: &mut u32,
                  part_semantic_bytes: &mut u64,
                  part_spans: &mut u32,
                  part_documents: &mut BTreeSet<SourceLeafDigestV1>,
-                 part_declarations: &mut Option<bool>,
                  part_count: &mut u32,
                  instrumentation: &mut BootstrapStreamingImportInstrumentation|
      -> Result<(), BootstrapStreamingImportError> {
@@ -2969,22 +2966,15 @@ fn partition_bootstrap_operation_spool(
         *part_semantic_bytes = 0;
         *part_spans = 0;
         part_documents.clear();
-        *part_declarations = None;
         Ok(())
     };
     for unit in units {
-        let changes_phase = part_declarations.is_some_and(|phase| phase != unit.declarations);
         let adds_document = !part_documents.contains(&unit.source_leaf);
-        let exceeds = changes_phase
-            || part_operations.saturating_add(unit.operations) > max_part_operations
+        let exceeds = part_operations.saturating_add(unit.operations) > max_part_operations
             || part_semantic_bytes.saturating_add(unit.semantic_bytes)
                 > MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART
             || part_spans.saturating_add(unit.spans) > MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART
-            || (unit.declarations
-                && adds_document
-                && part_documents.len() as u32 == MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART)
-            || (!unit.declarations
-                && adds_document
+            || (adds_document
                 && part_documents.len() as u32 == MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART);
         if exceeds {
             flush(
@@ -2993,19 +2983,18 @@ fn partition_bootstrap_operation_spool(
                 &mut part_semantic_bytes,
                 &mut part_spans,
                 &mut part_documents,
-                &mut part_declarations,
                 &mut part_count,
                 instrumentation,
             )?;
         }
-        part_declarations = Some(unit.declarations);
         part_operations += unit.operations;
         part_semantic_bytes += unit.semantic_bytes;
         part_spans += unit.spans;
         part_documents.insert(unit.source_leaf);
-        if unit.declarations {
-            instrumentation.page_declarations = instrumentation.page_declarations.saturating_add(1);
-        } else if !unit.split_continuation {
+        instrumentation.page_declarations = instrumentation
+            .page_declarations
+            .saturating_add(u64::from(unit.declarations));
+        if unit.has_content && !unit.split_continuation {
             instrumentation.page_capsules = instrumentation.page_capsules.saturating_add(1);
         }
     }
@@ -3015,7 +3004,6 @@ fn partition_bootstrap_operation_spool(
         &mut part_semantic_bytes,
         &mut part_spans,
         &mut part_documents,
-        &mut part_declarations,
         &mut part_count,
         instrumentation,
     )?;
@@ -10706,9 +10694,10 @@ mod tests {
         let (_root, prepared, _) = prepare_streaming_bootstrap("authoring-linear-1000", &files);
 
         assert_eq!(prepared.instrumentation().page_capsules, PAGE_COUNT as u64);
-        assert!(
-            prepared.instrumentation().parts > 1,
-            "the structural fixture must exercise cross-part authoring"
+        assert_eq!(
+            prepared.instrumentation().parts,
+            1,
+            "an ordinary graph within every declared resource bound must be authored in one pass"
         );
         assert_eq!(
             prepared.aggregate().parts().len(),
@@ -10748,9 +10737,8 @@ mod tests {
         assert_eq!(work.reference_catalog_fact_updates, PAGE_COUNT);
         assert_eq!(work.reference_catalog_persistent_node_reads, 0);
         assert_eq!(
-            work.authenticated_page_identity_lookups,
-            PAGE_COUNT * 3,
-            "author page-home resolution, prospective-reference validation, and reference-source preparation must each use one bounded authenticated point per page"
+            work.authenticated_page_identity_lookups, 0,
+            "page-capsule authoring must use its prospective catalog rather than reopen page identity per page"
         );
         let io = prepared.candidate().accepted_engine().instrumentation();
         eprintln!(
@@ -11039,11 +11027,11 @@ mod tests {
         let materialized =
             ImportId::derive(workspace, &[], &inventory, DIFF_SCHEMA_VERSION).unwrap();
         assert_eq!(prepared.aggregate().import_id(), materialized);
-        assert_eq!(prepared.aggregate().parts().len(), 2);
+        assert_eq!(prepared.aggregate().parts().len(), 1);
         assert_eq!(prepared.instrumentation().operations, 4);
 
         let mut operation_count = 0_u32;
-        for ordinal in 0..2 {
+        for ordinal in 0..prepared.aggregate().parts().len() as u32 {
             let mut part = prepared.open_part(ordinal).unwrap();
             let evidence = part.evidence().unwrap();
             operation_count += evidence.operation_root().operation_count();
@@ -11211,8 +11199,14 @@ mod tests {
             let mut source_leaf = [0_u8; 32];
             source_leaf[..8].copy_from_slice(&index.to_be_bytes());
             let record = BootstrapOperationRecord::new(
-                SemanticOperation::DeletePage {
+                SemanticOperation::CreatePage {
                     page_id: PageId::from_uuid(Uuid::from_u128(index as u128 + 1)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(
+                        declaration_count as u128 + index as u128 + 1,
+                    )),
+                    name: LogicalPageName::parse(&format!("Declaration {index}")).unwrap(),
+                    path: ManagedPath::parse(&format!("pages/declaration-{index}.md")).unwrap(),
+                    kind: ManagedTextKind::Page,
                 },
                 SourceLeafDigestV1::from_bytes(source_leaf),
                 None,
@@ -11315,11 +11309,27 @@ mod tests {
         fs::create_dir(&working).unwrap();
         let spool = synthetic_operation_spool(&working, 100_001);
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+        let part_count =
+            partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation).unwrap();
+        assert!(part_count > 1);
+        assert_eq!(instrumentation.parts, part_count);
+        let mut boundaries = FrameReader::open(
+            &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
+            std::mem::size_of::<u32>(),
+        )
+        .unwrap();
+        let mut observed = Vec::new();
+        while let Some(boundary) = boundaries.next().unwrap() {
+            observed.push(u32::from_be_bytes(boundary.try_into().unwrap()));
+        }
+        assert_eq!(observed.len(), part_count as usize);
         assert_eq!(
-            partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation).unwrap(),
-            25
+            observed.iter().map(|count| u64::from(*count)).sum::<u64>(),
+            100_001
         );
-        assert_eq!(instrumentation.parts, 25);
+        assert!(observed
+            .iter()
+            .all(|count| *count > 0 && *count <= MAX_OPERATIONS_PER_BOOTSTRAP_PART));
         assert_eq!(instrumentation.peak_owned_part_operations, 0);
         assert!(instrumentation.source_spans <= 100_001);
     }
@@ -11575,8 +11585,8 @@ mod tests {
                     .operation_root()
                     .operation_count())
                     .collect::<Vec<_>>(),
-                vec![1, block_count],
-                "the declaration phase remains separate, but the retired 4,096-operation cap must not split content"
+                vec![block_count + 1],
+                "a page declaration and its content must remain one capsule below the active resource bounds"
             );
         }
     }
@@ -11832,7 +11842,7 @@ mod tests {
                 &mut partition_instrumentation,
             )
             .unwrap(),
-            2
+            1
         );
         let mut boundaries = FrameReader::open(
             &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
@@ -11843,7 +11853,7 @@ mod tests {
         while let Some(boundary) = boundaries.next().unwrap() {
             operation_boundaries.push(u32::from_be_bytes(boundary.try_into().unwrap()));
         }
-        assert_eq!(operation_boundaries.len(), 2);
+        assert_eq!(operation_boundaries.len(), 1);
         assert_eq!(
             operation_boundaries.iter().sum::<u32>(),
             streaming.operation_count as u32
@@ -12241,21 +12251,37 @@ mod tests {
             ],
         );
         assert!(prepared.aggregate().parts().len() > 2);
-        let mut second_part = prepared.open_part(1).unwrap();
-        let mut second_effect = None;
-        while let Some(bytes) = second_part.next_object_bytes().unwrap() {
-            let object = OperationObject::decode(&bytes).unwrap();
-            if object.kind() == ObjectKind::SemanticEffect {
-                second_effect = Some(SemanticEffect::decode(object.payload()).unwrap());
+        let mut page_transitions = Vec::new();
+        for ordinal in 0..prepared.aggregate().parts().len() {
+            let mut part = prepared.open_part(ordinal as u32).unwrap();
+            while let Some(bytes) = part.next_object_bytes().unwrap() {
+                let object = OperationObject::decode(&bytes).unwrap();
+                if object.kind() != ObjectKind::SemanticEffect {
+                    continue;
+                }
+                let effect = SemanticEffect::decode(object.payload()).unwrap();
+                for delta in effect.pages() {
+                    let page = delta.after.as_ref().unwrap();
+                    page_transitions.push((
+                        ordinal,
+                        page.path().unwrap().as_str().to_owned(),
+                        page.name().as_str().to_owned(),
+                    ));
+                }
             }
         }
-        let second_effect = second_effect.unwrap();
-        assert_eq!(second_effect.pages().len(), 1);
-        let second_page = second_effect.pages()[0].after.as_ref().unwrap();
-        assert_eq!(second_page.path().unwrap().as_str(), "pages/z-second.md");
-        assert_eq!(second_page.name().as_str(), "Second Authority");
-        let first_material = &prepared.engine_materials[0];
-        let second_material = &prepared.engine_materials[1];
+        assert_eq!(
+            page_transitions
+                .iter()
+                .map(|(_, path, name)| (path.as_str(), name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("pages/a-first.md", "First Authority"),
+                ("pages/z-second.md", "Second Authority"),
+            ]
+        );
+        let first_material = &prepared.engine_materials[page_transitions[0].0];
+        let second_material = &prepared.engine_materials[page_transitions[1].0];
         assert_ne!(
             first_material.reference_catalog_root(),
             second_material.reference_catalog_root()
@@ -12281,8 +12307,9 @@ mod tests {
                     > 1
             })
             .collect::<Vec<_>>();
-        assert_eq!(matches.len(), 1);
-        matches.pop().unwrap()
+        assert!(!matches.is_empty());
+        matches.sort_unstable_by_key(|path| fs::metadata(path).unwrap().len());
+        matches.remove(0)
     }
 
     fn assert_materialized_snapshot_matches(
@@ -13420,6 +13447,7 @@ mod tests {
             .iter()
             .map(|(path, contents)| (path.as_str(), contents.as_str()))
             .collect::<Vec<_>>();
+        force_next_bootstrap_part_operation_limit(128);
         let (multi_root, multi, workspace) =
             prepare_streaming_bootstrap("orchestration-multipart", &files);
         assert_eq!(multi.instrumentation().page_capsules, 65);
