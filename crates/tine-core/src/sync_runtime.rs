@@ -9856,8 +9856,29 @@ impl RuntimeActor {
         {
             return self.tick_provider();
         }
+        // F38: 168 of 169 ticks of a converging import return Recovering with
+        // watcher_pending=false, so the external-feed branch above is skipped and
+        // the cost is in one of the remaining branches. Attribute by branch
+        // rather than by tagging the Recovering variant -- the variant is matched
+        // in many places and labelling it there does not survive editing (F39).
+        let derivative_started = std::env::var_os("TINE_TICK_TRACE")
+            .is_some()
+            .then(std::time::Instant::now);
         if let Some(tick) = self.tick_managed_local_derivative() {
+            if let Some(started) = derivative_started {
+                eprintln!(
+                    "  BRANCH managed_local_derivative {:.1}ms -> {:?}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    std::mem::discriminant(&tick),
+                );
+            }
             return tick;
+        }
+        if let Some(started) = derivative_started {
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            if elapsed > 1.0 {
+                eprintln!("  BRANCH managed_local_derivative {elapsed:.1}ms -> None (fell through)");
+            }
         }
         if self.shared_phase == Some(SyncSharedPhase::Active) && self.provider_has_work() {
             return self.tick_provider();
@@ -9871,7 +9892,20 @@ impl RuntimeActor {
             }
             return self.tick_provider();
         }
+        // NOTE: reached even when `last_watcher.pending` is false -- the early
+        // branch above is skipped but this fall-through calls the feed anyway.
+        // F38 showed 168 of 169 ticks returning Recovering with pending=false,
+        // and the earlier branches measured silent, so this is where it goes.
+        let feed_started = std::env::var_os("TINE_TICK_TRACE")
+            .is_some()
+            .then(std::time::Instant::now);
         let tick = self.tick_external_feed();
+        if let Some(started) = feed_started {
+            eprintln!(
+                "  BRANCH tick_external_feed(fallthrough) {:.1}ms",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         if self.provider_accepted_manifest_revalidation_after_external_tick {
             self.provider_accepted_manifest_revalidation_after_external_tick = false;
             self.provider_accepted_manifest_revalidation_ready = true;
