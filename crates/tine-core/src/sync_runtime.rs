@@ -21699,6 +21699,15 @@ mod tests {
             None => println!("REOPEN STAGES: none emitted (no recovery diagnostics on this open)"),
         }
 
+        if std::env::var_os("TINE_PROBE_KEEP").is_some() {
+            // Retain the fixture so its baseline scan.sqlite can be inspected
+            // AFTER a converging import. Every previous look at that database
+            // was mid-activation, which is exactly why the `head` table read
+            // zero rows and left F7's "production only reads head" conclusion
+            // unverified.
+            println!("PROBE FIXTURE RETAINED: {}", fixture.graph_root().display());
+            std::mem::forget(fixture);
+        }
         println!(
             "REAL-GRAPH MANAGED PROBE: activation={:.1}ms initial_feed={:.1}ms \
              ({blocked_ticks} blocked ticks) clean_reopen={:.1}ms recovery={:?}",
