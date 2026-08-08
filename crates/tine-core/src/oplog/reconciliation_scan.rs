@@ -759,6 +759,16 @@ impl fmt::Display for ExpectedPathSourceFailure {
     }
 }
 
+/// Temporary diagnostic: `BoundExceeded` is raised from ~30 sites and the
+/// message is identical at every one, so a failing scan cannot be attributed.
+/// Set `TINE_BOUND_TRACE=1` to learn which bound actually tripped.
+fn bound_exceeded_at(line: u32) -> ExpectedPathSourceFailure {
+    if std::env::var_os("TINE_BOUND_TRACE").is_some() {
+        eprintln!("BOUND EXCEEDED at reconciliation_scan.rs:{line}");
+    }
+    ExpectedPathSourceFailure::BoundExceeded
+}
+
 impl fmt::Display for ExpectedPathCorruptField {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -947,9 +957,9 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         let next_bytes = retained
             .retained_bytes
             .checked_add(row_bytes)
-            .ok_or(ExpectedPathSourceFailure::BoundExceeded)?;
+            .ok_or_else(|| bound_exceeded_at(950))?;
         if retained.rows.len() >= MAX_SCAN_EXPECTED_PATHS || next_bytes > MAX_SCAN_RETAINED_BYTES {
-            return Err(ExpectedPathSourceFailure::BoundExceeded);
+            return Err(bound_exceeded_at(952));
         }
         retained.retained_bytes = next_bytes;
         retained.rows.insert(row.page_id, row);
@@ -1275,11 +1285,11 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             let mut resolutions = Vec::new();
             resolutions
                 .try_reserve_exact(semantic_chunk.len())
-                .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+                .map_err(|_| bound_exceeded_at(1278))?;
             let mut bootstrap_page_ids = Vec::new();
             bootstrap_page_ids
                 .try_reserve_exact(semantic_chunk.len())
-                .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+                .map_err(|_| bound_exceeded_at(1282))?;
             for semantic in semantic_chunk {
                 budget
                     .reset_with_retained(retained_bytes)
@@ -1432,7 +1442,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             || request.maximum_retained_bytes > cursor.limits.maximum_retained_bytes
             || request.maximum_retained_bytes > cursor.limits.maximum_page_bytes
         {
-            return Err(ExpectedPathSourceFailure::BoundExceeded);
+            return Err(bound_exceeded_at(1435));
         }
         self.require_join_current(cursor.engine_binding, cursor.projection_head, budget)?;
         let token = cursor
@@ -1448,9 +1458,9 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         let rows_by_bytes = usize::try_from(
             page_budget
                 / u64::try_from(worst_row_bytes.max(1))
-                    .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?,
+                    .map_err(|_| bound_exceeded_at(1451))?,
         )
-        .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+        .map_err(|_| bound_exceeded_at(1453))?;
         let limit = request
             .maximum_rows
             .min(request.maximum_retained_rows)
@@ -1458,7 +1468,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             .min(MAX_CURRENT_PATH_CURSOR_PAGE_ROWS);
         if limit == 0 {
             let _ = self.engine.cancel_current_path_cursor(token);
-            return Err(ExpectedPathSourceFailure::BoundExceeded);
+            return Err(bound_exceeded_at(1461));
         }
         let page = self
             .engine
@@ -1475,42 +1485,42 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                     .sum::<u64>(),
             );
         if semantic_retained_bytes > page_budget {
-            return Err(ExpectedPathSourceFailure::BoundExceeded);
+            return Err(bound_exceeded_at(1478));
         }
         budget
             .reset_with_retained(semantic_retained_bytes)
             .map_err(map_projection_expected_failure)?;
         let mut rows = Vec::new();
         rows.try_reserve_exact(semantic_rows.len())
-            .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+            .map_err(|_| bound_exceeded_at(1485))?;
         let output_capacity_bytes = (rows.capacity() as u64)
             .checked_mul(mem::size_of::<AuthenticatedExpectedPath>() as u64)
-            .ok_or(ExpectedPathSourceFailure::BoundExceeded)?;
+            .ok_or_else(|| bound_exceeded_at(1488))?;
         let mut aggregate_path_bytes = 0_u64;
         for semantic in &semantic_rows {
             let path_bytes = semantic.path().as_str().len();
             if path_bytes > request.maximum_path_bytes {
-                return Err(ExpectedPathSourceFailure::BoundExceeded);
+                return Err(bound_exceeded_at(1493));
             }
             aggregate_path_bytes = aggregate_path_bytes
                 .checked_add(path_bytes as u64)
-                .ok_or(ExpectedPathSourceFailure::BoundExceeded)?;
+                .ok_or_else(|| bound_exceeded_at(1497))?;
             if aggregate_path_bytes > request.maximum_aggregate_path_bytes {
-                return Err(ExpectedPathSourceFailure::BoundExceeded);
+                return Err(bound_exceeded_at(1499));
             }
             budget
                 .reset_with_retained(
                     semantic_retained_bytes
                         .checked_add(output_capacity_bytes)
                         .and_then(|retained| retained.checked_add(aggregate_path_bytes))
-                        .ok_or(ExpectedPathSourceFailure::BoundExceeded)?,
+                        .ok_or_else(|| bound_exceeded_at(1506))?,
                 )
                 .map_err(map_projection_expected_failure)?;
         }
         let retained_bytes = semantic_retained_bytes
             .checked_add(output_capacity_bytes)
             .and_then(|retained| retained.checked_add(aggregate_path_bytes))
-            .ok_or(ExpectedPathSourceFailure::BoundExceeded)?;
+            .ok_or_else(|| bound_exceeded_at(1513))?;
         self.join_rows(cursor, &semantic_rows, retained_bytes, budget, &mut rows)?;
         self.require_join_current(cursor.engine_binding, cursor.projection_head, budget)?;
         Ok(AuthenticatedExpectedPathPage {
@@ -1532,7 +1542,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
             || path.as_str().len() > request.maximum_path_bytes
             || point_bytes as u64 > request.maximum_retained_bytes
         {
-            return Err(ExpectedPathSourceFailure::BoundExceeded);
+            return Err(bound_exceeded_at(1535));
         }
         let (engine, projection, _, source_commitment) = self.pin_join(budget)?;
         let row = self
@@ -1673,9 +1683,9 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         let (engine_binding, projection_head, binding, source_commitment) =
             self.pin_join(&mut budget)?;
         let total_rows = usize::try_from(engine_binding.catalog_rows())
-            .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+            .map_err(|_| bound_exceeded_at(1676))?;
         if total_rows > limits.maximum_rows {
-            return Err(ExpectedPathSourceFailure::BoundExceeded);
+            return Err(bound_exceeded_at(1678));
         }
         budget
             .reset_with_retained(mem::size_of::<DetachedJoinedExpectedPathCursor>() as u64)
@@ -1740,7 +1750,7 @@ impl<'a> AuthenticatedExpectedPathSource for JoinedAuthenticatedExpectedPathSour
         let (engine_binding, projection_head, binding, source_commitment) =
             self.pin_join(&mut budget)?;
         let total_rows = usize::try_from(engine_binding.catalog_rows())
-            .map_err(|_| ExpectedPathSourceFailure::BoundExceeded)?;
+            .map_err(|_| bound_exceeded_at(1743))?;
         if total_rows > limits.maximum_rows
             || limits.maximum_page_rows == 0
             || limits.maximum_path_bytes == 0
@@ -1748,7 +1758,7 @@ impl<'a> AuthenticatedExpectedPathSource for JoinedAuthenticatedExpectedPathSour
             || limits.maximum_retained_bytes
                 < mem::size_of::<JoinedAuthenticatedExpectedPathCursor<'_>>() as u64
         {
-            return Err(ExpectedPathSourceFailure::BoundExceeded);
+            return Err(bound_exceeded_at(1751));
         }
         let cursor_retained_bytes =
             mem::size_of::<JoinedAuthenticatedExpectedPathCursor<'_>>() as u64;
@@ -1880,7 +1890,7 @@ fn map_engine_expected_failure(error: super::EngineError) -> ExpectedPathSourceF
     } else if detail.contains("missing") {
         ExpectedPathSourceFailure::Missing
     } else if detail.contains("bound") || detail.contains("limit") {
-        ExpectedPathSourceFailure::BoundExceeded
+        bound_exceeded_at(1883)
     } else {
         ExpectedPathSourceFailure::CorruptField(ExpectedPathCorruptField::EngineAuthority)
     }
@@ -1888,7 +1898,7 @@ fn map_engine_expected_failure(error: super::EngineError) -> ExpectedPathSourceF
 
 fn map_projection_expected_failure(error: ProjectionWorkError) -> ExpectedPathSourceFailure {
     if error.to_string().contains("too large") {
-        return ExpectedPathSourceFailure::BoundExceeded;
+        return bound_exceeded_at(1891);
     }
     match error {
         ProjectionWorkError::MissingHead
@@ -1905,14 +1915,16 @@ fn map_projection_expected_failure(error: ProjectionWorkError) -> ExpectedPathSo
         ProjectionWorkError::HistoryBindingMismatch => {
             ExpectedPathSourceFailure::CorruptField(ExpectedPathCorruptField::ProjectionHistory)
         }
+        // These four are distinct causes -- a stored file too big, a payload too
+        // big, a preflight limit, and a retained-memory ceiling -- and collapsing
+        // them into one opaque BoundExceeded is why a failing scan could not be
+        // attributed. Keep the mapping but trace which one actually fired.
         ProjectionWorkError::Store(super::object_store::StoreError::StoredFileTooLarge {
             ..
-        })
-        | ProjectionWorkError::TooLarge(_)
-        | ProjectionWorkError::PreflightLimitExceeded
-        | ProjectionWorkError::RetainedMemoryLimitExceeded => {
-            ExpectedPathSourceFailure::BoundExceeded
-        }
+        }) => bound_exceeded_at(19141),
+        ProjectionWorkError::TooLarge(_) => bound_exceeded_at(19142),
+        ProjectionWorkError::PreflightLimitExceeded => bound_exceeded_at(19143),
+        ProjectionWorkError::RetainedMemoryLimitExceeded => bound_exceeded_at(19144),
         _ => ExpectedPathSourceFailure::CorruptField(ExpectedPathCorruptField::ProjectionAuthority),
     }
 }
@@ -3619,7 +3631,7 @@ mod tests {
                 || limits.maximum_retained_rows == 0
                 || limits.maximum_retained_bytes == 0
             {
-                return Err(ExpectedPathSourceFailure::BoundExceeded);
+                return Err(bound_exceeded_at(3622));
             }
             let mut aggregate = 0_u64;
             for row in &self.rows {
@@ -3629,7 +3641,7 @@ mod tests {
                 if row.path.as_str().len() > limits.maximum_path_bytes
                     || aggregate > limits.maximum_aggregate_path_bytes
                 {
-                    return Err(ExpectedPathSourceFailure::BoundExceeded);
+                    return Err(bound_exceeded_at(3632));
                 }
             }
             Ok((
@@ -3668,14 +3680,14 @@ mod tests {
                     break;
                 }
                 if row.path.as_str().len() > request.maximum_path_bytes {
-                    return Err(ExpectedPathSourceFailure::BoundExceeded);
+                    return Err(bound_exceeded_at(3671));
                 }
                 count += 1;
                 path_bytes = next_path_bytes;
                 retained_bytes = next_retained;
             }
             if count == 0 && cursor.next < self.rows.len() {
-                return Err(ExpectedPathSourceFailure::BoundExceeded);
+                return Err(bound_exceeded_at(3678));
             }
             let end = cursor.next + count;
             let rows = self.rows[cursor.next..end].to_vec();
@@ -3730,7 +3742,7 @@ mod tests {
                     < mem::size_of::<AuthenticatedExpectedPath>() as u64
                         + path.as_str().len() as u64
             {
-                return Err(ExpectedPathSourceFailure::BoundExceeded);
+                return Err(bound_exceeded_at(3733));
             }
             Ok(self.rows.iter().find(|row| row.path == *path).cloned())
         }
