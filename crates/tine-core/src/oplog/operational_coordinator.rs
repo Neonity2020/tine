@@ -801,13 +801,26 @@ impl PublishedContinuationCore {
                 OperationalPhase::ProjectionDrain,
             )?;
             fault(OperationalFaultPoint::BeforeProjection)?;
-            super::projection::execute_manifested_projection_work_under_handoff(
+            // ProjectionDrain is 58% of a managed import at ~1.45s per occurrence
+            // over ~1 iteration each (F45), so a single work item costs about a
+            // second. Split fetching the work from executing it.
+            let execute_started = std::env::var_os("TINE_PHASE_TRACE")
+                .is_some()
+                .then(std::time::Instant::now);
+            let executed = super::projection::execute_manifested_projection_work_under_handoff(
                 graph,
                 receipts,
                 engine,
                 &work,
                 &self.guard,
-            )
+            );
+            if let Some(started) = execute_started {
+                eprintln!(
+                    "PHASE TIME ProjectionDrain.execute {:.1}ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            executed
             .map_err(|error| {
                 OperationalCoordinatorError::new(
                     OperationalPhase::ProjectionDrain,
