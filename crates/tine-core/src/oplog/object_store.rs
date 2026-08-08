@@ -429,8 +429,9 @@ pub static INSPECT_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// `inspect_batch` makes this exact without touching a single call site --
 /// which matters, because guessing which callers dominate has already been
 /// wrong once.
-pub static INSPECT_BATCH_SITES: std::sync::Mutex<std::collections::BTreeMap<String, (usize, usize)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+pub static INSPECT_BATCH_SITES: std::sync::Mutex<
+    std::collections::BTreeMap<String, (usize, usize)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 pub static INSPECT_BATCH_OBJECT_READS: AtomicUsize = AtomicUsize::new(0);
 pub static INSPECT_BATCH_OBJECT_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static INSPECT_BATCH_DIGEST_BYTES: AtomicUsize = AtomicUsize::new(0);

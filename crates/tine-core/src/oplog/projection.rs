@@ -1459,8 +1459,7 @@ fn execute_manifested_projection_work_with_runtime(
     // for ~1.2KB of bytes and points at durable-write barriers rather than work.
     // This is the first of several durable receipt steps per document; time it to
     // test that hypothesis instead of assuming it.
-    let intent_started = super::phase_trace_enabled()
-        .then(std::time::Instant::now);
+    let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
     receipts.publish_intent(
         &local_attempt_intent,
         expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
@@ -1551,8 +1550,7 @@ fn execute_manifested_projection_work_with_runtime(
             // if one carries ~90ms and the other is sub-millisecond, the lever is
             // a single barrier; if the cost is spread, per-document work is
             // inherently multi-step and decision item 13 needs reframing.
-            let mutation_started = super::phase_trace_enabled()
-                .then(std::time::Instant::now);
+            let mutation_started = super::phase_trace_enabled().then(std::time::Instant::now);
             let mut authority = if has_attempts {
                 let reservation = receipts.reserve_fallback_attempt(&local_attempt_intent)?;
                 receipts.begin_mutation(&local_attempt_intent, Some(&reservation))?

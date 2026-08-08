@@ -9877,7 +9877,9 @@ impl RuntimeActor {
         if let Some(started) = derivative_started {
             let elapsed = started.elapsed().as_secs_f64() * 1000.0;
             if elapsed > 1.0 {
-                eprintln!("  BRANCH managed_local_derivative {elapsed:.1}ms -> None (fell through)");
+                eprintln!(
+                    "  BRANCH managed_local_derivative {elapsed:.1}ms -> None (fell through)"
+                );
             }
         }
         if self.shared_phase == Some(SyncSharedPhase::Active) && self.provider_has_work() {
@@ -21523,7 +21525,10 @@ mod tests {
             }
         }
         println!("BASELINE (20 pages): settled={settled}");
-        assert!(settled, "a 20-page managed graph must admit; nothing else is testable");
+        assert!(
+            settled,
+            "a 20-page managed graph must admit; nothing else is testable"
+        );
 
         // Now the bulk external change: the whole corpus arrives from outside.
         let manifests_before = fixture.manifest_count();
@@ -21560,7 +21565,10 @@ mod tests {
         let observe_result = handle.observe_watcher(observations);
         println!(
             "BULK OBSERVE: {observed} paths -> {:?}; manifests_before={manifests_before}",
-            observe_result.as_ref().map(|_| "accepted").map_err(|e| e.to_string())
+            observe_result
+                .as_ref()
+                .map(|_| "accepted")
+                .map_err(|e| e.to_string())
         );
         let mut post_settled = false;
         let mut blocked = 0_u32;
@@ -21650,7 +21658,11 @@ mod tests {
             for victim in &victims {
                 let _ = std::fs::remove_file(victim);
             }
-            println!("TRIMMED to {} .md files (removed {})", limit.min(kept), victims.len());
+            println!(
+                "TRIMMED to {} .md files (removed {})",
+                limit.min(kept),
+                victims.len()
+            );
         }
         let request = fixture.request();
 
@@ -21718,7 +21730,12 @@ mod tests {
         // pass -- and the aggregate ms/file cannot tell them apart.
         let mut sorted = tick_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let pick = |q: f64| sorted.get(((sorted.len() as f64 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+        let pick = |q: f64| {
+            sorted
+                .get(((sorted.len() as f64 - 1.0) * q) as usize)
+                .copied()
+                .unwrap_or(0.0)
+        };
         let total: f64 = sorted.iter().sum();
         let top10: f64 = sorted.iter().rev().take(sorted.len().max(10) / 10).sum();
         println!(
@@ -21729,8 +21746,16 @@ mod tests {
         println!(
             "TICK DISTRIBUTION (ms): min={:.1} p50={:.1} p90={:.1} p99={:.1} max={:.1} \
              | slowest 10% of ticks = {:.1}% of total tick time",
-            pick(0.0), pick(0.5), pick(0.9), pick(0.99), pick(1.0),
-            if total > 0.0 { 100.0 * top10 / total } else { 0.0 },
+            pick(0.0),
+            pick(0.5),
+            pick(0.9),
+            pick(0.99),
+            pick(1.0),
+            if total > 0.0 {
+                100.0 * top10 / total
+            } else {
+                0.0
+            },
         );
         // F49: is the per-document cost O(batch)? `inspect_batch` re-reads,
         // re-hashes and re-decodes every object of the batch it is asked about,
@@ -21750,7 +21775,11 @@ mod tests {
                 "INSPECT_BATCH: calls={calls} object_reads={reads} \
                  object_bytes={bytes} sha256_bytes={hashed} \
                  | per_call_objects={:.0} per_call_MB={:.2} total_GB={:.2}",
-                if calls > 0 { reads as f64 / calls as f64 } else { 0.0 },
+                if calls > 0 {
+                    reads as f64 / calls as f64
+                } else {
+                    0.0
+                },
                 if calls > 0 {
                     bytes as f64 / calls as f64 / 1_048_576.0
                 } else {
@@ -21785,14 +21814,11 @@ mod tests {
         // exactly the attribution this probe exists to capture.
         let reopen_started = std::time::Instant::now();
         let mut captured: Option<SyncRuntimeRecoveryDiagnostics> = None;
-        let reopened = active_handle(SyncRuntimeHandle::open_with_progress(
-            request,
-            |event| {
-                if let SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics } = event {
-                    captured = Some(diagnostics);
-                }
-            },
-        ));
+        let reopened = active_handle(SyncRuntimeHandle::open_with_progress(request, |event| {
+            if let SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics } = event {
+                captured = Some(diagnostics);
+            }
+        }));
         let reopen = reopen_started.elapsed();
         let status = reopened.status().unwrap();
         match captured {
@@ -21807,16 +21833,28 @@ mod tests {
                      | counts: applied_batches={} bulk_pages={} ancestry_full_scans={} \
                      bootstrap_parts={} manifests_offered={} manifests_replayed={} \
                      | recovery={} reason={:?}",
-                    ms(d.total), ms(d.projection_sidecar_shape),
-                    ms(d.projection_checkpoint_authentication), ms(d.projection_read_only_open),
-                    ms(d.projection_schema_and_claim), ms(d.projection_structural_validation),
-                    ms(d.projection_materialization_stamp), ms(d.projection_forensics_preservation),
-                    ms(d.projection_rebuild), ms(d.prepare_replay), ms(d.predecessor_restore),
-                    ms(d.bootstrap_part_replay), ms(d.archived_tail_replay), ms(d.finish_replay),
-                    d.projection_applied_batches, d.projection_bulk_pages_materialized,
-                    d.projection_ancestry_full_scans, d.bootstrap_parts_replayed,
-                    d.archived_manifests_offered, d.archived_manifests_replayed,
-                    d.projection_recovery, d.projection_reason,
+                    ms(d.total),
+                    ms(d.projection_sidecar_shape),
+                    ms(d.projection_checkpoint_authentication),
+                    ms(d.projection_read_only_open),
+                    ms(d.projection_schema_and_claim),
+                    ms(d.projection_structural_validation),
+                    ms(d.projection_materialization_stamp),
+                    ms(d.projection_forensics_preservation),
+                    ms(d.projection_rebuild),
+                    ms(d.prepare_replay),
+                    ms(d.predecessor_restore),
+                    ms(d.bootstrap_part_replay),
+                    ms(d.archived_tail_replay),
+                    ms(d.finish_replay),
+                    d.projection_applied_batches,
+                    d.projection_bulk_pages_materialized,
+                    d.projection_ancestry_full_scans,
+                    d.bootstrap_parts_replayed,
+                    d.archived_manifests_offered,
+                    d.archived_manifests_replayed,
+                    d.projection_recovery,
+                    d.projection_reason,
                 );
             }
             None => println!("REOPEN STAGES: none emitted (no recovery diagnostics on this open)"),
@@ -31108,7 +31146,10 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![1_000, 3_000, 10_000]);
-        assert!(!page_counts.is_empty(), "at least one page count is required");
+        assert!(
+            !page_counts.is_empty(),
+            "at least one page count is required"
+        );
 
         // Keep exactly one synthetic graph alive at a time. The receipt is a
         // measurement oracle, not a latency budget: it validates the measured

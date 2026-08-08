@@ -68,10 +68,10 @@ use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
     ObjectKind, ObjectStore, OperationBatch, PageId, PreparedBatch, ReferenceFactV1,
-    ReferenceSourceLocatorV1,
-    SemanticEffect, SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId,
-    WorkspaceStatus, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
-    OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
+    ReferenceSourceLocatorV1, SemanticEffect, SemanticEffectDigest, ShardedHotEngine,
+    ValidatedBatch, WorkspaceId, WorkspaceStatus, MANAGED_ENTITY_SET_VERSION,
+    MANIFEST_ENCODING_VERSION, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
+    OPLOG_PROTOCOL_VERSION,
 };
 
 pub const SQLITE_APPLICATION_ID: u32 = tine_storage::formats::SQLITE_APPLICATION_ID;

@@ -612,8 +612,7 @@ impl PublishedContinuationCore {
             // ArchiveStage charges 77.5% of the slice budget (F43), but ops are
             // not milliseconds, so time the call itself before concluding it
             // dominates wall clock too.
-            let stage_started = super::phase_trace_enabled()
-                .then(std::time::Instant::now);
+            let stage_started = super::phase_trace_enabled().then(std::time::Instant::now);
             let stage = engine
                 .stage_archive_batch_bounded(self.batch_id, stage_limit)
                 .map_err(|error| {
@@ -746,8 +745,7 @@ impl PublishedContinuationCore {
         // ~39s of a 50s import is inside resume() but outside ArchiveStage
         // (F45). This loop is the largest remaining block; time it as a whole
         // rather than guessing which of its calls dominates.
-        let projection_started = super::phase_trace_enabled()
-            .then(std::time::Instant::now);
+        let projection_started = super::phase_trace_enabled().then(std::time::Instant::now);
         let mut projection_iterations = 0_u32;
         loop {
             projection_iterations += 1;
@@ -802,8 +800,7 @@ impl PublishedContinuationCore {
             // ProjectionDrain is 58% of a managed import at ~1.45s per occurrence
             // over ~1 iteration each (F45), so a single work item costs about a
             // second. Split fetching the work from executing it.
-            let execute_started = super::phase_trace_enabled()
-                .then(std::time::Instant::now);
+            let execute_started = super::phase_trace_enabled().then(std::time::Instant::now);
             let executed = super::projection::execute_manifested_projection_work_under_handoff(
                 graph,
                 receipts,
@@ -817,8 +814,7 @@ impl PublishedContinuationCore {
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
             }
-            executed
-            .map_err(|error| {
+            executed.map_err(|error| {
                 OperationalCoordinatorError::new(
                     OperationalPhase::ProjectionDrain,
                     error.to_string(),
@@ -2092,21 +2088,22 @@ fn authenticate_published(
     // Identical arithmetic to the old per-object `encode().len()` fold: an
     // object file is written, and read back, at exactly its descriptor's
     // `encoded_byte_length`.
-    let actual = manifest
-        .required_objects()
-        .iter()
-        .try_fold(encoded.len(), |total, descriptor| {
-            usize::try_from(descriptor.encoded_byte_length())
-                .ok()
-                .and_then(|length| total.checked_add(length))
-                .ok_or_else(|| {
-                    OperationalCoordinatorError::retained_block(
-                        OperationalPhase::Publication,
-                        "durable retained-byte count overflowed",
-                        RetainedBlockReason::PublishedAuthentication,
-                    )
-                })
-        })?;
+    let actual =
+        manifest
+            .required_objects()
+            .iter()
+            .try_fold(encoded.len(), |total, descriptor| {
+                usize::try_from(descriptor.encoded_byte_length())
+                    .ok()
+                    .and_then(|length| total.checked_add(length))
+                    .ok_or_else(|| {
+                        OperationalCoordinatorError::retained_block(
+                            OperationalPhase::Publication,
+                            "durable retained-byte count overflowed",
+                            RetainedBlockReason::PublishedAuthentication,
+                        )
+                    })
+            })?;
     if actual != retained_bytes {
         return Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::Publication,

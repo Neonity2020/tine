@@ -840,7 +840,11 @@ impl SemanticEffect {
         if std::env::var_os("TINE_SEMANTIC_TRACE").is_some() {
             let before_pages = self.pages.iter().filter(|d| d.before.is_some()).count();
             let before_blocks = self.blocks.iter().filter(|d| d.before.is_some()).count();
-            let before_members = self.memberships.iter().filter(|d| d.before.is_some()).count();
+            let before_members = self
+                .memberships
+                .iter()
+                .filter(|d| d.before.is_some())
+                .count();
             eprintln!(
                 "SEMANTIC EFFECT: {}B | pages={} ({} with before) blocks={} ({} with before) \
                  memberships={} ({} with before) preambles={}",

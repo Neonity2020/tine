@@ -1475,8 +1475,7 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         let page_budget = request.maximum_retained_bytes / 2;
         let rows_by_bytes = usize::try_from(
             page_budget
-                / u64::try_from(worst_row_bytes.max(1))
-                    .map_err(|_| bound_exceeded_at(1451))?,
+                / u64::try_from(worst_row_bytes.max(1)).map_err(|_| bound_exceeded_at(1451))?,
         )
         .map_err(|_| bound_exceeded_at(1453))?;
         let limit = request
@@ -1712,8 +1711,8 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
         let mut budget = ProjectionExpectedPathReadBudget::new(limits.maximum_retained_bytes);
         let (engine_binding, projection_head, binding, source_commitment) =
             self.pin_join(&mut budget)?;
-        let total_rows = usize::try_from(engine_binding.catalog_rows())
-            .map_err(|_| bound_exceeded_at(1676))?;
+        let total_rows =
+            usize::try_from(engine_binding.catalog_rows()).map_err(|_| bound_exceeded_at(1676))?;
         if total_rows > limits.maximum_rows {
             return Err(bound_exceeded_at(1678));
         }
@@ -1779,8 +1778,8 @@ impl<'a> AuthenticatedExpectedPathSource for JoinedAuthenticatedExpectedPathSour
         let mut budget = ProjectionExpectedPathReadBudget::new(limits.maximum_retained_bytes);
         let (engine_binding, projection_head, binding, source_commitment) =
             self.pin_join(&mut budget)?;
-        let total_rows = usize::try_from(engine_binding.catalog_rows())
-            .map_err(|_| bound_exceeded_at(1743))?;
+        let total_rows =
+            usize::try_from(engine_binding.catalog_rows()).map_err(|_| bound_exceeded_at(1743))?;
         if total_rows > limits.maximum_rows
             || limits.maximum_page_rows == 0
             || limits.maximum_path_bytes == 0

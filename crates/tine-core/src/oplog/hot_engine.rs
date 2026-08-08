@@ -20904,9 +20904,8 @@ impl ShardedHotEngine {
             true,
         )?;
         self.record_replay_timing_elapsed(portable_paths_started, |timing, elapsed| {
-            timing.identity_portable_paths_nanos = timing
-                .identity_portable_paths_nanos
-                .saturating_add(elapsed);
+            timing.identity_portable_paths_nanos =
+                timing.identity_portable_paths_nanos.saturating_add(elapsed);
         });
         let page_names_started = self.replay_timing_started();
         let page_names = if declared_effect.pages().is_empty() {
@@ -20935,9 +20934,8 @@ impl ShardedHotEngine {
             )?
         };
         self.record_replay_timing_elapsed(page_names_started, |timing, elapsed| {
-            timing.identity_page_names_nanos = timing
-                .identity_page_names_nanos
-                .saturating_add(elapsed);
+            timing.identity_page_names_nanos =
+                timing.identity_page_names_nanos.saturating_add(elapsed);
         });
         let identity_binding_started = self.replay_timing_started();
         self.validate_manifested_portable_path_binding(
@@ -20947,9 +20945,7 @@ impl ShardedHotEngine {
             !portable_paths.conflicts.is_empty(),
         )?;
         self.record_replay_timing_elapsed(identity_binding_started, |timing, elapsed| {
-            timing.identity_binding_nanos = timing
-                .identity_binding_nanos
-                .saturating_add(elapsed);
+            timing.identity_binding_nanos = timing.identity_binding_nanos.saturating_add(elapsed);
         });
         let identity_roles_started = self.replay_timing_started();
         let identity = self.validate_and_prepare_semantic_roles_and_block_homes(
@@ -20960,9 +20956,7 @@ impl ShardedHotEngine {
             &declared_effect,
         )?;
         self.record_replay_timing_elapsed(identity_roles_started, |timing, elapsed| {
-            timing.identity_roles_nanos = timing
-                .identity_roles_nanos
-                .saturating_add(elapsed);
+            timing.identity_roles_nanos = timing.identity_roles_nanos.saturating_add(elapsed);
         });
         Self::record_validation_phase(&mut self.validation_phase_nanos, 7, &mut phase_started);
         let portable_path_blocked = !portable_paths.conflicts.is_empty();
@@ -21196,9 +21190,7 @@ impl ShardedHotEngine {
             return Err(error);
         }
         self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
-            timing.durable_history_nanos = timing
-                .durable_history_nanos
-                .saturating_add(elapsed);
+            timing.durable_history_nanos = timing.durable_history_nanos.saturating_add(elapsed);
         });
         let projection_preparation_error = self.prepare_projection_work(batch_id).err();
         self.commit_identity_publication(identity);

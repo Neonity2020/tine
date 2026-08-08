@@ -8,6 +8,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Managed storage imports roughly twice as fast, and read about eight times
+  fewer bytes.** Bringing a graph into managed storage was re-reading, re-hashing
+  and re-decoding the *entire* batch of pending objects in order to fetch a
+  single one — once per document, and again once per coordinator tick. On a real
+  1,000-page graph that meant gigabytes of redundant work: importing 300 pages
+  read 3.59 GB to move about 1.3 MB of notes. Objects are now fetched
+  individually by the content digest the caller already holds, and the
+  per-tick check reads only the batch manifest, which already records everything
+  it was asking for. Measured on a real graph: 100/200/300/400/600 pages now take
+  5.6/14.5/26.0/42.2/84.9 s, down from 10.8/29.1/50.2/80.0/157.0 s. No safety
+  guarantee changes: objects remain content-addressed and are still verified
+  individually when read.
+
 ## [0.6.91] - 2026-08-07
 
 ### Added
