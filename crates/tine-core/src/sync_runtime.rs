@@ -31009,6 +31009,10 @@ mod tests {
                 receipt.source_files as u64
             );
             assert_eq!(receipt.construction.preparation.huge_page_splits, 0);
+            assert_eq!(
+                receipt.construction.preparation.external_sort_runs, 0,
+                "ordinary activation must remain on the in-memory sort path"
+            );
             assert!(receipt.construction.preparation.max_part_documents <= 65);
             assert!(
                 receipt.construction.preparation.max_part_manifest_bytes

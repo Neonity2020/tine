@@ -137,7 +137,12 @@ pub const MAX_IMPORT_REPLAY_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_IMPORT_RENDERED_TARGET_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_IMPORT_STRUCTURAL_KEY_WORK: usize = 64_000_000;
 
-const BOOTSTRAP_STREAM_SORT_BUFFER_BYTES: usize = 1024 * 1024;
+/// Keep ordinary graph imports in memory. The sorter spills deterministically
+/// once its encoded records cross this bound, so large imports retain the same
+/// external-merge path without charging small graphs for it. The real 1,045
+/// file corpus peaks below 3 MiB per sorter; 32 MiB leaves ample headroom while
+/// keeping simultaneous sorters bounded on mobile-class processes.
+const BOOTSTRAP_STREAM_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const BOOTSTRAP_STREAM_SORT_FAN_IN: usize = 4;
 const BOOTSTRAP_STREAM_MAX_SORT_RUNS: usize = 4096;
 const BOOTSTRAP_STREAM_FRAME_BYTES: usize = 64 * 1024 * 1024 + 1024 * 1024;
@@ -1625,31 +1630,53 @@ impl ExternalSort {
         mut self,
         destination: &Path,
     ) -> Result<ExternalSortReceipt, BootstrapStreamingImportError> {
-        self.flush()?;
         if self.runs.is_empty() {
-            write_exact_new(destination, &[])?;
-        } else {
-            while self.runs.len() > 1 {
-                let current = std::mem::take(&mut self.runs);
-                for group in current.chunks(BOOTSTRAP_STREAM_SORT_FAN_IN) {
-                    let output = self.next_run_path("merge");
-                    merge_sort_runs(group, &output)?;
-                    self.total_runs = self.total_runs.saturating_add(1);
-                    if self.total_runs as usize > BOOTSTRAP_STREAM_MAX_SORT_RUNS {
-                        return Err(BootstrapStreamingImportError::ResourceLimit {
-                            resource: "external-sort runs",
-                            observed: self.total_runs,
-                            limit: BOOTSTRAP_STREAM_MAX_SORT_RUNS as u64,
-                        });
-                    }
-                    self.runs.push(output);
+            self.buffer.sort_unstable_by(|left, right| {
+                (&left.key, &left.value).cmp(&(&right.key, &right.value))
+            });
+            if self.buffer.is_empty() {
+                write_exact_new(destination, &[])?;
+            } else {
+                let mut writer = BufWriter::new(create_new_file(destination)?);
+                for record in self.buffer.drain(..) {
+                    self.total_bytes = self
+                        .total_bytes
+                        .checked_add(write_sort_record(&mut writer, &record)?)
+                        .ok_or_else(|| {
+                            BootstrapStreamingImportError::InvalidOperation(
+                                "in-memory sort byte count overflow".into(),
+                            )
+                        })?;
                 }
-                for path in current {
-                    fs::remove_file(path)?;
-                }
+                writer.flush()?;
             }
-            fs::rename(&self.runs[0], destination)?;
+            return Ok(ExternalSortReceipt {
+                bytes: self.total_bytes,
+                runs: 0,
+                peak_buffer_bytes: self.peak_buffer_bytes,
+            });
         }
+        self.flush()?;
+        while self.runs.len() > 1 {
+            let current = std::mem::take(&mut self.runs);
+            for group in current.chunks(BOOTSTRAP_STREAM_SORT_FAN_IN) {
+                let output = self.next_run_path("merge");
+                merge_sort_runs(group, &output)?;
+                self.total_runs = self.total_runs.saturating_add(1);
+                if self.total_runs as usize > BOOTSTRAP_STREAM_MAX_SORT_RUNS {
+                    return Err(BootstrapStreamingImportError::ResourceLimit {
+                        resource: "external-sort runs",
+                        observed: self.total_runs,
+                        limit: BOOTSTRAP_STREAM_MAX_SORT_RUNS as u64,
+                    });
+                }
+                self.runs.push(output);
+            }
+            for path in current {
+                fs::remove_file(path)?;
+            }
+        }
+        fs::rename(&self.runs[0], destination)?;
         Ok(ExternalSortReceipt {
             bytes: self.total_bytes,
             runs: self.total_runs,

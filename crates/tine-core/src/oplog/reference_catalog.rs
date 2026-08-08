@@ -2065,12 +2065,12 @@ impl ReferenceCatalogStateV2 {
         let facts_coverage_reads_before = store.stats().reads;
         facts_root = store
             .patricia
-            .construction_insert_many(construction, facts_root, &fact_updates)
+            .construction_insert_many_bulk(construction, facts_root, &fact_updates)
             .map_err(store_error)?;
         construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         coverage_root = store
             .patricia
-            .construction_insert_many(construction, coverage_root, &coverage_updates)
+            .construction_insert_many_bulk(construction, coverage_root, &coverage_updates)
             .map_err(store_error)?;
         construction.set_live_roots([facts_root, coverage_root, reverse_root]);
         facts_root = store

@@ -25788,7 +25788,9 @@ pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORIES: u64 = 1_000_000;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH: usize = 256;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_PATH_BYTES: usize = 4096;
 const BOOTSTRAP_SOURCE_MAX_AGGREGATE_PATH_BYTES: u64 = 512 * 1024 * 1024;
-const BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES: usize = 1024 * 1024;
+// Ordinary graphs sort each source spool in memory. Large captures retain the
+// external merge path once a single spool exceeds this measured threshold.
+const BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const BOOTSTRAP_SOURCE_MAX_SORT_RUNS: u64 = 4096;
 const BOOTSTRAP_SOURCE_MERGE_INPUTS: usize = 32;
 const BOOTSTRAP_SOURCE_CURSOR_BUFFER_BYTES: usize = 64 * 1024;
@@ -27357,13 +27359,35 @@ fn sort_bootstrap_source_spool(
         instrumentation.peak_owned_buffer_bytes =
             instrumentation.peak_owned_buffer_bytes.max(bytes as u64);
     }
-    if !rows.is_empty() {
+    if !rows.is_empty() && !runs.is_empty() {
         note_bootstrap_source_io_stage("flush final bootstrap source sort run");
         bootstrap_source_flush_sort_run(paths, kind, &mut rows, &mut runs, instrumentation)?;
     }
     note_bootstrap_source_io_stage("remove consumed raw bootstrap source spool");
     fs::remove_file(input)?;
     let sorted = paths.sorted(kind);
+    if runs.is_empty() && !rows.is_empty() {
+        note_bootstrap_source_io_stage("sort in-memory bootstrap source spool");
+        rows.sort_unstable_by(|left, right| {
+            bootstrap_source_spool_order(kind, left, right)
+                .expect("source spool rows are validated before in-memory sorting")
+        });
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&sorted)?;
+        for row in &rows {
+            write_bootstrap_source_frame(&mut file, row)?;
+        }
+        note_bootstrap_source_io_stage("sync in-memory sorted bootstrap source spool");
+        file.sync_all()?;
+        instrumentation.spool_bytes = instrumentation
+            .spool_bytes
+            .checked_add(file.metadata()?.len())
+            .ok_or_else(|| bootstrap_source_capture_error("source spool-byte counter overflow"))?;
+        note_bootstrap_source_io_stage("sync in-memory sorted bootstrap source spool directory");
+        return sync_bootstrap_source_directory(&paths.directory);
+    }
     if runs.is_empty() {
         note_bootstrap_source_io_stage("create empty sorted bootstrap source spool");
         let file = fs::OpenOptions::new()
