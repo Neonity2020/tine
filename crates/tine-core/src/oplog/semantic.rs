@@ -832,6 +832,28 @@ impl SemanticEffect {
     fn encode_validated(&self) -> Result<Vec<u8>, SemanticError> {
         let body = postcard::to_allocvec(self)
             .map_err(|error| SemanticError::Encode(error.to_string()))?;
+        // A semantic effect is one object per batch and can reach 64 MiB, four
+        // times what the tail will admit -- so its size is load-bearing. Each
+        // delta carries both `before` and `after`; on an initial import nothing
+        // exists beforehand, so a populated `before` means the content is
+        // encoded twice for no purpose. Measure rather than assume.
+        if std::env::var_os("TINE_SEMANTIC_TRACE").is_some() {
+            let before_pages = self.pages.iter().filter(|d| d.before.is_some()).count();
+            let before_blocks = self.blocks.iter().filter(|d| d.before.is_some()).count();
+            let before_members = self.memberships.iter().filter(|d| d.before.is_some()).count();
+            eprintln!(
+                "SEMANTIC EFFECT: {}B | pages={} ({} with before) blocks={} ({} with before) \
+                 memberships={} ({} with before) preambles={}",
+                body.len() + SEMANTIC_MAGIC.len(),
+                self.pages.len(),
+                before_pages,
+                self.blocks.len(),
+                before_blocks,
+                self.memberships.len(),
+                before_members,
+                self.page_preambles.len(),
+            );
+        }
         let mut bytes = Vec::with_capacity(SEMANTIC_MAGIC.len() + body.len());
         bytes.extend_from_slice(SEMANTIC_MAGIC);
         bytes.extend_from_slice(&body);
