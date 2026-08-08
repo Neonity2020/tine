@@ -87,8 +87,22 @@ struct ResumeBudget {
 impl ResumeBudget {
     fn new() -> Self {
         Self {
-            remaining: RESUME_OPERATION_BUDGET,
+            remaining: Self::budget(),
         }
+    }
+
+    /// The per-slice operation budget. A converging 300-file import takes 168
+    /// continuation slices at ~277 ms each (F41), i.e. ~1.8 files per slice, and
+    /// the per-slice cost is almost all fixed overhead — so this constant sets
+    /// the import's total cost. `TINE_RESUME_BUDGET` exists to measure that
+    /// trade-off (total time vs per-slice latency and peak memory) rather than
+    /// to be tuned in production; the default is unchanged.
+    fn budget() -> usize {
+        std::env::var("TINE_RESUME_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(RESUME_OPERATION_BUDGET)
     }
 
     /// Charge `count` units to the phase that actually performed the work.
