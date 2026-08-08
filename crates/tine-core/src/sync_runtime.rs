@@ -12450,7 +12450,33 @@ impl RuntimeActor {
             let Some(feed) = self.feed.as_mut() else {
                 return SyncRuntimeTick::Terminal("exact external feed was dropped".into());
             };
-            feed.drain_one(&self.graph, &self.receipts, authority, runtime, observed_at)
+            // F40: this call is the 285ms, 168 times, while the watcher reports
+            // nothing pending. Split it from refresh_watcher so the cost is
+            // attributed to the drain itself rather than to the tick.
+            let drain_started = std::env::var_os("TINE_TICK_TRACE")
+                .is_some()
+                .then(std::time::Instant::now);
+            let drained =
+                feed.drain_one(&self.graph, &self.receipts, authority, runtime, observed_at);
+            if let Some(started) = drain_started {
+                eprintln!(
+                    "    DRAIN drain_one {:.1}ms -> {}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    match &drained {
+                        ExactExternalFeedDrain::AdmittedComplete { .. } => "AdmittedComplete",
+                        ExactExternalFeedDrain::AdmittedNoop { .. } => "AdmittedNoop",
+                        ExactExternalFeedDrain::Idle => "Idle",
+                        ExactExternalFeedDrain::ForeignActor => "ForeignActor",
+                        ExactExternalFeedDrain::RecoveryBlocked(reason) => reason,
+                        ExactExternalFeedDrain::Recovering => "Recovering",
+                        ExactExternalFeedDrain::RetryFull => "RetryFull",
+                        ExactExternalFeedDrain::Blocked(_) => "Blocked",
+                        ExactExternalFeedDrain::Failed(_) => "Failed",
+                        ExactExternalFeedDrain::Terminal(_) => "Terminal",
+                    },
+                );
+            }
+            drained
         };
         let result = if let ExactExternalFeedDrain::AdmittedComplete {
             batch_id: Some(batch_id),
