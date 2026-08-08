@@ -530,5 +530,13 @@ try {
 } finally {
   await closeSession(activeSession);
   stopProcessGroup(windowManager);
-  fs.rmSync(root, { recursive: true, force: true });
+  // TINE_STORAGE_MODE_KEEP retains the run root so the managed storage tree can
+  // be measured after a *settled* activation. Without it every amplification
+  // figure has to be taken mid-run off a live fixture, which is exactly the
+  // caveat that made the first 13.8x measurement provisional.
+  if (process.env.TINE_STORAGE_MODE_KEEP) {
+    console.log(`RUN ROOT RETAINED: ${root}`);
+  } else {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }

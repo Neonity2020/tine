@@ -21379,6 +21379,96 @@ mod tests {
         }
     }
 
+    /// Does a *working* managed graph become permanently wedged by a bulk
+    /// external change? This is the Syncthing scenario: Tine is closed (or idle)
+    /// while another machine syncs a large batch of pages in, then the feed tries
+    /// to admit them all at once.
+    ///
+    /// The sibling probe shows an initial full-graph scan of 1,047 files is
+    /// rejected at `TAIL_MAX_BYTES` (16 MiB retained) and can never succeed,
+    /// because `model.rs:9581` assembles every pending file into ONE batch with
+    /// no byte-axis chunking. That leaves one question: is a graph that already
+    /// works able to be pushed over the line from outside?
+    ///
+    /// Starts small enough to settle, then drops the whole corpus in externally.
+    /// Opt-in via `TINE_REAL_GRAPH`; corpus copied, never mutated.
+    #[test]
+    #[ignore]
+    fn bulk_external_change_wedges_a_working_managed_graph() {
+        let Some(source) = std::env::var_os("TINE_REAL_GRAPH") else {
+            eprintln!("skipped: set TINE_REAL_GRAPH to a graph directory");
+            return;
+        };
+        let source = std::path::PathBuf::from(&source);
+        let fixture = RuntimeHostFixture::safe("realgraph-bulk-external-wedge");
+        let graph_root = fixture.graph_root().to_path_buf();
+
+        // Seed a graph small enough that admission comfortably succeeds.
+        let pages = graph_root.join("pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        for index in 0..20 {
+            std::fs::write(
+                pages.join(format!("seed {index:03}.md")),
+                format!("- seed page {index}\n"),
+            )
+            .unwrap();
+        }
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+
+        let mut settled = false;
+        for _ in 0..2_000 {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::Idle
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. } => {
+                    if !handle.status().unwrap().watcher.pending {
+                        settled = true;
+                        break;
+                    }
+                }
+                SyncRuntimeTick::Blocked(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                _ => {}
+            }
+        }
+        println!("BASELINE (20 pages): settled={settled}");
+        assert!(settled, "a 20-page managed graph must admit; nothing else is testable");
+
+        // Now the bulk external change: the whole corpus arrives from outside.
+        copy_tree_for_probe(&source, &graph_root);
+        let mut post_settled = false;
+        let mut blocked = 0_u32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::Idle
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. } => {
+                    if !handle.status().unwrap().watcher.pending {
+                        post_settled = true;
+                        break;
+                    }
+                }
+                SyncRuntimeTick::Blocked(_) => {
+                    blocked += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        println!(
+            "AFTER BULK EXTERNAL CHANGE (+1,047 files): settled={post_settled} blocked_ticks={blocked}"
+        );
+        if !post_settled {
+            println!(
+                "WEDGED: a working managed graph stopped admitting external changes \
+                 after a bulk sync. This is the Syncthing scenario."
+            );
+        }
+    }
+
     /// Attribution probe for the 2026-08-08 cold-open discrepancy.
     ///
     /// The app-level benchmark measures a managed cold open of the 1,047-file
