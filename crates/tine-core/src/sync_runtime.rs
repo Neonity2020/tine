@@ -21366,6 +21366,127 @@ mod tests {
         ));
     }
 
+    fn copy_tree_for_probe(source: &std::path::Path, destination: &std::path::Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree_for_probe(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// Attribution probe for the 2026-08-08 cold-open discrepancy.
+    ///
+    /// The app-level benchmark measures a managed cold open of the 1,047-file
+    /// anonymized graph at 4,688 ms against direct's 753 ms. The activation
+    /// oracle measures an *engine*-level cold reopen at 116 ms on 1,000
+    /// synthetic pages. Those two numbers cannot both be describing the same
+    /// work, and ~3.8 s is currently unattributed. This measures the engine
+    /// layer on the *real* corpus, so the two are finally comparable:
+    ///
+    /// - if reopen here is ~100 ms, the missing seconds are above the engine
+    ///   and no engine-level cut can recover them;
+    /// - if it is seconds, the synthetic fixture simply does not represent a
+    ///   real graph's shape, and the engine is the right target after all.
+    ///
+    /// Opt-in via `TINE_REAL_GRAPH`; the corpus is copied, never mutated.
+    #[test]
+    #[ignore]
+    fn real_graph_managed_activation_and_reopen_cost() {
+        let Some(source) = std::env::var_os("TINE_REAL_GRAPH") else {
+            eprintln!("skipped: set TINE_REAL_GRAPH to a graph directory");
+            return;
+        };
+        let fixture = RuntimeHostFixture::safe("realgraph-managed-reopen-probe");
+        copy_tree_for_probe(std::path::Path::new(&source), fixture.graph_root());
+        let request = fixture.request();
+
+        let activation_started = std::time::Instant::now();
+        let first = active_handle(SyncRuntimeHandle::open(request.clone()));
+        let activation = activation_started.elapsed();
+
+        // Not `drive_initial_feed`: on a real-scale graph the initial feed hits
+        // `Blocked("TailReservation: SQLite tail backpressure ...")`, which that
+        // shared helper treats as a hard failure. Backpressure is progress, not
+        // an error, so drive it locally rather than loosening a helper every
+        // other test depends on.
+        // Paced, not spun. An unpaced tight loop drove epoch ids past 571 without
+        // converging, but `Blocked(TailReservation…)` is SQLite tail backpressure
+        // that is meant to clear with time -- time a tight loop never grants. So
+        // sleeping on Blocked is what distinguishes "this does not converge" from
+        // "I measured my own spin". Bounded by wall clock, not iterations.
+        let budget = std::time::Duration::from_secs(
+            std::env::var("TINE_PROBE_FEED_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(240),
+        );
+        let feed_started = std::time::Instant::now();
+        let mut blocked_ticks = 0_u32;
+        let mut ticks = 0_u32;
+        let mut settled = false;
+        while feed_started.elapsed() < budget {
+            ticks += 1;
+            match first.tick().unwrap() {
+                SyncRuntimeTick::Idle
+                | SyncRuntimeTick::AdmittedNoop { .. }
+                | SyncRuntimeTick::AdmittedComplete { .. } => {
+                    if !first.status().unwrap().watcher.pending {
+                        settled = true;
+                        break;
+                    }
+                }
+                SyncRuntimeTick::Blocked(_) => {
+                    blocked_ticks += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                SyncRuntimeTick::Recovering
+                | SyncRuntimeTick::RetryFull
+                | SyncRuntimeTick::Failed(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => panic!("initial exact feed did not settle: {other:?}"),
+            }
+        }
+        let feed = feed_started.elapsed();
+        println!(
+            "FEED: settled={settled} ticks={ticks} blocked_ticks={blocked_ticks} \
+             elapsed={:.1}s",
+            feed.as_secs_f64()
+        );
+        if !settled {
+            println!(
+                "FEED DID NOT CONVERGE within {}s of paced ticking -- this is the \
+                 headline, not a harness limit",
+                budget.as_secs()
+            );
+            return;
+        }
+
+        assert!(matches!(
+            first.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopen_started = std::time::Instant::now();
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        let reopen = reopen_started.elapsed();
+        let status = reopened.status().unwrap();
+
+        println!(
+            "REAL-GRAPH MANAGED PROBE: activation={:.1}ms initial_feed={:.1}ms \
+             ({blocked_ticks} blocked ticks) clean_reopen={:.1}ms recovery={:?}",
+            activation.as_secs_f64() * 1000.0,
+            feed.as_secs_f64() * 1000.0,
+            reopen.as_secs_f64() * 1000.0,
+            status.recovery,
+        );
+    }
+
     #[test]
     fn clean_reopen_reads_an_unchanged_page_before_deferred_full_scan_catch_up() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-unchanged-safe-reopen");
