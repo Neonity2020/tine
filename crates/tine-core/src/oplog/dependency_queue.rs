@@ -272,6 +272,60 @@ pub(crate) fn begin_stage(
     ))
 }
 
+/// Publish the final status of one internally ordered, already-validated
+/// batch without constructing the resumable dependency scheduler around it.
+///
+/// Detached bootstrap authoring owns one private linear session. Its caller
+/// has already authenticated every causal parent, inserted the causal record,
+/// and replayed the immutable batch through semantic validation. If that
+/// process is interrupted, the whole temporary construction is discarded and
+/// rebuilt from the source graph. Registering dependencies, ready-queueing the
+/// batch, and retaining fanout continuations therefore add no recovery value.
+/// The compact final record remains necessary: scratch-backed history lookup
+/// uses it as the point authority for accepted status and manifest identity.
+pub(crate) fn record_ordered_final(
+    store: &ScratchStore,
+    roots: &ScratchRoots,
+    batch_id: BatchId,
+    manifest_fingerprint: ContentDigest,
+    event_binding_digest: ContentDigest,
+    dependency_set_commitment: ContentDigest,
+    dependency_count: usize,
+    final_status: Vec<u8>,
+    final_dependency_status: FinalDependencyStatus,
+) -> Result<ScratchRoots, DependencyQueueError> {
+    if final_status.is_empty() {
+        return Err(DependencyQueueError::MalformedRecord);
+    }
+    if lookup(store, roots, batch_id)?.is_some() {
+        return Err(DependencyQueueError::BatchCollision(batch_id));
+    }
+    let dependency_count =
+        u32::try_from(dependency_count).map_err(|_| DependencyQueueError::TooManyDependencies)?;
+    let record = StagedBatchRecord {
+        schema_version: DEPENDENCY_QUEUE_SCHEMA_VERSION,
+        batch_id,
+        manifest_fingerprint,
+        event_binding_digest,
+        dependency_set_commitment,
+        dependency_count,
+        registered_ordinal: dependency_count,
+        unresolved_count: 0,
+        dependency_rejected: false,
+        causal_accumulator_root: ScratchCausalAccumulatorRoot::default(),
+        causal_materialization_charged: true,
+        registration_work_remaining: None,
+        finalization_work_remaining: 0,
+        status: CompactBatchStatus::Final,
+        final_status: Some(final_status),
+        final_dependency_status: Some(final_dependency_status),
+    };
+    validate_record(&record)?;
+    let mut next = roots.clone();
+    next.batch_status_root = put_record(store, &next, &record)?;
+    Ok(next)
+}
+
 /// Visit exactly one canonical manifest dependency at the durable ordinal.
 ///
 /// `manifest_fingerprint`, `ordinal`, and `dependency` are selected from the
@@ -1306,6 +1360,65 @@ mod tests {
     use uuid::Uuid;
 
     use crate::oplog::{DeviceId, WorkspaceId};
+
+    #[test]
+    fn ordered_final_records_history_without_scheduler_state() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-dependency-queue-ordered-final-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let archive = Dir::open_ambient_dir(&path, ambient_authority()).unwrap();
+        let store =
+            ScratchStore::open(&archive, WorkspaceId::from_uuid(Uuid::from_u128(1))).unwrap();
+        let roots = ScratchRoots::default();
+        let batch_id = BatchId::from_uuid(Uuid::from_u128(2));
+        let fingerprint = ContentDigest::of(b"manifest");
+        let event_binding = ContentDigest::of(b"event");
+        let dependency_set = ContentDigest::of(b"dependencies");
+        let final_status = vec![1, 2, 3];
+
+        let next = record_ordered_final(
+            &store,
+            &roots,
+            batch_id,
+            fingerprint,
+            event_binding,
+            dependency_set,
+            7,
+            final_status.clone(),
+            FinalDependencyStatus::Satisfied,
+        )
+        .unwrap();
+        let record = lookup(&store, &next, batch_id).unwrap().unwrap();
+
+        assert_eq!(record.status(), CompactBatchStatus::Final);
+        assert_eq!(record.manifest_fingerprint(), fingerprint);
+        assert_eq!(record.event_binding_digest(), event_binding);
+        assert_eq!(record.dependency_count(), 7);
+        assert_eq!(record.registered_ordinal(), 7);
+        assert_eq!(record.unresolved_count(), 0);
+        assert_eq!(record.final_status(), Some(final_status.as_slice()));
+        assert_eq!(
+            record.final_dependency_status(),
+            Some(FinalDependencyStatus::Satisfied)
+        );
+        assert_eq!(next.dependency_root, roots.dependency_root);
+        assert_eq!(
+            next.unresolved_dependency_root,
+            roots.unresolved_dependency_root
+        );
+        assert_eq!(next.wait_root, roots.wait_root);
+        assert_eq!(next.wait_progress_root, roots.wait_progress_root);
+        assert_eq!(next.fanout_root, roots.fanout_root);
+        assert_eq!(next.fanout_head, 0);
+        assert_eq!(next.fanout_tail, 0);
+        assert_eq!(next.registering_len, 0);
+        assert_eq!(next.ready_queue_root, roots.ready_queue_root);
+        assert_eq!(next.ready_queue_len, 0);
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn correction11_n_children_before_parent_visits_each_wait_edge_once() {

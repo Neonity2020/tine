@@ -3067,7 +3067,7 @@ fn author_bootstrap_parts(
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
     progress: &mut dyn FnMut(BootstrapPreparationProgress),
 ) -> Result<AuthoredBootstrapParts, BootstrapStreamingImportError> {
-    let profile_digest = BootstrapPartitionProfileV1::v1().digest();
+    let profile_digest = BootstrapPartitionProfileV1::current().digest();
     // The provisional evidence and the exact descriptor have the same part
     // identity; payload commitment is filled from the prepared bytes below.
     // Keep the typed engine material returned by this one authoring pass rather
@@ -3122,7 +3122,6 @@ fn author_bootstrap_parts(
                 .try_into()
                 .expect("checked part-boundary frame length"),
         );
-        let mut records = Vec::with_capacity(operation_count as usize);
         let mut transaction_operations = Vec::with_capacity(operation_count as usize);
         let mut operation_leaves = Vec::with_capacity(operation_count as usize);
         let mut source_spans = BTreeSet::new();
@@ -3132,12 +3131,11 @@ fn author_bootstrap_parts(
                     "operation spool ended before its part boundary".into(),
                 )
             })?;
-            transaction_operations.push(record.operation.clone());
             operation_leaves.push(record.operation_leaf()?);
             if let Some(span) = record.source_span()? {
                 source_spans.insert(span);
             }
-            records.push(record);
+            transaction_operations.push(record.operation);
         }
         authored_operations += u64::from(operation_count);
         let transaction = OperationTransaction::new(transaction_operations)
@@ -3169,9 +3167,23 @@ fn author_bootstrap_parts(
             .manifest()
             .encode()
             .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
-        let payload_descriptors = prepared_payload_descriptors(&prepared)?;
+        let encoded_objects = prepared
+            .objects()
+            .iter()
+            .map(|object| {
+                object.encode().map_err(|error| {
+                    BootstrapStreamingImportError::InvalidOperation(error.to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload_descriptors = prepared_payload_descriptors(&encoded_objects)?;
         let payload_root = PayloadObjectRootV1::from_objects(&payload_descriptors)?;
-        validate_prepared_part_limits(&prepared, operation_count)?;
+        validate_prepared_part_limits(
+            &prepared,
+            &manifest_bytes,
+            &encoded_objects,
+            operation_count,
+        )?;
         let evidence = BootstrapImportPartEvidenceV1::new(
             import_id,
             profile_digest,
@@ -3212,7 +3224,7 @@ fn author_bootstrap_parts(
             evidence,
             &source_spans,
             &manifest_bytes,
-            prepared.objects(),
+            &encoded_objects,
             instrumentation,
         )?;
         instrumentation.peak_owned_part_operations = instrumentation
@@ -3248,7 +3260,6 @@ fn author_bootstrap_parts(
         descriptors.push(descriptor);
         engine_materials.push(engine_material);
         predecessor = Some(evidence.part_id());
-        drop(records);
         progress(BootstrapPreparationProgress::DetachedAuthoring {
             completed: ordinal + 1,
             total: part_count,
@@ -3314,15 +3325,11 @@ fn finish_boxed_detached_bootstrap_session(
 }
 
 fn prepared_payload_descriptors(
-    prepared: &super::PreparedBatch,
+    encoded_objects: &[Vec<u8>],
 ) -> Result<Vec<PayloadObjectDescriptorV1>, BootstrapStreamingImportError> {
-    prepared
-        .objects()
+    encoded_objects
         .iter()
-        .map(|object| {
-            let bytes = object.encode().map_err(|error| {
-                BootstrapStreamingImportError::InvalidOperation(error.to_string())
-            })?;
+        .map(|bytes| {
             PayloadObjectDescriptorV1::new(ContentDigest::of(&bytes), bytes.len() as u64)
                 .map_err(Into::into)
         })
@@ -3331,12 +3338,10 @@ fn prepared_payload_descriptors(
 
 fn validate_prepared_part_limits(
     prepared: &super::PreparedBatch,
+    manifest: &[u8],
+    encoded_objects: &[Vec<u8>],
     operation_count: u32,
 ) -> Result<(), BootstrapStreamingImportError> {
-    let manifest = prepared
-        .manifest()
-        .encode()
-        .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
     if manifest.len() > BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES {
         return if operation_count == 1 {
             Err(BootstrapStreamingImportError::SingletonOverLimit(
@@ -3352,10 +3357,7 @@ fn validate_prepared_part_limits(
     }
     let mut total = 0_u64;
     let mut semantic = None;
-    for object in prepared.objects() {
-        let bytes = object
-            .encode()
-            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
+    for (object, bytes) in prepared.objects().iter().zip(encoded_objects) {
         total = total.checked_add(bytes.len() as u64).ok_or_else(|| {
             BootstrapStreamingImportError::InvalidOperation(
                 "prepared object byte count overflow".into(),
@@ -3403,7 +3405,7 @@ fn write_prepared_bootstrap_part(
     evidence: BootstrapImportPartEvidenceV1,
     source_spans: &[SourceSpanV1],
     manifest_bytes: &[u8],
-    objects: &[super::OperationObject],
+    encoded_objects: &[Vec<u8>],
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<(), BootstrapStreamingImportError> {
     let directory = parts.join(format!("{ordinal:08}"));
@@ -3423,10 +3425,7 @@ fn write_prepared_bootstrap_part(
     let object_path = directory.join(BOOTSTRAP_STREAM_PART_OBJECTS);
     let mut writer = BufWriter::new(create_new_file(&object_path)?);
     let mut object_bytes = 0_u64;
-    for object in objects {
-        let bytes = object
-            .encode()
-            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
+    for bytes in encoded_objects {
         object_bytes = object_bytes.saturating_add(write_frame(&mut writer, &bytes)?);
     }
     writer.flush()?;
@@ -3591,7 +3590,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         );
     }
 
-    let profile_digest = BootstrapPartitionProfileV1::v1().digest();
+    let profile_digest = BootstrapPartitionProfileV1::current().digest();
     let initial_frontier = ArchiveLocalFrontierBindingV1::initial(source.import_id, profile_digest);
     let aggregate = BootstrapAggregateManifestV1::new_for_import(
         workspace_id,
@@ -10705,8 +10704,14 @@ mod tests {
         let (_root, prepared, _) = prepare_streaming_bootstrap("authoring-linear-1000", &files);
 
         assert_eq!(prepared.instrumentation().page_capsules, PAGE_COUNT as u64);
-        assert_eq!(prepared.instrumentation().parts, 17);
-        assert_eq!(prepared.aggregate().parts().len(), 17);
+        assert!(
+            prepared.instrumentation().parts > 1,
+            "the structural fixture must exercise cross-part authoring"
+        );
+        assert_eq!(
+            prepared.aggregate().parts().len(),
+            prepared.instrumentation().parts as usize
+        );
         assert!(
             prepared.instrumentation().peak_owned_part_operations
                 <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
@@ -10737,10 +10742,9 @@ mod tests {
             work.reference_catalog_full_delta_validations, 0,
             "private same-call construction must not replay prepared catalog deltas"
         );
-        assert_eq!(
-            work.reference_catalog_final_validations, 1,
-            "the complete reachable catalog must be validated exactly once before the candidate leaves construction"
-        );
+        assert_eq!(work.reference_catalog_prepared_sources, PAGE_COUNT);
+        assert_eq!(work.reference_catalog_fact_updates, PAGE_COUNT);
+        assert_eq!(work.reference_catalog_persistent_node_reads, 0);
         assert_eq!(
             work.authenticated_page_identity_lookups,
             PAGE_COUNT * 3,

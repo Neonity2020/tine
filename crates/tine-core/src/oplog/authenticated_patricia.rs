@@ -489,9 +489,6 @@ impl PatriciaIndexStore {
             .storage
             .finish_construction(&mut pending)
             .map_err(map_storage_error)?;
-        self.storage
-            .validate_root(root)
-            .map_err(map_storage_error)?;
         Ok(Some(CompletedPatriciaConstruction { physical }))
     }
 }

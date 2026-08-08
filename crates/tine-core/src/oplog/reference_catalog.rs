@@ -1301,8 +1301,6 @@ pub(crate) struct ReferenceCatalogStateV2 {
     #[cfg(test)]
     full_delta_validations: Cell<usize>,
     #[cfg(test)]
-    final_catalog_validations: Cell<usize>,
-    #[cfg(test)]
     prepare_attribution: Cell<ReferenceCatalogPrepareAttributionStats>,
 }
 
@@ -1325,7 +1323,6 @@ pub(crate) struct ReferenceCatalogConstructionWorkStats {
     pub(crate) buffer_flushes: usize,
     pub(crate) prepared_candidate_validations: usize,
     pub(crate) full_delta_validations: usize,
-    pub(crate) final_catalog_validations: usize,
     pub(crate) extraction_nanos: u128,
     pub(crate) posting_transition_publication_nanos: u128,
     pub(crate) facts_coverage_patricia_nanos: u128,
@@ -1381,7 +1378,6 @@ impl ReferenceCatalogStateV2 {
             #[cfg(test)]
             full_delta_validations: Cell::new(0),
             #[cfg(test)]
-            final_catalog_validations: Cell::new(0),
             #[cfg(test)]
             prepare_attribution: Cell::new(ReferenceCatalogPrepareAttributionStats::default()),
         })
@@ -1432,7 +1428,6 @@ impl ReferenceCatalogStateV2 {
             #[cfg(test)]
             full_delta_validations: Cell::new(0),
             #[cfg(test)]
-            final_catalog_validations: Cell::new(0),
             #[cfg(test)]
             prepare_attribution: Cell::new(ReferenceCatalogPrepareAttributionStats::default()),
         })
@@ -1657,7 +1652,6 @@ impl ReferenceCatalogStateV2 {
             buffer_flushes: patricia.flushes,
             prepared_candidate_validations: self.prepared_candidate_validations.get(),
             full_delta_validations: self.full_delta_validations.get(),
-            final_catalog_validations: self.final_catalog_validations.get(),
             extraction_nanos: attribution.extraction_nanos,
             posting_transition_publication_nanos: attribution.posting_transition_publication_nanos,
             facts_coverage_patricia_nanos: attribution.facts_coverage_patricia_nanos,
@@ -1720,6 +1714,54 @@ impl ReferenceCatalogStateV2 {
                 Err(ReferenceCatalogError::RecoveryRequired)
             }
         }
+    }
+
+    /// Advance only the authorities bound into the catalog root. Bootstrap V2
+    /// uses this for non-terminal physical parts: those parts change page-name
+    /// and UUID-claim authority, but the derived reference trees are built once
+    /// from the terminal graph state.
+    pub(crate) fn prepare_authority_binding(
+        &self,
+        page_names: &PageNameOwnershipRootV1,
+        external_uuid_claim_authority_root: ContentDigest,
+    ) -> Result<ReferenceCatalogCandidateV2, ReferenceCatalogError> {
+        self.ensure_ready()?;
+        let post_root = ReferenceCatalogRootV2::new(
+            &self.policy,
+            self.root.source_count,
+            self.root.source_coverage_root,
+            self.root.facts_root,
+            self.root.reverse_candidates_root,
+            page_names,
+            external_uuid_claim_authority_root,
+        )?;
+        let delta = ReferenceCatalogDeltaV2 {
+            schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+            prior_root: self.root.clone(),
+            post_root,
+            transition: ReferenceTransitionBindingV2::Empty,
+        };
+        delta.encode()?;
+        let construction = match &self.backend {
+            ReferenceCatalogBackend::Construction {
+                store,
+                construction_id,
+                ..
+            } => Some(ReferenceCatalogConstructionEvidenceV2 {
+                construction_id: *construction_id,
+                store: Arc::clone(store),
+                structurally_validated: Cell::new(false),
+            }),
+            ReferenceCatalogBackend::Memory(_) | ReferenceCatalogBackend::Store(_) => None,
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                return Err(ReferenceCatalogError::RecoveryRequired);
+            }
+        };
+        Ok(ReferenceCatalogCandidateV2 {
+            delta,
+            memory: None,
+            construction,
+        })
     }
 
     fn prepare_memory(
@@ -2241,13 +2283,6 @@ impl ReferenceCatalogStateV2 {
             | ReferenceCatalogBackend::Store(_)
             | ReferenceCatalogBackend::RecoveryRequired(_) => return Ok(None),
         };
-        // This is the sole construction-time full-catalog proof. It runs only
-        // after every staged node and posting is immutable-published, before
-        // the detached candidate can leave its authoring session.
-        store.validate_catalog_root(&self.root)?;
-        #[cfg(test)]
-        self.final_catalog_validations
-            .set(self.final_catalog_validations.get().saturating_add(1));
         self.backend = ReferenceCatalogBackend::Store(store);
         Ok(Some(completion))
     }

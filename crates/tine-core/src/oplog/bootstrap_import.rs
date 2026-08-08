@@ -737,12 +737,34 @@ impl BootstrapPartitionProfileV1 {
         }
     }
 
+    /// Current authoring profile. V2 keeps the same physical part limits as
+    /// V1, but derives the reference catalog once from the terminal bootstrap
+    /// state instead of rebuilding its growing Patricia trees for every part.
+    pub(crate) fn current() -> Self {
+        Self {
+            digest: BootstrapProfileDigestV1::digest(
+                b"tine/bootstrap-import/partition-profile/v2\0",
+                &[
+                    Self::v1().digest.as_bytes(),
+                    b"terminal-reference-catalog/v1",
+                ],
+            ),
+        }
+    }
+
     pub(crate) const fn digest(self) -> BootstrapProfileDigestV1 {
         self.digest
     }
 
+    pub(crate) fn uses_terminal_reference_catalog(
+        digest: BootstrapProfileDigestV1,
+    ) -> Result<bool, BootstrapImportError> {
+        Self::validate_digest(digest)?;
+        Ok(digest == Self::current().digest)
+    }
+
     fn validate_digest(digest: BootstrapProfileDigestV1) -> Result<(), BootstrapImportError> {
-        if digest != Self::v1().digest {
+        if digest != Self::v1().digest && digest != Self::current().digest {
             return Err(BootstrapImportError::ProfileMismatch);
         }
         Ok(())
@@ -4917,6 +4939,14 @@ mod tests {
     #[test]
     fn profile_constants_are_all_digest_sensitive_and_boundaries_stream() {
         let baseline = profile();
+        assert_ne!(baseline, BootstrapPartitionProfileV1::current().digest());
+        assert!(!BootstrapPartitionProfileV1::uses_terminal_reference_catalog(baseline).unwrap());
+        assert!(
+            BootstrapPartitionProfileV1::uses_terminal_reference_catalog(
+                BootstrapPartitionProfileV1::current().digest()
+            )
+            .unwrap()
+        );
         for index in 0..PROFILE_CONSTANTS_V1.len() {
             let mut changed = PROFILE_CONSTANTS_V1.to_vec();
             changed[index] = match changed[index] {
