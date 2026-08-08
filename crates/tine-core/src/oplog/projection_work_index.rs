@@ -409,10 +409,21 @@ impl ProjectionExpectedPathReadBudget {
     }
 
     pub(crate) fn reserve(&mut self, bytes: u64) -> Result<(), ProjectionWorkError> {
-        self.remaining_bytes = self
-            .remaining_bytes
-            .checked_sub(bytes)
-            .ok_or(ProjectionWorkError::RetainedMemoryLimitExceeded)?;
+        self.remaining_bytes = match self.remaining_bytes.checked_sub(bytes) {
+            Some(remaining) => remaining,
+            None => {
+                // The variant alone cannot distinguish "one oversized row" from
+                // "a page that simply holds too many rows", and those need
+                // opposite fixes. Cf. TINE_BOUND_TRACE in reconciliation_scan.
+                if std::env::var_os("TINE_BOUND_TRACE").is_some() {
+                    eprintln!(
+                        "RETAINED BUDGET EXHAUSTED: reserve({bytes}) with {} remaining of {} granted",
+                        self.remaining_bytes, self.granted_bytes
+                    );
+                }
+                return Err(ProjectionWorkError::RetainedMemoryLimitExceeded);
+            }
+        };
         Ok(())
     }
 
@@ -426,10 +437,18 @@ impl ProjectionExpectedPathReadBudget {
         &mut self,
         retained_bytes: u64,
     ) -> Result<(), ProjectionWorkError> {
-        self.remaining_bytes = self
-            .granted_bytes
-            .checked_sub(retained_bytes)
-            .ok_or(ProjectionWorkError::RetainedMemoryLimitExceeded)?;
+        self.remaining_bytes = match self.granted_bytes.checked_sub(retained_bytes) {
+            Some(remaining) => remaining,
+            None => {
+                if std::env::var_os("TINE_BOUND_TRACE").is_some() {
+                    eprintln!(
+                        "RETAINED BUDGET EXHAUSTED (reset): retained={retained_bytes} exceeds granted={}",
+                        self.granted_bytes
+                    );
+                }
+                return Err(ProjectionWorkError::RetainedMemoryLimitExceeded);
+            }
+        };
         Ok(())
     }
 
