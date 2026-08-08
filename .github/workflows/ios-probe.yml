@@ -14,6 +14,18 @@ jobs:
   ios-probe:
     runs-on: macos-latest
     timeout-minutes: 45
+    # tauri-plugin builds our app-local Swift package through swift-rs with
+    # `IPHONEOS_DEPLOYMENT_TARGET`, defaulting to **13.0** when unset
+    # (tauri-plugin-2.6.2 src/build/mobile.rs -> tauri_utils::build::link_swift_library).
+    # Our Package.swift declares `.iOS(.v14)` because the folder picker uses
+    # `UIDocumentPickerViewController(forOpeningContentTypes:)` and `UTType`, both
+    # iOS 14+. That mismatch is why `_init_plugin_tine_ios_folder_picker` came out
+    # undefined at link time while `tauri-plugin-opener`'s `_init_plugin_opener` —
+    # same `ios_plugin_binding!` + `@_cdecl` pattern, but a `.iOS(.v13)` package —
+    # resolved fine in the very same build. Pin the deployment target so the Swift
+    # build and the package declaration agree.
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
 
