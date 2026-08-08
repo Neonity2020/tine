@@ -9798,6 +9798,35 @@ impl RuntimeActor {
     }
 
     fn tick(&mut self) -> SyncRuntimeTick {
+        // Every tick of a converging import costs ~67ms even when it produces
+        // nothing (F33), and the first explanation for that was wrong (F37).
+        // Time the tick and label it by the branch it took, so the cost is
+        // attributed by measurement rather than inferred from mechanism.
+        if std::env::var_os("TINE_TICK_TRACE").is_none() {
+            return self.tick_inner();
+        }
+        let started = std::time::Instant::now();
+        let outcome = self.tick_inner();
+        let label = match &outcome {
+            SyncRuntimeTick::LocalMutation(_) => "LocalMutation",
+            SyncRuntimeTick::Idle => "Idle",
+            SyncRuntimeTick::AdmittedNoop { .. } => "AdmittedNoop",
+            SyncRuntimeTick::AdmittedComplete { .. } => "AdmittedComplete",
+            SyncRuntimeTick::Blocked(_) => "Blocked",
+            SyncRuntimeTick::Recovering => "Recovering",
+            SyncRuntimeTick::RetryFull => "RetryFull",
+            SyncRuntimeTick::Failed(_) => "Failed",
+            _ => "Other",
+        };
+        eprintln!(
+            "TICK: {label} {:.1}ms watcher_pending={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.last_watcher.pending,
+        );
+        outcome
+    }
+
+    fn tick_inner(&mut self) -> SyncRuntimeTick {
         if let Some(outcome) = self.advance_local_mutation_once() {
             return SyncRuntimeTick::LocalMutation(outcome);
         }
