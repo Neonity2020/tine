@@ -121,6 +121,12 @@ impl ResumeBudget {
                 "coordinator resume operation budget was exceeded",
             ));
         }
+        // The budget is charged per phase, so this is the only place that knows
+        // which phase consumes an import's work. ~36 s of a 300-file import is
+        // irreducible work (F42) and it has never been attributed to a phase.
+        if std::env::var_os("TINE_PHASE_TRACE").is_some() {
+            eprintln!("PHASE CHARGE {phase:?} {count}");
+        }
         self.remaining -= count;
         Ok(())
     }
