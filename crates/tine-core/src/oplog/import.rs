@@ -27,7 +27,8 @@ use super::bootstrap_import::{
     SourceBlobIndexBuilderV1, SourceContentDigestV1, SourceInventoryIndexBuilderV1,
     SourceInventoryRootBuilderV1, SourceInventoryRootV1, SourceLeafDigestV1, SourceLeafV1,
     SourceSpanRootV1, SourceSpanV1, MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART, MAX_BOOTSTRAP_PARTS,
-    MAX_OPERATIONS_PER_BOOTSTRAP_PART, MAX_PARSED_NODES_PER_SOURCE_FILE,
+    MAX_OPERATIONS_PER_BOOTSTRAP_PART, MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART,
+    MAX_PARSED_NODES_PER_SOURCE_FILE, MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART,
     MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART, MAX_SOURCE_FILE_BYTES, MAX_SOURCE_INDEX_PAGES,
     MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART, MAX_TOTAL_SOURCE_BYTES,
 };
@@ -159,17 +160,7 @@ const BOOTSTRAP_STREAM_PART_SPANS: &str = "spans.bin";
 const BOOTSTRAP_STREAM_PART_OBJECTS: &str = "objects.frames";
 const BOOTSTRAP_STREAM_OPERATION_SPOOL: &str = "operations.sorted";
 const BOOTSTRAP_STREAM_BOUNDARY_SPOOL: &str = "part-boundaries.frames";
-const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = 768 * 1024;
-/// A conservative page/document cardinality cap keeps the ordinary v4 JSON
-/// manifest, payload descriptor list, accepted-evidence document frontier, and
-/// aggregate part descriptor below their existing byte limits. Page content is
-/// packed up to this bound; a single page exceeds it only by being one document.
-const BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART: u32 = 512;
-/// Page declarations are small, but authoring adds payload metadata beyond the
-/// declaration operation itself. This cap leaves ample room under the separate
-/// 4,096-payload-object bound while still fitting one million empty pages into
-/// the existing 1,024-part aggregate limit.
-const BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART: u32 = 2048;
+const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART;
 /// Fixed per-operation allowance for the before/after and membership fields
 /// added by the existing semantic-effect encoder. The operation's own
 /// canonical bytes are charged separately. Exact prepared bytes are still
@@ -2991,10 +2982,10 @@ fn partition_bootstrap_operation_spool(
             || part_spans.saturating_add(unit.spans) > MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART
             || (unit.declarations
                 && adds_document
-                && part_documents.len() as u32 == BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART)
+                && part_documents.len() as u32 == MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART)
             || (!unit.declarations
                 && adds_document
-                && part_documents.len() as u32 == BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART);
+                && part_documents.len() as u32 == MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART);
         if exceeds {
             flush(
                 &mut writer,
@@ -3178,6 +3169,17 @@ fn author_bootstrap_parts(
             .collect::<Result<Vec<_>, _>>()?;
         let payload_descriptors = prepared_payload_descriptors(&encoded_objects)?;
         let payload_root = PayloadObjectRootV1::from_objects(&payload_descriptors)?;
+        #[cfg(test)]
+        if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+            eprintln!(
+                "bootstrap prepared part: ordinal={} operations={} manifest_bytes={} objects={} affected_documents={}",
+                ordinal,
+                operation_count,
+                manifest_bytes.len(),
+                encoded_objects.len(),
+                engine_material.accepted_evidence().affected_documents().len(),
+            );
+        }
         validate_prepared_part_limits(
             &prepared,
             &manifest_bytes,
@@ -11235,13 +11237,14 @@ mod tests {
     }
 
     #[test]
-    fn inactive_streaming_bootstrap_partitions_zero_one_4096_and_4097_without_retention() {
+    fn inactive_streaming_bootstrap_forced_partition_boundary_is_lossless() {
         for (count, expected_parts) in [(0, 0), (1, 1), (4096, 1), (4097, 2)] {
             let root = TestRoot::new(&format!("streaming-partition-{count}"));
             let working = root.path().join("partition");
             fs::create_dir(&working).unwrap();
             let spool = synthetic_operation_spool(&working, count);
             let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
+            force_next_bootstrap_part_operation_limit(4_096);
             assert_eq!(
                 partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation)
                     .unwrap(),
@@ -11253,20 +11256,27 @@ mod tests {
     }
 
     #[test]
-    fn inactive_streaming_bootstrap_partitions_512_and_513_page_capsules_losslessly() {
-        for (page_count, expected_boundaries) in [(512, vec![512]), (513, vec![512, 1])] {
+    fn inactive_streaming_bootstrap_partitions_page_document_boundary_losslessly() {
+        let limit = MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART as usize;
+        for (page_count, expected_boundaries) in [
+            (limit, vec![limit as u32]),
+            (limit + 1, vec![limit as u32, 1]),
+        ] {
             let root = TestRoot::new(&format!("streaming-page-capsules-{page_count}"));
             let working = root.path().join("partition");
             fs::create_dir(&working).unwrap();
-            let spool = synthetic_page_capsule_spool(&working, page_count);
+            let spool = synthetic_page_capsule_spool(&working, page_count as u64);
             let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
             assert_eq!(
                 partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation)
                     .unwrap(),
                 expected_boundaries.len() as u32
             );
-            assert_eq!(instrumentation.page_capsules, page_count);
-            assert_eq!(instrumentation.max_part_documents, page_count.min(512));
+            assert_eq!(instrumentation.page_capsules, page_count as u64);
+            assert_eq!(
+                instrumentation.max_part_documents,
+                page_count.min(limit) as u64
+            );
 
             let mut boundaries = FrameReader::open(
                 &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
@@ -11546,12 +11556,8 @@ mod tests {
     }
 
     #[test]
-    fn inactive_streaming_bootstrap_authors_4096_and_4097_operation_boundaries() {
-        for (block_count, expected_operations) in [
-            (4_095, vec![1, 4_095]),
-            (4_096, vec![1, 4_096]),
-            (4_097, vec![1, 4_096, 1]),
-        ] {
+    fn inactive_streaming_bootstrap_does_not_split_at_legacy_operation_boundary() {
+        for block_count in [4_095, 4_096, 4_097] {
             let mut source = String::new();
             for index in 0..block_count {
                 source.push_str(&format!("- block {index:04}\n"));
@@ -11569,8 +11575,8 @@ mod tests {
                     .operation_root()
                     .operation_count())
                     .collect::<Vec<_>>(),
-                expected_operations,
-                "the declaration phase is canonical and a huge page splits only at the hard content-operation bound"
+                vec![1, block_count],
+                "the declaration phase remains separate, but the retired 4,096-operation cap must not split content"
             );
         }
     }
@@ -11682,7 +11688,7 @@ mod tests {
         fs::create_dir(&working).unwrap();
         let operation_path = working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
         let mut writer = BufWriter::new(create_new_file(&operation_path).unwrap());
-        for index in 0..BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART {
+        for index in 0..MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART {
             let path = format!("pages/declaration-{index}.md");
             let record = BootstrapOperationRecord::new(
                 SemanticOperation::CreatePage {
@@ -11712,7 +11718,7 @@ mod tests {
         let mut boundaries = BufWriter::new(create_new_file(&boundary_path).unwrap());
         write_frame(
             &mut boundaries,
-            &BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART.to_be_bytes(),
+            &MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART.to_be_bytes(),
         )
         .unwrap();
         boundaries.flush().unwrap();
@@ -11729,8 +11735,8 @@ mod tests {
             ImportId::from_digest([0x6f; 32]),
             &BootstrapOperationSpool {
                 path: operation_path,
-                operation_count: u64::from(BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART),
-                declaration_count: u64::from(BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART),
+                operation_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
+                declaration_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
             },
             1,
             &working,
@@ -11741,7 +11747,7 @@ mod tests {
         assert_eq!(authored.descriptors.len(), 1);
         assert_eq!(
             instrumentation.max_part_documents,
-            u64::from(BOOTSTRAP_STREAM_MAX_PAGE_DECLARATIONS_PER_PART) + 1
+            u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART) + 1
         );
         assert!(
             instrumentation.max_part_payload_descriptors
@@ -11826,7 +11832,7 @@ mod tests {
                 &mut partition_instrumentation,
             )
             .unwrap(),
-            3
+            2
         );
         let mut boundaries = FrameReader::open(
             &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
@@ -11837,14 +11843,14 @@ mod tests {
         while let Some(boundary) = boundaries.next().unwrap() {
             operation_boundaries.push(u32::from_be_bytes(boundary.try_into().unwrap()));
         }
-        assert_eq!(operation_boundaries.len(), 3);
-        assert!(
-            MAX_OPERATIONS_PER_BOOTSTRAP_PART - operation_boundaries[1] < 16,
-            "the next 16-operation dense page capsule must be stopped by the operation limit"
+        assert_eq!(operation_boundaries.len(), 2);
+        assert_eq!(
+            operation_boundaries.iter().sum::<u32>(),
+            streaming.operation_count as u32
         );
         assert!(
             partition_instrumentation.max_part_documents
-                < u64::from(BOOTSTRAP_STREAM_MAX_PAGE_CAPSULES_PER_PART)
+                <= u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART)
         );
         let mut streaming_reader = BootstrapOperationSpoolReader::open(&streaming.path).unwrap();
         let mut streaming_operations = Vec::new();

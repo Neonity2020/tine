@@ -36,8 +36,12 @@ pub(crate) const SOURCE_BLOB_INDEX_SCHEMA_VERSION: u32 = 1;
 pub(crate) const PART_SPAN_INDEX_SCHEMA_VERSION: u32 = 1;
 pub(crate) const BOOTSTRAP_AGGREGATE_COMMIT_SCHEMA_VERSION: u32 = 1;
 
-pub(crate) const MAX_OPERATIONS_PER_BOOTSTRAP_PART: u32 = 4096;
-pub(crate) const MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART: u32 = 4096;
+/// Bootstrap parts are already bounded by semantic bytes, prepared object
+/// bytes, encoded manifest bytes, and the ordinary transaction ceiling. Keep
+/// this count ceiling aligned with that transaction boundary instead of
+/// splitting otherwise-small imports at a second, tighter arbitrary limit.
+pub(crate) const MAX_OPERATIONS_PER_BOOTSTRAP_PART: u32 = 100_000;
+pub(crate) const MAX_SOURCE_SPANS_PER_BOOTSTRAP_PART: u32 = 100_000;
 pub(crate) const MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART: u64 = 48 * 1024 * 1024;
 pub(crate) const MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART: u64 = 192 * 1024 * 1024;
 pub(crate) const MAX_BOOTSTRAP_PART_EVIDENCE_BYTES: usize = 768 * 1024;
@@ -45,7 +49,7 @@ pub(crate) const MAX_BOOTSTRAP_AGGREGATE_MANIFEST_BYTES: usize = 768 * 1024;
 pub(crate) const MAX_SOURCE_BLOB_CHUNK_BYTES: u32 = 1024 * 1024;
 pub(crate) const MAX_SOURCE_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_SOURCE_INDEX_PAGES: u32 = 4096;
-pub(crate) const MAX_PART_SPAN_INDEX_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_PART_SPAN_INDEX_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_BOOTSTRAP_AGGREGATE_COMMIT_BYTES: usize = 1024;
 pub(crate) const MAX_SOURCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_TOTAL_SOURCE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -64,6 +68,13 @@ pub(crate) const MAX_CANONICAL_NESTING_DEPTH: u8 = 4;
 pub(crate) const MAX_FULL_OBJECTS_PER_BOOTSTRAP_PART: u32 = 8_192;
 pub(crate) const MAX_FULL_OBJECT_BYTES_PER_BOOTSTRAP_PART: u64 =
     MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART + 2 * 768 * 1024;
+/// Declaration and content phases share the same encoded document/manifest
+/// budgets, so they share one page-document ceiling as well.
+pub(crate) const MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART: u32 = 2_048;
+/// Bootstrap parts are ordinary durable batches. Do not impose a second,
+/// tighter manifest policy here: the durable batch codec is the authority for
+/// both allocation bounds and accepted bytes.
+pub(crate) const MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART: usize = super::MAX_MANIFEST_BYTES;
 
 const EVIDENCE_MAGIC: &[u8; 8] = b"TINBPE1\0";
 const MANIFEST_MAGIC: &[u8; 8] = b"TINBAM1\0";
@@ -664,7 +675,46 @@ enum ProfileConstantV1 {
     U64(u64),
 }
 
+/// Exact legacy V1 constants. Current policy changes must not silently change
+/// the digest accepted for already-authored V1/V2 parts.
 const PROFILE_CONSTANTS_V1: &[ProfileConstantV1] = &[
+    ProfileConstantV1::U32(BOOTSTRAP_IMPORT_SCHEMA_VERSION),
+    ProfileConstantV1::U32(BOOTSTRAP_PARTITION_POLICY_VERSION),
+    ProfileConstantV1::U32(SOURCE_LEAF_SCHEMA_VERSION),
+    ProfileConstantV1::U32(SOURCE_BLOB_SCHEMA_VERSION),
+    ProfileConstantV1::U32(SOURCE_SPAN_SCHEMA_VERSION),
+    ProfileConstantV1::U32(OPERATION_ROOT_SCHEMA_VERSION),
+    ProfileConstantV1::U32(PAYLOAD_OBJECT_ROOT_SCHEMA_VERSION),
+    ProfileConstantV1::U32(FULL_OBJECT_ROOT_SCHEMA_VERSION),
+    ProfileConstantV1::U32(BOOTSTRAP_FRONTIER_SCHEMA_VERSION),
+    ProfileConstantV1::U32(SOURCE_INVENTORY_INDEX_SCHEMA_VERSION),
+    ProfileConstantV1::U32(SOURCE_BLOB_INDEX_SCHEMA_VERSION),
+    ProfileConstantV1::U32(PART_SPAN_INDEX_SCHEMA_VERSION),
+    ProfileConstantV1::U32(BOOTSTRAP_AGGREGATE_COMMIT_SCHEMA_VERSION),
+    ProfileConstantV1::U32(MAX_BOOTSTRAP_PARTS),
+    ProfileConstantV1::U32(4_096),
+    ProfileConstantV1::U32(4_096),
+    ProfileConstantV1::U64(MAX_SEMANTIC_EFFECT_BYTES_PER_BOOTSTRAP_PART),
+    ProfileConstantV1::U64(MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART),
+    ProfileConstantV1::U64(MAX_BOOTSTRAP_PART_EVIDENCE_BYTES as u64),
+    ProfileConstantV1::U64(MAX_BOOTSTRAP_AGGREGATE_MANIFEST_BYTES as u64),
+    ProfileConstantV1::U32(MAX_SOURCE_BLOB_CHUNK_BYTES),
+    ProfileConstantV1::U32(MAX_SOURCE_INVENTORY_LEAVES),
+    ProfileConstantV1::U32(MAX_SOURCE_BLOB_CHUNKS),
+    ProfileConstantV1::U64(MAX_SOURCE_LOCATOR_BYTES as u64),
+    ProfileConstantV1::U64(MAX_SOURCE_INDEX_PAGE_BYTES as u64),
+    ProfileConstantV1::U32(MAX_SOURCE_INDEX_PAGES),
+    ProfileConstantV1::U64((1024 * 1024) as u64),
+    ProfileConstantV1::U64(MAX_BOOTSTRAP_AGGREGATE_COMMIT_BYTES as u64),
+    ProfileConstantV1::U64(MAX_SOURCE_FILE_BYTES),
+    ProfileConstantV1::U64(MAX_TOTAL_SOURCE_BYTES),
+    ProfileConstantV1::U32(MAX_PARSED_NODES_PER_SOURCE_FILE),
+    ProfileConstantV1::U8(MAX_CANONICAL_NESTING_DEPTH),
+    ProfileConstantV1::U32(MAX_FULL_OBJECTS_PER_BOOTSTRAP_PART),
+    ProfileConstantV1::U64(MAX_FULL_OBJECT_BYTES_PER_BOOTSTRAP_PART),
+];
+
+const PROFILE_CONSTANTS_CURRENT: &[ProfileConstantV1] = &[
     ProfileConstantV1::U32(BOOTSTRAP_IMPORT_SCHEMA_VERSION),
     ProfileConstantV1::U32(BOOTSTRAP_PARTITION_POLICY_VERSION),
     ProfileConstantV1::U32(SOURCE_LEAF_SCHEMA_VERSION),
@@ -699,6 +749,8 @@ const PROFILE_CONSTANTS_V1: &[ProfileConstantV1] = &[
     ProfileConstantV1::U8(MAX_CANONICAL_NESTING_DEPTH),
     ProfileConstantV1::U32(MAX_FULL_OBJECTS_PER_BOOTSTRAP_PART),
     ProfileConstantV1::U64(MAX_FULL_OBJECT_BYTES_PER_BOOTSTRAP_PART),
+    ProfileConstantV1::U32(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
+    ProfileConstantV1::U64(MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART as u64),
 ];
 
 fn profile_digest_from_constants(constants: &[ProfileConstantV1]) -> BootstrapProfileDigestV1 {
@@ -737,16 +789,30 @@ impl BootstrapPartitionProfileV1 {
         }
     }
 
-    /// Current authoring profile. V2 keeps the same physical part limits as
-    /// V1, but derives the reference catalog once from the terminal bootstrap
-    /// state instead of rebuilding its growing Patricia trees for every part.
-    pub(crate) fn current() -> Self {
+    fn v2() -> Self {
         Self {
             digest: BootstrapProfileDigestV1::digest(
                 b"tine/bootstrap-import/partition-profile/v2\0",
                 &[
                     Self::v1().digest.as_bytes(),
                     b"terminal-reference-catalog/v1",
+                ],
+            ),
+        }
+    }
+
+    /// Current authoring profile. V3 retains terminal reference construction
+    /// and replaces redundant small count limits with the actual encoded-byte,
+    /// document, and transaction resource boundaries.
+    pub(crate) fn current() -> Self {
+        let current_constants = profile_digest_from_constants(PROFILE_CONSTANTS_CURRENT);
+        Self {
+            digest: BootstrapProfileDigestV1::digest(
+                b"tine/bootstrap-import/partition-profile/v3\0",
+                &[
+                    current_constants.as_bytes(),
+                    b"terminal-reference-catalog/v1",
+                    b"resource-budgeted-parts/v1",
                 ],
             ),
         }
@@ -760,11 +826,14 @@ impl BootstrapPartitionProfileV1 {
         digest: BootstrapProfileDigestV1,
     ) -> Result<bool, BootstrapImportError> {
         Self::validate_digest(digest)?;
-        Ok(digest == Self::current().digest)
+        Ok(digest == Self::v2().digest || digest == Self::current().digest)
     }
 
     fn validate_digest(digest: BootstrapProfileDigestV1) -> Result<(), BootstrapImportError> {
-        if digest != Self::v1().digest && digest != Self::current().digest {
+        if digest != Self::v1().digest
+            && digest != Self::v2().digest
+            && digest != Self::current().digest
+        {
             return Err(BootstrapImportError::ProfileMismatch);
         }
         Ok(())
