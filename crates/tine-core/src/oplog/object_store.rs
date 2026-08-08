@@ -425,6 +425,12 @@ pub(crate) struct AcceptedReadStats {
 /// import's *total* re-read volume can be read once at the end of a run.
 /// Diagnostic only — nothing reads these outside the probe.
 pub static INSPECT_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// `caller file:line -> (calls, required objects)`. `#[track_caller]` on
+/// `inspect_batch` makes this exact without touching a single call site --
+/// which matters, because guessing which callers dominate has already been
+/// wrong once.
+pub static INSPECT_BATCH_SITES: std::sync::Mutex<std::collections::BTreeMap<String, (usize, usize)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 pub static INSPECT_BATCH_OBJECT_READS: AtomicUsize = AtomicUsize::new(0);
 pub static INSPECT_BATCH_OBJECT_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static INSPECT_BATCH_DIGEST_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -2490,8 +2496,11 @@ impl ObjectStore {
 
     /// Inspect a single manifest and validate every present required object.
     /// Missing objects stage the batch; corrupt or mismatched objects reject it.
+    #[track_caller]
     pub fn inspect_batch(&self, batch_id: BatchId) -> Result<BatchInspection, StoreError> {
         INSPECT_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+        let caller = std::panic::Location::caller();
+        let site = format!("{}:{}", caller.file(), caller.line());
         let batches = self.open_namespace(BATCHES_DIR)?;
         let filename = manifest_filename(batch_id);
         let manifest_bytes =
@@ -2519,6 +2528,11 @@ impl ObjectStore {
             });
         }
 
+        if let Ok(mut sites) = INSPECT_BATCH_SITES.lock() {
+            let entry = sites.entry(site).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += manifest.required_objects().len();
+        }
         let objects_dir = self.open_namespace(OBJECTS_DIR)?;
         let mut missing = Vec::new();
         let mut objects = Vec::with_capacity(manifest.required_objects().len());
@@ -3519,6 +3533,84 @@ impl ObjectStore {
             });
         }
         Ok(true)
+    }
+
+    /// Read and validate only a batch's manifest, without touching its objects.
+    ///
+    /// The manifest's descriptors already carry `document_id`, `kind`,
+    /// `content_digest` and `encoded_byte_length` for every object, so a caller
+    /// that needs object *metadata* -- which documents a batch updates, how many
+    /// bytes it retains, which object holds a given kind -- never needs to read
+    /// the objects themselves. Pair this with [`Self::read_object`] to fetch the
+    /// one payload that is genuinely required.
+    pub(crate) fn read_manifest(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Option<OperationBatch>, StoreError> {
+        let batches = self.open_namespace(BATCHES_DIR)?;
+        let filename = manifest_filename(batch_id);
+        let Some(manifest_bytes) =
+            read_optional_regular(&batches, &filename, MAX_MANIFEST_BYTES as u64, None)?
+        else {
+            return Ok(None);
+        };
+        self.counters
+            .inspected_manifest_operations
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inspected_manifest_bytes
+            .fetch_add(manifest_bytes.len(), Ordering::Relaxed);
+        let manifest = OperationBatch::decode(&manifest_bytes)?;
+        if manifest.batch_id() != batch_id {
+            return Err(StoreError::ManifestPathMismatch {
+                expected: batch_id,
+                found: manifest.batch_id(),
+            });
+        }
+        if manifest.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: manifest.workspace_id(),
+            });
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Read exactly the one content-addressed object a caller already has the
+    /// digest for.
+    ///
+    /// This is the access path [`Self::inspect_batch`] is *not*: inspecting a
+    /// batch to obtain a single object costs O(whole batch) — it reads,
+    /// SHA-256s and decodes every object the manifest requires. Callers that
+    /// hold a digest are asking for a file whose name already *is* that digest,
+    /// so there is nothing to search and nothing to re-prove about the rest of
+    /// the batch.
+    ///
+    /// The object's own integrity is still checked here (digest + workspace),
+    /// because that is O(one object) and keeps the content-addressing contract.
+    /// What is dropped is re-proving *batch completeness* per object, which is
+    /// established once at acceptance: `hot_engine.rs:13120-13127` admits a
+    /// batch to the archive only on `BatchInspection::Ready`, and projection
+    /// work rows reach `Ready` only inside `accept_batch_at_history`.
+    pub(crate) fn read_object(&self, digest: ContentDigest) -> Result<OperationObject, StoreError> {
+        let objects = self.open_namespace(OBJECTS_DIR)?;
+        let bytes = read_required_regular(
+            &objects,
+            &object_filename(digest),
+            MAX_OBJECT_BYTES as u64,
+            None,
+        )?;
+        if ContentDigest::of(&bytes) != digest {
+            return Err(StoreError::ObjectPathMismatch(digest));
+        }
+        let object = OperationObject::decode(&bytes)?;
+        if object.workspace_id() != self.workspace_id {
+            return Err(StoreError::WorkspaceMismatch {
+                expected: self.workspace_id,
+                found: object.workspace_id(),
+            });
+        }
+        Ok(object)
     }
 
     pub(crate) fn read_object_bytes(&self, digest: ContentDigest) -> Result<Vec<u8>, StoreError> {

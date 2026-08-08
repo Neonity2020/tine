@@ -21,7 +21,7 @@ use std::fmt;
 use std::io;
 
 use super::{
-    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BatchInspection, BlockId, EngineError,
+    AnnotatedIdentity, AnnotatedProjectionBase, BaseBlob, BlockId, EngineError,
     LogseqIdentityOrigin, LogseqUuid, ManifestProjectionPrecondition, ManifestProjectionTarget,
     ManifestedProjectionIntent, MaterializedBlock, MaterializedPage, ObjectKind, ObjectStore,
     PageId, ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointBinding,
@@ -1361,29 +1361,36 @@ fn execute_manifested_projection_work_with_runtime(
     ) {
         return Err(ProjectionError::WorkNotReady);
     }
-    let batch = match archive
-        .inspect_batch(work.batch_id())
-        .map_err(|error| ProjectionError::Archive(error.to_string()))?
-    {
-        BatchInspection::Ready(batch) => batch,
-        BatchInspection::Absent | BatchInspection::Staged { .. } => {
-            return Err(ProjectionError::Archive(
-                "projection work batch is not a complete immutable object set".into(),
-            ));
-        }
-    };
-    let intent_object = batch
-        .objects()
-        .iter()
-        .find(|object| {
-            object.kind() == ObjectKind::ProjectionIntent
-                && object.document_id() == work.intent().document_id()
-                && object.descriptor().is_ok_and(|descriptor| {
-                    descriptor.content_digest() == work.intent().content_digest()
-                        && descriptor.encoded_byte_length() == work.intent().encoded_byte_length()
-                })
+    // Read the one object this work names, not the batch that contains it.
+    //
+    // The previous shape asked the archive to `inspect_batch(work.batch_id())`
+    // and then linearly scanned the result for an object whose digest it was
+    // already holding. `inspect_batch` reads, SHA-256s and decodes *every*
+    // object the manifest requires, so a single document's projection cost
+    // O(whole batch) and a whole import cost O(n^2): measured at 3.59 GB of
+    // read+SHA-256 to import 300 files of a ~1.3 MB corpus, scaling as n^1.79.
+    //
+    // Nothing is trusted here that was not already established. The object is
+    // content-addressed, so the digest in the authenticated work row pins its
+    // identity exactly as the scan did. Batch *completeness* is proved once at
+    // acceptance -- `hot_engine.rs:13120-13127` admits a batch to the archive
+    // only on `BatchInspection::Ready`, and a projection work row reaches
+    // `Ready` only inside `accept_batch_at_history` -- so re-deriving it per
+    // document was re-derivation, not protection. A missing object still fails
+    // closed, now as an archive read error rather than an incompleteness error.
+    let intent_object = archive
+        .read_object(work.intent().content_digest())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if intent_object.kind() != ObjectKind::ProjectionIntent
+        || intent_object.document_id() != work.intent().document_id()
+        || !intent_object.descriptor().is_ok_and(|descriptor| {
+            descriptor.content_digest() == work.intent().content_digest()
+                && descriptor.encoded_byte_length() == work.intent().encoded_byte_length()
         })
-        .ok_or(ProjectionError::WorkIntentMismatch)?;
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let intent_object = &intent_object;
     let manifested = ManifestedProjectionIntent::decode(intent_object.payload())
         .map_err(|error| ProjectionError::Archive(error.to_string()))?;
     if manifested.source_endpoint_id() != work.endpoint_id()
@@ -1404,18 +1411,20 @@ fn execute_manifested_projection_work_with_runtime(
     let expected_base = match manifested.precondition() {
         ManifestProjectionPrecondition::Absent => None,
         ManifestProjectionPrecondition::Present { base } => {
-            let base_object = batch
-                .objects()
-                .iter()
-                .find(|object| {
-                    object.kind() == ObjectKind::AnnotatedBaseBlob
-                        && object.document_id() == base.document_id()
-                        && object.descriptor().is_ok_and(|descriptor| {
-                            descriptor.content_digest() == base.content_digest()
-                                && descriptor.encoded_byte_length() == base.encoded_byte_length()
-                        })
+            // Same one-object read as the intent above, same argument.
+            let base_object = archive
+                .read_object(base.content_digest())
+                .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+            if base_object.kind() != ObjectKind::AnnotatedBaseBlob
+                || base_object.document_id() != base.document_id()
+                || !base_object.descriptor().is_ok_and(|descriptor| {
+                    descriptor.content_digest() == base.content_digest()
+                        && descriptor.encoded_byte_length() == base.encoded_byte_length()
                 })
-                .ok_or(ProjectionError::WorkIntentMismatch)?;
+            {
+                return Err(ProjectionError::WorkIntentMismatch);
+            }
+            let base_object = &base_object;
             Some(
                 AnnotatedProjectionBase::decode(base_object.payload())
                     .map_err(|error| ProjectionError::Archive(error.to_string()))?,

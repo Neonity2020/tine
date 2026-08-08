@@ -21758,6 +21758,13 @@ mod tests {
                 },
                 bytes as f64 / 1_073_741_824.0,
             );
+            if let Ok(sites) = crate::oplog::object_store::INSPECT_BATCH_SITES.lock() {
+                let mut rows: Vec<_> = sites.iter().collect();
+                rows.sort_by_key(|(_, (_, objects))| std::cmp::Reverse(*objects));
+                for (site, (calls, objects)) in rows.into_iter().take(8) {
+                    println!("  INSPECT_BATCH SITE {site}: calls={calls} objects={objects}");
+                }
+            }
         }
         if !settled {
             println!(

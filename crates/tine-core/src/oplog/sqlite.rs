@@ -67,7 +67,8 @@ use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
-    ObjectKind, ObjectStore, PageId, PreparedBatch, ReferenceFactV1, ReferenceSourceLocatorV1,
+    ObjectKind, ObjectStore, OperationBatch, PageId, PreparedBatch, ReferenceFactV1,
+    ReferenceSourceLocatorV1,
     SemanticEffect, SemanticEffectDigest, ShardedHotEngine, ValidatedBatch, WorkspaceId,
     WorkspaceStatus, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
     OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION, OPLOG_PROTOCOL_VERSION,
@@ -156,31 +157,34 @@ impl AcceptedBatchEvent {
         let evidence = engine
             .accepted_batch_evidence(batch_id)
             .map_err(|error| ProjectionError::InvalidAcceptedEvent(error.to_string()))?;
-        let validated = match store.inspect_batch(batch_id)? {
-            BatchInspection::Ready(validated) => validated,
-            BatchInspection::Absent => {
-                return Err(ProjectionError::InvalidAcceptedEvent(format!(
-                    "accepted batch {batch_id} is absent from the object store"
-                )));
-            }
-            BatchInspection::Staged { .. } => {
-                return Err(ProjectionError::InvalidAcceptedEvent(format!(
-                    "accepted batch {batch_id} is partial in the object store"
-                )));
-            }
-        };
-        if validated.manifest().lineage_digest() != engine.lineage_digest() {
+        // Read the manifest and the one object this event needs, not the whole
+        // batch. `inspect_batch` reads, SHA-256s and decodes every object the
+        // manifest requires; this runs once per coordinator slice, and an
+        // import takes ~n^0.6 slices, so a whole-batch read here is the second
+        // half of the O(n^2) the projection executor used to own.
+        //
+        // Batch completeness is not re-derived because it was established at
+        // acceptance -- `hot_engine.rs:13120-13127` admits a batch to the
+        // archive only on `BatchInspection::Ready` -- and this constructor is
+        // reached only for a batch the engine reports as accepted (the
+        // `accepted_batch_evidence` lookup above). A missing manifest or object
+        // still fails closed.
+        let manifest = store.read_manifest(batch_id)?.ok_or_else(|| {
+            ProjectionError::InvalidAcceptedEvent(format!(
+                "accepted batch {batch_id} is absent from the object store"
+            ))
+        })?;
+        if manifest.lineage_digest() != engine.lineage_digest() {
             return Err(ProjectionError::LineageMismatch {
                 expected: engine.lineage_digest(),
-                found: validated.manifest().lineage_digest(),
+                found: manifest.lineage_digest(),
             });
         }
-        let manifest_digest =
-            ContentDigest::of(&validated.manifest().encode().map_err(|error| {
-                ProjectionError::InvalidAcceptedEvent(format!(
-                    "cannot encode accepted manifest {batch_id}: {error}"
-                ))
-            })?);
+        let manifest_digest = ContentDigest::of(&manifest.encode().map_err(|error| {
+            ProjectionError::InvalidAcceptedEvent(format!(
+                "cannot encode accepted manifest {batch_id}: {error}"
+            ))
+        })?);
         if manifest_digest != evidence.manifest_fingerprint() {
             return Err(ProjectionError::ManifestMismatch {
                 batch_id,
@@ -204,7 +208,35 @@ impl AcceptedBatchEvent {
                 }
             }
         }
-        Self::from_validated(&validated, &evidence)?.with_effective_view(engine)
+        let semantic_effect = Self::read_semantic_effect(store, &manifest)?;
+        Self::from_manifest_and_semantic(&manifest, semantic_effect, &evidence)?
+            .with_effective_view(engine)
+    }
+
+    /// Fetch just the batch's `SemanticEffect` payload, located through the
+    /// manifest's descriptors rather than by scanning decoded objects.
+    fn read_semantic_effect(
+        store: &ObjectStore,
+        manifest: &OperationBatch,
+    ) -> Result<Vec<u8>, ProjectionError> {
+        let descriptor = manifest
+            .required_objects()
+            .iter()
+            .find(|descriptor| descriptor.kind() == ObjectKind::SemanticEffect)
+            .ok_or_else(|| {
+                ProjectionError::InvalidAcceptedEvent(format!(
+                    "accepted batch {} has no semantic effect",
+                    manifest.batch_id()
+                ))
+            })?;
+        let object = store.read_object(descriptor.content_digest())?;
+        if object.kind() != ObjectKind::SemanticEffect {
+            return Err(ProjectionError::InvalidAcceptedEvent(format!(
+                "accepted batch {} semantic effect object has the wrong kind",
+                manifest.batch_id()
+            )));
+        }
+        Ok(object.payload().to_vec())
     }
 
     fn from_indexed(
@@ -265,11 +297,33 @@ impl AcceptedBatchEvent {
         Self::from_validated(batch, evidence)
     }
 
+    /// Callers that already hold a fully validated batch. Everything this needs
+    /// from the objects is the one `SemanticEffect` payload; all other object
+    /// facts come from the manifest's descriptors, so both entry points share
+    /// [`Self::from_manifest_and_semantic`] and produce identical events.
     fn from_validated(
         batch: &ValidatedBatch,
         evidence: &super::AcceptedBatchEvidence,
     ) -> Result<Self, ProjectionError> {
         let manifest = batch.manifest();
+        let semantic = batch
+            .objects()
+            .iter()
+            .find(|object| object.kind() == ObjectKind::SemanticEffect)
+            .ok_or_else(|| {
+                ProjectionError::InvalidAcceptedEvent(format!(
+                    "accepted batch {} has no semantic effect",
+                    manifest.batch_id()
+                ))
+            })?;
+        Self::from_manifest_and_semantic(manifest, semantic.payload().to_vec(), evidence)
+    }
+
+    fn from_manifest_and_semantic(
+        manifest: &OperationBatch,
+        semantic_effect: Vec<u8>,
+        evidence: &super::AcceptedBatchEvidence,
+    ) -> Result<Self, ProjectionError> {
         let manifest_bytes = manifest.encode().map_err(|error| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "cannot encode accepted manifest {}: {error}",
@@ -287,17 +341,6 @@ impl AcceptedBatchEvent {
                 found: manifest_digest,
             });
         }
-        let semantic = batch
-            .objects()
-            .iter()
-            .find(|object| object.kind() == ObjectKind::SemanticEffect)
-            .ok_or_else(|| {
-                ProjectionError::InvalidAcceptedEvent(format!(
-                    "accepted batch {} has no semantic effect",
-                    manifest.batch_id()
-                ))
-            })?;
-        let semantic_effect = semantic.payload().to_vec();
         let decoded = SemanticEffect::decode(&semantic_effect).map_err(|error| {
             ProjectionError::InvalidAcceptedEvent(format!(
                 "accepted batch {} has an invalid semantic effect: {error}",
@@ -337,27 +380,32 @@ impl AcceptedBatchEvent {
                 manifest.batch_id()
             )));
         }
-        let retained_bytes = batch.objects().iter().try_fold(
+        // Both of these are manifest metadata, not object payloads. Each
+        // `ObjectDescriptor` carries `document_id`, `kind`, `content_digest` and
+        // `encoded_byte_length`, and `inspect_batch` reads every object file at
+        // exactly `encoded_byte_length` bytes -- so summing the descriptors is
+        // the same number the old fold produced, without re-encoding every
+        // object of the batch on every call.
+        let retained_bytes = manifest.required_objects().iter().try_fold(
             manifest_bytes.len(),
-            |total, object| -> Result<usize, ProjectionError> {
-                let encoded = object.encode().map_err(|error| {
-                    ProjectionError::InvalidAcceptedEvent(format!(
-                        "cannot encode object for accepted batch {}: {error}",
-                        manifest.batch_id()
-                    ))
+            |total, descriptor| -> Result<usize, ProjectionError> {
+                let length = usize::try_from(descriptor.encoded_byte_length()).map_err(|_| {
+                    ProjectionError::InvalidAcceptedEvent(
+                        "accepted event retained-byte count overflowed".into(),
+                    )
                 })?;
-                total.checked_add(encoded.len()).ok_or_else(|| {
+                total.checked_add(length).ok_or_else(|| {
                     ProjectionError::InvalidAcceptedEvent(
                         "accepted event retained-byte count overflowed".into(),
                     )
                 })
             },
         )?;
-        let updated_documents = batch
-            .objects()
+        let updated_documents = manifest
+            .required_objects()
             .iter()
-            .filter(|object| object.kind() == ObjectKind::CrdtUpdate)
-            .map(|object| object.document_id())
+            .filter(|descriptor| descriptor.kind() == ObjectKind::CrdtUpdate)
+            .map(|descriptor| descriptor.document_id())
             .collect::<BTreeSet<_>>();
         let evidenced_documents = evidence
             .affected_documents()
@@ -373,6 +421,11 @@ impl AcceptedBatchEvent {
         canonical_frontier_root_bytes(evidence.prior_frontier_root())?;
         canonical_frontier_root_bytes(evidence.post_frontier_root())?;
         canonical_affected_documents_bytes(evidence.affected_documents())?;
+        // The canonicity check above proved `decoded.encode() == semantic_effect`
+        // byte for byte, so re-encoding here produced a copy of bytes already in
+        // hand. `SemanticEffect` is capped at 64 MiB, so this was not a small
+        // duplicate.
+        let effective_semantic_effect = semantic_effect.clone();
         Ok(Self {
             workspace_id: manifest.workspace_id(),
             lineage_digest: manifest.lineage_digest(),
@@ -381,12 +434,7 @@ impl AcceptedBatchEvent {
             event_binding_digest,
             semantic_effect,
             semantic_effect_digest,
-            effective_semantic_effect: decoded.encode().map_err(|error| {
-                ProjectionError::InvalidAcceptedEvent(format!(
-                    "cannot encode initial effective semantic view for {}: {error}",
-                    manifest.batch_id()
-                ))
-            })?,
+            effective_semantic_effect,
             effective_transitions: Vec::new(),
             dependency_frontier: manifest.dependency_frontier().clone(),
             prior_frontier_root: evidence.prior_frontier_root().clone(),
