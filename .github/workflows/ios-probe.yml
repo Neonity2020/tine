@@ -69,6 +69,22 @@ jobs:
       # compile signal — it is what caught the E0425 cfg gap and the E0428
       # duplicate-command collision — and leaves linking to the gate that can
       # actually do it. Do not "restore" this to `build`.
+      # TEMPORARY DIAGNOSTIC (remove once the Swift link is green). Cargo hides
+      # build-script output, so `swift build` failures inside swift-rs are
+      # invisible in a normal run. Build ONLY the native plugin crate with -vv to
+      # surface what its build script actually does, and then look for the
+      # produced static library. Isolated from the app so it cannot fail at link.
+      - name: DIAGNOSTIC — build native Swift plugin crate verbosely
+        continue-on-error: true
+        run: |
+          set -x
+          cargo build -p tine-ios-folder-picker-native --target aarch64-apple-ios-sim -vv 2>&1 \
+            | grep -iE "swift|warning: unused manifest|cargo:|error" | head -80 || true
+          echo "--- searching for a built Swift static library ---"
+          find target -name "*tine-ios-folder-picker-native*" -maxdepth 6 2>/dev/null | head -20
+          find src-tauri/ios-folder-picker-native -maxdepth 3 -name ".build" -o -maxdepth 3 -name ".tauri" 2>/dev/null | head
+          echo "--- IPHONEOS_DEPLOYMENT_TARGET=$IPHONEOS_DEPLOYMENT_TARGET ---"
+
       - name: Type-check Rust lib for iOS device
         run: cargo check --lib -p tine --target aarch64-apple-ios
 
