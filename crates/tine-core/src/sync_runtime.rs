@@ -21437,7 +21437,42 @@ mod tests {
         assert!(settled, "a 20-page managed graph must admit; nothing else is testable");
 
         // Now the bulk external change: the whole corpus arrives from outside.
+        let manifests_before = fixture.manifest_count();
         copy_tree_for_probe(&source, &graph_root);
+
+        // A watcher that never learned about the new files would "settle"
+        // instantly and look like a pass, so tell it explicitly -- this is what
+        // the real watcher does when Syncthing lands a batch. Collect every new
+        // relative path and observe them in ONE call, which is the bulk case.
+        let mut observations = Vec::new();
+        let mut stack = vec![graph_root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&graph_root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                if let Ok(observation) = SyncWatcherObservation::managed_path(relative.as_str()) {
+                    observations.push(observation);
+                }
+            }
+        }
+        let observed = observations.len();
+        let observe_result = handle.observe_watcher(observations);
+        println!(
+            "BULK OBSERVE: {observed} paths -> {:?}; manifests_before={manifests_before}",
+            observe_result.as_ref().map(|_| "accepted").map_err(|e| e.to_string())
+        );
         let mut post_settled = false;
         let mut blocked = 0_u32;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -21458,13 +21493,20 @@ mod tests {
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
+        let manifests_after = fixture.manifest_count();
         println!(
-            "AFTER BULK EXTERNAL CHANGE (+1,047 files): settled={post_settled} blocked_ticks={blocked}"
+            "AFTER BULK EXTERNAL CHANGE: settled={post_settled} blocked_ticks={blocked} \
+             manifests {manifests_before} -> {manifests_after}"
         );
         if !post_settled {
             println!(
                 "WEDGED: a working managed graph stopped admitting external changes \
                  after a bulk sync. This is the Syncthing scenario."
+            );
+        } else if manifests_after == manifests_before {
+            println!(
+                "INCONCLUSIVE: it settled but admitted nothing (manifest count unchanged), \
+                 so this run did not actually exercise bulk admission."
             );
         }
     }
