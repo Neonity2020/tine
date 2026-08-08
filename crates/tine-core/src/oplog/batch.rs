@@ -175,13 +175,40 @@ impl PreparedBatch {
     /// every canonical object envelope. Tail capacity must be reserved from
     /// this value before the manifest can make a local mutation authoritative.
     pub fn retained_bytes(&self) -> Result<usize, BatchError> {
-        self.objects
+        let manifest_bytes = self.manifest.encode()?.len();
+        let total = self
+            .objects
             .iter()
-            .try_fold(self.manifest.encode()?.len(), |total, object| {
+            .try_fold(manifest_bytes, |total, object| {
                 total
                     .checked_add(object.encoded_len()?)
                     .ok_or(BatchError::LengthOverflow)
-            })
+            })?;
+        // A batch that exceeds TAIL_MAX_BYTES is rejected permanently, and the
+        // refusal reports only the total -- which cannot distinguish "many
+        // objects" from "a verbose envelope" from "one huge object". Those need
+        // different fixes. Report the composition by object kind so the
+        // dominant contributor is measured rather than guessed.
+        if std::env::var_os("TINE_BATCH_TRACE").is_some() {
+            use std::collections::BTreeMap;
+            let mut by_kind: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+            for object in &self.objects {
+                let entry = by_kind.entry(format!("{:?}", object.kind())).or_default();
+                entry.0 += 1;
+                entry.1 += object.encoded_len().unwrap_or(0);
+            }
+            let summary = by_kind
+                .iter()
+                .map(|(kind, (count, bytes))| format!("{kind}={count}objs/{bytes}B"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "BATCH COMPOSITION: total={total}B manifest={manifest_bytes}B \
+                 objects={} | {summary}",
+                self.objects.len()
+            );
+        }
+        Ok(total)
     }
 }
 
