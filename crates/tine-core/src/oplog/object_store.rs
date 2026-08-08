@@ -3594,12 +3594,23 @@ impl ObjectStore {
     /// work rows reach `Ready` only inside `accept_batch_at_history`.
     pub(crate) fn read_object(&self, digest: ContentDigest) -> Result<OperationObject, StoreError> {
         let objects = self.open_namespace(OBJECTS_DIR)?;
+        // Counted on the same counters as `inspect_batch`'s per-object reads.
+        // These measure *object reads*, not one particular access path, and
+        // tests use them as an oracle for how much an operation reconstructs
+        // (`ordinary_drain_reconstructs_each_accepted_event_once`). A new path
+        // that read objects silently would make that oracle lie.
+        self.counters
+            .inspected_object_operations
+            .fetch_add(1, Ordering::Relaxed);
         let bytes = read_required_regular(
             &objects,
             &object_filename(digest),
             MAX_OBJECT_BYTES as u64,
             None,
         )?;
+        self.counters
+            .inspected_object_bytes
+            .fetch_add(bytes.len(), Ordering::Relaxed);
         if ContentDigest::of(&bytes) != digest {
             return Err(StoreError::ObjectPathMismatch(digest));
         }
