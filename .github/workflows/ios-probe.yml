@@ -43,11 +43,25 @@ jobs:
       # `#[cfg(not(desktop))]` path (e.g. the opener plugin added for GH #49) on
       # the real iOS targets — device and simulator. If iOS is going to break,
       # it almost certainly breaks here first, and cheaply.
-      - name: Cross-compile Rust lib for iOS device
-        run: cargo build --lib -p tine --target aarch64-apple-ios
+      #
+      # `check`, NOT `build`, and that is deliberate. `tine`'s crate-type
+      # includes `cdylib`, so `cargo build --lib` runs a link step — and since
+      # `ios_folder_picker` calls a Swift `@_cdecl` symbol, that link can never
+      # succeed under bare Cargo:
+      #
+      #   Undefined symbols: "_init_plugin_tine_ios_folder_picker"
+      #
+      # The Swift package is compiled and linked by Tauri's native-plugin build
+      # path under Xcode/SwiftPM, which is GATE 3 below. `cargo build` here was
+      # correct only while no Swift existed. `check` keeps the fast, precise
+      # compile signal — it is what caught the E0425 cfg gap and the E0428
+      # duplicate-command collision — and leaves linking to the gate that can
+      # actually do it. Do not "restore" this to `build`.
+      - name: Type-check Rust lib for iOS device
+        run: cargo check --lib -p tine --target aarch64-apple-ios
 
-      - name: Cross-compile Rust lib for iOS simulator
-        run: cargo build --lib -p tine --target aarch64-apple-ios-sim
+      - name: Type-check Rust lib for iOS simulator
+        run: cargo check --lib -p tine --target aarch64-apple-ios-sim
 
       # --- HARD GATE 2: does the Xcode project generate? ---------------------
       # The app-local Swift package is compiled through Tauri's native-plugin
