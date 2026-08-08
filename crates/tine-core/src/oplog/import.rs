@@ -11343,11 +11343,14 @@ mod tests {
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
         assert_eq!(
             partition_bootstrap_operation_spool(&spool, &working, &mut instrumentation).unwrap(),
-            33
+            65_537_u32.div_ceil(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART)
         );
         assert_eq!(instrumentation.page_declarations, 65_537);
         assert_eq!(instrumentation.page_capsules, 0);
-        assert_eq!(instrumentation.max_part_documents, 2_048);
+        assert_eq!(
+            instrumentation.max_part_documents,
+            u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART)
+        );
     }
 
     #[test]
@@ -13439,7 +13442,10 @@ mod tests {
             .map(|ordinal| {
                 (
                     format!("pages/multipart-{ordinal:03}.md"),
-                    format!("- multipart page {ordinal}\n"),
+                    format!(
+                        "- multipart page {ordinal}\n  id:: {}\n",
+                        Uuid::from_u128(0x6b20_0000 + ordinal as u128)
+                    ),
                 )
             })
             .collect::<Vec<_>>();

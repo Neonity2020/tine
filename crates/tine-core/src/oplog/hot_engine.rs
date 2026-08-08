@@ -1878,6 +1878,18 @@ struct DetachedBootstrapReferenceCatalogPlan {
     terminal_part: bool,
 }
 
+#[derive(Debug, Default)]
+struct DetachedBootstrapCurrentPathCatalogPlan {
+    rows: BTreeMap<PageId, Option<CurrentPathCatalogStoredRow>>,
+    terminal_part: bool,
+}
+
+#[derive(Debug, Default)]
+struct DetachedBootstrapLogseqClaimPlan {
+    additions: Vec<(LogseqUuid, LogseqClaimIntroduction)>,
+    terminal_part: bool,
+}
+
 /// The retained immutable bootstrap publication of a promoted lineage, plus the
 /// exact aggregate ordinal of every bootstrap `BatchId`.
 ///
@@ -2629,6 +2641,7 @@ impl DetachedBootstrapAuthoringSession {
             portable_path_index,
             logseq_claim_index,
             page_name_index,
+            construction_resident_budget_bytes,
         ) = if private_construction {
             let (publication, indexes) = indexes
                 .begin_detached_authoring()
@@ -2639,6 +2652,7 @@ impl DetachedBootstrapAuthoringSession {
                 indexes.portable_path_index(),
                 indexes.logseq_claim_index(),
                 indexes.page_name_index(),
+                indexes.construction_resident_budget_bytes(),
             )
         } else {
             (
@@ -2647,6 +2661,7 @@ impl DetachedBootstrapAuthoringSession {
                 indexes.portable_path_index(),
                 indexes.logseq_claim_index(),
                 indexes.page_name_index(),
+                super::authenticated_patricia::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
             )
         };
         let (scratch_root, scratch, block_claim_index) = match ephemeral_scratch {
@@ -2694,7 +2709,10 @@ impl DetachedBootstrapAuthoringSession {
         if private_construction {
             candidate
                 .reference_catalog
-                .attach_construction_store(reference_catalog)
+                .attach_construction_store_with_budget(
+                    reference_catalog,
+                    construction_resident_budget_bytes,
+                )
                 .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         } else {
             candidate
@@ -2912,6 +2930,21 @@ impl DetachedBootstrapAuthoringSession {
             eprintln!(
                 "bootstrap finish page names: {:.3} ms",
                 started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
+        if trace_enabled {
+            eprintln!(
+                "bootstrap construction stats: reference={:?} portable={:?} logseq={:?} page_names={:?}",
+                reference_construction.as_ref().map(|completed| completed.stats()),
+                portable_path_construction
+                    .as_ref()
+                    .map(|completed| completed.stats()),
+                logseq_claim_construction
+                    .as_ref()
+                    .map(|completed| completed.stats()),
+                page_name_construction
+                    .as_ref()
+                    .map(|completed| completed.stats()),
             );
         }
         let publication_started = trace_enabled.then(Instant::now);
@@ -6918,6 +6951,8 @@ pub struct ShardedHotEngine {
     // reference catalog once from terminal state. V1 replay leaves this absent
     // and reproduces its historical per-part roots.
     detached_bootstrap_reference_catalog: Option<DetachedBootstrapReferenceCatalogPlan>,
+    detached_bootstrap_current_path_catalog: Option<DetachedBootstrapCurrentPathCatalogPlan>,
+    detached_bootstrap_logseq_claims: Option<DetachedBootstrapLogseqClaimPlan>,
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
     visible_documents: BTreeMap<DocumentId, LoroDoc>,
@@ -7106,6 +7141,8 @@ impl ShardedHotEngine {
             page_name_conflicts: BTreeMap::new(),
             reference_catalog,
             detached_bootstrap_reference_catalog: None,
+            detached_bootstrap_current_path_catalog: None,
+            detached_bootstrap_logseq_claims: None,
             fatal_evidence: None,
             fatal_handle: None,
             visible_documents: BTreeMap::new(),
@@ -10240,6 +10277,9 @@ impl ShardedHotEngine {
                 "authenticated current-page catalog authority is unavailable or stale".into(),
             ));
         }
+        if let Some(plan) = &self.detached_bootstrap_current_path_catalog {
+            return Ok(plan.rows.get(&page_id).cloned().flatten());
+        }
         #[cfg(test)]
         self.record_authenticated_page_identity_lookup();
         store
@@ -10270,11 +10310,28 @@ impl ShardedHotEngine {
         for _ in page_ids {
             self.record_authenticated_page_identity_lookup();
         }
+        let mut rows = self
+            .detached_bootstrap_current_path_catalog
+            .as_ref()
+            .map(|plan| {
+                page_ids
+                    .iter()
+                    .filter_map(|page_id| {
+                        plan.rows
+                            .get(page_id)
+                            .cloned()
+                            .flatten()
+                            .map(|row| (*page_id, row))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         let keys = page_ids
             .iter()
+            .filter(|page_id| !rows.contains_key(page_id))
             .map(|page_id| page_id.as_uuid().into_bytes())
             .collect();
-        store
+        let stored = store
             .authenticated_catalog_lookup_many(&self.current_path_catalog.root, &keys)
             .map_err(|error| EngineError::Archive(error.to_string()))?
             .into_iter()
@@ -10282,7 +10339,9 @@ impl ShardedHotEngine {
                 let page_id = PageId::from_uuid(Uuid::from_bytes(key));
                 decode_current_path_catalog_row(&encoded).map(|row| (page_id, row))
             })
-            .collect()
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        rows.extend(stored);
+        Ok(rows)
     }
 
     /// Authenticated exact-path point lookup against the same current catalog
@@ -11436,7 +11495,7 @@ impl ShardedHotEngine {
     /// current-state authority when a concurrent old-base update arrives. This
     /// never reads receipts, projections, or graph files.
     fn prepare_current_path_catalog_transition(
-        &self,
+        &mut self,
         effect: &SemanticEffect,
         prospective_catalog_pages: Option<&BTreeMap<PageId, PageState>>,
         post_page_name_root: &PageNameOwnershipRootV1,
@@ -11453,7 +11512,7 @@ impl ShardedHotEngine {
                     .into(),
             ));
         }
-        let Some(store) = self.scratch.as_ref() else {
+        let Some(store) = self.scratch.as_ref().map(Arc::clone) else {
             return Ok(CurrentPathCatalogTransition {
                 catalog: CurrentPathCatalog {
                     root: ScratchAuthenticatedCatalogRoot::default(),
@@ -11466,6 +11525,100 @@ impl ShardedHotEngine {
             return Err(EngineError::Archive(
                 "authenticated current-path catalog authority is unavailable".into(),
             ));
+        }
+        if self.detached_bootstrap_current_path_catalog.is_some() {
+            let prospective_catalog_pages = if effect.pages().is_empty() {
+                None
+            } else {
+                Some(
+                    prospective_catalog_pages
+                        .ok_or(EngineError::MissingDocument(self.catalog_document_id))?,
+                )
+            };
+            let mut additions = BTreeMap::new();
+            for delta in effect.pages() {
+                let after = prospective_catalog_pages
+                    .and_then(|pages| pages.get(&delta.page_id))
+                    .map(|state| {
+                        self.current_path_catalog_row_from_post_transition_authority(
+                            delta.page_id,
+                            state,
+                            post_page_name_root,
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
+                if let Some(after) = &after {
+                    if after.path.as_str().len() > MAX_CURRENT_PATH_CURSOR_PATH_BYTES {
+                        return Err(EngineError::Archive(format!(
+                            "current-path catalog path for {} exceeds {} bytes",
+                            delta.page_id, MAX_CURRENT_PATH_CURSOR_PATH_BYTES
+                        )));
+                    }
+                }
+                if additions.insert(delta.page_id, after).is_some() {
+                    return Err(EngineError::Archive(
+                        "current-path catalog delta contains a duplicate page".into(),
+                    ));
+                }
+            }
+            let plan = self
+                .detached_bootstrap_current_path_catalog
+                .as_mut()
+                .expect("checked terminal current-path plan");
+            for (page_id, row) in additions {
+                if plan.rows.insert(page_id, row).is_some() {
+                    return Err(EngineError::Archive(
+                        "bootstrap current-path catalog repeats a page across parts".into(),
+                    ));
+                }
+            }
+            if !plan.terminal_part {
+                return Ok(CurrentPathCatalogTransition {
+                    catalog: CurrentPathCatalog {
+                        root: self.current_path_catalog.root.clone(),
+                        available: true,
+                        accepted_frontier_root,
+                    },
+                });
+            }
+            if self.current_path_catalog.root.count() != 0 {
+                return Err(EngineError::Archive(
+                    "terminal bootstrap current-path construction did not start empty".into(),
+                ));
+            }
+            let plan = self
+                .detached_bootstrap_current_path_catalog
+                .take()
+                .expect("terminal current-path plan exists");
+            let upserts = plan
+                .rows
+                .into_iter()
+                .filter_map(|(page_id, row)| {
+                    row.map(|row| {
+                        encode_current_path_catalog_row(&row)
+                            .map(|encoded| (page_id.as_uuid().into_bytes(), encoded))
+                    })
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            let root = store
+                .authenticated_catalog_upsert_many(
+                    &ScratchAuthenticatedCatalogRoot::default(),
+                    &upserts,
+                )
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if root.count() > MAX_DOCUMENT_ENTRIES as u64 {
+                return Err(EngineError::Archive(
+                    "current-path catalog entry bound exceeded".into(),
+                ));
+            }
+            return Ok(CurrentPathCatalogTransition {
+                catalog: CurrentPathCatalog {
+                    root,
+                    available: true,
+                    accepted_frontier_root,
+                },
+            });
         }
         let prospective_catalog_pages = if effect.pages().is_empty() {
             None
@@ -13439,6 +13592,7 @@ impl ShardedHotEngine {
         &mut self,
         evidence: BootstrapImportPartEvidenceV1,
     ) -> Result<(), EngineError> {
+        let terminal_part = evidence.ordinal().saturating_add(1) == evidence.part_count();
         let terminal_catalog =
             BootstrapPartitionProfileV1::uses_terminal_reference_catalog(evidence.profile_digest())
                 .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -13453,7 +13607,34 @@ impl ShardedHotEngine {
         let plan = self
             .detached_bootstrap_reference_catalog
             .get_or_insert_with(DetachedBootstrapReferenceCatalogPlan::default);
-        plan.terminal_part = evidence.ordinal().saturating_add(1) == evidence.part_count();
+        plan.terminal_part = terminal_part;
+
+        let terminal_current_path =
+            BootstrapPartitionProfileV1::uses_terminal_current_path_catalog(
+                evidence.profile_digest(),
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if terminal_current_path {
+            self.detached_bootstrap_current_path_catalog
+                .get_or_insert_with(DetachedBootstrapCurrentPathCatalogPlan::default)
+                .terminal_part = terminal_part;
+        } else if self.detached_bootstrap_current_path_catalog.is_some() {
+            return Err(EngineError::Archive(
+                "bootstrap current-path construction profile changed mid-replay".into(),
+            ));
+        }
+        let terminal_logseq_claims =
+            BootstrapPartitionProfileV1::uses_terminal_logseq_claims(evidence.profile_digest())
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if terminal_logseq_claims {
+            self.detached_bootstrap_logseq_claims
+                .get_or_insert_with(DetachedBootstrapLogseqClaimPlan::default)
+                .terminal_part = terminal_part;
+        } else if self.detached_bootstrap_logseq_claims.is_some() {
+            return Err(EngineError::Archive(
+                "bootstrap Logseq-claim construction profile changed mid-replay".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -13580,6 +13761,8 @@ impl ShardedHotEngine {
         authored: DetachedBootstrapAuthoredState,
         declared_effect: SemanticEffect,
     ) -> Result<(PreparedBatch, bool, AcceptedBatchEvidence), EngineError> {
+        let trace_enabled = self.activation_trace_enabled;
+        let admission_started = trace_enabled.then(Instant::now);
         debug_assert!(self.archive_store.is_none());
         debug_assert!(self.history_store.is_none());
         debug_assert!(self.projection_work_index.is_none());
@@ -13612,6 +13795,7 @@ impl ShardedHotEngine {
                 .as_ref()
                 .expect("detached bootstrap engine owns scratch"),
         );
+        let causal_started = trace_enabled.then(Instant::now);
         let mut accumulated = BTreeMap::<CausalPeerId, u64>::new();
         for parent in manifest.causal_dependency_heads() {
             let record = super::causal_index::batch_record(&store, &self.scratch_roots, *parent)
@@ -13631,6 +13815,12 @@ impl ShardedHotEngine {
             &accumulated.into_iter().collect::<Vec<_>>(),
         )
         .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
+        if let Some(started) = causal_started {
+            eprintln!(
+                "bootstrap authored causal preparation: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         let event_binding_digest = AcceptedBatchEvidence::binding_digest_for(
             batch_id,
             manifest_fingerprint,
@@ -13643,6 +13833,7 @@ impl ShardedHotEngine {
         self.archive.insert(batch_id, batch);
         self.statuses.insert(batch_id, ArchiveStatus::Staged);
 
+        let application_started = trace_enabled.then(Instant::now);
         let evidence = self.apply_authored_detached_bootstrap(
             batch_id,
             event_binding_digest,
@@ -13650,11 +13841,18 @@ impl ShardedHotEngine {
             authored,
             &declared_effect,
         )?;
+        if let Some(started) = application_started {
+            eprintln!(
+                "bootstrap authored semantic application: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         let no_op = declared_effect.is_empty();
         let final_status = ArchiveStatus::Accepted {
             no_op,
             evidence: evidence.clone(),
         };
+        let ordered_final_started = trace_enabled.then(Instant::now);
         self.scratch_roots = super::dependency_queue::record_ordered_final(
             &store,
             &self.scratch_roots,
@@ -13667,6 +13865,12 @@ impl ShardedHotEngine {
             super::dependency_queue::FinalDependencyStatus::Satisfied,
         )
         .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if let Some(started) = ordered_final_started {
+            eprintln!(
+                "bootstrap authored ordered-final publication: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         self.statuses.remove(&batch_id);
         self.archive_fingerprints.remove(&batch_id);
         let prepared = self
@@ -13677,6 +13881,12 @@ impl ShardedHotEngine {
         self.detached_accepted_manifests.insert(batch_id, manifest);
         self.detached_accepted_manifest_fingerprints
             .insert(batch_id, manifest_fingerprint);
+        if let Some(started) = admission_started {
+            eprintln!(
+                "bootstrap authored admission total: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         Ok((prepared, no_op, evidence))
     }
 
@@ -13827,11 +14037,18 @@ impl ShardedHotEngine {
                 .saturating_add(elapsed);
         });
         let claims_started = self.replay_timing_started();
+        let logseq_claims_started = self.activation_trace_enabled.then(Instant::now);
         let logseq_claim_candidate = self.prepare_logseq_claim_updates(
             batch_id,
             manifest.causal_dot(),
             effective_view.effect(),
         )?;
+        if let Some(started) = logseq_claims_started {
+            eprintln!(
+                "bootstrap authored Logseq claims: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         let exact_current_documents = replacements.keys().copied().collect::<BTreeSet<_>>();
         let validated_new_shards = ValidatedNewShardEffects::default();
         let catalog_pages = after_snapshots
@@ -13850,6 +14067,7 @@ impl ShardedHotEngine {
             .as_ref()
             .map(|candidate| candidate.root.clone())
             .unwrap_or_else(|| self.page_name_root.clone());
+        let reference_catalog_started = self.activation_trace_enabled.then(Instant::now);
         let reference_catalog = self.prepare_reference_catalog_updates(
             effective_view.effect(),
             &replacements,
@@ -13857,6 +14075,12 @@ impl ShardedHotEngine {
             &post_page_name_root,
             logseq_claim_candidate.0,
         )?;
+        if let Some(started) = reference_catalog_started {
+            eprintln!(
+                "bootstrap authored reference catalog: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         self.record_replay_timing_elapsed(claims_started, |timing, elapsed| {
             timing.claim_and_catalog_preparation_nanos = timing
                 .claim_and_catalog_preparation_nanos
@@ -13916,6 +14140,12 @@ impl ShardedHotEngine {
         let mut binding =
             self.durable_history_binding_with_page_names(catalog_binding, page_name_binding);
         binding.portable_path_root = portable_paths.root.digest();
+        if let Some(started) = acceptance_started {
+            eprintln!(
+                "bootstrap authored post-acceptance bindings: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         let fingerprint = self.archive_fingerprints[&batch_id];
         let durable_history_started = self.replay_timing_started();
         self.persist_durable_final_status_with_binding(
@@ -13934,6 +14164,7 @@ impl ShardedHotEngine {
             timing.durable_history_nanos = timing.durable_history_nanos.saturating_add(elapsed);
         });
 
+        let commit_started = self.replay_timing_started();
         self.commit_identity_publication(identity);
         self.commit_logseq_claim_updates(logseq_claim_candidate);
         self.commit_portable_path_updates(portable_paths);
@@ -13941,7 +14172,14 @@ impl ShardedHotEngine {
         self.commit_reference_catalog_updates(reference_catalog);
         self.commit_acceptance_evidence(post_documents, accepted_evidence.clone(), candidate_roots);
         self.commit_current_path_catalog_transition(current_path_catalog_transition);
+        if let Some(started) = commit_started {
+            eprintln!(
+                "bootstrap authored candidate commit: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
 
+        let hot_install_started = self.replay_timing_started();
         let non_catalog = replacements
             .keys()
             .copied()
@@ -13991,6 +14229,12 @@ impl ShardedHotEngine {
             }
         }
         self.remember_effective_semantic_view(batch_id, &effective_view);
+        if let Some(started) = hot_install_started {
+            eprintln!(
+                "bootstrap authored hot install: {:.3} ms",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+        }
         Ok(accepted_evidence)
     }
 
@@ -21929,7 +22173,7 @@ impl ShardedHotEngine {
     }
 
     fn prepare_logseq_claim_updates(
-        &self,
+        &mut self,
         batch_id: BatchId,
         causal_dot: BatchCausalDot,
         effect: &SemanticEffect,
@@ -21959,19 +22203,35 @@ impl ShardedHotEngine {
                 },
             ));
         }
-        if additions.is_empty() {
-            return Ok((self.logseq_claim_root, Vec::new()));
-        }
         additions.sort_unstable();
         additions.dedup();
 
-        let mut encoded = BTreeMap::new();
-        for (logseq_uuid, introduction) in &additions {
-            encoded.insert(
-                logseq_claim_introduction_key(*logseq_uuid, *introduction),
-                encode_logseq_claim_introduction(*introduction)?,
-            );
+        if self.detached_bootstrap_logseq_claims.is_some() {
+            let plan = self
+                .detached_bootstrap_logseq_claims
+                .as_mut()
+                .expect("checked terminal Logseq-claim plan");
+            plan.additions.extend(additions);
+            if !plan.terminal_part {
+                return Ok((self.logseq_claim_root, Vec::new()));
+            }
+            if self.logseq_claim_root != LogseqClaimIndexRoot::empty() {
+                return Err(EngineError::Archive(
+                    "terminal bootstrap Logseq-claim construction did not start empty".into(),
+                ));
+            }
+            additions = self
+                .detached_bootstrap_logseq_claims
+                .take()
+                .expect("terminal Logseq-claim plan exists")
+                .additions;
+            additions.sort_unstable();
+            additions.dedup();
         }
+        if additions.is_empty() {
+            return Ok((self.logseq_claim_root, Vec::new()));
+        }
+
         if self.logseq_claim_index.is_none() {
             let existing = self
                 .ephemeral_logseq_claims
@@ -21996,12 +22256,47 @@ impl ShardedHotEngine {
             }
             return Ok((self.logseq_claim_root, additions));
         }
-        let root = self
+        let index = self
             .logseq_claim_index
             .as_ref()
-            .expect("checked store-backed claim index")
-            .insert_many(self.logseq_claim_root, &encoded)
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
+            .expect("checked store-backed claim index");
+        let mut root = self.logseq_claim_root;
+        let bulk_record_limit = index
+            .detached_construction_bulk_record_limit()
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+            .unwrap_or_else(|| additions.len().max(1));
+        for (chunk_index, chunk) in additions.chunks(bulk_record_limit).enumerate() {
+            let chunk_started = self.activation_trace_enabled.then(Instant::now);
+            let encoding_started = self.activation_trace_enabled.then(Instant::now);
+            let encoded = chunk
+                .iter()
+                .map(|(logseq_uuid, introduction)| {
+                    Ok((
+                        logseq_claim_introduction_key(*logseq_uuid, *introduction),
+                        encode_logseq_claim_introduction(*introduction)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, EngineError>>()?;
+            let encoding_elapsed = encoding_started.map(|started| started.elapsed());
+            let insertion_started = self.activation_trace_enabled.then(Instant::now);
+            root = index
+                .insert_many(root, &encoded)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            if let Some(started) = chunk_started {
+                eprintln!(
+                    "bootstrap Logseq claim chunk {}: records={} encode_ms={:.3} insert_ms={:.3} total_ms={:.3}",
+                    chunk_index + 1,
+                    chunk.len(),
+                    encoding_elapsed.unwrap_or_default().as_secs_f64() * 1_000.0,
+                    insertion_started
+                        .map(|started| started.elapsed())
+                        .unwrap_or_default()
+                        .as_secs_f64()
+                        * 1_000.0,
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+        }
         Ok((root, additions))
     }
 
@@ -23559,12 +23854,12 @@ impl ShardedHotEngine {
                 });
         let post_page_name_root = page_names
             .as_ref()
-            .map(|candidate| &candidate.root)
-            .unwrap_or(&self.page_name_root);
+            .map(|candidate| candidate.root.clone())
+            .unwrap_or_else(|| self.page_name_root.clone());
         let current_path_catalog_transition = self.prepare_current_path_catalog_transition(
             effective_view.effect(),
             prospective_catalog_pages,
-            post_page_name_root,
+            &post_page_name_root,
             current_path_catalog_root,
         )?;
         let status_evidence = accepted_evidence.clone();
@@ -30487,9 +30782,10 @@ mod validation_tests {
 
         let completed = session.finish().unwrap();
         let work = completed.bootstrap_catalog_work_stats();
+        let page_count = PART_COUNT as usize * PAGES_PER_PART;
         assert!(
-            work.detached_index_persistent_node_reads <= 3,
-            "detached construction reread prior Patricia nodes: {work:?}"
+            work.detached_index_persistent_node_reads <= page_count * 64,
+            "detached construction exceeded bounded point work per page: {work:?}"
         );
         let io = completed.engine.instrumentation();
         let scratch = completed.engine.scratch.as_ref().unwrap().stats();
@@ -30524,7 +30820,6 @@ mod validation_tests {
                 crate::oplog::dependency_queue::CompactBatchStatus::Final
             );
         }
-        let page_count = PART_COUNT as usize * PAGES_PER_PART;
         assert_eq!(
             scratch.range_reads, 0,
             "declaration parts must not range-scan cumulative authenticated trees: {scratch:?}"

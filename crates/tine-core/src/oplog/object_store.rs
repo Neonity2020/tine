@@ -1796,6 +1796,7 @@ pub(crate) struct DetachedBootstrapAuthoringIndexes {
     portable_path_index: Arc<super::portable_path_index::PortablePathIndexStore>,
     logseq_claim_index: Arc<super::uuid_claim_index::LogseqClaimIndexStore>,
     page_name_index: Arc<super::page_name_index::PageNameOwnershipStore>,
+    construction_resident_budget_bytes: usize,
 }
 
 impl DetachedBootstrapAuthoringIndexes {
@@ -1816,6 +1817,90 @@ impl DetachedBootstrapAuthoringIndexes {
     pub(crate) fn page_name_index(&self) -> Arc<super::page_name_index::PageNameOwnershipStore> {
         Arc::clone(&self.page_name_index)
     }
+
+    pub(crate) const fn construction_resident_budget_bytes(&self) -> usize {
+        self.construction_resident_budget_bytes
+    }
+}
+
+fn parse_available_kib(meminfo: &str) -> Option<u64> {
+    let value = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    value.checked_mul(1024)
+}
+
+fn finite_cgroup_available(maximum: &str, current: &str) -> Option<u64> {
+    let maximum = maximum.trim().parse::<u64>().ok()?;
+    if maximum >= (1_u64 << 60) {
+        return None;
+    }
+    let current = current.trim().parse::<u64>().ok()?;
+    Some(maximum.saturating_sub(current))
+}
+
+fn detached_bootstrap_available_memory_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let host = fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| parse_available_kib(&meminfo));
+        let cgroup_v2 = fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .zip(fs::read_to_string("/sys/fs/cgroup/memory.current").ok())
+            .and_then(|(maximum, current)| finite_cgroup_available(&maximum, &current));
+        let cgroup_v1 = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+            .ok()
+            .zip(fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes").ok())
+            .and_then(|(maximum, current)| finite_cgroup_available(&maximum, &current));
+        return [host, cgroup_v2, cgroup_v1].into_iter().flatten().min();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        None
+    }
+}
+
+fn detached_bootstrap_construction_budget_for_available(available: Option<u64>) -> usize {
+    const FALLBACK_BYTES: usize = 128 * 1024 * 1024;
+    let target = available
+        .and_then(|available| usize::try_from(available / 8).ok())
+        .unwrap_or(FALLBACK_BYTES);
+    target.clamp(
+        tine_storage::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+        tine_storage::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    )
+}
+
+fn detached_bootstrap_construction_resident_budget_bytes() -> usize {
+    detached_bootstrap_construction_budget_for_available(detached_bootstrap_available_memory_bytes())
+}
+
+#[cfg(test)]
+#[test]
+fn detached_bootstrap_construction_budget_tracks_available_memory_with_bounds() {
+    assert_eq!(
+        parse_available_kib("MemAvailable: 1024 kB\n"),
+        Some(1024 * 1024)
+    );
+    assert_eq!(finite_cgroup_available("1024\n", "256\n"), Some(768));
+    assert_eq!(finite_cgroup_available("max\n", "256\n"), None);
+    assert_eq!(
+        detached_bootstrap_construction_budget_for_available(Some(128 * 1024 * 1024)),
+        tine_storage::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    );
+    assert_eq!(
+        detached_bootstrap_construction_budget_for_available(Some(8 * 1024 * 1024 * 1024)),
+        tine_storage::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+    );
+    assert_eq!(
+        detached_bootstrap_construction_budget_for_available(None),
+        128 * 1024 * 1024,
+    );
 }
 
 impl BootstrapAuthoringCapability {
@@ -1860,21 +1945,31 @@ impl BootstrapAuthoringCapability {
             self.archive_identity,
         )?;
         let publisher = publication.publisher();
-        let indexes = DetachedBootstrapAuthoringIndexes {
-            reference_catalog: Arc::new(
-                self.reference_catalog
-                    .for_detached_bootstrap(publisher.clone())?,
-            ),
-            portable_path_index: Arc::new(
-                self.portable_path_index
-                    .for_detached_bootstrap(publisher.clone())?,
-            ),
-            logseq_claim_index: Arc::new(
-                self.logseq_claim_index
-                    .for_detached_bootstrap_construction(publisher.clone())?,
-            ),
-            page_name_index: Arc::new(self.page_name_index.for_detached_bootstrap(publisher)?),
-        };
+        let construction_resident_budget_bytes =
+            detached_bootstrap_construction_resident_budget_bytes();
+        let indexes =
+            DetachedBootstrapAuthoringIndexes {
+                reference_catalog: Arc::new(
+                    self.reference_catalog
+                        .for_detached_bootstrap(publisher.clone())?,
+                ),
+                portable_path_index: Arc::new(self.portable_path_index.for_detached_bootstrap(
+                    publisher.clone(),
+                    construction_resident_budget_bytes,
+                )?),
+                logseq_claim_index: Arc::new(
+                    self.logseq_claim_index
+                        .for_detached_bootstrap_construction(
+                            publisher.clone(),
+                            construction_resident_budget_bytes,
+                        )?,
+                ),
+                page_name_index: Arc::new(
+                    self.page_name_index
+                        .for_detached_bootstrap(publisher, construction_resident_budget_bytes)?,
+                ),
+                construction_resident_budget_bytes,
+            };
         Ok((publication, indexes))
     }
 }

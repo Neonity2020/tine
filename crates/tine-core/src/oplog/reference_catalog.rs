@@ -1398,13 +1398,27 @@ impl ReferenceCatalogStateV2 {
         &mut self,
         store: Arc<ReferenceCatalogStore>,
     ) -> Result<(), ReferenceCatalogError> {
+        self.attach_construction_store_with_budget(
+            store,
+            tine_storage::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+        )
+    }
+
+    pub(crate) fn attach_construction_store_with_budget(
+        &mut self,
+        store: Arc<ReferenceCatalogStore>,
+        resident_budget_bytes: usize,
+    ) -> Result<(), ReferenceCatalogError> {
         if self.root.source_count != 0 {
             return Err(ReferenceCatalogError::AuthorityMismatch);
         }
         self.backend = ReferenceCatalogBackend::Construction {
             store,
             construction_id: uuid::Uuid::new_v4(),
-            patricia: RefCell::new(PatriciaIndexConstruction::default()),
+            patricia: RefCell::new(
+                PatriciaIndexConstruction::with_resident_budget(resident_budget_bytes)
+                    .map_err(|_| ReferenceCatalogError::Allocation)?,
+            ),
         };
         Ok(())
     }

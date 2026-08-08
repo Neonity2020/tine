@@ -1639,11 +1639,12 @@ impl PageNameOwnershipStore {
     pub(crate) fn for_detached_bootstrap(
         &self,
         publisher: DetachedBootstrapImmutablePublisher,
+        resident_budget_bytes: usize,
     ) -> Result<Self, StoreError> {
         Ok(Self {
             patricia: self
                 .patricia
-                .for_detached_bootstrap_construction(publisher.clone())?,
+                .for_detached_bootstrap_construction(publisher.clone(), resident_budget_bytes)?,
             exact_names: self.exact_names.try_clone()?,
             detached_publisher: Some(publisher),
         })

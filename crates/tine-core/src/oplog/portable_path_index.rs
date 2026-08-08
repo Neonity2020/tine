@@ -204,11 +204,12 @@ impl PortablePathIndexStore {
     pub(crate) fn for_detached_bootstrap(
         &self,
         publisher: super::object_store::DetachedBootstrapImmutablePublisher,
+        resident_budget_bytes: usize,
     ) -> Result<Self, StoreError> {
         Ok(Self {
             patricia: self
                 .patricia
-                .for_detached_bootstrap_construction(publisher)?,
+                .for_detached_bootstrap_construction(publisher, resident_budget_bytes)?,
         })
     }
 

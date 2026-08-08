@@ -14,6 +14,7 @@ use super::object_store::{
 pub(crate) use tine_storage::{
     PatriciaIndexConstruction, PatriciaIndexConstructionStats, PatriciaIndexReclamationError,
     PatriciaIndexReclamationReport, PatriciaIndexRoot, PatriciaIndexStats,
+    DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES, MAX_PATRICIA_CONSTRUCTION_BULK_RECORDS,
     MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
 };
 
@@ -24,7 +25,6 @@ pub(crate) struct CompletedPatriciaConstruction {
 }
 
 impl CompletedPatriciaConstruction {
-    #[cfg(test)]
     pub(crate) const fn stats(&self) -> PatriciaIndexConstructionStats {
         self.physical.stats()
     }
@@ -154,10 +154,27 @@ impl PatriciaIndexStore {
     pub(crate) fn for_detached_bootstrap_construction(
         &self,
         publisher: DetachedBootstrapImmutablePublisher,
+        resident_budget_bytes: usize,
     ) -> Result<Self, StoreError> {
         let mut detached = self.for_detached_bootstrap(publisher)?;
-        detached.construction = Some(Mutex::new(Some(PatriciaIndexConstruction::default())));
+        detached.construction = Some(Mutex::new(Some(
+            PatriciaIndexConstruction::with_resident_budget(resident_budget_bytes)
+                .map_err(map_storage_error)?,
+        )));
         Ok(detached)
+    }
+
+    pub(crate) fn detached_construction_bulk_record_limit(
+        &self,
+    ) -> Result<Option<usize>, StoreError> {
+        let Some(construction) = self.construction_guard()? else {
+            return Ok(None);
+        };
+        construction
+            .as_ref()
+            .map(PatriciaIndexConstruction::bulk_record_limit)
+            .map(Some)
+            .ok_or(StoreError::MalformedLogseqClaimIndex)
     }
 
     fn construction_guard(

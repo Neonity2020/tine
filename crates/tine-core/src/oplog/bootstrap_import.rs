@@ -68,9 +68,23 @@ pub(crate) const MAX_CANONICAL_NESTING_DEPTH: u8 = 4;
 pub(crate) const MAX_FULL_OBJECTS_PER_BOOTSTRAP_PART: u32 = 8_192;
 pub(crate) const MAX_FULL_OBJECT_BYTES_PER_BOOTSTRAP_PART: u64 =
     MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART + 2 * 768 * 1024;
-/// Declaration and content phases share the same encoded document/manifest
-/// budgets, so they share one page-document ceiling as well.
-pub(crate) const MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART: u32 = 2_048;
+/// A bootstrap batch owns one semantic-effect object plus one CRDT object for
+/// the catalog and each page document. A JSON descriptor occupies at most 192
+/// bytes under the durable object bounds; reserve 64 KiB for every fixed field,
+/// causal head, and encoding delimiter. The part ceiling is the tighter of
+/// that manifest budget and the independent descriptor-count bound.
+const MAX_BOOTSTRAP_MANIFEST_DESCRIPTOR_BYTES: usize = 192;
+const BOOTSTRAP_MANIFEST_FIXED_HEADROOM_BYTES: usize = 64 * 1024;
+const MAX_MANIFEST_BOUND_PAGE_DOCUMENTS: u32 =
+    ((MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART - BOOTSTRAP_MANIFEST_FIXED_HEADROOM_BYTES)
+        / MAX_BOOTSTRAP_MANIFEST_DESCRIPTOR_BYTES) as u32
+        - 2;
+pub(crate) const MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART: u32 =
+    if MAX_MANIFEST_BOUND_PAGE_DOCUMENTS < MAX_FULL_OBJECTS_PER_BOOTSTRAP_PART - 2 {
+        MAX_MANIFEST_BOUND_PAGE_DOCUMENTS
+    } else {
+        MAX_FULL_OBJECTS_PER_BOOTSTRAP_PART - 2
+    };
 /// Bootstrap parts are ordinary durable batches. Do not impose a second,
 /// tighter manifest policy here: the durable batch codec is the authority for
 /// both allocation bounds and accepted bytes.
@@ -815,16 +829,31 @@ impl BootstrapPartitionProfileV1 {
         }
     }
 
-    /// Current authoring profile. V4 keeps each page declaration with its
-    /// content capsule. This avoids publishing and immediately reopening an
-    /// empty home document while retaining every V3 resource boundary.
-    pub(crate) fn current() -> Self {
+    fn v4() -> Self {
         Self {
             digest: BootstrapProfileDigestV1::digest(
                 b"tine/bootstrap-import/partition-profile/v4\0",
                 &[
                     Self::v3().digest.as_bytes(),
                     b"page-capsule-declarations/v1",
+                ],
+            ),
+        }
+    }
+
+    /// Current authoring profile. V4 keeps each page declaration with its
+    /// content capsule. This avoids publishing and immediately reopening an
+    /// empty home document while retaining every V3 resource boundary. V5
+    /// constructs the rebuildable current-path and Logseq-claim indexes once
+    /// from terminal authority instead of rebuilding every accumulated prefix.
+    pub(crate) fn current() -> Self {
+        Self {
+            digest: BootstrapProfileDigestV1::digest(
+                b"tine/bootstrap-import/partition-profile/v5\0",
+                &[
+                    Self::v4().digest.as_bytes(),
+                    b"terminal-current-path-catalog/v1",
+                    b"terminal-logseq-claims/v1",
                 ],
             ),
         }
@@ -840,13 +869,29 @@ impl BootstrapPartitionProfileV1 {
         Self::validate_digest(digest)?;
         Ok(digest == Self::v2().digest
             || digest == Self::v3().digest
+            || digest == Self::v4().digest
             || digest == Self::current().digest)
+    }
+
+    pub(crate) fn uses_terminal_current_path_catalog(
+        digest: BootstrapProfileDigestV1,
+    ) -> Result<bool, BootstrapImportError> {
+        Self::validate_digest(digest)?;
+        Ok(digest == Self::current().digest)
+    }
+
+    pub(crate) fn uses_terminal_logseq_claims(
+        digest: BootstrapProfileDigestV1,
+    ) -> Result<bool, BootstrapImportError> {
+        Self::validate_digest(digest)?;
+        Ok(digest == Self::current().digest)
     }
 
     fn validate_digest(digest: BootstrapProfileDigestV1) -> Result<(), BootstrapImportError> {
         if digest != Self::v1().digest
             && digest != Self::v2().digest
             && digest != Self::v3().digest
+            && digest != Self::v4().digest
             && digest != Self::current().digest
         {
             return Err(BootstrapImportError::ProfileMismatch);
@@ -5031,6 +5076,26 @@ mod tests {
             )
             .unwrap()
         );
+        assert!(
+            !BootstrapPartitionProfileV1::uses_terminal_current_path_catalog(
+                BootstrapPartitionProfileV1::v4().digest()
+            )
+            .unwrap()
+        );
+        assert!(
+            BootstrapPartitionProfileV1::uses_terminal_current_path_catalog(
+                BootstrapPartitionProfileV1::current().digest()
+            )
+            .unwrap()
+        );
+        assert!(!BootstrapPartitionProfileV1::uses_terminal_logseq_claims(
+            BootstrapPartitionProfileV1::v4().digest()
+        )
+        .unwrap());
+        assert!(BootstrapPartitionProfileV1::uses_terminal_logseq_claims(
+            BootstrapPartitionProfileV1::current().digest()
+        )
+        .unwrap());
         for index in 0..PROFILE_CONSTANTS_V1.len() {
             let mut changed = PROFILE_CONSTANTS_V1.to_vec();
             changed[index] = match changed[index] {
