@@ -529,7 +529,33 @@ impl PublishedContinuationCore {
         }
     }
 
+    /// Timing wrapper. ~44s of a 50s import is inside `drain_one` but outside
+    /// `stage_archive_batch_bounded` (F44); this bisects whether it is inside
+    /// `resume` at all, or in `drain_one`'s other work (notably the
+    /// reconciliation scan). Instrumenting here covers every call site at once.
     fn resume(
+        &mut self,
+        admission: &LocalRuntimeAdmission<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        engine: &mut ShardedHotEngine,
+        database: &mut SqliteFrontier,
+        tail: &mut TailOverlay,
+    ) -> Result<BatchId, OperationalCoordinatorError> {
+        if std::env::var_os("TINE_PHASE_TRACE").is_none() {
+            return self.resume_inner(admission, graph, receipts, engine, database, tail);
+        }
+        let started = std::time::Instant::now();
+        let outcome = self.resume_inner(admission, graph, receipts, engine, database, tail);
+        eprintln!(
+            "PHASE TIME coordinator.resume {:.1}ms ok={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            outcome.is_ok(),
+        );
+        outcome
+    }
+
+    fn resume_inner(
         &mut self,
         admission: &LocalRuntimeAdmission<'_>,
         graph: &Graph,
@@ -718,7 +744,15 @@ impl PublishedContinuationCore {
             ));
         }
 
+        // ~39s of a 50s import is inside resume() but outside ArchiveStage
+        // (F45). This loop is the largest remaining block; time it as a whole
+        // rather than guessing which of its calls dominates.
+        let projection_started = std::env::var_os("TINE_PHASE_TRACE")
+            .is_some()
+            .then(std::time::Instant::now);
+        let mut projection_iterations = 0_u32;
         loop {
+            projection_iterations += 1;
             let work = {
                 let page = engine
                     .projection_work_index()
@@ -738,9 +772,24 @@ impl PublishedContinuationCore {
                 page.work().first().cloned()
             };
             let Some(work) = work else {
+                if let Some(started) = projection_started {
+                    eprintln!(
+                        "PHASE TIME ProjectionDrain.loop {:.1}ms iterations={projection_iterations}",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
                 break;
             };
             if budget.remaining == 0 {
+                // The loop normally leaves HERE, not via `break` -- budget
+                // exhaustion is the common exit, clean drain the rare one. A
+                // timer only on the break path caught 2 of 169 slices.
+                if let Some(started) = projection_started {
+                    eprintln!(
+                        "PHASE TIME ProjectionDrain.loop {:.1}ms iterations={projection_iterations} exit=continuation",
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
                 return Err(OperationalCoordinatorError::continuation_required(
                     OperationalPhase::ProjectionDrain,
                     "projection bounded slice has ready-work continuation",
