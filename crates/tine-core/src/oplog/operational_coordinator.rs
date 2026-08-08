@@ -782,9 +782,25 @@ fn require_accepted_stage_disposition(
 ) -> Result<(), OperationalCoordinatorError> {
     match disposition {
         BatchDisposition::Accepted { .. } | BatchDisposition::DuplicateAccepted { .. } => Ok(()),
-        BatchDisposition::IncompleteStaged { .. } => Err(OperationalCoordinatorError::new(
+        // Carry the counts the variant already holds. Without them this failure
+        // reads identically whether one object is missing or ten thousand, and
+        // whether it is waiting on a dependency batch or on object bytes -- which
+        // are different bugs with different fixes. The retry loop above surfaces
+        // only this string, so anything dropped here is unrecoverable downstream.
+        BatchDisposition::IncompleteStaged {
+            missing_objects,
+            missing_dependencies,
+        } => Err(OperationalCoordinatorError::new(
             OperationalPhase::ArchiveStage,
-            format!("bounded staging slice for {batch_id} retains dependency/work continuation"),
+            format!(
+                "bounded staging slice for {batch_id} retains dependency/work continuation: \
+                 {missing_objects} missing objects, {} missing dependencies{}",
+                missing_dependencies.len(),
+                match missing_dependencies.first() {
+                    Some(first) => format!(" (first: {first})"),
+                    None => String::new(),
+                }
+            ),
         )),
         BatchDisposition::Rejected { error } => Err(OperationalCoordinatorError::retained_block(
             OperationalPhase::ArchiveStage,

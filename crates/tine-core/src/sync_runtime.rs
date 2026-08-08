@@ -21535,6 +21535,34 @@ mod tests {
         };
         let fixture = RuntimeHostFixture::safe("realgraph-managed-reopen-probe");
         copy_tree_for_probe(std::path::Path::new(&source), fixture.graph_root());
+        // The full corpus cannot be admitted at all (see the bulk-wedge probe:
+        // one batch, TAIL_MAX_BYTES, permanent block). To measure *reopen* we
+        // need a graph that activates, so optionally trim to a bounded subset.
+        // Real shape, bounded size -- still far better than a synthetic fixture.
+        if let Ok(limit) = std::env::var("TINE_PROBE_MAX_FILES") {
+            let limit: usize = limit.parse().unwrap_or(usize::MAX);
+            let mut kept = 0_usize;
+            let mut stack = vec![fixture.graph_root().to_path_buf()];
+            let mut victims = Vec::new();
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if entry.file_type().unwrap().is_dir() {
+                        stack.push(path);
+                    } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                        kept += 1;
+                        if kept > limit {
+                            victims.push(path);
+                        }
+                    }
+                }
+            }
+            for victim in &victims {
+                let _ = std::fs::remove_file(victim);
+            }
+            println!("TRIMMED to {} .md files (removed {})", limit.min(kept), victims.len());
+        }
         let request = fixture.request();
 
         let activation_started = std::time::Instant::now();
@@ -21561,6 +21589,7 @@ mod tests {
         let mut blocked_ticks = 0_u32;
         let mut ticks = 0_u32;
         let mut settled = false;
+        let mut last_block: Option<String> = None;
         while feed_started.elapsed() < budget {
             ticks += 1;
             match first.tick().unwrap() {
@@ -21572,8 +21601,15 @@ mod tests {
                         break;
                     }
                 }
-                SyncRuntimeTick::Blocked(_) => {
+                SyncRuntimeTick::Blocked(reason) => {
                     blocked_ticks += 1;
+                    // The reason is the whole diagnosis; a bare count told me
+                    // nothing when a 300-file subset blocked as hard as 1,047.
+                    let reason = format!("{reason:?}");
+                    if last_block.as_deref() != Some(reason.as_str()) {
+                        println!("  BLOCK REASON CHANGED -> {reason}");
+                        last_block = Some(reason);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }
                 SyncRuntimeTick::Recovering
@@ -21587,7 +21623,7 @@ mod tests {
         let feed = feed_started.elapsed();
         println!(
             "FEED: settled={settled} ticks={ticks} blocked_ticks={blocked_ticks} \
-             elapsed={:.1}s",
+             elapsed={:.1}s last_block={last_block:?}",
             feed.as_secs_f64()
         );
         if !settled {
@@ -21604,10 +21640,47 @@ mod tests {
             SyncShutdownOutcome::Safe(_)
         ));
 
+        // Open WITH progress: the per-stage reopen breakdown is only delivered
+        // through the progress callback, so plain `open()` silently discards
+        // exactly the attribution this probe exists to capture.
         let reopen_started = std::time::Instant::now();
-        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        let mut captured: Option<SyncRuntimeRecoveryDiagnostics> = None;
+        let reopened = active_handle(SyncRuntimeHandle::open_with_progress(
+            request,
+            |event| {
+                if let SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics } = event {
+                    captured = Some(diagnostics);
+                }
+            },
+        ));
         let reopen = reopen_started.elapsed();
         let status = reopened.status().unwrap();
+        match captured {
+            Some(d) => {
+                let ms = |x: std::time::Duration| x.as_secs_f64() * 1000.0;
+                println!(
+                    "REOPEN STAGES (ms): total={:.1} | projection: sidecar={:.1} \
+                     checkpoint_auth={:.1} ro_open={:.1} schema_claim={:.1} \
+                     structural={:.1} stamp={:.1} forensics={:.1} rebuild={:.1} \
+                     | replay: prepare={:.1} predecessor_restore={:.1} \
+                     bootstrap_part={:.1} archived_tail={:.1} finish={:.1} \
+                     | counts: applied_batches={} bulk_pages={} ancestry_full_scans={} \
+                     bootstrap_parts={} manifests_offered={} manifests_replayed={} \
+                     | recovery={} reason={:?}",
+                    ms(d.total), ms(d.projection_sidecar_shape),
+                    ms(d.projection_checkpoint_authentication), ms(d.projection_read_only_open),
+                    ms(d.projection_schema_and_claim), ms(d.projection_structural_validation),
+                    ms(d.projection_materialization_stamp), ms(d.projection_forensics_preservation),
+                    ms(d.projection_rebuild), ms(d.prepare_replay), ms(d.predecessor_restore),
+                    ms(d.bootstrap_part_replay), ms(d.archived_tail_replay), ms(d.finish_replay),
+                    d.projection_applied_batches, d.projection_bulk_pages_materialized,
+                    d.projection_ancestry_full_scans, d.bootstrap_parts_replayed,
+                    d.archived_manifests_offered, d.archived_manifests_replayed,
+                    d.projection_recovery, d.projection_reason,
+                );
+            }
+            None => println!("REOPEN STAGES: none emitted (no recovery diagnostics on this open)"),
+        }
 
         println!(
             "REAL-GRAPH MANAGED PROBE: activation={:.1}ms initial_feed={:.1}ms \
