@@ -583,6 +583,12 @@ impl PublishedContinuationCore {
                 WorkspaceAuthorityBoundary::ArchiveStage,
                 OperationalPhase::ArchiveStage,
             )?;
+            // ArchiveStage charges 77.5% of the slice budget (F43), but ops are
+            // not milliseconds, so time the call itself before concluding it
+            // dominates wall clock too.
+            let stage_started = std::env::var_os("TINE_PHASE_TRACE")
+                .is_some()
+                .then(std::time::Instant::now);
             let stage = engine
                 .stage_archive_batch_bounded(self.batch_id, stage_limit)
                 .map_err(|error| {
@@ -591,6 +597,12 @@ impl PublishedContinuationCore {
                         error.to_string(),
                     )
                 })?;
+            if let Some(started) = stage_started {
+                eprintln!(
+                    "PHASE TIME ArchiveStage.stage_archive_batch_bounded {:.1}ms limit={stage_limit}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
             budget.consume(stage.work(), OperationalPhase::ArchiveStage)?;
             fault(OperationalFaultPoint::AfterStage)?;
             require_accepted_stage_disposition(self.batch_id, &stage.outcome().disposition())?;
