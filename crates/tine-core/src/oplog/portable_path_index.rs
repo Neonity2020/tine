@@ -274,6 +274,33 @@ impl PortablePathIndexStore {
             .insert_many(root.0, &encoded)
             .map(PortablePathIndexRoot)
     }
+
+    /// Publish one source-selected bootstrap path set from the empty root.
+    /// Chunking follows the adaptive detached-construction memory budget; no
+    /// accumulated prefix is reopened between physical bootstrap parts.
+    pub(crate) fn build_detached_bootstrap_records(
+        &self,
+        records: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
+    ) -> Result<PortablePathIndexRoot, StoreError> {
+        let chunk_limit = self
+            .patricia
+            .detached_construction_bulk_record_limit()?
+            .ok_or(StoreError::MalformedLogseqClaimIndex)?
+            .max(1);
+        let mut root = PortablePathIndexRoot::empty();
+        let mut chunk = BTreeMap::new();
+        for (key, record) in records {
+            chunk.insert(key, record);
+            if chunk.len() == chunk_limit {
+                root = self.insert_many(root, &chunk)?;
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            root = self.insert_many(root, &chunk)?;
+        }
+        Ok(root)
+    }
 }
 
 fn exact_path_digest(path: &ManagedPath) -> ContentDigest {

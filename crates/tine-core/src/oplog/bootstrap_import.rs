@@ -841,12 +841,7 @@ impl BootstrapPartitionProfileV1 {
         }
     }
 
-    /// Current authoring profile. V4 keeps each page declaration with its
-    /// content capsule. This avoids publishing and immediately reopening an
-    /// empty home document while retaining every V3 resource boundary. V5
-    /// constructs the rebuildable current-path and Logseq-claim indexes once
-    /// from terminal authority instead of rebuilding every accumulated prefix.
-    pub(crate) fn current() -> Self {
+    fn v5() -> Self {
         Self {
             digest: BootstrapProfileDigestV1::digest(
                 b"tine/bootstrap-import/partition-profile/v5\0",
@@ -854,6 +849,26 @@ impl BootstrapPartitionProfileV1 {
                     Self::v4().digest.as_bytes(),
                     b"terminal-current-path-catalog/v1",
                     b"terminal-logseq-claims/v1",
+                ],
+            ),
+        }
+    }
+
+    /// Current authoring profile. V4 keeps each page declaration with its
+    /// content capsule. This avoids publishing and immediately reopening an
+    /// empty home document while retaining every V3 resource boundary. V5
+    /// constructs the rebuildable current-path and Logseq-claim indexes once
+    /// from terminal authority instead of rebuilding every accumulated prefix.
+    /// V6 applies the same rule to the portable-path and page-name indexes;
+    /// global source selection has already made both namespaces unique.
+    pub(crate) fn current() -> Self {
+        Self {
+            digest: BootstrapProfileDigestV1::digest(
+                b"tine/bootstrap-import/partition-profile/v6\0",
+                &[
+                    Self::v5().digest.as_bytes(),
+                    b"terminal-portable-paths/v1",
+                    b"terminal-page-names/v1",
                 ],
             ),
         }
@@ -870,6 +885,7 @@ impl BootstrapPartitionProfileV1 {
         Ok(digest == Self::v2().digest
             || digest == Self::v3().digest
             || digest == Self::v4().digest
+            || digest == Self::v5().digest
             || digest == Self::current().digest)
     }
 
@@ -877,10 +893,24 @@ impl BootstrapPartitionProfileV1 {
         digest: BootstrapProfileDigestV1,
     ) -> Result<bool, BootstrapImportError> {
         Self::validate_digest(digest)?;
-        Ok(digest == Self::current().digest)
+        Ok(digest == Self::v5().digest || digest == Self::current().digest)
     }
 
     pub(crate) fn uses_terminal_logseq_claims(
+        digest: BootstrapProfileDigestV1,
+    ) -> Result<bool, BootstrapImportError> {
+        Self::validate_digest(digest)?;
+        Ok(digest == Self::v5().digest || digest == Self::current().digest)
+    }
+
+    pub(crate) fn uses_terminal_portable_paths(
+        digest: BootstrapProfileDigestV1,
+    ) -> Result<bool, BootstrapImportError> {
+        Self::validate_digest(digest)?;
+        Ok(digest == Self::current().digest)
+    }
+
+    pub(crate) fn uses_terminal_page_names(
         digest: BootstrapProfileDigestV1,
     ) -> Result<bool, BootstrapImportError> {
         Self::validate_digest(digest)?;
@@ -892,6 +922,7 @@ impl BootstrapPartitionProfileV1 {
             && digest != Self::v2().digest
             && digest != Self::v3().digest
             && digest != Self::v4().digest
+            && digest != Self::v5().digest
             && digest != Self::current().digest
         {
             return Err(BootstrapImportError::ProfileMismatch);
@@ -5093,6 +5124,22 @@ mod tests {
         )
         .unwrap());
         assert!(BootstrapPartitionProfileV1::uses_terminal_logseq_claims(
+            BootstrapPartitionProfileV1::current().digest()
+        )
+        .unwrap());
+        assert!(!BootstrapPartitionProfileV1::uses_terminal_portable_paths(
+            BootstrapPartitionProfileV1::v5().digest()
+        )
+        .unwrap());
+        assert!(BootstrapPartitionProfileV1::uses_terminal_portable_paths(
+            BootstrapPartitionProfileV1::current().digest()
+        )
+        .unwrap());
+        assert!(!BootstrapPartitionProfileV1::uses_terminal_page_names(
+            BootstrapPartitionProfileV1::v5().digest()
+        )
+        .unwrap());
+        assert!(BootstrapPartitionProfileV1::uses_terminal_page_names(
             BootstrapPartitionProfileV1::current().digest()
         )
         .unwrap());

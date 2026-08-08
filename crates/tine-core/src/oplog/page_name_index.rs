@@ -459,6 +459,33 @@ pub(crate) struct PageNamePublicationCandidateV1 {
     ephemeral: Option<EphemeralPageNameOwnershipCandidateV1>,
 }
 
+/// One source-selected page creation retained until terminal bootstrap index
+/// publication. Bootstrap emits no page rename, release, or reacquisition, so
+/// the general transition machine would only publish every growing prefix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DetachedBootstrapPageNameCreation {
+    page_id: PageId,
+    exact_name: LogicalPageName,
+    acquisition_batch: BatchId,
+    acquisition_dot: BatchCausalDot,
+}
+
+impl DetachedBootstrapPageNameCreation {
+    pub(crate) const fn new(
+        page_id: PageId,
+        exact_name: LogicalPageName,
+        acquisition_batch: BatchId,
+        acquisition_dot: BatchCausalDot,
+    ) -> Self {
+        Self {
+            page_id,
+            exact_name,
+            acquisition_batch,
+            acquisition_dot,
+        }
+    }
+}
+
 /// Authenticated exact-name provenance for one occupied canonical key.
 ///
 /// The fields stay private so callers cannot manufacture an exact-title
@@ -475,6 +502,14 @@ pub(crate) struct AuthenticatedPageNameExactStateV1 {
 }
 
 impl PageNamePublicationCandidateV1 {
+    pub(crate) fn unchanged(root: PageNameOwnershipRootV1) -> Self {
+        Self {
+            root,
+            conflicts: Vec::new(),
+            ephemeral: None,
+        }
+    }
+
     pub(crate) fn authenticated_ephemeral_exact_state(
         &self,
         prior: &EphemeralPageNameOwnershipStateV1,
@@ -1840,6 +1875,67 @@ impl PageNameOwnershipStore {
         };
         next.validate_version_and_shape()?;
         Ok(next)
+    }
+
+    /// Publish the unique page creations collected by one detached bootstrap.
+    ///
+    /// The caller has already validated the source-selected creation-only
+    /// stream. Exact-name blobs and Patricia records are therefore encoded once
+    /// from that authority instead of being published and reread for every
+    /// physical part. The detached publisher keeps all output private until the
+    /// enclosing bootstrap publication is completed.
+    pub(crate) fn build_detached_bootstrap_creations(
+        &self,
+        creations: &BTreeMap<PageNameKeyDigest, DetachedBootstrapPageNameCreation>,
+    ) -> Result<PageNameOwnershipRootV1, StoreError> {
+        if self.detached_publisher.is_none() {
+            return Err(StoreError::MalformedPageNameIndex);
+        }
+        let chunk_limit = self
+            .patricia
+            .detached_construction_bulk_record_limit()?
+            .ok_or(StoreError::MalformedPageNameIndex)?
+            .max(1)
+            .min(MAX_PAGE_NAME_POINT_BATCH);
+        let mut root = PageNameOwnershipRootV1::empty();
+        let mut encoded = BTreeMap::new();
+        for (key, creation) in creations {
+            if creation.exact_name.key_digest() != *key {
+                return Err(StoreError::MalformedPageNameIndex);
+            }
+            let exact_name = self.put_exact_name(&creation.exact_name)?;
+            validate_exact_name_ref(*key, &exact_name, &creation.exact_name)?;
+            let record = PageNameOwnershipRecordV1::new(
+                *key,
+                Some(PageNameOwnershipOccupiedV1::new(
+                    creation.page_id,
+                    exact_name,
+                    creation.acquisition_batch,
+                    creation.acquisition_dot,
+                    creation.acquisition_batch,
+                    creation.acquisition_dot,
+                )),
+                None,
+            )?;
+            encoded.insert(key.as_bytes().to_vec(), encode_canonical(&record)?);
+            if encoded.len() == chunk_limit {
+                root.patricia_root = self.patricia.insert_many(root.patricia_root, &encoded)?;
+                root.entry_count = root
+                    .entry_count
+                    .checked_add(encoded.len() as u64)
+                    .ok_or(StoreError::MalformedPageNameIndex)?;
+                encoded.clear();
+            }
+        }
+        if !encoded.is_empty() {
+            root.patricia_root = self.patricia.insert_many(root.patricia_root, &encoded)?;
+            root.entry_count = root
+                .entry_count
+                .checked_add(encoded.len() as u64)
+                .ok_or(StoreError::MalformedPageNameIndex)?;
+        }
+        root.validate_version_and_shape()?;
+        Ok(root)
     }
 
     fn validate_record_names(

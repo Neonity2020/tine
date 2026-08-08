@@ -36,9 +36,9 @@ use super::page_name_index::{
     extract_validated_catalog_page_names, prepare_authored_page_name_transition,
     prepare_ephemeral_page_name_transition, prepare_page_name_transition,
     AuthenticatedCatalogPageNameCheckpointV1, AuthenticatedPageNameExactStateV1,
-    AuthoritativeCatalogPageNameObservationsV1, EphemeralPageNameOwnershipStateV1,
-    PageNameConflictEvidenceV1, PageNameOwnershipRootV1, PageNameOwnershipStore,
-    PageNamePublicationCandidateV1, PageNameTransitionError,
+    AuthoritativeCatalogPageNameObservationsV1, DetachedBootstrapPageNameCreation,
+    EphemeralPageNameOwnershipStateV1, PageNameConflictEvidenceV1, PageNameOwnershipRootV1,
+    PageNameOwnershipStore, PageNamePublicationCandidateV1, PageNameTransitionError,
 };
 use super::portable_path_index::{
     PortablePathIndexRoot, PortablePathIndexStore, PortablePathOccupied, PortablePathRecord,
@@ -1887,6 +1887,20 @@ struct DetachedBootstrapCurrentPathCatalogPlan {
 #[derive(Debug, Default)]
 struct DetachedBootstrapLogseqClaimPlan {
     additions: Vec<(LogseqUuid, LogseqClaimIntroduction)>,
+    terminal_part: bool,
+}
+
+#[derive(Debug, Default)]
+struct DetachedBootstrapPortablePathPlan {
+    records: BTreeMap<PortablePathKeyDigest, PortablePathRecord>,
+    page_ids: BTreeSet<PageId>,
+    terminal_part: bool,
+}
+
+#[derive(Debug, Default)]
+struct DetachedBootstrapPageNamePlan {
+    creations: BTreeMap<super::PageNameKeyDigest, DetachedBootstrapPageNameCreation>,
+    page_ids: BTreeSet<PageId>,
     terminal_part: bool,
 }
 
@@ -6953,6 +6967,8 @@ pub struct ShardedHotEngine {
     detached_bootstrap_reference_catalog: Option<DetachedBootstrapReferenceCatalogPlan>,
     detached_bootstrap_current_path_catalog: Option<DetachedBootstrapCurrentPathCatalogPlan>,
     detached_bootstrap_logseq_claims: Option<DetachedBootstrapLogseqClaimPlan>,
+    detached_bootstrap_portable_paths: Option<DetachedBootstrapPortablePathPlan>,
+    detached_bootstrap_page_names: Option<DetachedBootstrapPageNamePlan>,
     fatal_evidence: Option<ImmutableHomeEvidence>,
     fatal_handle: Option<FatalEvidenceHandle>,
     visible_documents: BTreeMap<DocumentId, LoroDoc>,
@@ -7143,6 +7159,8 @@ impl ShardedHotEngine {
             detached_bootstrap_reference_catalog: None,
             detached_bootstrap_current_path_catalog: None,
             detached_bootstrap_logseq_claims: None,
+            detached_bootstrap_portable_paths: None,
+            detached_bootstrap_page_names: None,
             fatal_evidence: None,
             fatal_handle: None,
             visible_documents: BTreeMap::new(),
@@ -11539,15 +11557,7 @@ impl ShardedHotEngine {
             for delta in effect.pages() {
                 let after = prospective_catalog_pages
                     .and_then(|pages| pages.get(&delta.page_id))
-                    .map(|state| {
-                        self.current_path_catalog_row_from_post_transition_authority(
-                            delta.page_id,
-                            state,
-                            post_page_name_root,
-                        )
-                    })
-                    .transpose()?
-                    .flatten();
+                    .and_then(current_path_catalog_row_from_page_state);
                 if let Some(after) = &after {
                     if after.path.as_str().len() > MAX_CURRENT_PATH_CURSOR_PATH_BYTES {
                         return Err(EngineError::Archive(format!(
@@ -13635,6 +13645,30 @@ impl ShardedHotEngine {
                 "bootstrap Logseq-claim construction profile changed mid-replay".into(),
             ));
         }
+        let terminal_portable_paths =
+            BootstrapPartitionProfileV1::uses_terminal_portable_paths(evidence.profile_digest())
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if terminal_portable_paths {
+            self.detached_bootstrap_portable_paths
+                .get_or_insert_with(DetachedBootstrapPortablePathPlan::default)
+                .terminal_part = terminal_part;
+        } else if self.detached_bootstrap_portable_paths.is_some() {
+            return Err(EngineError::Archive(
+                "bootstrap portable-path construction profile changed mid-replay".into(),
+            ));
+        }
+        let terminal_page_names =
+            BootstrapPartitionProfileV1::uses_terminal_page_names(evidence.profile_digest())
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+        if terminal_page_names {
+            self.detached_bootstrap_page_names
+                .get_or_insert_with(DetachedBootstrapPageNamePlan::default)
+                .terminal_part = terminal_part;
+        } else if self.detached_bootstrap_page_names.is_some() {
+            return Err(EngineError::Archive(
+                "bootstrap page-name construction profile changed mid-replay".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -13945,15 +13979,24 @@ impl ShardedHotEngine {
         });
 
         let portable_paths_started = self.replay_timing_started();
-        let portable_paths = self.prepare_portable_path_updates(
-            &causal_roots,
-            batch_id,
-            manifest.causal_dot(),
-            frontier,
-            effect,
-            catalog_pages,
-            true,
-        )?;
+        let portable_paths = if self.detached_bootstrap_portable_paths.is_some() {
+            self.prepare_detached_bootstrap_portable_path_updates(
+                batch_id,
+                manifest.causal_dot(),
+                effect,
+                catalog_pages,
+            )?
+        } else {
+            self.prepare_portable_path_updates(
+                &causal_roots,
+                batch_id,
+                manifest.causal_dot(),
+                frontier,
+                effect,
+                catalog_pages,
+                true,
+            )?
+        };
         self.validate_manifested_portable_path_binding(
             batch_id,
             frontier,
@@ -13966,7 +14009,17 @@ impl ShardedHotEngine {
         });
         let page_names_started = self.replay_timing_started();
         let page_names = if effect.pages().is_empty() {
-            None
+            self.prepare_authored_page_name_updates(
+                &causal_roots,
+                batch_id,
+                manifest.causal_dot(),
+                manifest.causal_dependency_heads(),
+                frontier,
+                effect,
+                &AuthoritativeCatalogPageNameObservationsV1::default(),
+                &AuthoritativeCatalogPageNameObservationsV1::default(),
+                &AuthoritativeCatalogPageNameObservationsV1::default(),
+            )?
         } else {
             let requested_page_ids = effect
                 .pages()
@@ -22522,7 +22575,7 @@ impl ShardedHotEngine {
 
     #[allow(clippy::too_many_arguments)]
     fn prepare_authored_page_name_updates(
-        &self,
+        &mut self,
         scratch_roots: &ScratchRoots,
         batch_id: BatchId,
         causal_dot: BatchCausalDot,
@@ -22533,6 +22586,87 @@ impl ShardedHotEngine {
         current_pages: &AuthoritativeCatalogPageNameObservationsV1,
         prospective_pages: &AuthoritativeCatalogPageNameObservationsV1,
     ) -> Result<Option<PageNamePublicationCandidateV1>, EngineError> {
+        if self.detached_bootstrap_page_names.is_some() {
+            let mut additions = Vec::with_capacity(effect.pages().len());
+            for delta in effect.pages() {
+                if delta.before.is_some()
+                    || exact_before.entries().get(&delta.page_id) != Some(&None)
+                    || current_pages.entries().get(&delta.page_id) != Some(&None)
+                    || prospective_pages.entries().get(&delta.page_id) != Some(&delta.after)
+                {
+                    return Err(EngineError::Archive(
+                        "terminal bootstrap page-name plan received a non-creation transition"
+                            .into(),
+                    ));
+                }
+                let state = delta.after.as_ref().ok_or_else(|| {
+                    EngineError::Archive(
+                        "terminal bootstrap page-name plan received an absent creation".into(),
+                    )
+                })?;
+                let PageState::Live { name, .. } = state else {
+                    return Err(EngineError::Archive(
+                        "terminal bootstrap page-name plan received a tombstone".into(),
+                    ));
+                };
+                additions.push((
+                    name.key_digest(),
+                    delta.page_id,
+                    DetachedBootstrapPageNameCreation::new(
+                        delta.page_id,
+                        name.clone(),
+                        batch_id,
+                        causal_dot,
+                    ),
+                ));
+            }
+            let terminal_part = self
+                .detached_bootstrap_page_names
+                .as_ref()
+                .expect("checked terminal page-name plan")
+                .terminal_part;
+            {
+                let plan = self
+                    .detached_bootstrap_page_names
+                    .as_mut()
+                    .expect("checked terminal page-name plan");
+                for (key, page_id, creation) in additions {
+                    if !plan.page_ids.insert(page_id)
+                        || plan.creations.insert(key, creation).is_some()
+                    {
+                        return Err(EngineError::Archive(
+                            "terminal bootstrap page-name plan repeats a page or canonical key"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            if !terminal_part {
+                return Ok(Some(PageNamePublicationCandidateV1::unchanged(
+                    self.page_name_root.clone(),
+                )));
+            }
+            if self.page_name_root != PageNameOwnershipRootV1::empty() {
+                return Err(EngineError::Archive(
+                    "terminal bootstrap page-name construction did not start empty".into(),
+                ));
+            }
+            let plan = self
+                .detached_bootstrap_page_names
+                .take()
+                .expect("terminal bootstrap page-name plan exists");
+            let root = self
+                .page_name_index
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "terminal bootstrap page-name construction has no durable index".into(),
+                    )
+                })?
+                .build_detached_bootstrap_creations(&plan.creations)
+                .map_err(|error| EngineError::Archive(error.to_string()))?;
+            return Ok(Some(PageNamePublicationCandidateV1::unchanged(root)));
+        }
         if effect.pages().is_empty() {
             return Ok(None);
         }
@@ -23274,6 +23408,101 @@ impl ShardedHotEngine {
             .validate()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         Ok(binding)
+    }
+
+    fn prepare_detached_bootstrap_portable_path_updates(
+        &mut self,
+        batch_id: BatchId,
+        causal_dot: BatchCausalDot,
+        effect: &SemanticEffect,
+        prospective_pages: Option<&BTreeMap<PageId, PageState>>,
+    ) -> Result<PortablePathPublicationCandidate, EngineError> {
+        let mut additions = Vec::with_capacity(effect.pages().len());
+        for delta in effect.pages() {
+            if delta.before.is_some() {
+                return Err(EngineError::Archive(
+                    "terminal bootstrap portable-path plan received a non-creation transition"
+                        .into(),
+                ));
+            }
+            let state = prospective_pages
+                .and_then(|pages| pages.get(&delta.page_id))
+                .filter(|state| Some(*state) == delta.after.as_ref())
+                .ok_or_else(|| {
+                    EngineError::Archive(
+                        "terminal bootstrap portable-path plan lacks its exact creation state"
+                            .into(),
+                    )
+                })?;
+            let path = state.path().ok_or_else(|| {
+                EngineError::Archive(
+                    "terminal bootstrap portable-path plan received a tombstone".into(),
+                )
+            })?;
+            let key = path.portable_key().digest();
+            let record = PortablePathRecord::new(
+                key,
+                Some(PortablePathOccupied::new(
+                    delta.page_id,
+                    path.clone(),
+                    batch_id,
+                    causal_dot,
+                )),
+                None,
+            )
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+            additions.push((key, delta.page_id, record));
+        }
+        let terminal_part = self
+            .detached_bootstrap_portable_paths
+            .as_ref()
+            .expect("checked terminal portable-path plan")
+            .terminal_part;
+        {
+            let plan = self
+                .detached_bootstrap_portable_paths
+                .as_mut()
+                .expect("checked terminal portable-path plan");
+            for (key, page_id, record) in additions {
+                if !plan.page_ids.insert(page_id) || plan.records.insert(key, record).is_some() {
+                    return Err(EngineError::Archive(
+                        "terminal bootstrap portable-path plan repeats a page or portable key"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        if !terminal_part {
+            return Ok(PortablePathPublicationCandidate {
+                root: self.portable_path_root,
+                changed: Vec::new(),
+                conflicts: Vec::new(),
+            });
+        }
+        if self.portable_path_root != PortablePathIndexRoot::empty() {
+            return Err(EngineError::Archive(
+                "terminal bootstrap portable-path construction did not start empty".into(),
+            ));
+        }
+        let plan = self
+            .detached_bootstrap_portable_paths
+            .take()
+            .expect("terminal bootstrap portable-path plan exists");
+        let root = self
+            .portable_path_index
+            .as_ref()
+            .ok_or_else(|| {
+                EngineError::Archive(
+                    "terminal bootstrap portable-path construction has no durable index".into(),
+                )
+            })?
+            .build_detached_bootstrap_records(plan.records)
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        Ok(PortablePathPublicationCandidate {
+            root,
+            changed: Vec::new(),
+            conflicts: Vec::new(),
+        })
     }
 
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
@@ -30227,6 +30456,24 @@ mod validation_tests {
         predecessor: Option<BootstrapPartId>,
         operation_count: u32,
     ) -> BootstrapImportPartEvidenceV1 {
+        detached_evidence_with_profile(
+            import_id,
+            BootstrapPartitionProfileV1::current().digest(),
+            ordinal,
+            part_count,
+            predecessor,
+            operation_count,
+        )
+    }
+
+    fn detached_evidence_with_profile(
+        import_id: ImportId,
+        profile: BootstrapProfileDigestV1,
+        ordinal: u32,
+        part_count: u32,
+        predecessor: Option<BootstrapPartId>,
+        operation_count: u32,
+    ) -> BootstrapImportPartEvidenceV1 {
         let operations = (0..operation_count)
             .map(|index| {
                 let digest = ContentDigest::of(
@@ -30241,7 +30488,7 @@ mod validation_tests {
             .collect::<Vec<_>>();
         BootstrapImportPartEvidenceV1::new(
             import_id,
-            BootstrapPartitionProfileV1::current().digest(),
+            profile,
             ordinal,
             part_count,
             SourceSpanRootV1::empty(),
@@ -30692,6 +30939,37 @@ mod validation_tests {
             second.prepared().manifest().causal_dependency_heads(),
             &[first.prepared().manifest().batch_id()]
         );
+        assert_eq!(
+            first.engine_material().history_binding().portable_path_root,
+            PortablePathIndexRoot::empty().digest(),
+            "a nonterminal physical part must not publish an accumulated path prefix"
+        );
+        assert_eq!(
+            first
+                .engine_material()
+                .history_binding()
+                .page_names
+                .ownership_root,
+            PageNameOwnershipRootV1::empty(),
+            "a nonterminal physical part must not publish an accumulated name prefix"
+        );
+        assert_ne!(
+            second
+                .engine_material()
+                .history_binding()
+                .portable_path_root,
+            PortablePathIndexRoot::empty().digest(),
+            "the terminal part must bind the complete portable-path authority"
+        );
+        assert_ne!(
+            second
+                .engine_material()
+                .history_binding()
+                .page_names
+                .ownership_root,
+            PageNameOwnershipRootV1::empty(),
+            "the terminal part must bind the complete page-name authority"
+        );
         let completed = session.finish().unwrap();
         assert_eq!(completed.part_count(), 2);
         // Deliberately the same durable archive: repeating the authoring must
@@ -30740,6 +31018,136 @@ mod validation_tests {
             "part two must edit state accepted from part one"
         );
         assert_eq!(blocks[&child].0, Some(parent));
+        let exact_path = ManagedPath::parse("pages/multi.md").unwrap();
+        let portable = completed
+            .engine
+            .portable_path_index
+            .as_ref()
+            .unwrap()
+            .lookup(
+                completed.engine.portable_path_root,
+                exact_path.portable_key().digest(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(portable.occupied().unwrap().page_id(), page);
+        assert_eq!(portable.occupied().unwrap().exact_path(), &exact_path);
+        let selected = completed
+            .engine
+            .authenticated_page_name_exact_state(
+                &completed.engine.page_name_root,
+                LogicalPageName::parse("Multipart").unwrap().key_digest(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.page_id(), page);
+        assert_eq!(selected.exact_name().as_str(), "Multipart");
+    }
+
+    #[test]
+    fn detached_bootstrap_terminal_identity_indexes_match_incremental_semantics() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(91_037));
+        let lineage = LineageDigest::of(b"detached-bootstrap-terminal-identity-differential");
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(91_038));
+        let import_id = ImportId::from_digest([0x4a; 32]);
+        let transactions = [
+            create_page_with_block(
+                PageId::from_uuid(Uuid::from_u128(91_039)),
+                DocumentId::from_uuid(Uuid::from_u128(91_040)),
+                BlockId::from_uuid(Uuid::from_u128(91_041)),
+                "Nested Alpha",
+                "notes/deep/alpha.md",
+            ),
+            create_page_with_block(
+                PageId::from_uuid(Uuid::from_u128(91_042)),
+                DocumentId::from_uuid(Uuid::from_u128(91_043)),
+                BlockId::from_uuid(Uuid::from_u128(91_044)),
+                "Nested Beta",
+                "elsewhere/beta.org",
+            ),
+        ];
+        let terminal_store =
+            TemporaryBootstrapCatalog::create(workspace, "terminal-identity-differential");
+        let incremental_store =
+            TemporaryBootstrapCatalog::create(workspace, "incremental-identity-differential");
+        let author = |capability: &BootstrapAuthoringCapability,
+                      profile: BootstrapProfileDigestV1| {
+            let mut session = DetachedBootstrapAuthoringSession::new(
+                workspace,
+                lineage,
+                catalog,
+                ReferenceCatalogPolicyV1::default(),
+                capability,
+            )
+            .unwrap();
+            let mut predecessor = None;
+            for (ordinal, transaction) in transactions.iter().enumerate() {
+                let evidence = detached_evidence_with_profile(
+                    import_id,
+                    profile,
+                    ordinal as u32,
+                    transactions.len() as u32,
+                    predecessor,
+                    transaction.operations.len() as u32,
+                );
+                session
+                    .author_part(detached_author(evidence, 91_045), transaction, evidence)
+                    .unwrap();
+                predecessor = Some(evidence.part_id());
+            }
+            session.finish().unwrap()
+        };
+        let terminal = author(
+            terminal_store.capability(),
+            BootstrapPartitionProfileV1::current().digest(),
+        );
+        let incremental = author(
+            incremental_store.capability(),
+            BootstrapPartitionProfileV1::v1().digest(),
+        );
+
+        for (name, path, page_id) in [
+            (
+                "Nested Alpha",
+                "notes/deep/alpha.md",
+                PageId::from_uuid(Uuid::from_u128(91_039)),
+            ),
+            (
+                "Nested Beta",
+                "elsewhere/beta.org",
+                PageId::from_uuid(Uuid::from_u128(91_042)),
+            ),
+        ] {
+            let path = ManagedPath::parse(path).unwrap();
+            let path_key = path.portable_key().digest();
+            let name = LogicalPageName::parse(name).unwrap();
+            for candidate in [&terminal, &incremental] {
+                let portable = candidate
+                    .engine
+                    .portable_path_index
+                    .as_ref()
+                    .unwrap()
+                    .lookup(candidate.engine.portable_path_root, path_key)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(portable.occupied().unwrap().page_id(), page_id);
+                assert_eq!(portable.occupied().unwrap().exact_path(), &path);
+                let selected = candidate
+                    .engine
+                    .authenticated_page_name_exact_state(
+                        &candidate.engine.page_name_root,
+                        name.key_digest(),
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selected.page_id(), page_id);
+                assert_eq!(selected.exact_name(), &name);
+                assert_eq!(
+                    candidate.engine.materialize_page(page_id).unwrap().path,
+                    path
+                );
+            }
+        }
     }
 
     #[test]
@@ -30934,6 +31342,7 @@ mod validation_tests {
             BlockId::from_uuid(Uuid::from_u128(91_078)),
         ];
         let import_id = ImportId::from_digest([0x46; 32]);
+        let profile = BootstrapPartitionProfileV1::v1().digest();
         let declaration = create_page_with_block(
             page,
             home,
@@ -30941,8 +31350,14 @@ mod validation_tests {
             "Cached Catalog",
             "pages/cached-catalog.md",
         );
-        let first_evidence =
-            detached_evidence(import_id, 0, 3, None, declaration.operations.len() as u32);
+        let first_evidence = detached_evidence_with_profile(
+            import_id,
+            profile,
+            0,
+            3,
+            None,
+            declaration.operations.len() as u32,
+        );
         let content = OperationTransaction::new(
             children
                 .iter()
@@ -30960,8 +31375,9 @@ mod validation_tests {
                 .collect(),
         )
         .unwrap();
-        let second_evidence = detached_evidence(
+        let second_evidence = detached_evidence_with_profile(
             import_id,
+            profile,
             1,
             3,
             Some(first_evidence.part_id()),
@@ -30970,8 +31386,9 @@ mod validation_tests {
         let deletion =
             OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id: page }])
                 .unwrap();
-        let third_evidence = detached_evidence(
+        let third_evidence = detached_evidence_with_profile(
             import_id,
+            profile,
             2,
             3,
             Some(second_evidence.part_id()),
