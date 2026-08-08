@@ -1538,6 +1538,14 @@ fn execute_manifested_projection_work_with_runtime(
     let (proof, authority) = match recovered {
         Some(recovered) => recovered,
         None => {
+            // publish_intent was 0.6ms of the 95ms (F47), so the cost is further
+            // down. Split reservation+begin_mutation from the write that follows:
+            // if one carries ~90ms and the other is sub-millisecond, the lever is
+            // a single barrier; if the cost is spread, per-document work is
+            // inherently multi-step and decision item 13 needs reframing.
+            let mutation_started = std::env::var_os("TINE_PHASE_TRACE")
+                .is_some()
+                .then(std::time::Instant::now);
             let mut authority = if has_attempts {
                 let reservation = receipts.reserve_fallback_attempt(&local_attempt_intent)?;
                 receipts.begin_mutation(&local_attempt_intent, Some(&reservation))?
@@ -1545,6 +1553,12 @@ fn execute_manifested_projection_work_with_runtime(
                 let reservation = receipts.reserve_attempt(&local_attempt_intent)?;
                 receipts.begin_mutation(&local_attempt_intent, Some(&reservation))?
             };
+            if let Some(started) = mutation_started {
+                eprintln!(
+                    "PHASE TIME Projection.begin_mutation {:.1}ms",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
             fail_during_manifested_projection_for_harness()?;
             let current = graph
                 .read_projection_input(work.path())
