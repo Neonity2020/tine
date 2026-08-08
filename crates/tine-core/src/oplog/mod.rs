@@ -91,6 +91,26 @@ pub(crate) mod uuid_claim_index;
 #[allow(dead_code)]
 pub(crate) mod watcher_queue;
 
+/// Diagnostic trace gates, resolved once per process.
+///
+/// `std::env::var_os` walks the whole environment on every call, and these gates
+/// sit on per-document and per-batch paths. Resolving them once keeps the
+/// instrumentation free when it is off, which is the only way it is acceptable
+/// on a hot path at all. The trade is that toggling mid-process does nothing --
+/// correct for a diagnostic, wrong for a feature flag, so do not reuse these for
+/// behaviour.
+pub(crate) fn phase_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TINE_PHASE_TRACE").is_some())
+}
+
+/// Per-call-site `inspect_batch` attribution. Off, it costs one atomic load;
+/// on, it formats a `file:line` key and takes a global lock per call.
+pub(crate) fn inspect_site_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TINE_INSPECT_SITES").is_some())
+}
+
 pub use crate::graph_text_scope::{
     GraphTextScopeBinding, GraphTextScopeBindingError, GRAPH_TEXT_SCOPE_BINDING_SCHEMA_VERSION,
     GRAPH_TEXT_SCOPE_VERSION,

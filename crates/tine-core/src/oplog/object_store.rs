@@ -2499,8 +2499,10 @@ impl ObjectStore {
     #[track_caller]
     pub fn inspect_batch(&self, batch_id: BatchId) -> Result<BatchInspection, StoreError> {
         INSPECT_BATCH_CALLS.fetch_add(1, Ordering::Relaxed);
-        let caller = std::panic::Location::caller();
-        let site = format!("{}:{}", caller.file(), caller.line());
+        let site = super::inspect_site_trace_enabled().then(|| {
+            let caller = std::panic::Location::caller();
+            format!("{}:{}", caller.file(), caller.line())
+        });
         let batches = self.open_namespace(BATCHES_DIR)?;
         let filename = manifest_filename(batch_id);
         let manifest_bytes =
@@ -2528,10 +2530,12 @@ impl ObjectStore {
             });
         }
 
-        if let Ok(mut sites) = INSPECT_BATCH_SITES.lock() {
-            let entry = sites.entry(site).or_insert((0, 0));
-            entry.0 += 1;
-            entry.1 += manifest.required_objects().len();
+        if let Some(site) = site {
+            if let Ok(mut sites) = INSPECT_BATCH_SITES.lock() {
+                let entry = sites.entry(site).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += manifest.required_objects().len();
+            }
         }
         let objects_dir = self.open_namespace(OBJECTS_DIR)?;
         let mut missing = Vec::new();

@@ -124,7 +124,7 @@ impl ResumeBudget {
         // The budget is charged per phase, so this is the only place that knows
         // which phase consumes an import's work. ~36 s of a 300-file import is
         // irreducible work (F42) and it has never been attributed to a phase.
-        if std::env::var_os("TINE_PHASE_TRACE").is_some() {
+        if super::phase_trace_enabled() {
             eprintln!("PHASE CHARGE {phase:?} {count}");
         }
         self.remaining -= count;
@@ -542,7 +542,7 @@ impl PublishedContinuationCore {
         database: &mut SqliteFrontier,
         tail: &mut TailOverlay,
     ) -> Result<BatchId, OperationalCoordinatorError> {
-        if std::env::var_os("TINE_PHASE_TRACE").is_none() {
+        if !super::phase_trace_enabled() {
             return self.resume_inner(admission, graph, receipts, engine, database, tail);
         }
         let started = std::time::Instant::now();
@@ -612,8 +612,7 @@ impl PublishedContinuationCore {
             // ArchiveStage charges 77.5% of the slice budget (F43), but ops are
             // not milliseconds, so time the call itself before concluding it
             // dominates wall clock too.
-            let stage_started = std::env::var_os("TINE_PHASE_TRACE")
-                .is_some()
+            let stage_started = super::phase_trace_enabled()
                 .then(std::time::Instant::now);
             let stage = engine
                 .stage_archive_batch_bounded(self.batch_id, stage_limit)
@@ -747,8 +746,7 @@ impl PublishedContinuationCore {
         // ~39s of a 50s import is inside resume() but outside ArchiveStage
         // (F45). This loop is the largest remaining block; time it as a whole
         // rather than guessing which of its calls dominates.
-        let projection_started = std::env::var_os("TINE_PHASE_TRACE")
-            .is_some()
+        let projection_started = super::phase_trace_enabled()
             .then(std::time::Instant::now);
         let mut projection_iterations = 0_u32;
         loop {
@@ -804,8 +802,7 @@ impl PublishedContinuationCore {
             // ProjectionDrain is 58% of a managed import at ~1.45s per occurrence
             // over ~1 iteration each (F45), so a single work item costs about a
             // second. Split fetching the work from executing it.
-            let execute_started = std::env::var_os("TINE_PHASE_TRACE")
-                .is_some()
+            let execute_started = super::phase_trace_enabled()
                 .then(std::time::Instant::now);
             let executed = super::projection::execute_manifested_projection_work_under_handoff(
                 graph,
