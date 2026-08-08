@@ -143,6 +143,11 @@ pub(crate) struct OperationalCoordinatorError {
     detail: String,
     revocation: Option<RuntimeRevocation>,
     retained_block: Option<RetainedBlockReason>,
+    /// This "failure" is a bounded slice asking to be resumed, not something
+    /// that went wrong. It must not be charged against the transient-failure
+    /// retry budget: retrying cannot continue a slice, so a legitimate
+    /// multi-slice import would exhaust three attempts and wedge permanently.
+    continuation_required: bool,
 }
 
 impl OperationalCoordinatorError {
@@ -152,6 +157,19 @@ impl OperationalCoordinatorError {
             detail: detail.into(),
             revocation: None,
             retained_block: None,
+            continuation_required: false,
+        }
+    }
+
+    /// A bounded slice completed its portion and must be resumed. Distinct from
+    /// a failure so the caller can continue instead of retrying.
+    fn continuation_required(phase: OperationalPhase, detail: impl Into<String>) -> Self {
+        Self {
+            phase,
+            detail: detail.into(),
+            revocation: None,
+            retained_block: None,
+            continuation_required: true,
         }
     }
 
@@ -161,6 +179,7 @@ impl OperationalCoordinatorError {
             detail: refusal.to_string(),
             revocation: refusal.revocation().cloned(),
             retained_block: None,
+            continuation_required: false,
         }
     }
 
@@ -174,6 +193,7 @@ impl OperationalCoordinatorError {
             detail: detail.into(),
             revocation: None,
             retained_block: Some(reason),
+            continuation_required: false,
         }
     }
 
@@ -195,6 +215,12 @@ impl OperationalCoordinatorError {
 
     pub(crate) const fn retained_block_reason(&self) -> Option<&RetainedBlockReason> {
         self.retained_block.as_ref()
+    }
+
+    /// True when this is a resume request from a bounded slice rather than a
+    /// failure. See `continuation_required`.
+    pub(crate) const fn is_continuation_required(&self) -> bool {
+        self.continuation_required
     }
 }
 
@@ -624,7 +650,7 @@ impl PublishedContinuationCore {
         }
         fault(OperationalFaultPoint::AfterTailAdmission)?;
         if stage_has_more {
-            return Err(OperationalCoordinatorError::new(
+            return Err(OperationalCoordinatorError::continuation_required(
                 OperationalPhase::ArchiveStage,
                 "bounded staging slice has durable ready/fanout continuation",
             ));
@@ -654,7 +680,7 @@ impl PublishedContinuationCore {
             OperationalCoordinatorError::new(OperationalPhase::SqliteDrain, error.to_string())
         })? != accepted_root
         {
-            return Err(OperationalCoordinatorError::new(
+            return Err(OperationalCoordinatorError::continuation_required(
                 OperationalPhase::SqliteDrain,
                 "SQLite bounded slice has durable accepted-sequence continuation",
             ));
@@ -683,7 +709,7 @@ impl PublishedContinuationCore {
                 break;
             };
             if budget.remaining == 0 {
-                return Err(OperationalCoordinatorError::new(
+                return Err(OperationalCoordinatorError::continuation_required(
                     OperationalPhase::ProjectionDrain,
                     "projection bounded slice has ready-work continuation",
                 ));
@@ -763,7 +789,7 @@ impl PublishedContinuationCore {
                 )
             })?;
             let Some(consumed) = consumed else {
-                return Err(OperationalCoordinatorError::new(
+                return Err(OperationalCoordinatorError::continuation_required(
                     OperationalPhase::ProjectionDrain,
                     "bounded receiver-local provider projection has durable continuation",
                 ));
@@ -787,6 +813,19 @@ fn require_accepted_stage_disposition(
         // whether it is waiting on a dependency batch or on object bytes -- which
         // are different bugs with different fixes. The retry loop above surfaces
         // only this string, so anything dropped here is unrecoverable downstream.
+        // `{0, []}` is the compact continuation sentinel a bounded slice returns
+        // when its work budget is spent (see hot_engine's
+        // `compact_incomplete_staged_disposition`): nothing is missing, there is
+        // simply more to do. Anything else is genuine incompleteness.
+        BatchDisposition::IncompleteStaged {
+            missing_objects: 0,
+            missing_dependencies,
+        } if missing_dependencies.is_empty() => {
+            Err(OperationalCoordinatorError::continuation_required(
+                OperationalPhase::ArchiveStage,
+                format!("bounded staging slice for {batch_id} needs another resume"),
+            ))
+        }
         BatchDisposition::IncompleteStaged {
             missing_objects,
             missing_dependencies,

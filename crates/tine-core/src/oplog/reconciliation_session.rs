@@ -336,6 +336,23 @@ impl<C, B> ReconciliationSession<C, B> {
     {
         match outcome {
             ReconciliationSessionDispatchOutcome::FailedClosed(continuation) => {
+                // A bounded slice asking to be resumed is not a failure. Charging
+                // it against the transient-failure budget is what wedges a
+                // multi-slice import permanently: three resumes and the work is
+                // abandoned as "a stable blocked state", however much remains.
+                // Resumption is bounded instead by the slice budget itself, which
+                // guarantees each pass charges work and therefore terminates.
+                if dispatch.requires_resume(&continuation) {
+                    let next = self.retain_continuation(
+                        token.lease,
+                        continuation,
+                        baseline,
+                        changed_paths,
+                        retry_attempts,
+                        None,
+                    );
+                    return Ok(ReconciliationSessionStep::Pending(next));
+                }
                 let retry_attempts = retry_attempts
                     .checked_add(1)
                     .expect("published reconciliation retry count exhausted");
@@ -665,6 +682,15 @@ trait ReconciliationSessionDispatch {
         retry_attempts: u8,
     ) -> BaselineBlockedObservation;
 
+    /// True when this continuation is a bounded slice asking to be resumed
+    /// rather than a transient failure. Resumption must not be charged against
+    /// the failure-retry budget: retrying cannot advance a slice, so a
+    /// legitimate multi-slice import would exhaust three attempts and wedge.
+    /// Defaults to false so existing dispatches keep their behaviour.
+    fn requires_resume(&self, _continuation: &Self::Continuation) -> bool {
+        false
+    }
+
     fn finish_baseline(
         &mut self,
         pending: Self::PendingBaseline,
@@ -938,6 +964,10 @@ fn import_blocked_observation(blocked: ReconciliationImportBlocked) -> BaselineB
 impl ReconciliationSessionDispatch for LiveReconciliationSessionDispatch<'_> {
     type Continuation = FailedClosedOperationalCoordinator;
     type PendingBaseline = PendingStableScanBaseline;
+
+    fn requires_resume(&self, continuation: &Self::Continuation) -> bool {
+        continuation.failure().is_continuation_required()
+    }
 
     fn dispatch(
         &mut self,
