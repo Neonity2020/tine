@@ -21590,7 +21590,9 @@ mod tests {
         let mut ticks = 0_u32;
         let mut settled = false;
         let mut last_block: Option<String> = None;
+        let mut tick_ms: Vec<f64> = Vec::new();
         while feed_started.elapsed() < budget {
+            let tick_started = std::time::Instant::now();
             ticks += 1;
             match first.tick().unwrap() {
                 SyncRuntimeTick::Idle
@@ -21619,12 +21621,27 @@ mod tests {
                 }
                 other => panic!("initial exact feed did not settle: {other:?}"),
             }
+            tick_ms.push(tick_started.elapsed().as_secs_f64() * 1000.0);
         }
         let feed = feed_started.elapsed();
+        // Is the feed cost uniform per tick, or concentrated in a few passes?
+        // Those imply different fixes -- per-file work vs a repeated whole-graph
+        // pass -- and the aggregate ms/file cannot tell them apart.
+        let mut sorted = tick_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pick = |q: f64| sorted.get(((sorted.len() as f64 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+        let total: f64 = sorted.iter().sum();
+        let top10: f64 = sorted.iter().rev().take(sorted.len().max(10) / 10).sum();
         println!(
             "FEED: settled={settled} ticks={ticks} blocked_ticks={blocked_ticks} \
              elapsed={:.1}s last_block={last_block:?}",
             feed.as_secs_f64()
+        );
+        println!(
+            "TICK DISTRIBUTION (ms): min={:.1} p50={:.1} p90={:.1} p99={:.1} max={:.1} \
+             | slowest 10% of ticks = {:.1}% of total tick time",
+            pick(0.0), pick(0.5), pick(0.9), pick(0.99), pick(1.0),
+            if total > 0.0 { 100.0 * top10 / total } else { 0.0 },
         );
         if !settled {
             println!(
