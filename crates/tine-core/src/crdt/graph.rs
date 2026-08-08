@@ -108,6 +108,24 @@ impl CrdtGraph {
         let doc = new_doc(session_id)?;
         apply_pages(&doc, &pages)?;
         let payload = doc.export(ExportMode::all_updates()).map_err(loro_error)?;
+        // CrdtUpdate is 4.64x the source graph and the largest single component
+        // of an admission batch (F30). `all_updates` replays every operation
+        // that built the document; for a freshly-created document a snapshot
+        // encodes the same state without the construction history. Measure the
+        // difference before anyone proposes switching -- the two have different
+        // merge semantics and that is Martin's call, not a size decision.
+        if std::env::var_os("TINE_CRDT_TRACE").is_some() {
+            let snapshot_len = doc
+                .export(ExportMode::Snapshot)
+                .map(|bytes| bytes.len())
+                .unwrap_or(0);
+            eprintln!(
+                "CRDT EXPORT: pages={} all_updates={}B snapshot={}B",
+                pages.len(),
+                payload.len(),
+                snapshot_len,
+            );
+        }
 
         let store = Store::initialize_at(sync_root, graph, device_id, session_id)?;
         let affected_pages = pages

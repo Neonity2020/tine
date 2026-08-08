@@ -15566,6 +15566,24 @@ impl ShardedHotEngine {
                     "document {document_id} produced an empty CRDT update"
                 )));
             }
+            // CrdtUpdate is the largest component of an admission batch: 4.64x
+            // the source graph (F30). For a NEW document `before_vector` is
+            // empty, so this "delta" is the document's entire construction
+            // history. A snapshot encodes the same final state without that
+            // history. Measure the gap; switching encodings changes merge
+            // semantics and is not a size decision to make unilaterally.
+            if std::env::var_os("TINE_CRDT_TRACE").is_some() {
+                let snapshot_len = document
+                    .export(ExportMode::Snapshot)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                eprintln!(
+                    "CRDT DOC EXPORT: updates={}B snapshot={}B empty_before={}",
+                    update.len(),
+                    snapshot_len,
+                    before_vector.is_empty(),
+                );
+            }
             objects.push(OperationObject::new(
                 self.workspace_id,
                 *document_id,
