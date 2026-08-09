@@ -4,6 +4,9 @@ import { spawn } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
+import { ensureDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 const APP = process.env.TINE_APP || "/tmp/tine-multiprocess";
 const TD = process.env.TAURI_DRIVER || "/aux/koutecky/logseq/.toolchain/cargo/bin/tauri-driver";

@@ -9,6 +9,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 if (process.platform !== "linux") throw new Error("native titlebar regression is Linux-only");
 
