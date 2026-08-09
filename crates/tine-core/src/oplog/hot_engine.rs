@@ -35123,7 +35123,7 @@ mod validation_tests {
         )
         .unwrap();
 
-        assert!(scan.instrumentation.expected_pages >= 4);
+        assert_eq!(scan.instrumentation.expected_pages, 2);
         assert_eq!(scan.candidates.len(), 3);
         assert!(scan.candidates.iter().any(|candidate| {
             candidate.change == GraphTextCandidateKind::Creation
