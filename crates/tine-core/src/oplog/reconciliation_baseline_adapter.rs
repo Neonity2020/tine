@@ -6,22 +6,20 @@
 //! candidates and no blocking diagnostics.
 
 use sha2::{Digest, Sha256};
-use std::{fmt, mem};
+use std::fmt;
 
 use super::{
     reconciliation_baseline::{
         BaselineBlockedReason, BaselineDirectoryPath, BaselineEpochId, BaselineEpochOutcome,
-        BaselineHead, BaselineObservedState, BaselineScanDirectory, BaselineScanInstrumentation,
-        BaselineScanPath, BaselineScanRowsIdentity, BaselineScanRowsIdentityBuilder,
-        BaselineTimestamp, BeginBaselineEpoch, FinishBaselineEpoch, ReconciliationBaseline,
-        ReconciliationBaselineError, MAX_BASELINE_WRITE_ROWS,
+        BaselineHead, BaselineScanDirectory, BaselineScanInstrumentation, BaselineScanRowsIdentity,
+        BaselineScanRowsIdentityBuilder, BaselineTimestamp, BeginBaselineEpoch,
+        FinishBaselineEpoch, ReconciliationBaseline, ReconciliationBaselineError,
     },
     reconciliation_scan::{
-        AuthenticatedExpectedPathSource, ExpectedPathSourceFailure, GraphTextCandidateKind,
-        GraphTextScanDiagnostic, GraphTextScanFileFingerprint, GraphTextScanPathClass,
+        AuthenticatedExpectedPathSource, ExpectedPathSourceFailure, GraphTextScanDiagnostic,
         StableGraphTextBaselineIdentity, StableGraphTextScan,
     },
-    ContentDigest, ManagedPath,
+    ContentDigest,
 };
 
 #[derive(Debug)]
@@ -128,7 +126,7 @@ pub(crate) enum BaselineAdapterStatus {
     },
 }
 
-/// Begin a bounded epoch and stream the scan-owned stable pass into SQLite.
+/// Begin a constant-sized diagnostic epoch for the scan-owned identity.
 ///
 /// Dropping the returned handle models a crash after append: the building
 /// epoch remains diagnostic garbage and the prior clean head is unchanged.
@@ -144,89 +142,26 @@ pub(crate) fn append_stable_scan_to_baseline<S: AuthenticatedExpectedPathSource>
     require_exact_baseline_binding(baseline, &scan_identity)?;
     require_current_scan_binding(&scan_identity, source, false)?;
 
-    let evidence = scan.baseline_evidence();
     let epoch = baseline.begin_epoch(BeginBaselineEpoch {
         started_at,
         accepted_frontier: scan.binding.expected_binding.accepted_frontier,
         projection_generation: scan.binding.expected_binding.projection_generation,
     })?;
-    let mut instrumentation = BaselineAdapterInstrumentation::default();
+    let root = BaselineScanDirectory {
+        path: BaselineDirectoryPath::parse(String::new())?,
+        resource: ContentDigest::from_bytes(*scan_identity.graph_resource.as_bytes()),
+    };
+    baseline.append_scan_directories(epoch, std::slice::from_ref(&root))?;
     let mut rows_identity = BaselineScanRowsIdentityBuilder::new();
-
-    let mut directory_page = Vec::with_capacity(MAX_BASELINE_WRITE_ROWS);
-    let mut directory_page_path_bytes = 0_usize;
-    for (path, resource) in evidence.directories {
-        let path = BaselineDirectoryPath::parse(path.clone())?;
-        let resource = if path.as_str().is_empty() {
-            ContentDigest::from_bytes(*scan_identity.graph_resource.as_bytes())
-        } else {
-            *resource
-        };
-        observe_page_row(
-            &mut instrumentation,
-            &directory_page,
-            directory_page_path_bytes,
-            path.as_str().len(),
-            mem::size_of::<BaselineScanDirectory>(),
-        );
-        directory_page_path_bytes = directory_page_path_bytes.saturating_add(path.as_str().len());
-        let row = BaselineScanDirectory { path, resource };
-        rows_identity.observe_directory(&row);
-        directory_page.push(row);
-        if directory_page.len() == MAX_BASELINE_WRITE_ROWS {
-            flush_directories(baseline, epoch, &mut directory_page, &mut instrumentation)?;
-            directory_page_path_bytes = 0;
-        }
-    }
-    flush_directories(baseline, epoch, &mut directory_page, &mut instrumentation)?;
-    drop(directory_page);
-
-    let mut path_page = Vec::with_capacity(MAX_BASELINE_WRITE_ROWS);
-    let mut path_page_path_bytes = 0_usize;
-    for file in evidence.files {
-        let Some(row) = scan_file_row(file)? else {
-            continue;
-        };
-        rows_identity.observe_path(&row);
-        observe_page_row(
-            &mut instrumentation,
-            &path_page,
-            path_page_path_bytes,
-            row.path.as_str().len(),
-            mem::size_of::<BaselineScanPath>(),
-        );
-        path_page_path_bytes = path_page_path_bytes.saturating_add(row.path.as_str().len());
-        path_page.push(row);
-        if path_page.len() == MAX_BASELINE_WRITE_ROWS {
-            flush_paths(baseline, epoch, &mut path_page, &mut instrumentation)?;
-            path_page_path_bytes = 0;
-        }
-    }
-    for candidate in &scan.candidates {
-        if candidate.change != GraphTextCandidateKind::Absence {
-            continue;
-        }
-        let row = BaselineScanPath {
-            path: candidate.path.clone(),
-            managed_kind: candidate.managed_kind,
-            state: BaselineObservedState::Absent,
-        };
-        rows_identity.observe_path(&row);
-        observe_page_row(
-            &mut instrumentation,
-            &path_page,
-            path_page_path_bytes,
-            row.path.as_str().len(),
-            mem::size_of::<BaselineScanPath>(),
-        );
-        path_page_path_bytes = path_page_path_bytes.saturating_add(row.path.as_str().len());
-        path_page.push(row);
-        if path_page.len() == MAX_BASELINE_WRITE_ROWS {
-            flush_paths(baseline, epoch, &mut path_page, &mut instrumentation)?;
-            path_page_path_bytes = 0;
-        }
-    }
-    flush_paths(baseline, epoch, &mut path_page, &mut instrumentation)?;
+    rows_identity.observe_directory(&root);
+    let rows_identity = rows_identity.finish();
+    let instrumentation = BaselineAdapterInstrumentation {
+        directory_rows: 1,
+        write_batches: 1,
+        peak_added_retained_rows: 1,
+        peak_added_retained_bytes: std::mem::size_of::<BaselineScanDirectory>() as u64,
+        ..BaselineAdapterInstrumentation::default()
+    };
 
     for diagnostic in &scan.diagnostics {
         if matches!(
@@ -250,7 +185,7 @@ pub(crate) fn append_stable_scan_to_baseline<S: AuthenticatedExpectedPathSource>
     let mut pending = PendingStableScanBaseline {
         epoch,
         scan_identity,
-        rows_identity: rows_identity.finish(),
+        rows_identity,
         scan_instrumentation: baseline_scan_instrumentation(scan),
         adapter_instrumentation: instrumentation,
         commitment: ContentDigest::of(b"unsealed pending stable scan baseline"),
@@ -375,97 +310,6 @@ fn require_current_scan_binding<S: AuthenticatedExpectedPathSource>(
     Ok(())
 }
 
-fn scan_file_row(
-    file: &GraphTextScanFileFingerprint,
-) -> Result<Option<BaselineScanPath>, BaselineUnavailable> {
-    let Some(description) = file.description else {
-        // Non-text and conflict-copy bytes are not hashed by the authenticated
-        // scanner. Their exact metadata remains committed by the stable pass
-        // digest (mirrored in both legacy compatibility columns);
-        // fabricating a content baseline here would create false authority.
-        return Ok(None);
-    };
-    if matches!(file.class, GraphTextScanPathClass::Configuration) {
-        // Configuration bytes and metadata are already committed by the
-        // stable-scan digest and by the Graph scope binding. They are
-        // not managed content and cannot be represented as a `ManagedPath`;
-        // attempting to do so would make every configured nested root block
-        // before reconciliation can compare its actual managed inventory.
-        return Ok(None);
-    }
-    let managed_kind = match file.class {
-        GraphTextScanPathClass::EligibleManaged(kind) => Some(kind),
-        GraphTextScanPathClass::EligibleUnmanaged
-        | GraphTextScanPathClass::ProviderConflictCopy
-        | GraphTextScanPathClass::RetainedNonText => None,
-        GraphTextScanPathClass::Configuration => {
-            unreachable!("configuration rows return before managed-path parsing")
-        }
-    };
-    let path = ManagedPath::parse(file.exact_relative.clone())
-        .map_err(|error| invalid_evidence(format!("invalid retained path: {error}")))?;
-    Ok(Some(BaselineScanPath {
-        path,
-        managed_kind,
-        state: BaselineObservedState::Present {
-            description,
-            file_resource: file.file_resource_id,
-            link_count: file.link_count,
-        },
-    }))
-}
-
-fn flush_directories(
-    baseline: &mut ReconciliationBaseline,
-    epoch: BaselineEpochId,
-    page: &mut Vec<BaselineScanDirectory>,
-    instrumentation: &mut BaselineAdapterInstrumentation,
-) -> Result<(), BaselineUnavailable> {
-    if page.is_empty() {
-        return Ok(());
-    }
-    baseline.append_scan_directories(epoch, page)?;
-    instrumentation.directory_rows = instrumentation
-        .directory_rows
-        .saturating_add(page.len() as u64);
-    instrumentation.write_batches = instrumentation.write_batches.saturating_add(1);
-    page.clear();
-    Ok(())
-}
-
-fn flush_paths(
-    baseline: &mut ReconciliationBaseline,
-    epoch: BaselineEpochId,
-    page: &mut Vec<BaselineScanPath>,
-    instrumentation: &mut BaselineAdapterInstrumentation,
-) -> Result<(), BaselineUnavailable> {
-    if page.is_empty() {
-        return Ok(());
-    }
-    baseline.append_scan_paths(epoch, page)?;
-    instrumentation.path_rows = instrumentation.path_rows.saturating_add(page.len() as u64);
-    instrumentation.write_batches = instrumentation.write_batches.saturating_add(1);
-    page.clear();
-    Ok(())
-}
-
-fn observe_page_row<T>(
-    instrumentation: &mut BaselineAdapterInstrumentation,
-    page: &Vec<T>,
-    retained_path_bytes: usize,
-    added_path_bytes: usize,
-    row_bytes: usize,
-) {
-    let rows = page.len().saturating_add(1) as u64;
-    let retained = (page.capacity() as u64)
-        .saturating_mul(row_bytes as u64)
-        .saturating_add(retained_path_bytes as u64)
-        .saturating_add(added_path_bytes as u64);
-    instrumentation.peak_added_retained_rows = instrumentation.peak_added_retained_rows.max(rows);
-    instrumentation.peak_added_retained_bytes =
-        instrumentation.peak_added_retained_bytes.max(retained);
-}
-
 fn pending_stable_scan_baseline_commitment(pending: &PendingStableScanBaseline) -> ContentDigest {
     let mut hasher = Sha256::new();
     hasher.update(b"tine/reconciliation/pending-stable-scan-baseline/v1\0");
@@ -548,18 +392,20 @@ mod tests {
     use crate::graph_text_scope::GraphTextScope;
     use crate::oplog::{
         reconciliation_baseline::{
-            ReconciliationBaselineBinding, TrustedPrivateApplicationRuntimeRoot,
+            BaselineObservedState, BaselineScanPath, ReconciliationBaselineBinding,
+            TrustedPrivateApplicationRuntimeRoot,
         },
         reconciliation_scan::{
             graph_text_scan_pass_digest, scan_epoch_digest_from_commitments,
             AuthenticatedExpectedPath, AuthenticatedExpectedPathPage,
             AuthenticatedExpectedPathStreamHeader, ExpectedPathBinding, ExpectedPathPageRequest,
             ExpectedPathPointRequest, ExpectedPathStreamLimits, GraphTextCandidateBinding,
-            GraphTextScanCandidate, GraphTextScanDiagnosticKind, GraphTextScanInstrumentation,
-            GraphTextScanPass, GraphTextScanPassInstrumentation,
+            GraphTextCandidateKind, GraphTextScanCandidate, GraphTextScanDiagnosticKind,
+            GraphTextScanFileFingerprint, GraphTextScanInstrumentation, GraphTextScanPass,
+            GraphTextScanPassInstrumentation, GraphTextScanPathClass,
         },
-        ApplicationRuntimeRoot, BlobDescription, CanonicalGraphResourceId, ManagedTextKind,
-        ProjectionEndpointId, WorkspaceId,
+        ApplicationRuntimeRoot, BlobDescription, CanonicalGraphResourceId, ManagedPath,
+        ManagedTextKind, ProjectionEndpointId, WorkspaceId,
     };
     use rusqlite::Connection;
     use std::{
@@ -898,8 +744,9 @@ mod tests {
             panic!("zero-candidate Noop did not become clean");
         };
         assert_eq!(fixture.baseline.head().unwrap(), head);
-        assert_eq!(instrumentation.path_rows, 1);
-        assert_eq!(instrumentation.directory_rows, 3);
+        assert_eq!(instrumentation.path_rows, 0);
+        assert_eq!(instrumentation.directory_rows, 1);
+        assert_eq!(instrumentation.write_batches, 1);
     }
 
     #[test]
@@ -996,8 +843,7 @@ mod tests {
         };
         assert_ne!(head, clean);
         let page = fixture.baseline.read_head_paths_page(None, 8).unwrap();
-        assert_eq!(page.rows.len(), 1);
-        assert_eq!(page.rows[0].path.as_str(), "pages/scan-a.md");
+        assert!(page.rows.is_empty());
     }
 
     #[test]
@@ -1031,7 +877,17 @@ mod tests {
         let clean = install_clean(&mut fixture, 1);
         let scan = one_path_scan(&fixture, 2, false);
         let (source, mut pending) = append(&mut fixture, &scan, 20);
-        pending.rows_identity = BaselineScanRowsIdentityBuilder::new().finish();
+        let mut forged = BaselineScanRowsIdentityBuilder::new();
+        forged.observe_path(&BaselineScanPath {
+            path: ManagedPath::parse("pages/forged.md".to_owned()).unwrap(),
+            managed_kind: Some(ManagedTextKind::Page),
+            state: BaselineObservedState::Present {
+                description: BlobDescription::of(b"forged"),
+                file_resource: ContentDigest::of(b"forged-resource"),
+                link_count: 1,
+            },
+        });
+        pending.rows_identity = forged.finish();
         pending.commitment = pending_stable_scan_baseline_commitment(&pending);
         let error = finish_stable_scan_baseline(
             &mut fixture.baseline,
@@ -1161,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_unicode_and_nonstandard_paths_round_trip_exactly() {
+    fn nested_unicode_and_nonstandard_paths_are_not_duplicated_into_baseline() {
         let mut fixture = Fixture::new("unicode-nonstandard");
         let exact = "资料/任意/页面-é.MARKDOWN";
         let scan = scan(
@@ -1182,9 +1038,7 @@ mod tests {
         )
         .unwrap();
         let page = fixture.baseline.read_head_paths_page(None, 8).unwrap();
-        assert_eq!(page.rows.len(), 1);
-        assert_eq!(page.rows[0].path.as_str(), exact);
-        assert_eq!(page.rows[0].managed_kind, None);
+        assert!(page.rows.is_empty());
     }
 
     #[test]
@@ -1295,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn ten_thousand_rows_are_paged_with_bounded_added_heap_and_sqlite_receipt() {
+    fn ten_thousand_row_scan_writes_only_constant_sized_baseline_identity() {
         let mut fixture = Fixture::new("ten-thousand");
         let paths = (0..10_000)
             .map(|index| {
@@ -1343,33 +1197,21 @@ mod tests {
         .filter_map(|path| fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .sum::<u64>();
-        assert_eq!(instrumentation.path_rows, 10_000);
-        assert!(instrumentation.write_batches >= 20);
-        assert!(instrumentation.peak_added_retained_rows <= MAX_BASELINE_WRITE_ROWS as u64);
-        assert!(instrumentation.peak_added_retained_bytes < 1024 * 1024);
-        assert!(sqlite_bytes > 100_000);
+        assert_eq!(instrumentation.path_rows, 0);
+        assert_eq!(instrumentation.directory_rows, 1);
+        assert_eq!(instrumentation.write_batches, 1);
+        assert_eq!(instrumentation.peak_added_retained_rows, 1);
         assert!(sqlite_bytes < 16 * 1024 * 1024);
-
-        let mut after = None;
-        let mut read = 0_usize;
-        loop {
-            let page = fixture
-                .baseline
-                .read_head_paths_page(after.as_ref(), 257)
-                .unwrap();
-            read += page.rows.len();
-            let Some(next) = page.next_after else {
-                break;
-            };
-            after = Some(next);
-        }
-        assert_eq!(read, 10_000);
+        assert!(fixture
+            .baseline
+            .read_head_paths_page(None, 257)
+            .unwrap()
+            .rows
+            .is_empty());
         eprintln!(
-            "ADAPTER_10K_RECEIPT rows=10000 sqlite_bytes={sqlite_bytes} elapsed_ms={} \
-             peak_added_rows={} peak_added_bytes={} write_batches={}",
+            "ADAPTER_10K_RECEIPT source_rows=10000 persisted_rows=0 sqlite_bytes={sqlite_bytes} \
+             elapsed_ms={} write_batches={}",
             elapsed.as_millis(),
-            instrumentation.peak_added_retained_rows,
-            instrumentation.peak_added_retained_bytes,
             instrumentation.write_batches,
         );
     }

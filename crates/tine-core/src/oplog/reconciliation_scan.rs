@@ -2058,14 +2058,6 @@ pub(crate) struct StableGraphTextScan {
     pub(crate) pass_b_digest: ContentDigest,
 }
 
-/// Borrowed, non-authoritative stable-scan evidence for the disposable
-/// baseline adapter. The adapter iterates these collections in bounded pages;
-/// this accessor never clones or rematerializes the graph.
-pub(crate) struct StableGraphTextBaselineEvidence<'a> {
-    pub(crate) directories: &'a BTreeMap<String, ContentDigest>,
-    pub(crate) files: &'a [GraphTextScanFileFingerprint],
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StableGraphTextBaselineIdentity {
     pub(crate) graph_resource: CanonicalGraphResourceId,
@@ -2096,13 +2088,6 @@ impl StableGraphTextBaselineIdentity {
 }
 
 impl StableGraphTextScan {
-    pub(crate) fn baseline_evidence(&self) -> StableGraphTextBaselineEvidence<'_> {
-        StableGraphTextBaselineEvidence {
-            directories: &self.baseline_pass.directories_by_exact_relative,
-            files: &self.baseline_pass.files,
-        }
-    }
-
     pub(crate) const fn baseline_revalidation_retained_bytes() -> u64 {
         MAX_SCAN_RETAINED_BYTES
     }
