@@ -149,7 +149,9 @@ async function openManagedSettings() {
 }
 
 async function closeSettings() {
-  await browser.keys("Escape");
+  const close = await browser.$(".settings-pane-head .icon-btn");
+  await close.waitForClickable({ timeout: 15_000 });
+  await close.click();
   await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 15_000 });
 }
 
