@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { flushAll, isRetryableSaveFailure, trackAssetWrite } from "./persistence";
+import { dirtyPages, flushAll, isRetryableSaveFailure, markDirty, resetSaveState, trackAssetWrite } from "./persistence";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
   let resolve!: (value: T) => void;
@@ -67,5 +67,24 @@ describe("save failure classification", () => {
     expect(isRetryableSaveFailure("identity.changed_since_load: ...")).toBe(true);
     expect(isRetryableSaveFailure("unknown: disk full")).toBe(true);
     expect(isRetryableSaveFailure(new Error("EBUSY"))).toBe(true);
+  });
+});
+
+// Direct Files data-safety audit, 2026-08-09, finding 6.
+//
+// `doSave` bailed out on a null DTO *before* removing the name from `dirty`, so a
+// dirty name with no page behind it wedged `flushAll()` permanently: every later
+// graph switch aborted with "Some pages couldn't be saved" and every window close
+// offered to discard edits that were in fact already on disk.
+describe("a dirty name with no page behind it does not wedge every flush", () => {
+  it("lets flushAll succeed again", async () => {
+    resetSaveState();
+    markDirty("A page that is not in the store");
+    expect([...dirtyPages()]).toContain("A page that is not in the store");
+
+    // Before the fix all three of these resolved false, forever.
+    expect(await flushAll()).toBe(true);
+    expect([...dirtyPages()]).toHaveLength(0);
+    expect(await flushAll()).toBe(true);
   });
 });

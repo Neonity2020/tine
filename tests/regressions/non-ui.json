@@ -2945,6 +2945,30 @@
         ]
       },
       "notes": "Direct Files data-safety audit 2026-08-09, finding 7. The ONLY durability barrier in the app was onCloseRequested. Android/iOS never send one - the OS backgrounds the app and reclaims it later - so everything inside the 400ms save debounce was RAM-only. The three pre-existing visibilitychange listeners (Page.tsx, journal.ts, assetRefresh.ts) all act on becoming VISIBLE; this is the other edge. FAIL-BEFORE is an absence, not a wrong value: no listener flushed on hide, verified by grep across the tree, so there is no pre-fix test that can fail. Confidence for #255 is therefore MODERATE, not high: this is the plainest explanation for the Android half and is a real missing handler, but no same-platform reproduction of the reporter's loss exists. Findings 2 and 6 are other live candidates for the same report."
+    },
+    {
+      "id": "REG-FLUSH-WEDGE-PHANTOM-DIRTY-AUDIT20260809",
+      "title": "A dirty page name with no page behind it no longer wedges every later flush",
+      "family": "durability",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android",
+        "ios"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/persistence.test.ts"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 6. doSave bailed on a null DTO BEFORE dirty.delete(name), so the name stayed dirty forever and flushAll() could never return true again: every graph switch aborted with 'Some pages couldn't be saved' and every window close offered to discard edits that were already on disk. Reachable because pinnedPages() did not pin in-flight saves - doSave removes a page from dirty before awaiting, so the working-set cap could evict it mid-write, and a transient failure then re-added a name with no page. Two parts: savingPages() is now pinned (prevents the eviction outright), and a dirty name with no page in the store is dropped rather than wedging. Deliberately NOT dropped when the page exists but the page-header firewall refused the DTO - that is a real unsaved edit and must keep blocking."
     }
   ]
 }

@@ -89,6 +89,12 @@ export function dirtyPages(): Iterable<string> {
 export function isSaving(name: string): boolean {
   return saveChain.has(name);
 }
+/** Pages with a save queued or in flight. `doSave` removes a page from `dirty`
+ *  before awaiting the backend, so these are invisible to `dirtyPages()` and the
+ *  working-set cap would otherwise evict one mid-write. */
+export function savingPages(): Iterable<string> {
+  return saveChain.keys();
+}
 /** What the store currently holds for a page: whether it exists at all, and its
  *  revision (the content hash) if it does. */
 export interface StoredPageState {
@@ -341,7 +347,18 @@ async function doSave(
   }
   const token = graphToken;
   const dto = measureIssue248("frontend.pageToDtoMs", () => pageToDto(name));
-  if (!dto) return false;
+  if (!dto) {
+    // Two very different reasons, and they must not share an outcome (audit
+    // finding 6). If the page is not in the store at all there is nothing to
+    // write and never will be, so leaving the name in `dirty` wedges
+    // `flushAll()` permanently: every later graph switch aborts with "Some pages
+    // couldn't be saved" and every window close offers to discard edits that are
+    // already on disk. Drop the phantom. If the page IS present, the DTO was
+    // refused by the page-header firewall (`pageToDto` has already toasted) —
+    // that is a real unsaved edit, so it stays dirty and keeps blocking.
+    if (!pageByName(name)) dirty.delete(name);
+    return false;
+  }
   if (dto.guide) {
     console.warn("Refusing to persist ephemeral bundled Guide page", name);
     dirty.delete(name);

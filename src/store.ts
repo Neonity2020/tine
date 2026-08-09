@@ -69,6 +69,7 @@ import {
   forceSave,
   addDirty,
   dirtyPages,
+  savingPages,
   setBaseRev,
   tombstone,
   untombstone,
@@ -493,6 +494,13 @@ function pinnedPages(): Set<string> {
   // Conflicted pages hold unsaved edits that aren't in `dirty` (the save batch
   // removed them); evicting one would silently drop those edits.
   for (const name of conflicts()) pin.add(name);
+  // A page whose save is in flight is ALSO not in `dirty` — `doSave` removes it
+  // before awaiting the backend. Evicting it there loses the edit outright, and
+  // if that save then fails transiently `doSave` re-adds a name with no page
+  // behind it, which `pageToDto` cannot serialize: the name is stuck in `dirty`
+  // forever and `flushAll()` can never succeed again. (Direct Files data-safety
+  // audit, 2026-08-09, finding 6.)
+  for (const name of savingPages()) pin.add(name);
   const ed = editingId();
   if (ed && doc.byId[ed]) pin.add(doc.byId[ed].page);
   return pin;
