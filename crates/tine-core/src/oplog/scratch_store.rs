@@ -1506,8 +1506,11 @@ impl ScratchStore {
         self.physical.binding_digest().map_err(Into::into)
     }
 
-    pub(crate) fn clone_pages_file(&self) -> Result<fs::File, ScratchError> {
-        self.physical.clone_pages_file().map_err(Into::into)
+    pub(crate) fn with_pages<T>(
+        &self,
+        operation: impl FnOnce(&mut fs::File) -> T,
+    ) -> Result<T, ScratchError> {
+        self.physical.with_pages(operation).map_err(Into::into)
     }
 
     pub(crate) fn insert_many(

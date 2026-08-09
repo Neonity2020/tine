@@ -2695,7 +2695,7 @@ impl DetachedBootstrapAuthoringSession {
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                 );
                 let block_claim_index = Arc::new(
-                    BlockClaimIndexStore::for_scratch(&scratch)
+                    BlockClaimIndexStore::for_scratch(Arc::clone(&scratch))
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                 );
                 (Some(scratch_root), scratch, block_claim_index)
@@ -31391,6 +31391,14 @@ mod validation_tests {
         assert!(
             io.scratch_page_bytes_read <= page_count * 32 * 1024,
             "detached authoring reread cumulative scratch bytes: {io:?}"
+        );
+        assert!(
+            scratch.page_append_batches.saturating_mul(10) < scratch.page_writes,
+            "detached authoring emitted near-record-granularity page writes: {scratch:?}"
+        );
+        assert!(
+            scratch.blob_append_batches.saturating_mul(10) < scratch.blob_writes,
+            "detached authoring emitted near-record-granularity blob writes: {scratch:?}"
         );
         for (page_id, expected_content) in sampled_pages {
             let page = completed.engine.materialize_page(page_id).unwrap();
