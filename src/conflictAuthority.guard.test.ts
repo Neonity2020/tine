@@ -17,7 +17,12 @@ import { describe, expect, it } from "vitest";
 // user's work. They now route through `reconcileExternalChange`. This test is
 // the reminder, not a style rule. (GH #254 increment 2, correction-delta
 // re-verification, HIGH blocker.)
-const ALLOWED = new Set(["src/persistence.ts", "src/ui.ts"]);
+// `ui.ts` DEFINES markConflict, and `doSave` is the one function allowed to call
+// it — the function, not the file. A whole-file allowance would have let a second
+// caller appear inside persistence.ts itself, which is exactly where the next one
+// would go.
+const DEFINING_FILE = "src/ui.ts";
+const ALLOWED_CALLER = { file: "src/persistence.ts", fn: "doSave" };
 
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -31,24 +36,38 @@ export function bannerRaiseViolations(file: string, source: string): string[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true,
     file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const violations: string[] = [];
-  const visit = (node: ts.Node) => {
+  const allowedFn = file === ALLOWED_CALLER.file ? ALLOWED_CALLER.fn : null;
+  const visit = (node: ts.Node, enclosing: string | null) => {
+    const scope = ts.isFunctionDeclaration(node) && node.name
+      ? node.name.text
+      : enclosing;
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
-      && node.expression.text === "markConflict") {
+      && node.expression.text === "markConflict"
+      && !(allowedFn !== null && scope === allowedFn)) {
       const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
       violations.push(`${file}:${line + 1}: markConflict outside the save-result path`);
     }
-    ts.forEachChild(node, visit);
+    ts.forEachChild(node, (child) => visit(child, scope));
   };
-  visit(sf);
+  visit(sf, null);
   return violations;
 }
 
 describe("only a backend save refusal may raise a conflict banner", () => {
   it("has no markConflict call outside the save-result path", () => {
     const violations = sourceFiles("src")
-      .filter((file) => !ALLOWED.has(file.split(path.sep).join("/")))
+      .map((file) => file.split(path.sep).join("/"))
+      .filter((file) => file !== DEFINING_FILE)
       .flatMap((file) => bannerRaiseViolations(file, readFileSync(file, "utf8")));
     expect(violations).toEqual([]);
+  });
+
+  it("still catches a second caller inside the allowed file", () => {
+    const source = "function doSave() { markConflict(name); }\n"
+      + "export function reconcileExternalChange() { markConflict(name); }\n";
+    expect(bannerRaiseViolations(ALLOWED_CALLER.file, source)).toEqual([
+      `${ALLOWED_CALLER.file}:2: markConflict outside the save-result path`,
+    ]);
   });
 
   it("recognises a banner raised without authority", () => {

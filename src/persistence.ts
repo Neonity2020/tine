@@ -370,15 +370,27 @@ function cutSourceUsable(expected: ClipboardSourcePage): boolean {
     && !isConflicted(expected.name);
 }
 
+/** Why a save is being run.
+ *
+ *  - `ordinary` — the user's pending edit. Skipped for a clean page and refused
+ *    for a conflicted one.
+ *  - `reobserve` — the disk changed under a page whose banner is already up, so
+ *    the authority that banner stands on has just been revoked. Runs the SAME
+ *    base-revision-guarded write, which cannot clobber; its refusal mints the
+ *    replacement epoch, and its success means the banner was stale.
+ *  - `force` — the user chose "Keep mine". Overwrites, presenting the epoch the
+ *    banner showed. */
+type SaveIntent = "ordinary" | "reobserve" | "force";
+
 function enqueueSave(
   name: string,
-  force = false,
+  intent: SaveIntent = "ordinary",
   expectedCutSource?: ClipboardSourcePage,
 ): Promise<boolean> {
   const prev = saveChain.get(name) ?? Promise.resolve(true);
   const next = prev.then(
-    () => doSave(name, force, expectedCutSource),
-    () => doSave(name, force, expectedCutSource),
+    () => doSave(name, intent, expectedCutSource),
+    () => doSave(name, intent, expectedCutSource),
   );
   saveChain.set(name, next);
   void next.finally(() => {
@@ -393,16 +405,20 @@ function enqueueSave(
  *  conflict marks it (no clobber); on a transient error keeps it dirty + toasts. */
 async function doSave(
   name: string,
-  force: boolean,
+  intent: SaveIntent,
   expectedCutSource?: ClipboardSourcePage,
 ): Promise<boolean> {
+  const force = intent === "force";
   // A cut-retirement save is authority-bound to the exact loaded page instance.
   // Check when this queued operation actually reaches its snapshot boundary, not
   // only when the caller enqueues it: another save may have been ahead of it.
   if (expectedCutSource && !cutSourceUsable(expectedCutSource)) return false;
   if (deletedPages.has(name)) return true; // tombstoned — never recreate a deleted page
-  if (!force && !dirty.has(name)) return true; // already saved by a prior link
-  if (isConflicted(name) && !force) return false;
+  // A re-observation must reach the backend even though the page is clean or
+  // already conflicted: those are exactly the states a banner leaves behind, and
+  // only a fresh refusal can mint the authority the visible banner needs.
+  if (intent === "ordinary" && !dirty.has(name)) return true; // saved by a prior link
+  if (intent === "ordinary" && isConflicted(name)) return false;
   // A cross-page move source: hold its save until the destination is durable (C#1).
   // Stays dirty, so it writes the moment `releaseSourcesFor(dest)` frees it.
   if (heldSources.has(name)) {
@@ -449,6 +465,11 @@ async function doSave(
     }
     clearTransientRetry(name);
     conflictObservation.delete(name);
+    // The bytes landed, so any banner still up is answered. Only a re-observation
+    // can arrive here with one raised (the ordinary path refuses a conflicted
+    // page and a force is followed by its own clear), and leaving it would park
+    // the page behind a warning about a change that is now written.
+    if (isConflicted(name)) clearConflict(name);
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
@@ -544,7 +565,7 @@ export function scheduleSave() {
  *  the pending edit simply lands. Reading the file to prove divergence first is
  *  not enough on its own — that read revokes any authority for the path. */
 export async function reconcileExternalChange(name: string): Promise<void> {
-  await enqueueSave(name);
+  await enqueueSave(name, "reobserve");
 }
 
 /** Save one page immediately, bypassing the debounce — for actions that must
@@ -570,7 +591,7 @@ export async function flushCutSourcePages(sources: readonly ClipboardSourcePage[
     || !sources.every(cutSourceUsable)
   ) return false;
   const results = await Promise.all(
-    sources.map((source) => enqueueSave(source.name, false, source)),
+    sources.map((source) => enqueueSave(source.name, "ordinary", source)),
   );
   if (results.some(Boolean)) scheduleDataRev();
   return results.every(Boolean);
@@ -624,7 +645,7 @@ export async function flushAll(): Promise<boolean> {
  *  must not clear the conflict unless it did. */
 export async function forceSave(name: string): Promise<boolean> {
   dirty.add(name); // ensure doSave writes even though it's parked as conflicted
-  const ok = await enqueueSave(name, true);
+  const ok = await enqueueSave(name, "force");
   if (!ok) pushToast(`Couldn't overwrite “${name}”.`, "error");
   return ok;
 }

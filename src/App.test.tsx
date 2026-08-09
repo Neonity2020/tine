@@ -211,6 +211,35 @@ describe("conflict requires per-page divergence, not just a notification", () =>
     return calls;
   }
 
+  /** The authority half of the real backend, which the flat mock above cannot
+   *  express: a token exists for exactly one observation, every read or external
+   *  observation revokes it, and a refusal mints the next one. `observe()` is
+   *  what the native watcher does before its event reaches us. */
+  function authoritativeBackend() {
+    let live: number | null = null;
+    let next = 11;
+    const calls: Array<{ force: boolean; observation: number | null }> = [];
+    const observe = () => {
+      live = null;
+    };
+    vi.spyOn(backend(), "savePage").mockImplementation(
+      (_dto, _baseRev, force, observation) => {
+        calls.push({ force: !!force, observation: observation ?? null });
+        if (force) {
+          if (observation === null || observation === undefined || observation !== live) {
+            return Promise.reject(new Error("conflict override authority is missing"));
+          }
+          live = null;
+          return Promise.resolve("rev-forced");
+        }
+        live = next;
+        next += 1;
+        return Promise.reject(new Error(`conflict:${live}`));
+      }
+    );
+    return { calls, observe };
+  }
+
   it("does not conflict a dirty page when the admitted epoch left it unchanged", async () => {
     liveDirtyPage("rev-1");
     vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-1"));
@@ -352,4 +381,63 @@ describe("conflict requires per-page divergence, not just a notification", () =>
       expect(calls[1]).toEqual({ force: true, observation: 11 });
     });
   }
+
+  // The same blocker one observation later (GH #254 increment 2, SECOND
+  // correction-delta re-verification). A banner is up and holding epoch 11 when
+  // a second external writer lands. The native watcher revokes that token before
+  // its event even reaches us, and the read this handler does to prove divergence
+  // revokes again — so by the time the user clicks "Keep mine", epoch 11 names
+  // nothing. The page is conflicted and no longer dirty, which is exactly the
+  // state an ordinary save declines, so nothing minted a replacement: the banner
+  // was permanently disarmed and only the destructive button still worked.
+  //
+  // Scope note: the sparse-v2 case above models the composition, not a
+  // production journey. The managed command maps divergence to a non-banner
+  // `managed.conflict` and refuses force outright, which is a separate open
+  // limitation rather than something these tests cover.
+  it("re-arms the banner when a second external change lands under it", async () => {
+    liveDirtyPage("rev-1");
+    const { calls, observe } = authoritativeBackend();
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+
+    observe(); // the watcher sees winner A
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+    expect(isConflicted(name)).toBe(true);
+    expect(isDirty(name)).toBe(false); // the refused save took it out of `dirty`
+
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-3"));
+    observe(); // winner B: the token behind the visible banner is now dead
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+
+    expect(isConflicted(name)).toBe(true);
+    // The re-observation reached the backend even though the page was clean and
+    // already conflicted, and it was NOT a force.
+    expect(calls).toEqual([
+      { force: false, observation: null },
+      { force: false, observation: null },
+    ]);
+
+    expect(await forceSave(name)).toBe(true);
+    expect(calls[2]).toEqual({ force: true, observation: 12 });
+  });
+
+  // The other side of letting a re-observation write: when the disk has come
+  // back to something the guard accepts, the edit lands and the banner must not
+  // survive its own resolution.
+  it("clears the banner when the re-observation's save succeeds", async () => {
+    liveDirtyPage("rev-1");
+    const { observe } = authoritativeBackend();
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+
+    observe();
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+    expect(isConflicted(name)).toBe(true);
+
+    vi.spyOn(backend(), "savePage").mockResolvedValue("rev-4");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-3"));
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+
+    expect(isConflicted(name)).toBe(false);
+    expect(isDirty(name)).toBe(false);
+  });
 });
