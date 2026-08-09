@@ -284,6 +284,29 @@ impl PortablePathKey {
         Self::from_components(path)
     }
 
+    /// Do two single path components share one portable identity?
+    ///
+    /// Answers exactly `from_graph_text_path(a) == from_graph_text_path(b)`, but
+    /// without building either key when both sides are ASCII. That case is the
+    /// hot one: the per-save alias scan compares every entry of the target's
+    /// parent directory against one requested component, and each comparison
+    /// allocated a `String` and ran NFD → default case fold → NFC over the name.
+    /// On a flat `journals/` directory that is the whole cost of a save.
+    /// (Direct Files performance audit 2026-08-09, finding F6.)
+    ///
+    /// Correct because on ASCII input NFD and NFC are the identity and default
+    /// case folding is exactly ASCII lowercasing. The guard demands ASCII on
+    /// BOTH sides, which is not redundant: folding can turn non-ASCII into
+    /// ASCII (U+212A KELVIN SIGN folds to `k`, U+FB01 LATIN SMALL LIGATURE FI to
+    /// `fi`), so a non-ASCII name can legitimately match an ASCII one and must
+    /// still go through the full fold.
+    pub(crate) fn graph_text_components_match(a: &str, b: &str) -> bool {
+        if a.is_ascii() && b.is_ascii() {
+            return a.eq_ignore_ascii_case(b);
+        }
+        Self::from_graph_text_path(a) == Self::from_graph_text_path(b)
+    }
+
     fn from_components(path: &str) -> Self {
         let mut key = String::with_capacity(path.len());
         for (index, component) in path.split('/').enumerate() {
@@ -1988,6 +2011,50 @@ fn is_strictly_sorted_by_key<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> 
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// The ASCII fast path in `graph_text_components_match` is an optimisation of
+    /// a case/NFC IDENTITY boundary — two files sharing one portable identity is
+    /// a refusal, so a fast path that says "different" where the fold says "same"
+    /// would admit exactly the collision the check exists to stop. It must agree
+    /// with building both keys on every input, including the ones that make the
+    /// both-sides-ASCII guard load-bearing: folding can produce ASCII from
+    /// non-ASCII. (Direct Files performance audit 2026-08-09, finding F6.)
+    #[test]
+    fn the_ascii_component_fast_path_agrees_with_the_full_fold() {
+        let names = [
+            "Journals",
+            "journals",
+            "JOURNALS",
+            "2026_08_09.md",
+            "2026_08_09.MD",
+            "Ärger.md",         // NFC precomposed
+            "A\u{0308}rger.md", // NFD, same page
+            "ärger.md",
+            "STRASSE.md",
+            "strasse.md",
+            "Stra\u{00DF}e.md", // ß folds to ss
+            "\u{212A}elvin.md", // KELVIN SIGN folds to ASCII k
+            "kelvin.md",
+            "Kelvin.md",
+            "\u{FB01}le.md", // ligature fi folds to ASCII fi
+            "file.md",
+            "FILE.md",
+            "Стр.md",
+            "стр.md",
+            "",
+        ];
+        for a in names {
+            for b in names {
+                let folded = PortablePathKey::from_graph_text_path(a)
+                    == PortablePathKey::from_graph_text_path(b);
+                assert_eq!(
+                    PortablePathKey::graph_text_components_match(a, b),
+                    folded,
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
 
     fn workspace() -> WorkspaceId {
         WorkspaceId::from_uuid(Uuid::from_u128(0x1020_3040_5060_7080_90a0_b0c0_d0e0_f001))
