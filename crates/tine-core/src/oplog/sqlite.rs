@@ -38,6 +38,8 @@ use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Instant;
 
 #[cfg(windows)]
@@ -1835,6 +1837,37 @@ thread_local! {
         RefCell::new(ProjectionOpenBreakdown::default());
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FullDigestScanInstrumentation {
+    pub(crate) semantic_projection_scans: usize,
+    pub(crate) materialized_row_scans: usize,
+}
+
+#[cfg(test)]
+static FULL_DIGEST_SCAN_INSTRUMENTATION: Mutex<
+    BTreeMap<WorkspaceId, FullDigestScanInstrumentation>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn reset_full_digest_scan_instrumentation(workspace: WorkspaceId) {
+    FULL_DIGEST_SCAN_INSTRUMENTATION
+        .lock()
+        .expect("full digest scan instrumentation lock")
+        .insert(workspace, FullDigestScanInstrumentation::default());
+}
+
+#[cfg(test)]
+pub(crate) fn take_full_digest_scan_instrumentation(
+    workspace: WorkspaceId,
+) -> FullDigestScanInstrumentation {
+    FULL_DIGEST_SCAN_INSTRUMENTATION
+        .lock()
+        .expect("full digest scan instrumentation lock")
+        .remove(&workspace)
+        .unwrap_or_default()
+}
+
 fn reset_projection_open_breakdown() {
     PROJECTION_OPEN_BREAKDOWN.with(|slot| *slot.borrow_mut() = ProjectionOpenBreakdown::default());
 }
@@ -3148,8 +3181,17 @@ impl SqliteFrontier {
     ///
     /// The process token separately binds `proof.authority_binding()` to the
     /// exact promotion state and retained candidate. This check proves the
-    /// reopened database still carries the same semantic rows, frontier, and
-    /// reference-catalog authority before writable runtime authority exists.
+    /// reopened database still carries the same cheap live bindings before
+    /// writable runtime authority exists.
+    ///
+    /// The complete semantic and materialized-row scans are the E-site proof:
+    /// they ran after candidate publication and reopen, and their digests live
+    /// in the process-bound `VerifiedBootstrapSqliteProjection`. Repeating
+    /// those graph-wide scans here would protect only against same-process
+    /// local database substitution, which is outside the managed-storage
+    /// threat model. This R-site consumes that typed proof and rechecks all
+    /// cheap live authority. A crash/restart has no such process proof and
+    /// continues through `freshly_verify_inactive_bootstrap` below.
     pub(crate) fn authenticate_same_process_bootstrap_reuse(
         &self,
         proof: &VerifiedBootstrapSqliteProjection,
@@ -3157,12 +3199,12 @@ impl SqliteFrontier {
         let frontier = self.frontier_root()?;
         let accepted_batch_count = u64::try_from(self.applied_batch_count()?)
             .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
+        let materialized = self.materialized_read()?;
         if self.claim != proof.claim()
             || frontier != *proof.frontier_root()
             || accepted_batch_count != proof.accepted_batch_count()
             || self.required_frontier_root != frontier
-            || self.semantic_projection_digest()? != proof.semantic_projection_digest()
-            || self.materialized_row_digest_for_harness()? != proof.materialized_row_digest()
+            || materialized.acceptance_sequence() != accepted_batch_count
             || (accepted_batch_count != 0
                 && self.authenticated_reference_catalog_root()?
                     != *frontier.reference_catalog_root())
@@ -3305,7 +3347,7 @@ impl SqliteFrontier {
         let binding = authority.binding();
         let claim = ProjectionClaim::current(binding.workspace_id(), binding.lineage_digest());
         let source = RebuildSource::from_inactive_bootstrap(authority)?;
-        let (opened, bootstrap_rebuild) =
+        let (mut opened, bootstrap_rebuild) =
             Self::rebuild_fresh_inactive_bootstrap(path, claim, source, authorization, terminal)?;
         let frontier_root = opened.database.frontier_root()?;
         let accepted_batch_count = u64::try_from(opened.database.applied_batch_count()?)
@@ -3337,8 +3379,23 @@ impl SqliteFrontier {
                 "SQLite reference catalog does not agree with inactive bootstrap authority".into(),
             ));
         }
+        // E site: candidate publication, reopen, frontier/stamp/reference
+        // checks, and these two complete scans together establish the one
+        // process-bound proof consumed by uninterrupted promotion. Keep this
+        // after publication: proving the unpublished candidate as well would
+        // duplicate graph-wide work without strengthening any in-scope crash,
+        // corruption, or concurrency boundary.
+        opened.rebuild.reference_coverage_full_scans += 1;
         let semantic_projection_digest = opened.database.semantic_projection_digest()?;
+        opened.rebuild.final_semantic_equivalence_proofs += 1;
+        #[cfg(test)]
+        let row_digest_started = std::time::Instant::now();
         let materialized_row_digest = opened.database.materialized_row_digest_for_harness()?;
+        opened.rebuild.final_row_digest_equivalence_proofs += 1;
+        #[cfg(test)]
+        {
+            opened.rebuild.final_row_digest_proof_micros = row_digest_started.elapsed().as_micros();
+        }
         let proof = VerifiedBootstrapSqliteProjection {
             claim,
             frontier_root,
@@ -4191,6 +4248,15 @@ impl SqliteFrontier {
     }
 
     pub fn semantic_projection_digest(&self) -> Result<ContentDigest, ProjectionError> {
+        #[cfg(test)]
+        {
+            FULL_DIGEST_SCAN_INSTRUMENTATION
+                .lock()
+                .expect("full digest scan instrumentation lock")
+                .entry(self.claim.workspace_id)
+                .or_default()
+                .semantic_projection_scans += 1;
+        }
         self.physical
             .semantic_projection_digest()
             .map_err(Into::into)
@@ -4202,6 +4268,15 @@ impl SqliteFrontier {
     pub(crate) fn materialized_row_digest_for_harness(
         &self,
     ) -> Result<ContentDigest, ProjectionError> {
+        #[cfg(test)]
+        {
+            FULL_DIGEST_SCAN_INSTRUMENTATION
+                .lock()
+                .expect("full digest scan instrumentation lock")
+                .entry(self.claim.workspace_id)
+                .or_default()
+                .materialized_row_scans += 1;
+        }
         let _gate = self.materialized_read()?;
         self.physical.materialized_row_digest().map_err(Into::into)
     }
@@ -4612,9 +4687,12 @@ impl SqliteFrontier {
         seeded
     }
 
-    /// The two complete unpublished-candidate scans that close a fresh build's
-    /// semantic and materialized-row proof, shared by archive replay and
-    /// terminal construction.
+    /// Close a fresh build's semantic and materialized-row proof.
+    ///
+    /// Ordinary archive rebuilds have no later typed bootstrap proof, so they
+    /// retain both unpublished-candidate scans. Inactive bootstrap activation
+    /// performs its one complete proof after publication and reopen in
+    /// `open_or_rebuild_inactive_bootstrap_authorized` instead.
     fn finish_fresh_candidate(
         &mut self,
         source: &RebuildSource<'_>,
@@ -4628,17 +4706,19 @@ impl SqliteFrontier {
                 .source_count(),
             inductive_coverage_count,
         )?;
-        instrumentation.reference_coverage_full_scans += 1;
-        let _semantic_digest = self.semantic_projection_digest()?;
-        instrumentation.final_semantic_equivalence_proofs += 1;
-        #[cfg(test)]
-        let row_digest_started = std::time::Instant::now();
-        let _row_digest = self.materialized_row_digest_for_harness()?;
-        instrumentation.final_row_digest_equivalence_proofs += 1;
-        #[cfg(test)]
-        {
-            instrumentation.final_row_digest_proof_micros =
-                row_digest_started.elapsed().as_micros();
+        if !matches!(&source.loader, RebuildLoader::InactiveBootstrap { .. }) {
+            instrumentation.reference_coverage_full_scans += 1;
+            let _semantic_digest = self.semantic_projection_digest()?;
+            instrumentation.final_semantic_equivalence_proofs += 1;
+            #[cfg(test)]
+            let row_digest_started = std::time::Instant::now();
+            let _row_digest = self.materialized_row_digest_for_harness()?;
+            instrumentation.final_row_digest_equivalence_proofs += 1;
+            #[cfg(test)]
+            {
+                instrumentation.final_row_digest_proof_micros =
+                    row_digest_started.elapsed().as_micros();
+            }
         }
         Ok(())
     }

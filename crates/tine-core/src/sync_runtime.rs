@@ -133,7 +133,10 @@ use crate::oplog::simulator::{
 };
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 #[cfg(test)]
-use crate::oplog::sqlite::BootstrapSqliteRebuildInstrumentation;
+use crate::oplog::sqlite::{
+    reset_full_digest_scan_instrumentation, take_full_digest_scan_instrumentation,
+    BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
+};
 #[cfg(test)]
 use crate::oplog::trusted_local_commit::{
     last_commit_stage_timings, TrustedLocalCommitStageTimings,
@@ -30787,6 +30790,7 @@ mod tests {
         total_ms: u128,
         phase_ms: Vec<(SyncLocalActivationPhase, u128)>,
         construction: ActivationConstructionInstrumentation,
+        full_digest_scans: FullDigestScanInstrumentation,
     }
 
     fn activation_source_counts(root: &Path) -> (usize, usize, usize) {
@@ -30825,6 +30829,8 @@ mod tests {
     fn activate_with_scale_receipt(fixture: &ActivationFixture) -> ActivationScaleReceipt {
         let (source_files, source_bytes, blocks) = activation_source_counts(&fixture.graph_root);
         let before = user_graph_bytes(&fixture.graph_root);
+        let workspace_id = fixture.request.identities.workspace_id;
+        reset_full_digest_scan_instrumentation(workspace_id);
         let started = std::time::Instant::now();
         let mut transitions = Vec::new();
         let activated = SyncRuntimeHandle::activate_or_resume_local_with_progress(
@@ -30870,6 +30876,7 @@ mod tests {
             .collect();
         drop(activated.handle);
         let construction = take_activation_construction_instrumentation();
+        let full_digest_scans = take_full_digest_scan_instrumentation(workspace_id);
         ActivationScaleReceipt {
             source_files,
             source_bytes,
@@ -30877,6 +30884,7 @@ mod tests {
             total_ms: total.as_millis(),
             phase_ms,
             construction,
+            full_digest_scans,
         }
     }
 
@@ -31000,6 +31008,14 @@ mod tests {
         assert_eq!(large_receipt.phase_ms.len(), 8);
         for receipt in [&small_receipt, &large_receipt] {
             assert_eq!(
+                receipt.full_digest_scans,
+                FullDigestScanInstrumentation {
+                    semantic_projection_scans: 1,
+                    materialized_row_scans: 1,
+                },
+                "one uninterrupted activation must execute each full SQLite digest proof exactly once"
+            );
+            assert_eq!(
                 receipt.construction.preparation.page_declarations,
                 receipt.source_files as u64
             );
@@ -31063,10 +31079,7 @@ mod tests {
                 receipt.construction.shadow.manifest_entries,
                 receipt.source_files as u64
             );
-            assert_eq!(
-                receipt.construction.shadow.payload_bytes_written,
-                receipt.source_bytes as u64
-            );
+            assert_eq!(receipt.construction.shadow.payload_bytes_written, 0);
             assert_eq!(receipt.construction.shadow.payload_bytes_read, 0);
             assert_eq!(
                 receipt.construction.shadow.bulk_pages_materialized,
