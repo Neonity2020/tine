@@ -158,15 +158,26 @@ export function divergedFromBaseline(name: string, stored: StoredPageState): boo
  *  claim ("the file changed under you") is false, so it goes, and the edit it
  *  was freezing is scheduled like any other. One owner for both directions means
  *  a later third observation site cannot reintroduce the asymmetry.
- *  (Direct Files data-safety audit, 2026-08-09, finding 17.) */
-export function applyDivergenceVerdict(name: string, stored: StoredPageState): void {
+ *  (Direct Files data-safety audit, 2026-08-09, finding 17.)
+ *
+ *  The raising direction does not raise the banner itself — see
+ *  `reconcileExternalChange` for why only the backend's own refusal may. */
+export async function applyDivergenceVerdict(name: string, stored: StoredPageState): Promise<void> {
   if (divergedFromBaseline(name, stored)) {
-    markConflict(name);
+    await reconcileExternalChange(name);
     return;
   }
   if (!isConflicted(name)) return;
   clearConflict(name);
-  if (dirty.has(name)) scheduleSave();
+  // Re-arm unconditionally rather than only for a page still in `dirty`. A
+  // conflicted page's edit is by definition NOT on disk, and `doSave` removes a
+  // page from `dirty` before awaiting the backend and does not put it back on a
+  // banner-class conflict — so the page whose banner we just lifted is usually
+  // unsaved AND unmarked. Leaving it that way strands a live edit that nothing
+  // will ever write, and `flushAll` (which consults only `dirty`, in-flight
+  // saves and `conflicts`) would then report the graph as safely landed and let
+  // a close discard it.
+  markDirty(name);
 }
 /** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
  *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
@@ -513,6 +524,27 @@ export function scheduleSave() {
       if (results.some(Boolean)) scheduleDataRev();
     })();
   }, delay);
+}
+
+/** An external write landed on a page that still has unsaved edits. Do NOT mark
+ *  it conflicted here.
+ *
+ *  A conflict banner is only usable if "Keep mine" can present the observation
+ *  epoch it was shown, and the backend mints one exactly once: for the disk
+ *  state it just refused to overwrite. A banner raised from the frontend has no
+ *  epoch, so `save_page` refuses the force, the banner stays up, its retry is
+ *  forbidden while the page is conflicted, and the only live action left is
+ *  "Use disk version" — which discards the edit. That is the unresolvable
+ *  dirty-editor tail this whole mechanism exists to prevent. (GH #254
+ *  increment 2, correction-delta re-verification, HIGH blocker.)
+ *
+ *  So run the ordinary, base-revision-guarded save instead. It cannot overwrite
+ *  a diverged file; if the disk really moved, its refusal raises the banner WITH
+ *  authority through the single conflict path in `doSave`, and if it did not,
+ *  the pending edit simply lands. Reading the file to prove divergence first is
+ *  not enough on its own — that read revokes any authority for the path. */
+export async function reconcileExternalChange(name: string): Promise<void> {
+  await enqueueSave(name);
 }
 
 /** Save one page immediately, bypassing the debounce — for actions that must

@@ -4,7 +4,7 @@ import { handleGraphChange, handleSparseV2Changed, installMobileExternalLinkHand
 import { resetPaneLayoutToSingle, restorePaneLayout } from "./panes";
 import { pageByName, reloadPage, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "./store";
 import { clearConflict, isConflicted, pageInventoryRev } from "./ui";
-import { flushPage, isDirty, markDirty, resetSaveState } from "./persistence";
+import { flushPage, forceSave, isDirty, markDirty, resetSaveState } from "./persistence";
 
 function addAnchor(href: string): HTMLAnchorElement {
   const a = document.createElement("a");
@@ -196,6 +196,21 @@ describe("conflict requires per-page divergence, not just a notification", () =>
     clearConflict(name);
   });
 
+  /** Stand in for the real Direct backend refusing a guarded save over a file
+   *  that moved: it mints an observation epoch for the state it refused to
+   *  overwrite and returns it as `conflict:<n>`. Returns the recorded calls so a
+   *  test can inspect what a later force presented. */
+  function refusingBackend(epoch: number) {
+    const calls: Array<{ force: boolean; observation: number | null }> = [];
+    vi.spyOn(backend(), "savePage").mockImplementation(
+      (_dto, _baseRev, force, observation) => {
+        calls.push({ force: !!force, observation: observation ?? null });
+        return Promise.reject(new Error(`conflict:${epoch}`));
+      }
+    );
+    return calls;
+  }
+
   it("does not conflict a dirty page when the admitted epoch left it unchanged", async () => {
     liveDirtyPage("rev-1");
     vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-1"));
@@ -212,6 +227,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
   it("still conflicts a dirty page when the stored revision genuinely moved", async () => {
     liveDirtyPage("rev-1");
     vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+    refusingBackend(7);
 
     await handleSparseV2Changed();
 
@@ -221,6 +237,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
   it("still conflicts a dirty page whose file was deleted under it", async () => {
     liveDirtyPage("rev-1");
     vi.spyOn(backend(), "getPage").mockResolvedValue(null);
+    refusingBackend(7);
 
     await handleSparseV2Changed();
 
@@ -259,6 +276,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
   it("still conflicts a dirty page on a legacy watcher event that really changed it", async () => {
     liveDirtyPage("rev-1");
     vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+    refusingBackend(7);
 
     await handleGraphChange({ name, kind: "page", created: false, removed: false });
 
@@ -276,6 +294,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
   // banner's claim is false and it must go.
   it("clears a conflict once the file is back and provably matches the baseline", async () => {
     liveDirtyPage("rev-1");
+    refusingBackend(7);
     vi.spyOn(backend(), "getPage").mockResolvedValue(null);
     await handleGraphChange({ name, kind: "page", created: false, removed: true });
     expect(isConflicted(name)).toBe(true);
@@ -291,6 +310,7 @@ describe("conflict requires per-page divergence, not just a notification", () =>
 
   it("keeps the conflict when the file comes back with different content", async () => {
     liveDirtyPage("rev-1");
+    refusingBackend(7);
     vi.spyOn(backend(), "getPage").mockResolvedValue(null);
     await handleGraphChange({ name, kind: "page", created: false, removed: true });
     expect(isConflicted(name)).toBe(true);
@@ -300,4 +320,36 @@ describe("conflict requires per-page divergence, not just a notification", () =>
 
     expect(isConflicted(name)).toBe(true);
   });
+
+  // GH #254 increment 2, correction-delta re-verification, HIGH blocker.
+  //
+  // A banner is only worth raising if its "Keep mine" can work. That force must
+  // present the observation epoch it was shown, and only a backend refusal mints
+  // one — so a banner the frontend raised by itself presents null, `save_page`
+  // refuses it, the retry is forbidden while the page is conflicted, and the one
+  // remaining action discards the user's edit. Every path that notices an
+  // external change under an unsaved edit therefore goes through the guarded
+  // save, whatever noticed it.
+  for (const [label, notice] of [
+    ["a legacy watcher event", () => handleGraphChange({ name, kind: "page" as const, created: false, removed: false })],
+    ["a sparse-v2 epoch", () => handleSparseV2Changed()],
+    ["an external delete", () => handleGraphChange({ name, kind: "page" as const, created: false, removed: true })],
+  ] as const) {
+    it(`gives "Keep mine" real authority after ${label}`, async () => {
+      liveDirtyPage("rev-1");
+      vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+      const calls = refusingBackend(11);
+
+      await notice();
+
+      expect(isConflicted(name)).toBe(true);
+      // The banner came from a guarded save the backend refused — not from the
+      // frontend deciding on its own.
+      expect(calls).toEqual([{ force: false, observation: null }]);
+
+      await forceSave(name);
+
+      expect(calls[1]).toEqual({ force: true, observation: 11 });
+    });
+  }
 });
