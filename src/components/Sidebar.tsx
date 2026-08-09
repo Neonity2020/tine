@@ -4,7 +4,7 @@ import { openSwitcher, favorites, recentPages, openPageContextMenu, graphMeta, o
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
 import { switchGraph, createNewGraph, loadGraphPath, authorizeGraphAccess, type LoadGraphPathOutcome } from "../graph";
 import { backend } from "../backend";
-import { allPages as allGraphPages, pageListLabel } from "../pages";
+import { allPages as allGraphPages, pageListLabels } from "../pages";
 import { EmojiText } from "../render/emoji";
 import { NamespaceTree } from "./Namespace";
 import type { PageKind } from "../types";
@@ -90,6 +90,10 @@ export function Sidebar(props: {
       .filter((p) => p.kind === "page")
       .sort((a, b) => a.name.localeCompare(b.name))
   );
+  // Built once per page-list change. Asking each row to disambiguate itself
+  // scanned the whole list per row (perf audit F9: 21 ms at 5,000 pages,
+  // 39 ms at 20,000, for 300 visible rows).
+  const pageLabel = createMemo(() => pageListLabels(allPages()));
 
   // `path` disambiguates nested pages that share a basename (#21 Phase 2). It's
   // optional: favorites / recent are keyed by name only, so they match on name
@@ -280,7 +284,7 @@ export function Sidebar(props: {
                     openPageContextMenu(e.clientX, e.clientY, { name: p.name, pageKind: "page", path: p.path });
                   }}
                 >
-                  <EmojiText text={pageListLabel(p, allPages())} />
+                  <EmojiText text={pageLabel()(p)} />
                 </div>
               )}
             </For>

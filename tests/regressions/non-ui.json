@@ -3231,6 +3231,31 @@
         ]
       },
       "notes": "Direct Files data-safety audit 2026-08-09, finding 15, landed as a CONSISTENCY fix with an explicit NEGATIVE result. Graph::is_shadow_journal (direct mode) hard-coded canonical candidates '{stem}.md' and '{stem}.org'; its managed twin managed_is_shadow_journal already asked configured_text_variant_paths, i.e. all of LOGSEQ_TEXT_EXTENSIONS = md/markdown/org. The audit predicted that in a '.markdown' graph a title-named leftover would therefore escape the #21 shadow rule and poison the (kind,name) cache. IT DOES NOT: probes at the observation boundary show load_named and journals_desc both still serve the canonical file for both extensions, because later layers mask the misclassification. The necessity gate is therefore NOT satisfied and no user-visible defect is claimed - the divergence between the two classifiers is real and was removed, and the three new tests pin the #21 rule per extension so that a change in whichever layer is currently masking it cannot silently take the guarantee with it."
+    },
+    {
+      "id": "REG-ALL-PAGES-LABEL-LINEAR-20260809",
+      "title": "The All Pages sidebar list scanned the whole page list once per visible row",
+      "family": "performance",
+      "sources": {
+        "issues": [
+          21
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/pages.test.ts"
+        ]
+      },
+      "notes": "Direct Files performance audit 2026-08-09, finding F9. pageListLabel disambiguates a row whose display name collides with another page (same title in different folders, or the same stem as .md and .org) by scanning the whole list twice - once for the name, once for the parent sub-path. The sidebar called it per rendered row, so rendering All Pages cost O(rows x pages): measured 21 ms at 5,000 pages and 39 ms at 20,000, for 300 visible rows. pageListLabels now counts both keys in ONE pass and returns a lookup, memoized in Sidebar alongside the existing filter+sort memo. The label RULE is unchanged and the three original correctness tests still pass verbatim. Necessity: the new shape test measures 527 ms to label 10,000 rows against the pre-fix per-row scan and fails; it passes linear. The index is keyed by value, not object identity, so a caller holding a copy of an entry gets the same label."
     }
   ]
 }
