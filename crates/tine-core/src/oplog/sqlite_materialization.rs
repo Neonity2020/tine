@@ -1885,6 +1885,32 @@ pub struct MaterializedPageInventoryRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNavigationPageRow {
+    pub page_id: PageId,
+    pub name: String,
+    pub name_key: String,
+    pub path: ManagedPath,
+    pub kind: ManagedTextKind,
+    pub preamble: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNavigationAliasRow {
+    pub source_page_id: PageId,
+    pub owner_name: String,
+    pub owner_path: ManagedPath,
+    pub normalized_alias: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNavigationReferenceNameRow {
+    pub source_page_id: PageId,
+    pub owner_path: ManagedPath,
+    pub raw_name: String,
+    pub normalized_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedBlockRow {
     pub block_id: BlockId,
     pub page_id: PageId,
@@ -2087,6 +2113,59 @@ impl<'a> SqliteMaterializedRead<'a> {
         )
     }
 
+    pub fn navigation_pages_after(
+        &self,
+        after: Option<(&ManagedPath, PageId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationPageRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner.navigation_pages_after_with_header_validation(
+                after.map(|(path, _)| path.as_str()),
+                after_page_id.as_ref(),
+                limit,
+                validate_storage_page_header,
+            )?,
+            navigation_page_row_from_storage,
+        )
+    }
+
+    pub fn navigation_aliases_after(
+        &self,
+        after: Option<(&ManagedPath, &str, PageId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationAliasRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, _, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner.navigation_aliases_after(
+                after
+                    .zip(after_page_id.as_ref())
+                    .map(|((path, alias, _), page_id)| (path.as_str(), alias, page_id)),
+                limit,
+            )?,
+            navigation_alias_row_from_storage,
+        )
+    }
+
+    pub fn navigation_reference_names_after(
+        &self,
+        after: Option<(&ManagedPath, &str, &str, PageId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationReferenceNameRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, _, _, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner.navigation_reference_names_after(
+                after
+                    .zip(after_page_id.as_ref())
+                    .map(|((path, raw, normalized, _), page_id)| {
+                        (path.as_str(), raw, normalized, page_id)
+                    }),
+                limit,
+            )?,
+            navigation_reference_name_row_from_storage,
+        )
+    }
+
     pub fn blocks_on_page(
         &self,
         page_id: PageId,
@@ -2200,6 +2279,41 @@ fn page_inventory_row_from_storage(
         name: row.name,
         path: ManagedPath::parse(row.path).map_err(typed_sql_decode_error)?,
         kind: text_kind_from_sql(row.text_kind).map_err(typed_sql_decode_error)?,
+    })
+}
+
+fn navigation_page_row_from_storage(
+    row: storage::PhysicalNavigationPageRow,
+) -> Result<MaterializedNavigationPageRow, MaterializationError> {
+    Ok(MaterializedNavigationPageRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        name: row.name,
+        name_key: row.name_key,
+        path: ManagedPath::parse(row.path).map_err(typed_sql_decode_error)?,
+        kind: text_kind_from_sql(row.text_kind).map_err(typed_sql_decode_error)?,
+        preamble: row.preamble,
+    })
+}
+
+fn navigation_alias_row_from_storage(
+    row: storage::PhysicalNavigationAliasRow,
+) -> Result<MaterializedNavigationAliasRow, MaterializationError> {
+    Ok(MaterializedNavigationAliasRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        owner_name: row.owner_name,
+        owner_path: ManagedPath::parse(row.owner_path).map_err(typed_sql_decode_error)?,
+        normalized_alias: row.normalized_alias,
+    })
+}
+
+fn navigation_reference_name_row_from_storage(
+    row: storage::PhysicalNavigationReferenceNameRow,
+) -> Result<MaterializedNavigationReferenceNameRow, MaterializationError> {
+    Ok(MaterializedNavigationReferenceNameRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        owner_path: ManagedPath::parse(row.owner_path).map_err(typed_sql_decode_error)?,
+        raw_name: row.raw_name,
+        normalized_name: row.normalized_name,
     })
 }
 

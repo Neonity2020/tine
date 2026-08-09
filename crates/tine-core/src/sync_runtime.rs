@@ -42,8 +42,8 @@ use crate::fast_commit::{
     forbidden_commit_work, graph_wide_commit_work, ForbiddenCommitWork, GraphWideCommitWork,
 };
 use crate::model::{
-    sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, Graph, PageDto, PageEntry,
-    PageKind,
+    sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, Format, Graph, PageDto,
+    PageEntry, PageKind,
 };
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
@@ -1809,6 +1809,42 @@ pub enum SyncApplicationPageInventoryOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationNavigationRequest {
+    ReferencedPageNames,
+    PageAliases,
+    PageIcons { names: Vec<String> },
+    ExistingPageNames { names: Vec<String> },
+    QuickSwitch { query: String, limit: usize },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum SyncApplicationNavigationReply {
+    ReferencedPageNames(Vec<String>),
+    PageAliases(Vec<(String, String)>),
+    PageIcons(HashMap<String, String>),
+    ExistingPageNames(Vec<String>),
+    QuickSwitch(Vec<PageEntry>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationNavigationOutcome {
+    Loaded {
+        reply: SyncApplicationNavigationReply,
+    },
+    Deferred {
+        state: SyncEditorDeferred,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SyncApplicationPageSelector {
     Logical {
@@ -3162,6 +3198,25 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
     }
 
+    /// Answer page navigation/autocomplete from the exact managed projection,
+    /// without constructing the Direct Files parsed-graph cache.
+    pub fn application_navigation(
+        &self,
+        request: SyncApplicationNavigationRequest,
+    ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        validate_application_navigation_request(&request)?;
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ApplicationNavigation {
+            request,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
     /// Load one canonical application DTO by logical identity or exact managed
     /// path. Parsing, sparse identity matching, and DTO construction all occur
     /// in the same actor turn.
@@ -4277,6 +4332,48 @@ fn validate_application_load_request(
                 )
             })?;
         }
+    }
+    Ok(())
+}
+
+fn validate_application_navigation_request(
+    request: &SyncApplicationNavigationRequest,
+) -> Result<(), SyncApplicationPageRequestError> {
+    let (names, query, limit) = match request {
+        SyncApplicationNavigationRequest::ReferencedPageNames
+        | SyncApplicationNavigationRequest::PageAliases => (&[][..], None, None),
+        SyncApplicationNavigationRequest::PageIcons { names }
+        | SyncApplicationNavigationRequest::ExistingPageNames { names } => {
+            (names.as_slice(), None, None)
+        }
+        SyncApplicationNavigationRequest::QuickSwitch { query, limit } => {
+            (&[][..], Some(query.as_str()), Some(*limit))
+        }
+    };
+    if names.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
+        return Err(SyncApplicationPageRequestError::RequestTooLarge(
+            SyncEditorRequestSize {
+                blocks: names.len(),
+                ..SyncEditorRequestSize::default()
+            },
+        ));
+    }
+    let text_bytes = names
+        .iter()
+        .map(String::len)
+        .chain(query.into_iter().map(str::len))
+        .try_fold(0_usize, usize::checked_add)
+        .unwrap_or(usize::MAX);
+    if text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+        || limit.is_some_and(|limit| limit > MAX_MATERIALIZATION_QUERY_ROWS)
+    {
+        return Err(SyncApplicationPageRequestError::RequestTooLarge(
+            SyncEditorRequestSize {
+                text_bytes,
+                blocks: limit.unwrap_or_default(),
+                ..SyncEditorRequestSize::default()
+            },
+        ));
     }
     Ok(())
 }
@@ -5576,6 +5673,11 @@ enum ActorRequest {
             Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError>,
         >,
     },
+    ApplicationNavigation {
+        request: SyncApplicationNavigationRequest,
+        reply:
+            mpsc::Sender<Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError>>,
+    },
     LoadApplicationPage {
         request: SyncApplicationPageLoadRequest,
         reply:
@@ -5728,6 +5830,11 @@ fn run_actor_loop(
             }
             ActorRequest::ApplicationPageInventory { reply } => {
                 let result = actor.application_page_inventory();
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ApplicationNavigation { request, reply } => {
+                let result = actor.application_navigation(request);
                 let _ = reply.send(result);
                 false
             }
@@ -6079,6 +6186,93 @@ enum ApplicationExactLoad {
     Loaded(ApplicationCurrentPage),
     Missing,
     Ambiguous,
+}
+
+type ApplicationNavigationOverlay = BTreeMap<ManagedPath, Option<(PageId, PageDto)>>;
+
+fn navigation_property_references(text: &str, output: &mut Vec<(String, String)>) {
+    for line in text.lines() {
+        let Some((key, value)) = crate::doc::parse_property_line(line) else {
+            continue;
+        };
+        if !(key.eq_ignore_ascii_case("tags")
+            || key.eq_ignore_ascii_case("alias")
+            || key.eq_ignore_ascii_case("aliases"))
+        {
+            continue;
+        }
+        let quoted = value.trim();
+        if quoted.len() >= 2 && quoted.starts_with('"') && quoted.ends_with('"') {
+            continue;
+        }
+        for value in value.split([',', '，']) {
+            let value = value.trim();
+            let value = value.strip_prefix('#').unwrap_or(value).trim();
+            let value = value
+                .strip_prefix("[[")
+                .and_then(|value| value.strip_suffix("]]"))
+                .unwrap_or(value)
+                .trim();
+            if !value.is_empty() {
+                output.push((value.to_owned(), crate::refs::page_key(value)));
+            }
+        }
+    }
+}
+
+fn navigation_page_aliases(page: &PageDto) -> Vec<String> {
+    fn properties_only(raw: &str) -> bool {
+        let mut property = false;
+        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+            if crate::doc::parse_property_line(line).is_none() {
+                return false;
+            }
+            property = true;
+        }
+        property
+    }
+    let source = page.pre_block.as_deref().or_else(|| {
+        page.blocks
+            .first()
+            .filter(|block| properties_only(&block.raw))
+            .map(|block| block.raw.as_str())
+    });
+    let mut references = Vec::new();
+    if let Some(source) = source {
+        for line in source.lines() {
+            let Some((key, value)) = crate::doc::parse_property_line(line) else {
+                continue;
+            };
+            if key.eq_ignore_ascii_case("alias") || key.eq_ignore_ascii_case("aliases") {
+                navigation_property_references(&format!("alias:: {value}"), &mut references);
+            }
+        }
+    }
+    let mut aliases = references
+        .into_iter()
+        .map(|(_, normalized)| normalized)
+        .collect::<Vec<_>>();
+    aliases.sort_unstable();
+    aliases.dedup();
+    aliases
+}
+
+fn navigation_page_reference_names(page: &PageDto) -> Vec<(String, String)> {
+    fn walk(blocks: &[BlockDto], is_org: bool, output: &mut Vec<(String, String)>) {
+        for block in blocks {
+            for name in crate::render::block_refs(&block.raw, is_org).page {
+                output.push((name.clone(), crate::refs::page_key(&name)));
+            }
+            navigation_property_references(&block.raw, output);
+            walk(&block.children, is_org, output);
+        }
+    }
+    let mut output = Vec::new();
+    if let Some(pre) = page.pre_block.as_deref() {
+        navigation_property_references(pre, &mut output);
+    }
+    walk(&page.blocks, page.format == Format::Org, &mut output);
+    output
 }
 
 enum ApplicationSaveReloadTarget {
@@ -7628,6 +7822,312 @@ impl RuntimeActor {
         }
         self.application_inventory_ready()
             .map(|pages| SyncApplicationPageInventoryOutcome::Loaded { pages })
+    }
+
+    fn application_navigation(
+        &mut self,
+        request: SyncApplicationNavigationRequest,
+    ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
+            return Ok(SyncApplicationNavigationOutcome::Deferred { state });
+        }
+        let reply = match request {
+            SyncApplicationNavigationRequest::ReferencedPageNames => {
+                SyncApplicationNavigationReply::ReferencedPageNames(
+                    self.application_navigation_reference_names_ready()?,
+                )
+            }
+            SyncApplicationNavigationRequest::PageAliases => {
+                SyncApplicationNavigationReply::PageAliases(
+                    self.application_navigation_aliases_ready()?
+                        .into_iter()
+                        .map(|(alias, owner, _)| (alias, owner))
+                        .collect(),
+                )
+            }
+            SyncApplicationNavigationRequest::PageIcons { names } => {
+                let pages = self.application_navigation_pages_ready()?;
+                let aliases = self.application_navigation_aliases_ready()?;
+                let mut real_names = HashSet::new();
+                let mut icons = HashMap::new();
+                for (page, preamble) in pages {
+                    if page.kind != PageKind::Page {
+                        continue;
+                    }
+                    let key = crate::refs::page_key(&page.name);
+                    real_names.insert(key.clone());
+                    if let Some(icon) = preamble.as_deref().and_then(crate::model::pre_block_icon) {
+                        icons.entry(key).or_insert(icon);
+                    }
+                }
+                for (alias, owner, _) in aliases {
+                    if real_names.contains(&alias) {
+                        continue;
+                    }
+                    if let Some(icon) = icons.get(&crate::refs::page_key(&owner)).cloned() {
+                        icons.entry(alias).or_insert(icon);
+                    }
+                }
+                let selected = names
+                    .into_iter()
+                    .filter_map(|name| {
+                        icons
+                            .get(&crate::refs::page_key(&name))
+                            .cloned()
+                            .map(|icon| (name, icon))
+                    })
+                    .collect();
+                SyncApplicationNavigationReply::PageIcons(selected)
+            }
+            SyncApplicationNavigationRequest::ExistingPageNames { names } => {
+                let mut known = self
+                    .application_navigation_pages_ready()?
+                    .into_iter()
+                    .map(|(page, _)| crate::refs::page_key(&page.name))
+                    .collect::<HashSet<_>>();
+                known.extend(
+                    self.application_navigation_aliases_ready()?
+                        .into_iter()
+                        .map(|(alias, _, _)| alias),
+                );
+                SyncApplicationNavigationReply::ExistingPageNames(
+                    names
+                        .into_iter()
+                        .filter(|name| known.contains(&crate::refs::page_key(name)))
+                        .collect(),
+                )
+            }
+            SyncApplicationNavigationRequest::QuickSwitch { query, limit } => {
+                let pages = self
+                    .application_navigation_pages_ready()?
+                    .into_iter()
+                    .map(|(page, _)| page)
+                    .collect();
+                let aliases = self.application_navigation_aliases_ready()?;
+                let referenced = self.application_navigation_reference_names_ready()?;
+                SyncApplicationNavigationReply::QuickSwitch(
+                    crate::query_plan::legacy_page_search_entries(
+                        pages, aliases, referenced, &query, limit,
+                    ),
+                )
+            }
+        };
+        Ok(SyncApplicationNavigationOutcome::Loaded { reply })
+    }
+
+    fn application_navigation_pages_ready(
+        &self,
+    ) -> Result<Vec<(PageEntry, Option<String>)>, SyncApplicationPageRequestError> {
+        let overlay = self.application_navigation_overlay_ready()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        const BATCH: usize = 256;
+        let mut cursor: Option<(ManagedPath, PageId)> = None;
+        let mut output: Vec<(PageId, PageEntry, Option<String>)> = Vec::new();
+        loop {
+            let rows = read
+                .navigation_pages_after(
+                    cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                    BATCH,
+                )
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if rows.is_empty() {
+                break;
+            }
+            let len = rows.len();
+            for row in rows {
+                if overlay.contains_key(&row.path) {
+                    cursor = Some((row.path, row.page_id));
+                    continue;
+                }
+                let page = self
+                    .graph
+                    .projected_inventory_entry(&row.path, &row.name, row.kind)
+                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                cursor = Some((row.path, row.page_id));
+                output.push((row.page_id, page, row.preamble));
+            }
+            if len < BATCH {
+                break;
+            }
+        }
+        for (path, current) in overlay {
+            let Some((page_id, page)) = current else {
+                continue;
+            };
+            let kind = match page.kind {
+                PageKind::Page => ManagedTextKind::Page,
+                PageKind::Journal => ManagedTextKind::Journal,
+            };
+            let entry = self
+                .graph
+                .projected_inventory_entry(&path, &page.name, kind)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            output.push((page_id, entry, page.pre_block));
+        }
+        output.sort_by(|a, b| a.1.rel_path.cmp(&b.1.rel_path).then_with(|| a.0.cmp(&b.0)));
+        Ok(output
+            .into_iter()
+            .map(|(_, page, preamble)| (page, preamble))
+            .collect())
+    }
+
+    fn application_navigation_overlay_ready(
+        &self,
+    ) -> Result<ApplicationNavigationOverlay, SyncApplicationPageRequestError> {
+        let paths = self
+            .managed_local
+            .as_ref()
+            .map(|managed| {
+                managed
+                    .latest_projection_frames
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut overlay = BTreeMap::new();
+        for path in paths {
+            let path = ManagedPath::parse(path)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            let current = match self.load_hot_application_exact_ready(&path)? {
+                ApplicationExactLoad::Loaded(current) => {
+                    Some((current.editor.page.page_id, current.page))
+                }
+                ApplicationExactLoad::Missing => None,
+                ApplicationExactLoad::Ambiguous => {
+                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                }
+            };
+            overlay.insert(path, current);
+        }
+        Ok(overlay)
+    }
+
+    fn application_navigation_aliases_ready(
+        &self,
+    ) -> Result<Vec<(String, String, String)>, SyncApplicationPageRequestError> {
+        let overlay = self.application_navigation_overlay_ready()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        const BATCH: usize = 256;
+        let mut cursor: Option<(ManagedPath, String, PageId)> = None;
+        let mut output = Vec::new();
+        loop {
+            let rows = read
+                .navigation_aliases_after(
+                    cursor
+                        .as_ref()
+                        .map(|(path, alias, page_id)| (path, alias.as_str(), *page_id)),
+                    BATCH,
+                )
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if rows.is_empty() {
+                break;
+            }
+            let len = rows.len();
+            for row in rows {
+                cursor = Some((
+                    row.owner_path.clone(),
+                    row.normalized_alias.clone(),
+                    row.source_page_id,
+                ));
+                if !overlay.contains_key(&row.owner_path) {
+                    output.push((
+                        row.normalized_alias,
+                        row.owner_name,
+                        row.owner_path.as_str().to_owned(),
+                    ));
+                }
+            }
+            if len < BATCH {
+                break;
+            }
+        }
+        for (path, current) in overlay {
+            let Some((_, page)) = current else {
+                continue;
+            };
+            output.extend(
+                navigation_page_aliases(&page)
+                    .into_iter()
+                    .map(|alias| (alias, page.name.clone(), path.as_str().to_owned())),
+            );
+        }
+        output.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+        Ok(output)
+    }
+
+    fn application_navigation_reference_names_ready(
+        &self,
+    ) -> Result<Vec<String>, SyncApplicationPageRequestError> {
+        let overlay = self.application_navigation_overlay_ready()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        const BATCH: usize = 256;
+        let mut cursor: Option<(ManagedPath, String, String, PageId)> = None;
+        let mut seen = HashSet::new();
+        let mut output = Vec::new();
+        loop {
+            let rows = read
+                .navigation_reference_names_after(
+                    cursor.as_ref().map(|(path, raw, normalized, page_id)| {
+                        (path, raw.as_str(), normalized.as_str(), *page_id)
+                    }),
+                    BATCH,
+                )
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if rows.is_empty() {
+                break;
+            }
+            let len = rows.len();
+            for row in rows {
+                cursor = Some((
+                    row.owner_path.clone(),
+                    row.raw_name.clone(),
+                    row.normalized_name.clone(),
+                    row.source_page_id,
+                ));
+                if !overlay.contains_key(&row.owner_path) && seen.insert(row.normalized_name) {
+                    output.push(row.raw_name);
+                }
+            }
+            if len < BATCH {
+                break;
+            }
+        }
+        for current in overlay.into_values().flatten() {
+            for (raw, normalized) in navigation_page_reference_names(&current.1) {
+                if seen.insert(normalized) {
+                    output.push(raw);
+                }
+            }
+        }
+        Ok(output)
     }
 
     fn application_inventory_ready(
@@ -17033,7 +17533,7 @@ mod tests {
             &fixture,
             "content/nested pages/Ordinary Ω.md",
             format!(
-                "title:: Ordinary Ω\nicon:: 🧭\n\n- TODO [#A] parent #gateway\n  collapsed:: true\n  id:: {genuine}\n  custom:: value\n  - child λ\n"
+                "title:: Ordinary Ω\nicon:: 🧭\nalias:: Compass\n\n- TODO [#A] parent #gateway\n  collapsed:: true\n  id:: {genuine}\n  custom:: value\n  - child λ\n"
             )
             .as_bytes(),
         );
@@ -17070,7 +17570,68 @@ mod tests {
             path == "diary/日記/2026_07_30.org" && *kind == PageKind::Journal && date_key.is_some()
         }));
 
+        let navigation = |request| match handle.application_navigation(request).unwrap() {
+            SyncApplicationNavigationOutcome::Loaded { reply } => reply,
+            other => panic!("application navigation was not ready: {other:?}"),
+        };
+        let SyncApplicationNavigationReply::ReferencedPageNames(referenced) =
+            navigation(SyncApplicationNavigationRequest::ReferencedPageNames)
+        else {
+            panic!("wrong referenced-name reply")
+        };
+        assert!(referenced
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("gateway")));
+        assert!(referenced
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("compass")));
+        let SyncApplicationNavigationReply::PageAliases(aliases) =
+            navigation(SyncApplicationNavigationRequest::PageAliases)
+        else {
+            panic!("wrong aliases reply")
+        };
+        assert!(aliases
+            .iter()
+            .any(|(alias, owner)| { alias == "compass" && owner == "Ordinary Ω" }));
+        let SyncApplicationNavigationReply::PageIcons(icons) =
+            navigation(SyncApplicationNavigationRequest::PageIcons {
+                names: vec!["Ordinary Ω".into(), "Compass".into(), "missing".into()],
+            })
+        else {
+            panic!("wrong page-icons reply")
+        };
+        assert_eq!(icons.get("Ordinary Ω").map(String::as_str), Some("🧭"));
+        assert_eq!(icons.get("Compass").map(String::as_str), Some("🧭"));
+        assert!(!icons.contains_key("missing"));
+        let SyncApplicationNavigationReply::ExistingPageNames(existing) =
+            navigation(SyncApplicationNavigationRequest::ExistingPageNames {
+                names: vec!["missing".into(), "Compass".into(), "Ordinary Ω".into()],
+            })
+        else {
+            panic!("wrong existing-name reply")
+        };
+        assert_eq!(existing, vec!["Compass", "Ordinary Ω"]);
+        let SyncApplicationNavigationReply::QuickSwitch(matches) =
+            navigation(SyncApplicationNavigationRequest::QuickSwitch {
+                query: "comp".into(),
+                limit: 8,
+            })
+        else {
+            panic!("wrong quick-switch reply")
+        };
         let graph = Graph::open(fixture.graph_root());
+        let direct_matches = graph.quick_switch("comp", 8);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|page| (&page.name, &page.rel_path))
+                .collect::<Vec<_>>(),
+            direct_matches
+                .iter()
+                .map(|page| (&page.name, &page.rel_path))
+                .collect::<Vec<_>>(),
+            "managed navigation must share Direct Files quick-switch semantics"
+        );
         for path in [
             "content/nested pages/Ordinary Ω.md",
             "diary/日記/2026_07_30.org",
@@ -17141,6 +17702,106 @@ mod tests {
             )
             .unwrap();
         drop(connection);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn application_navigation_observes_the_immediately_committed_frontier() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-application-navigation-frontier");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Navigation.md",
+            b"icon:: old\nalias:: Old Alias\n\n- mentions [[Old Phantom]]\n",
+        );
+        let (mut page, revision) =
+            load_application_exact(&handle, "content/nested pages/Navigation.md");
+        page.pre_block = Some("icon:: new\nalias:: New Alias".into());
+        page.blocks[0].raw = "- mentions [[New Phantom]]".into();
+        let saved = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        assert!(matches!(
+            saved,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+
+        let loaded = |request| match handle.application_navigation(request).unwrap() {
+            SyncApplicationNavigationOutcome::Loaded { reply } => reply,
+            other => panic!("application navigation was not ready: {other:?}"),
+        };
+        let SyncApplicationNavigationReply::PageAliases(aliases) =
+            loaded(SyncApplicationNavigationRequest::PageAliases)
+        else {
+            panic!("wrong aliases reply")
+        };
+        assert!(
+            aliases.contains(&("new alias".into(), "Navigation".into())),
+            "aliases after save: {aliases:?}"
+        );
+        assert!(!aliases.iter().any(|(alias, _)| alias == "old alias"));
+        let SyncApplicationNavigationReply::ReferencedPageNames(names) =
+            loaded(SyncApplicationNavigationRequest::ReferencedPageNames)
+        else {
+            panic!("wrong referenced-name reply")
+        };
+        assert!(names.iter().any(|name| name == "New Phantom"));
+        assert!(!names.iter().any(|name| name == "Old Phantom"));
+        let SyncApplicationNavigationReply::PageIcons(icons) =
+            loaded(SyncApplicationNavigationRequest::PageIcons {
+                names: vec!["Navigation".into(), "New Alias".into()],
+            })
+        else {
+            panic!("wrong icons reply")
+        };
+        assert_eq!(icons.get("Navigation").map(String::as_str), Some("new"));
+        assert_eq!(icons.get("New Alias").map(String::as_str), Some("new"));
+
+        let mut created_block = BlockDto::default();
+        created_block.raw = "- links [[Created Phantom]]".into();
+        let created = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: "Created Navigation".into(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: new_application_page(
+                    "Created Navigation",
+                    SyncPageKind::Page,
+                    Some("alias:: Created Alias"),
+                    vec![created_block],
+                ),
+            })
+            .unwrap();
+        assert!(matches!(
+            created,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        let SyncApplicationNavigationReply::ExistingPageNames(existing) =
+            loaded(SyncApplicationNavigationRequest::ExistingPageNames {
+                names: vec!["Created Navigation".into(), "Created Alias".into()],
+            })
+        else {
+            panic!("wrong existing names reply")
+        };
+        assert_eq!(existing, vec!["Created Navigation", "Created Alias"]);
+        let SyncApplicationNavigationReply::ReferencedPageNames(names) =
+            loaded(SyncApplicationNavigationRequest::ReferencedPageNames)
+        else {
+            panic!("wrong referenced-name reply")
+        };
+        assert!(names.iter().any(|name| name == "Created Phantom"));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

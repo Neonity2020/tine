@@ -1284,12 +1284,25 @@ fn execute_pages(
     branch: &QueryBranch,
     cancelled: &impl Fn() -> bool,
 ) -> Option<(Vec<QueryHit>, bool)> {
+    let file_pages = graph.list_pages();
+    let aliases = graph.page_aliases_with_owners();
+    let referenced = graph.referenced_page_names();
+    execute_page_candidates(plan, file_pages, aliases, referenced, branch, cancelled)
+}
+
+fn execute_page_candidates(
+    plan: &QueryPlan,
+    file_pages: Vec<PageEntry>,
+    aliases: Vec<(String, String, String)>,
+    referenced: Vec<String>,
+    branch: &QueryBranch,
+    cancelled: &impl Fn() -> bool,
+) -> Option<(Vec<QueryHit>, bool)> {
     if branch.limit == 0 {
         return Some((Vec::new(), false));
     }
-    let file_pages = graph.list_pages();
     let mut aliases_by_owner: HashMap<String, Vec<String>> = HashMap::new();
-    for (alias, _, owner_rel_path) in graph.page_aliases_with_owners() {
+    for (alias, _, owner_rel_path) in aliases {
         aliases_by_owner
             .entry(owner_rel_path)
             .or_default()
@@ -1327,7 +1340,7 @@ fn execute_pages(
         .iter()
         .map(|page| canonical_fold(&page.name))
         .collect();
-    for name in graph.referenced_page_names() {
+    for name in referenced {
         if cancelled() {
             return None;
         }
@@ -1396,6 +1409,26 @@ fn execute_pages(
             .collect(),
         has_more,
     ))
+}
+
+/// Execute the established literal page autocomplete/quick-switch semantics
+/// over an explicitly supplied exact-frontier candidate set. Managed storage
+/// uses this to share ranking with Direct Files without constructing a parsed
+/// `Graph` cache.
+pub(crate) fn legacy_page_search_entries(
+    file_pages: Vec<PageEntry>,
+    aliases: Vec<(String, String, String)>,
+    referenced: Vec<String>,
+    query: &str,
+    limit: usize,
+) -> Vec<PageEntry> {
+    let plan = QueryPlan::legacy_page_search(query, limit);
+    let Some(branch) = plan.branches.first() else {
+        return Vec::new();
+    };
+    execute_page_candidates(&plan, file_pages, aliases, referenced, branch, &|| false)
+        .map(|(hits, _)| page_hits_to_entries(hits))
+        .unwrap_or_default()
 }
 
 fn crumb_line(block: &DocBlock) -> String {

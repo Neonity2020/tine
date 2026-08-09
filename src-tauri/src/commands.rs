@@ -16,9 +16,11 @@ use tine_core::model::{
     BacklinkFilterContext, BacklinkFilterTarget, BlockDto, PageDto, PageEntry, PageKind, RefGroup,
 };
 use tine_core::sync_runtime::{
-    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
-    SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
-    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncRuntimeHandle,
+    SyncApplicationNavigationOutcome, SyncApplicationNavigationReply,
+    SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
+    SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
+    SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
+    SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -252,6 +254,21 @@ fn sparse_page_inventory(handle: &SyncRuntimeHandle) -> Result<Vec<PageEntry>, S
     map_sparse_page_inventory(outcome)
 }
 
+fn sparse_navigation(
+    handle: &SyncRuntimeHandle,
+    request: SyncApplicationNavigationRequest,
+) -> Result<SyncApplicationNavigationReply, String> {
+    match handle
+        .application_navigation(request)
+        .map_err(|error| error.to_string())?
+    {
+        SyncApplicationNavigationOutcome::Loaded { reply } => Ok(reply),
+        SyncApplicationNavigationOutcome::Deferred { state: _ } => Err(
+            "Tine-managed storage is updating page navigation. Try again when it finishes.".into(),
+        ),
+    }
+}
+
 fn map_sparse_page_inventory(
     outcome: SyncApplicationPageInventoryOutcome,
 ) -> Result<Vec<PageEntry>, String> {
@@ -390,8 +407,24 @@ pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>
 }
 
 #[tauri::command]
-pub(crate) fn referenced_page_names(state: GraphContext<'_>) -> Result<Vec<String>, String> {
-    with_read_graph(&state, |g| Ok(g.referenced_page_names()))
+pub(crate) async fn referenced_page_names(state: GraphContext<'_>) -> Result<Vec<String>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ReferencedPageNames,
+            )? {
+                SyncApplicationNavigationReply::ReferencedPageNames(names) => Ok(names),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot.legacy_graph()?.referenced_page_names()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Serialize)]
@@ -1150,11 +1183,16 @@ mod managed_actor_command_boundary_tests {
         let source = include_str!("commands.rs");
         for name in [
             "list_pages",
+            "referenced_page_names",
             "journal_feed_page",
             "get_page",
             "save_page",
             "journal_content_days",
             "get_page_by_path",
+            "page_aliases",
+            "page_icons",
+            "existing_page_names",
+            "quick_switch",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1175,6 +1213,32 @@ mod managed_actor_command_boundary_tests {
                 command.contains("slot_for_bound_window")
                     && command.contains("Some(binding_generation)"),
                 "{name} must re-resolve the captured generation inside the blocking operation"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_navigation_commands_never_fall_back_to_the_broad_parsed_cache() {
+        let source = include_str!("commands.rs");
+        for name in [
+            "referenced_page_names",
+            "page_aliases",
+            "page_icons",
+            "existing_page_names",
+            "quick_switch",
+        ] {
+            let signature = format!("pub(crate) async fn {name}(");
+            let start = source.find(&signature).expect("navigation command remains");
+            let tail = &source[start..];
+            let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+            let command = &tail[..end];
+            assert!(
+                command.contains("sparse_navigation("),
+                "{name} must use the exact managed navigation boundary"
+            );
+            assert!(
+                !command.contains("with_read_graph(") && !command.contains("read_graph_cloned("),
+                "{name} must not touch the managed broad parsed cache"
             );
         }
     }
@@ -1361,24 +1425,71 @@ pub(crate) fn query_facets(
 }
 
 #[tauri::command]
-pub(crate) fn page_aliases(state: GraphContext<'_>) -> Result<Vec<(String, String)>, String> {
-    with_read_graph(&state, |g| Ok(g.page_aliases()))
+pub(crate) async fn page_aliases(state: GraphContext<'_>) -> Result<Vec<(String, String)>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                match sparse_navigation(handle, SyncApplicationNavigationRequest::PageAliases)? {
+                    SyncApplicationNavigationReply::PageAliases(aliases) => Ok(aliases),
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => Ok(slot.legacy_graph()?.page_aliases()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn page_icons(
+pub(crate) async fn page_icons(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    with_read_graph(&state, |g| Ok(g.page_icons(&names)))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::PageIcons { names },
+            )? {
+                SyncApplicationNavigationReply::PageIcons(icons) => Ok(icons),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot.legacy_graph()?.page_icons(&names)),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn existing_page_names(
+pub(crate) async fn existing_page_names(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<String>, String> {
-    with_read_graph(&state, |g| Ok(g.existing_page_names(&names)))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ExistingPageNames { names },
+            )? {
+                SyncApplicationNavigationReply::ExistingPageNames(names) => Ok(names),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot.legacy_graph()?.existing_page_names(&names)),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1525,12 +1636,28 @@ pub(crate) async fn search(
 }
 
 #[tauri::command]
-pub(crate) fn quick_switch(
+pub(crate) async fn quick_switch(
     query: String,
     limit: usize,
     state: GraphContext<'_>,
 ) -> Result<Vec<PageEntry>, String> {
-    with_read_graph(&state, |g| Ok(g.quick_switch(&query, limit)))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::QuickSwitch { query, limit },
+            )? {
+                SyncApplicationNavigationReply::QuickSwitch(pages) => Ok(pages),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot.legacy_graph()?.quick_switch(&query, limit)),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn capture_quick_switch_for(

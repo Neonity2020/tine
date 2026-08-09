@@ -22900,7 +22900,7 @@ fn read_only_org(path: &Path, content: &str) -> bool {
 /// A page's `icon::` property value from its pre-block, handling markdown
 /// (`icon:: 🏁`), org property drawers (`:icon: 🏁`) and org `#+ICON:` directives.
 /// None if absent or blank.
-fn pre_block_icon(pre: &str) -> Option<String> {
+pub(crate) fn pre_block_icon(pre: &str) -> Option<String> {
     for line in pre.lines() {
         // Markdown `icon:: value` (single shared parser; needs the `::`).
         if let Some((k, v)) = crate::doc::parse_property_line(line) {
