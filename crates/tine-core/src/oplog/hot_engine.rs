@@ -31832,11 +31832,17 @@ mod validation_tests {
                     detached_descriptor(&second, second_evidence, first_descriptor.post_frontier());
                 for (part, descriptor) in [(&first, first_descriptor), (&second, second_descriptor)]
                 {
-                    for object in part.objects() {
-                        store
-                            .publish_bootstrap_object_bytes(&object.encode().unwrap())
-                            .unwrap();
+                    let object_bytes = part
+                        .objects()
+                        .iter()
+                        .map(|object| object.encode().unwrap())
+                        .collect::<Vec<_>>();
+                    for object in &object_bytes {
+                        store.publish_bootstrap_object_bytes(object).unwrap();
                     }
+                    store
+                        .publish_bootstrap_part_pack_for_test(descriptor, &object_bytes)
+                        .unwrap();
                     store
                         .publish_bootstrap_part_artifacts(
                             descriptor,

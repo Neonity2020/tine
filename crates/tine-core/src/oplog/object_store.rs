@@ -58,9 +58,10 @@ use super::{
         SourceBlobChunkDescriptorV1, SourceBlobChunkDigestV1, SourceBlobChunkRootBuilderV1,
         SourceBlobChunkRootV1, SourceBlobIndexPageV1, SourceBlobIndexValidatorV1,
         SourceInventoryIndexPageV1, SourceInventoryIndexValidatorV1, SourceInventoryRootV1,
-        SourceLeafV1, MAX_BOOTSTRAP_AGGREGATE_COMMIT_BYTES, MAX_BOOTSTRAP_AGGREGATE_MANIFEST_BYTES,
-        MAX_BOOTSTRAP_PART_EVIDENCE_BYTES, MAX_PART_SPAN_INDEX_BYTES, MAX_SOURCE_BLOB_CHUNK_BYTES,
-        MAX_SOURCE_INDEX_PAGE_BYTES,
+        SourceLeafV1, MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART,
+        MAX_BOOTSTRAP_AGGREGATE_COMMIT_BYTES, MAX_BOOTSTRAP_AGGREGATE_MANIFEST_BYTES,
+        MAX_BOOTSTRAP_PART_EVIDENCE_BYTES, MAX_OPERATIONS_PER_BOOTSTRAP_PART,
+        MAX_PART_SPAN_INDEX_BYTES, MAX_SOURCE_BLOB_CHUNK_BYTES, MAX_SOURCE_INDEX_PAGE_BYTES,
     },
     BatchError, BatchId, BatchOrigin, CanonicalArchiveResourceId, ContentDigest, DeviceId,
     DocumentId, ImportId, LineageDigest, ObjectDescriptor, OperationBatch, OperationObject,
@@ -76,10 +77,13 @@ const BOOTSTRAP_SOURCE_BLOB_DIR: &str = "source-blob-indexes";
 const BOOTSTRAP_SOURCE_CHUNKS_DIR: &str = "source-chunks";
 const BOOTSTRAP_PARTS_DIR: &str = "parts";
 const BOOTSTRAP_PART_SPANS_DIR: &str = "part-spans";
+const BOOTSTRAP_PART_PACKS_DIR: &str = "part-object-packs";
 const BOOTSTRAP_OBJECTS_DIR: &str = "objects";
 const BOOTSTRAP_EVIDENCE_DIR: &str = "evidence";
 const BOOTSTRAP_AGGREGATES_DIR: &str = "aggregates";
 const BOOTSTRAP_COMMITS_DIR: &str = "commits";
+const MAX_BOOTSTRAP_PART_PACK_BYTES: u64 =
+    MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART + 4 * MAX_OPERATIONS_PER_BOOTSTRAP_PART as u64;
 const LINEAGE_CLAIM_FILE: &str = "lineage.claim";
 const ENGINE_HISTORY_DIR: &str = "engine-history";
 const ENGINE_HISTORY_NODES_DIR: &str = "nodes";
@@ -1724,10 +1728,7 @@ pub(crate) struct BootstrapPublicationBatch<'a> {
     inventory_pages: BTreeMap<u32, ()>,
     blob_root: Option<SourceBlobChunkRootV1>,
     blob_pages: BTreeMap<u32, ()>,
-    expected_chunks: BTreeMap<SourceBlobChunkDigestV1, ()>,
-    chunks: BTreeMap<SourceBlobChunkDigestV1, ()>,
-    expected_objects: BTreeMap<ContentDigest, ()>,
-    objects: BTreeMap<ContentDigest, ()>,
+    part_packs: BTreeMap<super::identity::BootstrapPartId, ()>,
     parts: BTreeMap<super::identity::BootstrapPartId, ()>,
 }
 
@@ -2285,10 +2286,7 @@ impl ObjectStore {
             inventory_pages: BTreeMap::new(),
             blob_root: None,
             blob_pages: BTreeMap::new(),
-            expected_chunks: BTreeMap::new(),
-            chunks: BTreeMap::new(),
-            expected_objects: BTreeMap::new(),
-            objects: BTreeMap::new(),
+            part_packs: BTreeMap::new(),
             parts: BTreeMap::new(),
         })
     }
@@ -2365,6 +2363,36 @@ impl ObjectStore {
             digest.to_string(),
         )?;
         Ok(digest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_bootstrap_part_pack_for_test(
+        &self,
+        descriptor: BootstrapPartDescriptorV1,
+        objects: &[Vec<u8>],
+    ) -> Result<(), StoreError> {
+        let mut pack = Vec::new();
+        for object in objects {
+            let length = u32::try_from(object.len()).map_err(|_| {
+                StoreError::BootstrapArtifactMismatch("bootstrap test part object length")
+            })?;
+            pack.extend_from_slice(&length.to_be_bytes());
+            pack.extend_from_slice(object);
+        }
+        if pack.len() as u64 > MAX_BOOTSTRAP_PART_PACK_BYTES {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "bootstrap test part object pack length",
+            ));
+        }
+        let part_name = hex_bytes(descriptor.part_id().as_bytes());
+        let dir = self.bootstrap_namespace(BOOTSTRAP_PART_PACKS_DIR, true)?;
+        publish_bootstrap_immutable(
+            &dir,
+            &part_name,
+            &pack,
+            "bootstrap test part object pack",
+            part_name.clone(),
+        )
     }
 
     pub(crate) fn publish_bootstrap_part_artifacts(
@@ -4118,16 +4146,27 @@ impl ObjectStore {
         let spans = BootstrapPartSpanIndexV1::decode(&span_bytes)?;
         spans.validate_part(evidence)?;
 
-        let object_dir = self.bootstrap_namespace(BOOTSTRAP_OBJECTS_DIR, false)?;
+        let pack_dir = self.bootstrap_namespace(BOOTSTRAP_PART_PACKS_DIR, false)?;
+        let pack = open_file_nofollow(&pack_dir, &part_name)?;
+        if pack.metadata()?.len() > MAX_BOOTSTRAP_PART_PACK_BYTES {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "bootstrap part object pack exceeds its bound",
+            ));
+        }
+        let mut pack = BufReader::with_capacity(64 * 1024, pack);
         let mut objects = Vec::with_capacity(manifest.required_objects().len());
         let mut payloads = Vec::with_capacity(manifest.required_objects().len());
         for expected in manifest.required_objects() {
-            let bytes = read_required_regular(
-                &object_dir,
-                &object_filename(expected.content_digest()),
-                MAX_OBJECT_BYTES as u64,
-                Some(expected.encoded_byte_length()),
-            )?;
+            let mut length = [0; 4];
+            pack.read_exact(&mut length)?;
+            let length = u64::from(u32::from_be_bytes(length));
+            if length != expected.encoded_byte_length() || length > MAX_OBJECT_BYTES as u64 {
+                return Err(StoreError::BootstrapArtifactMismatch(
+                    "bootstrap part object pack frame length",
+                ));
+            }
+            let mut bytes = vec![0; length as usize];
+            pack.read_exact(&mut bytes)?;
             if ContentDigest::of(&bytes) != expected.content_digest() {
                 return Err(StoreError::ObjectPathMismatch(expected.content_digest()));
             }
@@ -4148,6 +4187,12 @@ impl ObjectStore {
                 expected.encoded_byte_length(),
             )?);
             objects.push(object);
+        }
+        let mut trailing = [0; 1];
+        if pack.read(&mut trailing)? != 0 {
+            return Err(StoreError::BootstrapArtifactMismatch(
+                "bootstrap part object pack has trailing bytes",
+            ));
         }
         let manifest_fingerprint = BootstrapManifestFingerprintV1::from_bytes(
             *ContentDigest::of(&manifest_bytes).as_bytes(),
@@ -8035,62 +8080,50 @@ impl BootstrapPublicationBatch<'_> {
         )?;
         self.blob_root = Some(root);
         self.blob_pages.insert(page.page_ordinal(), ());
-        for entry in page.entries() {
-            self.expected_chunks.insert(entry.content_digest(), ());
-        }
         Ok(())
     }
 
-    pub(crate) fn publish_source_chunk(
+    pub(crate) fn publish_part_pack(
         &mut self,
-        digest: SourceBlobChunkDigestV1,
-        bytes: &[u8],
+        descriptor: BootstrapPartDescriptorV1,
+        source: &mut (impl Read + Seek),
+        exact_length: u64,
     ) -> Result<(), StoreError> {
-        if bytes.is_empty()
-            || bytes.len() > MAX_SOURCE_BLOB_CHUNK_BYTES as usize
-            || ContentDigest::of(bytes).as_bytes() != digest.as_bytes()
-        {
+        if exact_length > MAX_BOOTSTRAP_PART_PACK_BYTES {
             return Err(StoreError::BootstrapArtifactMismatch(
-                "source chunk digest or length",
+                "bootstrap part object pack length",
             ));
         }
         let dir = self
             .store
-            .bootstrap_namespace(BOOTSTRAP_SOURCE_CHUNKS_DIR, true)?;
-        let identity = hex_bytes(digest.as_bytes());
-        self.stage(
-            &dir,
-            &identity,
-            bytes,
-            Collision::Bootstrap("source chunk", identity.clone()),
-        )?;
-        self.chunks.insert(digest, ());
+            .bootstrap_namespace(BOOTSTRAP_PART_PACKS_DIR, true)?;
+        let part_name = hex_bytes(descriptor.part_id().as_bytes());
+        let final_name = part_name.clone();
+        source.seek(SeekFrom::Start(0))?;
+        let staged = tine_storage::StagedExactImmutablePublication::construct(&dir, |target| {
+            let copied = std::io::copy(source, target)?;
+            if copied != exact_length {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "bootstrap part object pack changed while being published",
+                ));
+            }
+            Ok((final_name, copied))
+        })
+        .map_err(|error| {
+            publication_error(
+                error,
+                Collision::Bootstrap("bootstrap part object pack", part_name.clone()),
+            )
+        })?;
+        staged.commit().map_err(|error| {
+            publication_error(
+                error,
+                Collision::Bootstrap("bootstrap part object pack", part_name.clone()),
+            )
+        })?;
+        self.part_packs.insert(descriptor.part_id(), ());
         Ok(())
-    }
-
-    pub(crate) fn publish_object_bytes(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<ContentDigest, StoreError> {
-        let object = OperationObject::decode(bytes)?;
-        if object.workspace_id() != self.store.workspace_id {
-            return Err(StoreError::WorkspaceMismatch {
-                expected: self.store.workspace_id,
-                found: object.workspace_id(),
-            });
-        }
-        let digest = ContentDigest::of(bytes);
-        let dir = self
-            .store
-            .bootstrap_namespace(BOOTSTRAP_OBJECTS_DIR, true)?;
-        self.stage(
-            &dir,
-            &object_filename(digest),
-            bytes,
-            Collision::Bootstrap("bootstrap operation object", digest.to_string()),
-        )?;
-        self.objects.insert(digest, ());
-        Ok(digest)
     }
 
     pub(crate) fn publish_part_artifacts(
@@ -8122,9 +8155,6 @@ impl BootstrapPublicationBatch<'_> {
             )?],
         )?;
         spans.validate_part(descriptor.evidence())?;
-        for object in manifest.required_objects() {
-            self.expected_objects.insert(object.content_digest(), ());
-        }
 
         let parts = self.store.bootstrap_namespace(BOOTSTRAP_PARTS_DIR, true)?;
         let part_name = hex_bytes(descriptor.part_id().as_bytes());
@@ -8183,11 +8213,7 @@ impl BootstrapPublicationBatch<'_> {
             || self.inventory_pages != inventory_ordinals
             || self.blob_root != expected_blob_root
             || self.blob_pages != blob_ordinals
-            || self.expected_chunks != self.chunks
-            || self
-                .expected_objects
-                .keys()
-                .any(|digest| !self.objects.contains_key(digest))
+            || self.part_packs != parts
             || self.parts != parts
         {
             return Err(StoreError::BootstrapArtifactMismatch(
@@ -11243,6 +11269,9 @@ mod bootstrap_store_tests {
                     store.publish_bootstrap_object_bytes(object).unwrap();
                 }
                 store
+                    .publish_bootstrap_part_pack_for_test(part.descriptor, &part.object_bytes)
+                    .unwrap();
+                store
                     .publish_bootstrap_part_artifacts(
                         part.descriptor,
                         &part.manifest_bytes,
@@ -11416,13 +11445,21 @@ mod bootstrap_store_tests {
                 .publish_source_blob_page(fixture.blob_root, page)
                 .unwrap();
         }
-        for (digest, bytes) in &fixture.source_chunks {
-            publication.publish_source_chunk(*digest, bytes).unwrap();
-        }
         for part in &fixture.parts {
+            let mut pack = Vec::new();
             for object in &part.object_bytes {
-                publication.publish_object_bytes(object).unwrap();
+                let length = u32::try_from(object.len()).unwrap();
+                pack.extend_from_slice(&length.to_be_bytes());
+                pack.extend_from_slice(object);
             }
+            let pack_length = pack.len() as u64;
+            publication
+                .publish_part_pack(
+                    part.descriptor,
+                    &mut std::io::Cursor::new(pack),
+                    pack_length,
+                )
+                .unwrap();
             publication
                 .publish_part_artifacts(part.descriptor, &part.manifest_bytes, &part.spans)
                 .unwrap();
@@ -11723,23 +11760,24 @@ mod bootstrap_store_tests {
             .commit_bootstrap_aggregate(&missing_chunk.aggregate)
             .is_err());
 
-        let missing_object = BootstrapFixture::new("missing-object", 1);
-        let store = missing_object.store();
-        missing_object.publish_replay_prefix(&store);
+        let missing_pack = BootstrapFixture::new("missing-pack", 1);
+        let store = missing_pack.store();
+        missing_pack.publish_replay_prefix(&store);
         store
-            .publish_bootstrap_aggregate_prefix(&missing_object.aggregate)
+            .publish_bootstrap_aggregate_prefix(&missing_pack.aggregate)
             .unwrap();
-        let object_digest = ContentDigest::of(&missing_object.parts[0].object_bytes[0]);
         std::fs::remove_file(
-            missing_object
+            missing_pack
                 .archive
                 .join(BOOTSTRAP_DIR)
-                .join(BOOTSTRAP_OBJECTS_DIR)
-                .join(object_filename(object_digest)),
+                .join(BOOTSTRAP_PART_PACKS_DIR)
+                .join(hex_bytes(
+                    missing_pack.parts[0].descriptor.part_id().as_bytes(),
+                )),
         )
         .unwrap();
         assert!(store
-            .commit_bootstrap_aggregate(&missing_object.aggregate)
+            .commit_bootstrap_aggregate(&missing_pack.aggregate)
             .is_err());
 
         let truncated = BootstrapFixture::new("truncated-span", 1);
