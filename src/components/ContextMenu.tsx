@@ -40,6 +40,7 @@ import {
   dtoSubtreeMarkdown,
   flushAll,
   flushPage,
+  isDirty,
   deletePage,
   restoreTodayJournalInFeed,
   selectedIds,
@@ -820,7 +821,7 @@ function PageMenu(props: {
     const captured = target();
     // Native GTK confirm — window.confirm silently returns true here, which would
     // delete the page with no prompt.
-    if (!(await backend().confirm(`Delete "${name}"? The file moves to the graph's .tine-trash folder.`))) return;
+    if (!(await backend().confirm(deletePageConfirmText(name)))) return;
     // Route through the store (not backend directly) so it tombstones the page and
     // cancels any pending save — otherwise a just-typed, never-saved page could be
     // recreated by a queued save right after we delete it.
@@ -931,6 +932,22 @@ export function pageMenuAvailability(pageKind: PageKind): { rename: boolean; del
 
 export function deletePageMenuLabel(pageKind: PageKind): string {
   return pageKind === "journal" ? "Delete journal" : "Delete page";
+}
+
+/** What the delete confirmation actually promises.
+ *
+ *  "Moves to .tine-trash" reads as fully recoverable, and for a saved page it
+ *  is. But the trash receives the FILE, and a page with unsaved edits has work
+ *  that is not in that file: a dirty page's latest keystrokes, or — provably —
+ *  every edit on a conflicted page, whose saves are refused by design until the
+ *  conflict is resolved. Deleting throws that away with nothing to recover from,
+ *  so the prompt has to say so while the user can still answer no. (Direct Files
+ *  data-safety audit, 2026-08-09, finding 18.) */
+export function deletePageConfirmText(name: string): string {
+  const trashed = `Delete "${name}"? The file moves to the graph's .tine-trash folder.`;
+  return isDirty(name) || isConflicted(name)
+    ? `${trashed}\n\nThis page has unsaved changes. They were never written to the file, so they are NOT in the trash copy and cannot be recovered.`
+    : trashed;
 }
 
 // Inline page rename: a context-menu item that expands into a name field (mirrors

@@ -3087,6 +3087,77 @@
         ]
       },
       "notes": "Martin, 2026-08-09: a generated graph wrote each report to `pages/c01 Swap Bribery.md` with `title:: Swap Bribery` and linked the index by FILENAME. Since Logseq resolves a page's name as title:: > filename > first block (graph-parser extract.cljc get-page-name), the filename named nothing and all 29 links opened blank pages with no signal. Tine <=0.6.5 used the filename and ignored title::; aa4a4b29 (2026-07-29, shipped in 0.6.90) corrected that, which is why the graph looked fine when built. Backend was never at fault - load_named returned full content for all 30 pages. DELIBERATE DIVERGENCE, approved by Martin: Logseq does NOT distinguish unresolved links (components/block.cljs:548 dims only untitled-page?, i.e. a page that EXISTS under a uuid name); Tine dims them, as Obsidian does. Applied to [[refs]] only, NOT #tags - a tag with no page file is ordinary Logseq usage and dimming those would mark most tags in a normal graph. existing_page_names resolves like load_named (normalized keys + alias table, no PageKind filter, so a link to an existing journal is alive) and costs one memoized page-list read per call; pageExistsBatch coalesces every reference in a tick into one IPC, asks each name once per graph, and treats UNKNOWN AS ALIVE so a page of good links never flashes as dead. Verified on the real 30-page graph: 8/8 refs dimmed before the repair, 0/8 after, all six sampled links clicking through to 24-27 block pages."
+    },
+    {
+      "id": "REG-SAVE-DEBOUNCE-CEILING-20260809",
+      "title": "A fluent typing burst is never written to disk until the typist pauses",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/persistenceDebounceCeiling.test.ts"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 9. scheduleSave cleared and re-armed a 400 ms timer on every markDirty, with no ceiling, so the debounce fired only during a pause in typing. Measured fail-before: 40 keystrokes at 300 ms intervals - 12 seconds of prose at a pace slower than most people type - produced ZERO writes. A crash, power loss or OOM kill during a long passage therefore lost the whole passage, and the loss window grew with how well the writing was going. Fixed by measuring a MAX_SAVE_DELAY_MS ceiling of 3 s from the FIRST dirty mark of a burst rather than the last, so the bound is on file staleness rather than typing speed; the burst clock restarts whenever no save is armed, which every drain path (flushAll, resetSaveState, the timer itself) already guarantees by nulling saveTimer. Coalescing is unchanged: a short burst still costs exactly one write."
+    },
+    {
+      "id": "REG-CONFLICT-RESOLVE-PINNED-FILE-20260809",
+      "title": "\"Use disk version\" on a page pinned to a specific file loads a different file",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [
+          21
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ConflictBar.test.tsx"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 10. Two files can carry one page NAME - the duplicate-day stray of GH #21, or same-titled pages in different folders - and the editor pins such a page to its exact path so saves write back to the file it was loaded from. ConflictBar's \"Use disk version\" resolved by NAME (backend getPage), which reaches the backend's canonical owner of that name, so the button silently re-pointed the tab at a different file: the user discarded their edits to THIS file and got someone else's file loaded in its place. Fixed by resolving through getPageByPath whenever the loaded page carries a path - the same idiom store.ts, RightSidebar and LiveRefGroup already use. An absent pinned file drops the page rather than falling back to the name, since that fallback is the same defect; an unpinned (never-saved) page still resolves by name because it has nothing else."
+    },
+    {
+      "id": "REG-DELETE-PAGE-UNSAVED-WARNING-20260809",
+      "title": "Deleting a page with unsaved edits promises a recoverable trash copy that does not contain them",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ContextMenu.test.tsx"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 18. The delete confirmation said only 'The file moves to the graph's .tine-trash folder', which reads as fully recoverable. The trash receives the FILE, so a dirty page's latest keystrokes - and, provably, EVERY edit on a conflicted page, whose saves are refused by design until the conflict is resolved - are destroyed with nothing to recover from. The prompt now names that outcome when the page is dirty or conflicted, while the user can still answer no; wording is unchanged for a page with nothing unsaved. Deliberately NOT fixed by flushing first: making delete trigger a save is a behavior change with its own risk, and it cannot help the conflicted case at all."
     }
   ]
 }

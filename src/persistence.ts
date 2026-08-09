@@ -38,6 +38,11 @@ const saveChain = new Map<string, Promise<boolean>>();
 const transientFailures = new Map<string, number>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+// When the current run of edits first went dirty, so the debounce below can be
+// coalescing without being indefinitely postponable. Null whenever no save is
+// armed — every drain path (`flushAll`, `resetSaveState`, the timer itself)
+// clears `saveTimer`, so the next edit starts a fresh burst.
+let burstStartedAt: number | null = null;
 let dataRevTimer: ReturnType<typeof setTimeout> | null = null;
 const assetWriteChain = new Set<Promise<boolean>>();
 // Cross-page move barrier (audit C#1): while a moved subtree's DESTINATION write is not
@@ -406,11 +411,27 @@ async function doSave(
   }
 }
 
+/** How long an edit waits for the typing to settle before it is written. */
+const SAVE_DEBOUNCE_MS = 400;
+/** …and the longest a run of edits can postpone that write by continuing.
+ *
+ *  Without a ceiling the debounce re-arms on every keystroke, so a fluent
+ *  typist never pauses long enough to trigger it and nothing reaches disk until
+ *  they stop — a crash mid-paragraph loses the paragraph. Measured from the
+ *  FIRST edit of the burst, not the last, so the bound is on how stale the file
+ *  can be rather than on how fast the user types. (Direct Files data-safety
+ *  audit, finding 9.) */
+const MAX_SAVE_DELAY_MS = 3_000;
+
 export function scheduleSave() {
   if (!doc.loaded) return;
   if (saveTimer) clearTimeout(saveTimer);
+  else burstStartedAt = Date.now();
+  const postponedBy = Date.now() - (burstStartedAt ?? Date.now());
+  const delay = Math.max(0, Math.min(SAVE_DEBOUNCE_MS, MAX_SAVE_DELAY_MS - postponedBy));
   saveTimer = setTimeout(() => {
     saveTimer = null;
+    burstStartedAt = null;
     const names = [...dirty];
     void (async () => {
       const results = await Promise.all(names.map((n) => enqueueSave(n)));
@@ -419,7 +440,7 @@ export function scheduleSave() {
       // for a lull instead of firing on every 400ms save batch.
       if (results.some(Boolean)) scheduleDataRev();
     })();
-  }, 400);
+  }, delay);
 }
 
 /** Save one page immediately, bypassing the debounce — for actions that must
