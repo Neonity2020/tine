@@ -429,6 +429,25 @@ async function doSave(
     if (String(e) === "conflict" || String(e) === "Error: conflict") {
       clearTransientRetry(name);
       markConflict(name);
+    } else if (String(e).includes("conflict_retry.")) {
+      // The backend could not coherently observe the winner, so it minted no
+      // authority — and a force that reached here has already CONSUMED the
+      // token its banner was standing on. Leaving that banner up is the
+      // unresolvable state C5 exists to prevent: "Keep mine" is permanently
+      // dead (its authority is spent), the retry below refuses to run while the
+      // page is conflicted, and the only live button, "Use disk version",
+      // discards the user's edits.
+      //
+      // So retract the spent banner and let the ordinary retry decide. The edit
+      // stays dirty and unwritten; if the disk really has diverged, the retry's
+      // own base_rev guard raises a FRESH conflict with a fresh token, which is
+      // a banner the user can actually act on. (GH #254 increment 2,
+      // adversarial implementation verification, finding 3.)
+      clearConflict(name);
+      if (token === graphToken) {
+        dirty.add(name);
+        scheduleTransientRetry(name, token, e);
+      }
     } else if (token === graphToken) {
       dirty.add(name); // keep pending — retried on next edit / flush
       scheduleTransientRetry(name, token, e);
