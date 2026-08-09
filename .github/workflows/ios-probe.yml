@@ -19,11 +19,16 @@ jobs:
     # (tauri-plugin-2.6.2 src/build/mobile.rs -> tauri_utils::build::link_swift_library).
     # Our Package.swift declares `.iOS(.v14)` because the folder picker uses
     # `UIDocumentPickerViewController(forOpeningContentTypes:)` and `UTType`, both
-    # iOS 14+. That mismatch is why `_init_plugin_tine_ios_folder_picker` came out
-    # undefined at link time while `tauri-plugin-opener`'s `_init_plugin_opener` —
-    # same `ios_plugin_binding!` + `@_cdecl` pattern, but a `.iOS(.v13)` package —
-    # resolved fine in the very same build. Pin the deployment target so the Swift
-    # build and the package declaration agree.
+    # iOS 14+. Pin the deployment target so the Swift build and the package
+    # declaration agree.
+    #
+    # NOTE, so nobody re-derives a wrong story from this block: an earlier version
+    # of this comment blamed the deployment-target mismatch for the
+    # `Undefined symbols: _init_plugin_tine_ios_folder_picker` failure. That was a
+    # guess and it was WRONG — pinning 14.0 changed nothing (run 31279327083).
+    # The real cause was Rust-side rlib pruning; see the `extern crate` comment in
+    # src-tauri/src/ios_folder_picker.rs. This pin is kept because it is correct,
+    # not because it fixed anything.
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "14.0"
     steps:
@@ -69,37 +74,28 @@ jobs:
       # compile signal — it is what caught the E0425 cfg gap and the E0428
       # duplicate-command collision — and leaves linking to the gate that can
       # actually do it. Do not "restore" this to `build`.
-      # TEMPORARY DIAGNOSTIC (remove once the Swift link is green).
-      #
-      # The previous version of this step was useless in two ways, both fixed here:
-      #   * `| grep ... | head -80` closed the pipe before our crate's build-script
-      #     output appeared ("grep: stdout: Broken pipe"), so the interesting lines
-      #     were discarded. Write the full log to a file, then grep the FILE.
-      #   * it searched with `-maxdepth 6`. swift-rs emits to
-      #     $OUT_DIR/swift-rs/<pkg>/<arch>-apple-macosx/<config>/lib<pkg>.a
-      #     (swift-rs-1.0.7 src-rs/build.rs:231,284-291), which is ~9 levels under
-      #     `target/` — so the search could not have found the library whether or
-      #     not it existed. Do not reintroduce a maxdepth here.
-      #
-      # swift-rs `panic!`s if `swift build` fails (build.rs:280), so a crate that
-      # builds at all proves the Swift package compiled. The open question is
-      # therefore not "was it built" but "where is the symbol lost", which is what
-      # the `nm` probes below answer.
-      - name: DIAGNOSTIC — build native Swift plugin crate verbosely
-        continue-on-error: true
+      # iOS must present exactly ONE window. The base config declares `main` AND
+      # the always-on-top quick-capture mini window, both `visible: false` and
+      # revealed programmatically on desktop. UIKit has no such model: it presents
+      # a window per webview, and `capture` — declared second — covered `main`.
+      # Run 31298413218 passed every runtime assertion while showing the capture
+      # UI, which is why this guard is a step and not a comment.
+      # `tauri.android.conf.json` already solved this; `tauri.ios.conf.json`
+      # mirrors it. Deleting either file silently reintroduces the bug.
+      - name: Assert iOS declares a single window
         run: |
-          set -x
-          cargo build -p tine-ios-folder-picker-native --target aarch64-apple-ios-sim -vv \
-            > /tmp/native-build.log 2>&1 || echo "NATIVE CRATE BUILD FAILED"
-          echo "=== our crate's build-script + swift lines ==="
-          grep -iE "tine-ios-folder-picker|swift|cargo:rustc-link|error" /tmp/native-build.log | tail -60 || true
-          echo "=== swift-rs output tree ==="
-          find target -path '*swift-rs*' -name '*.a' 2>/dev/null || true
-          find target -type d -name 'swift-rs' 2>/dev/null || true
-          echo "=== does the Swift archive export the symbol? ==="
-          for a in $(find target -path '*swift-rs*' -name '*.a' 2>/dev/null); do
-            echo "--- $a"; nm -gU "$a" 2>/dev/null | grep -i "init_plugin" || echo "  (no init_plugin symbol)"
-          done
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, sys
+          cfg = json.load(open("src-tauri/tauri.ios.conf.json"))
+          windows = cfg["app"]["windows"]
+          labels = [w.get("label") for w in windows]
+          if labels != ["main"]:
+              sys.exit(f"iOS must declare exactly one window ['main'], got {labels}. "
+                       "A second window (e.g. 'capture') is presented by UIKit and "
+                       "covers the graph.")
+          print("ok: iOS declares a single 'main' window")
+          PY
 
       - name: Type-check Rust lib for iOS device
         run: cargo check --lib -p tine --target aarch64-apple-ios
@@ -118,32 +114,24 @@ jobs:
       - name: tauri ios build (simulator, unsigned)
         run: npx tauri ios build --target aarch64-sim --ci
 
-      # TEMPORARY DIAGNOSTIC (remove with the one above). Runs even when the
-      # build above fails, which is the whole point.
-      #
-      # `tauri-plugin-opener` reaches Xcode through the IDENTICAL path (it also
-      # ships `ios/Package.swift` -> link_apple_library -> link_swift_library ->
-      # swift_rs) and its `_init_plugin_opener` resolves in the same link that
-      # cannot find ours. So comparing the two symbols inside the same archive
-      # localizes the loss precisely:
-      #   both present            -> the archive is fine; Xcode link inputs differ
-      #   opener only             -> our Swift object never reached libtine_lib.a
-      #   neither                 -> nothing Swift is bundled; the static-lib
-      #                              bundling assumption itself is wrong
-      - name: DIAGNOSTIC — locate the lost symbol
-        if: always()
-        continue-on-error: true
+      # The Swift folder-picker symbol must be DEFINED in the linked library, not
+      # merely referenced. This is a one-line standing guard for the defect that
+      # cost this slice several CI rounds: `tine-ios-folder-picker-native` exports
+      # no Rust items, so if anything ever stops referencing it (see the
+      # `extern crate` in src-tauri/src/ios_folder_picker.rs) its rlib is pruned,
+      # its Swift archive is never bundled, and the link fails with
+      # `Undefined symbols: _init_plugin_tine_ios_folder_picker`.
+      - name: Assert the Swift plugin symbol is linked in
         run: |
-          set -x
-          echo "=== Rust static libs produced for iOS ==="
-          find target -name 'libtine_lib.a' 2>/dev/null || true
-          for a in $(find target -name 'libtine_lib.a' 2>/dev/null); do
-            echo "--- $a"
-            echo "  ours:";   nm "$a" 2>/dev/null | grep -i "init_plugin_tine_ios_folder_picker" | head -5 || echo "    ABSENT"
-            echo "  opener:"; nm "$a" 2>/dev/null | grep -i "init_plugin_opener"                 | head -5 || echo "    ABSENT"
+          set -euo pipefail
+          found=0
+          for a in $(find target -name 'libtine_lib.a'); do
+            if nm "$a" 2>/dev/null | grep -q "^[0-9a-f]* T _init_plugin_tine_ios_folder_picker$"; then
+              echo "ok: $a defines _init_plugin_tine_ios_folder_picker"
+              found=1
+            fi
           done
-          echo "=== swift archives present at link time ==="
-          find target -path '*swift-rs*' -name '*.a' 2>/dev/null || true
+          test "$found" = 1
 
       - name: Boot Simulator and launch a container graph
         shell: bash
