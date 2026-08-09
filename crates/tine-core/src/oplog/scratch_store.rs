@@ -78,6 +78,10 @@ pub(crate) struct ScratchStats {
     pub point_reads: usize,
     pub range_reads: usize,
     pub scratch_syncs: usize,
+    #[cfg(test)]
+    pub page_append_batches: usize,
+    #[cfg(test)]
+    pub blob_append_batches: usize,
     pub stale_runs_reclaimed: usize,
     pub live_runs_skipped: usize,
     pub retained_runs_preserved: usize,
@@ -1440,6 +1444,10 @@ impl ScratchStore {
             point_reads: operations.point_reads,
             range_reads: operations.range_reads,
             scratch_syncs: operations.scratch_syncs,
+            #[cfg(test)]
+            page_append_batches: operations.page_append_batches,
+            #[cfg(test)]
+            blob_append_batches: operations.blob_append_batches,
             stale_runs_reclaimed: lifecycle.stale_runs_reclaimed,
             live_runs_skipped: lifecycle.live_runs_skipped,
             retained_runs_preserved: lifecycle.retained_runs_preserved,
@@ -4259,6 +4267,13 @@ mod tests {
             .unwrap();
         let page_ref = root.levels[0].as_ref().unwrap().page_ref.clone();
         let blob_ref = store.append_blob(b"fixture blob").unwrap();
+        assert_eq!(
+            store
+                .lookup(&root, ScratchPageKind::DocumentExact, b"alpha")
+                .unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(store.read_blob(&blob_ref).unwrap(), b"fixture blob");
         let initial = run_snapshot(&path, run_id);
         assert_eq!(initial[PAGES_FILE], PAGE_BYTES);
         assert_eq!(&initial[PAGES_FILE][15..], SEGMENT_BYTES);
