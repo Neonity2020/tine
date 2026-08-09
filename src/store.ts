@@ -513,6 +513,28 @@ export function reloadPage(dto: PageDto) {
   upsertPage(dto);
 }
 
+/** Apply a watcher-driven disk reload only if it is STILL safe at this instant.
+ *
+ *  `reloadDisposition` is correct, but the watcher sites read its verdict and
+ *  then `await backend().getPage(...)` before acting — tens to hundreds of ms on
+ *  a large graph, and a Syncthing burst fires many of these concurrently. If the
+ *  user clicks into a block and types inside that window, `commit()` writes into
+ *  the store synchronously; the resolved IPC then replaces the page, dropping the
+ *  typed text AND its undo history, with no conflict raised and nothing written
+ *  to disk. (Direct Files data-safety audit, 2026-08-09, finding 5.)
+ *
+ *  `upsertUnlessDirty` already re-checks at the moment of the upsert; only these
+ *  watcher sites skipped it. Re-checking here rather than at each call site means
+ *  a fifth site cannot reintroduce the hole. `reloadPage` itself stays a
+ *  deliberate clobber — "use disk version" is an explicit user decision.
+ *
+ *  Returns false when the reload was declined. */
+export function reloadPageIfStillSafe(name: string, dto: PageDto): boolean {
+  if (reloadDisposition(name) !== "reload") return false;
+  upsertPage(dto);
+  return true;
+}
+
 /** After a PDF highlight write changed an `hls__` page on disk, refresh its
  *  loaded copy (main view or sidebar) so its content AND save baseline (baseRev)
  *  track disk — otherwise a later editor save would conflict against the highlight

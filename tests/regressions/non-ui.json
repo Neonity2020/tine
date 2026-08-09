@@ -2969,6 +2969,30 @@
         ]
       },
       "notes": "Direct Files data-safety audit 2026-08-09, finding 6. doSave bailed on a null DTO BEFORE dirty.delete(name), so the name stayed dirty forever and flushAll() could never return true again: every graph switch aborted with 'Some pages couldn't be saved' and every window close offered to discard edits that were already on disk. Reachable because pinnedPages() did not pin in-flight saves - doSave removes a page from dirty before awaiting, so the working-set cap could evict it mid-write, and a transient failure then re-added a name with no page. Two parts: savingPages() is now pinned (prevents the eviction outright), and a dirty name with no page in the store is dropped rather than wedging. Deliberately NOT dropped when the page exists but the page-header firewall refused the DTO - that is a real unsaved edit and must keep blocking."
+    },
+    {
+      "id": "REG-WATCHER-RELOAD-RECHECK-AUDIT20260809",
+      "title": "A watcher-driven disk reload re-checks safety at the moment it applies, not before its IPC",
+      "family": "durability",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android",
+        "ios"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/store.test.ts"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 5. reloadDisposition is correct, but all four watcher sites read its verdict and then awaited backend().getPage(...) before acting - tens to hundreds of ms on a large graph, and a Syncthing burst fires many concurrently. Text typed inside that window was destroyed: upsertPage replaced the page, dropping the edit AND its undo history, with no conflict raised and nothing written to disk. store.upsertUnlessDirty already re-checked at the moment of the upsert; only these sites skipped it. reloadPageIfStillSafe re-checks centrally so a fifth watcher site cannot reintroduce the hole. reloadPage itself is deliberately left as a clobber - 'use disk version' is an explicit user decision."
     }
   ]
 }

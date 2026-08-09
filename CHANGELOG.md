@@ -10,6 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Text typed while a synced file change was being loaded is no longer silently discarded. Tine decided it was safe to reload the page *before* fetching it, and never re-checked — so anything typed during the fetch was replaced by the disk version, along with its undo history.
 - Fixed a state where Tine would insist it had unsaved changes forever — blocking every graph switch and offering to discard your work on every window close — for edits that were in fact already written to disk.
 - **Edits are now saved when the app is backgrounded**, not only when a window is closed cleanly. On Android and iOS the system can reclaim a backgrounded app without warning, so anything typed since the last pause could be lost; desktop had narrower versions of the same hole (GH #255).
 - **Editing one block no longer rewrites blocks you never touched.** On a real-shaped 1,045-file graph, editing a block and undoing it failed to restore 96 of 983 files: an unbulleted `## Heading` gained a `- ` prefix, and in the worst case the file's indentation was pushed *into* the note text and the block gained a nesting level. Found by the 2026-08-09 Direct Files data-safety audit; the same measurement now reports zero damaged files.

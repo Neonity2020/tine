@@ -91,7 +91,7 @@ import {
   captureToPage,
   pageByName,
   reloadDisposition,
-  reloadPage,
+  reloadPageIfStillSafe,
   restoreTodayJournalInFeed,
 } from "./store";
 import { divergedFromBaseline, isSaving } from "./persistence";
@@ -247,7 +247,7 @@ export async function handleGraphChange(c: GraphChange) {
   }
   if (routes.some((p) => p.route.kind === "page" && p.route.name === c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) reloadPage(toLoadablePage(dto, c.name));
+    if (dto) reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name));
     // A page surface may have the same journal loaded while another live pane
     // shows Journals.  Reloading that DTO is not feed reconciliation: always
     // give the live feed owner its authoritative null-cursor restart too.
@@ -257,7 +257,7 @@ export async function handleGraphChange(c: GraphChange) {
   if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
     if (pageByName(c.name)) {
       const dto = await backend().getPage(c.name, c.kind);
-      if (dto) reloadPage(dto);
+      if (dto) reloadPageIfStillSafe(c.name, dto);
       requestJournalFeedWatcherRestart(routes);
       return;
     }
@@ -269,7 +269,7 @@ export async function handleGraphChange(c: GraphChange) {
   }
   if (pageByName(c.name) && !doc.feed.includes(c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) reloadPage(dto);
+    if (dto) reloadPageIfStillSafe(c.name, dto);
   }
 }
 
@@ -302,7 +302,7 @@ export async function handleSparseV2Changed() {
       markConflict(route.name);
       continue;
     }
-    if (dto) reloadPage(toLoadablePage(dto, route.name));
+    if (dto) reloadPageIfStillSafe(route.name, toLoadablePage(dto, route.name));
   }
   requestJournalFeedWatcherRestart(routes);
 }

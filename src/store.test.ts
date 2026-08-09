@@ -72,6 +72,7 @@ import {
   ensureBlockId,
   persistentBlockRef,
   resolveBlockRef,
+  reloadPageIfStillSafe,
 } from "./store";
 import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
@@ -2166,5 +2167,52 @@ describe("SCHEDULED/DEADLINE time (#30) — read/write round-trip, OG format", (
     // Simulate the picker committing a NEW day with the seeded time carried through.
     setSchedule(b.id, "scheduled", { y: 2026, m: 6, d: 10 }, sel.repeater, sel.time);
     expect(doc.byId[b.id].raw).toBe("Task\nSCHEDULED: <2026-07-10 Fri 14:30>");
+  });
+});
+
+// Direct Files data-safety audit, 2026-08-09, finding 5.
+//
+// The watcher sites computed `reloadDisposition` and then applied the reload
+// AFTER an `await backend().getPage(...)`. On a large graph that IPC is tens to
+// hundreds of ms, and a Syncthing burst fires many concurrently. Text typed
+// inside that window was destroyed: `upsertPage` replaces the page, dropping the
+// edit and its undo, with no conflict raised and nothing written to disk.
+describe("a watcher reload re-checks safety at the moment it applies", () => {
+  const disk = (name: string, raw: string): PageDto => ({
+    name,
+    kind: "page",
+    title: name,
+    pre_block: null,
+    blocks: [{ id: `${name}-disk`, raw, collapsed: false, children: [] }],
+  });
+
+  it("declines when the page went dirty while the DTO was in flight", () => {
+    loadSingle({
+      name: "Raced",
+      kind: "page",
+      title: "Raced",
+      pre_block: null,
+      blocks: [{ id: "raced-1", raw: "original", collapsed: false, children: [] }],
+    });
+    // "reload" was the correct verdict when the watcher event arrived...
+    expect(reloadDisposition("Raced")).toBe("reload");
+    // ...then the user typed while getPage was in flight.
+    setRaw("raced-1", "the user typed this");
+
+    expect(reloadPageIfStillSafe("Raced", disk("Raced", "what the disk says"))).toBe(false);
+    expect(doc.byId["raced-1"].raw).toBe("the user typed this");
+  });
+
+  it("still applies an ordinary reload of a clean page", () => {
+    // Necessity guard: the re-check must not disable watcher reloads outright.
+    loadSingle({
+      name: "Clean",
+      kind: "page",
+      title: "Clean",
+      pre_block: null,
+      blocks: [{ id: "clean-1", raw: "original", collapsed: false, children: [] }],
+    });
+    expect(reloadPageIfStillSafe("Clean", disk("Clean", "from disk"))).toBe(true);
+    expect(pageByName("Clean")!.roots.map((id) => doc.byId[id].raw)).toEqual(["from disk"]);
   });
 });
