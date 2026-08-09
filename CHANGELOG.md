@@ -15,6 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- Deleting a page no longer freezes the app while it works. On a large graph the delete could block for the better part of a second (longer on very large graphs) because it ran on the same thread that dispatches every other command.
 - Text typed while a synced file change was being loaded is no longer silently discarded. Tine decided it was safe to reload the page *before* fetching it, and never re-checked — so anything typed during the fetch was replaced by the disk version, along with its undo history.
 - Fixed a state where Tine would insist it had unsaved changes forever — blocking every graph switch and offering to discard your work on every window close — for edits that were in fact already written to disk.
 - **Edits are now saved when the app is backgrounded**, not only when a window is closed cleanly. On Android and iOS the system can reclaim a backgrounded app without warning, so anything typed since the last pause could be lost; desktop had narrower versions of the same hole (GH #255).

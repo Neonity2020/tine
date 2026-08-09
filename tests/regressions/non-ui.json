@@ -2993,6 +2993,28 @@
         ]
       },
       "notes": "Direct Files data-safety audit 2026-08-09, finding 5. reloadDisposition is correct, but all four watcher sites read its verdict and then awaited backend().getPage(...) before acting - tens to hundreds of ms on a large graph, and a Syncthing burst fires many concurrently. Text typed inside that window was destroyed: upsertPage replaced the page, dropping the edit AND its undo history, with no conflict raised and nothing written to disk. store.upsertUnlessDirty already re-checked at the moment of the upsert; only these sites skipped it. reloadPageIfStillSafe re-checks centrally so a fifth watcher site cannot reintroduce the hole. reloadPage itself is deliberately left as a clobber - 'use disk version' is an explicit user decision."
+    },
+    {
+      "id": "REG-DELETE-PAGE-OFF-COMMAND-THREAD-AUDIT20260809",
+      "title": "Deleting a page does its graph-wide work on the blocking pool, not the command thread",
+      "family": "direct-save-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "tauri-commands",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/commands.rs"
+        ]
+      },
+      "notes": "Direct Files perf audit 2026-08-09, F3. delete_page re-derives the page inventory and rebuilds three O(pages) indexes: measured ~95 us/file, linear, 757 ms at 8,006 files and ~1.9 s projected at 20,000. It was the only such command still running synchronously on the command thread; get_page, save_page and rename_page already cross the blocking pool. The guard test expensive_reference_and_rename_commands_cross_the_blocking_pool existed and simply did not list delete_page - a coverage omission, not a missing mechanism. This does not make delete faster; it stops it freezing command dispatch. The O(graph) cost itself is a separate, still-open finding."
     }
   ]
 }

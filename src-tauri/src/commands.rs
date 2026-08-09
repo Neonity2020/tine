@@ -1078,17 +1078,27 @@ pub(crate) fn block_referrers(
     })
 }
 
+/// Deleting one page is graph-wide work: it re-derives the page inventory and
+/// rebuilds three O(pages) indexes. Measured at ~95 µs/file, linear — 757 ms at
+/// 8,006 files. This was the only such command still running on the command
+/// thread; its neighbours `get_page`, `save_page` and `rename_page` already
+/// cross the blocking pool, and the guard test below simply did not list it.
+/// (Direct Files perf audit, 2026-08-09, F3.)
 #[tauri::command]
-pub(crate) fn delete_page(
+pub(crate) async fn delete_page(
     name: String,
     kind: PageKind,
     expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.delete_page_expected(&name, kind, expected_path.as_deref())
+    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        graph
+            .delete_page_expected(&name, kind, expected_path.as_deref())
             .map_err(|e| e.to_string())
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1113,7 +1123,9 @@ mod graph_wide_command_boundary_tests {
     #[test]
     fn expensive_reference_and_rename_commands_cross_the_blocking_pool() {
         let source = include_str!("commands.rs");
-        for name in ["get_backlinks", "get_unlinked_refs", "rename_page"] {
+        // `delete_page` was omitted here until the 2026-08-09 perf audit (F3)
+        // measured it at 757 ms on an 8,006-file graph, on the command thread.
+        for name in ["get_backlinks", "get_unlinked_refs", "rename_page", "delete_page"] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("command stays async");
             let tail = &source[start..];
