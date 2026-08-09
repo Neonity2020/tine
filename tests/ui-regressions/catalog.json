@@ -6236,6 +6236,33 @@
         "failBefore": "proven"
       },
       "notes": "Reported on a >5,000-page graph: a page with ~173 linked references collapsed its own section while scrolling or expanding a group, while ~48 references behaved. The flag was a component-local signal, so ANY remount of the page subtree reset it, and OG_REFERENCE_COLLAPSE_THRESHOLD=100 makes 'reset' mean collapsed — which is precisely the 48-fine/173-broken split. Moving the state to src/referenceSectionState.ts makes the symptom impossible whatever causes the remount, which is what the reporter asked for ('stay in current existing state no matter what'). Memory-only: OG's collapse-above-100 default still applies on a fresh start, and resetStore clears it on graph switch. NOT YET REPRODUCED on a real large graph — the remount trigger (suspected Page.tsx pagesToRender() going transiently empty) is unconfirmed; keep reported until a large-graph user or the Direct Files perf audit confirms."
+    },
+    {
+      "id": "UI-EDITOR-FOLLOW-LINK-AT-CARET-274",
+      "title": "Ctrl+O opens the page at the caret, Ctrl+Shift+O opens it in the sidebar",
+      "family": "keyboard-navigation",
+      "sources": {
+        "issues": [
+          274
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/nearestLink.test.ts",
+          "src/followLink.test.ts"
+        ],
+        "scenario": "editor.follow-link-at-caret",
+        "failBefore": "proven"
+      },
+      "notes": "OG parity gap: OG binds :editor/follow-link to mod+o and :editor/open-link-in-sidebar to mod+shift+o (frontend/modules/shortcut/config.cljs:214/:217); Tine had no mod+o at all. The 'which link' rule is transcribed from OG's thingatpt.cljs extract-nearest-link-from-text, including its surprising part: OG collects EVERY candidate in the block and picks the one nearest the caret, so a caret anywhere in a block with one link still follows it. URLs are included for follow and deliberately excluded for the sidebar, matching OG's two call sites. Block refs are best-effort: a bare ((uuid)) in raw text carries no page, so a block outside the loaded working set is not found - the same give-up OG's open-link-in-sidebar! does when db/get-page misses. FAIL-BEFORE is an absence (no mod+o binding existed), verified by grep."
     }
   ]
 }
