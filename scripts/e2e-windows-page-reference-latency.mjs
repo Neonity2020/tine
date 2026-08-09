@@ -145,23 +145,37 @@ try {
     timeoutMsg: "the GH #295 demonstration page did not open",
   });
 
-  const clicked = await browser.execute((marker) => {
+  // The navigation click can leave the pointer over a page-reference at the
+  // same screen coordinates, opening a hover peek above the target row. Close
+  // that real transient, then use WebDriver for the edit-entry click as well as
+  // the measured keys; Element.click() alone does not emit Tine's mousedown
+  // edit gesture on historical candidates.
+  if (await browser.$(".peek-popup").isExisting()) {
+    await browser.keys(["Escape"]);
+    await browser.$(".peek-popup").waitForExist({ reverse: true, timeout: 5_000 });
+  }
+  const targetFound = await browser.execute((marker) => {
     const blocks = [...document.querySelectorAll(".ls-block")];
     const markerIndex = blocks.findIndex((block) => {
-      const content = block.querySelector(".block-content");
+      const content = block.querySelector(":scope > .block-main .block-content");
       return content?.textContent?.includes(marker);
     });
     if (markerIndex < 0) return false;
     for (const block of blocks.slice(markerIndex + 1)) {
-      const content = block.querySelector(".block-content");
+      const content = block.querySelector(":scope > .block-main .block-content");
       if (content instanceof HTMLElement && !content.textContent?.trim()) {
-        content.click();
+        const wrapper = content.closest(".block-content-wrapper");
+        if (!(wrapper instanceof HTMLElement)) return false;
+        wrapper.dataset.e2eIssue295EditorTarget = "true";
         return true;
       }
     }
     return false;
   }, MARKER);
-  if (!clicked) throw new Error("the demonstrated empty child block was not found");
+  if (!targetFound) throw new Error("the demonstrated empty child block was not found");
+  const target = await browser.$('[data-e2e-issue295-editor-target="true"]');
+  await target.scrollIntoView({ block: "center", inline: "center" });
+  await target.click();
   const editor = await browser.$("textarea.block-editor");
   await editor.waitForExist({ timeout: 10_000 });
   await editor.click();
