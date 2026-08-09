@@ -1733,6 +1733,9 @@ export function mockBackend(): Backend {
     async takeIdentifierMigrationNotice(): Promise<boolean> {
       return false;
     },
+    async takeDataHomeFallbackNotice(): Promise<string | null> {
+      return null;
+    },
     async gpuEnv(): Promise<GpuEnv> {
       return { software_forced: false, appimage: false };
     },

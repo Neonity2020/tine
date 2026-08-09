@@ -613,6 +613,25 @@ export function App(): JSX.Element {
     }
   });
 
+  // The normal app-data home was not writable, so this launch put settings, the
+  // session and the WebView store somewhere else rather than crashing on the way
+  // up. Sticky: the relocation lasts only as long as the permissions problem, so
+  // the user needs to know where their state went and why.
+  onMount(async () => {
+    try {
+      const fallback = await backend().takeDataHomeFallbackNotice();
+      if (fallback) {
+        pushToast(
+          `Tine could not write its usual application-data folder, so this session is keeping settings and backups in ${fallback} instead. Fixing the permissions on that folder restores the normal location.`,
+          "warn",
+          { sticky: true }
+        );
+      }
+    } catch {
+      // Non-Tauri/mock or an older backend without the command: nothing to notify.
+    }
+  });
+
   onMount(async () => {
     const injected = (window as any).__GRAPH_PATH__ ?? "";
     let startup = "";

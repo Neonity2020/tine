@@ -3279,6 +3279,26 @@
         ]
       },
       "notes": "Direct Files performance audit 2026-08-09, finding F9. pageListLabel disambiguates a row whose display name collides with another page (same title in different folders, or the same stem as .md and .org) by scanning the whole list twice - once for the name, once for the parent sub-path. The sidebar called it per rendered row, so rendering All Pages cost O(rows x pages): measured 21 ms at 5,000 pages and 39 ms at 20,000, for 300 visible rows. pageListLabels now counts both keys in ONE pass and returns a lookup, memoized in Sidebar alongside the existing filter+sort memo. The label RULE is unchanged and the three original correctness tests still pass verbatim. Necessity: the shape tests COUNT element reads through a Proxy rather than timing anything - a linear implementation reads the array once while building the index and never again, a per-row scan reads it once more per row - and both fail against the pre-fix implementation. A first attempt asserted wall-clock and was replaced after it flaked on a loaded box: 47 ms against a 26 ms ceiling with the fix in place. The index is keyed by value, not object identity, so a caller holding a copy of an entry gets the same label."
+    },
+    {
+      "id": "REG-STARTUP-UNWRITABLE-DATA-HOME-20260809",
+      "title": "Tine crashes at launch with a backtrace when the app-data home is not writable",
+      "family": "availability",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux"
+      ],
+      "layer": "tauri-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/data_home.rs"
+        ]
+      },
+      "notes": "Found while working the 2026-08-09 Direct Files audit backlog; reproduced on the stock deployed release binary, so not a regression from that work. Tauri creates the WebView user-data directory ($XDG_DATA_HOME/page.tine.Tine) inside its OWN setup(), while building the configured windows (tauri::manager::webview calls create_dir_all there), and an IO error at that point is unreachable by the application: it panics with 'Failed to setup app: Permission denied (os error 13)' at tauri-2.11.2/src/app.rs:1417, before Tine's setup hook runs. A user whose ~/.local/share is root-owned - the shape of the box this was found on, drwxr-xr-t root root - therefore got a hard crash with a backtrace and no actionable message, made more confusing by Tine's own desktop-identity step logging the same Permission denied and explicitly treating it as NON-fatal one line earlier. data_home::ensure_usable now probes the directory before anything resolves it (create_dir_all is not the question: it succeeds on an existing directory nobody may write) and, when it is unusable, points XDG_DATA_HOME at the first writable fallback for that launch - ~/.tine-data, then $XDG_RUNTIME_DIR/tine-data, then a uid-namespaced temp dir - so settings, session and the WebView store live somewhere real. XDG_DATA_HOME is the one lever that redirects Tauri's path resolver, WebKitGTK's website-data manager and Tine's own settings together. The frontend toasts once, stickily, naming the directory, because a silent relocation is its own defect. If nothing at all is writable the app prints one actionable sentence and exits 1 rather than panicking. Verified on the built binary: unwritable base -> app stays up, ~/.tine-data/page.tine.Tine populated with tine-settings.json and the WebKit store, nothing written to the read-only base; ordinary writable base -> no relocation diagnostic at all and no probe residue."
     }
   ]
 }

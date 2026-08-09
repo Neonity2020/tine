@@ -212,6 +212,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("store_plugin_registry_cache", NoGraphSlot),
     ("stream_asset_path", LegacyOnly),
     ("sync_conflict_diff", ReadOnly),
+    ("take_data_home_fallback_notice", NoGraphSlot),
     ("take_identifier_migration_notice", NoGraphSlot),
     ("tine_open_devtools", NoGraphSlot),
     ("tine_quit", NoGraphSlot),

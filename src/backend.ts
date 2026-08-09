@@ -508,6 +508,11 @@ export interface Backend {
    *  page.tine.Tine (so the UI can explain that some app-level prefs may need
    *  re-setting). Self-clears after the first call. */
   takeIdentifierMigrationNotice(): Promise<boolean>;
+  /** The directory this launch had to fall back to, exactly ONCE, when the
+   *  normal app-data home could not be written (Tauri would otherwise have
+   *  panicked before any window existed). `null` on every ordinary launch.
+   *  Self-clears after the first call. */
+  takeDataHomeFallbackNotice(): Promise<string | null>;
   /** What the backend knows about the rendering path, for the CPU-rendering
    *  warning (see `gpu.ts`). A silent driver fallback is detected in the webview
    *  (WebGL renderer); this just supplies why/where context for the message. */
@@ -1156,6 +1161,9 @@ class TauriBackend implements Backend {
   }
   takeIdentifierMigrationNotice() {
     return this.call<boolean>("take_identifier_migration_notice");
+  }
+  takeDataHomeFallbackNotice() {
+    return this.call<string | null>("take_data_home_fallback_notice");
   }
   gpuEnv() {
     return this.call<GpuEnv>("gpu_env");
