@@ -3800,6 +3800,38 @@ export function toggleCollapse(id: string) {
   markDirty(n.page);
 }
 
+/** Expand every collapsed ancestor of `id` so the block itself can render, as
+ *  one undo step. Returns true if anything changed.
+ *
+ *  Needed because a collapsed parent does not render its children into the DOM
+ *  at all (`Block.tsx`'s `<Show when={… && !collapsed()}>`), so "navigate to this
+ *  block, scroll to it and highlight it" silently does nothing when the target is
+ *  hidden — GH #258, reported against Ctrl+Shift+K block results.
+ *
+ *  The expansion is deliberately persistent, exactly like expanding by hand:
+ *  `collapsed::` is on-disk state, and leaving the outline visually expanded but
+ *  unsaved would revert under the user on the next load. One `withUndoUnit`
+ *  keeps the whole chain a single Ctrl+Z. */
+export function expandAncestors(id: string): boolean {
+  const target = doc.byId[id];
+  if (!target) return false;
+  const collapsedAncestors: string[] = [];
+  let parent = target.parent;
+  while (parent !== null && parent !== undefined) {
+    const node = doc.byId[parent];
+    if (!node) break;
+    if (node.collapsed) collapsedAncestors.push(parent);
+    parent = node.parent;
+  }
+  if (collapsedAncestors.length === 0) return false;
+  if (!collapsedAncestors.every((ancestor) => blockWritable(ancestor))) return false;
+  withUndoUnit("reveal-block", [target.page], () => {
+    for (const ancestor of collapsedAncestors) writeCollapsed(ancestor, false);
+  });
+  markDirty(target.page);
+  return true;
+}
+
 /** Explicitly collapse or expand a block (no-op if it has no children or is
  *  already in the requested state). */
 export function setCollapsed(id: string, collapsed: boolean) {

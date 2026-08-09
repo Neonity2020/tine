@@ -6183,6 +6183,32 @@
         "failBefore": "proven"
       },
       "notes": "DELIBERATE DIVERGENCE FROM OG, approved by Martin 2026-08-09. OG's Enter dwim (frontend/util/thingatpt.cljs admonition&src-at-point) recognises only ``` and #+BEGIN_, so OG also splits the bullet and breaks the environment; the reporter is asking for an improvement, not restored parity. Scope is the editor's Enter decision only (src/editor/fences.ts caretInDisplayMath): the parser, the on-disk bytes and property classification are untouched. Necessity gate proven — the new tests fail on the pre-fix tree."
+    },
+    {
+      "id": "UI-NAV-REVEAL-COLLAPSED-BLOCK-258",
+      "title": "Navigating to a block nested inside collapsed parents expands its ancestors, scrolls to it and highlights it",
+      "family": "navigation",
+      "sources": {
+        "issues": [
+          258
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "render",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "src/router.revealBlock.test.tsx"
+        ],
+        "scenario": "navigation.open-page-at-block-reveals-collapsed-target",
+        "failBefore": "proven"
+      },
+      "notes": "openPageAtBlock polled the DOM for .ls-block[data-block-id] up to 20x50ms, but Block.tsx renders no children for a collapsed parent, so a Ctrl+Shift+K block result inside a collapsed subtree could never match and the poll timed out silently. store.expandAncestors expands the target's own ancestor chain (not unrelated collapsed blocks) as ONE undo step, persisting collapsed:: exactly as a manual expand does. Necessity gate proven: two of the three tests fail on the pre-fix tree. Reporter supplied an AI-written root cause; it was independently confirmed against router.ts:596 and Block.tsx:577 before implementing."
     }
   ]
 }

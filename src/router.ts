@@ -12,6 +12,7 @@ import {
 } from "./ui";
 import {
   doc,
+  expandAncestors,
   persistentBlockRef,
   resolveBlockRef,
   extendFeedForScroll,
@@ -618,7 +619,15 @@ export function createPaneRouter(paneId = "main"): PaneRouter {
     const tick = () => {
       if (typeof document === "undefined") return;
       const id = liveId();
-      if (id) renderedBlocks.add(id);
+      if (id) {
+        renderedBlocks.add(id);
+        // A collapsed parent renders no children at all, so without this the
+        // query below can never match and the poll just times out silently —
+        // the target block is simply never revealed (GH #258). Runs inside the
+        // poll, not before it, because the page load is async: the block may not
+        // be in the store yet on the first tick.
+        expandAncestors(id);
+      }
       const el = id
         ? document.querySelector(`.ls-block[data-block-id="${id}"]`)
         : null;
