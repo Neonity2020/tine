@@ -13987,9 +13987,20 @@ impl Graph {
         // rebuild: it is genuinely derived from block content, so a content edit
         // really can change it, and it recomputes from the warm in-memory cache
         // rather than from disk.
+        //
+        // `generation + 1 == newgen` is load-bearing: re-tagging is sound only
+        // for a list that was CURRENT as of the previous generation. A list
+        // cached before some unrelated page was created is stale at an OLDER
+        // generation, and stamping it as current republishes that staleness
+        // permanently — `list_pages` is keyed on generation equality, so it
+        // never rebuilds and the missing page stays unloadable. The
+        // reference-candidate index above uses this same guard for this same
+        // reason; the first version of this block omitted it.
         if cache_built && !identity_changed && !is_new_page && !failures_changed {
             if let Some((generation, _)) = self.page_list_cache.write().unwrap().as_mut() {
-                *generation = newgen;
+                if *generation + 1 == newgen {
+                    *generation = newgen;
+                }
             }
         }
         // Scoped query/backlink invalidation (#52): a content edit to one page

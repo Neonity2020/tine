@@ -3031,7 +3031,8 @@ mod untouched_bytes_survive_an_edit {
     #[test]
     fn a_heading_inside_a_continuation_body_keeps_its_text_and_depth() {
         let root = scratch("continuation-heading");
-        let original = "- intro\n\t- body line one\n\t  \n\t  ## Section\n\t  \n\t  more prose\n- tail\n";
+        let original =
+            "- intro\n\t- body line one\n\t  \n\t  ## Section\n\t  \n\t  more prose\n- tail\n";
         std::fs::write(root.join("pages/Note.md"), original).unwrap();
 
         let after = edit_last_root(&root, "pages/Note.md", "tail edited");
@@ -3068,7 +3069,10 @@ mod untouched_bytes_survive_an_edit {
         let page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
         graph.save_page(&page, page.rev.as_deref()).unwrap();
 
-        assert_eq!(std::fs::read_to_string(root.join("pages/Note.md")).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
+            original
+        );
     }
 }
 
@@ -3112,6 +3116,36 @@ mod page_inventory_survives_a_content_save {
         let mut page = graph.load_by_path(rel).unwrap().unwrap();
         page.blocks[0].raw = raw.into();
         graph.save_page(&page, page.rev.as_deref()).unwrap();
+    }
+
+    /// Keeping the inventory warm must never keep it WRONG. Regression for a
+    /// defect I shipped with the optimization itself: the re-tag stamped a
+    /// cached list as current no matter how old it was, so a list captured
+    /// before a page was created got republished as authoritative — and since
+    /// `list_pages` is keyed on generation equality it never rebuilt, leaving a
+    /// page that exists on disk permanently unfindable.
+    #[test]
+    fn a_page_created_after_the_inventory_was_cached_is_still_found() {
+        let (root, graph) = graph_with(8, "created-after-cache");
+        graph.list_pages(); // cache the inventory WITHOUT the page below
+
+        std::fs::write(root.join("pages/Latecomer.md"), "- arrived late\n").unwrap();
+        graph.sync_file(&root.join("pages/Latecomer.md"));
+        // A content-only save on an unrelated page is what re-tags the cache.
+        save_first_block(&graph, "pages/Page 0.md", "edited body");
+
+        assert!(
+            graph.list_pages().iter().any(|p| p.name == "Latecomer"),
+            "a page created after the inventory was cached vanished from it"
+        );
+        assert!(
+            graph
+                .load_named("Latecomer", tine_core::model::PageKind::Page)
+                .unwrap()
+                .is_some(),
+            "the page exists on disk but cannot be loaded by name"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The perf property, as a RATIO rather than an absolute bound: a shared box
@@ -3237,7 +3271,9 @@ mod external_atomic_replacement {
         graph
             .save_page(&page, base.as_deref())
             .expect("a same-byte atomic replacement must not block the save");
-        assert!(std::fs::read_to_string(root.join("pages/Note.md")).unwrap().contains("mine"));
+        assert!(std::fs::read_to_string(root.join("pages/Note.md"))
+            .unwrap()
+            .contains("mine"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3295,7 +3331,10 @@ mod external_atomic_replacement {
 
         page.blocks[0].raw = "mine".into();
         assert_eq!(
-            graph.save_page(&page, base.as_deref()).unwrap_err().to_string(),
+            graph
+                .save_page(&page, base.as_deref())
+                .unwrap_err()
+                .to_string(),
             "conflict"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3319,7 +3358,10 @@ mod external_atomic_replacement {
         std::fs::remove_file(root.join("pages/Note.md")).unwrap();
 
         page.blocks[0].raw = "mine".into();
-        let error = graph.save_page(&page, base.as_deref()).unwrap_err().to_string();
+        let error = graph
+            .save_page(&page, base.as_deref())
+            .unwrap_err()
+            .to_string();
         assert_ne!(error, "", "the save must refuse");
         assert!(
             !root.join("pages/Note.md").exists(),
@@ -3358,7 +3400,10 @@ mod unlinked_references_see_code_blocks {
         let (root, graph) = graph_with("- how to build it\n  ```sh\n  make Widget\n  ```\n");
         let groups = graph.unlinked_refs("Widget");
         assert_eq!(
-            groups.iter().map(|group| group.page.as_str()).collect::<Vec<_>>(),
+            groups
+                .iter()
+                .map(|group| group.page.as_str())
+                .collect::<Vec<_>>(),
             vec!["Notes"],
             "the fenced mention never reached the panel"
         );
@@ -3386,7 +3431,11 @@ mod unlinked_references_see_code_blocks {
             graph.unlinked_refs("Widget").is_empty(),
             "an explicit link or a logbook line leaked into unlinked references"
         );
-        assert_eq!(graph.backlinks("Widget").len(), 1, "the link is still linked");
+        assert_eq!(
+            graph.backlinks("Widget").len(),
+            1,
+            "the link is still linked"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

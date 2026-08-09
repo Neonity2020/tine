@@ -707,7 +707,10 @@ fn walk_blocks(
 /// region by subtraction rather than by re-scanning the source: an allowlist of
 /// block kinds silently loses coverage every time lsdoc grows a variant, which
 /// is precisely how GH #270 happened.
-fn plain_search_ranges(raw_len: usize, projection: &ReferenceSourceProjection) -> Vec<Range<usize>> {
+fn plain_search_ranges(
+    raw_len: usize,
+    projection: &ReferenceSourceProjection,
+) -> Vec<Range<usize>> {
     let mut claimed: Vec<Range<usize>> = projection
         .explicit
         .iter()
