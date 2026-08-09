@@ -2848,10 +2848,33 @@
       "status": "reported",
       "coverage": {
         "tests": [
-          "src-tauri/src/graph.rs::tests::direct_large_graph_open_manual_benchmark"
+          "src-tauri/src/graph.rs::tests::direct_large_graph_open_manual_benchmark",
+          "scripts/e2e-windows-direct-large-open.mjs"
         ]
       },
-      "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore does not reproduce the Windows report. Debug builds now emit phase and cumulative timings for canonicalization, private/shared storage discovery, asset approval, Direct core open, legacy store discovery, graph binding, backup scheduling, settings/title, and warm-cache scheduling. Keep this reported until a current Windows trace identifies the missing filesystem or platform phase."
+      "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore does not reproduce the Windows report. Debug builds now emit phase and cumulative timings for canonicalization, private/shared storage discovery, asset approval, Direct core open, legacy store discovery, graph binding, backup scheduling, settings/title, and warm-cache scheduling. The focused Windows WebView2 scenario measures the load_graph interval on the same file-count shape and preserves phase diagnostics, but cannot duplicate the reporter's physical disk, antivirus, or 24.6 GB of real payload. Keep this reported until a current Windows trace identifies the missing filesystem or platform phase."
+    },
+    {
+      "id": "REG-WINDOWS-MANAGED-ACTIVATION-292",
+      "title": "Managed storage activation on a large Windows graph either becomes active or leaves Direct Files usable",
+      "family": "managed-storage-activation",
+      "sources": {
+        "issues": [
+          292
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
+      "layer": "real-app",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-windows-managed-storage.mjs"
+        ]
+      },
+      "notes": "The reporter saw activation fail on Windows 11 with about 13,000 pages, after which pages were unavailable until returning to Direct Files. The focused hosted-Windows WebView2 scenario drives the real Settings activation on a 13,000-page nested Unicode Markdown/Org graph, verifies byte-preserved source files, opens a nested page under managed storage, returns to Direct Files, and reopens the page. Keep this reported until hosted execution either reproduces the failure or records a repeatable pass that sharply narrows the remaining Windows 11 or graph-content evidence gap."
     },
     {
       "id": "REG-CASE-INSENSITIVE-TRACKED-PATHS-280",
