@@ -31081,6 +31081,7 @@ mod tests {
             );
             assert_eq!(receipt.construction.shadow.payload_bytes_written, 0);
             assert_eq!(receipt.construction.shadow.payload_bytes_read, 0);
+            assert_eq!(receipt.construction.shadow.source_revalidations, 1);
             assert_eq!(
                 receipt.construction.shadow.bulk_pages_materialized,
                 receipt.source_files as u64
