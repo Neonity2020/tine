@@ -3174,3 +3174,161 @@ mod page_inventory_survives_a_content_save {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// GH #254: an external writer that publishes by `rename()` must not make the
+/// open page permanently unsaveable.
+///
+/// Syncthing, Dropbox, Verysync, Logseq OG, VS Code and Vim with
+/// `backupcopy=no` all publish temp-then-rename, which changes the inode. The
+/// ordinary save refused on that alone, BEFORE comparing bytes, with
+/// `path-pinned page does not match its captured exact owner` — a code the
+/// frontend classifies as transient and retries forever, so the page silently
+/// stopped saving. Direct Files data-safety audit, 2026-08-09, finding 2.
+///
+/// This covers only the ORDINARY save half, which the contract verifier
+/// certified as an independently safe increment. Force-save ("Keep mine") and
+/// the trusted journal projection are deliberately untouched.
+mod external_atomic_replacement {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tine-gh254-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        root
+    }
+
+    /// Replace `pages/Note.md` the way a syncing tool does: write a temp file in
+    /// the same directory, then rename it over the target. New inode.
+    fn deliver(root: &std::path::Path, bytes: &str) {
+        let tmp = root.join("pages/.delivery.tmp");
+        std::fs::write(&tmp, bytes).unwrap();
+        std::fs::rename(&tmp, root.join("pages/Note.md")).unwrap();
+    }
+
+    fn open_with(root: &std::path::Path, bytes: &str) -> (Graph, tine_core::model::PageDto) {
+        std::fs::write(root.join("pages/Note.md"), bytes).unwrap();
+        let graph = Graph::open(root);
+        graph.warm_cache();
+        let page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        (graph, page)
+    }
+
+    /// The headline case. Identical bytes on a new inode are a republication of
+    /// the state the editor already has, not a conflict — and no watcher event
+    /// is needed for the save to work.
+    #[test]
+    fn a_same_byte_delivery_does_not_block_the_save() {
+        let root = scratch("same-bytes");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+
+        deliver(&root, "- original\n");
+
+        page.blocks[0].raw = "mine".into();
+        graph
+            .save_page(&page, base.as_deref())
+            .expect("a same-byte atomic replacement must not block the save");
+        assert!(std::fs::read_to_string(root.join("pages/Note.md")).unwrap().contains("mine"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And it must keep working: the old refusal was permanent for the loaded
+    /// instance, which is what turned this into "my notes stopped saving".
+    #[test]
+    fn a_second_save_after_a_same_byte_delivery_also_works() {
+        let root = scratch("same-bytes-twice");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+        deliver(&root, "- original\n");
+
+        page.blocks[0].raw = "mine".into();
+        let rev = graph.save_page(&page, base.as_deref()).unwrap();
+        page.blocks[0].raw = "mine again".into();
+        graph
+            .save_page(&page, Some(rev.as_str()))
+            .expect("the page must not become permanently unsaveable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Necessity guard, and the whole point of the byte comparison: DIFFERENT
+    /// bytes are a real conflict and must still refuse — with the literal
+    /// `conflict` code the frontend can actually resolve, not a physical-identity
+    /// message it retries forever.
+    #[test]
+    fn a_different_byte_delivery_is_a_resolvable_conflict() {
+        let root = scratch("diff-bytes");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+
+        deliver(&root, "- from another device\n");
+
+        page.blocks[0].raw = "mine".into();
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
+        assert_eq!(error.to_string(), "conflict", "must be the resolvable code");
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
+            "- from another device\n",
+            "the other device's bytes must survive"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same conflict delivered in place (same inode) must behave identically
+    /// — the two shapes were resolvable and unresolvable respectively, which is
+    /// how the inode was identified as the discriminator.
+    #[test]
+    fn an_in_place_different_byte_change_conflicts_the_same_way() {
+        let root = scratch("inplace-diff");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+
+        std::fs::write(root.join("pages/Note.md"), "- edited in place\n").unwrap();
+
+        page.blocks[0].raw = "mine".into();
+        assert_eq!(
+            graph.save_page(&page, base.as_deref()).unwrap_err().to_string(),
+            "conflict"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Necessity guard: an externally DELETED target must still refuse rather
+    /// than silently resurrecting the page.
+    ///
+    /// It refuses, but NOT with the resolvable `conflict` code — it fails
+    /// earlier, in the name-only-creation identity check. Verified to be
+    /// identical before and after this change, so it is pre-existing and out of
+    /// scope here. Closing it properly needs the absent-target override
+    /// authority the contract verifier called blocker A, which belongs to the
+    /// GH #254 project. Asserted as-is so a future change to it is deliberate.
+    #[test]
+    fn an_external_delete_still_refuses_without_resurrecting() {
+        let root = scratch("deleted");
+        let (graph, mut page) = open_with(&root, "- original\n");
+        let base = page.rev.clone();
+
+        std::fs::remove_file(root.join("pages/Note.md")).unwrap();
+
+        page.blocks[0].raw = "mine".into();
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err().to_string();
+        assert_ne!(error, "", "the save must refuse");
+        assert!(
+            !root.join("pages/Note.md").exists(),
+            "a deleted page must not be silently resurrected"
+        );
+        assert_eq!(
+            error, "effective page identity evidence is stale or incomplete for name-only creation",
+            "pre-existing refusal code; see the doc comment before changing this"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

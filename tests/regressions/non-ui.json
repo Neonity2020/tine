@@ -3015,6 +3015,30 @@
         ]
       },
       "notes": "Direct Files perf audit 2026-08-09, F3. delete_page re-derives the page inventory and rebuilds three O(pages) indexes: measured ~95 us/file, linear, 757 ms at 8,006 files and ~1.9 s projected at 20,000. It was the only such command still running synchronously on the command thread; get_page, save_page and rename_page already cross the blocking pool. The guard test expensive_reference_and_rename_commands_cross_the_blocking_pool existed and simply did not list delete_page - a coverage omission, not a missing mechanism. This does not make delete faster; it stops it freezing command dispatch. The O(graph) cost itself is a separate, still-open finding."
+    },
+    {
+      "id": "REG-DIRECT-SAVE-ATOMIC-REPLACEMENT-GH254",
+      "title": "An ordinary save after an external atomic replacement compares bytes instead of refusing on physical identity",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [
+          "254"
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/graph.rs"
+        ]
+      },
+      "notes": "GH #254 increment 1, ordinary save only. An external editor that writes by temp+rename (the common safe pattern, and what Syncthing/Dropbox deliver) leaves the same path on a NEW inode. save_page authorized with PinnedSaveAuthority::LoadedRevision, whose retained-identity check refused before the byte comparison ever ran, returning 'path-pinned page does not match its captured exact owner' - a message isRetryableSaveFailure retries forever, so the page became permanently unsaveable with no user-resolvable path out. Measured pre-fix: 4 of 5 cases fail, and NOTABLY the different-byte case failed with the same unresolvable code, so a genuine external change was equally unrecoverable, not just the same-byte one. A new authority OrdinaryEditorSave proves exact path ownership and nothing about physical identity; the byte comparison then decides. Equal bytes on a new inode re-pin to the current snapshot and proceed; different bytes return the literal 'conflict' the frontend can resolve. LoadedRevision is UNCHANGED and still used by verify_existing_journal_page_projection, which authenticates before an opaque durable append and must not inherit this reorder - the contract verifier rejected a helper-wide change twice on exactly this boundary. KNOWN UNCHANGED and out of scope: an externally DELETED target still refuses through the name-only-creation identity check rather than conflict; verified byte-identical before and after, asserted as-is, and owned by increment 2 (a present-only authority cannot express an absent snapshot). The force-save half of #254 ('Keep mine' overwriting the wrong snapshot) is NOT fixed here."
     }
   ]
 }

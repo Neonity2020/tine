@@ -19521,7 +19521,9 @@ impl Graph {
             )
         })?;
         let owner_matches = match authority {
-            PinnedSaveAuthority::UserOverride => loaded.entry.path == path,
+            PinnedSaveAuthority::UserOverride | PinnedSaveAuthority::OrdinaryEditorSave => {
+                loaded.entry.path == path
+            }
             PinnedSaveAuthority::LoadedRevision(loaded_rev) => {
                 let retained = self.loaded_file_identities.read().unwrap();
                 loaded_rev.is_some_and(|revision| {
@@ -20112,7 +20114,7 @@ impl Graph {
             page,
             &path,
             validation.target.as_ref(),
-            PinnedSaveAuthority::LoadedRevision(base_rev),
+            PinnedSaveAuthority::OrdinaryEditorSave,
         )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
@@ -20134,20 +20136,28 @@ impl Graph {
                 if !base_rev.is_some_and(|rev| content_rev(&disk_s) == rev) {
                     return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
                 }
-                let retained_matches = self
-                    .loaded_file_identities
-                    .read()
+                // Reaching here PROVES the file holds exactly the bytes the
+                // editor loaded. A different inode carrying those same bytes is
+                // an atomic republication of the state we already have — every
+                // tool that publishes by `rename()` does this — so it is not a
+                // conflict, and refusing it made the page permanently unsaveable
+                // (GH #254; the frontend retries the old refusal forever).
+                //
+                // Re-pin to the CURRENT snapshot so the write binds to the inode
+                // that actually exists, and so the identity-bound retire/publish
+                // check below has the right expectation. `expected_identity`
+                // already flows from `current_identity`; this only keeps the
+                // retained map honest for the next save.
+                //
+                // Deliberately source-local to the ordinary editor save. The
+                // trusted journal projection keeps its stricter
+                // `LoadedRevision` refusal untouched: it authenticates before an
+                // opaque durable append, and rebinding there needs its own rule
+                // and its own proof that no append occurs on a failed precommit.
+                self.loaded_file_identities
+                    .write()
                     .unwrap()
-                    .get(&path)
-                    .is_some_and(|(revision, identity)| {
-                        base_rev == Some(revision.as_str()) && *identity == current_identity
-                    });
-                if !retained_matches {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "existing page identity changed since load",
-                    ));
-                }
+                    .insert(path.clone(), (content_rev(&disk_s), current_identity));
                 Some((disk_s, current_identity))
             }
             None => {
@@ -25415,6 +25425,25 @@ enum PinnedSaveAuthority<'a> {
     /// `PageDto.rev` is NOT part of the working-store DTO that `pageToDto`
     /// builds, so it must never be read as one.
     LoadedRevision(Option<&'a str>),
+    /// An ordinary editor save. Proves exact path ownership here and NOTHING
+    /// about physical identity, because the identity decision belongs after the
+    /// byte comparison, not before it.
+    ///
+    /// `LoadedRevision` refuses a changed inode up front. That is right for the
+    /// trusted journal projection, which authenticates before an opaque durable
+    /// append — but for an editor save it pre-empts the base-revision check and
+    /// turns every rename-based external write (Syncthing, Dropbox, Logseq OG,
+    /// VS Code, any temp+rename tool) into a permanent
+    /// `path-pinned page does not match its captured exact owner`. The frontend
+    /// classifies that as transient and retries it forever, so the page becomes
+    /// silently unsaveable — GH #254.
+    ///
+    /// The byte comparison below is the stronger proof anyway: `base_rev` is
+    /// SHA-256 of the exact bytes the editor loaded, and under the storage threat
+    /// model (`specs/notes/2026-08-07-trust-model-and-threat-model-decision.md`)
+    /// a byte-forging adversary is out of scope. Equal bytes therefore mean the
+    /// same state regardless of which inode carries them.
+    OrdinaryEditorSave,
     /// The user was shown the conflict and chose to keep their own edits.
     ///
     /// A stale revision and a stale identity ARE the conflict being resolved —
