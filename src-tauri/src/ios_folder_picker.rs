@@ -4,6 +4,23 @@ use tauri::{
     AppHandle, Manager, Runtime, State,
 };
 
+// LOAD-BEARING, and it looks like dead code. Do not remove it.
+//
+// `tine-ios-folder-picker-native` exports no Rust items at all — it exists only
+// so its build script compiles the Swift package and emits
+// `cargo:rustc-link-lib=static=tine-ios-folder-picker-native`. Those directives
+// reach the final link only for rlibs rustc actually loads, and nothing else in
+// this crate ever names it: `ios_plugin_binding!` below expands to
+// `swift_rs::swift!(fn ...)`, a bare `extern "C"` declaration that references no
+// crate (tauri-2.11.2 src/lib.rs:61-65). So without this line the dependency is
+// pruned, the Swift archive is never bundled into `libtine_lib.a`, and Xcode
+// fails with `Undefined symbols: "_init_plugin_tine_ios_folder_picker"`.
+//
+// `tauri-plugin-opener` uses the identical Swift binding pattern and does NOT
+// need this only because `tauri_plugin_opener::init()` is called in `lib.rs`,
+// which pulls its rlib in as a side effect.
+extern crate tine_ios_folder_picker_native;
+
 tauri::ios_plugin_binding!(init_plugin_tine_ios_folder_picker);
 
 #[derive(Debug, Deserialize, Serialize)]
