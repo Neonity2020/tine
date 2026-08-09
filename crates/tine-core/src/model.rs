@@ -40575,7 +40575,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_shadow_capture_rejects_enumeration_replacement_and_set_change() {
+    fn live_admission_snapshot_defers_late_enumeration_changes_to_the_fenced_feed() {
         let root = scratch("initial-shadow-race");
         fs::create_dir_all(root.join("pages/nested")).unwrap();
         fs::write(root.join("pages/nested/a.md"), b"- first\n").unwrap();
@@ -40588,10 +40588,25 @@ mod tests {
                 fs::write(nested.join("inserted.md"), b"- inserted\n")
             }));
         });
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+        let inventory = graph.initial_shadow_raw_managed_text_inventory().unwrap();
+        assert_eq!(
+            inventory,
+            vec![(
+                ManagedPath::parse("pages/nested/a.md").unwrap(),
+                b"- first\n".to_vec(),
+            )]
+        );
+        assert_eq!(
+            fs::read(root.join("pages/nested/a.md")).unwrap(),
+            b"- replaced\n"
+        );
+        assert_eq!(
+            fs::read(root.join("pages/nested/inserted.md")).unwrap(),
+            b"- inserted\n"
+        );
         assert!(matches!(
             &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
+            GraphTextAdmissionState::SnapshotComplete(_)
         ));
 
         let _ = fs::remove_dir_all(&root);
@@ -40654,7 +40669,7 @@ mod tests {
             ]
         );
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.builder_enumerations, 12);
+        assert_eq!(counters.builder_enumerations, 6);
         assert_eq!(counters.point_query_attempts, 0);
         assert_eq!(counters.parser_invocations, 3);
         assert_eq!(counters.index_map_insertions, 15);
@@ -42126,41 +42141,34 @@ mod tests {
     }
 
     #[test]
-    fn admission_memory_preflights_combined_captures_maps_parser_event_and_overflow() {
-        let combined_root = scratch("admission-combined-capture-bound");
+    fn admission_memory_preflights_capture_maps_parser_event_and_overflow() {
+        let capture_root = scratch("admission-capture-bound");
         for index in 0..8 {
             fs::write(
-                combined_root.join(format!("Page-{index}.md")),
+                capture_root.join(format!("Page-{index}.md")),
                 vec![b'x'; 8 * 1024],
             )
             .unwrap();
         }
-        let graph = Graph::open(&combined_root);
+        let graph = Graph::open(&capture_root);
         let permit = graph.admit_retained_managed_text_writer().unwrap();
-        let first = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-        let second = collect_initial_shadow_managed_inventory(&graph, &permit, false).unwrap();
-        let individual_limit = first
-            .peak_build_charge
-            .max(second.peak_build_charge)
-            .checked_add(16 * 1024)
-            .unwrap();
-        assert!(first.peak_build_charge < individual_limit);
-        assert!(second.peak_build_charge < individual_limit);
-        assert!(
-            checked_add_bytes(first.peak_build_charge, second.peak_build_charge).unwrap()
-                > individual_limit
-        );
+        let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
+        let capture_limit = capture.peak_build_charge.checked_add(16 * 1024).unwrap();
+        assert!(capture.peak_build_charge < capture_limit);
         reset_graph_text_admission_test_counters();
-        assert!(graph
-            .initial_shadow_raw_managed_text_inventory_with_limits(InitialShadowLimits {
-                peak_build_bytes: individual_limit,
-                ..INITIAL_SHADOW_LIMITS
-            })
-            .is_err());
-        assert_eq!(graph_text_admission_test_counters().parser_invocations, 0);
+        assert_eq!(
+            graph
+                .initial_shadow_raw_managed_text_inventory_with_limits(InitialShadowLimits {
+                    peak_build_bytes: capture_limit,
+                    ..INITIAL_SHADOW_LIMITS
+                })
+                .unwrap()
+                .len(),
+            8
+        );
         assert!(matches!(
             &*graph.graph_text_admission.read().unwrap(),
-            GraphTextAdmissionState::Poisoned { .. }
+            GraphTextAdmissionState::SnapshotComplete(_)
         ));
 
         let resource_root = scratch("admission-resource-map-preflight");
@@ -42193,11 +42201,8 @@ mod tests {
         fs::write(parser_root.join("Page.md"), &parser_content).unwrap();
         let graph = Graph::open(&parser_root);
         let permit = graph.admit_retained_managed_text_writer().unwrap();
-        let first = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-        let second = collect_initial_shadow_managed_inventory(&graph, &permit, false).unwrap();
-        let combined =
-            checked_add_bytes(first.peak_build_charge, second.peak_build_charge).unwrap();
-        let permanent = graph_text_initial_permanent_upper_bound(&graph, &first, true).unwrap();
+        let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
+        let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
         let path = ManagedPath::parse("Page.md").unwrap();
         let semantic_budget =
             graph_text_observed_semantic_name_upper_bound(&graph, &path, &parser_content).unwrap();
@@ -42209,7 +42214,7 @@ mod tests {
         )
         .unwrap();
         let parser_limit = checked_add_bytes(
-            checked_add_bytes(combined, permanent).unwrap(),
+            checked_add_bytes(capture.peak_build_charge, permanent).unwrap(),
             parse_peak - 1,
         )
         .unwrap();
@@ -42278,14 +42283,14 @@ mod tests {
         assert_eq!(
             graph_text_admission_test_counters().builder_enumerations,
             3,
-            "combined-charge overflow must fail before the second capture enumerates"
+            "capture-charge overflow must fail after one graph-wide census"
         );
         assert!(matches!(
             &*graph.graph_text_admission.read().unwrap(),
             GraphTextAdmissionState::Poisoned { .. }
         ));
 
-        let _ = fs::remove_dir_all(&combined_root);
+        let _ = fs::remove_dir_all(&capture_root);
         let _ = fs::remove_dir_all(&resource_root);
         let _ = fs::remove_dir_all(&parser_root);
         let _ = fs::remove_dir_all(&event_root);
@@ -43826,7 +43831,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_shadow_ignores_equal_creation_roots_and_rejects_directory_retarget() {
+    fn live_admission_ignores_equal_creation_roots_and_defers_directory_retarget() {
         let equal = scratch("initial-shadow-equal-roots");
         fs::create_dir_all(equal.join("logseq")).unwrap();
         fs::write(
@@ -43859,7 +43864,17 @@ mod tests {
                 fs::write(pages.join("a.md"), b"- same\n")
             }));
         });
-        assert!(graph.initial_shadow_raw_managed_text_inventory().is_err());
+        assert_eq!(
+            graph.initial_shadow_raw_managed_text_inventory().unwrap(),
+            vec![(
+                ManagedPath::parse("content/pages/a.md").unwrap(),
+                b"- same\n".to_vec(),
+            )]
+        );
+        assert!(matches!(
+            &*graph.graph_text_admission.read().unwrap(),
+            GraphTextAdmissionState::SnapshotComplete(_)
+        ));
 
         let _ = fs::remove_dir_all(&equal);
         let _ = fs::remove_dir_all(&retarget);
