@@ -148,6 +148,8 @@ jobs:
       - name: Build exact candidate app
         working-directory: candidate
         run: cargo build --release --features custom-protocol --manifest-path src-tauri/Cargo.toml
+      - name: Install Tauri WebDriver bridge
+        run: cargo install tauri-driver --locked
       - name: Install Edge WebDriver matching the WebView2 runtime
         shell: pwsh
         run: ./scripts/install-windows-webview2-driver.ps1
