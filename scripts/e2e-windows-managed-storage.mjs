@@ -126,7 +126,7 @@ async function clickButtonAndConfirm(text) {
   if (exitCode !== 0) throw new Error(`native confirmation helper failed for ${text}: exit ${exitCode}`);
 }
 
-async function openManagedSettings() {
+async function openManagedSettings(expectedAction) {
   const settings = await browser.$('button[title^="Settings"]');
   await settings.waitForExist({ timeout: 15_000 });
   await settings.click();
@@ -140,12 +140,12 @@ async function openManagedSettings() {
   await waitForBody("Storage & sync", 15_000, "storage settings");
   const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
   await experimental.waitForExist({ timeout: 15_000 });
-  const enable = await buttonContaining("Enable Tine-managed storage...");
-  if (!enable || !(await enable.isDisplayed())) await experimental.click();
+  const action = await buttonContaining(expectedAction);
+  if (!action || !(await action.isDisplayed())) await experimental.click();
   await browser.waitUntil(async () => {
-    const button = await buttonContaining("Enable Tine-managed storage...");
+    const button = await buttonContaining(expectedAction);
     return Boolean(button && await button.isDisplayed());
-  }, { timeout: 15_000, timeoutMsg: "managed storage controls did not expand" });
+  }, { timeout: 15_000, timeoutMsg: `managed storage action did not expand: ${expectedAction}` });
 }
 
 async function closeSettings() {
@@ -232,7 +232,7 @@ try {
   await openPage(nestedTitle);
   receipt.milestones.directFilesOpened = true;
 
-  await openManagedSettings();
+  await openManagedSettings("Enable Tine-managed storage...");
   const activationStarted = Date.now();
   await clickButtonAndConfirm("Enable Tine-managed storage...");
   await waitForActivation();
@@ -242,7 +242,7 @@ try {
   await openPage(nestedTitle);
   receipt.milestones.managedPageOpened = true;
 
-  await openManagedSettings();
+  await openManagedSettings("Return to Direct files");
   await clickButtonAndConfirm("Return to Direct files");
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
   assertSameSource(before, "return to Direct Files");
