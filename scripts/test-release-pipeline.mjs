@@ -13,6 +13,7 @@ import {
   selectExactCiEvidence,
 } from "./ci-evidence-lib.mjs";
 import {
+  selectWebdriverWindowWithSelector,
   tauriCapabilities,
   webdriverServerArgs,
   windowsUserDataFolder,
@@ -856,6 +857,17 @@ function assemble(input, output) {
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "tine-release-pipeline-test-"));
 try {
+  let selectedWindow = "capture";
+  const selected = await selectWebdriverWindowWithSelector({
+    async getWindowHandles() { return ["capture", "main"]; },
+    async switchToWindow(handle) { selectedWindow = handle; },
+    async getTitle() { return selectedWindow === "main" ? "Tine" : "Quick Capture"; },
+    async getUrl() { return selectedWindow; },
+    $(selector) {
+      return { isExisting: async () => selector === ".main-app" && selectedWindow === "main" };
+    },
+  }, ".main-app", 100);
+  assert.equal(selected, "main");
   const priorWebviewRoot = process.env.E2E_WEBVIEW_USER_DATA_ROOT;
   process.env.E2E_WEBVIEW_USER_DATA_ROOT = path.join(temporary, "webview2");
   const windowsCapabilities = tauriCapabilities("C:/Tine.exe", "fixture session", "win32");
