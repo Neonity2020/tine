@@ -37,6 +37,10 @@ const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-releas
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
+const windowsWebviewDriverInstaller = fs.readFileSync(
+  path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
+  "utf8"
+);
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
 const windowsScenarios = [
@@ -637,6 +641,23 @@ assert.doesNotMatch(
   uiE2eWorkflow,
   /name: Run Windows WebView2 smoke\n\s+continue-on-error:/,
   "the focused Windows workflow hides a 0\/N scenario result behind a green job"
+);
+assert.match(
+  uiE2eWorkflow,
+  /Install Edge WebDriver matching the WebView2 runtime[\s\S]*?\.\/scripts\/install-windows-webview2-driver\.ps1/,
+  "focused Windows UI CI does not select EdgeDriver from the actual WebView2 runtime"
+);
+assert.match(
+  releaseWorkflow,
+  /Install Edge WebDriver matching the WebView2 runtime[\s\S]*?\.\/scripts\/install-windows-webview2-driver\.ps1/,
+  "release Windows UI CI does not select EdgeDriver from the actual WebView2 runtime"
+);
+assert.match(windowsWebviewDriverInstaller, /Microsoft\\EdgeWebView\\Application/);
+assert.match(windowsWebviewDriverInstaller, /msedgewebview2\.exe/);
+assert.doesNotMatch(
+  windowsWebviewDriverInstaller,
+  /Microsoft\\Edge\\Application\\msedge\.exe/,
+  "the WebView2 driver installer must not infer its version from the independently updated desktop browser"
 );
 assert.match(
   releaseWorkflow,
