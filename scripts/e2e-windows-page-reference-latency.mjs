@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  selectWebdriverWindowWithSelector,
   startWebdriverApplication,
   stopWebdriverApplication,
   tauriCapabilities,
@@ -121,6 +122,7 @@ try {
     connectionRetryCount: 1,
     connectionRetryTimeout: 60_000,
   });
+  await selectWebdriverWindowWithSelector(browser, 'button[title^="Search (Ctrl+K)"]');
   await browser.$(".ls-block").waitForExist({ timeout: 90_000 });
   const pageLink = await browser.$(`a*=${PAGE_TITLE}`);
   await pageLink.waitForClickable({ timeout: 30_000 });
