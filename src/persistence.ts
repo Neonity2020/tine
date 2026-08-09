@@ -323,6 +323,24 @@ export function isRetryableSaveFailure(error: unknown): boolean {
   ].some((code) => message.includes(code));
 }
 
+/** The bounded failure code the Direct backend prefixes to a save error.
+ *
+ *  `direct_save_error_message` emits `"{code}: {raw error}"`, and many raw errors
+ *  carry a graph-relative PATH. So a family test has to read the code, not search
+ *  the whole string: a page legitimately named `conflict_authority.notes` would
+ *  otherwise make an unrelated `precheck.symlink` failure look like a spent
+ *  override, and its handler would keep re-observing a save that can never
+ *  succeed. (GH #254 increment 2, fourth correction-delta re-verification.)
+ *
+ *  Returns the whole message when there is no code separator, which is the
+ *  banner-class `conflict` / `conflict:<n>` shape; those are matched before this
+ *  is consulted. */
+function directSaveFailureCode(error: unknown): string {
+  const message = String(error).replace(/^Error: /, "");
+  const separator = message.indexOf(": ");
+  return separator > 0 ? message.slice(0, separator) : message;
+}
+
 /** The observation epoch a banner-class conflict was raised at.
  *
  *  `conflict:<n>` is the whole contract for the keep-mine/use-disk banner; the
@@ -513,7 +531,7 @@ async function doSave(
       if (observed >= 0) conflictObservation.set(name, observed);
       else conflictObservation.delete(name);
       markConflict(name);
-    } else if (String(e).includes("conflict_authority.")) {
+    } else if (directSaveFailureCode(e).startsWith("conflict_authority.")) {
       // The force named an observation the disk has since moved past — a later
       // external write, or a read, revoked it before the click reached the
       // backend. The refusal is right: that authority was for a state the user
@@ -533,7 +551,7 @@ async function doSave(
         dirty.add(name); // the edit is still unwritten
         void reconcileExternalChange(name);
       }
-    } else if (String(e).includes("conflict_retry.")) {
+    } else if (directSaveFailureCode(e).startsWith("conflict_retry.")) {
       // The backend could not coherently observe the winner, so it minted no
       // authority — and a force that reached here has already CONSUMED the
       // token its banner was standing on. Leaving that banner up is the

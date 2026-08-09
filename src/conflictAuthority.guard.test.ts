@@ -42,9 +42,36 @@ function isFunctionLike(node: ts.Node): boolean {
     || ts.isConstructorDeclaration(node);
 }
 
+/** Every local name that refers to `markConflict` in this file — the import
+ *  itself, an alias on the import, and a plain `const x = markConflict`. Matching
+ *  only the literal identifier would let `import { markConflict as raise }` walk
+ *  straight past the rule this file exists to hold. */
+function localNamesForMarkConflict(sf: ts.SourceFile): Set<string> {
+  const names = new Set(["markConflict"]);
+  const visit = (node: ts.Node) => {
+    if (ts.isImportDeclaration(node) && node.importClause?.namedBindings
+      && ts.isNamedImports(node.importClause.namedBindings)) {
+      for (const element of node.importClause.namedBindings.elements) {
+        if ((element.propertyName ?? element.name).text === "markConflict") {
+          names.add(element.name.text);
+        }
+      }
+    }
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)
+      && node.initializer && ts.isIdentifier(node.initializer)
+      && names.has(node.initializer.text)) {
+      names.add(node.name.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return names;
+}
+
 export function bannerRaiseViolations(file: string, source: string): string[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true,
     file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  const raisers = localNamesForMarkConflict(sf);
   const violations: string[] = [];
   const allowedFn = file === ALLOWED_CALLER.file ? ALLOWED_CALLER.fn : null;
   const visit = (node: ts.Node, enclosing: string | null) => {
@@ -60,7 +87,7 @@ export function bannerRaiseViolations(file: string, source: string): string[] {
         ? null
         : enclosing;
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
-      && node.expression.text === "markConflict"
+      && raisers.has(node.expression.text)
       && !(allowedFn !== null && scope === allowedFn)) {
       const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
       violations.push(`${file}:${line + 1}: markConflict outside the save-result path`);
@@ -84,6 +111,13 @@ describe("only a backend save refusal may raise a conflict banner", () => {
       "export function markConflict(name: string) { setConflicts(name); }\n"
       + "markConflict(\"smuggled\");\n"))
       .toEqual(["src/ui.ts:2: markConflict outside the save-result path"]);
+  });
+
+  it("recognises an aliased import of markConflict", () => {
+    expect(bannerRaiseViolations("src/App.tsx",
+      "import { markConflict as raiseConflict } from \"./ui\";\n"
+      + "raiseConflict(name);\n"))
+      .toEqual(["src/App.tsx:2: markConflict outside the save-result path"]);
   });
 
   it("does not let a nested closure inherit doSave's allowance", () => {

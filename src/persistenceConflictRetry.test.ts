@@ -51,6 +51,46 @@ vi.mock("./ui", () => ({
 
 const { forceSave, markDirty, resetSaveState } = await import("./persistence");
 
+// GH #254 increment 2, fourth correction-delta re-verification, HIGH. A Direct
+// save error is "{bounded code}: {raw error}", and raw errors carry graph
+// PATHS — so a page the user is entitled to name `conflict_authority.notes` put
+// that family marker inside an unrelated failure's message. A substring test
+// then routed a permanent precheck failure into the authority handler, which
+// deletes the epoch, re-dirties the page and fire-and-forgets another save: one
+// user request became four backend calls and would have kept feeding the queue
+// instead of reaching the bounded retry/toast path.
+describe("a failure is classified by its code, not by the page's name", () => {
+  beforeEach(() => {
+    calls.length = 0;
+    toasts.length = 0;
+    conflicted.clear();
+    nextResult = null;
+    resetSaveState();
+  });
+
+  // Only the `conflict_authority` case fails against the pre-fix substring test:
+  // its handler re-enqueues, so one request multiplied. The `conflict_retry` case
+  // passed either way, because that handler schedules a BOUNDED retry — it is
+  // here as a specification of the same rule for a family with the same shape,
+  // not as fail-before evidence.
+  for (const family of ["conflict_authority", "conflict_retry"]) {
+    it(`does not read "${family}." out of a page path`, async () => {
+      const name = `${family}.notes`;
+      markDirty(name);
+      nextResult = () => Promise.reject(new Error(
+        `precheck.symlink: managed text entry is a symlink or reparse point: pages/${name}.md`
+      ));
+
+      expect(await forceSave(name)).toBe(false);
+
+      // Exactly the one request, then the bounded transient path — not a
+      // self-feeding chain of re-observations.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(calls.length).toBe(1);
+    });
+  }
+});
+
 describe("a tokenless force does not strand the page behind a spent banner", () => {
   beforeEach(() => {
     calls.length = 0;
