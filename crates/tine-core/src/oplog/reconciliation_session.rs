@@ -881,7 +881,12 @@ impl LiveReconciliationSessionDispatch<'_> {
                 .reasons
                 .contains(&ReconciliationFullScanReason::Explicit);
             if prior.is_some() && explicit {
-                return FullScanAbsenceDisposition::Proceed(absences);
+                // Catastrophic shrink intentionally retains one aggregate
+                // quarantine signature rather than graph-sized pending rows.
+                // The scan candidates still enter the sole affected-path
+                // importer; there are no per-path pending rows to bind or
+                // settle for this confirmed aggregate observation.
+                return FullScanAbsenceDisposition::Proceed(Vec::new());
             }
             if let Err(error) = baseline.record_blocked(
                 digest,
@@ -1408,11 +1413,17 @@ mod tests {
         baseline: ReconciliationBaseline,
         next_timestamp: u64,
         path: String,
+        paths: Vec<String>,
         admission: LocalRuntimeAdmission<'static>,
     }
 
     impl LiveFixture {
         fn new(label: &str, complete_projection: bool) -> Self {
+            Self::new_with_page_count(label, complete_projection, 1)
+        }
+
+        fn new_with_page_count(label: &str, complete_projection: bool, page_count: usize) -> Self {
+            assert!(page_count > 0);
             let root = TestRoot::new(label);
             let graph_root = root.path().join("graph");
             fs::create_dir_all(&graph_root).unwrap();
@@ -1432,15 +1443,37 @@ mod tests {
             .unwrap();
             let lineage = LineageDigest::of(label.as_bytes());
             let catalog = DocumentId::from_uuid(Uuid::from_u128(104));
-            let page_id = PageId::from_uuid(Uuid::from_u128(105));
-            let path = "pages/live.md".to_owned();
-            let transaction = OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                page_id,
-                home_document_id: DocumentId::from_uuid(Uuid::from_u128(106)),
-                name: LogicalPageName::parse("Live Session").unwrap(),
-                path: ManagedPath::parse(&path).unwrap(),
-                kind: ManagedTextKind::Page,
-            }])
+            let pages = (0..page_count)
+                .map(|index| {
+                    let path = if index == 0 {
+                        "pages/live.md".to_owned()
+                    } else {
+                        format!("pages/nested/live-{index:03}.md")
+                    };
+                    let page_id = PageId::from_uuid(Uuid::from_u128(105 + index as u128));
+                    let operation = SemanticOperation::CreatePage {
+                        page_id,
+                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(
+                            1_000 + index as u128,
+                        )),
+                        name: LogicalPageName::parse(if index == 0 {
+                            "Live Session".to_owned()
+                        } else {
+                            format!("Live Session {index}")
+                        })
+                        .unwrap(),
+                        path: ManagedPath::parse(&path).unwrap(),
+                        kind: ManagedTextKind::Page,
+                    };
+                    (path, page_id, operation)
+                })
+                .collect::<Vec<_>>();
+            let transaction = OperationTransaction::new(
+                pages
+                    .iter()
+                    .map(|(_, _, operation)| operation.clone())
+                    .collect(),
+            )
             .unwrap();
             let author = ShardedHotEngine::new(workspace_id, lineage, catalog);
             let bootstrap = author
@@ -1470,7 +1503,9 @@ mod tests {
                 .stage_archive_batch(bootstrap.manifest().batch_id())
                 .unwrap();
             if complete_projection {
-                write_projection_exact(&graph, &receipts, &engine, page_id, None).unwrap();
+                for (_, page_id, _) in &pages {
+                    write_projection_exact(&graph, &receipts, &engine, *page_id, None).unwrap();
+                }
             }
             let archive = ObjectStore::open(&archive_root, workspace_id).unwrap();
             let runtime =
@@ -1498,6 +1533,11 @@ mod tests {
             .database;
             let source = RebuildSource::new(&engine, &archive).unwrap();
             let tail = TailOverlay::from_durable(&database, &source).unwrap();
+            let paths = pages
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect::<Vec<_>>();
+            let path = paths[0].clone();
             Self {
                 _root: root,
                 graph_root,
@@ -1508,8 +1548,9 @@ mod tests {
                 tail,
                 baseline,
                 next_timestamp: 0,
-                admission: LocalRuntimeAdmission::unenrolled_pre_activation(),
                 path,
+                paths,
+                admission: LocalRuntimeAdmission::unenrolled_pre_activation(),
             }
         }
 
@@ -1533,6 +1574,23 @@ mod tests {
         ReconciliationSession::new(ReconciliationSchedulerLimits::default())
     }
 
+    fn drive_live_session(
+        session: &mut ReconciliationSession,
+        fixture: &mut LiveFixture,
+    ) -> Result<ReconciliationSessionStep, ReconciliationSessionError> {
+        let mut step = session.step(fixture.dependencies())?;
+        for _ in 0..512 {
+            step = match step {
+                ReconciliationSessionStep::Pending(continuation) => {
+                    session.resume(continuation, fixture.dependencies())?
+                }
+                ReconciliationSessionStep::RetryFull => session.step(fixture.dependencies())?,
+                terminal => return Ok(terminal),
+            };
+        }
+        panic!("live reconciliation did not reach a bounded terminal step");
+    }
+
     fn assert_blocked_and_idle(session: &mut ReconciliationSession, fixture: &mut LiveFixture) {
         assert_eq!(
             session.status().last_completion,
@@ -1548,12 +1606,17 @@ mod tests {
     }
 
     fn expected_path_exists(fixture: &mut LiveFixture) -> bool {
+        let path = fixture.path.clone();
+        expected_path_exists_at(fixture, &path)
+    }
+
+    fn expected_path_exists_at(fixture: &mut LiveFixture, path: &str) -> bool {
         let projection = fixture.engine.projection_work_index().unwrap();
         let source = JoinedAuthenticatedExpectedPathSource::new(&fixture.engine, projection);
         let limits = GraphTextScanLimits::default();
         source
             .expected_path_at(
-                &ManagedPath::parse(&fixture.path).unwrap(),
+                &ManagedPath::parse(path).unwrap(),
                 ExpectedPathPointRequest {
                     maximum_path_bytes: limits.exact_path_bytes,
                     maximum_retained_rows: limits.retained_rows,
@@ -1562,6 +1625,14 @@ mod tests {
             )
             .unwrap()
             .is_some()
+    }
+
+    fn expected_path_count(fixture: &mut LiveFixture) -> usize {
+        let paths = fixture.paths.clone();
+        paths
+            .iter()
+            .filter(|path| expected_path_exists_at(fixture, path))
+            .count()
     }
 
     #[test]
@@ -1589,9 +1660,13 @@ mod tests {
         );
 
         reopened_process.trigger(ReconciliationTrigger::Explicit);
+        let confirmed = drive_live_session(&mut reopened_process, &mut fixture);
+        let blocked_detail = reopened_process.take_terminal_blocked_detail();
         assert_eq!(
-            reopened_process.step(fixture.dependencies()),
-            Ok(ReconciliationSessionStep::Complete)
+            confirmed,
+            Ok(ReconciliationSessionStep::Complete),
+            "explicit confirmation failed: {:?}; detail={blocked_detail:?}",
+            reopened_process.status(),
         );
         assert!(!expected_path_exists(&mut fixture));
     }
@@ -1644,6 +1719,66 @@ mod tests {
             "a later disappearance must start a new confirmation cycle"
         );
         assert!(expected_path_exists(&mut fixture));
+    }
+
+    #[test]
+    fn empty_provider_view_survives_restart_until_explicit_confirmation() {
+        const PAGE_COUNT: usize = 40;
+        let mut fixture = LiveFixture::new_with_page_count("empty-provider-view", true, PAGE_COUNT);
+        fs::remove_dir_all(fixture.graph_root.join("pages")).unwrap();
+
+        let mut first_process = live_session();
+        first_process.trigger(ReconciliationTrigger::Startup);
+        assert_eq!(
+            first_process.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert_eq!(expected_path_count(&mut fixture), PAGE_COUNT);
+
+        let mut reopened_process = live_session();
+        reopened_process.trigger(ReconciliationTrigger::Startup);
+        assert_eq!(
+            reopened_process.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Noop)
+        );
+        assert_eq!(
+            expected_path_count(&mut fixture),
+            PAGE_COUNT,
+            "restart over the same empty provider view must not author tombstones"
+        );
+
+        reopened_process.trigger(ReconciliationTrigger::Explicit);
+        let confirmed = drive_live_session(&mut reopened_process, &mut fixture);
+        let blocked_detail = reopened_process.take_terminal_blocked_detail();
+        assert_eq!(
+            confirmed,
+            Ok(ReconciliationSessionStep::Complete),
+            "explicit confirmation failed: {:?}; detail={blocked_detail:?}",
+            reopened_process.status(),
+        );
+        assert_eq!(expected_path_count(&mut fixture), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_traversal_preserves_expected_graph_without_tombstones() {
+        use std::os::unix::fs::symlink;
+
+        let mut fixture = LiveFixture::new("refused-traversal", true);
+        symlink(
+            fixture.graph_root.join(&fixture.path),
+            fixture.graph_root.join("pages/provider-placeholder.md"),
+        )
+        .unwrap();
+        let mut session = live_session();
+        session.trigger(ReconciliationTrigger::Explicit);
+
+        assert_eq!(
+            session.step(fixture.dependencies()),
+            Ok(ReconciliationSessionStep::Blocked)
+        );
+        assert!(expected_path_exists(&mut fixture));
+        assert_blocked_and_idle(&mut session, &mut fixture);
     }
 
     #[test]
