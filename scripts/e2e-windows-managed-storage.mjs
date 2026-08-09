@@ -193,6 +193,7 @@ const env = {
   TINE_GRAPH: graph,
   TINE_DEBUG: "1",
   TINE_DEBUG_LOG: debugLog,
+  TINE_ACTIVATION_TRACE: "1",
   APPDATA: path.join(root, "appdata"),
   LOCALAPPDATA: path.join(root, "localappdata"),
 };
