@@ -114,24 +114,18 @@ jobs:
       - name: tauri ios build (simulator, unsigned)
         run: npx tauri ios build --target aarch64-sim --ci
 
-      # The Swift folder-picker symbol must be DEFINED in the linked library, not
-      # merely referenced. This is a one-line standing guard for the defect that
-      # cost this slice several CI rounds: `tine-ios-folder-picker-native` exports
-      # no Rust items, so if anything ever stops referencing it (see the
-      # `extern crate` in src-tauri/src/ios_folder_picker.rs) its rlib is pruned,
-      # its Swift archive is never bundled, and the link fails with
-      # `Undefined symbols: _init_plugin_tine_ios_folder_picker`.
-      - name: Assert the Swift plugin symbol is linked in
-        run: |
-          set -euo pipefail
-          found=0
-          for a in $(find target -name 'libtine_lib.a'); do
-            if nm "$a" 2>/dev/null | grep -q "^[0-9a-f]* T _init_plugin_tine_ios_folder_picker$"; then
-              echo "ok: $a defines _init_plugin_tine_ios_folder_picker"
-              found=1
-            fi
-          done
-          test "$found" = 1
+      # NOTE: there is deliberately no separate `nm` check that the Swift
+      # folder-picker symbol is linked in. The step ABOVE already is that gate —
+      # a missing definition is exactly how this defect manifested:
+      #
+      #   Undefined symbols: "_init_plugin_tine_ios_folder_picker"
+      #
+      # `tine-ios-folder-picker-native` exports no Rust items, so if anything ever
+      # stops referencing it (see the `extern crate` in
+      # src-tauri/src/ios_folder_picker.rs) its rlib is pruned, its Swift archive
+      # is never bundled, and `tauri ios build` fails right here. A separate nm
+      # step was tried and removed: it added no coverage the link does not already
+      # provide, and only produced a second thing to keep working.
 
       - name: Boot Simulator and launch a container graph
         shell: bash
