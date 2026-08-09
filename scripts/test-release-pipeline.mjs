@@ -28,10 +28,6 @@ const releaseWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workfl
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
 const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
-const issue295Workflow = fs.readFileSync(
-  path.join(process.cwd(), ".github/workflows/windows-issue-295.yml"),
-  "utf8"
-);
 const flatpakWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/flatpak.yml"), "utf8");
 const flatpakMetadataWorkflow = fs.readFileSync(
   path.join(process.cwd(), ".github/workflows/flatpak-metadata.yml"),
@@ -80,10 +76,10 @@ assert.deepEqual(
   [],
   "tracked paths must remain unique on case-insensitive filesystems"
 );
-assert.match(issue295Workflow, /candidate_ref:[\s\S]*?required: true/);
-assert.match(issue295Workflow, /ref: \$\{\{ inputs\.candidate_ref \}\}[\s\S]*?path: candidate/);
-assert.match(issue295Workflow, /a4cc5eca0c08ac3e819dc490e3d48f545c207da742a670bf437a86a6d1b6aa24/);
-assert.match(issue295Workflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
+assert.match(uiE2eWorkflow, /windows-issue-295:[\s\S]*?inputs\.windows_scenario == 'windows-page-reference-latency'/);
+assert.match(uiE2eWorkflow, /ref: \$\{\{ inputs\.linux_scenario \}\}[\s\S]*?path: candidate/);
+assert.match(uiE2eWorkflow, /a4cc5eca0c08ac3e819dc490e3d48f545c207da742a670bf437a86a6d1b6aa24/);
+assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
 assert.match(issue295Scenario, /dispatchToSecondPaint/);
