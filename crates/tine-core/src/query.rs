@@ -5319,8 +5319,9 @@ mod tests {
         );
         assert_eq!(
             source.evidence[0].occurrences.len(),
-            2,
-            "alias + title; code excluded"
+            3,
+            "alias + title + the mention inside inline code, which Logseq also \
+             reports as unlinked (GH #270)"
         );
         assert!(source.evidence[0]
             .occurrences
@@ -5334,7 +5335,8 @@ mod tests {
             .find(|trace| trace.page == "Source")
             .unwrap();
         assert!(source_trace.included_linked && source_trace.included_unlinked);
-        assert_eq!(source_trace.occurrences.len(), 3);
+        // One explicit `[[Alias]]` plus the three plain mentions above.
+        assert_eq!(source_trace.occurrences.len(), 4);
         assert!(!serde_json::to_string(&diagnostics)
             .unwrap()
             .contains("launcher-ranking"));

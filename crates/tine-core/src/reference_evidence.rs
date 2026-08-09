@@ -108,7 +108,15 @@ pub(crate) struct ProjectedBlockRef {
 pub(crate) struct ReferenceSourceProjection {
     pub explicit: Vec<ProjectedPageRef>,
     pub block_references: Vec<ProjectedBlockRef>,
+    /// Source ranges eligible for an unlinked (plain-text) match.
+    ///
+    /// This is the COMPLEMENT of the ranges the parser already claimed as
+    /// reference syntax or as non-prose bookkeeping — not an allowlist of
+    /// "safe" block types. See `plain_search_ranges`.
     pub plain_ranges: Vec<Range<usize>>,
+    /// Ranges withheld from the plain complement that are not themselves page
+    /// references: structural property declarations and `:LOGBOOK:` drawers.
+    pub withheld_ranges: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -321,13 +329,6 @@ fn walk_inlines(
 ) {
     for inline in inlines {
         match inline {
-            Inline::Plain {
-                span: Some(span), ..
-            } => {
-                if let Some(range) = mapper.map(span, raw_len) {
-                    projection.plain_ranges.push(range);
-                }
-            }
             Inline::Link {
                 url: Url::BlockRef { v },
                 label,
@@ -421,8 +422,10 @@ fn walk_inlines(
             | Inline::Superscript { children, .. } => {
                 walk_inlines(children, mapper, raw_len, is_org, property_key, projection)
             }
-            // Code/verbatim and the remaining opaque inline forms are deliberately
-            // not plain-reference search ranges.
+            // Plain text needs no arm: `plain_search_ranges` derives the
+            // unlinked-match region as the complement of what the parser DID
+            // claim, so text this walk never visits (code, math, raw HTML,
+            // examples, hiccup) stays searchable exactly as it does in Logseq.
             _ => {}
         }
     }
@@ -651,11 +654,19 @@ fn walk_blocks(
                     );
                     let PropertySource {
                         key,
+                        key_range,
                         value_offset: offset,
                         value,
-                        ..
                     } = property;
                     if structural_property(&key, raw) {
+                        // Withheld from the plain complement. Logseq does scan
+                        // `id::`/`collapsed::`/`logseq.*` text, but those are
+                        // bookkeeping the user never wrote as prose, and a
+                        // page named after a uuid fragment is not a real
+                        // outcome. Named divergence; see the GH #270 receipt.
+                        projection
+                            .withheld_ranges
+                            .push(key_range.start..offset + value.len());
                         continue;
                     }
                     let parsed = lsdoc::parse_format(&value, if is_org { "org" } else { "md" });
@@ -670,9 +681,60 @@ fn walk_blocks(
                     project_implicit_linkable_property(projection, &key, offset, &value, raw.len());
                 }
             }
+            // Logseq strips the logbook before matching
+            // (`drawer/remove-logbook` in `get-page-unlinked-references`), so
+            // clock entries never manufacture an unlinked reference. Every
+            // other drawer keeps its text, exactly as Logseq does.
+            Block::Drawer {
+                name,
+                span: Some(span),
+            } if name.eq_ignore_ascii_case("logbook") => {
+                if let Some(range) = mapper.map(span, raw.len()) {
+                    projection.withheld_ranges.push(range);
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// The unlinked-match region: everything the parser did NOT already claim.
+///
+/// Logseq matches unlinked references with a raw regex over the whole block
+/// content (`db/model.cljs` `get-page-unlinked-references`), so code fences,
+/// inline code, math, raw HTML and every other opaque form are searchable
+/// there. Tine keeps a single parser-derived matcher and reaches the same
+/// region by subtraction rather than by re-scanning the source: an allowlist of
+/// block kinds silently loses coverage every time lsdoc grows a variant, which
+/// is precisely how GH #270 happened.
+fn plain_search_ranges(raw_len: usize, projection: &ReferenceSourceProjection) -> Vec<Range<usize>> {
+    let mut claimed: Vec<Range<usize>> = projection
+        .explicit
+        .iter()
+        .map(|reference| reference.range.clone())
+        .chain(
+            projection
+                .block_references
+                .iter()
+                .map(|reference| reference.range.clone()),
+        )
+        .chain(projection.withheld_ranges.iter().cloned())
+        .filter(|range| range.start < range.end && range.end <= raw_len)
+        .collect();
+    claimed.sort_by_key(|range| (range.start, range.end));
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for range in claimed {
+        if range.start > cursor {
+            out.push(cursor..range.start);
+        }
+        cursor = cursor.max(range.end);
+    }
+    if cursor < raw_len {
+        out.push(cursor..raw_len);
+    }
+    out
 }
 
 pub(crate) fn project(raw: &str, is_org: bool, blocks: &[Block]) -> ReferenceSourceProjection {
@@ -702,10 +764,7 @@ pub(crate) fn project(raw: &str, is_org: bool, blocks: &[Block]) -> ReferenceSou
             .then_with(|| left.raw_claim.cmp(&right.raw_claim))
     });
     projection.block_references.dedup();
-    projection
-        .plain_ranges
-        .sort_by_key(|range| (range.start, range.end));
-    projection.plain_ranges.dedup();
+    projection.plain_ranges = plain_search_ranges(raw.len(), &projection);
     projection
 }
 
@@ -717,6 +776,25 @@ fn byte_to_utf16(raw: &str, byte: usize) -> usize {
 
 fn is_og_edge_alphanumeric(ch: Option<char>) -> bool {
     ch.is_some_and(|ch| ch.is_ascii_alphanumeric())
+}
+
+/// Exact Logseq prefix semantics from `db/model.cljs`'s `pattern`:
+/// `(^|[^\[#0-9a-zA-Z]|((^|[^\[])\[))`.
+///
+/// A `#` or a doubled `[` immediately before the name is already-linked syntax
+/// and never counts as an unlinked match. This used to be implied by the
+/// overlap check against parsed references, but the plain region now includes
+/// text the parser never interprets — `[[Page]]` inside a code fence, or an
+/// escaped `\[[Page]]` — where no reference span exists to overlap with. A
+/// single `[`, as in a Markdown link label, is still a valid boundary.
+fn og_prefix_allows(raw: &str, start: usize) -> bool {
+    let mut preceding = raw.get(..start).unwrap_or_default().chars().rev();
+    match preceding.next() {
+        None => true,
+        Some('[') => preceding.next() != Some('['),
+        Some('#') => false,
+        Some(_) => true,
+    }
 }
 
 fn overlaps(range: &Range<usize>, other: &Range<usize>) -> bool {
@@ -743,7 +821,24 @@ fn visit_plain_matches(
         .chars()
         .next_back()
         .is_some_and(|ch| ch.is_alphanumeric());
-    for (offset, _) in source.char_indices() {
+    // A cheap prefilter for the common case. It skips a start position only
+    // when BOTH the needle's first character and the source character are
+    // ASCII, where lowercase is exact and NFC is the identity — so no match
+    // can begin there. Anything non-ASCII falls through to the authoritative
+    // lowercase+NFC matcher below, which keeps folding cases like the Kelvin
+    // sign correct. Worth having because the searchable region grew to the
+    // whole block once opaque forms stopped being skipped (GH #270).
+    let ascii_first = needle
+        .chars()
+        .next()
+        .filter(char::is_ascii)
+        .map(|ch| (ch.to_ascii_lowercase(), ch.to_ascii_uppercase()));
+    for (offset, first) in source.char_indices() {
+        if let Some((lower, upper)) = ascii_first {
+            if first.is_ascii() && first != lower && first != upper {
+                continue;
+            }
+        }
         let start = range.start + offset;
         let mut end = start;
         let mut candidate_raw = String::new();
@@ -774,7 +869,8 @@ fn visit_plain_matches(
         let after = raw.get(end..).and_then(|suffix| suffix.chars().next());
         // Exact OG edge semantics: only adjacent ASCII alphanumerics exclude
         // an unlinked match. `_` and continuous CJK are valid boundaries.
-        if (!first_requires_boundary || !is_og_edge_alphanumeric(before))
+        if og_prefix_allows(raw, start)
+            && (!first_requires_boundary || !is_og_edge_alphanumeric(before))
             && (!last_requires_boundary || !is_og_edge_alphanumeric(after))
             && !visit(start..end)
         {
@@ -1040,17 +1136,17 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            got.iter()
-                .filter(|hit| hit.kind == ReferenceKind::Plain)
-                .count(),
-            1
-        );
-        let plain = got
+        let plains = got
             .iter()
-            .find(|hit| hit.kind == ReferenceKind::Plain)
-            .unwrap();
-        assert_eq!(&raw[plain.span.start..plain.span.end], "Target");
+            .filter(|hit| hit.kind == ReferenceKind::Plain)
+            .collect::<Vec<_>>();
+        // The prose mention and the inline-code mention. The `[[Target]]` text
+        // is claimed by the explicit reference and is not double-counted.
+        assert_eq!(plains.len(), 2, "{got:?}");
+        assert!(plains
+            .iter()
+            .all(|hit| &raw[hit.span.start..hit.span.end] == "Target"));
+        assert!(plains.iter().all(|hit| hit.span.start > 10));
     }
 
     #[test]
@@ -1063,11 +1159,73 @@ mod tests {
         assert_eq!(plains.len(), 2);
     }
 
+    /// GH #270. Logseq's unlinked-reference matcher is a raw regex over the
+    /// whole block content, so code is searched and an escaped `\[[Name]]` is
+    /// not. Tine used to have this exactly inverted: it reported the escaped
+    /// bracket and hid both code mentions.
     #[test]
-    fn escaped_and_code_links_do_not_become_explicit_or_plain() {
-        let got = evidence("\\[[Target]] and `Target`\n```\nTarget\n```", &["Target"]);
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0].kind, ReferenceKind::Plain);
+    fn code_is_searched_and_escaped_brackets_are_not() {
+        let raw = "\\[[Target]] and `Target`\n```\nTarget\n```";
+        let got = evidence(raw, &["Target"]);
+        assert!(
+            got.iter().all(|hit| hit.kind == ReferenceKind::Plain),
+            "{got:?}"
+        );
+        let starts = got.iter().map(|hit| hit.span.start).collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            vec![
+                raw.find("`Target`").unwrap() + 1,
+                raw.find("\nTarget\n").unwrap() + 1,
+            ],
+            "{got:?}"
+        );
+    }
+
+    /// The `[`/`#` prefix rule is what keeps already-linked syntax out of the
+    /// unlinked panel now that unparsed regions are searchable: inside a fence
+    /// there is no parsed reference to overlap with.
+    #[test]
+    fn already_linked_syntax_inside_code_is_still_not_an_unlinked_match() {
+        for raw in [
+            "```\n[[Target]]\n```",
+            "```\n#Target\n```",
+            "`[[Target]]`",
+            "$$\n[[Target]]\n$$",
+        ] {
+            assert!(evidence(raw, &["Target"]).is_empty(), "{raw}");
+        }
+        // A single bracket is an ordinary boundary, as in a Markdown label.
+        assert_eq!(evidence("```\n[Target](x)\n```", &["Target"]).len(), 1);
+    }
+
+    /// Every block kind the old allowlist dropped. Each of these is one of the
+    /// seven measured divergences from Logseq recorded in the GH #270 receipt.
+    #[test]
+    fn opaque_block_kinds_are_searched_like_logseq_does() {
+        for raw in [
+            "```clojure\nTarget\n```",
+            "$$\nx = Target\n$$",
+            "<div>Target</div>",
+            "#+BEGIN_EXPORT html\nTarget\n#+END_EXPORT",
+            "#+BEGIN_EXAMPLE\nTarget\n#+END_EXAMPLE",
+            "\\begin{align}\nTarget\n\\end{align}",
+            "[:span \"Target\"]",
+        ] {
+            let got = evidence(raw, &["Target"]);
+            assert_eq!(got.len(), 1, "{raw}: {got:?}");
+            assert_eq!(got[0].kind, ReferenceKind::Plain, "{raw}");
+        }
+    }
+
+    /// Logseq applies `drawer/remove-logbook` before matching, so clock lines
+    /// never manufacture an unlinked reference. Other drawers keep their text.
+    #[test]
+    fn the_logbook_drawer_is_stripped_but_other_drawers_are_not() {
+        let logbook = "do the thing\n:LOGBOOK:\nCLOCK: Target\n:END:";
+        assert!(evidence(logbook, &["Target"]).is_empty(), "logbook leaked");
+        let other = "do the thing\n:NOTES:\nTarget\n:END:";
+        assert_eq!(evidence(other, &["Target"]).len(), 1, "{other}");
     }
 
     #[test]
@@ -1181,6 +1339,31 @@ mod tests {
         assert!(
             got.is_empty(),
             "structural id leaked into evidence: {got:?}"
+        );
+    }
+
+    /// The searchable region is now the whole block, so a start position that
+    /// cannot begin the name must be rejected without building a candidate
+    /// string. Asserted as a ratio against a same-sized input where every
+    /// position IS a plausible start, so it does not depend on the machine.
+    #[test]
+    fn impossible_start_positions_are_skipped_without_building_candidates() {
+        let haystack = "ababab ".repeat(40_000);
+        let range = 0..haystack.len();
+
+        let absent = std::time::Instant::now();
+        visit_plain_matches(&haystack, &range, "qqqq", |_| true);
+        let absent = absent.elapsed().max(std::time::Duration::from_nanos(1));
+
+        let plausible = std::time::Instant::now();
+        visit_plain_matches(&haystack, &range, "aaaa", |_| true);
+        let plausible = plausible.elapsed();
+
+        assert!(
+            plausible.as_nanos() > absent.as_nanos() * 4,
+            "a name whose first character never occurs cost {absent:?}, \
+             barely less than the {plausible:?} of one that does — the \
+             prefilter is gone and every position is building a candidate"
         );
     }
 

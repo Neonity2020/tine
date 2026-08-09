@@ -3022,7 +3022,7 @@
       "family": "direct-save-fidelity",
       "sources": {
         "issues": [
-          "254"
+          254
         ],
         "commits": []
       },
@@ -3039,6 +3039,31 @@
         ]
       },
       "notes": "GH #254 increment 1, ordinary save only. An external editor that writes by temp+rename (the common safe pattern, and what Syncthing/Dropbox deliver) leaves the same path on a NEW inode. save_page authorized with PinnedSaveAuthority::LoadedRevision, whose retained-identity check refused before the byte comparison ever ran, returning 'path-pinned page does not match its captured exact owner' - a message isRetryableSaveFailure retries forever, so the page became permanently unsaveable with no user-resolvable path out. Measured pre-fix: 4 of 5 cases fail, and NOTABLY the different-byte case failed with the same unresolvable code, so a genuine external change was equally unrecoverable, not just the same-byte one. A new authority OrdinaryEditorSave proves exact path ownership and nothing about physical identity; the byte comparison then decides. Equal bytes on a new inode re-pin to the current snapshot and proceed; different bytes return the literal 'conflict' the frontend can resolve. LoadedRevision is UNCHANGED and still used by verify_existing_journal_page_projection, which authenticates before an opaque durable append and must not inherit this reorder - the contract verifier rejected a helper-wide change twice on exactly this boundary. KNOWN UNCHANGED and out of scope: an externally DELETED target still refuses through the name-only-creation identity check rather than conflict; verified byte-identical before and after, asserted as-is, and owned by increment 2 (a present-only authority cannot express an absent snapshot). The force-save half of #254 ('Keep mine' overwriting the wrong snapshot) is NOT fixed here."
+    },
+    {
+      "id": "REG-UNLINKED-REFS-SEE-CODE-GH270",
+      "title": "Unlinked References finds a page name written inside code, math and other literal text",
+      "family": "references",
+      "sources": {
+        "issues": [
+          270
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/reference_evidence.rs",
+          "crates/tine-core/tests/graph.rs"
+        ]
+      },
+      "notes": "Logseq matches unlinked references with a raw regex over the whole block content (db/model.cljs get-page-unlinked-references, only drawer/remove-logbook stripped), so code fences, inline code, math, raw HTML, examples, latex environments and hiccup are all searched. Tine derived its search region from an ALLOWLIST of block kinds in reference_evidence walk_blocks, whose `_ => {}` arm silently dropped every other variant - so the region lost coverage each time lsdoc grew a block type. Now derived by SUBTRACTION: plain_search_ranges takes the complement of what the parser already claimed (explicit refs, block refs, structural properties, :LOGBOOK: drawers), which is Logseq's own semantics reached through the parser rather than a second scanner - alias/NFC/boundary logic unchanged and new lsdoc variants covered for free. Logseq's `#`/doubled-`[` prefix rule had to be ported explicitly (og_prefix_allows): it used to be implied by overlap with a parsed reference, but inside a fence there is no parsed reference, so `[[Page]]` in code would otherwise have matched. That also corrected an inversion - for `\\[[Target]]` Tine reported the escaped bracket and hid both code mentions, exactly backwards from Logseq. DELIBERATE DIVERGENCE, named: structural id::/collapsed::/logseq.* property text stays withheld (Logseq scans it) because a page named after a uuid fragment is not a real outcome. PERF: widening the region cost +13% (285->325 ms cold on the 1,045-file anonymized graph), so an ASCII prefilter was added to visit_plain_matches - it skips a start position only when BOTH the name's first char and the source char are ASCII, where lowercase is exact and NFC is identity, leaving folding cases like the Kelvin sign to the authoritative matcher. Net 285 ms -> 36 ms, ~8x faster than before the change. Reusing string buffers instead was measured WORSE (400 ms) because flat_map(char::to_lowercase) loses str::to_lowercase's ASCII fast path. Necessity: 6 unit tests and 2 of 3 integration tests fail on the pre-fix tree; the third asserts the complement did NOT over-widen (an explicit link and a CLOCK: line stay out) and passes both sides."
     }
   ]
 }

@@ -3332,3 +3332,61 @@ mod external_atomic_replacement {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// GH #270 at the boundary the reporter observed: the Unlinked References
+/// panel of a page, fed by `Graph::unlinked_refs`.
+mod unlinked_references_see_code_blocks {
+    use super::*;
+
+    fn graph_with(source: &str) -> (std::path::PathBuf, Graph) {
+        let root = std::env::temp_dir().join(format!(
+            "tine-gh270-{}-{}",
+            std::process::id(),
+            source.len()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/Widget.md"), "- the page itself\n").unwrap();
+        std::fs::write(root.join("pages/Notes.md"), source).unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        (root, graph)
+    }
+
+    #[test]
+    fn a_mention_inside_a_fenced_code_block_is_reported() {
+        let (root, graph) = graph_with("- how to build it\n  ```sh\n  make Widget\n  ```\n");
+        let groups = graph.unlinked_refs("Widget");
+        assert_eq!(
+            groups.iter().map(|group| group.page.as_str()).collect::<Vec<_>>(),
+            vec!["Notes"],
+            "the fenced mention never reached the panel"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mention_inside_inline_code_or_math_is_reported() {
+        for source in [
+            "- run `Widget --help` first\n",
+            "- the model\n  $$\n  W = Widget(x)\n  $$\n",
+        ] {
+            let (root, graph) = graph_with(source);
+            assert_eq!(graph.unlinked_refs("Widget").len(), 1, "{source}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The complement is not "everything": an existing link is still a LINKED
+    /// reference, and clock entries are stripped exactly as Logseq strips them.
+    #[test]
+    fn linked_syntax_and_logbook_clock_lines_stay_out() {
+        let (root, graph) = graph_with("- see [[Widget]]\n  :LOGBOOK:\n  CLOCK: Widget\n  :END:\n");
+        assert!(
+            graph.unlinked_refs("Widget").is_empty(),
+            "an explicit link or a logbook line leaked into unlinked references"
+        );
+        assert_eq!(graph.backlinks("Widget").len(), 1, "the link is still linked");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
