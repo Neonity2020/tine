@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
-#[cfg(test)]
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use loro::{LoroDoc, VersionVector};
@@ -213,21 +212,13 @@ pub(crate) struct DocumentStateWork {
     pub checkpoint_blob_append_nanos: u128,
     #[cfg(test)]
     pub checkpoint_whole_digest_nanos: u128,
-    #[cfg(test)]
     pub loro_external_flush_nanos: u128,
-    #[cfg(test)]
     pub state_checkpoint_export_nanos: u128,
-    #[cfg(test)]
     pub external_witness_root_nanos: u128,
-    #[cfg(test)]
     pub blob_tree_nanos: u128,
-    #[cfg(test)]
     pub external_record_validation_nanos: u128,
-    #[cfg(test)]
     pub external_record_encoding_nanos: u128,
-    #[cfg(test)]
     pub external_exact_map_insert_nanos: u128,
-    #[cfg(test)]
     pub external_current_map_insert_nanos: u128,
 }
 
@@ -326,8 +317,7 @@ fn commit_external_batch(
         work.external_history_blob_reads = work
             .external_history_blob_reads
             .saturating_add(record_work.external_history_blob_reads);
-        #[cfg(test)]
-        accumulate_test_timing(&mut work, &record_work);
+        accumulate_timing(&mut work, &record_work);
         exact_changes.insert(
             external_exact_key(lane, input.document_id, record.causal_digest),
             Some(bytes.clone()),
@@ -341,33 +331,29 @@ fn commit_external_batch(
     #[cfg(test)]
     blob_writer.record_test_work(&mut work);
     if !exact_changes.is_empty() {
-        #[cfg(test)]
-        let exact_map_started = Instant::now();
+        let exact_map_started = activation_trace_enabled().then(Instant::now);
         candidate.external_document_state_root = store.insert_many(
             &candidate.external_document_state_root,
             ScratchPageKind::DocumentExternalExact,
             &exact_changes,
         )?;
-        #[cfg(test)]
-        {
+        if let Some(started) = exact_map_started {
             work.external_exact_map_insert_nanos = work
                 .external_exact_map_insert_nanos
-                .saturating_add(exact_map_started.elapsed().as_nanos());
+                .saturating_add(started.elapsed().as_nanos());
         }
     }
     if !current_changes.is_empty() {
-        #[cfg(test)]
-        let current_map_started = Instant::now();
+        let current_map_started = activation_trace_enabled().then(Instant::now);
         candidate.external_document_current_root = store.insert_many(
             &candidate.external_document_current_root,
             ScratchPageKind::DocumentExternalCurrent,
             &current_changes,
         )?;
-        #[cfg(test)]
-        {
+        if let Some(started) = current_map_started {
             work.external_current_map_insert_nanos = work
                 .external_current_map_insert_nanos
-                .saturating_add(current_map_started.elapsed().as_nanos());
+                .saturating_add(started.elapsed().as_nanos());
         }
     }
     Ok((candidate, work))
@@ -397,15 +383,15 @@ fn prepare_external_record(
     )
     .map_err(|error| DocumentStateError::InvalidCrdt(error.to_string()))?;
     let causal_digest = dependencies.causal_state_digest();
-    #[cfg(test)]
-    let checkpoint_export_started = Instant::now();
+    let trace_enabled = activation_trace_enabled();
+    let checkpoint_export_started = trace_enabled.then(Instant::now);
     let state_checkpoint = document
         .flush_external_store()
         .map_err(|error| DocumentStateError::InvalidCrdt(error.to_string()))?;
-    #[cfg(test)]
-    let checkpoint_export_nanos = checkpoint_export_started.elapsed().as_nanos();
-    #[cfg(test)]
-    let witness_root_started = Instant::now();
+    let checkpoint_export_nanos = checkpoint_export_started
+        .map(|started| started.elapsed().as_nanos())
+        .unwrap_or_default();
+    let witness_root_started = trace_enabled.then(Instant::now);
     let witness = LoroHistoryWitness::new(
         store.workspace_id(),
         document_id,
@@ -416,21 +402,16 @@ fn prepare_external_record(
         latest_update_digest,
     )?;
     let history_root = external.history_store.publish_root(witness)?;
-    #[cfg(test)]
-    let witness_root_nanos = witness_root_started.elapsed().as_nanos();
+    let witness_root_nanos = witness_root_started
+        .map(|started| started.elapsed().as_nanos())
+        .unwrap_or_default();
     let history_after = external.history_store.stats();
-    #[cfg(test)]
-    let blob_tree_started = Instant::now();
-    #[cfg(test)]
-    let blob_lsm_insert_before = blob_writer.lsm_insert_nanos;
+    let blob_tree_started = trace_enabled.then(Instant::now);
     let (state_checkpoint, state_page_bytes_written) =
         blob_writer.put_blob_tree(&state_checkpoint)?;
-    #[cfg(test)]
-    let blob_tree_nanos = blob_tree_started.elapsed().as_nanos().saturating_sub(
-        blob_writer
-            .lsm_insert_nanos
-            .saturating_sub(blob_lsm_insert_before),
-    );
+    let blob_tree_nanos = blob_tree_started
+        .map(|started| started.elapsed().as_nanos())
+        .unwrap_or_default();
     let record = ExternalDocumentStateRecord {
         schema_version: EXTERNAL_DOCUMENT_STATE_SCHEMA_VERSION,
         document_id,
@@ -444,38 +425,34 @@ fn prepare_external_record(
         latest_manifest_fingerprint,
         latest_update_digest,
     };
-    #[cfg(test)]
-    let record_validation_started = Instant::now();
+    let record_validation_started = trace_enabled.then(Instant::now);
     validate_external_record(store, &record)?;
-    #[cfg(test)]
-    let record_validation_nanos = record_validation_started.elapsed().as_nanos();
-    #[cfg(test)]
-    let record_encoding_started = Instant::now();
+    let record_validation_nanos = record_validation_started
+        .map(|started| started.elapsed().as_nanos())
+        .unwrap_or_default();
+    let record_encoding_started = trace_enabled.then(Instant::now);
     let bytes = encode_canonical(&record)?;
-    #[cfg(test)]
-    let record_encoding_nanos = record_encoding_started.elapsed().as_nanos();
+    let record_encoding_nanos = record_encoding_started
+        .map(|started| started.elapsed().as_nanos())
+        .unwrap_or_default();
     let mut work = DocumentStateWork {
         state_page_bytes_written,
         ..DocumentStateWork::default()
     };
     record_loro_store_work(&mut work, history_before, history_after);
-    #[cfg(test)]
-    {
-        work.loro_external_flush_nanos = history_after
-            .flush_nanos
-            .saturating_sub(history_before.flush_nanos);
-        work.state_checkpoint_export_nanos =
-            checkpoint_export_nanos.saturating_sub(work.loro_external_flush_nanos);
-        work.external_witness_root_nanos = witness_root_nanos;
-        work.blob_tree_nanos = blob_tree_nanos;
-        work.external_record_validation_nanos = record_validation_nanos;
-        work.external_record_encoding_nanos = record_encoding_nanos;
-    }
+    work.loro_external_flush_nanos = history_after
+        .flush_nanos
+        .saturating_sub(history_before.flush_nanos);
+    work.state_checkpoint_export_nanos =
+        checkpoint_export_nanos.saturating_sub(work.loro_external_flush_nanos);
+    work.external_witness_root_nanos = witness_root_nanos;
+    work.blob_tree_nanos = blob_tree_nanos;
+    work.external_record_validation_nanos = record_validation_nanos;
+    work.external_record_encoding_nanos = record_encoding_nanos;
     Ok((record, bytes, work))
 }
 
-#[cfg(test)]
-fn accumulate_test_timing(total: &mut DocumentStateWork, record: &DocumentStateWork) {
+fn accumulate_timing(total: &mut DocumentStateWork, record: &DocumentStateWork) {
     total.loro_external_flush_nanos = total
         .loro_external_flush_nanos
         .saturating_add(record.loro_external_flush_nanos);
@@ -492,6 +469,11 @@ fn accumulate_test_timing(total: &mut DocumentStateWork, record: &DocumentStateW
     total.external_record_encoding_nanos = total
         .external_record_encoding_nanos
         .saturating_add(record.external_record_encoding_nanos);
+}
+
+fn activation_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| cfg!(test) || std::env::var_os("TINE_ACTIVATION_TRACE").is_some())
 }
 
 struct CheckpointBlobWriter<'a> {

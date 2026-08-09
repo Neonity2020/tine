@@ -5615,47 +5615,49 @@ impl ReplayTimingStats {
         }
     }
 
-    #[cfg(test)]
     fn add_document_state_work(&mut self, work: &super::document_state::DocumentStateWork) {
-        self.external_checkpoint_phase_calls = self
-            .external_checkpoint_phase_calls
-            .saturating_add(work.external_checkpoint_phase_calls);
-        self.external_checkpoint_nonempty_calls = self
-            .external_checkpoint_nonempty_calls
-            .saturating_add(work.external_checkpoint_nonempty_calls);
-        self.external_checkpoint_documents = self
-            .external_checkpoint_documents
-            .saturating_add(work.external_checkpoint_documents);
-        self.checkpoint_chunks = self
-            .checkpoint_chunks
-            .saturating_add(work.checkpoint_chunks);
-        self.checkpoint_existing_hits = self
-            .checkpoint_existing_hits
-            .saturating_add(work.checkpoint_existing_hits);
-        self.checkpoint_staged_hits = self
-            .checkpoint_staged_hits
-            .saturating_add(work.checkpoint_staged_hits);
-        self.checkpoint_new_chunks = self
-            .checkpoint_new_chunks
-            .saturating_add(work.checkpoint_new_chunks);
-        self.blob_dedup_lsm_flushes = self
-            .blob_dedup_lsm_flushes
-            .saturating_add(work.blob_dedup_lsm_flushes);
-        self.blob_dedup_lsm_insert_nanos = self
-            .blob_dedup_lsm_insert_nanos
-            .saturating_add(work.blob_dedup_lsm_insert_nanos);
-        self.checkpoint_chunk_digest_nanos = self
-            .checkpoint_chunk_digest_nanos
-            .saturating_add(work.checkpoint_chunk_digest_nanos);
-        self.blob_dedup_lookup_nanos = self
-            .blob_dedup_lookup_nanos
-            .saturating_add(work.blob_dedup_lookup_nanos);
-        self.checkpoint_blob_append_nanos = self
-            .checkpoint_blob_append_nanos
-            .saturating_add(work.checkpoint_blob_append_nanos);
-        self.checkpoint_whole_digest_nanos = self
-            .checkpoint_whole_digest_nanos
-            .saturating_add(work.checkpoint_whole_digest_nanos);
+        #[cfg(test)]
+        {
+            self.external_checkpoint_phase_calls = self
+                .external_checkpoint_phase_calls
+                .saturating_add(work.external_checkpoint_phase_calls);
+            self.external_checkpoint_nonempty_calls = self
+                .external_checkpoint_nonempty_calls
+                .saturating_add(work.external_checkpoint_nonempty_calls);
+            self.external_checkpoint_documents = self
+                .external_checkpoint_documents
+                .saturating_add(work.external_checkpoint_documents);
+            self.checkpoint_chunks = self
+                .checkpoint_chunks
+                .saturating_add(work.checkpoint_chunks);
+            self.checkpoint_existing_hits = self
+                .checkpoint_existing_hits
+                .saturating_add(work.checkpoint_existing_hits);
+            self.checkpoint_staged_hits = self
+                .checkpoint_staged_hits
+                .saturating_add(work.checkpoint_staged_hits);
+            self.checkpoint_new_chunks = self
+                .checkpoint_new_chunks
+                .saturating_add(work.checkpoint_new_chunks);
+            self.blob_dedup_lsm_flushes = self
+                .blob_dedup_lsm_flushes
+                .saturating_add(work.blob_dedup_lsm_flushes);
+            self.blob_dedup_lsm_insert_nanos = self
+                .blob_dedup_lsm_insert_nanos
+                .saturating_add(work.blob_dedup_lsm_insert_nanos);
+            self.checkpoint_chunk_digest_nanos = self
+                .checkpoint_chunk_digest_nanos
+                .saturating_add(work.checkpoint_chunk_digest_nanos);
+            self.blob_dedup_lookup_nanos = self
+                .blob_dedup_lookup_nanos
+                .saturating_add(work.blob_dedup_lookup_nanos);
+            self.checkpoint_blob_append_nanos = self
+                .checkpoint_blob_append_nanos
+                .saturating_add(work.checkpoint_blob_append_nanos);
+            self.checkpoint_whole_digest_nanos = self
+                .checkpoint_whole_digest_nanos
+                .saturating_add(work.checkpoint_whole_digest_nanos);
+        }
         self.loro_external_flush_nanos = self
             .loro_external_flush_nanos
             .saturating_add(work.loro_external_flush_nanos);
@@ -21023,10 +21025,11 @@ impl ShardedHotEngine {
             .external_history_blob_reads
             .saturating_add(document.external_history_blob_reads);
         self.history_work.set(work);
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
-            timing.add_document_state_work(&document);
-        });
+        if self.activation_trace_enabled || cfg!(test) {
+            self.record_replay_timing(|timing| {
+                timing.add_document_state_work(&document);
+            });
+        }
     }
 
     fn record_author_snapshot_clone(&self, document: &LoroDoc) {
