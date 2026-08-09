@@ -80,6 +80,10 @@ assert.deepEqual(
 assert.match(uiE2eWorkflow, /windows-issue-295:[\s\S]*?inputs\.windows_scenario == 'windows-page-reference-latency'/);
 assert.match(uiE2eWorkflow, /ref: \$\{\{ inputs\.linux_scenario \}\}[\s\S]*?path: candidate/);
 assert.match(uiE2eWorkflow, /a4cc5eca0c08ac3e819dc490e3d48f545c207da742a670bf437a86a6d1b6aa24/);
+assert.match(
+  uiE2eWorkflow,
+  /windows-issue-295:[\s\S]*?Install Tauri WebDriver bridge[\s\S]*?cargo install tauri-driver --locked[\s\S]*?Drive literal page-reference keys/,
+);
 assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
