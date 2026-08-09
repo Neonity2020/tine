@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,28 @@ pub(crate) type WindowKey = String;
 pub(crate) const SPARSE_V2_UNSUPPORTED: &str =
     "This action is unavailable while Tine-managed storage is active.";
 static NEXT_BINDING: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManagedBroadCacheTouches {
+    pub(crate) reads: u64,
+    pub(crate) builds: u64,
+    pub(crate) invalidations: u64,
+    pub(crate) reopens: u64,
+}
+
+#[cfg(test)]
+static MANAGED_BROAD_CACHE_TOUCHES: Mutex<BTreeMap<u64, ManagedBroadCacheTouches>> =
+    Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn record_managed_broad_cache_touch(
+    binding_generation: u64,
+    update: impl FnOnce(&mut ManagedBroadCacheTouches),
+) {
+    let mut by_binding = MANAGED_BROAD_CACHE_TOUCHES.lock().unwrap();
+    update(by_binding.entry(binding_generation).or_default());
+}
 
 /// Read-only graph lease used by the auxiliary Quick Capture WebView. Capture
 /// deliberately does not own a graph slot: the registry permits one writable
@@ -267,7 +291,13 @@ impl GraphSlot {
                 let lease = self.legacy_graph()?;
                 f(&lease)
             }
-            GraphAuthority::SparseV2(_) => f(&self.derived_read_graph()),
+            GraphAuthority::SparseV2(_) => {
+                #[cfg(test)]
+                record_managed_broad_cache_touch(self.binding_generation, |touches| {
+                    touches.reads += 1
+                });
+                f(&self.derived_read_graph())
+            }
         }
     }
 
@@ -321,6 +351,12 @@ impl GraphSlot {
             return Arc::clone(graph);
         }
         let mut slot = self.derived_read_graph.write().unwrap();
+        #[cfg(test)]
+        if slot.is_none() {
+            record_managed_broad_cache_touch(self.binding_generation, |touches| {
+                touches.builds += 1
+            });
+        }
         Arc::clone(
             slot.get_or_insert_with(|| Arc::new(Graph::open_derived_read_only(&self.graph_root))),
         )
@@ -334,6 +370,10 @@ impl GraphSlot {
     /// which is the common case.
     pub(crate) fn invalidate_derived_read_graph(&self) {
         if let Some(graph) = self.derived_read_graph.read().unwrap().as_ref() {
+            #[cfg(test)]
+            record_managed_broad_cache_touch(self.binding_generation, |touches| {
+                touches.invalidations += 1
+            });
             graph.invalidate_cache();
         }
     }
@@ -349,6 +389,8 @@ impl GraphSlot {
     /// it already holds, so a stale copy makes a saved setting look reverted.
     /// This is what the legacy path gets by publishing a replacement slot.
     pub(crate) fn reopen_derived_read_graph(&self) {
+        #[cfg(test)]
+        record_managed_broad_cache_touch(self.binding_generation, |touches| touches.reopens += 1);
         *self.derived_read_graph.write().unwrap() = None;
         let refreshed = self.derived_read_graph().meta();
         *self.graph_meta.write().unwrap() = refreshed;
@@ -356,6 +398,17 @@ impl GraphSlot {
 
     pub(crate) fn graph_meta(&self) -> tine_core::model::GraphMeta {
         self.graph_meta.read().unwrap().clone()
+    }
+
+    /// Temporary C0 migration oracle. Every managed semantic slice must make
+    /// this stay at zero before the broad projected-tree cache can be removed.
+    #[cfg(test)]
+    pub(crate) fn take_managed_broad_cache_touches(&self) -> ManagedBroadCacheTouches {
+        MANAGED_BROAD_CACHE_TOUCHES
+            .lock()
+            .unwrap()
+            .remove(&self.binding_generation)
+            .unwrap_or_default()
     }
 
     /// Borrow the actor only through the graph slot that owns it.
@@ -851,6 +904,16 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("pages/Alpha.md")).unwrap(),
             "- alpha mentions [[Target]]\n"
+        );
+        assert_eq!(
+            slot.take_managed_broad_cache_touches(),
+            ManagedBroadCacheTouches {
+                reads: 2,
+                builds: 1,
+                invalidations: 0,
+                reopens: 0,
+            },
+            "the C0 oracle must expose every managed fallback to the broad parsed graph"
         );
 
         let _ = std::fs::remove_dir_all(&root);
