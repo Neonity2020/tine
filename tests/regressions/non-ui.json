@@ -3299,6 +3299,28 @@
         ]
       },
       "notes": "Found while working the 2026-08-09 Direct Files audit backlog; reproduced on the stock deployed release binary, so not a regression from that work. Tauri creates the WebView user-data directory ($XDG_DATA_HOME/page.tine.Tine) inside its OWN setup(), while building the configured windows (tauri::manager::webview calls create_dir_all there), and an IO error at that point is unreachable by the application: it panics with 'Failed to setup app: Permission denied (os error 13)' at tauri-2.11.2/src/app.rs:1417, before Tine's setup hook runs. A user whose ~/.local/share is root-owned - the shape of the box this was found on, drwxr-xr-t root root - therefore got a hard crash with a backtrace and no actionable message, made more confusing by Tine's own desktop-identity step logging the same Permission denied and explicitly treating it as NON-fatal one line earlier. data_home::ensure_usable now probes the directory before anything resolves it (create_dir_all is not the question: it succeeds on an existing directory nobody may write) and, when it is unusable, points XDG_DATA_HOME at the first writable fallback for that launch - ~/.tine-data, then $XDG_RUNTIME_DIR/tine-data, then a uid-namespaced temp dir - so settings, session and the WebView store live somewhere real. XDG_DATA_HOME is the one lever that redirects Tauri's path resolver, WebKitGTK's website-data manager and Tine's own settings together. The frontend toasts once, stickily, naming the directory, because a silent relocation is its own defect. If nothing at all is writable the app prints one actionable sentence and exits 1 rather than panicking. Verified on the built binary: unwritable base -> app stays up, ~/.tine-data/page.tine.Tine populated with tine-settings.json and the WebKit store, nothing written to the read-only base; ordinary writable base -> no relocation diagnostic at all and no probe residue."
+    },
+    {
+      "id": "REG-WATCH-RETRY-UNWATCHED-ROOT-20260809",
+      "title": "A graph whose watch() failed stays blind to external changes while another graph is watched",
+      "family": "external-change-reconciliation",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "tauri-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/watcher.rs"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 16, landed in its REACHABLE form only. The audit claimed an inotify watch() failure leaves the watcher permanently blind with no poll fallback; that is not what the code does. A failed root is never inserted into `watched` and is retried on the next cycle, and when EVERY root fails `watched` is empty, which takes the else branch and its bounded <=3 s recv_timeout - a working recovery loop. The reachable case is mixed: with two graphs open, the inotify branch blocks on rx.recv() until an event arrives from a root that IS watched, so a root the kernel refused is retried only when some other graph happens to change. inotify limits are per-user (fs.inotify.max_user_watches), so opening a second large graph is exactly how one root fails while the other is healthy, and on a quiet healthy graph the failing one stays invisible indefinitely. inotify_cycle_wait now bounds the wait to UNWATCHED_ROOT_RETRY (3 s, matching the poll branch ceiling) whenever a desired root is unwatched, and never delays a sooner scheduled retry. Coverage gaps stated in the tests themselves: they pin the wait policy, not a real kernel watch() failure (which needs privileges unavailable here) and not the call-site wiring, and they are a specification rather than fail-before evidence because the function is new."
     }
   ]
 }
