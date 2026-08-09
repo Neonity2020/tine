@@ -6,6 +6,7 @@ use crate::state::{canonical_graph_root, poke_watcher, slot_for_window, AppState
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tine_core::crdt::ManagedSyncStoreState;
 use tine_core::model::{Graph, GraphMeta};
@@ -348,16 +349,33 @@ pub(crate) async fn load_graph(
     Ok(result)
 }
 
+fn graph_load_phase(started: Option<Instant>, previous: &mut Option<Instant>, phase: &str) {
+    let (Some(started), Some(prior)) = (started, *previous) else {
+        return;
+    };
+    let now = Instant::now();
+    crate::debug::diag(format!(
+        "graph load phase: {phase}; phase_ms={}; total_ms={}",
+        now.duration_since(prior).as_millis(),
+        now.duration_since(started).as_millis()
+    ));
+    *previous = Some(now);
+}
+
 pub(crate) fn load_graph_for_label(
     path: String,
     app: &tauri::AppHandle,
     window_label: &str,
     state: &State<'_, AppState>,
 ) -> Result<LoadGraphResult, String> {
+    let started = crate::debug::debug_enabled().then(Instant::now);
+    let mut previous = started;
     let root = resolve_root(&path)
         .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
     let root_key = canonical_graph_root(&root)?;
+    graph_load_phase(started, &mut previous, "canonical graph root");
     let _load = state.graph_load.lock().unwrap();
+    graph_load_phase(started, &mut previous, "serialized graph-open lock");
     if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)?;
@@ -385,9 +403,12 @@ pub(crate) fn load_graph_for_label(
             window_label: owner,
         });
     }
-    if let Some(record) = state.sync_runtime.binding_record(app, &root_key)? {
+    let binding_record = state.sync_runtime.binding_record(app, &root_key)?;
+    graph_load_phase(started, &mut previous, "private storage discovery");
+    if let Some(record) = binding_record {
         let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
         let binding = state.sync_runtime.open_record(app, &record)?;
+        graph_load_phase(started, &mut previous, "managed storage recovery");
         let slot = Arc::new(GraphSlot::from_sparse_v2(
             binding,
             root_key.clone(),
@@ -414,8 +435,10 @@ pub(crate) fn load_graph_for_label(
         });
     }
     refuse_unclaimed_sparse_archive(&root_key)?;
+    graph_load_phase(started, &mut previous, "shared storage discovery");
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
+    graph_load_phase(started, &mut previous, "asset approval lookup");
     let LoadedGraph {
         graph,
         meta,
@@ -423,9 +446,11 @@ pub(crate) fn load_graph_for_label(
     } = open_graph_for_load(&root, approved_assets.as_deref(), |graph| {
         backup_graph_now(app, graph, "")
     })?;
+    graph_load_phase(started, &mut previous, "Direct Files core open");
     let managed_state = graph
         .managed_sync_store_state()
         .map_err(|error| format!("managed sync store is unsafe or invalid: {error}"))?;
+    graph_load_phase(started, &mut previous, "legacy managed-store discovery");
     if managed_state != ManagedSyncStoreState::Absent {
         launch_backup_done = ensure_managed_sync_safety_snapshot(
             app,
@@ -450,9 +475,11 @@ pub(crate) fn load_graph_for_label(
         .bind(window_label.to_string(), slot.clone())?;
     state.note_focused(window_label);
     poke_watcher(&state);
+    graph_load_phase(started, &mut previous, "graph binding and watcher poke");
     if !launch_backup_done {
         backup_async(app.clone(), slot.clone())?;
     }
+    graph_load_phase(started, &mut previous, "backup scheduling");
     remember_graph(app, &meta.root)?;
     if let Some(window) = app.get_webview_window(window_label) {
         let name = Path::new(&meta.root)
@@ -461,8 +488,10 @@ pub(crate) fn load_graph_for_label(
             .unwrap_or("Graph");
         let _ = window.set_title(&format!("Tine — {name}"));
     }
+    graph_load_phase(started, &mut previous, "settings and window title");
     let binding_generation = slot.binding_generation;
     warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
+    graph_load_phase(started, &mut previous, "warm-cache scheduling complete");
     Ok(LoadGraphResult::Loaded {
         meta,
         binding_generation,
@@ -875,6 +904,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "manual large-graph startup benchmark"]
+    fn direct_large_graph_open_manual_benchmark() {
+        let page_count = std::env::var("TINE_DIRECT_OPEN_BENCH_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(13_000);
+        let asset_count = std::env::var("TINE_DIRECT_OPEN_BENCH_ASSETS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(12_884);
+        let dir = scratch("direct-large-open-bench");
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        for index in 0..page_count {
+            std::fs::write(
+                dir.join("pages").join(format!("page-{index:05}.md")),
+                format!("- page {index}\n"),
+            )
+            .unwrap();
+        }
+        for index in 0..asset_count {
+            let bucket = assets.join(format!("bucket-{:03}", index % 281));
+            std::fs::create_dir_all(&bucket).unwrap();
+            let file = std::fs::File::create(bucket.join(format!("asset-{index:05}.bin"))).unwrap();
+            file.set_len(2 * 1024 * 1024).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(loaded.meta.root, dir.display().to_string());
+        eprintln!(
+            "direct open: pages={page_count}, assets={asset_count}, apparent_asset_gib={:.1}, elapsed={elapsed:?}",
+            asset_count as f64 * 2.0 / 1024.0
+        );
+
+        if std::env::var_os("TINE_DIRECT_OPEN_BENCH_KEEP").is_some() {
+            eprintln!("retained benchmark graph at {}", dir.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     fn count_update_chunks(path: &Path) -> usize {

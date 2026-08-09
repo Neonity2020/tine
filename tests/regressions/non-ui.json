@@ -2829,6 +2829,29 @@
         ]
       },
       "notes": "The frontend already reduced ./assets/dir/file.png to the assets-relative name dir/file.png, but all native read entry points applied the top-level-only validator used by asset creation. Read paths now accept ordinary nested relative components and retain canonical containment beneath the approved assets root. Absolute paths, empty/dot/parent components, portable backslash traversal and symlink escapes remain refused. Asset creation/import still accepts only a top-level filename."
+    },
+    {
+      "id": "REG-DIRECT-LARGE-GRAPH-OPEN-266",
+      "title": "Opening a large Direct Files graph does not synchronously scan its pages or assets",
+      "family": "direct-files-performance",
+      "sources": {
+        "issues": [
+          266
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "linux"
+      ],
+      "layer": "core-native",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/graph.rs::tests::direct_large_graph_open_manual_benchmark"
+        ]
+      },
+      "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore does not reproduce the Windows report. Debug builds now emit phase and cumulative timings for canonicalization, private/shared storage discovery, asset approval, Direct core open, legacy store discovery, graph binding, backup scheduling, settings/title, and warm-cache scheduling. Keep this reported until a current Windows trace identifies the missing filesystem or platform phase."
     }
   ]
 }
