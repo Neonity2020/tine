@@ -829,7 +829,7 @@
       "Hosted Windows filesystem speed, WebView2 startup timing, and managed-storage activation duration may vary."
     ],
     "nonRequirements": [
-      "Native confirmation-dialog appearance, internal private-storage layout, or exact progress wording."
+      "Exact native confirmation-dialog appearance, internal private-storage layout, or exact progress wording."
     ],
     "stability": "burn-in"
   },

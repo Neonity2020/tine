@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 
 // Focused Windows proof for GH #292. This is a real WebView2 + Tauri + NTFS
-// journey; Linux already owns the native confirmation-dialog proof, so this
-// scenario bypasses only that dialog and exercises the production Settings
-// action and native storage commands underneath it.
+// journey, including the native confirmation dialogs and the production
+// Settings action that invokes the managed-storage commands.
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { remote } from "webdriverio";
@@ -107,6 +106,26 @@ async function clickButton(text) {
   await button.click();
 }
 
+async function clickButtonAndConfirm(text) {
+  // WebDriver cannot address native Windows dialogs. Start a hidden helper
+  // before the click because the click command itself waits while the modal is
+  // open; Enter accepts the dialog's default affirmative button without
+  // depending on a localized mnemonic.
+  const confirmer = spawn("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "Start-Sleep -Milliseconds 750; Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')",
+  ], { windowsHide: true, stdio: "ignore" });
+  const completed = new Promise((resolve) => {
+    confirmer.once("exit", (code) => resolve(code));
+    confirmer.once("error", () => resolve(-1));
+  });
+  await clickButton(text);
+  const exitCode = await completed;
+  if (exitCode !== 0) throw new Error(`native confirmation helper failed for ${text}: exit ${exitCode}`);
+}
+
 async function openManagedSettings() {
   const settings = await browser.$('button[title^="Settings"]');
   await settings.waitForExist({ timeout: 15_000 });
@@ -128,24 +147,6 @@ async function openManagedSettings() {
 async function closeSettings() {
   await browser.keys("Escape");
   await browser.$(".settings-modal").waitForExist({ reverse: true, timeout: 15_000 });
-}
-
-async function installConfirmationBypass() {
-  const installed = await browser.execute(() => {
-    const internals = window.__TAURI_INTERNALS__;
-    if (!internals || typeof internals.invoke !== "function") return false;
-    const original = internals.invoke.bind(internals);
-    internals.invoke = (command, args, options) => {
-      const message = typeof args?.message === "string" ? args.message : "";
-      if (command === "plugin:dialog|message"
-          && (message.startsWith("Enable Tine-managed storage") || message.startsWith("Return to Direct files"))) {
-        return Promise.resolve("Yes");
-      }
-      return original(command, args, options);
-    };
-    return true;
-  });
-  if (!installed) throw new Error("could not install the scoped native-confirmation bypass");
 }
 
 async function waitForActivation() {
@@ -223,9 +224,8 @@ try {
   receipt.milestones.directFilesOpened = true;
 
   await openManagedSettings();
-  await installConfirmationBypass();
   const activationStarted = Date.now();
-  await clickButton("Enable Tine-managed storage...");
+  await clickButtonAndConfirm("Enable Tine-managed storage...");
   await waitForActivation();
   receipt.milestones.activationMs = Date.now() - activationStarted;
   assertSameSource(before, "managed activation");
@@ -234,7 +234,7 @@ try {
   receipt.milestones.managedPageOpened = true;
 
   await openManagedSettings();
-  await clickButton("Return to Direct files");
+  await clickButtonAndConfirm("Return to Direct files");
   await waitForBody("Enable Tine-managed storage...", 120_000, "Direct Files status after rollback");
   assertSameSource(before, "return to Direct Files");
   await closeSettings();
