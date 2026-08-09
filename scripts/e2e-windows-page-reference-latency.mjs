@@ -85,6 +85,7 @@ const env = {
   TINE_DEBUG_LOG: debugLog,
   TINE_E2E_APPLICATION_STDOUT_LOG: path.join(artifacts, "application-stdout.log"),
   TINE_E2E_APPLICATION_STDERR_LOG: path.join(artifacts, "application-stderr.log"),
+  E2E_WEBVIEW_USER_DATA_ROOT: path.join(root, "webview2-profile"),
   APPDATA: path.join(root, "appdata"),
   LOCALAPPDATA: path.join(root, "localappdata"),
 };
