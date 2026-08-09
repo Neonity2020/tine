@@ -126,6 +126,7 @@ import {
 import { paneSel, samePaneTarget } from "./paneSelect";
 import { SurfaceContext } from "./components/Block";
 import { endEdit } from "./editorController";
+import { installBackgroundFlush } from "./backgroundFlush";
 import { installAndroidBackHandler, requestAndroidRootClose } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
@@ -723,6 +724,17 @@ export function App(): JSX.Element {
   // would otherwise drop the last keystrokes typed right before quitting.
   // Hardened so it can NEVER wedge the window open: a re-entry guard, a timeout
   // cap on the flush, and a destroy()→close() fallback.
+  // GH #255: the OS can reclaim a backgrounded app without ever sending a close
+  // request, and everything inside the 400 ms save debounce is RAM-only until
+  // then. This is the only durability barrier on Android/iOS, and it also covers
+  // the desktop paths that skip a clean close. Installed unconditionally — it is
+  // a DOM listener, so it works in the browser dev shell too.
+  onMount(() => onCleanup(installBackgroundFlush({
+    endEdit: () => endEdit("graph-switch"),
+    flushAll,
+    closeInFlight: () => safeClose.inFlight(),
+  })));
+
   onMount(() => {
     if (!isTauri()) return;
     let unlisten = () => {};

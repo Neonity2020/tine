@@ -2919,6 +2919,32 @@
         ]
       },
       "notes": "Direct Files perf audit 2026-08-09, F1, found independently by both the Opus and Codex lanes with agreeing numbers (243 ms vs 263-281 ms). list_pages is memoized on raw cache_gen and its only rebuild path walks the graph text scope, re-reads every file and re-parses each one: ~35 us/file, linear from 506 to 8,006 pages, and find_entry rebuilds straight from it. Every save bumped the generation, so the first navigation or [[ autocomplete after any typing pause stalled ~1/4 s on a real 5,225-file graph. page_list_cache is now re-tagged to the new generation under the same condition the effective-identity index already uses. DELIBERATELY NARROWER than the auditor's recommendation: list_pages parses every file so a title:: edit really does move an entry (hence the !identity_changed gate), and referenced_page_names is genuinely content-derived and is left to rebuild. The test asserts a ratio, not an absolute time, so it survives a loaded shared box."
+    },
+    {
+      "id": "REG-BACKGROUND-FLUSH-255",
+      "title": "Pending edits are written when the app is backgrounded or hidden, not only on a clean window close",
+      "family": "durability",
+      "sources": {
+        "issues": [
+          255
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android",
+        "ios"
+      ],
+      "layer": "frontend",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "src/backgroundFlush.test.ts"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 7. The ONLY durability barrier in the app was onCloseRequested. Android/iOS never send one - the OS backgrounds the app and reclaims it later - so everything inside the 400ms save debounce was RAM-only. The three pre-existing visibilitychange listeners (Page.tsx, journal.ts, assetRefresh.ts) all act on becoming VISIBLE; this is the other edge. FAIL-BEFORE is an absence, not a wrong value: no listener flushed on hide, verified by grep across the tree, so there is no pre-fix test that can fail. Confidence for #255 is therefore MODERATE, not high: this is the plainest explanation for the Android half and is a real missing handler, but no same-platform reproduction of the reporter's loss exists. Findings 2 and 6 are other live candidates for the same report."
     }
   ]
 }
