@@ -62,6 +62,13 @@ const heldSources = new Set<string>();
 // path), so remember it and re-issue it the moment the dest is durable.
 const heldForcedSaves = new Set<string>();
 const heldByDest = new Map<string, string[]>();
+// Which conflict observation each banner is showing. "Keep mine" presents this
+// back so the override answers the conflict the USER SAW. Without it, a second
+// force request issued under one banner — a double click, the button is not
+// disabled while its request is pending — consumes authority the first request
+// minted for a NEWER external winner, and overwrites bytes nobody was shown.
+// (GH #254 increment 2, adversarial implementation verification, finding 1.)
+const conflictObservation = new Map<string, number>();
 
 // ---------------------------------------------------------------------------
 // Accessors — store.ts mutations call these instead of touching the guards.
@@ -222,6 +229,7 @@ export function untombstone(name: string) {
 export function forgetSaveState(name: string) {
   dirty.delete(name);
   baseRev.delete(name);
+  conflictObservation.delete(name);
   clearTransientRetry(name);
 }
 /** Cancel timers, invalidate in-flight saves (bump the graph token), and clear
@@ -239,6 +247,7 @@ export function resetSaveState() {
   graphToken++;
   dirty.clear();
   baseRev.clear();
+  conflictObservation.clear();
   deletedPages.clear();
   heldSources.clear();
   heldByDest.clear();
@@ -289,6 +298,19 @@ export function isRetryableSaveFailure(error: unknown): boolean {
     // Permanent until the page is reloaded — retrying just hides it.
     "managed.conflict",
   ].some((code) => message.includes(code));
+}
+
+/** The observation epoch a banner-class conflict was raised at.
+ *
+ *  `conflict:<n>` is the whole contract for the keep-mine/use-disk banner; the
+ *  bare `conflict` is the legacy shape and means the backend minted authority it
+ *  could not name, so no override may be presented for it. Returns null when the
+ *  error is not banner class at all, and -1 for the unnameable legacy shape. */
+function conflictObservationEpoch(error: unknown): number | null {
+  const message = String(error).replace(/^Error: /, "");
+  if (message === "conflict") return -1;
+  const match = /^conflict:(\d+)$/.exec(message);
+  return match ? Number(match[1]) : null;
 }
 
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
@@ -404,7 +426,7 @@ async function doSave(
   try {
     const baseline = baseRev.get(name) ?? null;
     const rev = await measureIssue248Async("frontend.savePageAwaitMs", () =>
-      backend().savePage(dto, baseline, force)
+      backend().savePage(dto, baseline, force, force ? (conflictObservation.get(name) ?? null) : null)
     );
     // A reload/rename/delete/rebind while savePage was in flight invalidates the
     // retirement proof even if those bytes landed. Never let that stale success
@@ -415,6 +437,7 @@ async function doSave(
       if (baseline === null) bumpPageInventoryRev();
     }
     clearTransientRetry(name);
+    conflictObservation.delete(name);
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
@@ -426,8 +449,11 @@ async function doSave(
     // options cannot resolve any of them AND stops the page saving from then on.
     // Those now arrive with their own bounded code and fall through to the
     // retry/toast path below.
-    if (String(e) === "conflict" || String(e) === "Error: conflict") {
+    const observed = conflictObservationEpoch(e);
+    if (observed !== null) {
       clearTransientRetry(name);
+      if (observed >= 0) conflictObservation.set(name, observed);
+      else conflictObservation.delete(name);
       markConflict(name);
     } else if (String(e).includes("conflict_retry.")) {
       // The backend could not coherently observe the winner, so it minted no
@@ -444,6 +470,7 @@ async function doSave(
       // a banner the user can actually act on. (GH #254 increment 2,
       // adversarial implementation verification, finding 3.)
       clearConflict(name);
+      conflictObservation.delete(name);
       if (token === graphToken) {
         dirty.add(name);
         scheduleTransientRetry(name, token, e);

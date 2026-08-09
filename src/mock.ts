@@ -879,7 +879,7 @@ export function mockBackend(): Backend {
       }
       return files.map((f) => ({ ...f, bytes: new TextEncoder().encode(f.text).length }));
     },
-    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean): Promise<string> {
+    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<string> {
       return "mock-rev"; // no-op in mock
     },
     async managedSyncStatus() {

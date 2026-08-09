@@ -42,6 +42,6 @@ pub use graph_text_scope::{
     GRAPH_TEXT_SCOPE_VERSION,
 };
 pub use model::{
-    BlockDto, BlockPreview, Graph, GraphMeta, PageDto, PageEntry, PageKind, RefGroup,
-    ReferencedPageNames,
+    BlockDto, BlockPreview, ConflictOverride, Graph, GraphMeta, PageDto, PageEntry, PageKind,
+    ReferencedPageNames, RefGroup,
 };

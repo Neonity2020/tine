@@ -242,7 +242,7 @@ export interface Backend {
   /** Save a page. `baseRev` is the file hash the editor loaded; the backend
    *  rejects with "conflict" if the file changed on disk since then (unless
    *  `force`). Returns the new on-disk rev to use as the next baseline. */
-  savePage(page: PageDto, baseRev: string | null, force?: boolean): Promise<string>;
+  savePage(page: PageDto, baseRev: string | null, force?: boolean, conflictEpoch?: number | null): Promise<string>;
   managedSyncStatus(): Promise<ManagedSyncStatus | null>;
   managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
@@ -718,9 +718,9 @@ class TauriBackend implements Backend {
   graphSourceFiles(includeJournals: boolean) {
     return this.call<GraphSourceFile[]>("graph_source_files", { includeJournals });
   }
-  savePage(page: PageDto, baseRev: string | null, force = false) {
+  savePage(page: PageDto, baseRev: string | null, force = false, conflictEpoch: number | null = null) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
-      this.call<string>("save_page", { page, baseRev, force })
+      this.call<string>("save_page", { page, baseRev, force, conflictEpoch })
     );
   }
   managedSyncStatus() {

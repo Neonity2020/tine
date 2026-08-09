@@ -2026,6 +2026,17 @@ struct ConflictEditorEpisode {
     loaded_revision: Option<String>,
 }
 
+/// Which conflict a "Keep mine" is answering.
+///
+/// A force request must name the observation the user was actually SHOWN. The
+/// path alone is not enough: authority for a NEWER, unseen winner can be minted
+/// between the moment a request is issued and the moment it runs, and a request
+/// that names only its path will happily consume it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConflictOverride {
+    pub observation_epoch: u64,
+}
+
 #[derive(Clone, Debug)]
 struct ConflictAuthority {
     snapshot: ConflictSnapshot,
@@ -20051,7 +20062,7 @@ impl Graph {
         editor_episode: &ConflictEditorEpisode,
         snapshot: ConflictSnapshot,
         bytes: Option<String>,
-    ) {
+    ) -> u64 {
         debug_assert_eq!(
             matches!(snapshot, ConflictSnapshot::Present { .. }),
             bytes.is_some()
@@ -20067,14 +20078,28 @@ impl Graph {
                 observation_epoch,
             },
         );
+        observation_epoch
     }
 
     fn consume_conflict_authority(
         &self,
         path: &Path,
         editor_episode: &ConflictEditorEpisode,
+        presented: ConflictOverride,
     ) -> io::Result<ConflictAuthority> {
         let mut state = self.conflict_authority.lock().unwrap();
+        // Check ownership BEFORE taking. A request that does not name the live
+        // observation is not this token's owner, and spending it on their behalf
+        // would leave the user unable to resolve the conflict they can actually
+        // see — a stray duplicate click would disarm the banner permanently.
+        if let Some(live) = state.tokens.get(path) {
+            if live.observation_epoch != presented.observation_epoch {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflict override authority is newer than the conflict this request answers",
+                ));
+            }
+        }
         let token = state.tokens.remove(path);
         let consumed_epoch = Self::advance_conflict_observation_epoch(&mut state, path) - 1;
         let token = token.ok_or_else(|| {
@@ -20089,6 +20114,20 @@ impl Graph {
                 "conflict override authority belongs to a different editor episode",
             ));
         }
+        // The caller must name the observation it was SHOWN, not merely hold a
+        // path. Without this the check above is only self-consistency: it proves
+        // the live token is the newest one, never that the user ever saw it.
+        //
+        // The reachable loss: an external writer publishes B after the banner
+        // showed A. Two force requests are in flight under that one banner (a
+        // double click; the button is not disabled while pending). The first
+        // correctly refuses B and — being a coherent observation — mints fresh
+        // authority FOR B. The second request, issued before B existed and
+        // serialized behind the first by the per-page save queue, then consumed
+        // that new token and overwrote B. The user never saw B and never chose
+        // to discard it. (GH #254 increment 2, adversarial implementation
+        // verification, finding 1.)
+        debug_assert_eq!(token.observation_epoch, presented.observation_epoch);
         Ok(token)
     }
 
@@ -20103,8 +20142,17 @@ impl Graph {
         let Some(editor_episode) = editor_episode else {
             return io::Error::new(io::ErrorKind::AlreadyExists, "conflict");
         };
-        self.mint_conflict_authority(path, editor_episode, snapshot, bytes);
-        io::Error::new(io::ErrorKind::AlreadyExists, site.message())
+        let observation_epoch = self.mint_conflict_authority(path, editor_episode, snapshot, bytes);
+        // The epoch rides along so the UI can echo it back on "Keep mine" and
+        // name the observation the user was actually shown. `contains`-based
+        // code classification is unaffected by the suffix.
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} {CONFLICT_OBSERVATION_TAG}{observation_epoch}]",
+                site.message()
+            ),
+        )
     }
 
     fn tokenless_conflict_error(site: EditorConflictSite, observation: io::Error) -> io::Error {
@@ -20920,17 +20968,53 @@ impl Graph {
 
     /// Apply the one-shot conflict authority associated with the revision carried
     /// by a directly loaded `PageDto`.
+    /// The conflict currently outstanding for this page's save target, if any.
+    ///
+    /// The UI reads this when it raises a banner and echoes it back on "Keep
+    /// mine", so the override names the observation the user saw. Only Tine's
+    /// own save attempts mint, and they are serialized per page, so the value a
+    /// caller reads immediately after its own save failed is that save's own
+    /// observation.
+    pub fn outstanding_conflict_override(
+        &self,
+        page: &PageDto,
+    ) -> io::Result<Option<ConflictOverride>> {
+        let write = self.admit_managed_text_writer()?;
+        let (path, _cache) = self.save_target(&write, page)?;
+        let state = self.conflict_authority.lock().unwrap();
+        Ok(state.tokens.get(&path).map(|token| ConflictOverride {
+            observation_epoch: token.observation_epoch,
+        }))
+    }
+
+    /// Force with whatever authority is outstanding right now.
+    ///
+    /// Deliberately NOT the production path: "whatever is current" is exactly
+    /// the assumption finding 1 exploited. Tests use it to mean "the conflict I
+    /// just caused"; the app must name its observation explicitly through
+    /// `force_save_page_at_revision`.
     pub fn force_save_page(&self, page: &PageDto) -> io::Result<String> {
-        self.force_save_page_at_revision(page, page.rev.as_deref())
+        let outstanding = self.outstanding_conflict_override(page)?;
+        self.force_save_page_at_revision(
+            page,
+            page.rev.as_deref(),
+            outstanding.unwrap_or(ConflictOverride {
+                // No token: let the consume step produce its own "missing or
+                // already consumed" refusal rather than a mismatch message.
+                observation_epoch: u64::MAX,
+            }),
+        )
     }
 
     /// Save with the exact conflict snapshot shown to this editor episode as the
     /// ordinary-save baseline. `base_rev` comes from the frontend's editor state;
-    /// its save DTO deliberately omits `PageDto.rev`.
+    /// its save DTO deliberately omits `PageDto.rev`. `authority` names WHICH
+    /// conflict observation the user answered.
     pub fn force_save_page_at_revision(
         &self,
         page: &PageDto,
         base_rev: Option<&str>,
+        authority: ConflictOverride,
     ) -> io::Result<String> {
         if page.guide {
             #[cfg(debug_assertions)]
@@ -20947,7 +21031,7 @@ impl Graph {
         };
         // Atomic take happens before every fallible validation below. A failed or
         // replayed attempt therefore cannot reuse the authority it started with.
-        let authority = self.consume_conflict_authority(&path, &editor_episode)?;
+        let authority = self.consume_conflict_authority(&path, &editor_episode, authority)?;
         // "Keep mine" resolves a content conflict, but it must not turn an I/O or
         // decoding failure into permission to overwrite unknown bytes.
         let requested_identity = page
@@ -31359,6 +31443,20 @@ fn graph_text_admission_unavailable(cause: &str) -> io::Error {
 /// The strings matched here are produced by this module, so this is internal
 /// consistency rather than parsing a foreign format. `direct_save_failure_codes_
 /// are_stable` pins each code to the site that produces it.
+/// Marker introducing the observation epoch in a banner-class conflict message.
+pub(crate) const CONFLICT_OBSERVATION_TAG: &str = "[observation ";
+
+/// The observation epoch a banner-class conflict was minted at, if this error
+/// carries one. The UI stores it with the banner and presents it back on "Keep
+/// mine" so the override answers the conflict the user saw, not whatever
+/// authority happens to be current when the request runs.
+pub fn direct_save_conflict_epoch(error: &io::Error) -> Option<u64> {
+    let message = error.to_string();
+    let start = message.rfind(CONFLICT_OBSERVATION_TAG)? + CONFLICT_OBSERVATION_TAG.len();
+    let rest = &message[start..];
+    rest[..rest.find(']')?].parse().ok()
+}
+
 pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
     let message = error.to_string();
     let has = |needle: &str| message.contains(needle);
@@ -37185,9 +37283,9 @@ mod tests {
         // The wire shape: the working store has no revision to send.
         dto.rev = None;
         fs::write(&path, "- theirs\n").unwrap();
-        g.save_page(&dto, Some(&base_rev)).unwrap_err();
+        let shown = g.save_page(&dto, Some(&base_rev)).unwrap_err();
 
-        g.force_save_page_at_revision(&dto, Some(&base_rev))
+        g.force_save_page_at_revision(&dto, Some(&base_rev), gh254_shown(&shown))
             .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
@@ -37209,9 +37307,9 @@ mod tests {
         dto.blocks[0].raw = "mine".into();
         dto.rev = None;
         fs::write(&path, "- theirs\n").unwrap();
-        g.save_page(&dto, Some(&base_rev)).unwrap_err();
+        let shown = g.save_page(&dto, Some(&base_rev)).unwrap_err();
 
-        g.force_save_page_at_revision(&dto, Some(&base_rev))
+        g.force_save_page_at_revision(&dto, Some(&base_rev), gh254_shown(&shown))
             .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
@@ -49840,9 +49938,9 @@ mod tests {
         let saved_rev = graph.save_page(&page, Some(&base_rev)).unwrap();
         page.blocks[0].raw = "forced A".to_owned();
         fs::write(moved.join("pages/Target.org"), "* external A\n").unwrap();
-        graph.save_page(&page, Some(&saved_rev)).unwrap_err();
+        let shown = graph.save_page(&page, Some(&saved_rev)).unwrap_err();
         graph
-            .force_save_page_at_revision(&page, Some(&saved_rev))
+            .force_save_page_at_revision(&page, Some(&saved_rev), gh254_shown(&shown))
             .unwrap();
         graph
             .delete_page_expected("Victim", PageKind::Page, None)
@@ -51336,6 +51434,118 @@ mod tests {
 
     /// The other half of the same rule: a DIFFERENT-byte winner on a new inode
     /// is still refused, and is left exactly as that winner wrote it.
+    /// The observation a banner-class conflict named, as the UI echoes it back.
+    fn gh254_shown(error: &io::Error) -> ConflictOverride {
+        ConflictOverride {
+            observation_epoch: direct_save_conflict_epoch(error)
+                .expect("a banner-class conflict names its observation"),
+        }
+    }
+
+    /// Adversarial implementation verification, finding 1. Two force requests
+    /// issued under ONE banner: the button is not disabled while its request is
+    /// pending, and the per-page save queue serializes them. An external writer
+    /// publishes B after the banner showed A. The first request correctly
+    /// refuses B — and, being a coherent observation, mints fresh authority FOR
+    /// B. The second request, issued before B existed, must not be able to
+    /// spend it: the user never saw B.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner() {
+        let (root, path, graph, page) = gh254_loaded("force-double-click");
+        fs::write(&path, "- shown winner A\n").unwrap();
+        let shown = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let banner = ConflictOverride {
+            observation_epoch: direct_save_conflict_epoch(&shown)
+                .expect("a banner-class conflict names its observation"),
+        };
+
+        // …and then B lands, unseen.
+        fs::write(&path, "- winner B, which nobody was shown\n").unwrap();
+
+        // Click one: refuses B and re-banners over it.
+        let first = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), banner)
+            .unwrap_err();
+        assert_eq!(gh254_code(&first), "conflict.save_baseline_present");
+
+        // Click two, already in flight under the SAME banner.
+        let second = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), banner)
+            .unwrap_err();
+        assert_eq!(second.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "- winner B, which nobody was shown\n",
+            "a duplicated request overwrote a winner the user never saw"
+        );
+
+        // The user, now shown B, can still resolve it deliberately.
+        let over_b = ConflictOverride {
+            observation_epoch: direct_save_conflict_epoch(&first).unwrap(),
+        };
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), over_b)
+            .unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("mine"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Refusing a mis-addressed override must not SPEND the live one. Checking
+    /// ownership after taking would let one stray duplicate click disarm the
+    /// banner permanently: the user would keep seeing a conflict whose "Keep
+    /// mine" can never work, with only the destructive button left.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_a_mis_addressed_override_does_not_disarm_the_live_banner() {
+        let (root, path, graph, page) = gh254_loaded("force-no-disarm");
+        fs::write(&path, "- the winner\n").unwrap();
+        let shown = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let live = gh254_shown(&shown);
+
+        let wrong = ConflictOverride {
+            observation_epoch: live.observation_epoch + 7,
+        };
+        let refused = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), wrong)
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- the winner\n");
+
+        // The banner the user is looking at still resolves.
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), live)
+            .unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("mine"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The same handle also stops a stale override from a second editor episode
+    /// that loaded the same revision: it can only present an epoch it was shown,
+    /// and the live token has moved past it.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_an_override_naming_a_superseded_observation_is_refused() {
+        let (root, path, graph, page) = gh254_loaded("force-stale-episode");
+        fs::write(&path, "- first winner\n").unwrap();
+        let first = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let stale = ConflictOverride {
+            observation_epoch: direct_save_conflict_epoch(&first).unwrap(),
+        };
+
+        // A later observation supersedes it.
+        fs::write(&path, "- second winner\n").unwrap();
+        let second = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert!(direct_save_conflict_epoch(&second).unwrap() > stale.observation_epoch);
+
+        let refused = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), stale)
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- second winner\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn gh254_force_refuses_a_different_byte_winner_on_a_new_inode() {
