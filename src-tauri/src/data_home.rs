@@ -44,7 +44,11 @@ static RELOCATED_TO: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(all(desktop, target_os = "linux"))]
 fn probe_writable(base: &Path, identifier: &str) -> std::io::Result<()> {
     let app_dir = base.join(identifier);
-    let target = if app_dir.is_dir() { app_dir } else { base.to_path_buf() };
+    let target = if app_dir.is_dir() {
+        app_dir
+    } else {
+        base.to_path_buf()
+    };
     std::fs::create_dir_all(&target)?;
     let probe = target.join(format!(".tine-write-probe-{}", std::process::id()));
     std::fs::write(&probe, b"")?;
@@ -108,8 +112,9 @@ pub(crate) fn ensure_usable(identifier: &str) {
             "app-data home relocated to {} for this launch",
             candidate.display()
         ));
-        *RELOCATED_TO.lock().unwrap_or_else(|poison| poison.into_inner()) =
-            Some(candidate.display().to_string());
+        *RELOCATED_TO
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(candidate.display().to_string());
         return;
     }
     // Everything is unwritable. Tauri is about to panic on exactly this error;
