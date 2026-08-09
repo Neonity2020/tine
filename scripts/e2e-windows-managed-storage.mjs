@@ -229,7 +229,7 @@ try {
     connectionRetryTimeout: 60_000,
   });
   await browser.$(".ls-block").waitForExist({ timeout: 60_000 });
-  await waitForBody(journalMarker, 60_000, "initial Direct Files journal");
+  await openPage(nestedTitle);
   receipt.milestones.directFilesOpened = true;
 
   await openManagedSettings();
