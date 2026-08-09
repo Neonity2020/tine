@@ -31456,7 +31456,6 @@ mod validation_tests {
         let completed = session.finish().unwrap();
         let finished = finish_started.elapsed();
         let work = completed.bootstrap_catalog_work_stats();
-        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
         let (sample_page, sample_content) = sample.unwrap();
         assert_eq!(
             completed
@@ -31467,12 +31466,23 @@ mod validation_tests {
                 .content,
             sample_content
         );
+        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
+        assert!(
+            scratch.page_append_batches.saturating_mul(100) < scratch.page_writes,
+            "detached bootstrap emitted one physical page write per logical record: {scratch:?}"
+        );
+        assert!(
+            scratch.blob_append_batches.saturating_mul(100) < scratch.blob_writes,
+            "detached bootstrap emitted one physical blob write per logical record: {scratch:?}"
+        );
         eprintln!(
-            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} catalog_work={work:?}",
+            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_page_append_batches={} scratch_blob_append_batches={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} catalog_work={work:?}",
             authored.as_secs_f64() * 1_000.0,
             finished.as_secs_f64() * 1_000.0,
             scratch.page_reads,
             scratch.page_writes,
+            scratch.page_append_batches,
+            scratch.blob_append_batches,
             scratch.range_reads,
             scratch.page_bytes_read,
             scratch.page_bytes_written,
