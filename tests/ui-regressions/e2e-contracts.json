@@ -795,6 +795,28 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-windows-managed-storage.mjs": {
+    "contracts": [
+      {
+        "class": "exact-safety-interoperability",
+        "userOutcome": "On Windows, explicit managed-storage activation and return to Direct Files preserve every captured Markdown and Org source byte.",
+        "blocking": true,
+        "authority": "Tine managed-storage authority transition and Direct Files interoperability contract"
+      },
+      {
+        "class": "core-operation",
+        "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after managed-storage activation and after returning to Direct Files.",
+        "blocking": true
+      }
+    ],
+    "acceptableVariations": [
+      "Hosted Windows filesystem speed, WebView2 startup timing, and managed-storage activation duration may vary."
+    ],
+    "nonRequirements": [
+      "Native confirmation-dialog appearance, internal private-storage layout, or exact progress wording."
+    ],
+    "stability": "burn-in"
+  },
   "scripts/e2e-windows-smoke.mjs": {
    "contracts": [
     {
