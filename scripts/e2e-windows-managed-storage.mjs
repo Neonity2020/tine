@@ -171,7 +171,12 @@ async function waitForActivation() {
 }
 
 async function openPage(title) {
-  await browser.keys(["Control", "k"]);
+  // WebView2 attachment does not guarantee native keyboard focus. Fixture
+  // navigation is not a shortcut assertion, so enter the switcher through its
+  // visible application control.
+  const search = await browser.$('button[title^="Search (Ctrl+K)"]');
+  await search.waitForClickable({ timeout: 15_000 });
+  await search.click();
   const input = await browser.$(".switcher-input");
   await input.waitForExist({ timeout: 15_000 });
   await input.setValue(title);
