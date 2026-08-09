@@ -138,13 +138,14 @@ async function openManagedSettings(expectedAction) {
     }
   }
   await waitForBody("Storage & sync", 15_000, "storage settings");
-  const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
-  await experimental.waitForExist({ timeout: 15_000 });
-  const action = await buttonContaining(expectedAction);
-  if (!action || !(await action.isDisplayed())) await experimental.click();
   await browser.waitUntil(async () => {
     const button = await buttonContaining(expectedAction);
-    return Boolean(button && await button.isDisplayed());
+    if (button && await button.isDisplayed()) return true;
+    const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
+    if (await experimental.isExisting() && await experimental.getAttribute("aria-expanded") !== "true") {
+      await experimental.click();
+    }
+    return false;
   }, { timeout: 15_000, timeoutMsg: `managed storage action did not expand: ${expectedAction}` });
 }
 
