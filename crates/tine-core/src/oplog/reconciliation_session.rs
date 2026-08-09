@@ -1084,8 +1084,8 @@ impl LiveReconciliationSessionDispatch<'_> {
                 Ok(scan) => scan,
                 Err(error) => {
                     let outcome = match error.class {
-                        // The two-pass scanner established that its observed
-                        // epoch moved. One coalesced fresh scan is meaningful.
+                        // The retained graph or expected binding moved around
+                        // the census. One coalesced fresh scan is meaningful.
                         GraphTextScanFailureClass::UnstableEpoch => {
                             ReconciliationSessionDispatchOutcome::RetryFull
                         }

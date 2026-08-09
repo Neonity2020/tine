@@ -1008,7 +1008,7 @@ impl ReconciliationBaseline {
         validate_scan_instrumentation(&finish.instrumentation, finish.candidate_count, clean)?;
         if clean && finish.pass_a_digest != finish.pass_b_digest {
             return Err(unavailable(
-                "an unstable two-pass scan cannot become the clean baseline head",
+                "an unstable scan compatibility identity cannot become the clean baseline head",
             ));
         }
         let path = self.path.clone();

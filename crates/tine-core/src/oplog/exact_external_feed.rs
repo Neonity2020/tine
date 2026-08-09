@@ -560,10 +560,10 @@ impl ExactExternalFeedState {
                     active.rebase_before_step = true;
                     active.retry_rebase = true;
                 } else if active.retry_rebases == 0 {
-                    // Refresh once for the two-pass race. Further instability
-                    // gets a bounded retry cycle below instead of repeatedly
-                    // rebuilding the complete graph-wide index in one watcher
-                    // turn.
+                    // Refresh once when the retained graph or expected binding
+                    // moved around the census. Further instability gets a
+                    // bounded retry cycle below instead of repeatedly rebuilding
+                    // the complete graph-wide index in one watcher turn.
                     active.rebase_before_step = true;
                     active.retry_rebase = true;
                 } else {
