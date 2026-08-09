@@ -30,34 +30,52 @@ describe("pageListLabel", () => {
 
 // Direct Files performance audit, finding F9. The label rule is unchanged; what
 // changed is that deciding it no longer costs a scan of the whole page list PER
-// ROW. A correctness test cannot see that, so pin the shape directly: building
-// the index once and asking it N times must stay linear in the list, not
-// quadratic. Measured before the change: 21 ms at 5,000 pages and 39 ms at
-// 20,000, for the sidebar's 300 visible rows.
-describe("pageListLabels scales with the list, not with list x rows", () => {
-  const list = (n: number) =>
-    Array.from({ length: n }, (_, i) => page(`p${i}`, `pages/p${i}.md`));
-
-  function costOfLabellingEveryRow(n: number): number {
-    const pages = list(n);
-    const started = performance.now();
-    const label = pageListLabels(pages);
-    for (const p of pages) label(p);
-    return performance.now() - started;
+// ROW. A correctness test cannot see that, and a wall-clock test on a shared box
+// is a coin flip — so count the work directly instead: a linear implementation
+// reads the array once while BUILDING the index and never touches it again,
+// while a per-row scan reads it once more for every row it labels.
+describe("pageListLabels reads the page list once, not once per row", () => {
+  function countingList(n: number) {
+    const pages = Array.from({ length: n }, (_, i) => page(`p${i}`, `pages/p${i}.md`));
+    let reads = 0;
+    const watched = new Proxy(pages, {
+      get(target, key, receiver) {
+        if (typeof key === "string" && /^\d+$/.test(key)) reads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    return { pages, watched, reads: () => reads };
   }
 
-  it("stays roughly linear when the list grows tenfold", () => {
-    costOfLabellingEveryRow(2_000); // warm the JIT so the first run isn't the slow one
-    const small = costOfLabellingEveryRow(1_000);
-    const large = costOfLabellingEveryRow(10_000);
+  it("touches no list element while labelling", () => {
+    const { pages, watched, reads } = countingList(500);
 
-    // Quadratic would be ~100x. Allow a very loose ceiling: this is a shape
-    // assertion on a shared CI box, not a benchmark.
-    expect(large).toBeLessThan(Math.max(small, 0.5) * 25);
+    const label = pageListLabels(watched);
+    const afterBuild = reads();
+    for (const p of pages) label(p);
+
+    expect(afterBuild).toBeLessThanOrEqual(pages.length);
+    expect(reads() - afterBuild).toBe(0);
+  });
+
+  // Same assertion stated as the failure it catches: the pre-fix implementation
+  // read ~2 x 500 x 500 elements to label this list.
+  it("does not grow its element reads with the number of rows labelled", () => {
+    const { pages, watched, reads } = countingList(500);
+    const label = pageListLabels(watched);
+
+    for (const p of pages.slice(0, 10)) label(p);
+    const afterTen = reads();
+    for (const p of pages) label(p);
+
+    expect(reads()).toBe(afterTen);
   });
 
   it("still disambiguates correctly at scale", () => {
-    const pages = [...list(5_000), page("p0", "pages/other/p0.md")];
+    const pages = [
+      ...Array.from({ length: 5_000 }, (_, i) => page(`p${i}`, `pages/p${i}.md`)),
+      page("p0", "pages/other/p0.md"),
+    ];
     const label = pageListLabels(pages);
     expect(label(pages[0])).toBe("p0 — pages/");
     expect(label(pages[pages.length - 1])).toBe("p0 — other/");
