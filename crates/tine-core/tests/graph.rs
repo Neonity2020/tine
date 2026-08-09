@@ -460,6 +460,11 @@ fn portable_case_nfc_and_file_identity_aliases_are_readable_but_non_writable() {
         ),
         ("nfc", "external/Caf\u{e9}.md", "external/Cafe\u{301}.md"),
         (
+            "ancestor-nfc",
+            "Ext\u{e9}rnal/Page.md",
+            "Exte\u{301}rnal/page.md",
+        ),
+        (
             "german-sharp-s",
             "external/Straße.md",
             "external/STRASSE.md",

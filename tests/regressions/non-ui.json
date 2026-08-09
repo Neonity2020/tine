@@ -2347,7 +2347,7 @@
     },
     {
       "id": "REG-DIRECT-SAVE-WHOLE-GRAPH-REPARSE-267",
-      "title": "Saving a page does not reparse every document in the graph",
+      "title": "Saving an existing page never captures or reparses the whole graph",
       "family": "direct-save-performance",
       "sources": {
         "issues": [
@@ -2364,15 +2364,16 @@
       "status": "covered",
       "coverage": {
         "tests": [
+          "crates/tine-core/src/model.rs::invalidated_graph_index_does_not_expand_an_existing_save",
+          "crates/tine-core/src/model.rs::changed_existing_save_has_one_portable_traversal_and_no_graph_capture",
+          "crates/tine-core/src/model.rs::steady_state_direct_saves_never_build_the_graph_index",
           "crates/tine-core/src/model.rs::a_rebuild_parses_only_the_documents_whose_bytes_changed",
-          "crates/tine-core/src/model.rs::reused_semantics_follow_the_bytes_not_the_file",
-          "crates/tine-core/src/model.rs::steady_state_direct_saves_do_not_rebuild_the_graph_index",
           "crates/tine-core/src/model.rs::direct_save_latency_manual_benchmark"
         ],
         "scenario": "direct-markdown.save-latency",
         "failBefore": "proven"
       },
-      "notes": "A Direct save validates its target against a guarded graph-wide admission index. Whenever the exact-observation chain had broken -- which on Windows and in poll mode was permanent before REG-EXTERNAL-GRAPH-WIDE-EVENTS-268 and REG-POLL-MODE-ADMISSION-INDEX-REBUILD-001 -- rebuilding that index PARSED EVERY DOCUMENT IN THE GRAPH, on every save. An invalidation means 'we lost track of the filesystem', not 'everything changed': the capture already carries a per-file BlobDescription (SHA-256 of the content plus its length), so a rebuild now reuses the prior index's parsed semantics for every file whose digest is unchanged and parses only what actually moved. Soundness rests on a new per-record `semantic_parsed` flag: a record whose semantic came from the page cache or from its filename is a guess and is never reused, so the reuse cannot launder a guess into something later builds treat as parsed. Fail-before proven by disabling the reuse in place: a rebuild then parsed 27 documents whether or not anything had changed, against 3 (nothing changed) and 4 (one document changed) with it. Measured on a synthetic 1,001-page / 12 MB graph, release build, local ext4: a save that rebuilds went 81 ms -> 62 ms, with the index-construction phase 29 ms -> 9 ms and decode_semantics still true (authority preserved). The remaining ~50 ms is the two-pass capture, which still reads every file; that cut is not in this change. Two simpler designs were tried and rejected with evidence, both recorded in the handoff: threading a `need_semantics` flag into the cache-hit test forced an index rebuild MID-WRITE, when the save's own .editor-recovery file still aliases the target's inode, and failed the save outright; and skipping the parse for saves alone opened a real hole where a page creation could be admitted over an externally retitled document. Also note the codebase's standing contract, asserted by generation_bound_identity_validation_avoids_save_time_graph_reparse, that name-only creation must not run a per-document parse pass -- any future cut here has to keep it."
+      "notes": "Reopened after the reporter confirmed the defect remained in v0.6.91 Direct Files. The diagnostic refusal was `precheck.limit: guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`; GH #295 independently measured one complete 1,046-file / 16.7 MB capture on every Windows save (roughly 0.9-1.1 s). Root cause was architectural: both existing-target validation and the atomic replacement transaction invoked the complete managed shadow-import admission index. The cut now keeps an existing save local: one exact target parse/read, one capability-safe traversal following only portable-equivalent target path components (including case/NFC aliases in ancestor directories), exact file identity and link-count-one checks, and the existing no-replace/retire/restore/fsync protocol. Missing-target creation alone retains the complete semantic proof and its parsed-semantic reuse. On the attached #295 graph in release mode, warm save median was 1.13 ms and forcibly invalidated save median 0.98 ms, with complete builds unchanged at one; the prior current-master measurement was 2.75 ms warm and 70 ms invalidated. Structural tests prove exactly one portable traversal, zero graph capture enumerations, one target parse, and no write on portable/hard-link/external-byte conflicts."
     },
     {
       "id": "REG-SAME-BYTES-EXTERNAL-REPLACE-STRANDS-EDITOR-001",

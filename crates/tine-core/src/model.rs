@@ -3795,6 +3795,7 @@ thread_local! {
     static GRAPH_TEXT_ADMISSION_TEST_COUNTERS: std::cell::Cell<GraphTextAdmissionTestCounters> = const { std::cell::Cell::new(GraphTextAdmissionTestCounters { builder_enumerations: 0, point_query_attempts: 0, parser_invocations: 0, index_map_insertions: 0, event_map_key_reads: 0, event_map_key_writes: 0, event_reverse_members: 0, persistent_node_allocations: 0, persistent_rotations: 0, persistent_payload_members: 0 }) };
     static GRAPH_TEXT_PARSE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static GRAPH_TEXT_PORTABLE_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_TEXT_EVENT_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_EXACT_FEED_PREPARE_PATH: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> io::Result<()>>>> = std::cell::RefCell::new(None);
@@ -5851,8 +5852,9 @@ impl Graph {
     /// its 200 ms coalescing delay. Exact file paths update the retained final
     /// state under the same resource-wide authority as Tine writes. Overflow,
     /// notify errors, directory/configuration events, poll cycles, and any
-    /// ambiguous path invalidate the generation; the next guarded write must
-    /// perform exactly one complete rebuild before it can authorize mutation.
+    /// ambiguous path invalidate the generation. Missing-target creation must
+    /// rebuild complete semantic proof; an existing exact-owner save uses its
+    /// retained path-local and single-link proofs instead.
     pub fn observe_graph_text_external_paths<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
@@ -6785,6 +6787,180 @@ impl Graph {
         }))
     }
 
+    /// Prove the exact-file properties needed before the final mutation
+    /// boundary. Portable-path proof is deliberately separate: initial
+    /// validation must not enumerate a large retained parent twice per save.
+    fn validate_existing_graph_text_target_local(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        expected_identity: ContentDigest,
+    ) -> io::Result<()> {
+        let target = self.managed_target(permit, path, false)?;
+        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        self.validate_existing_graph_text_target_exact(
+            &target,
+            &managed_path,
+            Some(expected_identity),
+        )?;
+        Ok(())
+    }
+
+    fn validate_existing_graph_text_target_exact(
+        &self,
+        target: &ManagedTextTarget,
+        managed_path: &ManagedPath,
+        expected_identity: Option<ContentDigest>,
+    ) -> io::Result<ContentDigest> {
+        projection_optional_regular_metadata(target.parent(), &target.filename)?;
+        let file = open_projection_file_nofollow(target.parent(), &target.filename)?;
+        let identity = canonical_projection_file_resource_id(&file)?;
+        if expected_identity.is_some_and(|expected| expected != identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed text target changed at the local identity validation boundary",
+            ));
+        }
+        validate_graph_text_single_link(&file, managed_path.as_str())?;
+        Ok(identity)
+    }
+
+    /// Starting from the retained graph root, traverse only directory spellings
+    /// whose single-component portable identity matches the requested path.
+    /// This discovers case/NFC aliases in any ancestor without admitting an
+    /// unrelated subtree or reading graph-text bytes.
+    fn validate_graph_text_portable_aliases_path_local(
+        &self,
+        permit: &ManagedTextWritePermit,
+        managed_path: &ManagedPath,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        GRAPH_TEXT_PORTABLE_TRAVERSALS.with(|count| count.set(count.get().saturating_add(1)));
+
+        struct PortablePrefix {
+            directory: Dir,
+            relative: String,
+        }
+
+        let limits = managed_text_inventory_limits();
+        let components = managed_path.as_str().split('/').collect::<Vec<_>>();
+        if components.len().saturating_sub(1) > limits.directory_depth {
+            return Err(managed_text_inventory_limit_error(
+                "managed directory depth",
+            ));
+        }
+        let mut prefixes = vec![PortablePrefix {
+            directory: self.managed_permit_root(permit)?.try_clone()?,
+            relative: String::new(),
+        }];
+        let mut all_entries = 0_usize;
+        let mut directory_count = 1_usize;
+        let mut path_bytes = 0_u64;
+
+        for (component_index, requested_component) in components.iter().enumerate() {
+            let requested_key = PortablePathKey::from_graph_text_path(requested_component);
+            let is_filename = component_index + 1 == components.len();
+            let mut next = Vec::new();
+
+            for prefix in prefixes {
+                for entry in prefix.directory.entries()? {
+                    all_entries = all_entries.checked_add(1).ok_or_else(|| {
+                        managed_text_inventory_limit_error("all directory entries")
+                    })?;
+                    if all_entries > limits.all_entries {
+                        return Err(managed_text_inventory_limit_error("all directory entries"));
+                    }
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else {
+                        // ManagedPath is UTF-8 by contract, so this entry cannot
+                        // share the requested portable component identity.
+                        continue;
+                    };
+                    let relative_len = prefix
+                        .relative
+                        .len()
+                        .checked_add(usize::from(!prefix.relative.is_empty()))
+                        .and_then(|length| length.checked_add(name.len()))
+                        .ok_or_else(|| {
+                            managed_text_inventory_limit_error("aggregate path bytes")
+                        })?;
+                    path_bytes = path_bytes
+                        .checked_add(usize_to_u64(relative_len)?)
+                        .ok_or_else(|| {
+                            managed_text_inventory_limit_error("aggregate path bytes")
+                        })?;
+                    if path_bytes > limits.path_bytes {
+                        return Err(managed_text_inventory_limit_error("aggregate path bytes"));
+                    }
+                    if PortablePathKey::from_graph_text_path(name) != requested_key {
+                        continue;
+                    }
+                    let relative = if prefix.relative.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{}/{name}", prefix.relative)
+                    };
+                    let file_type = entry.file_type()?;
+                    if file_type.is_symlink() {
+                        continue;
+                    }
+
+                    if is_filename {
+                        if relative == managed_path.as_str()
+                            || !file_type.is_file()
+                            || !self.graph_text_scope.is_eligible(&relative)
+                        {
+                            continue;
+                        }
+                        projection_optional_regular_metadata(&prefix.directory, name)?;
+                        match open_projection_file_nofollow(&prefix.directory, name) {
+                            Ok(_) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::AlreadyExists,
+                                    format!(
+                                        "graph text paths share one portable case/NFC identity: {relative} and {}",
+                                        managed_path.as_str()
+                                    ),
+                                ));
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+
+                    if !file_type.is_dir() || !self.graph_text_scope.should_descend(&relative) {
+                        continue;
+                    }
+                    directory_count = directory_count
+                        .checked_add(1)
+                        .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
+                    if directory_count > limits.directories {
+                        return Err(managed_text_inventory_limit_error("directory count"));
+                    }
+                    if next.len() == limits.pending_directories {
+                        return Err(managed_text_inventory_limit_error("pending directories"));
+                    }
+                    projection_real_directory(&prefix.directory, name)?;
+                    next.push(PortablePrefix {
+                        directory: open_projection_dir_nofollow(&prefix.directory, name)?,
+                        relative,
+                    });
+                }
+            }
+            if is_filename {
+                return Ok(());
+            }
+            prefixes = next;
+        }
+        Ok(())
+    }
+
     /// Apply strict current graph-scope collision policy to editor/name-only
     /// mutation. Portable aliases remain readable, but an editor mutation
     /// cannot choose one without authenticated exact logical authority.
@@ -7126,6 +7302,13 @@ impl Graph {
         requested_identity: Option<(PageKind, &str)>,
     ) -> io::Result<ExactGraphValidation> {
         let loaded_target = self.load_validated_graph_text_target(permit, target)?;
+        if let Some(loaded) = loaded_target.as_ref() {
+            self.validate_existing_graph_text_target_local(permit, target, loaded.file_identity)?;
+            return Ok(ExactGraphValidation {
+                target: loaded_target,
+                requested_identity_elsewhere: false,
+            });
+        }
         if let (None, Some((kind, name))) = (loaded_target.as_ref(), requested_identity.as_ref()) {
             // A watcher failure can make the guarded collision generation
             // undecodable. Its generation-bound effective-identity evidence is
@@ -7135,11 +7318,7 @@ impl Graph {
                 self.validate_name_only_effective_identity(&[], *kind, name)?;
             }
         }
-        let index = self.validate_current_graph_text_collision_strict(
-            permit,
-            target,
-            loaded_target.as_ref().map(|loaded| loaded.file_identity),
-        )?;
+        let index = self.validate_current_graph_text_collision_strict(permit, target, None)?;
         let requested_identity_elsewhere = match (loaded_target.as_ref(), requested_identity) {
             (None, Some((kind, name))) => {
                 let retained_collision = index
@@ -7473,16 +7652,35 @@ impl Graph {
         expected_bytes: Option<&[u8]>,
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
-        // Recovery/staging names are transaction-local states, not independent
-        // owners. Capture the complete baseline before introducing them.
-        let _ = self.guarded_graph_text_identity_index()?;
         use std::sync::atomic::{AtomicU64, Ordering};
         static RECOVERY_SEQ: AtomicU64 = AtomicU64::new(0);
 
         let target = self.managed_target(permit, path, false)?;
-        projection_optional_regular_metadata(target.parent(), &target.filename)?;
+        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        self.validate_existing_graph_text_target_exact(
+            &target,
+            &managed_path,
+            Some(expected_identity),
+        )?;
         preflight_projection_chain(&target.chain)?;
         let temp = create_editor_staged_recovery(target.parent(), &target.filename, bytes)?;
+        let staged_identity = match (|| {
+            let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
+            let identity = canonical_projection_file_resource_id(&staged_file)?;
+            validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
+            Ok::<_, io::Error>(identity)
+        })() {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = target.parent().remove_file(&temp);
+                return Err(error);
+            }
+        };
         let recovery = format!(
             ".{}.{}.{}.editor-recovery",
             target.filename,
@@ -7496,10 +7694,11 @@ impl Graph {
             // final byte reread and after force-save's final retained-identity
             // validation, but before the first live-name mutation.
             managed_write_before_mutation_hook()?;
-            self.validate_current_graph_text_collision_strict(
-                permit,
-                path,
-                self.managed_optional_file_identity(permit, path)?,
+            self.validate_graph_text_portable_aliases_path_local(permit, &managed_path)?;
+            self.validate_existing_graph_text_target_exact(
+                &target,
+                &managed_path,
+                Some(expected_identity),
             )?;
             rename_projection_noreplace(target.parent(), &target.filename, &recovery)?;
             retired = true;
@@ -7507,6 +7706,7 @@ impl Graph {
             let (retired_file, retired_bytes) =
                 sync_open_and_read_projection_regular(target.parent(), &recovery)?;
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
+            validate_graph_text_single_link(&retired_file, managed_path.as_str())?;
             drop(retired_file);
             sync_projection_chain_required(&target.chain)?;
             if retired_identity != expected_identity
@@ -7518,20 +7718,25 @@ impl Graph {
                 ));
             }
             managed_write_after_retire_hook()?;
-            self.validate_current_graph_text_collision_strict(
-                permit,
-                path,
-                Some(retired_identity),
-            )?;
+
+            let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
+            if canonical_projection_file_resource_id(&staged_file)? != staged_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "staged editor identity changed before publication",
+                ));
+            }
+            validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
+            drop(staged_file);
 
             rename_projection_noreplace(target.parent(), &temp, &target.filename)?;
             published = true;
             journal_projection_after_publish_hook()?;
             sync_projection_chain_required(&target.chain)?;
-            self.validate_current_graph_text_collision_strict(
-                permit,
-                path,
-                self.managed_optional_file_identity(permit, path)?,
+            self.validate_existing_graph_text_target_exact(
+                &target,
+                &managed_path,
+                Some(staged_identity),
             )?;
             target.parent().remove_file(&recovery)?;
             retired = false;
@@ -7546,11 +7751,17 @@ impl Graph {
             Err(primary) => {
                 if retired && !published {
                     let restore = managed_write_before_restore_hook().and_then(|()| {
-                        self.validate_current_graph_text_collision_strict(
-                            permit,
-                            path,
-                            Some(expected_identity),
-                        )?;
+                        let recovery_file =
+                            open_projection_file_nofollow(target.parent(), &recovery)?;
+                        if canonical_projection_file_resource_id(&recovery_file)?
+                            != expected_identity
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "displaced target identity changed before restore",
+                            ));
+                        }
+                        validate_graph_text_single_link(&recovery_file, managed_path.as_str())?;
                         rename_projection_noreplace(target.parent(), &recovery, &target.filename)
                     });
                     match restore {
@@ -30082,6 +30293,19 @@ fn projection_file_link_count(_file: &fs::File) -> io::Result<u64> {
     ))
 }
 
+fn validate_graph_text_single_link(file: &fs::File, relative: &str) -> io::Result<()> {
+    let link_count = projection_file_link_count(file)?;
+    if link_count != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "graph text files alias one physical resource: {relative} has link count {link_count}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn validate_graph_text_event_parent(
     index: &CompleteGraphTextAdmissionIndex,
@@ -35486,6 +35710,86 @@ mod tests {
     }
 
     #[test]
+    fn changed_existing_save_has_one_portable_traversal_and_no_graph_capture() {
+        let dir = scratch("existing-save-portable-traversal-count");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("- unrelated {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/Target.md").unwrap().unwrap();
+        page.blocks[0].raw = "after".into();
+
+        reset_graph_text_admission_test_counters();
+        GRAPH_TEXT_PORTABLE_TRAVERSALS.with(|count| count.set(0));
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        GRAPH_TEXT_VALIDATION_TARGET_READS.with(|reads| reads.set(0));
+        let builds_before = graph.guarded_graph_text_identity_report().complete_builds;
+
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+
+        assert_eq!(GRAPH_TEXT_PORTABLE_TRAVERSALS.with(Cell::get), 1);
+        assert_eq!(
+            graph_text_admission_test_counters().builder_enumerations,
+            0,
+            "existing save must not enter complete graph capture"
+        );
+        assert_eq!(
+            graph.guarded_graph_text_identity_report().complete_builds,
+            builds_before
+        );
+        assert_eq!(
+            GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
+            1,
+            "only the exact target may be parsed"
+        );
+        assert_eq!(GRAPH_TEXT_VALIDATION_TARGET_READS.with(Cell::get), 1);
+        assert_eq!(
+            GRAPH_TEXT_CONTENT_READS.with(Cell::get),
+            2,
+            "only exact validation and the target receipt may read content"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn portable_prefix_branching_limit_fails_before_mutation() {
+        let dir = scratch("portable-prefix-branch-limit");
+        for ancestor in ["External", "external", "EXTERNAL"] {
+            fs::create_dir_all(dir.join(ancestor)).unwrap();
+        }
+        fs::write(dir.join("External/Target.md"), b"- before\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("External/Target.md").unwrap().unwrap();
+        page.blocks[0].raw = "must not publish".into();
+
+        MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+            *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
+                directories: 2,
+                ..MANAGED_TEXT_INVENTORY_LIMITS
+            });
+        });
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
+            *override_limits.borrow_mut() = None;
+        });
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.join("External/Target.md")).unwrap(),
+            "- before\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn empty_cold_graph_advances_effective_identity_evidence_incrementally() {
         let dir = scratch("cold-empty-effective-identity");
         let graph = Graph::open(&dir);
@@ -36029,7 +36333,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resource_epoch_makes_a_sibling_rebuild_and_refuse_every_collision_class() {
+    fn resource_epoch_uses_local_existing_proofs_and_complete_creation_proof() {
         // Portable path identity.
         let dir = scratch("guarded-resource-epoch-portable");
         let primary = dir.join("pages/Case.md");
@@ -36051,7 +36355,11 @@ mod tests {
                 .kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        assert_eq!(
+            graph_b.guarded_graph_text_identity_stats().0,
+            1,
+            "portable refusal must not rebuild a sibling's complete index"
+        );
         let _ = fs::remove_dir_all(&dir);
 
         // Physical resource identity.
@@ -36071,7 +36379,11 @@ mod tests {
                 .kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        assert_eq!(
+            graph_b.guarded_graph_text_identity_stats().0,
+            1,
+            "link-count refusal must not rebuild a sibling's complete index"
+        );
         let _ = fs::remove_dir_all(&dir);
 
         // Content-derived semantic identity.
@@ -36093,7 +36405,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_epoch_rebuilds_a_sibling_once_then_keeps_its_warm_saves_scan_free() {
+    fn resource_epoch_does_not_make_existing_sibling_saves_rebuild() {
         let dir = scratch("guarded-resource-epoch-warm");
         fs::write(dir.join("pages/A.md"), "- a\n").unwrap();
         fs::write(dir.join("pages/B.md"), "- b\n").unwrap();
@@ -36102,22 +36414,23 @@ mod tests {
         let mut page_b = graph_b.load_by_path("pages/B.md").unwrap().unwrap();
 
         guarded_test_resave(&graph_a, &mut page_a, "a transition").unwrap();
-        guarded_test_resave(&graph_b, &mut page_b, "b rebuild").unwrap();
-        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        guarded_test_resave(&graph_b, &mut page_b, "b local save").unwrap();
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 1);
         let epochs = graph_b.guarded_graph_text_identity_epochs();
-        assert_eq!(epochs.0, Some(epochs.1));
+        assert_ne!(epochs.0, Some(epochs.1));
+        assert!(graph_b.guarded_graph_text_identity_stats().2);
 
         let before_warm = crate::fast_commit::graph_wide_commit_work();
         guarded_test_resave(&graph_b, &mut page_b, "b warm one").unwrap();
         let after_warm_one = graph_b.guarded_graph_text_identity_epochs();
-        assert_eq!(after_warm_one.0, Some(after_warm_one.1));
+        assert_ne!(after_warm_one.0, Some(after_warm_one.1));
         assert!(
             after_warm_one.1 > epochs.1,
-            "an ordinary save must publish its exact resource-identity transition"
+            "an ordinary save must still advance the shared resource epoch"
         );
         guarded_test_resave(&graph_b, &mut page_b, "b warm two").unwrap();
         let after_warm_two = graph_b.guarded_graph_text_identity_epochs();
-        assert_eq!(after_warm_two.0, Some(after_warm_two.1));
+        assert_ne!(after_warm_two.0, Some(after_warm_two.1));
         assert!(
             after_warm_two.1 > after_warm_one.1,
             "each ordinary save must advance the shared resource epoch once"
@@ -36126,7 +36439,7 @@ mod tests {
             crate::fast_commit::graph_wide_commit_work().since(before_warm),
             crate::fast_commit::GraphWideCommitWork::default()
         );
-        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -36144,8 +36457,9 @@ mod tests {
             graph_b.guarded_graph_text_identity_epochs().0,
             Some(graph_b.guarded_graph_text_identity_epochs().1)
         );
-        guarded_test_resave(&graph_b, &mut page_b, "rebuilt after uncertainty").unwrap();
-        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        guarded_test_resave(&graph_b, &mut page_b, "saved after uncertainty").unwrap();
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 1);
+        assert!(graph_b.guarded_graph_text_identity_stats().2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -36175,14 +36489,15 @@ mod tests {
             "committed before publication failed"
         );
 
-        guarded_test_resave(&graph_b, &mut page_b, "sibling rebuilt").unwrap();
-        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        guarded_test_resave(&graph_b, &mut page_b, "sibling local save").unwrap();
+        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 1);
+        assert!(graph_b.guarded_graph_text_identity_stats().2);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn guarded_identity_tracks_external_create_delete_rename_hardlink_and_overflow() {
+    fn existing_save_local_proofs_cover_hardlinks_and_index_uncertainty() {
         let dir = scratch("guarded-external-transitions");
         let primary = dir.join("pages/A.md");
         let other = dir.join("pages/Other.md");
@@ -36194,7 +36509,7 @@ mod tests {
         let mut page = graph.load_by_path("pages/A.md").unwrap().unwrap();
 
         guarded_test_resave(&graph, &mut page, "baseline").unwrap();
-        assert_eq!(graph.guarded_graph_text_identity_stats().0, 1);
+        assert_eq!(graph.guarded_graph_text_identity_stats().0, 0);
 
         fs::write(&other, "- external\n").unwrap();
         graph
@@ -36218,8 +36533,8 @@ mod tests {
         guarded_test_resave(&graph, &mut page, "after delete").unwrap();
         assert_eq!(
             graph.guarded_graph_text_identity_stats().0,
-            1,
-            "exact external final states do not rebuild the complete generation"
+            0,
+            "exact external final states do not build the complete generation"
         );
 
         fs::hard_link(&primary, &alias).unwrap();
@@ -36233,22 +36548,27 @@ mod tests {
                 .kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(graph.guarded_graph_text_identity_stats().0, 2);
+        assert_eq!(
+            fs::read_to_string(&primary).unwrap(),
+            "- after delete\n",
+            "link-count refusal must not write the target"
+        );
+        assert_eq!(graph.guarded_graph_text_identity_stats().0, 0);
 
         fs::remove_file(&alias).unwrap();
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
         assert!(graph.guarded_graph_text_identity_stats().2);
-        guarded_test_resave(&graph, &mut page, "after overflow rebuild").unwrap();
+        guarded_test_resave(&graph, &mut page, "after uncertain observation").unwrap();
         let stats = graph.guarded_graph_text_identity_stats();
-        assert_eq!(stats.0, 3, "overflow forces exactly one later rebuild");
-        assert!(!stats.2);
+        assert_eq!(stats.0, 0, "uncertainty must not build on existing save");
+        assert!(stats.2);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn guarded_identity_collision_classes_match_before_and_after_invalidation() {
+    fn local_portable_refusal_and_semantic_creation_survive_invalidation() {
         for (label, first, sibling) in [
             ("case", "Case.md", "case.md"),
             ("nfc", "Caf\u{e9}.md", "Cafe\u{301}.md"),
@@ -36274,7 +36594,7 @@ mod tests {
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::AlreadyExists,
-                "{label} collision must be refused by the exact retained delta"
+                "{label} collision must be refused by retained-parent enumeration"
             );
 
             graph
@@ -36285,9 +36605,14 @@ mod tests {
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::AlreadyExists,
-                "{label} collision must be refused after complete rebuild"
+                "{label} collision must be refused after index invalidation"
             );
-            assert_eq!(graph.guarded_graph_text_identity_stats().0, 2);
+            assert_eq!(
+                fs::read_to_string(&first_path).unwrap(),
+                "- baseline\n",
+                "{label} refusal must not write the target"
+            );
+            assert_eq!(graph.guarded_graph_text_identity_stats().0, 0);
             let _ = fs::remove_dir_all(&dir);
         }
 
@@ -36320,11 +36645,12 @@ mod tests {
     }
 
     #[test]
-    fn guarded_identity_update_failure_commits_cache_and_forces_one_safe_rebuild() {
+    fn guarded_identity_update_failure_does_not_reopen_existing_save_cut() {
         let dir = scratch("guarded-index-update-failure");
         fs::write(dir.join("pages/A.md"), "- original\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
+        guarded_test_prime_identity(&graph);
         let mut page = graph.load_by_path("pages/A.md").unwrap().unwrap();
         guarded_test_resave(&graph, &mut page, "baseline").unwrap();
         assert_eq!(graph.guarded_graph_text_identity_stats().0, 1);
@@ -36342,10 +36668,10 @@ mod tests {
             "committed across index failure"
         );
 
-        guarded_test_resave(&graph, &mut page, "after safe rebuild").unwrap();
+        guarded_test_resave(&graph, &mut page, "after local recovery").unwrap();
         let stats = graph.guarded_graph_text_identity_stats();
-        assert_eq!(stats.0, 2);
-        assert!(!stats.2);
+        assert_eq!(stats.0, 1);
+        assert!(stats.2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -39626,20 +39952,15 @@ mod tests {
         }
     }
 
-    /// A symlink in a DESCENDED scope aborts the whole guarded capture, so it
-    /// takes down saves of unrelated pages. That is the real F3a class.
-    ///
-    /// It also settles an error in the 2026-08-06 Direct Files audit, which used
-    /// `assets/` as its exemplar and proposed it as the repro: `assets` is
-    /// fixed-excluded (`graph_text_scope.rs`, `fixed_excluded`), so the walk
-    /// skips it and the save succeeds. Both halves are asserted here so nobody
-    /// re-runs the wrong experiment and retires a real finding.
+    /// Existing saves inspect only their exact retained parent, and skip
+    /// unrelated symlinks there just as graph-text discovery does. Symlinks in
+    /// other parents are outside the local validation boundary entirely.
     #[cfg(unix)]
     #[test]
-    fn a_symlink_blocks_saves_only_inside_a_descended_scope() {
+    fn unrelated_symlinks_do_not_expand_an_existing_save() {
         use std::os::unix::fs::symlink;
 
-        // (a) assets/ is excluded from the walk -- a symlink there is harmless.
+        // A symlink outside the target parent is unrelated.
         let dir = scratch("symlink-scope-assets");
         fs::create_dir_all(dir.join("assets")).unwrap();
         fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
@@ -39654,10 +39975,8 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&dir);
 
-        // (b) a symlink in pages/ IS in a descended scope. It used to abort the
-        // guarded capture and therefore take down every OTHER page's save --
-        // "one symlink and my graph is read-only". It is now skipped, exactly as
-        // every other traversal in Tine already skips it.
+        // A different-name symlink inside the target parent is not an admitted
+        // graph-text sibling and cannot redirect the exact target.
         for (tag, link, target) in [
             (
                 "symlink-scope-pages-file",
@@ -39736,21 +40055,77 @@ mod tests {
         started.elapsed()
     }
 
-    /// The Direct-save admission gate, stated as counters rather than a
-    /// stopwatch — a stopwatch on shared CI measures the machine, not the code.
-    ///
-    /// This is the gate that never existed. #267 ("saving takes about a minute,
-    /// then a red toast") is a whole-graph rebuild happening per save, and
-    /// nothing in the suite would have noticed it appear.
+    /// GH #267. Losing complete-index certainty is unrelated to the authority
+    /// for an already loaded exact target. Existing Direct Files saves must
+    /// therefore remain target-local for both supported text formats.
     #[test]
-    fn steady_state_direct_saves_do_not_rebuild_the_graph_index() {
+    fn invalidated_graph_index_does_not_expand_an_existing_save() {
+        for (tag, extension, before, after) in [
+            (
+                "existing-save-cut-markdown",
+                "md",
+                "- before\n",
+                "saved markdown",
+            ),
+            ("existing-save-cut-org", "org", "* before\n", "saved org"),
+        ] {
+            let dir = scratch(tag);
+            for index in 0..24 {
+                fs::write(
+                    dir.join("pages").join(format!("Unrelated {index}.md")),
+                    format!("title:: Unrelated {index}\n\n- body {index}\n"),
+                )
+                .unwrap();
+            }
+            let relative = format!("pages/Target.{extension}");
+            fs::write(dir.join(&relative), before).unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let mut page = graph.load_by_path(&relative).unwrap().unwrap();
+            page.blocks[0].raw = after.to_owned();
+
+            graph
+                .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+                .unwrap();
+            let before_report = graph.guarded_graph_text_identity_report();
+            assert!(before_report.invalidated, "test must start invalidated");
+            GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+
+            graph.save_page(&page, page.rev.as_deref()).unwrap();
+
+            let after_report = graph.guarded_graph_text_identity_report();
+            assert_eq!(
+                after_report.complete_builds, before_report.complete_builds,
+                "an existing {extension} save must not construct the complete graph index"
+            );
+            assert_eq!(
+                GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
+                1,
+                "an existing {extension} save must parse only its exact target"
+            );
+            assert!(
+                fs::read_to_string(dir.join(relative))
+                    .unwrap()
+                    .contains(after),
+                "the target-local {extension} save must reach disk"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Repeated existing saves never need to construct the complete admission
+    /// index, even when their own exact publications leave that optional index
+    /// invalidated. State this as counters rather than a CI stopwatch.
+    #[test]
+    fn steady_state_direct_saves_never_build_the_graph_index() {
         let (dir, graph) = direct_save_bench_graph("direct-save-steady", 40);
 
+        let before = graph.guarded_graph_text_identity_report();
         direct_save_bench_once(&graph, "- warm");
         let warm = graph.guarded_graph_text_identity_report();
-        assert!(
-            warm.complete_builds >= 1 && !warm.invalidated,
-            "the first save should have built and kept an index: {warm:?}"
+        assert_eq!(
+            warm.complete_builds, before.complete_builds,
+            "the first existing save must not build the complete index: {warm:?}"
         );
 
         for round in 0..8 {
@@ -39760,19 +40135,57 @@ mod tests {
         let after = graph.guarded_graph_text_identity_report();
         assert_eq!(
             after.complete_builds, warm.complete_builds,
-            "a steady-state Direct save must not rebuild the whole-graph admission index"
-        );
-        assert!(
-            !after.invalidated,
-            "a steady-state Direct save must not leave the index invalidated: {after:?}"
+            "a steady-state Direct save must not build the whole-graph admission index"
         );
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// THE cut (GH #267). An invalidation means "we lost track of the
-    /// filesystem", not "every document changed" — yet a rebuild used to reparse
-    /// the whole graph, on every save, in the condition Windows and network
-    /// shares were permanently in.
+    /// The deliberately more expensive half of the split: a missing target
+    /// still needs a complete semantic owner proof after index invalidation.
+    #[test]
+    fn invalidated_missing_target_creation_rebuilds_complete_semantic_proof() {
+        let dir = scratch("missing-target-complete-semantic-proof");
+        for index in 0..24 {
+            fs::write(
+                dir.join("pages").join(format!("Unrelated {index}.md")),
+                format!("title:: Unrelated {index}\n\n- body {index}\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.join("pages/Physical Owner.md"),
+            b"title:: Claimed Name\n\n- owner\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        let before = graph.guarded_graph_text_identity_report();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Claimed Name"), None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        let after = graph.guarded_graph_text_identity_report();
+        assert_eq!(
+            after.complete_builds,
+            before.complete_builds + 1,
+            "missing-target creation must construct complete semantic evidence"
+        );
+        assert!(
+            GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get) >= 25,
+            "complete creation proof must parse all possible semantic owners"
+        );
+        assert!(!dir.join("pages/Claimed Name.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Complete semantic proof remains incremental even though an existing
+    /// save no longer invokes it. Missing-target creation is the legitimate
+    /// caller: unchanged parsed semantics are reused and one changed document
+    /// causes exactly one additional parse.
     #[test]
     fn a_rebuild_parses_only_the_documents_whose_bytes_changed() {
         let dir = scratch("rebuild-reuses-parsed-semantics");
@@ -39786,32 +40199,33 @@ mod tests {
         fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
+        guarded_test_prime_identity(&graph);
 
-        // Reach the state where the index holds parsed semantics: one save after
-        // an invalidation pays for the whole graph, once.
-        direct_save_bench_once(&graph, "- warm");
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        direct_save_bench_once(&graph, "- first rebuild");
+        graph
+            .save_page(&direct_save_bench_new_page("First Semantic Proof"), None)
+            .unwrap();
         let full = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
         assert!(
-            full >= 24,
-            "the first rebuild after a cache-derived build still reads the graph: {full}"
+            full >= 25,
+            "first semantic rebuild must parse the graph: {full}"
         );
 
-        // Control: nothing in the graph changed, but we lost track again. Every
-        // document's semantics must be reused; whatever this costs is the save's
-        // own irreducible work, not the graph's.
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        direct_save_bench_once(&graph, "- unchanged rebuild");
+        graph
+            .save_page(
+                &direct_save_bench_new_page("Unchanged Semantic Proof"),
+                None,
+            )
+            .unwrap();
         let unchanged = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
 
-        // Now exactly one document changes, and we lose track again.
         fs::write(
             dir.join("pages/Unrelated 7.md"),
             b"title:: Unrelated 7\n\n- externally edited\n",
@@ -39821,39 +40235,69 @@ mod tests {
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        direct_save_bench_once(&graph, "- one changed document");
+        graph
+            .save_page(&direct_save_bench_new_page("Changed Semantic Proof"), None)
+            .unwrap();
         let incremental = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
 
         assert_eq!(
             incremental,
             unchanged + 1,
-            "a rebuild must parse exactly the documents whose bytes changed \
-             (unchanged rebuild {unchanged}, one-change rebuild {incremental}, graph of 25)"
+            "one changed document must cause exactly one additional parse \
+             (unchanged rebuild {unchanged}, changed rebuild {incremental})"
         );
-        assert!(
-            incremental < full,
-            "a rebuild after one external edit must cost far less than the full pass \
-             ({incremental} vs {full})"
-        );
-
+        assert!(incremental < full, "incremental {incremental}, full {full}");
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// GH #267 / F3. The save-time capture runs two passes that must agree, and
-    /// any concurrent filesystem activity anywhere in the graph makes them
-    /// disagree. On a Syncthing / Dropbox / OneDrive folder that is not an
-    /// anomaly, it is the steady state — and one disagreement failed the save.
+    /// The complete capture still has a bounded retry contract for callers
+    /// that require it. A one-shot concurrent change is retried internally and
+    /// does not escape from missing-target creation.
     #[test]
     fn a_concurrent_change_during_capture_is_retried_not_surfaced() {
-        let dir = scratch("capture-retry");
+        let dir = scratch("complete-capture-retry");
+        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+        fs::write(dir.join("pages/Other.md"), b"- other\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        guarded_test_prime_identity(&graph);
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+
+        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+            let other = dir.join("pages/Other.md");
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(&other, b"- pulled in\n")));
+        });
+
+        graph
+            .save_page(&direct_save_bench_new_page("Created After Retry"), None)
+            .expect("one capture disagreement must be retried");
+        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+            assert!(
+                hook.borrow().is_none(),
+                "complete capture must consume the race hook"
+            );
+        });
+        assert!(dir.join("pages/Created After Retry.md").is_file());
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Other.md")).unwrap(),
+            "- pulled in\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// GH #267 / F3. Leave a deterministic whole-graph capture race armed and
+    /// prove an existing save never reaches it.
+    #[test]
+    fn an_existing_save_never_enters_the_graph_capture_race() {
+        let dir = scratch("existing-save-skips-capture-retry");
         fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
         fs::write(dir.join("pages/Other.md"), b"- other\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
 
-        // One disturbance between the two passes — the hook is one-shot, so the
-        // next attempt sees a quiet graph, which is exactly the bounded-retry
-        // premise: "something moved while we looked", not "the graph is broken".
+        // This hook runs only between the old capture's two graph-wide passes.
         INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
             let other = dir.join("pages/Other.md");
             *hook.borrow_mut() = Some(Box::new(move || fs::write(&other, b"- other, pulled in\n")));
@@ -39865,6 +40309,12 @@ mod tests {
         graph
             .save_page(&page, Some(&base))
             .expect("a sync client touching an unrelated file must not fail this save");
+        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
+            assert!(
+                hook.borrow_mut().take().is_some(),
+                "existing save must not enter whole-graph capture"
+            );
+        });
         assert_eq!(
             fs::read_to_string(dir.join("pages/Target.md")).unwrap(),
             "- saved during sync activity\n"
@@ -39939,46 +40389,76 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The reuse is keyed on a content digest, so it must survive a rewrite that
-    /// leaves the bytes identical — and must NOT survive one that does not, even
-    /// when the file keeps its length.
+    /// A missing-target creation still rebuilds semantic evidence after an
+    /// external retitle, even though existing-target saves no longer do so.
     #[test]
-    fn reused_semantics_follow_the_bytes_not_the_file() {
-        let dir = scratch("rebuild-reuse-follows-bytes");
+    fn missing_target_creation_refuses_an_externally_retitled_owner() {
+        let dir = scratch("creation-proof-follows-external-retitle");
         fs::write(dir.join("pages/Owner.md"), b"title:: Alpha Name\n\n- o\n").unwrap();
-        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        direct_save_bench_once(&graph, "- warm");
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
-        direct_save_bench_once(&graph, "- parsed rebuild");
+        guarded_test_prime_identity(&graph);
 
-        // Same length, different bytes: a digest notices, a stat does not.
         fs::write(dir.join("pages/Owner.md"), b"title:: Omega Name\n\n- o\n").unwrap();
         graph
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
-        direct_save_bench_once(&graph, "- after retitle");
-
-        // The retitled document must own its NEW identity. This is the direction
-        // the reuse could get wrong: a stale parse would still say "Alpha Name",
-        // and creating "Omega Name" would be admitted over a file that already
-        // holds it.
+        let before = graph.guarded_graph_text_identity_report();
         let error = graph
             .save_page(&direct_save_bench_new_page("Omega Name"), None)
             .expect_err("the retitled document owns this effective page identity");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            graph.guarded_graph_text_identity_report().complete_builds,
+            before.complete_builds + 1
+        );
+        assert!(!dir.join("pages/Omega Name.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        // The opposite direction is deliberately NOT asserted here. Creating
-        // "Alpha Name" is still refused, and for a reason that predates this
-        // reuse: the page cache has not seen the external retitle either, and
-        // `validate_name_only_effective_identity` fails closed on the identity it
-        // last knew. Verified by disabling the reuse entirely -- the refusal is
-        // unchanged. Fail-closed is the safe direction, so it stays a separate
-        // question from this one.
+    /// Semantic reuse is keyed by content, not by an inode or stat tuple. A
+    /// same-bytes replacement is reusable; a same-length retitle is not.
+    #[test]
+    fn reused_semantics_follow_the_bytes_not_the_file() {
+        let dir = scratch("rebuild-reuse-follows-bytes");
+        let alpha = b"title:: Alpha Name\n\n- o\n";
+        fs::write(dir.join("pages/Owner.md"), alpha).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        guarded_test_prime_identity(&graph);
 
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        graph
+            .save_page(&direct_save_bench_new_page("Semantic Prime"), None)
+            .unwrap();
+
+        replace_file_with_a_new_inode(&dir, "pages/Owner.md", alpha);
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        graph
+            .save_page(&direct_save_bench_new_page("Same Bytes Proof"), None)
+            .unwrap();
+        let same_bytes = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
+
+        replace_file_with_a_new_inode(&dir, "pages/Owner.md", b"title:: Omega Name\n\n- o\n");
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Omega Name"), None)
+            .expect_err("the retitled document owns its new semantic identity");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
+            same_bytes + 1,
+            "the changed bytes must add exactly one parse"
+        );
+        assert!(!dir.join("pages/Omega Name.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -40001,12 +40481,12 @@ mod tests {
         }
     }
 
-    /// The measured receipt behind that gate. Release-only and `--ignored`:
-    /// it prints the shape of a Direct save, split into the phases D0 added, in
-    /// both the warm and the rebuild condition. Point it at a real graph copy
-    /// with TINE_DIRECT_SAVE_BENCH_GRAPH_COPY, or let it synthesise one.
+    /// The measured receipt behind that gate. Release-only and `--ignored`: it
+    /// compares an existing Direct save with a valid complete index against the
+    /// same save after forced invalidation. Point it at a real graph copy with
+    /// TINE_DIRECT_SAVE_BENCH_GRAPH_COPY, or let it synthesise one.
     #[test]
-    #[ignore = "manual benchmark: Direct-mode save latency, warm vs rebuilding"]
+    #[ignore = "manual benchmark: Direct-mode save latency, warm vs invalidated"]
     fn direct_save_latency_manual_benchmark() {
         assert!(
             !cfg!(debug_assertions),
@@ -40049,6 +40529,8 @@ mod tests {
             );
         };
 
+        guarded_test_prime_identity(&graph);
+        let builds_before = graph.guarded_graph_text_identity_report().complete_builds;
         direct_save_bench_once(&graph, "- prime");
         let mut warm = Vec::new();
         for round in 0..rounds {
@@ -40063,7 +40545,12 @@ mod tests {
                 .unwrap();
             cold.push(direct_save_bench_once(&graph, &format!("- cold {round}")));
         }
-        describe("rebuilding index", &mut cold, &graph);
+        describe("invalidated index", &mut cold, &graph);
+        assert_eq!(
+            graph.guarded_graph_text_identity_report().complete_builds,
+            builds_before,
+            "existing-page benchmark must not construct another complete index"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
