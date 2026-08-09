@@ -94,7 +94,7 @@ import {
   reloadPageIfStillSafe,
   restoreTodayJournalInFeed,
 } from "./store";
-import { divergedFromBaseline, isSaving } from "./persistence";
+import { applyDivergenceVerdict, isSaving } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
 import { backend, isTauri, type GraphChange } from "./backend";
 import { parserFailed } from "./render/parse";
@@ -244,8 +244,7 @@ export async function handleGraphChange(c: GraphChange) {
     // conflict here blocks every subsequent save of the very edit it warns about.
     if (!isSaving(c.name)) {
       const current = await backend().getPage(c.name, c.kind);
-      if (divergedFromBaseline(c.name, { exists: !!current, rev: current?.rev ?? null }))
-        markConflict(c.name);
+      applyDivergenceVerdict(c.name, { exists: !!current, rev: current?.rev ?? null });
     }
     if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
     return;
@@ -302,9 +301,9 @@ export async function handleSparseV2Changed() {
     if (disposition === "conflict") {
       // The page has an unsaved edit. Prove this page actually diverged before
       // blocking its saves — the epoch alone says only that SOMETHING was
-      // admitted, which is usually our own write coming back.
-      if (!divergedFromBaseline(route.name, { exists: !!dto, rev: dto?.rev ?? null })) continue;
-      markConflict(route.name);
+      // admitted, which is usually our own write coming back — and lift an
+      // existing conflict when the proof comes back negative.
+      applyDivergenceVerdict(route.name, { exists: !!dto, rev: dto?.rev ?? null });
       continue;
     }
     if (dto) reloadPageIfStillSafe(route.name, toLoadablePage(dto, route.name));

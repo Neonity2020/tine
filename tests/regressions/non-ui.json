@@ -3183,6 +3183,29 @@
         ]
       },
       "notes": "Direct Files data-safety audit 2026-08-09, finding 11. The shared close transaction (desktop window-close and Android root Back) bounded flushAll at a flat 4 s and treated expiry as failure, so a flush that had merely not FINISHED was reported in the same words as one that could never succeed - 'unsaved changes that couldn't be saved... close anyway and lose them?' - inviting the user to throw away a write in progress. A slow or network filesystem, a fsync behind a busy disk, or many dirty pages can exceed 4 s with nothing wrong; on the 1,045-file anonymized corpus a save averages ~7 ms, so the bound is already several hundred pages' worth. The close now races the SAME flush promise twice: at the soft bound it says 'still saving' and grants a 26 s grace period, and only a flush that genuinely finished false, threw, or outlasted the grace period reaches a discard prompt - which now distinguishes 'failed' from 'still-saving' in its wording. The pre-existing test asserted that the timeout case behaved identically to failure, i.e. it encoded the defect; it was split rather than grandfathered."
+    },
+    {
+      "id": "REG-CONFLICT-SELF-CLEARS-20260809",
+      "title": "A conflict raised by a transient file removal is never cleared when the file returns",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/App.test.tsx"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 17. Raising a conflict was gated on a per-page divergence proof; clearing one was gated on nothing, because only a user's click (or forgetPage) ever cleared a conflict. handleGraphChange's REMOVED branch calls markConflict with no proof at all, so an external editor writing by temp+rename, or a mid-delivery Syncthing pass, could park a page behind the banner permanently. doSave then refuses that page forever, and both banner buttons destroy something: 'Use disk version' the unsaved edit, 'Keep mine' a file it never needed to overwrite. Fixed by making the proof two-directional in ONE owner, applyDivergenceVerdict, used by both observation sites (legacy watcher and sparse-v2 epoch): a negative proof on a currently-conflicted page clears the conflict and reschedules the edit it was freezing. A third site cannot reintroduce the asymmetry. A file that returns with DIFFERENT content still conflicts."
     }
   ]
 }

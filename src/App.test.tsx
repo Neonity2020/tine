@@ -264,4 +264,40 @@ describe("conflict requires per-page divergence, not just a notification", () =>
 
     expect(isConflicted(name)).toBe(true);
   });
+
+  // Direct Files data-safety audit, finding 17. Nothing but an explicit user
+  // click ever cleared a conflict, and a removal event raises one with no
+  // divergence proof at all — so an editor writing by temp+rename, or a
+  // mid-delivery Syncthing pass, could park a page behind a banner permanently.
+  // The page then refuses every ordinary save, and both buttons are destructive:
+  // "Use disk version" discards the edit, "Keep mine" overwrites a file it never
+  // needed to. The divergence proof that gates RAISING a conflict decides this
+  // too: when the disk provably holds the editor's own baseline again, the
+  // banner's claim is false and it must go.
+  it("clears a conflict once the file is back and provably matches the baseline", async () => {
+    liveDirtyPage("rev-1");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(null);
+    await handleGraphChange({ name, kind: "page", created: false, removed: true });
+    expect(isConflicted(name)).toBe(true);
+
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-1"));
+    await handleGraphChange({ name, kind: "page", created: true, removed: false });
+
+    expect(isConflicted(name)).toBe(false);
+    // …and the edit that was frozen behind it is savable again, not discarded.
+    expect(isDirty(name)).toBe(true);
+    expect(pageByName(name)?.roots).toEqual(["one"]);
+  });
+
+  it("keeps the conflict when the file comes back with different content", async () => {
+    liveDirtyPage("rev-1");
+    vi.spyOn(backend(), "getPage").mockResolvedValue(null);
+    await handleGraphChange({ name, kind: "page", created: false, removed: true });
+    expect(isConflicted(name)).toBe(true);
+
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+    await handleGraphChange({ name, kind: "page", created: true, removed: false });
+
+    expect(isConflicted(name)).toBe(true);
+  });
 });

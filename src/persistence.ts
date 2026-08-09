@@ -10,7 +10,7 @@
 
 import { doc, pageByName, pageInstanceGeneration, pageToDto } from "./store";
 import { backend } from "./backend";
-import { markConflict, isConflicted, conflicts, bumpDataRev, bumpPageInventoryRev, pushToast } from "./ui";
+import { markConflict, clearConflict, isConflicted, conflicts, bumpDataRev, bumpPageInventoryRev, pushToast } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
 
@@ -134,6 +134,32 @@ export function divergedFromBaseline(name: string, stored: StoredPageState): boo
   const baseline = baseRev.get(name) ?? null;
   if (!stored.exists) return baseline !== null;
   return stored.rev !== baseline;
+}
+
+/** Apply that verdict — in BOTH directions.
+ *
+ *  Raising a conflict was already gated on the proof above; clearing one was not
+ *  gated on anything, because nothing but a user's click ever cleared a
+ *  conflict. So a page could be parked behind the banner permanently by an event
+ *  that never meant anything: a removal event carries no divergence proof at all
+ *  (`handleGraphChange`), and an editor writing by temp+rename, or a
+ *  mid-delivery sync pass, produces exactly that. The page then refuses every
+ *  ordinary save, and both buttons on the banner destroy something — "Use disk
+ *  version" the edit, "Keep mine" a file it never needed to overwrite.
+ *
+ *  When the disk provably holds this editor's own baseline again, the banner's
+ *  claim ("the file changed under you") is false, so it goes, and the edit it
+ *  was freezing is scheduled like any other. One owner for both directions means
+ *  a later third observation site cannot reintroduce the asymmetry.
+ *  (Direct Files data-safety audit, 2026-08-09, finding 17.) */
+export function applyDivergenceVerdict(name: string, stored: StoredPageState): void {
+  if (divergedFromBaseline(name, stored)) {
+    markConflict(name);
+    return;
+  }
+  if (!isConflicted(name)) return;
+  clearConflict(name);
+  if (dirty.has(name)) scheduleSave();
 }
 /** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
  *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
