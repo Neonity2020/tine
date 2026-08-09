@@ -140,8 +140,12 @@ async function openManagedSettings() {
   await waitForBody("Storage & sync", 15_000, "storage settings");
   const experimental = await browser.$(".settings-experimental .settings-advanced-toggle");
   await experimental.waitForExist({ timeout: 15_000 });
-  if ((await experimental.getAttribute("aria-expanded")) !== "true") await experimental.click();
-  await waitForBody("Testing only.", 15_000, "experimental disclosure");
+  const enable = await buttonContaining("Enable Tine-managed storage...");
+  if (!enable || !(await enable.isDisplayed())) await experimental.click();
+  await browser.waitUntil(async () => {
+    const button = await buttonContaining("Enable Tine-managed storage...");
+    return Boolean(button && await button.isDisplayed());
+  }, { timeout: 15_000, timeoutMsg: "managed storage controls did not expand" });
 }
 
 async function closeSettings() {
