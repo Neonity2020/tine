@@ -8,6 +8,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- Pressing Enter inside a multi-line `$$ … $$` math environment now inserts a new line and keeps the block together, instead of splitting it and breaking the environment (GH #278).
+
+
 ### Changed
 
 - **Managed storage imports roughly twice as fast, and read about eight times

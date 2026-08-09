@@ -155,7 +155,7 @@ import {
 import { splitProps, joinProps, isBuiltinHidden, isSheetCellHidden, hideAll, caretInFence, caretOnPropertyLine, isPropertiesOnly, multilineExitTrim } from "../editor/properties";
 import { queryMacroExtents } from "../editor/edn";
 import { normalizePlanning } from "../editor/planning";
-import { caretOnOpeningFence } from "../editor/fences";
+import { caretOnOpeningFence, caretInDisplayMath } from "../editor/fences";
 import { isAnnotationBlock, annotationInfo } from "../editor/annotation";
 import { AnnotationBody } from "./AnnotationBody";
 import { logbookInfo, type LogbookInfo } from "../logbook";
@@ -2958,13 +2958,16 @@ export function Editor(props: { id: string }): JSX.Element {
       (!e.shiftKey || (docModeEnterForNewLine && !e.altKey))
     ) {
       const inFence = !isAnnot() && caretInFence(raw, start);
+      // GH #278: a multi-line `$$ … $$` environment behaves like a fence for
+      // Enter. See caretInDisplayMath — a deliberate divergence from OG.
+      const inMath = !isAnnot() && !inFence && caretInDisplayMath(raw, start);
       const inPageProperties = !isAnnot() && isFirstPagePropertiesBlock(raw);
       // Double-Enter escape: the first Enter creates a trailing blank line; the
       // second removes that sentinel and creates a normal sibling. Keep the text
       // trim and structural insertion in one undo unit so one Undo restores the
       // exact pre-exit special block and removes the sibling.
-      if ((isCalc() || inFence || inPageProperties) && start === end) {
-        const kind = isCalc() ? "calc" : inFence ? "fence" : "properties";
+      if ((isCalc() || inFence || inMath || inPageProperties) && start === end) {
+        const kind = isCalc() ? "calc" : inFence ? "fence" : inMath ? "math" : "properties";
         const trimmed = multilineExitTrim(raw, start, kind);
         if (trimmed !== null) {
           e.preventDefault();
@@ -2997,7 +3000,7 @@ export function Editor(props: { id: string }): JSX.Element {
       // — GH #66). caretInFence treats a still-unterminated fence (being typed) as
       // inside too, and returns false when the caret sits on a ``` delimiter line,
       // so Enter on the closing fence still exits the block.
-      if (!isAnnot() && (inFence || caretOnOpeningFence(raw, start))) {
+      if (!isAnnot() && (inFence || inMath || caretOnOpeningFence(raw, start))) {
         softNewlineCmd();
         return;
       }
