@@ -784,6 +784,7 @@ mod tests {
             binding,
             instrumentation: GraphTextScanInstrumentation::default(),
             wall_time: Duration::ZERO,
+            expected_path_count: 0,
             pass_a_digest: super::super::reconciliation_scan::graph_text_scan_pass_digest(
                 &baseline_pass,
             ),

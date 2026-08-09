@@ -172,6 +172,7 @@ struct ActiveDrain {
     rebase_before_step: bool,
     retry_rebase: bool,
     retry_rebases: u8,
+    startup_full_scan: bool,
 }
 
 /// Move-only bounded exact-feed state for one actor-owned promoted runtime.
@@ -419,6 +420,7 @@ impl ExactExternalFeedState {
                 rebase_before_step: matches!(scope, ActiveDrainScope::FullScan),
                 retry_rebase: false,
                 retry_rebases: 0,
+                startup_full_scan: self.initial_index_build_pending,
                 scope,
                 continuation: None,
             });
@@ -491,6 +493,15 @@ impl ExactExternalFeedState {
                 ActiveDrainScope::Exact(paths) => {
                     ReconciliationTrigger::WatcherPaths(paths.clone())
                 }
+                ActiveDrainScope::FullScan
+                    if self
+                        .active
+                        .as_ref()
+                        .expect("active drain disappeared")
+                        .startup_full_scan =>
+                {
+                    ReconciliationTrigger::Startup
+                }
                 ActiveDrainScope::FullScan => ReconciliationTrigger::WatcherUncertain,
             };
             self.reconciliation.trigger(trigger);
@@ -545,6 +556,7 @@ impl ExactExternalFeedState {
                     // exact hint insufficient. Collapse this same queue epoch
                     // to a full rebase.
                     active.scope = ActiveDrainScope::FullScan;
+                    active.startup_full_scan = false;
                     active.rebase_before_step = true;
                     active.retry_rebase = true;
                 } else if active.retry_rebases == 0 {

@@ -30,7 +30,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const RECONCILIATION_BASELINE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const RECONCILIATION_BASELINE_SCHEMA_VERSION: u32 = 3;
 pub(crate) const RECONCILIATION_BASELINE_APPLICATION_ID: u32 = 0x5449_4e42;
 pub(crate) const MAX_BASELINE_WRITE_ROWS: usize = 512;
 pub(crate) const MAX_BASELINE_PAGE_ROWS: usize = 512;
@@ -39,6 +39,7 @@ pub(crate) const MAX_BASELINE_PATHS_PER_EPOCH: usize = 1_000_000;
 pub(crate) const MAX_BASELINE_DIRECTORIES_PER_EPOCH: usize = 1_000_000;
 pub(crate) const MAX_BASELINE_SCAN_ENTRIES: u64 = 2_000_000;
 pub(crate) const MAX_BASELINE_BLOCKED_SIGNATURES: usize = 100_000;
+pub(crate) const MAX_BASELINE_PENDING_ABSENCES: usize = 1_000_000;
 pub(crate) const MAX_BASELINE_EXACT_PATH_BYTES: usize = 4096;
 pub(crate) const MAX_BASELINE_AGGREGATE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_BASELINE_BLOCKED_REASON_BYTES: usize = 4096;
@@ -143,6 +144,18 @@ CREATE TABLE blocked (
     last_seen INTEGER NOT NULL CHECK (last_seen >= first_seen)
 ) STRICT;";
 
+const PENDING_ABSENCES_DDL: &str = "
+CREATE TABLE pending_absences (
+    exact_path TEXT PRIMARY KEY,
+    expected_owner BLOB NOT NULL CHECK (length(expected_owner) = 32),
+    expected_content_digest BLOB NOT NULL CHECK (length(expected_content_digest) = 32),
+    expected_byte_len INTEGER NOT NULL CHECK (expected_byte_len >= 0),
+    evidence_mask INTEGER NOT NULL CHECK (evidence_mask BETWEEN 1 AND 3),
+    first_seen INTEGER NOT NULL CHECK (first_seen >= 0),
+    last_seen INTEGER NOT NULL CHECK (last_seen >= first_seen),
+    confirmed_epoch INTEGER REFERENCES epochs(id) ON DELETE SET NULL
+) STRICT;";
+
 const HEAD_DDL: &str = "
 CREATE TABLE head (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -161,6 +174,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "epochs",
     "head",
     "paths",
+    "pending_absences",
 ];
 const EXPECTED_INDEXES: &[&str] = &["blocked_last_seen_idx", "epochs_state_id_idx"];
 
@@ -299,6 +313,35 @@ impl BaselineTimestamp {
     pub(crate) const fn as_millis(self) -> i64 {
         self.0
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingAbsenceEvidence {
+    FullScan,
+    TargetedPoint,
+}
+
+impl PendingAbsenceEvidence {
+    const fn mask(self) -> i64 {
+        match self {
+            Self::FullScan => 1,
+            Self::TargetedPoint => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingAbsenceObservation {
+    pub(crate) path: ManagedPath,
+    pub(crate) expected_owner: ContentDigest,
+    pub(crate) expected_description: BlobDescription,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingAbsenceState {
+    pub(crate) existed: bool,
+    pub(crate) had_full_scan_evidence: bool,
+    pub(crate) had_targeted_point_evidence: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -679,6 +722,7 @@ impl ReconciliationBaseline {
         let mut connection = open_ambient_sqlite_connection(&path, false)?;
         require_existing_regular(&parent, &path)?;
         require_safe_sqlite_sidecars(&parent, &path)?;
+        migrate_schema_if_needed(&mut connection, &path)?;
         let trusted_data_version = validate_database(&mut connection, &path, &binding)?;
         configure_trusted_connection(&connection, &path)?;
         Ok(Self {
@@ -1462,6 +1506,303 @@ impl ReconciliationBaseline {
         })
     }
 
+    /// Stage owner-bound absence uncertainty in one transaction.
+    ///
+    /// A complete snapshot also cancels rows which are no longer absent. The
+    /// returned state describes evidence that existed before this call, so the
+    /// caller cannot accidentally use the observation it just wrote as its own
+    /// independent confirmation.
+    pub(crate) fn stage_pending_absences(
+        &mut self,
+        observations: &[PendingAbsenceObservation],
+        evidence: PendingAbsenceEvidence,
+        complete_snapshot: bool,
+        observed_at: BaselineTimestamp,
+    ) -> Result<Vec<PendingAbsenceState>, ReconciliationBaselineError> {
+        let mut current = BTreeMap::new();
+        for observation in observations {
+            validate_managed_path(&observation.path)?;
+            if current
+                .insert(observation.path.as_str(), observation)
+                .is_some()
+            {
+                return Err(unavailable("duplicate pending absence path"));
+            }
+        }
+
+        let path = self.path.clone();
+        let trusted_data_version = self.trusted_data_version;
+        let transaction = begin_immediate(&mut self.connection, &path)?;
+        require_data_version(&transaction, &path, trusted_data_version)?;
+        let mut prior = BTreeMap::new();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT exact_path, expected_owner, expected_content_digest,
+                            expected_byte_len, evidence_mask
+                     FROM pending_absences ORDER BY exact_path",
+                )
+                .map_err(|error| {
+                    classify_sql_error(&path, error, "preparing pending absence read")
+                })?;
+            let mut rows = statement
+                .query([])
+                .map_err(|error| classify_sql_error(&path, error, "querying pending absences"))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|error| classify_sql_error(&path, error, "reading pending absence"))?
+            {
+                let exact: String = row.get(0).map_err(|error| {
+                    classify_sql_error(&path, error, "decoding pending absence path")
+                })?;
+                let managed = ManagedPath::parse(exact.clone())
+                    .map_err(|error| rebuild(&path, format!("malformed pending path: {error}")))?;
+                let owner = decode_digest_value(row.get(1), &path, "pending expected owner")?;
+                let digest_bytes: Vec<u8> = row.get(2).map_err(|error| {
+                    classify_sql_error(&path, error, "decoding pending content digest")
+                })?;
+                let digest =
+                    decode_fixed_32(&digest_bytes, &path, "pending expected content digest")?;
+                let byte_len = decode_bounded_u64(
+                    row.get(3),
+                    u64::MAX,
+                    &path,
+                    "pending expected byte length",
+                )?;
+                let mask: i64 = row.get(4).map_err(|error| {
+                    classify_sql_error(&path, error, "decoding pending evidence mask")
+                })?;
+                if !(1..=3).contains(&mask) || managed.as_str() != exact {
+                    return Err(rebuild(&path, "malformed pending absence row"));
+                }
+                prior.insert(
+                    exact,
+                    (owner, BlobDescription::from_parts(digest, byte_len), mask),
+                );
+            }
+        }
+
+        if complete_snapshot {
+            let stale = prior
+                .iter()
+                .filter_map(|(exact, (owner, description, _))| {
+                    (!current.get(exact.as_str()).is_some_and(|observation| {
+                        observation.expected_owner == *owner
+                            && observation.expected_description == *description
+                    }))
+                    .then_some(exact.clone())
+                })
+                .collect::<Vec<_>>();
+            let mut remove = transaction
+                .prepare("DELETE FROM pending_absences WHERE exact_path = ?1")
+                .map_err(|error| {
+                    classify_sql_error(&path, error, "preparing pending absence cancellation")
+                })?;
+            for exact in stale {
+                remove.execute([exact]).map_err(|error| {
+                    classify_sql_error(&path, error, "cancelling stale pending absence")
+                })?;
+            }
+        }
+
+        let retained_matching = current
+            .iter()
+            .filter(|(exact, observation)| {
+                prior
+                    .get::<str>(*exact)
+                    .is_some_and(|(owner, description, _)| {
+                        *owner == observation.expected_owner
+                            && *description == observation.expected_description
+                    })
+            })
+            .count();
+        let retained_total = if complete_snapshot {
+            retained_matching
+        } else {
+            prior.len()
+        };
+        let new_rows = observations.len().saturating_sub(retained_matching);
+        if retained_total.saturating_add(new_rows) > MAX_BASELINE_PENDING_ABSENCES {
+            return Err(unavailable("pending absence row bound exceeded"));
+        }
+
+        let mut states = Vec::with_capacity(observations.len());
+        let mut upsert = transaction
+            .prepare(
+                "INSERT INTO pending_absences (
+                    exact_path, expected_owner, expected_content_digest,
+                    expected_byte_len, evidence_mask, first_seen, last_seen
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(exact_path) DO UPDATE SET
+                    expected_owner = excluded.expected_owner,
+                    expected_content_digest = excluded.expected_content_digest,
+                    expected_byte_len = excluded.expected_byte_len,
+                    evidence_mask = CASE
+                        WHEN pending_absences.expected_owner = excluded.expected_owner
+                         AND pending_absences.expected_content_digest = excluded.expected_content_digest
+                         AND pending_absences.expected_byte_len = excluded.expected_byte_len
+                        THEN pending_absences.evidence_mask | excluded.evidence_mask
+                        ELSE excluded.evidence_mask
+                    END,
+                    first_seen = CASE
+                        WHEN pending_absences.expected_owner = excluded.expected_owner
+                         AND pending_absences.expected_content_digest = excluded.expected_content_digest
+                         AND pending_absences.expected_byte_len = excluded.expected_byte_len
+                        THEN pending_absences.first_seen
+                        ELSE excluded.first_seen
+                    END,
+                    last_seen = excluded.last_seen,
+                    confirmed_epoch = NULL",
+            )
+            .map_err(|error| {
+                classify_sql_error(&path, error, "preparing pending absence upsert")
+            })?;
+        for observation in observations {
+            let previous =
+                prior
+                    .get(observation.path.as_str())
+                    .filter(|(owner, description, _)| {
+                        *owner == observation.expected_owner
+                            && *description == observation.expected_description
+                    });
+            states.push(PendingAbsenceState {
+                existed: previous.is_some(),
+                had_full_scan_evidence: previous.is_some_and(|(_, _, mask)| mask & 1 != 0),
+                had_targeted_point_evidence: previous.is_some_and(|(_, _, mask)| mask & 2 != 0),
+            });
+            upsert
+                .execute(params![
+                    observation.path.as_str(),
+                    digest_blob(observation.expected_owner),
+                    observation.expected_description.sha256().as_slice(),
+                    sqlite_u64(
+                        observation.expected_description.byte_length(),
+                        "pending expected byte length"
+                    )?,
+                    evidence.mask(),
+                    observed_at.as_millis(),
+                ])
+                .map_err(|error| classify_sql_error(&path, error, "staging pending absence"))?;
+        }
+        drop(upsert);
+        transaction
+            .commit()
+            .map_err(|error| classify_sql_error(&path, error, "committing pending absences"))?;
+        Ok(states)
+    }
+
+    pub(crate) fn clear_pending_absences(
+        &mut self,
+        observations: &[PendingAbsenceObservation],
+    ) -> Result<(), ReconciliationBaselineError> {
+        let path = self.path.clone();
+        let trusted_data_version = self.trusted_data_version;
+        let transaction = begin_immediate(&mut self.connection, &path)?;
+        require_data_version(&transaction, &path, trusted_data_version)?;
+        let mut remove = transaction
+            .prepare(
+                "DELETE FROM pending_absences
+                 WHERE exact_path = ?1 AND expected_owner = ?2
+                   AND expected_content_digest = ?3 AND expected_byte_len = ?4",
+            )
+            .map_err(|error| {
+                classify_sql_error(&path, error, "preparing confirmed absence clear")
+            })?;
+        for observation in observations {
+            remove
+                .execute(params![
+                    observation.path.as_str(),
+                    digest_blob(observation.expected_owner),
+                    observation.expected_description.sha256().as_slice(),
+                    sqlite_u64(
+                        observation.expected_description.byte_length(),
+                        "pending expected byte length"
+                    )?,
+                ])
+                .map_err(|error| {
+                    classify_sql_error(&path, error, "clearing confirmed pending absence")
+                })?;
+        }
+        drop(remove);
+        transaction
+            .commit()
+            .map_err(|error| classify_sql_error(&path, error, "committing confirmed absence clear"))
+    }
+
+    pub(crate) fn bind_confirmed_absences_to_epoch(
+        &mut self,
+        epoch: BaselineEpochId,
+        observations: &[PendingAbsenceObservation],
+    ) -> Result<(), ReconciliationBaselineError> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let trusted_data_version = self.trusted_data_version;
+        let transaction = begin_immediate(&mut self.connection, &path)?;
+        require_data_version(&transaction, &path, trusted_data_version)?;
+        let (state, _, _) = epoch_write_state(&transaction, &path, epoch)?;
+        if state != EpochState::Building {
+            return Err(unavailable(
+                "confirmed absences require a building baseline epoch",
+            ));
+        }
+        let mut bind = transaction
+            .prepare(
+                "UPDATE pending_absences SET confirmed_epoch = ?5
+                 WHERE exact_path = ?1 AND expected_owner = ?2
+                   AND expected_content_digest = ?3 AND expected_byte_len = ?4",
+            )
+            .map_err(|error| {
+                classify_sql_error(&path, error, "preparing confirmed absence binding")
+            })?;
+        for observation in observations {
+            let changed = bind
+                .execute(params![
+                    observation.path.as_str(),
+                    digest_blob(observation.expected_owner),
+                    observation.expected_description.sha256().as_slice(),
+                    sqlite_u64(
+                        observation.expected_description.byte_length(),
+                        "pending expected byte length"
+                    )?,
+                    epoch.as_i64(),
+                ])
+                .map_err(|error| classify_sql_error(&path, error, "binding confirmed absence"))?;
+            if changed != 1 {
+                return Err(unavailable(
+                    "confirmed absence no longer matches pending owner evidence",
+                ));
+            }
+        }
+        drop(bind);
+        transaction.commit().map_err(|error| {
+            classify_sql_error(&path, error, "committing confirmed absence binding")
+        })
+    }
+
+    pub(crate) fn settle_confirmed_absences(
+        &mut self,
+        epoch: BaselineEpochId,
+        admitted: bool,
+    ) -> Result<(), ReconciliationBaselineError> {
+        let path = self.path.clone();
+        let trusted_data_version = self.trusted_data_version;
+        let transaction = begin_immediate(&mut self.connection, &path)?;
+        require_data_version(&transaction, &path, trusted_data_version)?;
+        let statement = if admitted {
+            "DELETE FROM pending_absences WHERE confirmed_epoch = ?1"
+        } else {
+            "UPDATE pending_absences SET confirmed_epoch = NULL WHERE confirmed_epoch = ?1"
+        };
+        transaction
+            .execute(statement, [epoch.as_i64()])
+            .map_err(|error| classify_sql_error(&path, error, "settling confirmed absences"))?;
+        transaction.commit().map_err(|error| {
+            classify_sql_error(&path, error, "committing confirmed absence settlement")
+        })
+    }
+
     pub(crate) fn blocked_signature(
         &mut self,
         observation_digest: ContentDigest,
@@ -1592,6 +1933,7 @@ fn initialize_schema(
              {PATHS_DDL}
              {DIRECTORIES_DDL}
              {BLOCKED_DDL}
+             {PENDING_ABSENCES_DDL}
              {HEAD_DDL}
              {EPOCH_STATE_INDEX_DDL}
              {BLOCKED_LAST_SEEN_INDEX_DDL}"
@@ -1614,6 +1956,40 @@ fn initialize_schema(
         )
         .map_err(|error| classify_sql_error(path, error, "binding baseline schema"))?;
     Ok(())
+}
+
+fn migrate_schema_if_needed(
+    connection: &mut Connection,
+    path: &Path,
+) -> Result<(), ReconciliationBaselineError> {
+    let application_id: u32 = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .map_err(|error| classify_sql_error(path, error, "reading baseline application id"))?;
+    let user_version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| classify_sql_error(path, error, "reading baseline schema version"))?;
+    if application_id != RECONCILIATION_BASELINE_APPLICATION_ID || user_version != 2 {
+        return Ok(());
+    }
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| classify_sql_error(path, error, "starting baseline schema migration"))?;
+    transaction
+        .execute_batch(PENDING_ABSENCES_DDL)
+        .map_err(|error| classify_sql_error(path, error, "adding pending absence storage"))?;
+    transaction
+        .execute(
+            "UPDATE binding SET schema_version = ?1 WHERE singleton = 1 AND schema_version = 2",
+            [i64::from(RECONCILIATION_BASELINE_SCHEMA_VERSION)],
+        )
+        .map_err(|error| classify_sql_error(path, error, "updating baseline schema binding"))?;
+    transaction
+        .pragma_update(None, "user_version", RECONCILIATION_BASELINE_SCHEMA_VERSION)
+        .map_err(|error| classify_sql_error(path, error, "updating baseline schema version"))?;
+    transaction
+        .commit()
+        .map_err(|error| classify_sql_error(path, error, "committing baseline schema migration"))
 }
 
 /// Open stock SQLite by ambient filename.
@@ -1773,6 +2149,7 @@ fn validate_schema(
         ("table", "paths", PATHS_DDL),
         ("table", "directories", DIRECTORIES_DDL),
         ("table", "blocked", BLOCKED_DDL),
+        ("table", "pending_absences", PENDING_ABSENCES_DDL),
         ("table", "head", HEAD_DDL),
         ("index", "epochs_state_id_idx", EPOCH_STATE_INDEX_DDL),
         (
@@ -1934,6 +2311,12 @@ fn validate_rows(
         "blocked",
         MAX_BASELINE_BLOCKED_SIGNATURES,
     )?;
+    require_table_bound(
+        transaction,
+        path,
+        "pending_absences",
+        MAX_BASELINE_PENDING_ABSENCES,
+    )?;
     require_table_bound(transaction, path, "head", 1)?;
 
     let mut epochs = validate_epochs(transaction, path)?;
@@ -1941,6 +2324,7 @@ fn validate_rows(
     validate_directory_rows(transaction, path, binding, &mut epochs)?;
     validate_epoch_counts(path, &epochs)?;
     validate_blocked_rows(transaction, path)?;
+    validate_pending_absence_rows(transaction, path)?;
     validate_head_row(transaction, path, &epochs)?;
     Ok(())
 }
@@ -2284,6 +2668,63 @@ fn validate_blocked_rows(
             || last_seen < first_seen
         {
             return Err(rebuild(path, "malformed blocked signature row"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pending_absence_rows(
+    transaction: &Transaction<'_>,
+    path: &Path,
+) -> Result<(), ReconciliationBaselineError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT exact_path, expected_owner, expected_content_digest,
+                    expected_byte_len, evidence_mask, first_seen, last_seen,
+                    confirmed_epoch
+             FROM pending_absences ORDER BY exact_path",
+        )
+        .map_err(|error| classify_sql_error(path, error, "preparing pending-absence validation"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| classify_sql_error(path, error, "querying pending absences"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| classify_sql_error(path, error, "reading pending absence row"))?
+    {
+        let exact: String = row
+            .get(0)
+            .map_err(|error| classify_sql_error(path, error, "decoding pending path"))?;
+        let managed = ManagedPath::parse(exact.clone())
+            .map_err(|error| rebuild(path, format!("malformed pending path: {error}")))?;
+        let _: ContentDigest = decode_digest_value(row.get(1), path, "pending expected owner")?;
+        let digest: Vec<u8> = row
+            .get(2)
+            .map_err(|error| classify_sql_error(path, error, "decoding pending expected digest"))?;
+        let _ = decode_fixed_32(&digest, path, "pending expected digest")?;
+        let byte_len: i64 = row.get(3).map_err(|error| {
+            classify_sql_error(path, error, "decoding pending expected byte length")
+        })?;
+        let evidence_mask: i64 = row
+            .get(4)
+            .map_err(|error| classify_sql_error(path, error, "decoding pending evidence mask"))?;
+        let first_seen: i64 = row
+            .get(5)
+            .map_err(|error| classify_sql_error(path, error, "decoding pending first seen"))?;
+        let last_seen: i64 = row
+            .get(6)
+            .map_err(|error| classify_sql_error(path, error, "decoding pending last seen"))?;
+        let confirmed_epoch: Option<i64> = row
+            .get(7)
+            .map_err(|error| classify_sql_error(path, error, "decoding pending confirmed epoch"))?;
+        if managed.as_str() != exact
+            || byte_len < 0
+            || !(1..=3).contains(&evidence_mask)
+            || first_seen < 0
+            || last_seen < first_seen
+            || confirmed_epoch.is_some_and(|epoch| epoch <= 0)
+        {
+            return Err(rebuild(path, "malformed pending absence row"));
         }
     }
     Ok(())
@@ -3829,6 +4270,136 @@ mod tests {
         assert_eq!(second.last_seen, BaselineTimestamp::from_millis(3).unwrap());
         assert_eq!(baseline.blocked_signature(digest).unwrap(), Some(second));
         assert_eq!(baseline.head().unwrap(), head);
+    }
+
+    fn pending(path: &str, owner: &[u8], bytes: &[u8]) -> PendingAbsenceObservation {
+        PendingAbsenceObservation {
+            path: ManagedPath::parse(path).unwrap(),
+            expected_owner: ContentDigest::of(owner),
+            expected_description: BlobDescription::of(bytes),
+        }
+    }
+
+    #[test]
+    fn pending_absence_requires_prior_evidence_and_complete_scan_cancels_it() {
+        let (directory, binding, mut baseline) = open_fresh("pending-absence");
+        let missing = pending("nested/žluťoučký.org", b"owner-a", b"before");
+        let first = baseline
+            .stage_pending_absences(
+                std::slice::from_ref(&missing),
+                PendingAbsenceEvidence::FullScan,
+                true,
+                BaselineTimestamp::from_millis(1).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            first,
+            vec![PendingAbsenceState {
+                existed: false,
+                had_full_scan_evidence: false,
+                had_targeted_point_evidence: false,
+            }]
+        );
+        drop(baseline);
+
+        let runtime = trusted_runtime(directory.path());
+        let mut reopened = ReconciliationBaseline::open_existing(&runtime, binding).unwrap();
+        let second = reopened
+            .stage_pending_absences(
+                std::slice::from_ref(&missing),
+                PendingAbsenceEvidence::TargetedPoint,
+                false,
+                BaselineTimestamp::from_millis(2).unwrap(),
+            )
+            .unwrap();
+        assert!(second[0].existed);
+        assert!(second[0].had_full_scan_evidence);
+        assert!(!second[0].had_targeted_point_evidence);
+
+        reopened
+            .stage_pending_absences(
+                &[],
+                PendingAbsenceEvidence::FullScan,
+                true,
+                BaselineTimestamp::from_millis(3).unwrap(),
+            )
+            .unwrap();
+        let count: i64 = reopened
+            .connection
+            .query_row("SELECT COUNT(*) FROM pending_absences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "reappearance must cancel pending absence");
+    }
+
+    #[test]
+    fn pending_absence_owner_replacement_starts_new_uncertainty() {
+        let (_directory, _binding, mut baseline) = open_fresh("pending-owner");
+        let old = pending("pages/same.md", b"owner-a", b"old");
+        let replacement = pending("pages/same.md", b"owner-b", b"new");
+        baseline
+            .stage_pending_absences(
+                std::slice::from_ref(&old),
+                PendingAbsenceEvidence::TargetedPoint,
+                false,
+                BaselineTimestamp::from_millis(1).unwrap(),
+            )
+            .unwrap();
+        let state = baseline
+            .stage_pending_absences(
+                std::slice::from_ref(&replacement),
+                PendingAbsenceEvidence::FullScan,
+                true,
+                BaselineTimestamp::from_millis(2).unwrap(),
+            )
+            .unwrap();
+        assert!(!state[0].existed);
+        baseline
+            .clear_pending_absences(std::slice::from_ref(&old))
+            .unwrap();
+        let count: i64 = baseline
+            .connection
+            .query_row("SELECT COUNT(*) FROM pending_absences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "stale owner cannot clear replacement uncertainty");
+        baseline
+            .clear_pending_absences(std::slice::from_ref(&replacement))
+            .unwrap();
+    }
+
+    #[test]
+    fn schema_v2_upgrades_in_place_without_losing_diagnostics() {
+        let (directory, binding, mut baseline) = open_fresh("schema-v2-upgrade");
+        let digest = ContentDigest::of(b"retained-diagnostic");
+        baseline
+            .record_blocked(
+                digest,
+                BaselineBlockedReason::ReconciliationFailed,
+                "retained",
+                BaselineTimestamp::from_millis(1).unwrap(),
+            )
+            .unwrap();
+        baseline
+            .connection
+            .execute_batch(
+                "DROP TABLE pending_absences;
+                 PRAGMA user_version = 2;
+                 UPDATE binding SET schema_version = 2 WHERE singleton = 1;",
+            )
+            .unwrap();
+        drop(baseline);
+
+        let runtime = trusted_runtime(directory.path());
+        let mut upgraded = ReconciliationBaseline::open_existing(&runtime, binding).unwrap();
+        assert!(upgraded.blocked_signature(digest).unwrap().is_some());
+        let version: u32 = upgraded
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, RECONCILIATION_BASELINE_SCHEMA_VERSION);
     }
 
     #[test]

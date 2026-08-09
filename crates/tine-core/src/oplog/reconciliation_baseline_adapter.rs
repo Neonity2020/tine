@@ -259,8 +259,9 @@ pub(crate) fn append_stable_scan_to_baseline<S: AuthenticatedExpectedPathSource>
     Ok(pending)
 }
 
-/// Finish one appended epoch. Candidate-bearing completion is deliberately
-/// retained as incomplete diagnostics and requests a fresh post-drain scan.
+/// Finish one appended epoch. Candidate-bearing completion remains diagnostic
+/// only; exact publication is already the authority boundary, so it does not
+/// trigger another graph-wide census merely to install an unused clean head.
 pub(crate) fn finish_stable_scan_baseline<S: AuthenticatedExpectedPathSource>(
     baseline: &mut ReconciliationBaseline,
     source: &S,
@@ -288,12 +289,10 @@ pub(crate) fn finish_stable_scan_baseline<S: AuthenticatedExpectedPathSource>(
     if can_promote {
         require_current_scan_binding(&pending.scan_identity, source, true)?;
     }
-    let (outcome, complete_with_candidates) = match terminal {
-        BaselineTerminalOutcome::Noop if can_promote => (BaselineEpochOutcome::Noop, false),
-        BaselineTerminalOutcome::Noop => (BaselineEpochOutcome::Incomplete, false),
-        BaselineTerminalOutcome::Complete => {
-            (BaselineEpochOutcome::Incomplete, candidate_count != 0)
-        }
+    let outcome = match terminal {
+        BaselineTerminalOutcome::Noop if can_promote => BaselineEpochOutcome::Noop,
+        BaselineTerminalOutcome::Noop => BaselineEpochOutcome::Incomplete,
+        BaselineTerminalOutcome::Complete => BaselineEpochOutcome::Incomplete,
         BaselineTerminalOutcome::Blocked(blocked) => {
             baseline.record_blocked(
                 blocked.observation_digest,
@@ -301,10 +300,10 @@ pub(crate) fn finish_stable_scan_baseline<S: AuthenticatedExpectedPathSource>(
                 blocked.detail,
                 completed_at,
             )?;
-            (BaselineEpochOutcome::Blocked, false)
+            BaselineEpochOutcome::Blocked
         }
-        BaselineTerminalOutcome::FailedClosed => (BaselineEpochOutcome::Blocked, false),
-        BaselineTerminalOutcome::Retry => (BaselineEpochOutcome::Incomplete, false),
+        BaselineTerminalOutcome::FailedClosed => BaselineEpochOutcome::Blocked,
+        BaselineTerminalOutcome::Retry => BaselineEpochOutcome::Incomplete,
     };
     let finish = FinishBaselineEpoch {
         completed_at,
@@ -326,15 +325,16 @@ pub(crate) fn finish_stable_scan_baseline<S: AuthenticatedExpectedPathSource>(
     }
 
     baseline.finish_sealed_diagnostic_epoch(pending.epoch, finish, pending.rows_identity)?;
-    if complete_with_candidates {
-        Ok(BaselineAdapterStatus::NeedPostDrainFullScan {
-            instrumentation: pending.adapter_instrumentation,
-        })
-    } else {
-        Ok(BaselineAdapterStatus::DiagnosticOnly {
-            instrumentation: pending.adapter_instrumentation,
-        })
-    }
+    baseline.settle_confirmed_absences(
+        pending.epoch,
+        matches!(
+            terminal,
+            BaselineTerminalOutcome::Noop | BaselineTerminalOutcome::Complete
+        ),
+    )?;
+    Ok(BaselineAdapterStatus::DiagnosticOnly {
+        instrumentation: pending.adapter_instrumentation,
+    })
 }
 
 fn require_exact_baseline_binding(
@@ -815,6 +815,7 @@ mod tests {
             diagnostics,
             binding: candidate_binding,
             wall_time: Duration::from_millis(2),
+            expected_path_count: 0,
             baseline_pass,
             pass_a_digest: pass_digest,
             pass_b_digest: pass_digest,
@@ -901,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_complete_requires_post_drain_full_scan_and_has_no_head() {
+    fn candidate_complete_is_diagnostic_without_redundant_post_drain_scan() {
         let mut fixture = Fixture::new("candidate-complete");
         let scan = one_path_scan(&fixture, 1, true);
         let (source, pending) = append(&mut fixture, &scan, 10);
@@ -916,7 +917,7 @@ mod tests {
                 BaselineTimestamp::from_millis(11).unwrap(),
             )
             .unwrap(),
-            BaselineAdapterStatus::NeedPostDrainFullScan { .. }
+            BaselineAdapterStatus::DiagnosticOnly { .. }
         ));
         assert!(fixture.baseline.head().is_err());
     }
