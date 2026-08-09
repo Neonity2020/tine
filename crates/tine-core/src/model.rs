@@ -31498,6 +31498,17 @@ pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
         "conflict_retry.final_reread_present"
     } else if has("tokenless editor conflict: post-publication validation") {
         "conflict_retry.replace_post_publication"
+    } else if has("conflict override authority is newer") {
+        // A "Keep mine" that named an observation the disk has since moved past.
+        // Its own family, NOT `conflict.*`: the frontend must not read it as a
+        // fresh banner (there is no new authority in it) and must not read it as
+        // a transient failure either -- the banner it answers is now dead, so the
+        // only safe response is to observe again and re-raise a live one.
+        "conflict_authority.superseded"
+    } else if has("conflict override authority belongs to a different editor episode") {
+        "conflict_authority.other_episode"
+    } else if has("conflict override authority is missing or already consumed") {
+        "conflict_authority.spent"
     } else if has("editor conflict: save baseline present") {
         "conflict.save_baseline_present"
     } else if has("editor conflict: save baseline absent") {
@@ -41109,6 +41120,31 @@ mod tests {
             (
                 "conflict.base_rev",
                 Error::new(ErrorKind::AlreadyExists, "conflict"),
+            ),
+            // `consume_conflict_authority`, and the command boundary's refusal of
+            // a force that names no observation. Their own family: a force whose
+            // authority is dead is neither a fresh banner nor a transient
+            // failure, and the frontend has to observe again to raise a live one.
+            (
+                "conflict_authority.superseded",
+                Error::new(
+                    ErrorKind::PermissionDenied,
+                    "conflict override authority is newer than the conflict this request answers",
+                ),
+            ),
+            (
+                "conflict_authority.other_episode",
+                Error::new(
+                    ErrorKind::PermissionDenied,
+                    "conflict override authority belongs to a different editor episode",
+                ),
+            ),
+            (
+                "conflict_authority.spent",
+                Error::new(
+                    ErrorKind::PermissionDenied,
+                    "conflict override authority is missing or already consumed",
+                ),
             ),
             // `require_pinned_save_owner`, LoadedRevision arm: the file moved
             // between load and save without the watcher seeing it. A real

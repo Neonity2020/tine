@@ -219,6 +219,8 @@ describe("conflict requires per-page divergence, not just a notification", () =>
     let live: number | null = null;
     let next = 11;
     const calls: Array<{ force: boolean; observation: number | null }> = [];
+    const pending: Array<() => void> = [];
+    let holding = false;
     const observe = () => {
       live = null;
     };
@@ -227,17 +229,43 @@ describe("conflict requires per-page divergence, not just a notification", () =>
         calls.push({ force: !!force, observation: observation ?? null });
         if (force) {
           if (observation === null || observation === undefined || observation !== live) {
-            return Promise.reject(new Error("conflict override authority is missing"));
+            // The exact family the backend uses when a force names an
+            // observation that is not the live one.
+            return Promise.reject(new Error("conflict_authority.superseded: ..."));
           }
           live = null;
           return Promise.resolve("rev-forced");
         }
-        live = next;
-        next += 1;
-        return Promise.reject(new Error(`conflict:${live}`));
+        const refuse = () => {
+          live = next;
+          next += 1;
+        };
+        if (!holding) {
+          refuse();
+          return Promise.reject(new Error(`conflict:${live}`));
+        }
+        return new Promise<string>((_resolve, reject) => {
+          pending.push(() => {
+            refuse();
+            reject(new Error(`conflict:${live}`));
+          });
+        });
       }
     );
-    return { calls, observe };
+    /** Leave the NEXT guarded refusal in flight instead of answering it. */
+    const hold = () => {
+      holding = true;
+    };
+    /** Block until the held refusal has actually reached the backend. */
+    const heldReachedBackend = () =>
+      vi.waitFor(() => expect(pending.length).toBeGreaterThan(0));
+    /** Answer it, and stop holding the ones after it. */
+    const settle = async () => {
+      await heldReachedBackend();
+      holding = false;
+      pending.shift()!();
+    };
+    return { calls, observe, hold, heldReachedBackend, settle };
   }
 
   it("does not conflict a dirty page when the admitted epoch left it unchanged", async () => {
@@ -439,5 +467,47 @@ describe("conflict requires per-page divergence, not just a notification", () =>
 
     expect(isConflicted(name)).toBe(false);
     expect(isDirty(name)).toBe(false);
+  });
+
+  // Third correction-delta re-verification, CRITICAL. The banner's epoch used to
+  // be read when the queued force reached the backend, not when the user clicked.
+  // A re-observation running ahead of it in the per-page queue replaced that
+  // entry with an epoch minted for a winner the user never saw — and the force,
+  // issued to discard A, was then authorised to discard B.
+  it("does not let a queued \"Keep mine\" adopt an epoch minted after the click", async () => {
+    liveDirtyPage("rev-1");
+    const { calls, observe, hold, heldReachedBackend, settle } = authoritativeBackend();
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-2"));
+
+    observe();
+    await handleGraphChange({ name, kind: "page", created: false, removed: false });
+    expect(isConflicted(name)).toBe(true); // winner A refused: epoch 11
+
+    // Winner B lands. Its re-observation is deliberately still in flight when the
+    // user clicks the banner they can see, which is still A's.
+    vi.spyOn(backend(), "getPage").mockResolvedValue(storedPage("rev-3"));
+    observe();
+    hold();
+    const second = handleGraphChange({ name, kind: "page", created: false, removed: false });
+    await heldReachedBackend(); // the re-observation is in flight...
+    const clicked = forceSave(name); // ...and the user clicks the banner they see
+    await settle(); // the re-observation now refuses B and mints epoch 12
+    await second;
+    await clicked;
+
+    // The force presented 11 — the observation it was issued under — so the
+    // backend refused it and B survives.
+    const forced = calls.filter((call) => call.force);
+    expect(forced.some((call) => call.observation === 12)).toBe(false);
+    expect(forced[0]).toEqual({ force: true, observation: 11 });
+    // …and the user is not stranded: the refusal re-observes, so the banner comes
+    // back live and describing B. The re-observation is deliberately not awaited
+    // by the force (the click is answered as soon as it is refused), so wait for
+    // it the way the UI does — by watching the banner become actionable again.
+    expect(isConflicted(name)).toBe(true);
+    await vi.waitFor(() =>
+      expect(calls.filter((call) => !call.force).length).toBeGreaterThanOrEqual(3)
+    );
+    expect(await forceSave(name)).toBe(true);
   });
 });

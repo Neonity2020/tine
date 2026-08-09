@@ -17,11 +17,11 @@ import { describe, expect, it } from "vitest";
 // user's work. They now route through `reconcileExternalChange`. This test is
 // the reminder, not a style rule. (GH #254 increment 2, correction-delta
 // re-verification, HIGH blocker.)
-// `ui.ts` DEFINES markConflict, and `doSave` is the one function allowed to call
-// it — the function, not the file. A whole-file allowance would have let a second
-// caller appear inside persistence.ts itself, which is exactly where the next one
-// would go.
-const DEFINING_FILE = "src/ui.ts";
+// `doSave` is the one function allowed to call markConflict — the function, not
+// the file. A whole-file allowance would have let a second caller appear inside
+// persistence.ts itself, which is exactly where the next one would go. Nothing is
+// excluded by filename: `ui.ts` only DEFINES markConflict, and a definition is not
+// a call expression, so it needs no exemption and gets none.
 const ALLOWED_CALLER = { file: "src/persistence.ts", fn: "doSave" };
 
 function sourceFiles(dir: string): string[] {
@@ -32,15 +32,33 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
+function isFunctionLike(node: ts.Node): boolean {
+  return ts.isFunctionDeclaration(node)
+    || ts.isFunctionExpression(node)
+    || ts.isArrowFunction(node)
+    || ts.isMethodDeclaration(node)
+    || ts.isGetAccessor(node)
+    || ts.isSetAccessor(node)
+    || ts.isConstructorDeclaration(node);
+}
+
 export function bannerRaiseViolations(file: string, source: string): string[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true,
     file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const violations: string[] = [];
   const allowedFn = file === ALLOWED_CALLER.file ? ALLOWED_CALLER.fn : null;
   const visit = (node: ts.Node, enclosing: string | null) => {
-    const scope = ts.isFunctionDeclaration(node) && node.name
-      ? node.name.text
-      : enclosing;
+    // Only a NAMED function declaration opens the allowed scope, and every other
+    // function-like body closes it. An arrow or anonymous function nested inside
+    // `doSave` can be handed to a timer, a promise or an event listener and run
+    // long after — with the queue, the store and the banner in a different state
+    // — so inheriting doSave's allowance would let the call escape the one place
+    // that has the epoch.
+    const scope = ts.isFunctionDeclaration(node)
+      ? (node.name?.text ?? null)
+      : isFunctionLike(node)
+        ? null
+        : enclosing;
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
       && node.expression.text === "markConflict"
       && !(allowedFn !== null && scope === allowedFn)) {
@@ -57,9 +75,26 @@ describe("only a backend save refusal may raise a conflict banner", () => {
   it("has no markConflict call outside the save-result path", () => {
     const violations = sourceFiles("src")
       .map((file) => file.split(path.sep).join("/"))
-      .filter((file) => file !== DEFINING_FILE)
       .flatMap((file) => bannerRaiseViolations(file, readFileSync(file, "utf8")));
     expect(violations).toEqual([]);
+  });
+
+  it("does not exempt the file that defines markConflict", () => {
+    expect(bannerRaiseViolations("src/ui.ts",
+      "export function markConflict(name: string) { setConflicts(name); }\n"
+      + "markConflict(\"smuggled\");\n"))
+      .toEqual(["src/ui.ts:2: markConflict outside the save-result path"]);
+  });
+
+  it("does not let a nested closure inherit doSave's allowance", () => {
+    const source = "function doSave() {\n"
+      + "  markConflict(name);\n"
+      + "  const later = () => markConflict(name);\n"
+      + "  register(later);\n"
+      + "}\n";
+    expect(bannerRaiseViolations(ALLOWED_CALLER.file, source)).toEqual([
+      `${ALLOWED_CALLER.file}:3: markConflict outside the save-result path`,
+    ]);
   });
 
   it("still catches a second caller inside the allowed file", () => {
