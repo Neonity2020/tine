@@ -685,6 +685,48 @@ pub struct BoundedRefGroups {
     pub exceeded: bool,
 }
 
+/// The reference-name inventory as answered to a caller that may already hold
+/// it. `names` is `None` exactly when the caller's presented digest still
+/// describes the current set — which is the ordinary case, since the frontend
+/// re-asks after every typing lull and typing inside a block rarely adds or
+/// removes a `[[link]]`. Callers must read `None` as "keep what you have", never
+/// as "the graph references nothing".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferencedPageNames {
+    pub digest: u64,
+    pub names: Option<Vec<String>>,
+}
+
+impl ReferencedPageNames {
+    fn answer(digest: u64, names: &[String], known: Option<u64>) -> Self {
+        Self {
+            digest,
+            names: (known != Some(digest)).then(|| names.to_vec()),
+        }
+    }
+}
+
+/// Order-independent digest of a reference-name set.
+///
+/// Commutative on purpose: the memo's order comes from a `HashMap`, so a
+/// sequence-dependent hash would report a change on every rebuild even when the
+/// set is identical — which is exactly the case this exists to make cheap. The
+/// length is mixed in separately so a name swapped for one whose hash collides
+/// with it does not slip through unless the count matches too.
+fn referenced_names_digest(names: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut sum: u64 = 0;
+    let mut xor: u64 = 0;
+    for name in names {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut hasher);
+        let hash = hasher.finish();
+        sum = sum.wrapping_add(hash);
+        xor ^= hash;
+    }
+    sum.rotate_left(17) ^ xor.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (names.len() as u64)
+}
+
 /// A deliberately bounded block-reference hover preview. Ordinary query,
 /// reference, and batched-resolution results carry shallow block identities;
 /// callers that genuinely need a subtree must ask for one explicitly and give
@@ -2117,7 +2159,9 @@ pub struct Graph {
     /// autocomplete surface such a page instead of offering a misleading
     /// "Create …". Built from the page cache, and only when it's already warm
     /// (never force-built on a keystroke); empty until then.
-    referenced_names_cache: RwLock<Option<(u64, Vec<String>)>>,
+    /// `(cache_gen, names, digest)` — the digest lets a caller holding the same
+    /// set skip transporting it (see `referenced_page_names_versioned`).
+    referenced_names_cache: RwLock<Option<(u64, Vec<String>, u64)>>,
     /// Per-resolved-path write locks. The same page file has TWO in-process
     /// writers — the editor (`save_page`/`write_page`) and the PDF highlight path
     /// (`write_highlights`, for an `hls__` page) — and a rename rewrites many
@@ -11881,12 +11925,39 @@ impl Graph {
     /// cache isn't warm yet it returns empty and memoizes nothing — we never force
     /// a full-graph parse from here (this runs on autocomplete keystrokes).
     pub fn referenced_page_names(&self) -> Vec<String> {
+        self.referenced_page_names_versioned(None)
+            .names
+            .unwrap_or_default()
+    }
+
+    /// The same inventory, plus an order-independent digest of it, so a caller
+    /// that already holds an identical set can skip transporting it.
+    ///
+    /// The frontend asks for this after every typing lull, because its resource
+    /// is keyed on `dataRev` and a save bumps that. The answer almost never
+    /// changes — typing inside a block rarely adds or removes a `[[link]]` — but
+    /// several thousand strings were serialised, sent over IPC and re-parsed on
+    /// the UI thread every time. Passing back the digest the caller already has
+    /// turns the unchanged case into an integer. (Direct Files performance audit
+    /// 2026-08-09, finding F7; 15–23 ms and ~5,000 names at 5,225 files.)
+    ///
+    /// The digest is a commutative fold, deliberately: the memo's own order comes
+    /// from a `HashMap`, so a sequence-dependent hash would report spurious
+    /// changes. It carries the count as well, so adding a name that collides with
+    /// a removed one still shows up unless the count also matches.
+    pub fn referenced_page_names_versioned(&self, known: Option<u64>) -> ReferencedPageNames {
         let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        if let Some((g, names)) = self.referenced_names_cache.read().unwrap().as_ref() {
+        if let Some((g, names, digest)) = self.referenced_names_cache.read().unwrap().as_ref() {
             if *g == gen {
-                return names.clone();
+                return ReferencedPageNames::answer(*digest, names, known);
             }
         }
+        let names = self.rebuild_referenced_page_names(gen);
+        let digest = referenced_names_digest(&names);
+        ReferencedPageNames::answer(digest, &names, known)
+    }
+
+    fn rebuild_referenced_page_names(&self, gen: u64) -> Vec<String> {
         let guard = self.cache.read().unwrap();
         let Some(pages) = guard.as_ref() else {
             return Vec::new(); // cache not warm — don't force a parse, don't memoize
@@ -11967,7 +12038,8 @@ impl Graph {
         }
         drop(guard);
         let names: Vec<String> = seen.into_values().collect();
-        *self.referenced_names_cache.write().unwrap() = Some((gen, names.clone()));
+        let digest = referenced_names_digest(&names);
+        *self.referenced_names_cache.write().unwrap() = Some((gen, names.clone(), digest));
         names
     }
 
@@ -31632,6 +31704,60 @@ fn atomic_update_with_hooks(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    // Direct Files performance audit 2026-08-09, finding F7. The digest exists to
+    // let the frontend skip transporting several thousand names it already has,
+    // so it has exactly two jobs: never report a change that did not happen (the
+    // memo's order comes from a HashMap, so a sequence-dependent hash would
+    // report one on every rebuild and the gate would save nothing), and never
+    // miss one (which would strand a stale inventory in autocomplete).
+    #[test]
+    fn the_reference_digest_ignores_order_and_notices_every_real_change() {
+        let names = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_owned()).collect()
+        };
+        let base = names(&["Alpha", "Beta", "Gamma"]);
+        let shuffled = names(&["Gamma", "Alpha", "Beta"]);
+        assert_eq!(
+            referenced_names_digest(&base),
+            referenced_names_digest(&shuffled),
+            "a reordered set is the same set"
+        );
+
+        for changed in [
+            names(&["Alpha", "Beta"]),                   // removed
+            names(&["Alpha", "Beta", "Gamma", "Delta"]), // added
+            names(&["Alpha", "Beta", "gamma"]),          // recased
+            names(&["Alpha", "Beta", "Gamma", "Gamma"]), // duplicated
+            Vec::new(),                                  // emptied
+        ] {
+            assert_ne!(
+                referenced_names_digest(&base),
+                referenced_names_digest(&changed),
+                "{changed:?} must not be mistaken for {base:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caller_holding_the_current_reference_set_is_not_sent_it_again() {
+        let names = vec!["Alpha".to_owned(), "Beta".to_owned()];
+        let digest = referenced_names_digest(&names);
+
+        let first = ReferencedPageNames::answer(digest, &names, None);
+        assert_eq!(first.digest, digest);
+        assert_eq!(first.names.as_deref(), Some(&names[..]));
+
+        let repeat = ReferencedPageNames::answer(digest, &names, Some(digest));
+        assert_eq!(repeat.names, None, "the caller already has this set");
+
+        let stale = ReferencedPageNames::answer(digest, &names, Some(digest ^ 1));
+        assert_eq!(
+            stale.names.as_deref(),
+            Some(&names[..]),
+            "a caller naming any other set must be sent the current one"
+        );
+    }
 
     #[cfg(any(unix, windows))]
     fn handoff_binding(graph: &Graph, seed: u128) -> (WorkspaceId, ProjectionEndpointBinding) {

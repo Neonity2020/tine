@@ -103,6 +103,13 @@ export interface GraphSourceFile {
   bytes: number;
 }
 
+/** The reference-name inventory, digest-gated. `names` is null exactly when the
+ *  digest the caller presented still describes the current set. */
+export interface ReferencedPageNames {
+  digest: number;
+  names: string[] | null;
+}
+
 export type GraphFolderPickResult =
   | { status: "picked"; path: string }
   | { status: "permission-requested" | "permission-needed" | "cancelled" | "refused"; path?: string };
@@ -218,8 +225,12 @@ export interface Backend {
    *  the created graph's root path to then `loadGraph`. Creates the graph in
    *  `dir` if empty, else in a fresh `tine-demo` subfolder. */
   createGraph(dir: string): Promise<string>;
-  /** Page names that exist only through references in the warmed graph cache. */
-  referencedPageNames(): Promise<string[]>;
+  /** Page names that exist only through references in the warmed graph cache.
+   *  Pass the digest of the set you already hold: the answer omits `names`
+   *  entirely when nothing changed, which is the usual case between saves and
+   *  saves several thousand strings of IPC and JSON parsing on the UI thread.
+   *  A `null` `names` means "keep what you have", never "the set is empty". */
+  referencedPageNames(knownDigest?: number | null): Promise<ReferencedPageNames>;
   listPages(): Promise<PageEntry[]>;
   journalFeedPage(limit: number, beforeDay: number | null): Promise<import("./types").JournalFeedPage>;
   /** Journal date-keys (yyyymmdd) whose page has real content. */
@@ -687,8 +698,10 @@ class TauriBackend implements Backend {
   createGraph(dir: string) {
     return this.call<string>("create_graph", { dir });
   }
-  referencedPageNames() {
-    return this.call<string[]>("referenced_page_names");
+  referencedPageNames(knownDigest?: number | null) {
+    return this.call<ReferencedPageNames>("referenced_page_names", {
+      knownDigest: knownDigest ?? null,
+    });
   }
   listPages() {
     return this.call<PageEntry[]>("list_pages");

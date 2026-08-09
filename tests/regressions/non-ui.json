@@ -3321,6 +3321,30 @@
         ]
       },
       "notes": "Direct Files data-safety audit 2026-08-09, finding 16, landed in its REACHABLE form only. The audit claimed an inotify watch() failure leaves the watcher permanently blind with no poll fallback; that is not what the code does. A failed root is never inserted into `watched` and is retried on the next cycle, and when EVERY root fails `watched` is empty, which takes the else branch and its bounded <=3 s recv_timeout - a working recovery loop. The reachable case is mixed: with two graphs open, the inotify branch blocks on rx.recv() until an event arrives from a root that IS watched, so a root the kernel refused is retried only when some other graph happens to change. inotify limits are per-user (fs.inotify.max_user_watches), so opening a second large graph is exactly how one root fails while the other is healthy, and on a quiet healthy graph the failing one stays invisible indefinitely. inotify_cycle_wait now bounds the wait to UNWATCHED_ROOT_RETRY (3 s, matching the poll branch ceiling) whenever a desired root is unwatched, and never delays a sooner scheduled retry. Coverage gaps stated in the tests themselves: they pin the wait policy, not a real kernel watch() failure (which needs privileges unavailable here) and not the call-site wiring, and they are a specification rather than fail-before evidence because the function is new."
+    },
+    {
+      "id": "REG-REFERENCED-NAMES-DIGEST-GATE-20260809",
+      "title": "Every typing lull shipped the whole reference-name inventory across IPC",
+      "family": "direct-files-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs",
+          "src/pages.inventory.test.ts"
+        ]
+      },
+      "notes": "Direct Files performance audit 2026-08-09, finding F7. The frontend's reference-name resource is keyed on dataRev, which a save bumps ~700 ms after every typing lull, so referenced_page_names ran and its result crossed IPC on every pause in typing: measured 15-23 ms and about 5,000 names at 5,225 files, with the JSON parse landing on the UI thread. The answer almost never changes, because typing inside a block rarely adds or removes a [[link]]. referenced_page_names now takes the digest of the set the caller already holds and omits the payload when it still matches, so the ordinary case is an integer. The digest is a commutative fold with the length mixed in: the memo's order comes from a HashMap, so a sequence-dependent hash would report a change on every rebuild and the gate would save nothing. NOT fixed here: the whole-graph recompute itself still runs once per cache generation, because computing the digest needs the names; making it incremental needs per-name reference counts in cache_upsert/cache_remove and is a separate packet. The frontend test pins the dangerous reading of an omitted payload - treating it as an empty set would erase every reference-only page from autocomplete and the namespace tree - and that the digest is actually presented back."
     }
   ]
 }

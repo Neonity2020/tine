@@ -390,8 +390,13 @@ pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>
 }
 
 #[tauri::command]
-pub(crate) fn referenced_page_names(state: GraphContext<'_>) -> Result<Vec<String>, String> {
-    with_read_graph(&state, |g| Ok(g.referenced_page_names()))
+pub(crate) fn referenced_page_names(
+    known_digest: Option<u64>,
+    state: GraphContext<'_>,
+) -> Result<tine_core::ReferencedPageNames, String> {
+    with_read_graph(&state, |g| {
+        Ok(g.referenced_page_names_versioned(known_digest))
+    })
 }
 
 #[derive(Serialize)]
