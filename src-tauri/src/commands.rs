@@ -1369,6 +1369,14 @@ pub(crate) fn page_icons(
 }
 
 #[tauri::command]
+pub(crate) fn existing_page_names(
+    names: Vec<String>,
+    state: GraphContext<'_>,
+) -> Result<Vec<String>, String> {
+    with_read_graph(&state, |g| Ok(g.existing_page_names(&names)))
+}
+
+#[tauri::command]
 pub(crate) fn set_favorites(names: Vec<String>, state: GraphContext<'_>) -> Result<(), String> {
     with_config_graph(&state, |g| {
         g.set_favorites(&names).map_err(|e| e.to_string())

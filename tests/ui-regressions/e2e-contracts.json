@@ -842,6 +842,35 @@
     "Any particular DOM shape for the page body, the order in which the three pages are visited, or which watch backend the platform selects."
    ],
    "stability": "stable"
+  },
+  "scripts/e2e-page-identity-links.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A page whose file carries `title::` is reachable under that title, matching Logseq's title:: > filename > first-block naming order.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A [[link]] naming no existing page is visibly distinguished before it is clicked, and still navigates and still creates the page.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A #tag whose page has no file is NOT distinguished; fileless tag pages are ordinary Logseq usage.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "How an unresolved link is distinguished (colour, opacity, underline style) may change; the journey asserts the marker class, not its rendered appearance.",
+    "Whether the marker appears on first paint or once the batched existence lookup resolves."
+   ],
+   "nonRequirements": [
+    "Exact dimming colour, opacity value, underline geometry, or CSS custom-property names.",
+    "The order in which references on a page resolve their existence."
+   ],
+   "stability": "stable",
+   "notes": "Added 2026-08-09 after a generated graph linked 29 papers by filename while every file declared a different title::; every link opened a blank page with nothing on screen to explain it. Logseq does NOT dim unresolved links (components/block.cljs:548 dims only untitled-page?, meaning a page existing under a uuid name), so the dimming is a deliberate, Martin-approved divergence and this journey is its contract."
   }
  }
 }

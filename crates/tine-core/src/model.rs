@@ -13052,6 +13052,37 @@ impl Graph {
         out
     }
 
+    /// The subset of `names` that already name a document in this graph — a real
+    /// page, a journal, or an alias of one. The UI dims the rest, so a link that
+    /// will open a blank page is visible as such before it is clicked.
+    ///
+    /// A DELIBERATE divergence from Logseq, which renders a link to a
+    /// non-existent page exactly like a live one (`components/block.cljs:548`
+    /// dims only `untitled-page?`, meaning a page that exists under a uuid name).
+    /// Approved by Martin 2026-08-09 after a `title::`/filename mismatch silently
+    /// dead-ended 29 links with no visible signal. Obsidian's "unresolved link"
+    /// styling is the same affordance.
+    ///
+    /// Resolution deliberately mirrors `load_named`'s: normalized page keys plus
+    /// the alias table, and no `PageKind` filter — a link to an existing journal
+    /// is alive. Costs one page-list read (memoized) per call, so callers must
+    /// batch; the UI coalesces every reference in a tick into one request.
+    pub fn existing_page_names(&self, names: &[String]) -> Vec<String> {
+        let mut known: std::collections::HashSet<String> = self
+            .list_pages()
+            .iter()
+            .map(|entry| crate::refs::page_key(&entry.name))
+            .collect();
+        for (alias, _canonical) in self.page_aliases() {
+            known.insert(alias);
+        }
+        names
+            .iter()
+            .filter(|name| known.contains(&crate::refs::page_key(name)))
+            .cloned()
+            .collect()
+    }
+
     /// Alias → canonical-page-name pairs (for the UI to resolve links/navigation).
     pub fn page_aliases(&self) -> Vec<(String, String)> {
         self.page_aliases_with_owners()

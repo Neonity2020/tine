@@ -287,6 +287,8 @@ export interface Backend {
   pageAliases(): Promise<[string, string][]>;
   /** `icon::` property for each named page that has one (page-name → icon). */
   pageIcons(names: string[]): Promise<Record<string, string>>;
+  /** The subset of `names` that already name a page, journal or alias. */
+  existingPageNames(names: string[]): Promise<string[]>;
   /** Persist favorited page names to config.edn `:favorites`. */
   setFavorites(names: string[]): Promise<void>;
   /** Persist the task workflow to config.edn `:preferred-workflow`. */
@@ -818,6 +820,9 @@ class TauriBackend implements Backend {
   }
   pageIcons(names: string[]) {
     return this.call<Record<string, string>>("page_icons", { names });
+  }
+  existingPageNames(names: string[]) {
+    return this.call<string[]>("existing_page_names", { names });
   }
   setFavorites(names: string[]) {
     return this.call<void>("set_favorites", { names });

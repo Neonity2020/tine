@@ -18,6 +18,7 @@ import { EmojiText } from "./emoji";
 import { sanitizeRawHtml, rawHtmlLocalImages } from "./htmlSanitize";
 import { allowLocalFileImages } from "../localFileSettings";
 import { pageIcon } from "../pageIconBatch";
+import { pageIsMissing } from "../pageExistsBatch";
 import { typographic } from "./typography";
 import { coarseSpanAttrs, literalSpanAttrs, plainSpanAttrs, typographicPlainSpanAttrs, type SpanDomAttrs } from "./spans";
 import { typographyMode } from "../ui";
@@ -282,6 +283,12 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
   // WebKitGTK paints color-emoji webfonts blank. Reactive + batched + cached per
   // graph; an icon-less graph costs one IPC and no re-render (see pageIconBatch).
   const icon = () => (isGuidePageName(targetName()) ? null : pageIcon(targetName()));
+  // Dim a `[[ref]]` whose page does not exist, so a link that will open a blank
+  // page says so before it is clicked. NOT applied to `#tags`: a tag whose page
+  // has no file is ordinary Logseq usage, and dimming those would mark most tags
+  // in a normal graph. Deliberate divergence from OG — see `existing_page_names`.
+  const missing = () =>
+    !props.tag && !isGuidePageName(targetName()) && pageIsMissing(targetName());
   const kind = (): PageKind => (isGuidePageName(targetName()) ? "page" : isJournalTitle(targetName()) ? "journal" : "page");
   const open = (e: MouseEvent) => {
     e.stopPropagation();
@@ -305,7 +312,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
     <>
       <a
         ref={anchorEl}
-        class={props.tag ? "tag" : "page-ref"}
+        class={`${props.tag ? "tag" : "page-ref"}${missing() ? " page-ref-missing" : ""}`}
         {...(props.spanAttrs ?? {})}
         // Shift+click opens the page in the sidebar (via `open`); suppress the
         // browser's native shift-range-selection so the main editor's text isn't

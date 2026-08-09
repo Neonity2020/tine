@@ -3064,6 +3064,29 @@
         ]
       },
       "notes": "Logseq matches unlinked references with a raw regex over the whole block content (db/model.cljs get-page-unlinked-references, only drawer/remove-logbook stripped), so code fences, inline code, math, raw HTML, examples, latex environments and hiccup are all searched. Tine derived its search region from an ALLOWLIST of block kinds in reference_evidence walk_blocks, whose `_ => {}` arm silently dropped every other variant - so the region lost coverage each time lsdoc grew a block type. Now derived by SUBTRACTION: plain_search_ranges takes the complement of what the parser already claimed (explicit refs, block refs, structural properties, :LOGBOOK: drawers), which is Logseq's own semantics reached through the parser rather than a second scanner - alias/NFC/boundary logic unchanged and new lsdoc variants covered for free. Logseq's `#`/doubled-`[` prefix rule had to be ported explicitly (og_prefix_allows): it used to be implied by overlap with a parsed reference, but inside a fence there is no parsed reference, so `[[Page]]` in code would otherwise have matched. That also corrected an inversion - for `\\[[Target]]` Tine reported the escaped bracket and hid both code mentions, exactly backwards from Logseq. DELIBERATE DIVERGENCE, named: structural id::/collapsed::/logseq.* property text stays withheld (Logseq scans it) because a page named after a uuid fragment is not a real outcome. PERF: widening the region cost +13% (285->325 ms cold on the 1,045-file anonymized graph), so an ASCII prefilter was added to visit_plain_matches - it skips a start position only when BOTH the name's first char and the source char are ASCII, where lowercase is exact and NFC is identity, leaving folding cases like the Kelvin sign to the authoritative matcher. Net 285 ms -> 36 ms, ~8x faster than before the change. Reusing string buffers instead was measured WORSE (400 ms) because flat_map(char::to_lowercase) loses str::to_lowercase's ASCII fast path. Necessity: 6 unit tests and 2 of 3 integration tests fail on the pre-fix tree; the third asserts the complement did NOT over-widen (an explicit link and a CLOCK: line stay out) and passes both sides."
+    },
+    {
+      "id": "REG-UNRESOLVED-PAGE-LINK-VISIBLE-20260809",
+      "title": "A link naming no existing page is visibly distinguished, and a fileless #tag is not",
+      "family": "references",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/pageExistsBatch.test.ts",
+          "scripts/e2e-page-identity-links.mjs"
+        ]
+      },
+      "notes": "Martin, 2026-08-09: a generated graph wrote each report to `pages/c01 Swap Bribery.md` with `title:: Swap Bribery` and linked the index by FILENAME. Since Logseq resolves a page's name as title:: > filename > first block (graph-parser extract.cljc get-page-name), the filename named nothing and all 29 links opened blank pages with no signal. Tine <=0.6.5 used the filename and ignored title::; aa4a4b29 (2026-07-29, shipped in 0.6.90) corrected that, which is why the graph looked fine when built. Backend was never at fault - load_named returned full content for all 30 pages. DELIBERATE DIVERGENCE, approved by Martin: Logseq does NOT distinguish unresolved links (components/block.cljs:548 dims only untitled-page?, i.e. a page that EXISTS under a uuid name); Tine dims them, as Obsidian does. Applied to [[refs]] only, NOT #tags - a tag with no page file is ordinary Logseq usage and dimming those would mark most tags in a normal graph. existing_page_names resolves like load_named (normalized keys + alias table, no PageKind filter, so a link to an existing journal is alive) and costs one memoized page-list read per call; pageExistsBatch coalesces every reference in a tick into one IPC, asks each name once per graph, and treats UNKNOWN AS ALIVE so a page of good links never flashes as dead. Verified on the real 30-page graph: 8/8 refs dimmed before the repair, 0/8 after, all six sampled links clicking through to 24-27 block pages."
     }
   ]
 }

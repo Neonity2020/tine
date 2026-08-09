@@ -4419,6 +4419,22 @@ textarea {
   opacity: 0.55;
 }
 
+/* A link whose page does not exist yet: clicking it opens a blank page. Muted
+   with a dotted underline so it reads as "not written yet" rather than broken —
+   the link still works and still creates the page. Deliberate divergence from
+   Logseq, which renders these identically to live links; added after a
+   `title::`/filename mismatch silently dead-ended a whole index (2026-08-09). */
+.page-ref-missing {
+  color: var(--text-muted);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.page-ref-missing:hover {
+  text-decoration: underline dotted;
+  color: var(--link-color);
+}
+
 .tag {
   color: var(--tag-color);
   cursor: pointer;

@@ -1235,6 +1235,10 @@ export function mockBackend(): Backend {
       }
       return out;
     },
+    async existingPageNames(names: string[]): Promise<string[]> {
+      return names.filter((name) =>
+        all.some((p) => p.name.toLowerCase() === name.toLowerCase()));
+    },
     async setFavorites(): Promise<void> {
       // no-op in the browser mock
     },

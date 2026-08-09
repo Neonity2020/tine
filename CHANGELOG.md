@@ -11,6 +11,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Added
 
 - **Ctrl+O opens the page under the caret**, and Ctrl+Shift+O opens it in the sidebar — matching Logseq, so you can navigate `[[links]]` and `#tags` without the mouse (GH #274).
+- **A link to a page that doesn't exist yet is now dimmed**, with a dotted underline, so you can see before clicking that it will open a blank page. The link still works and still creates the page. `#tags` are deliberately left alone, since a tag with no page file is perfectly normal. Logseq does not make this distinction; it was added after a graph whose links all pointed at names no page had, with nothing on screen to say so.
+
+
+### Changed
+
+- **Documenting a change that shipped undocumented in 0.6.90:** a page's name comes from its `title::` property when it has one, and only otherwise from its filename — which is what Logseq does (`title::` → filename → first block). Before 0.6.90 Tine used the filename and ignored `title::`. If a graph was built against the old behaviour, files carrying a `title::` that differs from their filename are now reachable under the *title*, and `[[filename]]` links to them will open blank pages. The new dimming above makes those visible; either drop the `title::` or link to its value.
 
 
 ### Fixed
