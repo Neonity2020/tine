@@ -28,6 +28,10 @@ const releaseWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workfl
 const ciWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ci.yml"), "utf8");
 const nextestConfig = fs.readFileSync(path.join(process.cwd(), ".config/nextest.toml"), "utf8");
 const uiE2eWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/ui-e2e.yml"), "utf8");
+const issue295Workflow = fs.readFileSync(
+  path.join(process.cwd(), ".github/workflows/windows-issue-295.yml"),
+  "utf8"
+);
 const flatpakWorkflow = fs.readFileSync(path.join(process.cwd(), ".github/workflows/flatpak.yml"), "utf8");
 const flatpakMetadataWorkflow = fs.readFileSync(
   path.join(process.cwd(), ".github/workflows/flatpak-metadata.yml"),
@@ -39,6 +43,10 @@ const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
 const windowsWebviewDriverInstaller = fs.readFileSync(
   path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
+  "utf8"
+);
+const issue295Scenario = fs.readFileSync(
+  path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
   "utf8"
 );
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
@@ -72,6 +80,15 @@ assert.deepEqual(
   [],
   "tracked paths must remain unique on case-insensitive filesystems"
 );
+assert.match(issue295Workflow, /candidate_ref:[\s\S]*?required: true/);
+assert.match(issue295Workflow, /ref: \$\{\{ inputs\.candidate_ref \}\}[\s\S]*?path: candidate/);
+assert.match(issue295Workflow, /a4cc5eca0c08ac3e819dc490e3d48f545c207da742a670bf437a86a6d1b6aa24/);
+assert.match(issue295Workflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
+assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
+assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
+assert.match(issue295Scenario, /dispatchToSecondPaint/);
+assert.match(issue295Scenario, /quickSwitch/);
+assert.match(issue295Scenario, /directSave/);
 
 function yamlBlock(lines, key, indent) {
   const header = `${" ".repeat(indent)}${key}:`;
