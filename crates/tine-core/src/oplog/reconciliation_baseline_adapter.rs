@@ -380,13 +380,14 @@ fn scan_file_row(
 ) -> Result<Option<BaselineScanPath>, BaselineUnavailable> {
     let Some(description) = file.description else {
         // Non-text and conflict-copy bytes are not hashed by the authenticated
-        // scanner. Their exact metadata remains committed by both pass digests;
+        // scanner. Their exact metadata remains committed by the stable pass
+        // digest (mirrored in both legacy compatibility columns);
         // fabricating a content baseline here would create false authority.
         return Ok(None);
     };
     if matches!(file.class, GraphTextScanPathClass::Configuration) {
-        // Configuration bytes and metadata are already committed by both
-        // stable-scan pass digests and by the Graph scope binding. They are
+        // Configuration bytes and metadata are already committed by the
+        // stable-scan digest and by the Graph scope binding. They are
         // not managed content and cannot be represented as a `ManagedPath`;
         // attempting to do so would make every configured nested root block
         // before reconciliation can compare its actual managed inventory.
@@ -803,10 +804,10 @@ mod tests {
             .collect::<Vec<_>>();
         StableGraphTextScan {
             instrumentation: GraphTextScanInstrumentation {
-                passes: 2,
-                directories: (baseline_pass.directories_by_exact_relative.len() * 2) as u64,
-                regular_files: (baseline_pass.files.len() * 2) as u64,
-                eligible_files: (baseline_pass.files.len() * 2) as u64,
+                passes: 1,
+                directories: baseline_pass.directories_by_exact_relative.len() as u64,
+                regular_files: baseline_pass.files.len() as u64,
+                eligible_files: baseline_pass.files.len() as u64,
                 candidates: candidates.len() as u64,
                 diagnostics: diagnostics.len() as u64,
                 ..GraphTextScanInstrumentation::default()

@@ -3392,8 +3392,11 @@ fn validate_scan_instrumentation(
     candidate_count: usize,
     clean: bool,
 ) -> Result<(), ReconciliationBaselineError> {
+    // Disposable v2 baselines written by pre-cut builds may still carry two
+    // discovery passes. New StableGraphTextScan identities require exactly
+    // one; the store only needs to decode either bounded historical shape.
     if instrumentation.passes > 2
-        || (clean && instrumentation.passes != 2)
+        || (clean && instrumentation.passes == 0)
         || instrumentation.directory_entries > MAX_BASELINE_SCAN_ENTRIES
         || instrumentation.directories > MAX_BASELINE_DIRECTORIES_PER_EPOCH as u64
         || instrumentation.regular_files > MAX_BASELINE_SCAN_ENTRIES

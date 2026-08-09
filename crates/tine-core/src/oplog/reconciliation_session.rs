@@ -569,7 +569,7 @@ impl ReconciliationSession<FailedClosedOperationalCoordinator> {
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies,
             #[cfg(test)]
-            before_second_scan_pass: None,
+            after_scan_capture: None,
             #[cfg(test)]
             arrival_before_dispatch: None,
         };
@@ -577,14 +577,14 @@ impl ReconciliationSession<FailedClosedOperationalCoordinator> {
     }
 
     #[cfg(test)]
-    pub(crate) fn step_with_before_second_scan_pass<'a>(
+    pub(crate) fn step_with_after_scan_capture<'a>(
         &mut self,
         dependencies: ReconciliationSessionDependencies<'a>,
-        before_second_scan_pass: impl FnMut() + 'a,
+        after_scan_capture: impl FnMut() + 'a,
     ) -> Result<ReconciliationSessionStep, ReconciliationSessionError> {
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies,
-            before_second_scan_pass: Some(Box::new(before_second_scan_pass)),
+            after_scan_capture: Some(Box::new(after_scan_capture)),
             arrival_before_dispatch: None,
         };
         self.step_with(&mut dispatch)
@@ -599,7 +599,7 @@ impl ReconciliationSession<FailedClosedOperationalCoordinator> {
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies,
             #[cfg(test)]
-            before_second_scan_pass: None,
+            after_scan_capture: None,
             #[cfg(test)]
             arrival_before_dispatch: None,
         };
@@ -706,7 +706,7 @@ trait ReconciliationSessionDispatch {
 struct LiveReconciliationSessionDispatch<'a> {
     dependencies: ReconciliationSessionDependencies<'a>,
     #[cfg(test)]
-    before_second_scan_pass: Option<Box<dyn FnMut() + 'a>>,
+    after_scan_capture: Option<Box<dyn FnMut() + 'a>>,
     #[cfg(test)]
     arrival_before_dispatch: Option<ReconciliationTrigger>,
 }
@@ -1060,7 +1060,7 @@ impl LiveReconciliationSessionDispatch<'_> {
                 },
             );
             #[cfg(test)]
-            let result = if let Some(hook) = self.before_second_scan_pass.as_mut() {
+            let result = if let Some(hook) = self.after_scan_capture.as_mut() {
                 super::reconciliation_scan::scan_graph_text_with_hook(
                     graph,
                     &source,
@@ -1204,7 +1204,21 @@ fn import_blocked_observation(blocked: ReconciliationImportBlocked) -> BaselineB
                     BaselineBlockedReason::ReconciliationFailed
                 }
             };
-            BaselineBlockedObservation::new(reason, blocked.detail)
+            let mut detail = blocked.detail;
+            if let Some(first) = blocked.evidence.first() {
+                detail.push_str(&format!(
+                    ": first evidence={:?} at {}",
+                    first.kind, first.path
+                ));
+                if blocked.evidence.len() > 1 || blocked.omitted_evidence != 0 {
+                    detail.push_str(&format!(
+                        " ({} additional retained, {} omitted)",
+                        blocked.evidence.len().saturating_sub(1),
+                        blocked.omitted_evidence
+                    ));
+                }
+            }
+            BaselineBlockedObservation::new(reason, detail)
         }
         ReconciliationImportBlocked::Coordinator(plan) => BaselineBlockedObservation::new(
             BaselineBlockedReason::ReconciliationFailed,
@@ -1715,14 +1729,14 @@ mod tests {
     }
 
     #[test]
-    fn live_unstable_scan_race_queues_one_full_retry() {
+    fn live_change_after_capture_converges_on_next_explicit_scan() {
         let mut fixture = LiveFixture::new("unstable-scan-race", true);
         let mutation = fixture.graph_root.join(&fixture.path);
         let mut session = live_session();
         session.trigger(ReconciliationTrigger::Explicit);
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies: fixture.dependencies(),
-            before_second_scan_pass: Some(Box::new(move || {
+            after_scan_capture: Some(Box::new(move || {
                 fs::write(&mutation, b"- changed during scan\n").unwrap();
             })),
             arrival_before_dispatch: None,
@@ -1730,16 +1744,17 @@ mod tests {
 
         assert_eq!(
             session.step_with(&mut dispatch),
-            Ok(ReconciliationSessionStep::RetryFull)
+            Ok(ReconciliationSessionStep::Noop)
         );
         drop(dispatch);
         assert_eq!(
             session.status().last_completion,
-            Some(ReconciliationCompletionOutcome::Retry)
+            Some(ReconciliationCompletionOutcome::Noop)
         );
         assert!(!session.status().active);
-        assert!(session.status().pending);
+        assert!(!session.status().pending);
 
+        session.trigger(ReconciliationTrigger::Explicit);
         let retry = session.step(fixture.dependencies());
         assert!(matches!(
             retry,
@@ -1787,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn live_failure_keeps_queued_precondition_ahead_of_full_retry() {
+    fn live_after_capture_change_keeps_queued_precondition_ahead_of_fresh_scan() {
         let mut fixture = LiveFixture::new("queued-precondition", true);
         let mutation = fixture.graph_root.join(&fixture.path);
         let precondition = paths(&[&fixture.path]);
@@ -1795,7 +1810,7 @@ mod tests {
         session.trigger(ReconciliationTrigger::Explicit);
         let mut dispatch = LiveReconciliationSessionDispatch {
             dependencies: fixture.dependencies(),
-            before_second_scan_pass: Some(Box::new(move || {
+            after_scan_capture: Some(Box::new(move || {
                 fs::write(&mutation, b"- changed during scan\n").unwrap();
             })),
             arrival_before_dispatch: Some(ReconciliationTrigger::ProjectionPreconditionMismatch(
@@ -1805,10 +1820,11 @@ mod tests {
 
         assert_eq!(
             session.step_with(&mut dispatch),
-            Ok(ReconciliationSessionStep::RetryFull)
+            Ok(ReconciliationSessionStep::Noop)
         );
         drop(dispatch);
         assert!(session.status().pending);
+        session.trigger(ReconciliationTrigger::Explicit);
 
         let precondition_job = session
             .scheduler
@@ -1830,7 +1846,7 @@ mod tests {
         let retry_job = session
             .scheduler
             .next()
-            .expect("unstable scan retry must remain after the urgent precondition");
+            .expect("fresh full scan must remain after the urgent precondition");
         assert!(matches!(retry_job.work(), ReconciliationWork::FullScan(_)));
         session
             .scheduler

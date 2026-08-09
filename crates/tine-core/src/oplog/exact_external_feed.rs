@@ -200,7 +200,7 @@ pub(crate) struct ExactExternalFeedState {
     #[cfg(test)]
     rebase_count: u64,
     #[cfg(test)]
-    before_second_scan_pass: Option<Box<dyn FnMut()>>,
+    after_scan_capture: Option<Box<dyn FnMut()>>,
 }
 
 impl fmt::Debug for ExactExternalFeedState {
@@ -266,7 +266,7 @@ impl ExactExternalFeedState {
             #[cfg(test)]
             rebase_count: 0,
             #[cfg(test)]
-            before_second_scan_pass: None,
+            after_scan_capture: None,
         })
     }
 
@@ -907,7 +907,7 @@ impl ExactExternalFeedState {
         continuation: Option<ReconciliationPendingContinuation>,
     ) -> Result<ReconciliationSessionStep, ExecuteReconciliationError> {
         #[cfg(test)]
-        let before_second_scan_pass = self.before_second_scan_pass.take();
+        let after_scan_capture = self.after_scan_capture.take();
         let Self {
             reconciliation,
             baseline,
@@ -948,8 +948,8 @@ impl ExactExternalFeedState {
             None => {
                 #[cfg(test)]
                 {
-                    if let Some(hook) = before_second_scan_pass {
-                        reconciliation.step_with_before_second_scan_pass(dependencies, hook)
+                    if let Some(hook) = after_scan_capture {
+                        reconciliation.step_with_after_scan_capture(dependencies, hook)
                     } else {
                         reconciliation.step(dependencies)
                     }
@@ -1507,9 +1507,9 @@ pub(crate) mod tests {
             ),
             (
                 0xEFA0_0100,
-                "diary/\u{65e5}\u{8a18}/journal space.org",
-                "Journal space",
-                ManagedTextKind::Journal,
+                "content/nested pages/deep/Org page.org",
+                "Org page",
+                ManagedTextKind::Page,
                 "org original",
             ),
             (
@@ -1653,7 +1653,7 @@ pub(crate) mod tests {
     #[test]
     fn bootstrap_expected_paths_share_bounded_bulk_materialization_across_full_scan() {
         const PAGE_COUNT: usize = 65;
-        const EXPECTED_STREAM_PASSES: usize = 3;
+        const EXPECTED_STREAM_PASSES: usize = 1;
 
         let files = (0..PAGE_COUNT).map(|index| {
             (
@@ -1909,7 +1909,7 @@ pub(crate) mod tests {
             ));
 
             let markdown = "content/nested pages/deep/Caf\u{e9} note.md";
-            let org = "diary/\u{65e5}\u{8a18}/journal space.org";
+            let org = "content/nested pages/deep/Org page.org";
             let old = "content/nested pages/rename old.org";
             let new = "content/nested pages/deeper/renamed \u{65e5}.org";
             fs::write(
@@ -1949,6 +1949,26 @@ pub(crate) mod tests {
                 &mut clock,
             );
             assert_admitted(result);
+            assert_eq!(
+                fixture.manifest_count(),
+                before,
+                "one uncertain full observation must not publish the rename deletion"
+            );
+            owner
+                .observe(
+                    &fixture.graph,
+                    &runtime,
+                    [WatcherObservation::RescanRequired],
+                )
+                .unwrap();
+            assert_admitted(drive_terminal(
+                &mut owner,
+                &fixture.graph,
+                &fixture.receipts,
+                &mut authority,
+                &mut runtime,
+                &mut clock,
+            ));
             assert_eq!(fixture.manifest_count(), before + 1);
             assert_eq!(
                 fs::read(fixture.graph_root.join(markdown)).unwrap(),
@@ -2109,7 +2129,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unstable_full_scan_retries_behind_the_same_epoch_fence() {
+    fn change_after_single_capture_converges_in_the_next_full_epoch() {
         let mut fixture = configured_fixture("unstable-full-scan");
         let enrollment = fixture.enrollment_root("unstable-full-scan");
         let paths = PromotedPaths::new(&fixture, "unstable-full-scan");
@@ -2137,24 +2157,29 @@ pub(crate) mod tests {
             )
             .unwrap();
         let graph_root = fixture.graph_root.clone();
-        owner.before_second_scan_pass = Some(Box::new(move || {
+        owner.after_scan_capture = Some(Box::new(move || {
             let changed = graph_root.join("content/nested pages/raced.md");
             fs::create_dir_all(changed.parent().unwrap()).unwrap();
-            fs::write(changed, b"- arrived between scan passes\n").unwrap();
+            fs::write(changed, b"- arrived after capture\n").unwrap();
         }));
 
         clock += 1;
-        assert_eq!(
-            owner.drain_one(
-                &fixture.graph,
-                &fixture.receipts,
-                &mut authority,
-                &mut runtime,
-                BaselineTimestamp::from_millis(clock).unwrap(),
-            ),
-            ExactExternalFeedDrain::RetryFull
+        let first = owner.drain_one(
+            &fixture.graph,
+            &fixture.receipts,
+            &mut authority,
+            &mut runtime,
+            BaselineTimestamp::from_millis(clock).unwrap(),
         );
+        assert!(matches!(first, ExactExternalFeedDrain::AdmittedNoop { .. }));
         assert_eq!(owner.rebase_count, rebases_before + 1);
+        owner
+            .observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::RescanRequired],
+            )
+            .unwrap();
         assert_admitted(drive_terminal(
             &mut owner,
             &fixture.graph,
@@ -2166,7 +2191,7 @@ pub(crate) mod tests {
         assert_eq!(
             owner.rebase_count,
             rebases_before + 2,
-            "an unstable full scan must refresh the exact index behind its existing queue fence"
+            "the later full epoch performs one fresh census"
         );
         let settled = runtime.watcher_status();
         assert_eq!(settled.acknowledged, settled.latest_enqueue);
@@ -2174,7 +2199,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn continuously_unstable_epoch_bounds_graph_wide_rebases_and_still_converges() {
+    fn repeated_after_capture_changes_cost_one_census_per_epoch_and_converge() {
         let mut fixture = configured_fixture("bounded-unstable-full-scan");
         let enrollment = fixture.enrollment_root("bounded-unstable-full-scan");
         let paths = PromotedPaths::new(&fixture, "bounded-unstable-full-scan");
@@ -2193,20 +2218,19 @@ pub(crate) mod tests {
             &mut clock,
         ));
         let rebases_before = owner.rebase_count;
-        owner
-            .observe(
-                &fixture.graph,
-                &runtime,
-                [WatcherObservation::RescanRequired],
-            )
-            .unwrap();
-
         for race in 0..4 {
+            owner
+                .observe(
+                    &fixture.graph,
+                    &runtime,
+                    [WatcherObservation::RescanRequired],
+                )
+                .unwrap();
             let graph_root = fixture.graph_root.clone();
-            owner.before_second_scan_pass = Some(Box::new(move || {
+            owner.after_scan_capture = Some(Box::new(move || {
                 let changed = graph_root.join(format!("content/nested pages/raced-{race}.md"));
                 fs::create_dir_all(changed.parent().unwrap()).unwrap();
-                fs::write(changed, format!("- race {race}\n")).unwrap();
+                fs::write(changed, format!("- after capture {race}\n")).unwrap();
             }));
             clock += 1;
             let result = owner.drain_one(
@@ -2216,21 +2240,20 @@ pub(crate) mod tests {
                 &mut runtime,
                 BaselineTimestamp::from_millis(clock).unwrap(),
             );
-            if race % 2 == 0 {
-                assert_eq!(result, ExactExternalFeedDrain::RetryFull);
-            } else {
-                assert!(matches!(
-                    result,
-                    ExactExternalFeedDrain::Failed(ref detail)
-                        if detail.contains("retained for bounded retry")
-                ));
-            }
+            assert_admitted(result);
             assert_eq!(
                 owner.rebase_count,
                 rebases_before + race + 1,
-                "one watcher retry cycle may perform only its initial and one retry rebase"
+                "each independent full epoch performs exactly one census"
             );
         }
+        owner
+            .observe(
+                &fixture.graph,
+                &runtime,
+                [WatcherObservation::RescanRequired],
+            )
+            .unwrap();
         let mut terminal = None;
         for _ in 0..64 {
             clock += 1;

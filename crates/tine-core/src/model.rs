@@ -2828,6 +2828,8 @@ struct CompleteGraphTextAdmissionIndex {
     paths_by_semantic_key: PersistentMap<(u8, String), std::collections::BTreeSet<ManagedPath>>,
     tombstones_by_exact_path: PersistentMap<ManagedPath, GraphTextAdmissionTombstone>,
     directories_by_exact_relative: PersistentMap<String, ContentDigest>,
+    reconciliation_scan_instrumentation:
+        crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation,
     permanent_bytes: u64,
     permanent_limit: u64,
     peak_limit: u64,
@@ -7805,7 +7807,7 @@ impl Graph {
             Option<io::Error>,
         )> = (|| {
             let (first, combined_capture_bytes) =
-                self.capture_initial_shadow_with_limits(limits)?;
+                self.capture_live_graph_text_admission_with_limits(limits)?;
             let index = build_graph_text_admission_index(
                 self,
                 &first,
@@ -7858,6 +7860,24 @@ impl Graph {
             return Err(initial_shadow_limit_error("peak build memory"));
         }
         Ok((first, combined_capture_bytes))
+    }
+
+    /// One physical census for the live exact-feed index. Discovery is not
+    /// publication authority: reconciliation recaptures every affected path,
+    /// and absences cross the durable confirmation boundary before admission.
+    /// Bootstrap source proof retains its separate two-pass capture above.
+    fn capture_live_graph_text_admission_with_limits(
+        &self,
+        limits: InitialShadowLimits,
+    ) -> io::Result<(InitialShadowCapture, u64)> {
+        require_projection_platform()?;
+        let permit = self.admit_retained_managed_text_writer()?;
+        let capture =
+            collect_initial_shadow_managed_inventory_with_limits(self, &permit, true, limits, 0)?;
+        initial_shadow_revalidation_hook(&self.root)?;
+        self.ensure_projection_root_binding()?;
+        let capture_bytes = capture.peak_build_charge;
+        Ok((capture, capture_bytes))
     }
 
     /// Capture the resource retained by this Graph even when its ambient path
@@ -7939,6 +7959,23 @@ impl Graph {
         limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
     ) -> io::Result<crate::oplog::reconciliation_scan::GraphTextScanPass> {
         require_projection_platform()?;
+        let admission = {
+            let state = self.graph_text_admission.read().unwrap();
+            match &*state {
+                GraphTextAdmissionState::SnapshotComplete(index)
+                | GraphTextAdmissionState::CatchingUp(index)
+                | GraphTextAdmissionState::Complete(index) => Some(Arc::clone(index)),
+                GraphTextAdmissionState::Poisoned { cause, .. } => {
+                    return Err(graph_text_admission_unavailable(cause));
+                }
+                GraphTextAdmissionState::Unbuilt
+                | GraphTextAdmissionState::Armed(_)
+                | GraphTextAdmissionState::Building { .. } => None,
+            }
+        };
+        if let Some(admission) = admission {
+            return reconciliation_scan_pass_from_admission(self, &admission, limits);
+        }
         let permit = self.admit_retained_managed_text_writer()?;
         collect_reconciliation_scan_pass(self, &permit, limits)
     }
@@ -8218,10 +8255,10 @@ impl Graph {
     ///
     /// An actor intentionally arms the feed during fast runtime open, then
     /// holds one uncertainty epoch before doing any graph-wide work.  The
-    /// first drain calls this method once: its bounded two-pass snapshot and
+    /// first drain calls this method once: its bounded single-census snapshot and
     /// its initial feed fence are published together as `CatchingUp`.  This
     /// avoids a stale open-time snapshot followed by a second full rebuild,
-    /// while retaining the ordinary build-time race checks.
+    /// while retaining exact affected-path admission checks.
     pub(crate) fn build_graph_text_exact_feed_at_fence(
         &self,
         lease: &GraphTextExactFeedLease,
@@ -8254,7 +8291,7 @@ impl Graph {
 
     /// Rebuild the complete exact-feed index at one held queue fence.
     ///
-    /// The old index remains authoritative while the bounded two-pass capture
+    /// The old index remains authoritative while the bounded single census
     /// is constructed. Publication is one pointer swap only after the retained
     /// graph/root/scope, lease, prior generation, and prior feed fence are
     /// re-proved unchanged. A transient scan failure therefore leaves the old
@@ -8310,7 +8347,7 @@ impl Graph {
         };
 
         let (capture, combined_capture_bytes) =
-            self.capture_initial_shadow_with_limits(INITIAL_SHADOW_LIMITS)?;
+            self.capture_live_graph_text_admission_with_limits(INITIAL_SHADOW_LIMITS)?;
         let replacement_peak_base =
             checked_add_bytes(combined_capture_bytes, current.permanent_bytes)?;
         let mut replacement = build_graph_text_admission_index(
@@ -25171,7 +25208,229 @@ struct InitialShadowCapture {
     paths_by_file_resource:
         std::collections::BTreeMap<ContentDigest, std::collections::BTreeSet<String>>,
     file_link_count_by_exact_relative: std::collections::BTreeMap<String, u64>,
+    all_entries: u64,
+    raw_bytes: u64,
     peak_build_charge: u64,
+}
+
+fn reconciliation_scan_classify_path(
+    graph: &Graph,
+    relative: &str,
+) -> io::Result<(
+    crate::oplog::reconciliation_scan::GraphTextScanPathClass,
+    Option<PortablePathKey>,
+)> {
+    use crate::oplog::reconciliation_scan::GraphTextScanPathClass;
+
+    let page_like = is_page_file(Path::new(relative));
+    let is_configuration = relative.eq_ignore_ascii_case("logseq/config.edn");
+    let is_conflict = page_like && path_is_sync_conflict(Path::new(relative));
+    let eligible = graph.graph_text_scope.is_eligible(relative);
+    let under_configured_root = [&graph.config.pages_dir, &graph.config.journals_dir]
+        .into_iter()
+        .any(|root| {
+            relative
+                .strip_prefix(root)
+                .is_some_and(|tail| tail.starts_with('/'))
+        });
+    if page_like
+        && under_configured_root
+        && !eligible
+        && ManagedPath::parse(relative.to_owned()).is_err()
+    {
+        return Err(reconciliation_scan_unsafe_error(format!(
+            "configured graph-text path is not portable: {relative}"
+        )));
+    }
+    if is_configuration {
+        return Ok((GraphTextScanPathClass::Configuration, None));
+    }
+    if is_conflict {
+        return Ok((GraphTextScanPathClass::ProviderConflictCopy, None));
+    }
+    if !eligible {
+        return Ok((GraphTextScanPathClass::RetainedNonText, None));
+    }
+    let path = ManagedPath::parse(relative.to_owned()).map_err(|error| {
+        reconciliation_scan_unsafe_error(format!(
+            "eligible graph-text path is not portable: {error}"
+        ))
+    })?;
+    let portable_key = path.portable_key();
+    let class = match graph.classify_managed_text_path(&path) {
+        Ok(kind) => GraphTextScanPathClass::EligibleManaged(kind),
+        Err(_) => GraphTextScanPathClass::EligibleUnmanaged,
+    };
+    Ok((class, Some(portable_key)))
+}
+
+fn reconciliation_scan_pass_from_admission(
+    graph: &Graph,
+    index: &CompleteGraphTextAdmissionIndex,
+    limits: crate::oplog::reconciliation_scan::GraphTextScanLimits,
+) -> io::Result<crate::oplog::reconciliation_scan::GraphTextScanPass> {
+    use crate::oplog::reconciliation_scan::{
+        GraphTextScanFileFingerprint, GraphTextScanPass, GraphTextScanPathClass,
+        GRAPH_TEXT_SCAN_READ_BUFFER_BYTES,
+    };
+
+    if limits.read_buffer_bytes == 0 || limits.read_buffer_bytes > GRAPH_TEXT_SCAN_READ_BUFFER_BYTES
+    {
+        return Err(reconciliation_scan_limit_error("read buffer"));
+    }
+    graph.ensure_projection_root_binding()?;
+    let graph_resource = graph.canonical_resource_id()?;
+    let scope_binding = graph.graph_text_scope_binding()?;
+    if graph_resource != index.graph_resource || scope_binding != index.scope_binding {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "queue-fenced admission snapshot belongs to an older graph binding",
+        ));
+    }
+    let all_entries = index
+        .directories_by_exact_relative
+        .len()
+        .checked_add(index.file_resource_by_exact_relative.len())
+        .ok_or_else(allocation_overflow)?;
+    if index.directories_by_exact_relative.len() > limits.directories
+        || all_entries > limits.all_entries
+    {
+        return Err(reconciliation_scan_limit_error("snapshot row count"));
+    }
+
+    let mut instrumentation = index.reconciliation_scan_instrumentation;
+    let mut aggregate_hashed_bytes = instrumentation.bytes_hashed;
+    let config_description = reconciliation_scan_current_config_description(
+        graph.projection_root.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "graph has no retained no-follow projection capability",
+            )
+        })?,
+        &mut aggregate_hashed_bytes,
+        &mut instrumentation,
+        limits,
+    )?;
+    if config_description != graph.reconciliation_scan_open_config_description {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "reconciliation scan config refresh required: on-disk description changed",
+        ));
+    }
+
+    let directories_by_exact_relative = index
+        .directories_by_exact_relative
+        .iter()
+        .map(|(path, resource)| (path.clone(), *resource))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut files = Vec::with_capacity(index.file_resource_by_exact_relative.len());
+    let mut aggregate_path_bytes = 0_u64;
+    let mut retained_bytes = 1024_u64
+        .checked_add(limits.read_buffer_bytes as u64)
+        .ok_or_else(allocation_overflow)?;
+    for path in directories_by_exact_relative.keys() {
+        if path.len() > limits.exact_path_bytes {
+            return Err(reconciliation_scan_limit_error("exact path bytes"));
+        }
+        aggregate_path_bytes = aggregate_path_bytes
+            .checked_add(path.len() as u64)
+            .ok_or_else(|| reconciliation_scan_limit_error("aggregate path bytes"))?;
+        retained_bytes = reconciliation_scan_add_retained_bytes(
+            retained_bytes,
+            (path.len() as u64).saturating_mul(2).saturating_add(1024),
+            limits,
+        )?;
+    }
+    for (relative, file_resource_id) in &index.file_resource_by_exact_relative {
+        if relative.len() > limits.exact_path_bytes {
+            return Err(reconciliation_scan_limit_error("exact path bytes"));
+        }
+        aggregate_path_bytes = aggregate_path_bytes
+            .checked_add(relative.len() as u64)
+            .ok_or_else(|| reconciliation_scan_limit_error("aggregate path bytes"))?;
+        if aggregate_path_bytes > limits.aggregate_path_bytes {
+            return Err(reconciliation_scan_limit_error("aggregate path bytes"));
+        }
+        let link_count = index
+            .file_link_count_by_exact_relative
+            .get(relative)
+            .copied()
+            .ok_or_else(|| reconciliation_scan_unsafe_error("admission file lacks link count"))?;
+        if link_count != 1 {
+            return Err(reconciliation_scan_unsafe_error(format!(
+                "scan regular file has ambiguous link count {link_count}: {relative}"
+            )));
+        }
+        let (class, portable_key) = reconciliation_scan_classify_path(graph, relative)?;
+        let record = if class.is_eligible() {
+            let path = ManagedPath::parse(relative.clone()).map_err(|error| {
+                reconciliation_scan_unsafe_error(format!(
+                    "eligible admission path lost managed identity: {error}"
+                ))
+            })?;
+            Some(index.files_by_exact_path.get(&path).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("queue-fenced admission lacks eligible path {relative}"),
+                )
+            })?)
+        } else {
+            None
+        };
+        if record.is_some_and(|record| {
+            record.file_resource_id != *file_resource_id || record.link_count != link_count
+        }) {
+            return Err(reconciliation_scan_unsafe_error(format!(
+                "queue-fenced admission has inconsistent file evidence: {relative}"
+            )));
+        }
+        let description = match class {
+            GraphTextScanPathClass::Configuration => config_description,
+            _ => record.map(|record| record.description),
+        };
+        let semantic_key = record.map(|record| graph_text_semantic_key_digest(&record.semantic));
+        if class.is_eligible() && description.is_none() {
+            return Err(reconciliation_scan_unsafe_error(format!(
+                "queue-fenced admission lacks eligible description: {relative}"
+            )));
+        }
+        let portable_bytes = portable_key
+            .as_ref()
+            .map_or(0_u64, |key| key.as_bytes().len() as u64);
+        retained_bytes = reconciliation_scan_add_retained_bytes(
+            retained_bytes,
+            (relative.len() as u64)
+                .saturating_mul(2)
+                .saturating_add(portable_bytes.saturating_mul(2))
+                .saturating_add(1024),
+            limits,
+        )?;
+        files.push(GraphTextScanFileFingerprint {
+            exact_relative: relative.clone(),
+            class,
+            portable_key,
+            semantic_key,
+            description,
+            file_resource_id: *file_resource_id,
+            link_count,
+        });
+    }
+    instrumentation.eligible_files =
+        files.iter().filter(|file| file.class.is_eligible()).count() as u64;
+    if instrumentation.eligible_files > limits.eligible_files as u64 {
+        return Err(reconciliation_scan_limit_error("eligible file count"));
+    }
+    instrumentation.peak_retained_rows = (directories_by_exact_relative.len() + files.len()) as u64;
+    instrumentation.peak_retained_bytes = retained_bytes;
+    instrumentation.retained_rows = instrumentation.peak_retained_rows;
+    instrumentation.retained_bytes = retained_bytes;
+    Ok(GraphTextScanPass {
+        graph_resource,
+        scope_binding,
+        directories_by_exact_relative,
+        files,
+        instrumentation,
+    })
 }
 
 fn collect_reconciliation_scan_pass(
@@ -25412,51 +25671,9 @@ fn collect_reconciliation_scan_pass(
                 )));
             }
 
-            let page_like = is_page_file(Path::new(&child_relative));
-            let is_configuration = child_relative.eq_ignore_ascii_case("logseq/config.edn");
-            let is_conflict = page_like && path_is_sync_conflict(Path::new(&child_relative));
-            let eligible = graph.graph_text_scope.is_eligible(&child_relative);
-            let under_configured_root = [&graph.config.pages_dir, &graph.config.journals_dir]
-                .into_iter()
-                .any(|root| {
-                    child_relative
-                        .strip_prefix(root)
-                        .is_some_and(|tail| tail.starts_with('/'))
-                });
-            if page_like
-                && under_configured_root
-                && !eligible
-                && ManagedPath::parse(child_relative.clone()).is_err()
-            {
-                return Err(reconciliation_scan_unsafe_error(format!(
-                    "configured graph-text path is not portable: {child_relative}"
-                )));
-            }
-            let lexically_managed = if eligible {
-                Some(ManagedPath::parse(child_relative.clone()).map_err(|error| {
-                    reconciliation_scan_unsafe_error(format!(
-                        "eligible graph-text path is not portable: {error}"
-                    ))
-                })?)
-            } else {
-                None
-            };
-            let (class, portable_key) = if is_configuration {
-                (GraphTextScanPathClass::Configuration, None)
-            } else if is_conflict {
-                (GraphTextScanPathClass::ProviderConflictCopy, None)
-            } else if eligible {
-                let path = lexically_managed
-                    .expect("eligible graph-text files have recognized text extensions");
-                let portable_key = path.portable_key();
-                let class = match graph.classify_managed_text_path(&path) {
-                    Ok(kind) => GraphTextScanPathClass::EligibleManaged(kind),
-                    Err(_) => GraphTextScanPathClass::EligibleUnmanaged,
-                };
-                (class, Some(portable_key))
-            } else {
-                (GraphTextScanPathClass::RetainedNonText, None)
-            };
+            let (class, portable_key) = reconciliation_scan_classify_path(graph, &child_relative)?;
+            let eligible = class.is_eligible();
+            let is_configuration = class == GraphTextScanPathClass::Configuration;
             let description = if eligible || is_configuration {
                 Some(reconciliation_scan_hash_file(
                     &mut file,
@@ -28509,6 +28726,8 @@ fn collect_initial_shadow_managed_inventory_with_limits_inner(
         directories_by_exact_relative,
         paths_by_file_resource,
         file_link_count_by_exact_relative,
+        all_entries: all_entries as u64,
+        raw_bytes,
         peak_build_charge: {
             #[cfg(test)]
             {
@@ -28624,6 +28843,8 @@ fn initial_shadow_captures_match(
     first.directories_by_exact_relative == second.directories_by_exact_relative
         && first.paths_by_file_resource == second.paths_by_file_resource
         && first.file_link_count_by_exact_relative == second.file_link_count_by_exact_relative
+        && first.all_entries == second.all_entries
+        && first.raw_bytes == second.raw_bytes
         && first.entries.len() == second.entries.len()
         && first
             .entries
@@ -28734,6 +28955,19 @@ fn build_graph_text_admission_index(
             .iter()
             .map(|(key, value)| (key.clone(), *value))
             .collect(),
+        reconciliation_scan_instrumentation:
+            crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation {
+                directory_entries: capture.all_entries,
+                directories: capture.directories_by_exact_relative.len() as u64,
+                regular_files: capture.file_link_count_by_exact_relative.len() as u64,
+                eligible_files: capture.entries.len() as u64,
+                bytes_read: capture.raw_bytes,
+                bytes_hashed: capture.raw_bytes,
+                peak_read_buffers: 1,
+                peak_read_buffer_bytes:
+                    crate::oplog::reconciliation_scan::GRAPH_TEXT_SCAN_READ_BUFFER_BYTES as u64,
+                ..crate::oplog::reconciliation_scan::GraphTextScanPassInstrumentation::default()
+            },
         permanent_bytes,
         permanent_limit: limits.permanent_index_bytes,
         peak_limit: limits.peak_build_bytes,
