@@ -795,6 +795,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-windows-direct-large-open.mjs": {
+    "contracts": [
+      {
+        "class": "core-operation",
+        "userOutcome": "A reporter-scale Direct Files graph opens through the real Windows WebView2 and native backend without the severe 45-second load-call delay.",
+        "blocking": true
+      }
+    ],
+    "acceptableVariations": [
+      "Hosted Windows storage throughput and individual phase timings may vary below the severe-regression ceiling."
+    ],
+    "nonRequirements": [
+      "Matching the reporter's physical disk, antivirus configuration, or 24.6 GB of asset payload bytes."
+    ],
+    "stability": "burn-in"
+  },
   "scripts/e2e-windows-managed-storage.mjs": {
     "contracts": [
       {

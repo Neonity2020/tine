@@ -16,8 +16,9 @@ const suiteName = process.argv[2] ?? "linux-smoke";
 const only = process.argv.find((arg) => arg.startsWith("--scenario="))?.slice("--scenario=".length);
 const app = path.resolve(process.env.TINE_APP || path.join(root, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine"));
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
-const focusedManagedWindows = suiteName === "windows-smoke" && only === "windows-managed-storage";
-const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (focusedManagedWindows ? 15 * 60_000 : 180_000));
+const longFocusedWindows = suiteName === "windows-smoke"
+  && ["windows-managed-storage", "windows-direct-large-open"].includes(only);
+const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (longFocusedWindows ? 15 * 60_000 : 180_000));
 const suiteStartedAt = new Date().toISOString();
 function gitOutput(args) {
   const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
@@ -146,6 +147,7 @@ const suites = {
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
+    ["windows-direct-large-open", "scripts/e2e-windows-direct-large-open.mjs", {}],
     ["windows-managed-storage", "scripts/e2e-windows-managed-storage.mjs", {}],
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
     ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
