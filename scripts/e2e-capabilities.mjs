@@ -168,6 +168,29 @@ export function webdriverServerArgs(port, nativePort, nativeDriver, platform = p
   ];
 }
 
+export async function selectWebdriverWindowWithSelector(browser, selector, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  const observations = [];
+  while (Date.now() < deadline) {
+    for (const handle of await browser.getWindowHandles()) {
+      try {
+        await browser.switchToWindow(handle);
+        const title = await browser.getTitle();
+        const url = await browser.getUrl();
+        const matched = await browser.$(selector).isExisting();
+        observations.push({ handle, title, url, matched });
+        if (matched) return handle;
+      } catch (error) {
+        observations.push({ handle, error: String(error) });
+      }
+    }
+    await sleep(100);
+  }
+  throw new Error(
+    `no WebDriver window exposed ${selector}: ${JSON.stringify(observations.slice(-20))}`,
+  );
+}
+
 export function windowsWebviewProfileSnapshot(root) {
   const files = [];
   function walk(directory, depth = 0) {
