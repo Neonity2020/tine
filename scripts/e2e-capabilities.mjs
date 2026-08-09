@@ -46,8 +46,8 @@ export function tauriCapabilities(
   };
 }
 
-function windowsUserDataFolder(session) {
-  const root = process.env.E2E_WEBVIEW_USER_DATA_ROOT;
+export function windowsUserDataFolder(session, env = process.env) {
+  const root = env.E2E_WEBVIEW_USER_DATA_ROOT;
   if (!root) throw new Error("Windows WebView2 E2E requires E2E_WEBVIEW_USER_DATA_ROOT");
   const userDataFolder = path.join(root, session.replaceAll(/[^A-Za-z0-9_-]/g, "-"));
   fs.mkdirSync(userDataFolder, { recursive: true });
@@ -95,7 +95,7 @@ export async function startWebdriverApplication(
 ) {
   if (platform !== "win32") return { env, applicationProcess: undefined, debuggerAddress: undefined };
 
-  const userDataFolder = windowsUserDataFolder(session);
+  const userDataFolder = windowsUserDataFolder(session, env);
   const debuggerAddress = `127.0.0.1:${debuggerPort}`;
   const applicationEnv = {
     ...env,
