@@ -194,6 +194,8 @@ const env = {
   TINE_DEBUG: "1",
   TINE_DEBUG_LOG: debugLog,
   TINE_ACTIVATION_TRACE: "1",
+  TINE_E2E_APPLICATION_STDOUT_LOG: path.join(artifacts, "application-stdout.log"),
+  TINE_E2E_APPLICATION_STDERR_LOG: path.join(artifacts, "application-stderr.log"),
   APPDATA: path.join(root, "appdata"),
   LOCALAPPDATA: path.join(root, "localappdata"),
 };
