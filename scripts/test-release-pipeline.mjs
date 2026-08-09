@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -47,6 +48,26 @@ const windowsScenarios = [
   "e2e-print-security.mjs",
   "e2e-tab-overflow.mjs",
 ];
+
+const trackedPaths = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
+  .split("\0")
+  .filter(Boolean);
+const pathOwners = new Map();
+const caseInsensitiveCollisions = [];
+for (const trackedPath of trackedPaths) {
+  const portableKey = trackedPath.normalize("NFC").toLowerCase();
+  const existing = pathOwners.get(portableKey);
+  if (existing && existing !== trackedPath) {
+    caseInsensitiveCollisions.push([existing, trackedPath]);
+  } else {
+    pathOwners.set(portableKey, trackedPath);
+  }
+}
+assert.deepEqual(
+  caseInsensitiveCollisions,
+  [],
+  "tracked paths must remain unique on case-insensitive filesystems"
+);
 
 function yamlBlock(lines, key, indent) {
   const header = `${" ".repeat(indent)}${key}:`;

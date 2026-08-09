@@ -2852,6 +2852,29 @@
         ]
       },
       "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore does not reproduce the Windows report. Debug builds now emit phase and cumulative timings for canonicalization, private/shared storage discovery, asset approval, Direct core open, legacy store discovery, graph binding, backup scheduling, settings/title, and warm-cache scheduling. Keep this reported until a current Windows trace identifies the missing filesystem or platform phase."
+    },
+    {
+      "id": "REG-CASE-INSENSITIVE-TRACKED-PATHS-280",
+      "title": "A fresh checkout has no tracked paths that collide on a case-insensitive filesystem",
+      "family": "build-portability",
+      "sources": {
+        "issues": [
+          280
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "macos"
+      ],
+      "layer": "release-tooling",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/test-release-pipeline.mjs"
+        ]
+      },
+      "notes": "docs/UI-REGRESSION-TESTING.md is the current referenced execution contract; the case-only lowercase twin was an older planning document with no references and caused Git to omit one file on Windows checkout. The obsolete twin is removed, and the release-pipeline contract now folds every tracked path through NFC plus lowercase and refuses future collisions."
     }
   ]
 }
