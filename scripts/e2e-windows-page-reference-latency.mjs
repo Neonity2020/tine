@@ -194,6 +194,8 @@ try {
       issue248: [],
       popupPaintAt: null,
       instrumentation: "pending",
+      invokeDescriptor: null,
+      invokeReplacementHeld: false,
     };
     window.__tineIssue295 = state;
     window.__tineIssue248Bench = {
@@ -234,7 +236,15 @@ try {
     try {
       const internals = window.__TAURI_INTERNALS__;
       const originalInvoke = internals.invoke.bind(internals);
-      internals.invoke = (...args) => {
+      const descriptor = Object.getOwnPropertyDescriptor(internals, "invoke");
+      state.invokeDescriptor = descriptor ? {
+        configurable: descriptor.configurable,
+        enumerable: descriptor.enumerable,
+        writable: descriptor.writable,
+        hasGetter: typeof descriptor.get === "function",
+        hasSetter: typeof descriptor.set === "function",
+      } : null;
+      const wrappedInvoke = (...args) => {
         const command = String(args[0]);
         if (command !== "quick_switch" && command !== "save_page") return originalInvoke(...args);
         const span = { command, startedAt: performance.now(), endedAt: null, outcome: "pending" };
@@ -258,7 +268,11 @@ try {
           throw error;
         }
       };
-      state.instrumentation = "invoke-wrapped";
+      internals.invoke = wrappedInvoke;
+      state.invokeReplacementHeld = internals.invoke === wrappedInvoke;
+      state.instrumentation = state.invokeReplacementHeld
+        ? "invoke-wrapped"
+        : "invoke-replacement-not-retained";
     } catch (error) {
       state.instrumentation = `unavailable: ${String(error)}`;
     }
@@ -286,11 +300,14 @@ try {
     await sleep(KEY_PERIOD_MS);
   }
 
+  await browser.$(".autocomplete .ac-item").waitForExist({
+    timeout: 30_000,
+    timeoutMsg: "page-reference candidates did not paint",
+  });
   await browser.waitUntil(async () => browser.execute(() => {
     const state = window.__tineIssue295;
-    const quickSwitchFinished = state.invokes.some((span) => span.command === "quick_switch" && span.endedAt !== null);
-    return state.popupPaintAt !== null && quickSwitchFinished;
-  }), { timeout: 30_000, timeoutMsg: "page-reference candidates did not complete and paint" });
+    return state.invokes.some((span) => span.command === "quick_switch" && span.endedAt !== null);
+  }), { timeout: 30_000, timeoutMsg: "native quick_switch timing did not complete" });
   await sleep(1500);
 
   const measurements = await browser.execute(() => window.__tineIssue295);
@@ -341,8 +358,15 @@ try {
   fs.writeFileSync(path.join(artifacts, "windows-page-reference-latency-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
   console.log(`PASS: GH #295 literal Windows key timing: ${JSON.stringify(receipt.timings)}`);
 } catch (error) {
+  let raw = null;
+  try { raw = await browser?.execute(() => window.__tineIssue295 ?? null); } catch {}
   try { await browser?.saveScreenshot(path.join(artifacts, "failure.png")); } catch {}
-  const failure = { ...receipt, result: "fail", error: String(error).split("\n").slice(0, 10).join(" | ") };
+  const failure = {
+    ...receipt,
+    result: "fail",
+    error: String(error).split("\n").slice(0, 10).join(" | "),
+    raw,
+  };
   fs.writeFileSync(path.join(artifacts, "failure-capsule.json"), `${JSON.stringify(failure, null, 2)}\n`);
   throw error;
 } finally {
