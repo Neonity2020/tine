@@ -13,6 +13,7 @@ import {
   selectExactCiEvidence,
 } from "./ci-evidence-lib.mjs";
 import {
+  freeLoopbackPort,
   selectWebdriverWindowWithSelector,
   tauriCapabilities,
   webdriverServerArgs,
@@ -857,6 +858,10 @@ function assemble(input, output) {
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "tine-release-pipeline-test-"));
 try {
+  const firstFreePort = await freeLoopbackPort();
+  const secondFreePort = await freeLoopbackPort(new Set([firstFreePort]));
+  assert.ok(Number.isInteger(firstFreePort));
+  assert.notEqual(secondFreePort, firstFreePort);
   let selectedWindow = "capture";
   const selected = await selectWebdriverWindowWithSelector({
     async getWindowHandles() { return ["capture", "main"]; },

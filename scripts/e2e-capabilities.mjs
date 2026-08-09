@@ -1,7 +1,22 @@
 import fs from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
+
+export async function freeLoopbackPort(excluded = new Set()) {
+  while (true) {
+    const port = await new Promise((resolve, reject) => {
+      const server = net.createServer();
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        server.close(() => resolve(address.port));
+      });
+    });
+    if (!excluded.has(port)) return port;
+  }
+}
 
 export function tauriCapabilities(
   application,

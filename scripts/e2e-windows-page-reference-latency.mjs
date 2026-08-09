@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  freeLoopbackPort,
   selectWebdriverWindowWithSelector,
   startWebdriverApplication,
   stopWebdriverApplication,
@@ -32,8 +33,18 @@ const PAGE_TITLE = "Zojigc";
 const MARKER = "sometimes even hangs for a few seconds";
 const TYPED = "[[typing refference here lags a lot";
 const TD = process.env.TAURI_DRIVER || "tauri-driver";
-const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4444);
-const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4445);
+function configuredPort(name) {
+  const value = process.env[name];
+  if (value === undefined || value === "") return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`${name} must be an integer TCP port`);
+  }
+  return port;
+}
+const DRIVER_PORT = configuredPort("E2E_DRIVER_PORT") ?? await freeLoopbackPort();
+const NATIVE_PORT = configuredPort("E2E_NATIVE_PORT")
+  ?? await freeLoopbackPort(new Set([DRIVER_PORT]));
 const KEY_PERIOD_MS = Number(process.env.TINE_295_KEY_PERIOD_MS || 115);
 const root = path.join(os.tmpdir(), `tine-295-${process.pid}`);
 const graph = path.join(root, "graph");
@@ -110,6 +121,8 @@ const receipt = {
   fixturePageSha256: EXPECTED_PAGE_SHA256,
   literalKeys: TYPED,
   keyPeriodMs: KEY_PERIOD_MS,
+  driverPort: DRIVER_PORT,
+  nativePort: NATIVE_PORT,
 };
 
 try {
