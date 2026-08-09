@@ -912,7 +912,7 @@ pub(crate) async fn save_page(
                     // the moment it is needed.
                     let started = Instant::now();
                     let result = if force.unwrap_or(false) {
-                        graph.force_save_page(&page)
+                        graph.force_save_page_at_revision(&page, base_rev.as_deref())
                     } else {
                         graph.save_page(&page, base_rev.as_deref())
                     };
@@ -3143,5 +3143,37 @@ mod direct_save_error_tests {
             )),
             "conflict"
         );
+    }
+
+    #[test]
+    fn every_minted_site_and_no_tokenless_site_reaches_the_banner() {
+        for message in [
+            "editor conflict: save baseline present",
+            "editor conflict: save baseline absent",
+            "editor conflict: commit recheck",
+            "editor conflict: replace pre-retirement",
+            "editor conflict: retired mismatch",
+            "editor conflict: publication collision",
+            "editor conflict: create publication collision",
+            "editor conflict: final reread absent",
+            "editor conflict: final reread present",
+            "editor conflict: post-publication validation",
+        ] {
+            assert_eq!(
+                direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, message,)),
+                "conflict",
+                "minted authority at {message} must reach the two-arm banner"
+            );
+        }
+        for message in [
+            "tokenless editor conflict: commit recheck: continued churn",
+            "tokenless editor conflict: replace pre-retirement: transient I/O",
+            "tokenless editor conflict: final reread present: transient I/O",
+        ] {
+            let reported =
+                direct_save_error_message(io::Error::new(io::ErrorKind::WouldBlock, message));
+            assert!(reported.starts_with("conflict_retry."), "{reported}");
+            assert_ne!(reported, "conflict");
+        }
     }
 }

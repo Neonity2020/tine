@@ -2008,6 +2008,88 @@ fn verify_handoff_binding(
     Ok(())
 }
 
+/// The exact live-path state shown to the user by a resolvable save conflict.
+/// Bytes are retained beside this value in `ConflictAuthority`; keeping the
+/// authority shape small makes it impossible to mistake ordinary load evidence
+/// for override authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConflictSnapshot {
+    Present {
+        revision: String,
+        resource_identity: ContentDigest,
+    },
+    Absent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConflictEditorEpisode {
+    loaded_revision: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ConflictAuthority {
+    snapshot: ConflictSnapshot,
+    bytes: Option<String>,
+    editor_episode: ConflictEditorEpisode,
+    observation_epoch: u64,
+}
+
+#[derive(Default)]
+struct ConflictAuthorityState {
+    observation_epochs: std::collections::HashMap<PathBuf, u64>,
+    tokens: std::collections::HashMap<PathBuf, ConflictAuthority>,
+}
+
+#[derive(Clone, Copy)]
+enum EditorConflictSite {
+    SaveBaselinePresent,
+    SaveBaselineAbsent,
+    CommitRecheck,
+    ReplacePreRetirement,
+    ReplaceRetiredMismatch,
+    ReplacePublicationCollision,
+    CreatePublicationCollision,
+    FinalRereadAbsent,
+    FinalRereadPresent,
+    ReplacePostPublication,
+}
+
+impl EditorConflictSite {
+    fn message(self) -> &'static str {
+        match self {
+            Self::SaveBaselinePresent => "editor conflict: save baseline present",
+            Self::SaveBaselineAbsent => "editor conflict: save baseline absent",
+            Self::CommitRecheck => "editor conflict: commit recheck",
+            Self::ReplacePreRetirement => "editor conflict: replace pre-retirement",
+            Self::ReplaceRetiredMismatch => "editor conflict: retired mismatch",
+            Self::ReplacePublicationCollision => "editor conflict: publication collision",
+            Self::CreatePublicationCollision => "editor conflict: create publication collision",
+            Self::FinalRereadAbsent => "editor conflict: final reread absent",
+            Self::FinalRereadPresent => "editor conflict: final reread present",
+            Self::ReplacePostPublication => "editor conflict: post-publication validation",
+        }
+    }
+
+    fn tokenless_message(self) -> &'static str {
+        match self {
+            Self::SaveBaselinePresent => "tokenless editor conflict: save baseline present",
+            Self::SaveBaselineAbsent => "tokenless editor conflict: save baseline absent",
+            Self::CommitRecheck => "tokenless editor conflict: commit recheck",
+            Self::ReplacePreRetirement => "tokenless editor conflict: replace pre-retirement",
+            Self::ReplaceRetiredMismatch => "tokenless editor conflict: retired mismatch",
+            Self::ReplacePublicationCollision => "tokenless editor conflict: publication collision",
+            Self::CreatePublicationCollision => {
+                "tokenless editor conflict: create publication collision"
+            }
+            Self::FinalRereadAbsent => "tokenless editor conflict: final reread absent",
+            Self::FinalRereadPresent => "tokenless editor conflict: final reread present",
+            Self::ReplacePostPublication => {
+                "tokenless editor conflict: post-publication validation"
+            }
+        }
+    }
+}
+
 pub struct Graph {
     pub root: PathBuf,
     /// This instance may only ever *read* graph text.
@@ -2152,6 +2234,10 @@ pub struct Graph {
     /// identity and bytes; this is discovery/read evidence, never creation
     /// authority.
     loaded_file_identities: RwLock<std::collections::HashMap<PathBuf, (String, ContentDigest)>>,
+    /// One-shot authority minted only by a coherent editor-conflict observation.
+    /// This is deliberately separate from `loaded_file_identities`: ordinary
+    /// loads are evidence for ordinary saves, never permission to overwrite.
+    conflict_authority: std::sync::Mutex<ConflictAuthorityState>,
     /// All page names referenced anywhere — `[[link]]`/`#tag`/`#[[..]]` plus
     /// `tags::`/`alias::` property values — in their as-written display case,
     /// keyed by `cache_gen`. Like OG, a page that is only referenced (never given
@@ -3833,6 +3919,9 @@ thread_local! {
     static JOURNAL_PROJECTION_BEFORE_CACHE_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_DURING_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static EDITOR_COMMIT_BEFORE_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static EDITOR_COMMIT_BEFORE_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
+    static CONFLICT_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_REPLACEMENT_HANDOFF: std::cell::RefCell<Option<HandoffSafe>> = const { std::cell::RefCell::new(None) };
     static SYNC_IDENTITY_AFTER_PREPARE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_SYNC_ENABLE_AFTER_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
@@ -4819,6 +4908,45 @@ fn managed_write_during_rollback_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
+fn editor_commit_before_recheck_hook() -> io::Result<()> {
+    EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn editor_commit_before_recheck_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn editor_commit_before_final_reread_hook() -> io::Result<()> {
+    EDITOR_COMMIT_BEFORE_FINAL_REREAD.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn editor_commit_before_final_reread_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn conflict_observation_hook() -> io::Result<()> {
+    CONFLICT_OBSERVATION.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+fn conflict_observation_hook() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
 fn sync_identity_after_prepare_hook() -> io::Result<()> {
     SYNC_IDENTITY_AFTER_PREPARE.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
@@ -5177,6 +5305,7 @@ impl Graph {
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             disk_revs: RwLock::new(std::collections::HashMap::new()),
             loaded_file_identities: RwLock::new(std::collections::HashMap::new()),
+            conflict_authority: std::sync::Mutex::new(ConflictAuthorityState::default()),
             referenced_names_cache: RwLock::new(None),
             page_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             managed_sync: std::sync::Mutex::new(None),
@@ -5883,7 +6012,12 @@ impl Graph {
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
     ) -> io::Result<()> {
-        let _ = self.update_guarded_graph_text_identity_paths(paths, false);
+        let paths = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
+        for path in &paths {
+            self.revoke_conflict_authority(path);
+        }
+        let _ = self
+            .update_guarded_graph_text_identity_paths(paths.iter().map(PathBuf::as_path), false);
         // The filesystem transition is already durable. Returning an error
         // here would report failure for a committed edit and strand cache state
         // behind disk; invalidation is the fail-closed recovery boundary.
@@ -5905,12 +6039,17 @@ impl Graph {
         uncertain: bool,
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
+        let paths = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
         if uncertain {
+            self.revoke_all_conflict_authority();
             self.invalidate_guarded_graph_text_identity("external watcher generation is uncertain");
             return Ok(());
         }
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        let _ = self.update_guarded_graph_text_identity_paths(paths.iter().copied(), true);
+        for path in &paths {
+            self.revoke_conflict_authority(path);
+        }
+        let _ =
+            self.update_guarded_graph_text_identity_paths(paths.iter().map(PathBuf::as_path), true);
         Ok(())
     }
 
@@ -6770,6 +6909,45 @@ impl Graph {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
+        #[cfg(test)]
+        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+        let identity = canonical_projection_file_resource_id(&file)?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed text file is not valid UTF-8",
+            )
+        })?;
+        Ok(Some((text, identity)))
+    }
+
+    /// One-open coherent snapshot for a conflict authority decision. Unlike an
+    /// ordinary read, this also performs the hard-refusal admission checks that
+    /// must never mint override authority (portable alias and multiple links).
+    fn managed_read_optional_editor_conflict_snapshot(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+    ) -> io::Result<Option<(String, ContentDigest)>> {
+        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        let target = match self.managed_target(permit, path, false) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        projection_optional_regular_metadata(target.parent(), &target.filename)?;
+        let (file, bytes) =
+            match open_and_read_projection_regular(target.parent(), &target.filename) {
+                Ok(value) => value,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        validate_graph_text_single_link(&file, managed_path.as_str())?;
         #[cfg(test)]
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let identity = canonical_projection_file_resource_id(&file)?;
@@ -7649,6 +7827,17 @@ impl Graph {
         bytes: &[u8],
         create_new: bool,
     ) -> io::Result<()> {
+        self.managed_atomic_write_with_conflict(permit, path, bytes, create_new, None)
+    }
+
+    fn managed_atomic_write_with_conflict(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        bytes: &[u8],
+        create_new: bool,
+        editor_episode: Option<&ConflictEditorEpisode>,
+    ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         // Establish the retained baseline before creating the staged inode. The
         // temp name is deliberately outside the graph-text namespace, but its
@@ -7676,6 +7865,17 @@ impl Graph {
         };
         if let Err(error) = result {
             let _ = target.parent().remove_file(&temp);
+            if create_new
+                && error.kind() == io::ErrorKind::AlreadyExists
+                && editor_episode.is_some()
+            {
+                return Err(self.observe_editor_conflict(
+                    permit,
+                    path,
+                    editor_episode,
+                    EditorConflictSite::CreatePublicationCollision,
+                ));
+            }
             return Err(error);
         }
         sync_projection_chain_required(&target.chain)?;
@@ -7701,6 +7901,7 @@ impl Graph {
         bytes: &[u8],
         expected_identity: ContentDigest,
         expected_bytes: Option<&[u8]>,
+        editor_episode: Option<&ConflictEditorEpisode>,
     ) -> io::Result<()> {
         let _identity = self.lock_graph_text_identity_mutation()?;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -7713,11 +7914,26 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        self.validate_existing_graph_text_target_exact(
+        if let Err(error) = self.validate_existing_graph_text_target_exact(
             &target,
             &managed_path,
             Some(expected_identity),
-        )?;
+        ) {
+            if editor_episode.is_some()
+                && (error.kind() == io::ErrorKind::NotFound
+                    || error
+                        .to_string()
+                        .contains("changed at the local identity validation boundary"))
+            {
+                return Err(self.observe_editor_conflict(
+                    permit,
+                    path,
+                    editor_episode,
+                    EditorConflictSite::ReplacePreRetirement,
+                ));
+            }
+            return Err(error);
+        }
         preflight_projection_chain(&target.chain)?;
         let temp = create_editor_staged_recovery(target.parent(), &target.filename, bytes)?;
         let staged_identity = match (|| {
@@ -7740,17 +7956,35 @@ impl Graph {
         );
         let mut retired = false;
         let mut published = false;
+        let mut conflict_site = None;
+        let mut retired_conflict_snapshot = None;
+        let mut restore_succeeded = false;
         let result = (|| {
             // Deterministic tests replace the target here: after normal-save's
             // final byte reread and after force-save's final retained-identity
             // validation, but before the first live-name mutation.
             managed_write_before_mutation_hook()?;
             self.validate_graph_text_portable_aliases_path_local(permit, &managed_path)?;
-            self.validate_existing_graph_text_target_exact(
+            if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
                 &managed_path,
                 Some(expected_identity),
-            )?;
+            ) {
+                if editor_episode.is_some()
+                    && (error.kind() == io::ErrorKind::NotFound
+                        || error
+                            .to_string()
+                            .contains("changed at the local identity validation boundary"))
+                {
+                    return Err(self.observe_editor_conflict(
+                        permit,
+                        path,
+                        editor_episode,
+                        EditorConflictSite::ReplacePreRetirement,
+                    ));
+                }
+                return Err(error);
+            }
             rename_projection_noreplace(target.parent(), &target.filename, &recovery)?;
             retired = true;
 
@@ -7763,6 +7997,8 @@ impl Graph {
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
             {
+                conflict_site = Some(EditorConflictSite::ReplaceRetiredMismatch);
+                retired_conflict_snapshot = Some((retired_bytes, retired_identity));
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "managed text target changed at the identity-bound publication boundary",
@@ -7780,15 +8016,32 @@ impl Graph {
             validate_graph_text_single_link(&staged_file, managed_path.as_str())?;
             drop(staged_file);
 
-            rename_projection_noreplace(target.parent(), &temp, &target.filename)?;
+            if let Err(error) =
+                rename_projection_noreplace(target.parent(), &temp, &target.filename)
+            {
+                if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
+                    conflict_site = Some(EditorConflictSite::ReplacePublicationCollision);
+                }
+                return Err(error);
+            }
             published = true;
             journal_projection_after_publish_hook()?;
             sync_projection_chain_required(&target.chain)?;
-            self.validate_existing_graph_text_target_exact(
+            if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
                 &managed_path,
                 Some(staged_identity),
-            )?;
+            ) {
+                if editor_episode.is_some()
+                    && (error.kind() == io::ErrorKind::NotFound
+                        || error
+                            .to_string()
+                            .contains("changed at the local identity validation boundary"))
+                {
+                    conflict_site = Some(EditorConflictSite::ReplacePostPublication);
+                }
+                return Err(error);
+            }
             target.parent().remove_file(&recovery)?;
             retired = false;
             sync_projection_chain_required(&target.chain)
@@ -7826,6 +8079,7 @@ impl Graph {
                                     ),
                                 ))
                             } else {
+                                restore_succeeded = true;
                                 debug_assert!(!retired || published);
                                 let _ = target.parent().remove_file(&temp);
                                 Err(primary)
@@ -7849,7 +8103,34 @@ impl Graph {
         };
         match outcome {
             Ok(()) => self.finish_tine_owned_graph_text_identity_paths(std::iter::once(path)),
-            Err(error) => {
+            Err(mut error) => {
+                if let Some(site) = conflict_site {
+                    error = if matches!(site, EditorConflictSite::ReplaceRetiredMismatch)
+                        && restore_succeeded
+                    {
+                        match retired_conflict_snapshot {
+                            Some((bytes, resource_identity)) => match String::from_utf8(bytes) {
+                                Ok(bytes) => self.conflict_error_from_snapshot(
+                                    path,
+                                    editor_episode,
+                                    site,
+                                    ConflictSnapshot::Present {
+                                        revision: content_rev(&bytes),
+                                        resource_identity,
+                                    },
+                                    Some(bytes),
+                                ),
+                                Err(_) => io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "managed text file is not valid UTF-8",
+                                ),
+                            },
+                            None => error,
+                        }
+                    } else {
+                        self.observe_editor_conflict(permit, path, editor_episode, site)
+                    };
+                }
                 self.invalidate_guarded_graph_text_identity(format!(
                     "identity-bound replacement failed after staging: {error}"
                 ));
@@ -11155,7 +11436,16 @@ impl Graph {
         };
         let page = page_dto_from_crdt(&snapshot)?;
         let cache = self.managed_path_is_cacheable(&write, &path)?;
-        self.write_page(&write, &page, &path, before.as_deref(), true, None, cache)?;
+        self.write_page(
+            &write,
+            &page,
+            &path,
+            before.as_deref(),
+            true,
+            None,
+            None,
+            cache,
+        )?;
         self.record_managed_projection(&write, &path);
         let after = self.managed_read_optional_text(&write, &path)?;
         let mut changes = Vec::new();
@@ -12558,6 +12848,7 @@ impl Graph {
             Some(&win_content),
             true,
             None,
+            None,
             win_cacheable,
         ) {
             let _ = managed_write_during_rollback_hook();
@@ -12756,6 +13047,7 @@ impl Graph {
             &dst,
             Some(&dst_content),
             true,
+            None,
             None,
             dst_cacheable,
         ) {
@@ -13534,6 +13826,7 @@ impl Graph {
     /// disk parse for a page not yet in the cache (e.g. just created externally).
     pub fn load_page(&self, entry: &PageEntry) -> io::Result<PageDto> {
         crate::fast_commit::note_application_page_load();
+        self.revoke_conflict_authority(&entry.path);
         let permit = self.admit_retained_managed_text_writer()?;
         let Some(ExactGraphLoadedPage {
             entry: effective,
@@ -13577,6 +13870,7 @@ impl Graph {
         let Some(abs) = self.resolve_rel(rel) else {
             return Ok(None);
         };
+        self.revoke_conflict_authority(&abs);
         if self.entry_for_path(&abs).is_none() {
             return Ok(None);
         }
@@ -14077,14 +14371,14 @@ impl Graph {
         // really can change it, and it recomputes from the warm in-memory cache
         // rather than from disk.
         //
-        // `generation + 1 == newgen` is load-bearing: re-tagging is sound only
-        // for a list that was CURRENT as of the previous generation. A list
-        // cached before some unrelated page was created is stale at an OLDER
-        // generation, and stamping it as current republishes that staleness
-        // permanently — `list_pages` is keyed on generation equality, so it
-        // never rebuilds and the missing page stays unloadable. The
-        // reference-candidate index above uses this same guard for this same
-        // reason; the first version of this block omitted it.
+        // The `generation + 1 == newgen` guard is load-bearing, and its absence
+        // was a real regression: re-tagging is only sound for a list that was
+        // CURRENT as of the previous generation. A list cached before an
+        // unrelated page was created is stale at an older generation, and
+        // stamping it as current republishes that staleness permanently —
+        // `list_pages` is keyed on generation equality, so it never rebuilds and
+        // the missing page becomes unloadable. The reference-candidate index
+        // above already uses exactly this guard for exactly this reason.
         if cache_built && !identity_changed && !is_new_page && !failures_changed {
             if let Some((generation, _)) = self.page_list_cache.write().unwrap().as_mut() {
                 if *generation + 1 == newgen {
@@ -16164,7 +16458,7 @@ impl Graph {
             );
             let content = serialize_pdf_hls_page(&page_path, &page_doc, None)?;
             let page_rev =
-                self.commit_editor_write(&write, &page_path, &content, None, true, None)?;
+                self.commit_editor_write(&write, &page_path, &content, None, true, None, None)?;
             let name = crate::pdf::hls_page_name(&key);
             let entry = PageEntry {
                 name,
@@ -16483,6 +16777,7 @@ impl Graph {
             &page_md,
             page_baseline.as_deref(),
             true,
+            None,
             None,
         ) {
             Ok(rev) => rev,
@@ -16938,6 +17233,7 @@ impl Graph {
             current_text,
             false,
             false,
+            None,
             || {
                 let mut published = false;
                 let mut mutated = false;
@@ -18584,6 +18880,7 @@ impl Graph {
         baseline: Option<&str>,
         recheck: bool,
         create_parent: bool,
+        editor_episode: Option<&ConflictEditorEpisode>,
         publish: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<(String, T)> {
         let rev = content_rev(content);
@@ -18595,17 +18892,49 @@ impl Graph {
                 }
             }
             if recheck {
+                editor_commit_before_recheck_hook()?;
                 // Only NotFound means "no baseline file". Permission errors, invalid
                 // UTF-8, and transient I/O failures must abort; collapsing them to
                 // None would authorize an overwrite of unreadable on-disk data.
-                let now = self.managed_read_optional_text(write, path)?;
-                let still_matches = match (now.as_deref(), baseline) {
+                let now = match self.managed_read_optional_editor_conflict_snapshot(write, path) {
+                    Ok(now) => now,
+                    Err(error) if editor_episode.is_some() => {
+                        return Err(Self::observation_failure_or_hard_refusal(
+                            EditorConflictSite::CommitRecheck,
+                            error,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                let still_matches = match (now.as_ref().map(|(text, _)| text.as_str()), baseline) {
                     (Some(n), Some(e)) => n == e,
                     (None, None) => true,
                     _ => false,
                 };
                 if !still_matches {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+                    if let Err(error) = self.validate_editor_conflict_portable_path(write, path) {
+                        return Err(error);
+                    }
+                    let error = match now {
+                        Some((bytes, resource_identity)) => self.conflict_error_from_snapshot(
+                            path,
+                            editor_episode,
+                            EditorConflictSite::CommitRecheck,
+                            ConflictSnapshot::Present {
+                                revision: content_rev(&bytes),
+                                resource_identity,
+                            },
+                            Some(bytes),
+                        ),
+                        None => self.conflict_error_from_snapshot(
+                            path,
+                            editor_episode,
+                            EditorConflictSite::CommitRecheck,
+                            ConflictSnapshot::Absent,
+                            None,
+                        ),
+                    };
+                    return Err(error);
                 }
             }
             publish()
@@ -18627,30 +18956,69 @@ impl Graph {
         baseline: Option<&str>,
         recheck: bool,
         expected_identity: Option<ContentDigest>,
+        editor_episode: Option<&ConflictEditorEpisode>,
     ) -> io::Result<String> {
-        let (rev, ()) = self.commit_write(write, path, content, baseline, recheck, true, || {
-            match expected_identity {
+        let (rev, ()) = self.commit_write(
+            write,
+            path,
+            content,
+            baseline,
+            recheck,
+            true,
+            editor_episode,
+            || match expected_identity {
                 Some(identity) => self.managed_atomic_replace_bound(
                     write,
                     path,
                     content.as_bytes(),
                     identity,
                     recheck.then_some(baseline).flatten().map(str::as_bytes),
+                    editor_episode,
                 ),
-                None => {
-                    self.managed_atomic_write(write, path, content.as_bytes(), baseline.is_none())
-                }
+                None => self.managed_atomic_write_with_conflict(
+                    write,
+                    path,
+                    content.as_bytes(),
+                    baseline.is_none(),
+                    editor_episode,
+                ),
+            },
+        )?;
+        editor_commit_before_final_reread_hook()?;
+        let reread = match self.managed_read_optional_editor_conflict_snapshot(write, path) {
+            Ok(reread) => reread,
+            Err(error) if editor_episode.is_some() => {
+                return Err(Self::observation_failure_or_hard_refusal(
+                    EditorConflictSite::FinalRereadPresent,
+                    error,
+                ));
             }
-        })?;
-        let (reread, identity) = self
-            .managed_read_optional_text_with_identity(write, path)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "managed text file disappeared after atomic publication",
-                )
-            })?;
+            Err(error) => return Err(error),
+        };
+        let Some((reread, identity)) = reread else {
+            self.validate_editor_conflict_portable_path(write, path)?;
+            return Err(self.conflict_error_from_snapshot(
+                path,
+                editor_episode,
+                EditorConflictSite::FinalRereadAbsent,
+                ConflictSnapshot::Absent,
+                None,
+            ));
+        };
         if reread != content || content_rev(&reread) != rev {
+            if editor_episode.is_some() {
+                self.validate_editor_conflict_portable_path(write, path)?;
+                return Err(self.conflict_error_from_snapshot(
+                    path,
+                    editor_episode,
+                    EditorConflictSite::FinalRereadPresent,
+                    ConflictSnapshot::Present {
+                        revision: content_rev(&reread),
+                        resource_identity: identity,
+                    },
+                    Some(reread),
+                ));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "managed text final reread does not match published bytes",
@@ -18685,6 +19053,7 @@ impl Graph {
         let _identity = self.lock_graph_text_identity_mutation()?;
         let lock = self.page_lock(path);
         let _guard = lock.lock().unwrap();
+        self.revoke_conflict_authority(path);
         // Watch events are untrusted path inputs. Lexically reject non-managed
         // names first; the retained capability traversal below then performs the
         // component-wise no-follow containment and file-shape checks.
@@ -18959,7 +19328,7 @@ impl Graph {
         let joined = page_dto_from_crdt(&joined)?;
         drop(sync_guard);
 
-        self.write_page(write, &joined, path, Some(content), true, None, cache)?;
+        self.write_page(write, &joined, path, Some(content), true, None, None, cache)?;
         self.record_managed_projection(write, path);
         Ok(true)
     }
@@ -19100,6 +19469,8 @@ impl Graph {
     /// Drop a file deleted on disk from the cache; returns the entry if it was
     /// cached (so the UI can react).
     pub fn forget_file(&self, path: &Path) -> Option<PageEntry> {
+        self.loaded_file_identities.write().unwrap().remove(path);
+        self.revoke_conflict_authority(path);
         let entry = self.entry_for_path(path)?;
         let was_cached = {
             let guard = self.cache.read().unwrap();
@@ -19315,9 +19686,18 @@ impl Graph {
         if let Some(prepared) =
             self.prepare_managed_save(page, &path, Some(&current), cache, budget)?
         {
-            prepared.commit_and_publish(self, write, &path, Some(&current), true, None, cache)?;
+            prepared.commit_and_publish(
+                self,
+                write,
+                &path,
+                Some(&current),
+                true,
+                None,
+                None,
+                cache,
+            )?;
         } else {
-            self.write_page(write, page, &path, Some(&current), true, None, cache)?;
+            self.write_page(write, page, &path, Some(&current), true, None, None, cache)?;
         }
         Ok(())
     }
@@ -19635,6 +20015,173 @@ impl Graph {
         }
     }
 
+    fn advance_conflict_observation_epoch(state: &mut ConflictAuthorityState, path: &Path) -> u64 {
+        let epoch = state
+            .observation_epochs
+            .entry(path.to_path_buf())
+            .or_insert(0);
+        *epoch = epoch
+            .checked_add(1)
+            .expect("per-path conflict observation epoch exhausted");
+        state.tokens.remove(path);
+        *epoch
+    }
+
+    fn revoke_conflict_authority(&self, path: &Path) {
+        let mut state = self.conflict_authority.lock().unwrap();
+        Self::advance_conflict_observation_epoch(&mut state, path);
+    }
+
+    fn revoke_all_conflict_authority(&self) {
+        let mut state = self.conflict_authority.lock().unwrap();
+        let paths = state
+            .observation_epochs
+            .keys()
+            .chain(state.tokens.keys())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for path in paths {
+            Self::advance_conflict_observation_epoch(&mut state, &path);
+        }
+    }
+
+    fn mint_conflict_authority(
+        &self,
+        path: &Path,
+        editor_episode: &ConflictEditorEpisode,
+        snapshot: ConflictSnapshot,
+        bytes: Option<String>,
+    ) {
+        debug_assert_eq!(
+            matches!(snapshot, ConflictSnapshot::Present { .. }),
+            bytes.is_some()
+        );
+        let mut state = self.conflict_authority.lock().unwrap();
+        let observation_epoch = Self::advance_conflict_observation_epoch(&mut state, path);
+        state.tokens.insert(
+            path.to_path_buf(),
+            ConflictAuthority {
+                snapshot,
+                bytes,
+                editor_episode: editor_episode.clone(),
+                observation_epoch,
+            },
+        );
+    }
+
+    fn consume_conflict_authority(
+        &self,
+        path: &Path,
+        editor_episode: &ConflictEditorEpisode,
+    ) -> io::Result<ConflictAuthority> {
+        let mut state = self.conflict_authority.lock().unwrap();
+        let token = state.tokens.remove(path);
+        let consumed_epoch = Self::advance_conflict_observation_epoch(&mut state, path) - 1;
+        let token = token.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "conflict override authority is missing or already consumed",
+            )
+        })?;
+        if token.observation_epoch != consumed_epoch || token.editor_episode != *editor_episode {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "conflict override authority belongs to a different editor episode",
+            ));
+        }
+        Ok(token)
+    }
+
+    fn conflict_error_from_snapshot(
+        &self,
+        path: &Path,
+        editor_episode: Option<&ConflictEditorEpisode>,
+        site: EditorConflictSite,
+        snapshot: ConflictSnapshot,
+        bytes: Option<String>,
+    ) -> io::Error {
+        let Some(editor_episode) = editor_episode else {
+            return io::Error::new(io::ErrorKind::AlreadyExists, "conflict");
+        };
+        self.mint_conflict_authority(path, editor_episode, snapshot, bytes);
+        io::Error::new(io::ErrorKind::AlreadyExists, site.message())
+    }
+
+    fn tokenless_conflict_error(site: EditorConflictSite, observation: io::Error) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{}: {observation}", site.tokenless_message()),
+        )
+    }
+
+    fn observation_failure_or_hard_refusal(
+        site: EditorConflictSite,
+        observation: io::Error,
+    ) -> io::Error {
+        match observation.kind() {
+            io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::Other => Self::tokenless_conflict_error(site, observation),
+            _ => observation,
+        }
+    }
+
+    fn validate_editor_conflict_portable_path(
+        &self,
+        write: &ManagedTextWritePermit,
+        path: &Path,
+    ) -> io::Result<()> {
+        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        self.validate_graph_text_portable_aliases_path_local(write, &managed_path)
+    }
+
+    fn observe_editor_conflict(
+        &self,
+        write: &ManagedTextWritePermit,
+        path: &Path,
+        editor_episode: Option<&ConflictEditorEpisode>,
+        site: EditorConflictSite,
+    ) -> io::Error {
+        let Some(editor_episode) = editor_episode else {
+            return io::Error::new(io::ErrorKind::AlreadyExists, "conflict");
+        };
+        if let Err(error) = self.validate_editor_conflict_portable_path(write, path) {
+            return error;
+        }
+        if let Err(error) = conflict_observation_hook() {
+            return Self::observation_failure_or_hard_refusal(site, error);
+        }
+        match self.managed_read_optional_editor_conflict_snapshot(write, path) {
+            Ok(Some((bytes, resource_identity))) => {
+                let revision = content_rev(&bytes);
+                self.conflict_error_from_snapshot(
+                    path,
+                    Some(editor_episode),
+                    site,
+                    ConflictSnapshot::Present {
+                        revision,
+                        resource_identity,
+                    },
+                    Some(bytes),
+                )
+            }
+            Ok(None) => self.conflict_error_from_snapshot(
+                path,
+                Some(editor_episode),
+                site,
+                ConflictSnapshot::Absent,
+                None,
+            ),
+            Err(error) => Self::observation_failure_or_hard_refusal(site, error),
+        }
+    }
+
     fn require_pinned_save_owner(
         &self,
         page: &PageDto,
@@ -19645,17 +20192,26 @@ impl Graph {
         if page.path.is_empty() {
             return Ok(());
         }
-        let loaded = loaded.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "a path-pinned page requires its existing retained file owner",
-            )
-        })?;
         let owner_matches = match authority {
-            PinnedSaveAuthority::UserOverride | PinnedSaveAuthority::OrdinaryEditorSave => {
-                loaded.entry.path == path
-            }
+            PinnedSaveAuthority::UserOverride(snapshot) => match (snapshot, loaded) {
+                (ConflictSnapshot::Present { .. }, Some(loaded)) => loaded.entry.path == path,
+                (ConflictSnapshot::Absent, None) => true,
+                _ => false,
+            },
+            PinnedSaveAuthority::OrdinaryEditorSave(loaded_revision) => match loaded {
+                Some(loaded) => loaded.entry.path == path,
+                // A pinned editor that loaded an existing file may observe its
+                // deletion and mint Absent authority. A never-loaded pinned DTO
+                // still has no creation authority of its own.
+                None => loaded_revision.is_some(),
+            },
             PinnedSaveAuthority::LoadedRevision(loaded_rev) => {
+                let Some(loaded) = loaded else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "a path-pinned page requires its existing retained file owner",
+                    ));
+                };
                 let retained = self.loaded_file_identities.read().unwrap();
                 loaded_rev.is_some_and(|revision| {
                     retained
@@ -20144,6 +20700,7 @@ impl Graph {
                 Some(&plan.expected_base),
                 true,
                 Some(plan.expected_identity),
+                None,
             )?;
         }
 
@@ -20236,16 +20793,22 @@ impl Graph {
         // or steal its self-write marker (see `page_locks`).
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
+        let editor_episode = ConflictEditorEpisode {
+            loaded_revision: base_rev.map(str::to_owned),
+        };
         // Single read of the current file (the conflict baseline AND the
         // formatting source AND, with the written content, the returned rev) —
         // avoids re-reading the file 2-3× per save, which is felt on NFS.
-        let validation =
-            self.validate_graph_text_target(&write, &path, Some((page.kind, &page.name)))?;
+        let requested_identity = page
+            .path
+            .is_empty()
+            .then_some((page.kind, page.name.as_str()));
+        let validation = self.validate_graph_text_target(&write, &path, requested_identity)?;
         self.require_pinned_save_owner(
             page,
             &path,
             validation.target.as_ref(),
-            PinnedSaveAuthority::OrdinaryEditorSave,
+            PinnedSaveAuthority::OrdinaryEditorSave(base_rev),
         )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
@@ -20265,7 +20828,16 @@ impl Graph {
                 // editor believed the page was new, so any existing file is an
                 // external creation → conflict.
                 if !base_rev.is_some_and(|rev| content_rev(&disk_s) == rev) {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+                    return Err(self.conflict_error_from_snapshot(
+                        &path,
+                        Some(&editor_episode),
+                        EditorConflictSite::SaveBaselinePresent,
+                        ConflictSnapshot::Present {
+                            revision: content_rev(&disk_s),
+                            resource_identity: current_identity,
+                        },
+                        Some(disk_s),
+                    ));
                 }
                 // Reaching here PROVES the file holds exactly the bytes the
                 // editor loaded. A different inode carrying those same bytes is
@@ -20295,7 +20867,13 @@ impl Graph {
                 // The file is gone. If the editor had a baseline (page existed at
                 // load), it was deleted externally — DON'T silently resurrect it.
                 if base_rev.is_some() {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "conflict"));
+                    return Err(self.conflict_error_from_snapshot(
+                        &path,
+                        Some(&editor_episode),
+                        EditorConflictSite::SaveBaselineAbsent,
+                        ConflictSnapshot::Absent,
+                        None,
+                    ));
                 }
                 None
             }
@@ -20309,7 +20887,7 @@ impl Graph {
         let budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let existing_content = existing.as_ref().map(|(content, _)| content.as_str());
         let expected_identity = existing.as_ref().map(|(_, identity)| *identity);
-        if let Some(prepared) =
+        let result = if let Some(prepared) =
             self.prepare_managed_save(page, &path, existing_content, cache, &budget)?
         {
             prepared.commit_and_publish(
@@ -20319,6 +20897,7 @@ impl Graph {
                 existing_content,
                 true,
                 expected_identity,
+                Some(&editor_episode),
                 cache,
             )
         } else {
@@ -20329,13 +20908,30 @@ impl Graph {
                 existing_content,
                 true,
                 expected_identity,
+                Some(&editor_episode),
                 cache,
             )
+        };
+        if result.is_ok() {
+            self.revoke_conflict_authority(&path);
         }
+        result
     }
 
-    /// Save a page unconditionally (the user chose "keep mine" over a conflict).
+    /// Apply the one-shot conflict authority associated with the revision carried
+    /// by a directly loaded `PageDto`.
     pub fn force_save_page(&self, page: &PageDto) -> io::Result<String> {
+        self.force_save_page_at_revision(page, page.rev.as_deref())
+    }
+
+    /// Save with the exact conflict snapshot shown to this editor episode as the
+    /// ordinary-save baseline. `base_rev` comes from the frontend's editor state;
+    /// its save DTO deliberately omits `PageDto.rev`.
+    pub fn force_save_page_at_revision(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+    ) -> io::Result<String> {
         if page.guide {
             #[cfg(debug_assertions)]
             eprintln!("attempted to force-persist an ephemeral bundled Guide page");
@@ -20346,46 +20942,126 @@ impl Graph {
         let (path, cache) = self.save_target(&write, page)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
+        let editor_episode = ConflictEditorEpisode {
+            loaded_revision: base_rev.map(str::to_owned),
+        };
+        // Atomic take happens before every fallible validation below. A failed or
+        // replayed attempt therefore cannot reuse the authority it started with.
+        let authority = self.consume_conflict_authority(&path, &editor_episode)?;
         // "Keep mine" resolves a content conflict, but it must not turn an I/O or
         // decoding failure into permission to overwrite unknown bytes.
-        let validation =
-            self.validate_graph_text_target(&write, &path, Some((page.kind, &page.name)))?;
-        self.require_pinned_save_owner(
-            page,
-            &path,
-            validation.target.as_ref(),
-            PinnedSaveAuthority::UserOverride,
-        )?;
+        let requested_identity = page
+            .path
+            .is_empty()
+            .then_some((page.kind, page.name.as_str()));
+        let validation = self.validate_graph_text_target(&write, &path, requested_identity)?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "another graph document owns this effective page identity",
             ));
         }
-        let existing: Option<(String, ContentDigest)> = validation
-            .target
-            .map(|loaded| {
-                let retained_matches = self
-                    .loaded_file_identities
-                    .read()
-                    .unwrap()
-                    .get(&path)
-                    .is_some_and(|(_, identity)| *identity == loaded.file_identity);
-                if !retained_matches {
+        let validation_snapshot = validation.target.as_ref().map(|loaded| {
+            (
+                loaded.content.as_str(),
+                loaded.revision.as_str(),
+                loaded.file_identity,
+            )
+        });
+        // The BYTES decide. A changed resource identity does not veto.
+        //
+        // A syncer that republishes the same content by temp+rename leaves the
+        // shown bytes on a NEW inode. Increment 1 already ruled that case "an
+        // atomic republication of the state we already have" and re-pins rather
+        // than conflicting. Force is the ordinary save with a substituted
+        // baseline, so it must not be STRICTER than the path it is defined in
+        // terms of — refusing here would mint a fresh, visually identical banner
+        // for the user to click again, in exactly the Syncthing scenario GH #254
+        // exists for, and a busy syncer can repeat it. Martin's 2026-08-09
+        // ruling is that state decides, and the state the user was shown is
+        // still what is on disk.
+        //
+        // Safety is unchanged: `rebound_identity` becomes the write's
+        // `expected_identity`, so the identity-bound retire/publish check still
+        // fails closed against a DIFFERENT-byte winner. A same-byte
+        // republication is the only thing this admits.
+        let mut rebound_identity = None;
+        let snapshot_still_matches = match (&authority.snapshot, validation_snapshot) {
+            (
+                ConflictSnapshot::Present { revision, .. },
+                Some((content, current_revision, current_identity)),
+            ) => {
+                let same_state =
+                    authority.bytes.as_deref() == Some(content) && revision == current_revision;
+                if same_state {
+                    rebound_identity = Some(current_identity);
+                }
+                same_state
+            }
+            (ConflictSnapshot::Absent, None) => true,
+            _ => false,
+        };
+        if !snapshot_still_matches {
+            let (snapshot, bytes, site) = match validation.target {
+                Some(loaded) => (
+                    ConflictSnapshot::Present {
+                        revision: loaded.revision,
+                        resource_identity: loaded.file_identity,
+                    },
+                    Some(loaded.content),
+                    EditorConflictSite::SaveBaselinePresent,
+                ),
+                None => (
+                    ConflictSnapshot::Absent,
+                    None,
+                    EditorConflictSite::SaveBaselineAbsent,
+                ),
+            };
+            return Err(self.conflict_error_from_snapshot(
+                &path,
+                Some(&editor_episode),
+                site,
+                snapshot,
+                bytes,
+            ));
+        }
+        self.require_pinned_save_owner(
+            page,
+            &path,
+            validation.target.as_ref(),
+            PinnedSaveAuthority::UserOverride(&authority.snapshot),
+        )?;
+        let existing: Option<(String, ContentDigest)> = match authority.snapshot {
+            ConflictSnapshot::Present {
+                revision,
+                resource_identity,
+            } => {
+                let bytes = authority.bytes.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "present conflict authority has no retained baseline bytes",
+                    )
+                })?;
+                if content_rev(&bytes) != revision {
                     return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "existing page identity changed since load",
+                        io::ErrorKind::PermissionDenied,
+                        "present conflict authority revision does not match retained bytes",
                     ));
                 }
-                Ok((loaded.content, loaded.file_identity))
-            })
-            .transpose()?;
-        // recheck = false: "keep mine" overwrites unconditionally. Same locked path
-        // is threaded into write_page (M2) so a forced save can't land on a twin.
+                // Bind to the identity that is actually on disk now. These differ
+                // only for a same-byte republication, which the check above
+                // deliberately admits; binding to the stale one would make the
+                // publication boundary refuse the write we just authorized.
+                Some((bytes, rebound_identity.unwrap_or(resource_identity)))
+            }
+            ConflictSnapshot::Absent => None,
+        };
+        // Force is the ordinary editor-save protocol with a substituted baseline.
+        // Both the late byte recheck and exact-identity publication remain enabled.
         let budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let existing_content = existing.as_ref().map(|(content, _)| content.as_str());
         let expected_identity = existing.as_ref().map(|(_, identity)| *identity);
-        if let Some(prepared) =
+        let result = if let Some(prepared) =
             self.prepare_managed_save(page, &path, existing_content, cache, &budget)?
         {
             prepared.commit_and_publish(
@@ -20393,8 +21069,9 @@ impl Graph {
                 &write,
                 &path,
                 existing_content,
-                false,
+                true,
                 expected_identity,
+                Some(&editor_episode),
                 cache,
             )
         } else {
@@ -20403,11 +21080,16 @@ impl Graph {
                 page,
                 &path,
                 existing_content,
-                false,
+                true,
                 expected_identity,
+                Some(&editor_episode),
                 cache,
             )
+        };
+        if result.is_ok() {
+            self.revoke_conflict_authority(&path);
         }
+        result
     }
 
     /// Write a page to `path` (already resolved + locked by the caller), reproducing
@@ -20421,6 +21103,7 @@ impl Graph {
         existing: Option<&str>,
         recheck: bool,
         expected_identity: Option<ContentDigest>,
+        editor_episode: Option<&ConflictEditorEpisode>,
         cache: bool,
     ) -> io::Result<String> {
         let (doc, content) = self.serialize_page_dto_for_path(page, path, existing)?;
@@ -20429,11 +21112,19 @@ impl Graph {
         // watcher record, AND — crucially — the cache update below.
         let changed = existing != Some(content.as_str());
         // The shared commit protocol (marker → A3 recheck vs `existing` →
-        // atomic_write); `force_save_page` passes recheck=false so "keep mine"
-        // overwrites unconditionally. On a no-op, just hash the unchanged bytes for
-        // the returned/cached rev — no write, no marker.
+        // atomic_write). A force save substitutes its one-shot conflict snapshot
+        // for `existing` and still rechecks it. On a no-op, just hash the unchanged
+        // bytes for the returned/cached rev — no write, no marker.
         let rev = if changed {
-            self.commit_editor_write(write, &path, &content, existing, recheck, expected_identity)?
+            self.commit_editor_write(
+                write,
+                &path,
+                &content,
+                existing,
+                recheck,
+                expected_identity,
+                editor_episode,
+            )?
         } else {
             content_rev(&content)
         };
@@ -22135,6 +22826,7 @@ impl PreparedManagedSaveOperation {
         existing: Option<&str>,
         recheck: bool,
         expected_identity: Option<ContentDigest>,
+        editor_episode: Option<&ConflictEditorEpisode>,
         cache: bool,
     ) -> io::Result<String> {
         let Self {
@@ -22159,6 +22851,7 @@ impl PreparedManagedSaveOperation {
                 existing,
                 recheck,
                 expected_identity,
+                editor_episode,
                 cache,
             );
             if result.is_ok() {
@@ -25574,7 +26267,7 @@ enum PinnedSaveAuthority<'a> {
     /// model (`specs/notes/2026-08-07-trust-model-and-threat-model-decision.md`)
     /// a byte-forging adversary is out of scope. Equal bytes therefore mean the
     /// same state regardless of which inode carries them.
-    OrdinaryEditorSave,
+    OrdinaryEditorSave(Option<&'a str>),
     /// The user was shown the conflict and chose to keep their own edits.
     ///
     /// A stale revision and a stale identity ARE the conflict being resolved —
@@ -25582,7 +26275,7 @@ enum PinnedSaveAuthority<'a> {
     /// needed, leaving discard-my-work as the only exit the app offers. The pin
     /// must still resolve to a retained file owner at the validated path, so an
     /// override cannot be redirected onto a file this page never came from.
-    UserOverride,
+    UserOverride(&'a ConflictSnapshot),
 }
 
 struct ExactGraphLoadedPage {
@@ -30687,6 +31380,46 @@ pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
         "identity.changed_since_load"
     } else if has("owns this effective page identity") {
         "identity.owned_elsewhere"
+    } else if has("tokenless editor conflict: save baseline present") {
+        "conflict_retry.save_baseline_present"
+    } else if has("tokenless editor conflict: save baseline absent") {
+        "conflict_retry.save_baseline_absent"
+    } else if has("tokenless editor conflict: commit recheck") {
+        "conflict_retry.commit_recheck"
+    } else if has("tokenless editor conflict: replace pre-retirement") {
+        "conflict_retry.replace_pre_retirement"
+    } else if has("tokenless editor conflict: retired mismatch") {
+        "conflict_retry.replace_retired_mismatch"
+    } else if has("tokenless editor conflict: publication collision") {
+        "conflict_retry.replace_publication_collision"
+    } else if has("tokenless editor conflict: create publication collision") {
+        "conflict_retry.create_publication_collision"
+    } else if has("tokenless editor conflict: final reread absent") {
+        "conflict_retry.final_reread_absent"
+    } else if has("tokenless editor conflict: final reread present") {
+        "conflict_retry.final_reread_present"
+    } else if has("tokenless editor conflict: post-publication validation") {
+        "conflict_retry.replace_post_publication"
+    } else if has("editor conflict: save baseline present") {
+        "conflict.save_baseline_present"
+    } else if has("editor conflict: save baseline absent") {
+        "conflict.save_baseline_absent"
+    } else if has("editor conflict: commit recheck") {
+        "conflict.commit_recheck"
+    } else if has("editor conflict: replace pre-retirement") {
+        "conflict.replace_pre_retirement"
+    } else if has("editor conflict: retired mismatch") {
+        "conflict.replace_retired_mismatch"
+    } else if has("editor conflict: publication collision") {
+        "conflict.replace_publication_collision"
+    } else if has("editor conflict: create publication collision") {
+        "conflict.create_publication_collision"
+    } else if has("editor conflict: final reread absent") {
+        "conflict.final_reread_absent"
+    } else if has("editor conflict: final reread present") {
+        "conflict.final_reread_present"
+    } else if has("editor conflict: post-publication validation") {
+        "conflict.replace_post_publication"
     } else if has("does not match its captured exact owner") {
         // The file changed between load and save without the watcher seeing it.
         // A genuine content conflict, and one "keep mine" can now resolve.
@@ -33685,6 +34418,23 @@ mod tests {
         dir
     }
 
+    fn arm_present_conflict_for_force(graph: &Graph, page: &PageDto, path: &Path) {
+        let bytes = fs::read_to_string(path).unwrap();
+        let resource_identity =
+            canonical_projection_file_resource_id(&fs::File::open(path).unwrap()).unwrap();
+        graph.mint_conflict_authority(
+            path,
+            &ConflictEditorEpisode {
+                loaded_revision: page.rev.clone(),
+            },
+            ConflictSnapshot::Present {
+                revision: content_rev(&bytes),
+                resource_identity,
+            },
+            Some(bytes),
+        );
+    }
+
     /// The read-only view exists so managed storage can answer whole-graph
     /// questions from its own projected tree. It must answer them -- and it must
     /// not be able to write that tree back, because the oplog owns it.
@@ -34373,6 +35123,14 @@ mod tests {
         fs::write(&replacement, &foreign_bytes).unwrap();
         let foreign_identity =
             canonical_projection_file_resource_id(&fs::File::open(&replacement).unwrap()).unwrap();
+        if force {
+            fs::write(&path, "- shown force conflict\n").unwrap();
+            let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+            assert_eq!(
+                direct_save_failure_code(&conflict),
+                "conflict.save_baseline_present"
+            );
+        }
         MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             let replacement = replacement.clone();
@@ -34485,20 +35243,22 @@ mod tests {
             });
         }
 
-        let error = if restoration_branch {
-            graph.force_save_page(&page)
-        } else {
-            graph.save_page(&page, page.rev.as_deref())
-        }
-        .unwrap_err();
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
-        assert!(
-            error.to_string().contains("displaced target retained as")
-                && error
-                    .to_string()
-                    .contains("staged editor bytes retained as"),
-            "{error}"
-        );
+        if restoration_branch {
+            assert!(
+                error.to_string().contains("displaced target retained as")
+                    && error
+                        .to_string()
+                        .contains("staged editor bytes retained as"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(
+                direct_save_failure_code(&error),
+                "conflict.replace_publication_collision"
+            );
+        }
         assert_eq!(fs::read(&path).unwrap(), foreign_bytes);
         assert_eq!(
             canonical_projection_file_resource_id(&fs::File::open(&path).unwrap()).unwrap(),
@@ -35973,8 +36733,8 @@ mod tests {
         graph.save_page(&exact, exact.rev.as_deref()).unwrap();
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
-            2,
-            "exact save reads its target once for validation and once for its projection receipt"
+            3,
+            "exact save reads validation, coherent late-recheck, and final receipt snapshots"
         );
         assert_eq!(
             GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
@@ -36028,8 +36788,8 @@ mod tests {
         assert_eq!(GRAPH_TEXT_VALIDATION_TARGET_READS.with(Cell::get), 1);
         assert_eq!(
             GRAPH_TEXT_CONTENT_READS.with(Cell::get),
-            2,
-            "only exact validation and the target receipt may read content"
+            3,
+            "only exact validation, coherent late recheck, and the target receipt may read content"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -36419,12 +37179,16 @@ mod tests {
         fs::write(&path, "- original\n").unwrap();
         let g = Graph::open(&dir);
         let mut dto = g.load_named("A", PageKind::Page).unwrap().unwrap();
+        let base_rev = dto.rev.clone().unwrap();
         assert!(!dto.path.is_empty(), "a loaded page is path-pinned");
         dto.blocks[0].raw = "mine".into();
         // The wire shape: the working store has no revision to send.
         dto.rev = None;
+        fs::write(&path, "- theirs\n").unwrap();
+        g.save_page(&dto, Some(&base_rev)).unwrap_err();
 
-        g.force_save_page(&dto).unwrap();
+        g.force_save_page_at_revision(&dto, Some(&base_rev))
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
         let _ = fs::remove_dir_all(&dir);
@@ -36441,11 +37205,14 @@ mod tests {
         fs::write(&path, "- original\n").unwrap();
         let g = Graph::open(&dir);
         let mut dto = g.load_named("A", PageKind::Page).unwrap().unwrap();
+        let base_rev = dto.rev.clone().unwrap();
         dto.blocks[0].raw = "mine".into();
         dto.rev = None;
         fs::write(&path, "- theirs\n").unwrap();
+        g.save_page(&dto, Some(&base_rev)).unwrap_err();
 
-        g.force_save_page(&dto).unwrap();
+        g.force_save_page_at_revision(&dto, Some(&base_rev))
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "- mine\n");
         let _ = fs::remove_dir_all(&dir);
@@ -36462,9 +37229,13 @@ mod tests {
         let unknown = b"\xff\xfeunknown on-disk bytes";
         fs::write(&path, unknown).unwrap();
 
-        let err = g.force_save_page(&dto).unwrap_err();
+        let err = g.save_page(&dto, dto.rev.as_deref()).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            g.force_save_page(&dto).is_err(),
+            "a hard refusal must not mint override authority"
+        );
         assert_eq!(fs::read(&path).unwrap(), unknown);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -37358,6 +38129,7 @@ mod tests {
             assert!(err.to_string().contains("page-header property"));
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
+            arm_present_conflict_for_force(&g, &dto, &path);
             let err = g.force_save_page(&dto).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
@@ -37434,6 +38206,7 @@ mod tests {
                 }];
 
                 let err = if forced {
+                    arm_present_conflict_for_force(&g, &dto, &path);
                     g.force_save_page(&dto).unwrap_err()
                 } else {
                     g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
@@ -37696,6 +38469,7 @@ mod tests {
         );
         for forced in [false, true] {
             let err = if forced {
+                arm_present_conflict_for_force(&g, &dto, &path);
                 g.force_save_page(&dto).unwrap_err()
             } else {
                 g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
@@ -40284,6 +41058,38 @@ mod tests {
                 direct_save_failure_code(&error),
                 code,
                 "classifier drifted for: {error}"
+            );
+        }
+        for (suffix, message) in [
+            ("save_baseline_present", "save baseline present"),
+            ("save_baseline_absent", "save baseline absent"),
+            ("commit_recheck", "commit recheck"),
+            ("replace_pre_retirement", "replace pre-retirement"),
+            ("replace_retired_mismatch", "retired mismatch"),
+            ("replace_publication_collision", "publication collision"),
+            (
+                "create_publication_collision",
+                "create publication collision",
+            ),
+            ("final_reread_absent", "final reread absent"),
+            ("final_reread_present", "final reread present"),
+            ("replace_post_publication", "post-publication validation"),
+        ] {
+            let minted = Error::new(
+                ErrorKind::AlreadyExists,
+                format!("editor conflict: {message}"),
+            );
+            assert_eq!(
+                direct_save_failure_code(&minted),
+                format!("conflict.{suffix}")
+            );
+            let tokenless = Error::new(
+                ErrorKind::WouldBlock,
+                format!("tokenless editor conflict: {message}: continued churn"),
+            );
+            assert_eq!(
+                direct_save_failure_code(&tokenless),
+                format!("conflict_retry.{suffix}")
             );
         }
     }
@@ -48024,6 +48830,14 @@ mod tests {
         let probe_rev = probe_page.rev.clone().unwrap();
         probe_page.blocks[0].raw = format!("after\nid:: {id}");
         if forced {
+            fs::write(
+                probe.join("pages/Exact.md"),
+                format!("- external baseline\n  id:: {id}\n"),
+            )
+            .unwrap();
+            probe_graph
+                .save_page(&probe_page, Some(&probe_rev))
+                .unwrap_err();
             probe_graph.force_save_page(&probe_page).unwrap();
         } else {
             probe_graph
@@ -48041,6 +48855,14 @@ mod tests {
         let mut page = graph.load_named("Exact", PageKind::Page).unwrap().unwrap();
         let rev = page.rev.clone().unwrap();
         page.blocks[0].raw = format!("after\nid:: {id}");
+        if forced {
+            fs::write(
+                retry.join("pages/Exact.md"),
+                format!("- external baseline\n  id:: {id}\n"),
+            )
+            .unwrap();
+            graph.save_page(&page, Some(&rev)).unwrap_err();
+        }
         let files_before = regular_file_tree(&retry);
         let pages_before = exact_budget_managed_pages(&graph);
         let frontier_before = exact_budget_frontier(&graph);
@@ -48069,6 +48891,7 @@ mod tests {
 
         set_managed_content_budget_limit(peak);
         if forced {
+            graph.save_page(&page, Some(&rev)).unwrap_err();
             graph.force_save_page(&page).unwrap();
         } else {
             graph.save_page(&page, Some(&rev)).unwrap();
@@ -49014,9 +49837,13 @@ mod tests {
             }));
         });
 
-        graph.save_page(&page, Some(&base_rev)).unwrap();
+        let saved_rev = graph.save_page(&page, Some(&base_rev)).unwrap();
         page.blocks[0].raw = "forced A".to_owned();
-        graph.force_save_page(&page).unwrap();
+        fs::write(moved.join("pages/Target.org"), "* external A\n").unwrap();
+        graph.save_page(&page, Some(&saved_rev)).unwrap_err();
+        graph
+            .force_save_page_at_revision(&page, Some(&saved_rev))
+            .unwrap();
         graph
             .delete_page_expected("Victim", PageKind::Page, None)
             .unwrap();
@@ -50281,5 +51108,456 @@ mod tests {
                 Some(expected)
             );
         }
+    }
+
+    // GH #254 increment 2. These tests intentionally drive each accepted
+    // conflict site through its own deterministic boundary. The site-specific
+    // codes are part of the safety contract: only a site that captured a usable
+    // override token may enter the keep-mine/use-disk banner class.
+    fn gh254_loaded(tag: &str) -> (PathBuf, PathBuf, Graph, PageDto) {
+        let root = scratch(&format!("gh254-increment2-{tag}"));
+        let path = root.join("pages/Note.md");
+        fs::write(&path, "- loaded\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        page.blocks[0].raw = "mine".into();
+        (root, path, graph, page)
+    }
+
+    fn gh254_code(error: &io::Error) -> &'static str {
+        direct_save_failure_code(error)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn gh254_replace(path: &Path, replacement: &Path) -> io::Result<()> {
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(replacement, path)
+    }
+
+    #[test]
+    fn gh254_token_is_required_and_consumed_once_per_force_attempt() {
+        let (root, path, graph, page) = gh254_loaded("one-shot");
+        assert!(
+            graph.force_save_page(&page).is_err(),
+            "a load is not authority"
+        );
+        fs::write(&path, "- external winner\n").unwrap();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&conflict), "conflict.save_baseline_present");
+        graph.force_save_page(&page).unwrap();
+        assert!(
+            graph.force_save_page(&page).is_err(),
+            "successful force must not replay its consumed token"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_force_binds_the_shown_bytes_not_only_the_revision_or_path() {
+        let (root, path, graph, page) = gh254_loaded("substituted-baseline");
+        fs::write(&path, "- shown winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        // Preserve the inode while changing its bytes. Revision-only force used
+        // to overwrite this unseen second winner.
+        EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(path, "- unseen second winner\n")
+            }));
+        });
+        let error = graph.force_save_page(&page).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.commit_recheck");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "- unseen second winner\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_absent_snapshot_can_create_once_without_a_present_owner() {
+        let (root, path, graph, page) = gh254_loaded("absent");
+        fs::remove_file(&path).unwrap();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&conflict), "conflict.save_baseline_absent");
+        graph.force_save_page(&page).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("mine"));
+        assert!(graph.force_save_page(&page).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_reload_watcher_and_forget_each_revoke_authority() {
+        for action in ["reload", "watcher", "forget"] {
+            let (root, path, graph, page) = gh254_loaded(action);
+            fs::write(&path, "- external winner\n").unwrap();
+            graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+            match action {
+                "reload" => {
+                    graph.load_by_path("pages/Note.md").unwrap().unwrap();
+                }
+                "watcher" => {
+                    graph.sync_file_checked(&path).unwrap();
+                }
+                "forget" => {
+                    graph.forget_file(&path);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                graph.force_save_page(&page).is_err(),
+                "{action} must revoke the shown-snapshot authority"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn gh254_token_cannot_cross_graph_instance_or_editor_episode() {
+        let (root, path, graph, page) = gh254_loaded("scope");
+        fs::write(&path, "- external winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+
+        let reopened = Graph::open(&root);
+        reopened.warm_cache();
+        let mut transplanted = reopened.load_by_path("pages/Note.md").unwrap().unwrap();
+        transplanted.blocks[0].raw = "transplanted mine".into();
+        assert!(reopened.force_save_page(&transplanted).is_err());
+
+        // Loading again in the original Graph starts a newer editor episode and
+        // revokes the earlier episode's token even when the path is unchanged.
+        graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        assert!(graph.force_save_page(&page).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_token_cannot_cross_path_rename_or_successful_save() {
+        // Exact-path scope: authority for Note is not authority for Other.
+        let (root, path, graph, page) = gh254_loaded("path-scope");
+        let other_path = root.join("pages/Other.md");
+        fs::write(&other_path, "- other\n").unwrap();
+        let mut other = graph.load_by_path("pages/Other.md").unwrap().unwrap();
+        other.blocks[0].raw = "other mine".into();
+        fs::write(&path, "- external winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert!(graph.force_save_page(&other).is_err());
+
+        // Any successful save on the token path revokes it, including a save
+        // that becomes possible because disk returned to the loaded baseline.
+        fs::write(&path, "- loaded\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        assert!(graph.force_save_page(&page).is_err());
+        let _ = fs::remove_dir_all(root);
+
+        // Rename crosses the shared Tine-owned mutation boundary and revokes
+        // source and destination rather than transplanting authority.
+        let (root, path, graph, page) = gh254_loaded("rename-scope");
+        fs::write(&path, "- external winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        graph.rename_page("Note", "Renamed").unwrap();
+        assert!(graph.force_save_page(&page).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_newer_conflict_and_deletion_hook_advance_the_path_epoch() {
+        let (root, path, graph, page) = gh254_loaded("epoch");
+        fs::write(&path, "- winner one\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let first_epoch = graph
+            .conflict_authority
+            .lock()
+            .unwrap()
+            .tokens
+            .get(&path)
+            .unwrap()
+            .observation_epoch;
+
+        fs::write(&path, "- winner two\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let second_epoch = graph
+            .conflict_authority
+            .lock()
+            .unwrap()
+            .tokens
+            .get(&path)
+            .unwrap()
+            .observation_epoch;
+        assert!(second_epoch > first_epoch);
+
+        graph.forget_file(&path);
+        assert!(!graph
+            .loaded_file_identities
+            .read()
+            .unwrap()
+            .contains_key(&path));
+        let state = graph.conflict_authority.lock().unwrap();
+        assert!(!state.tokens.contains_key(&path));
+        assert!(state.observation_epochs[&path] > second_epoch);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A same-byte republication is the SAME STATE, so "Keep mine" goes through
+    /// and lands on the inode that is actually at the path now.
+    ///
+    /// Bytes decide; a changed resource identity does not veto. Refusing here
+    /// would make force stricter than an ordinary save — which already treats a
+    /// same-byte replacement as the state it already has — and would hand the
+    /// user a fresh, visually identical banner to click again in exactly the
+    /// Syncthing scenario GH #254 exists for. Martin's 2026-08-09 ruling: state
+    /// decides, and the state the user was shown is still what is on disk.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_force_accepts_a_same_byte_republication_and_targets_the_live_inode() {
+        let (root, path, graph, page) = gh254_loaded("force-identity");
+        fs::write(&path, "- shown winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let replacement = path.with_file_name(".same-byte-new-inode");
+        fs::write(&replacement, "- shown winner\n").unwrap();
+        gh254_replace(&path, &replacement).unwrap();
+
+        graph.force_save_page(&page).unwrap();
+        assert!(
+            fs::read_to_string(&path).unwrap().contains("mine"),
+            "keep-mine did not land on the republished inode"
+        );
+        assert!(
+            !replacement.exists(),
+            "the staging name must not survive as a stray sibling"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The other half of the same rule: a DIFFERENT-byte winner on a new inode
+    /// is still refused, and is left exactly as that winner wrote it.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_force_refuses_a_different_byte_winner_on_a_new_inode() {
+        let (root, path, graph, page) = gh254_loaded("force-identity-diff");
+        fs::write(&path, "- shown winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let replacement = path.with_file_name(".different-byte-new-inode");
+        fs::write(&replacement, "- a newer winner nobody saw\n").unwrap();
+        gh254_replace(&path, &replacement).unwrap();
+
+        let error = graph.force_save_page(&page).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.save_baseline_present");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "- a newer winner nobody saw\n",
+            "an unseen winner must survive Keep mine"
+        );
+        // The refusal minted a fresh conflict over the winner the user can now
+        // actually see, so the second click resolves it deliberately.
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_s1_initial_present_baseline_mismatch_mints_exact_winner() {
+        let (root, path, graph, page) = gh254_loaded("s1");
+        fs::write(&path, "- s1 winner\n").unwrap();
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.save_baseline_present");
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_s2_initial_absence_mints_absent() {
+        let (root, path, graph, page) = gh254_loaded("s2");
+        fs::remove_file(path).unwrap();
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.save_baseline_absent");
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_s3_commit_recheck_reads_bytes_and_identity_together() {
+        let (root, path, graph, page) = gh254_loaded("s3");
+        EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s3 winner\n")));
+        });
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.commit_recheck");
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_s4_pre_retirement_identity_change_observes_live_winner() {
+        let (root, path, graph, page) = gh254_loaded("s4");
+        let replacement = path.with_file_name(".s4-winner");
+        fs::write(&replacement, "- s4 winner\n").unwrap();
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || gh254_replace(&path, &replacement)));
+        });
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.replace_pre_retirement");
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_s5_retired_mismatch_mints_only_after_restore() {
+        let (root, path, graph, page) = gh254_loaded("s5");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s5 winner\n")));
+        });
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.replace_retired_mismatch");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- s5 winner\n");
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_s6_publication_collision_observes_after_restore_outcome() {
+        for restore_succeeds in [false, true] {
+            let (root, path, graph, page) = gh254_loaded(if restore_succeeds {
+                "s6-restored"
+            } else {
+                "s6-live"
+            });
+            MANAGED_WRITE_AFTER_RETIRE.with(|hook| {
+                let path = path.clone();
+                *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s6 transient\n")));
+            });
+            if restore_succeeds {
+                MANAGED_WRITE_BEFORE_RESTORE.with(|hook| {
+                    let path = path.clone();
+                    *hook.borrow_mut() = Some(Box::new(move || fs::remove_file(path)));
+                });
+            }
+            let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+            assert_eq!(gh254_code(&error), "conflict.replace_publication_collision");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                if restore_succeeds {
+                    "- loaded\n"
+                } else {
+                    "- s6 transient\n"
+                }
+            );
+            graph.force_save_page(&page).unwrap();
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn gh254_s7_absent_creation_losing_noreplace_race_mints_present() {
+        let root = scratch("gh254-increment2-s7");
+        let path = root.join("pages/New.md");
+        let graph = Graph::open(&root);
+        let page = PageDto {
+            name: "New".into(),
+            kind: PageKind::Page,
+            title: "New".into(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                raw: "mine".into(),
+                ..Default::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: String::new(),
+            guide: false,
+        };
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s7 winner\n")));
+        });
+        let error = graph.save_page(&page, None).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.create_publication_collision");
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_s8_final_reread_covers_present_and_absent_arms() {
+        for absent in [false, true] {
+            let (root, path, graph, page) =
+                gh254_loaded(if absent { "s8-absent" } else { "s8-present" });
+            EDITOR_COMMIT_BEFORE_FINAL_REREAD.with(|hook| {
+                let path = path.clone();
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if absent {
+                        fs::remove_file(path)
+                    } else {
+                        let replacement = path.with_file_name(".s8-winner");
+                        fs::write(&replacement, "- s8 winner\n")?;
+                        gh254_replace(&path, &replacement)
+                    }
+                }));
+            });
+            let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+            assert_eq!(
+                gh254_code(&error),
+                if absent {
+                    "conflict.final_reread_absent"
+                } else {
+                    "conflict.final_reread_present"
+                }
+            );
+            graph.force_save_page(&page).unwrap();
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_s9_post_publication_validation_observes_after_cleanup() {
+        let (root, path, graph, page) = gh254_loaded("s9");
+        JOURNAL_PROJECTION_AFTER_PUBLISH.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let replacement = path.with_file_name(".s9-winner");
+                fs::write(&replacement, "- s9 winner\n")?;
+                gh254_replace(&path, &replacement)
+            }));
+        });
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict.replace_post_publication");
+        graph.force_save_page(&page).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh254_tokenless_observation_failure_is_retryable_but_not_banner_class() {
+        let (root, path, graph, page) = gh254_loaded("tokenless");
+        let replacement = path.with_file_name(".tokenless-winner");
+        fs::write(&replacement, "- winner\n").unwrap();
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let path = path.clone();
+            *hook.borrow_mut() = Some(Box::new(move || gh254_replace(&path, &replacement)));
+        });
+        CONFLICT_OBSERVATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|| {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "continued delivery churn",
+                ))
+            }));
+        });
+        let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        assert_eq!(gh254_code(&error), "conflict_retry.replace_pre_retirement");
+        assert!(!gh254_code(&error).starts_with("conflict."));
+        assert!(graph.force_save_page(&page).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }

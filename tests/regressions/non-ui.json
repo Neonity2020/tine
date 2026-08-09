@@ -3061,7 +3061,33 @@
           "crates/tine-core/tests/graph.rs"
         ]
       },
-      "notes": "GH #254 increment 1, ordinary save only. An external editor that writes by temp+rename (the common safe pattern, and what Syncthing/Dropbox deliver) leaves the same path on a NEW inode. save_page authorized with PinnedSaveAuthority::LoadedRevision, whose retained-identity check refused before the byte comparison ever ran, returning 'path-pinned page does not match its captured exact owner' - a message isRetryableSaveFailure retries forever, so the page became permanently unsaveable with no user-resolvable path out. Measured pre-fix: 4 of 5 cases fail, and NOTABLY the different-byte case failed with the same unresolvable code, so a genuine external change was equally unrecoverable, not just the same-byte one. A new authority OrdinaryEditorSave proves exact path ownership and nothing about physical identity; the byte comparison then decides. Equal bytes on a new inode re-pin to the current snapshot and proceed; different bytes return the literal 'conflict' the frontend can resolve. LoadedRevision is UNCHANGED and still used by verify_existing_journal_page_projection, which authenticates before an opaque durable append and must not inherit this reorder - the contract verifier rejected a helper-wide change twice on exactly this boundary. KNOWN UNCHANGED and out of scope: an externally DELETED target still refuses through the name-only-creation identity check rather than conflict; verified byte-identical before and after, asserted as-is, and owned by increment 2 (a present-only authority cannot express an absent snapshot). The force-save half of #254 ('Keep mine' overwriting the wrong snapshot) is NOT fixed here."
+      "notes": "GH #254 increment 1, ordinary save only. An external editor that writes by temp+rename (the common safe pattern, and what Syncthing/Dropbox deliver) leaves the same path on a NEW inode. save_page authorized with PinnedSaveAuthority::LoadedRevision, whose retained-identity check refused before the byte comparison ever ran, returning 'path-pinned page does not match its captured exact owner' - a message isRetryableSaveFailure retries forever, so the page became permanently unsaveable with no user-resolvable path out. Measured pre-fix: 4 of 5 cases fail, and NOTABLY the different-byte case failed with the same unresolvable code, so a genuine external change was equally unrecoverable, not just the same-byte one. A new authority OrdinaryEditorSave proves exact path ownership and nothing about physical identity; the byte comparison then decides. Equal bytes on a new inode re-pin to the current snapshot and proceed; different bytes return the literal 'conflict' the frontend can resolve. LoadedRevision is UNCHANGED and still used by verify_existing_journal_page_projection, which authenticates before an opaque durable append and must not inherit this reorder - the contract verifier rejected a helper-wide change twice on exactly this boundary. At increment 1, delete conflicts and the force-save half were deliberately deferred to increment 2; the next record covers both."
+    },
+    {
+      "id": "REG-DIRECT-SAVE-EXACT-CONFLICT-AUTHORITY-GH254",
+      "title": "Keep mine writes only over the exact disk snapshot shown by its conflict",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [
+          254
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs",
+          "src-tauri/src/commands.rs",
+          "src/persistence.test.ts"
+        ]
+      },
+      "notes": "GH #254 increment 2. A conflict now mints one per-Graph, per-editor-episode, exact-path, monotonic-epoch token holding Present { revision, resource_identity } or Absent plus the coherently observed baseline bytes. Force consumes it before every attempt and runs the ordinary save protocol with those bytes and identity substituted as its rechecked baseline; it never delegates by revision alone or rebinds to a same-byte replacement inode. S1-S9 each have a deterministic site test, including both final-reread arms and post-restore/post-publication observation timing. Stable observations get per-site conflict.* codes; exceptional observation failure gets conflict_retry.* and cannot reach the keep-mine/use-disk banner. Loads, watcher observations, forget_file, successful saves, and the shared Tine-owned graph-text mutation boundary revoke authority, covering rename/delete/trash/merge, managed projection/import/migration, sync-conflict resolution, and PDF-highlight page writes. Hard admission refusals remain tokenless."
     },
     {
       "id": "REG-UNLINKED-REFS-SEE-CODE-GH270",
