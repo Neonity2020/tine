@@ -11,6 +11,12 @@ import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
+import {
+  collapsedGroupsFor,
+  sectionOverride,
+  setCollapsedGroupsFor,
+  setSectionOverride,
+} from "../referenceSectionState";
 
 const norm = (s: string) => s.trim().toLowerCase();
 const pageIdentity = (s: string) => {
@@ -115,8 +121,25 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     }
   );
   const mergedGroups = createMemo(() => mergeReferenceGroups(groups() ?? []));
-  const [collapsedOverride, setCollapsedOverride] = createSignal<boolean | null>(null);
-  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
+  // GH #272: held outside the component so a remount cannot silently re-collapse
+  // a section the user expanded. See referenceSectionState.
+  const [collapsedOverrideSignal, setCollapsedOverrideSignal] =
+    createSignal<boolean | null>(sectionOverride("linked", props.name) ?? null);
+  const collapsedOverride = collapsedOverrideSignal;
+  const setCollapsedOverride = (value: boolean) => {
+    setSectionOverride("linked", props.name, value);
+    setCollapsedOverrideSignal(value);
+  };
+  const [collapsedGroupsSignal, setCollapsedGroupsSignal] =
+    createSignal<Set<string>>(collapsedGroupsFor("linked", props.name));
+  const collapsedGroups = collapsedGroupsSignal;
+  const setCollapsedGroups = (next: Set<string> | ((current: Set<string>) => Set<string>)) => {
+    setCollapsedGroupsSignal((current) => {
+      const value = typeof next === "function" ? next(current) : next;
+      setCollapsedGroupsFor("linked", props.name, value);
+      return value;
+    });
+  };
   const [filterOpen, setFilterOpen] = createSignal(false);
   const [searchDraft, setSearchDraft] = createSignal("");
   const [searchQuery, setSearchQuery] = createSignal("");
@@ -126,10 +149,14 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   });
   // page name -> "in" (must also reference) | "out" (must not reference).
   const [filters, setFilters] = createSignal<FilterMap>(loadFilters(props.name));
-  // Reload the saved filter when the page changes.
+  // Reload the saved per-page state when the page changes. The section's own
+  // expand/collapse is RESTORED here, not reset (GH #272): a pane can route to
+  // another page without remounting, and coming back must not silently discard
+  // the choice the user made on the first page.
   createEffect(() => {
-    props.name;
-    setCollapsedOverride(null);
+    const page = props.name;
+    setCollapsedOverrideSignal(sectionOverride("linked", page) ?? null);
+    setCollapsedGroupsSignal(collapsedGroupsFor("linked", page));
     setFilters(loadFilters(props.name));
     setFilterOpen(false);
     setSearchDraft("");

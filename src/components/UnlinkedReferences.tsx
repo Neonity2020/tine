@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createResource, createSignal, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createResource, createSignal, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { openPage } from "../router";
 import { ReferenceExcerptBlocks } from "./ReferenceEvidence";
@@ -8,6 +8,12 @@ import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
+import {
+  collapsedGroupsFor,
+  sectionOverride,
+  setCollapsedGroupsFor,
+  setSectionOverride,
+} from "../referenceSectionState";
 
 const pageIdentity = (name: string) => {
   const lowered = name.trim().toLowerCase();
@@ -38,9 +44,34 @@ function mergeReferenceGroups(groups: RefGroup[]): RefGroup[] {
 
 // "Unlinked References" — plain-text mentions of the page, collapsed by default.
 export function UnlinkedReferences(props: { name: string }): JSX.Element {
-  const [open, setOpen] = createSignal(false);
+  // GH #272 was reported against Linked References, but this section had the
+  // identical latent defect: `open` was component-local, so a remount silently
+  // closed a section the user had opened. Held outside the component for the
+  // same reason. See referenceSectionState.
+  const [openSignal, setOpenSignal] = createSignal(sectionOverride("unlinked", props.name) ?? false);
+  const open = openSignal;
+  const setOpen = (value: boolean) => {
+    setSectionOverride("unlinked", props.name, value);
+    setOpenSignal(value);
+  };
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
-  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
+  const [collapsedGroupsSignal, setCollapsedGroupsSignal] =
+    createSignal<Set<string>>(collapsedGroupsFor("unlinked", props.name));
+  const collapsedGroups = collapsedGroupsSignal;
+  const setCollapsedGroups = (next: Set<string> | ((current: Set<string>) => Set<string>)) => {
+    setCollapsedGroupsSignal((current) => {
+      const value = typeof next === "function" ? next(current) : next;
+      setCollapsedGroupsFor("unlinked", props.name, value);
+      return value;
+    });
+  };
+  // A pane can route to another page without remounting; restore that page's
+  // state rather than carrying this one's over.
+  createEffect(() => {
+    const page = props.name;
+    setOpenSignal(sectionOverride("unlinked", page) ?? false);
+    setCollapsedGroupsSignal(collapsedGroupsFor("unlinked", page));
+  });
   const [groups] = createResource(
     () => props.name,
     async (n) => {

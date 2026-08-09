@@ -6209,6 +6209,33 @@
         "failBefore": "proven"
       },
       "notes": "openPageAtBlock polled the DOM for .ls-block[data-block-id] up to 20x50ms, but Block.tsx renders no children for a collapsed parent, so a Ctrl+Shift+K block result inside a collapsed subtree could never match and the poll timed out silently. store.expandAncestors expands the target's own ancestor chain (not unrelated collapsed blocks) as ONE undo step, persisting collapsed:: exactly as a manual expand does. Necessity gate proven: two of the three tests fail on the pre-fix tree. Reporter supplied an AI-written root cause; it was independently confirmed against router.ts:596 and Block.tsx:577 before implementing."
+    },
+    {
+      "id": "UI-REFERENCES-SECTION-STATE-REMOUNT-272",
+      "title": "Linked and Unlinked References keep the user's expand/collapse choice when the page subtree re-renders",
+      "family": "references-panel",
+      "sources": {
+        "issues": [
+          272
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "render",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "src/components/LinkedReferences.test.tsx",
+          "src/referenceSectionState.test.ts"
+        ],
+        "scenario": "references.section-expand-state-survives-remount",
+        "failBefore": "proven"
+      },
+      "notes": "Reported on a >5,000-page graph: a page with ~173 linked references collapsed its own section while scrolling or expanding a group, while ~48 references behaved. The flag was a component-local signal, so ANY remount of the page subtree reset it, and OG_REFERENCE_COLLAPSE_THRESHOLD=100 makes 'reset' mean collapsed — which is precisely the 48-fine/173-broken split. Moving the state to src/referenceSectionState.ts makes the symptom impossible whatever causes the remount, which is what the reporter asked for ('stay in current existing state no matter what'). Memory-only: OG's collapse-above-100 default still applies on a fresh start, and resetStore clears it on graph switch. NOT YET REPRODUCED on a real large graph — the remount trigger (suspected Page.tsx pagesToRender() going transiently empty) is unconfirmed; keep reported until a large-graph user or the Direct Files perf audit confirms."
     }
   ]
 }

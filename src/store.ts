@@ -19,6 +19,7 @@ import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
+import { resetReferenceSectionState } from "./referenceSectionState";
 import {
   isConflicted,
   clearConflict,
@@ -555,6 +556,9 @@ export function resetStore() {
   // across the switch (audit P2).
   clearSeededFacets();
   clearMatrixDimensionCache();
+  // Linked/Unlinked References expand state is keyed by page identity, and every
+  // page identity is retired with the old graph (GH #272).
+  resetReferenceSectionState();
   for (const name of pageInstanceGenerations.keys()) retirePageInstance(name);
   setDoc({ byId: {}, pages: [], feed: [], loaded: false });
   endEdit("graph-switch");

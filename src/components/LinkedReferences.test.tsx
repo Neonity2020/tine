@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { backend } from "../backend";
 import type { BacklinkFilterContext, BlockDto, RefGroup } from "../types";
 import { LinkedReferences } from "./LinkedReferences";
+import { resetReferenceSectionState } from "../referenceSectionState";
 
 vi.mock("./LiveRefGroup", () => ({
   LiveRefGroup: (props: { blocks: BlockDto[]; showBreadcrumb?: boolean }) => (
@@ -31,7 +32,55 @@ function wait(ms: number): Promise<void> {
 afterEach(() => {
   document.body.innerHTML = "";
   localStorage.clear();
+  resetReferenceSectionState();
   vi.restoreAllMocks();
+});
+
+// GH #272: on a big graph the section would collapse itself while the user
+// scrolled or expanded a group. The expand/collapse flag was component-local, so
+// any remount of the subtree reset it — and above OG's 100-reference threshold
+// "reset" means collapsed. Below the threshold the same remount is invisible,
+// which is exactly the reporter's 48-fine / 173-broken split.
+describe("Linked References section state survives a remount (GH #272)", () => {
+  const bigResult = (): RefGroup[] => [{
+    page: "Source",
+    kind: "page",
+    blocks: Array.from({ length: 173 }, (_, index) => block(`b${index}`, `[[Target]] ${index}`)),
+  }];
+
+  it("stays expanded when the component is destroyed and recreated", async () => {
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(bigResult());
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+
+    let dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+    // Above the threshold it starts collapsed, matching OG.
+    expect(root.querySelector(".test-ref-group")).toBeNull();
+    (root.querySelector(".references-header") as HTMLElement).click();
+    await tick();
+    expect(root.querySelector(".test-ref-group")).not.toBeNull();
+
+    // Exactly what a transient re-render of the page subtree does.
+    dispose();
+    root.innerHTML = "";
+    dispose = render(() => <LinkedReferences name="Target" />, root);
+    await tick();
+
+    expect(root.querySelector(".test-ref-group")).not.toBeNull();
+    dispose();
+  });
+
+  it("still applies OG's collapse-above-100 default on a page the user has not touched", async () => {
+    // Necessity guard: remembering the choice must not turn into "always open".
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue(bigResult());
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const dispose = render(() => <LinkedReferences name="Untouched" />, root);
+    await tick();
+    expect(root.querySelector(".test-ref-group")).toBeNull();
+    dispose();
+  });
 });
 
 describe("Linked References filters", () => {
