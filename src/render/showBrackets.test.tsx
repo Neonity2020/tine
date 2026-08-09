@@ -50,7 +50,10 @@ describe("show-brackets setting gates page-reference brackets", () => {
     setGraphMeta({ show_brackets: false } as never);
     const h = inl(pageRef("My Page"));
     expect(h).not.toContain('class="bracket"');
-    expect(h).toContain('class="page-ref"');
+    // Match the CLASS, not the whole attribute: an unresolved reference also
+    // carries `page-ref-missing`, and this test is about brackets, not
+    // existence. "My Page" has no file in this fixture, so it is unresolved.
+    expect(h).toMatch(/class="page-ref(?:[ "])/);
     expect(h).toContain("My Page");
   });
 
