@@ -1297,8 +1297,15 @@ impl BlockClaimIndexRoot {
 
 #[derive(Debug)]
 pub(crate) struct BlockClaimIndexStore {
-    file: Mutex<fs::File>,
+    backing: BlockClaimIndexBacking,
     counters: Arc<StoreCounters>,
+}
+
+#[derive(Debug)]
+enum BlockClaimIndexBacking {
+    Scratch(Arc<super::scratch_store::ScratchStore>),
+    #[cfg(test)]
+    Standalone(Mutex<fs::File>),
 }
 
 impl BlockClaimIndexStore {
@@ -1312,14 +1319,10 @@ impl BlockClaimIndexStore {
     /// in-memory test map, whose fixed capacity would otherwise cap an
     /// importable graph at a few thousand blocks.
     pub(crate) fn for_scratch(
-        scratch: &super::scratch_store::ScratchStore,
+        scratch: Arc<super::scratch_store::ScratchStore>,
     ) -> Result<Self, StoreError> {
         Ok(Self {
-            file: Mutex::new(
-                scratch
-                    .clone_pages_file()
-                    .map_err(|error| StoreError::Scratch(error.to_string()))?,
-            ),
+            backing: BlockClaimIndexBacking::Scratch(scratch),
             counters: Arc::new(StoreCounters::default()),
         })
     }
@@ -1353,13 +1356,14 @@ impl RetainedEngineScratch {
         store: &ObjectStore,
         scratch: super::scratch_store::ScratchStore,
     ) -> Result<Self, StoreError> {
-        let claim_index = store.engine_claim_index(&scratch)?;
+        let scratch = Arc::new(scratch);
+        let claim_index = store.engine_claim_index(Arc::clone(&scratch))?;
         let run_id = scratch.run_id();
         let binding_digest = scratch
             .binding_digest()
             .map_err(|error| StoreError::Scratch(error.to_string()))?;
         Ok(Self {
-            scratch: Arc::new(scratch),
+            scratch,
             claim_index,
             run_id,
             binding_digest,
@@ -3077,7 +3081,7 @@ impl ObjectStore {
         file.sync_all()?;
         sync_dir_required(&run)?;
         Ok(BlockClaimIndexStore {
-            file: Mutex::new(file),
+            backing: BlockClaimIndexBacking::Standalone(Mutex::new(file)),
             counters: Arc::clone(&self.counters),
         })
     }
@@ -3164,19 +3168,18 @@ impl ObjectStore {
             super::scratch_store::ScratchStore::open(&self.capability, self.workspace_id)
                 .map_err(|error| StoreError::Scratch(error.to_string()))?,
         );
-        Ok((Arc::clone(&scratch), self.engine_claim_index(&scratch)?))
+        Ok((
+            Arc::clone(&scratch),
+            self.engine_claim_index(Arc::clone(&scratch))?,
+        ))
     }
 
     fn engine_claim_index(
         &self,
-        scratch: &super::scratch_store::ScratchStore,
+        scratch: Arc<super::scratch_store::ScratchStore>,
     ) -> Result<BlockClaimIndexStore, StoreError> {
         Ok(BlockClaimIndexStore {
-            file: Mutex::new(
-                scratch
-                    .clone_pages_file()
-                    .map_err(|error| StoreError::Scratch(error.to_string()))?,
-            ),
+            backing: BlockClaimIndexBacking::Scratch(scratch),
             counters: Arc::clone(&self.counters),
         })
     }
@@ -7051,6 +7054,24 @@ fn validate_engine_history_root(
 }
 
 impl BlockClaimIndexStore {
+    fn with_file<T>(
+        &self,
+        operation: impl FnOnce(&mut fs::File) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        match &self.backing {
+            BlockClaimIndexBacking::Scratch(scratch) => scratch
+                .with_pages(operation)
+                .map_err(|error| StoreError::Scratch(error.to_string()))?,
+            #[cfg(test)]
+            BlockClaimIndexBacking::Standalone(file) => {
+                let mut file = file
+                    .lock()
+                    .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
+                operation(&mut file)
+            }
+        }
+    }
+
     pub(crate) fn lookup_many(
         &self,
         root: BlockClaimIndexRoot,
@@ -7062,62 +7083,54 @@ impl BlockClaimIndexStore {
         if !keys.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err(StoreError::MalformedBlockClaimIndex);
         }
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        let mut segments: Vec<_> = root.levels.into_iter().flatten().flatten().collect();
-        segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
-        let mut remaining: Vec<_> = keys
-            .iter()
-            .copied()
-            .map(|key| {
-                let (first, second) = block_claim_filter_hashes(&key);
-                (key, first, second)
-            })
-            .collect();
-        let global_filter = self.read_claim_global_filter(
-            &mut file,
-            root.global_filter
-                .ok_or(StoreError::MalformedBlockClaimIndex)?,
-        )?;
-        remaining.retain(|(_, first, second)| {
-            block_claim_global_filter_might_contain(&global_filter, *first, *second)
-        });
-        if remaining.is_empty() {
-            return Ok(BTreeMap::new());
-        }
-        let mut found = BTreeMap::new();
-        for segment in segments {
-            let filter = self.read_claim_filter(&mut file, segment.filter_ref)?;
-            if filter.entry_count != segment.entry_count {
-                return Err(StoreError::MalformedBlockClaimIndex);
-            }
-            let selected: Vec<_> = remaining
+        self.with_file(|file| {
+            let mut segments: Vec<_> = root.levels.into_iter().flatten().flatten().collect();
+            segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.generation));
+            let mut remaining: Vec<_> = keys
                 .iter()
-                .filter(|(_, first, second)| {
-                    block_claim_filter_might_contain(&filter, *first, *second)
+                .copied()
+                .map(|key| {
+                    let (first, second) = block_claim_filter_hashes(&key);
+                    (key, first, second)
                 })
-                .map(|(key, _, _)| *key)
                 .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            let mut segment_found = BTreeMap::new();
-            self.lookup_many_at(
-                &mut file,
-                segment.page_ref,
-                0,
-                &selected,
-                &mut segment_found,
+            let global_filter = self.read_claim_global_filter(
+                file,
+                root.global_filter
+                    .ok_or(StoreError::MalformedBlockClaimIndex)?,
             )?;
-            found.extend(segment_found);
-            remaining.retain(|(key, _, _)| !found.contains_key(key));
+            remaining.retain(|(_, first, second)| {
+                block_claim_global_filter_might_contain(&global_filter, *first, *second)
+            });
             if remaining.is_empty() {
-                break;
+                return Ok(BTreeMap::new());
             }
-        }
-        Ok(found)
+            let mut found = BTreeMap::new();
+            for segment in segments {
+                let filter = self.read_claim_filter(file, segment.filter_ref)?;
+                if filter.entry_count != segment.entry_count {
+                    return Err(StoreError::MalformedBlockClaimIndex);
+                }
+                let selected: Vec<_> = remaining
+                    .iter()
+                    .filter(|(_, first, second)| {
+                        block_claim_filter_might_contain(&filter, *first, *second)
+                    })
+                    .map(|(key, _, _)| *key)
+                    .collect();
+                if selected.is_empty() {
+                    continue;
+                }
+                let mut segment_found = BTreeMap::new();
+                self.lookup_many_at(file, segment.page_ref, 0, &selected, &mut segment_found)?;
+                found.extend(segment_found);
+                remaining.retain(|(key, _, _)| !found.contains_key(key));
+                if remaining.is_empty() {
+                    break;
+                }
+            }
+            Ok(found)
+        })
     }
 
     pub(crate) fn insert_many(
@@ -7135,66 +7148,64 @@ impl BlockClaimIndexStore {
         {
             return Err(StoreError::MalformedBlockClaimIndex);
         }
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-        let generation = root
-            .next_generation
-            .checked_add(1)
-            .ok_or(StoreError::MalformedBlockClaimIndex)?;
-        let mut global_filter = match root.global_filter {
-            Some(page_ref) => self.read_claim_global_filter(&mut file, page_ref)?,
-            None => new_block_claim_global_filter(),
-        };
-        update_block_claim_global_filter(&mut global_filter, records)?;
-        let mut next = root;
-        next.next_generation = generation;
-        let mut merged = records.to_vec();
-        let mut installed = false;
-        for level in &mut next.levels {
-            if let Some(empty) = level.iter().position(Option::is_none) {
-                let entry_count = u64::try_from(merged.len())
-                    .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
-                let filter_ref = self.append_claim_filter(&mut file, &merged)?;
-                let page_ref = self.build_claim_subtree(&mut file, 0, merged)?;
-                level[empty] = Some(BlockClaimSegmentRef {
-                    generation,
-                    entry_count,
-                    page_ref,
-                    filter_ref,
-                });
-                installed = true;
-                break;
-            }
-            let mut existing: Vec<_> = level.iter_mut().filter_map(Option::take).collect();
-            existing.sort_unstable_by_key(|segment| segment.generation);
-            let capacity = existing.iter().try_fold(merged.len(), |capacity, segment| {
-                usize::try_from(segment.entry_count)
-                    .ok()
-                    .and_then(|entries| capacity.checked_add(entries))
-            });
-            let mut combined =
-                AHashMap::with_capacity(capacity.ok_or(StoreError::MalformedBlockClaimIndex)?);
-            for segment in existing {
-                let mut older = Vec::with_capacity(
-                    usize::try_from(segment.entry_count)
-                        .map_err(|_| StoreError::MalformedBlockClaimIndex)?,
-                );
-                self.materialize_claim_segment(&mut file, segment.page_ref, 0, &mut older)?;
-                if older.len() as u64 != segment.entry_count {
-                    return Err(StoreError::MalformedBlockClaimIndex);
+        self.with_file(|file| {
+            let generation = root
+                .next_generation
+                .checked_add(1)
+                .ok_or(StoreError::MalformedBlockClaimIndex)?;
+            let mut global_filter = match root.global_filter {
+                Some(page_ref) => self.read_claim_global_filter(file, page_ref)?,
+                None => new_block_claim_global_filter(),
+            };
+            update_block_claim_global_filter(&mut global_filter, records)?;
+            let mut next = root;
+            next.next_generation = generation;
+            let mut merged = records.to_vec();
+            let mut installed = false;
+            for level in &mut next.levels {
+                if let Some(empty) = level.iter().position(Option::is_none) {
+                    let entry_count = u64::try_from(merged.len())
+                        .map_err(|_| StoreError::MalformedBlockClaimIndex)?;
+                    let filter_ref = self.append_claim_filter(file, &merged)?;
+                    let page_ref = self.build_claim_subtree(file, 0, merged)?;
+                    level[empty] = Some(BlockClaimSegmentRef {
+                        generation,
+                        entry_count,
+                        page_ref,
+                        filter_ref,
+                    });
+                    installed = true;
+                    break;
                 }
-                combined.extend(older);
+                let mut existing: Vec<_> = level.iter_mut().filter_map(Option::take).collect();
+                existing.sort_unstable_by_key(|segment| segment.generation);
+                let capacity = existing.iter().try_fold(merged.len(), |capacity, segment| {
+                    usize::try_from(segment.entry_count)
+                        .ok()
+                        .and_then(|entries| capacity.checked_add(entries))
+                });
+                let mut combined =
+                    AHashMap::with_capacity(capacity.ok_or(StoreError::MalformedBlockClaimIndex)?);
+                for segment in existing {
+                    let mut older = Vec::with_capacity(
+                        usize::try_from(segment.entry_count)
+                            .map_err(|_| StoreError::MalformedBlockClaimIndex)?,
+                    );
+                    self.materialize_claim_segment(file, segment.page_ref, 0, &mut older)?;
+                    if older.len() as u64 != segment.entry_count {
+                        return Err(StoreError::MalformedBlockClaimIndex);
+                    }
+                    combined.extend(older);
+                }
+                combined.extend(merged);
+                merged = combined.into_iter().collect();
             }
-            combined.extend(merged);
-            merged = combined.into_iter().collect();
-        }
-        if !installed {
-            return Err(StoreError::MalformedBlockClaimIndex);
-        }
-        next.global_filter = Some(self.append_claim_global_filter(&mut file, &global_filter)?);
-        Ok(next)
+            if !installed {
+                return Err(StoreError::MalformedBlockClaimIndex);
+            }
+            next.global_filter = Some(self.append_claim_global_filter(file, &global_filter)?);
+            Ok(next)
+        })
     }
 
     fn lookup_many_at(
