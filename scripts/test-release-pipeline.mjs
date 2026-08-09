@@ -15,6 +15,7 @@ import {
 import {
   tauriCapabilities,
   webdriverServerArgs,
+  windowsUserDataFolder,
   windowsWebviewProfileSnapshot,
 } from "./e2e-capabilities.mjs";
 import { candidateProblems, releaseLayout, RELEASE_LANES } from "./release-layout.mjs";
@@ -860,6 +861,12 @@ try {
   );
   assert.equal(windowsCapabilities.browserName, "webview2");
   assert.equal(windowsCapabilities["ms:edgeOptions"].binary, "C:/Tine.exe");
+  assert.equal(
+    windowsUserDataFolder("explicit session", {
+      E2E_WEBVIEW_USER_DATA_ROOT: path.join(temporary, "explicit-webview2"),
+    }),
+    path.join(temporary, "explicit-webview2", "explicit-session"),
+  );
   const attachedCapabilities = tauriCapabilities(
     "C:/Tine.exe",
     "fixture session",
