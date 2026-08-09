@@ -88,6 +88,7 @@ assert.match(
 );
 assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
 assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
+assert.match(issue295Scenario, /await target\.click\(\)/);
 assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
 assert.match(issue295Scenario, /dispatchToSecondPaint/);
 assert.match(issue295Scenario, /quickSwitch/);
