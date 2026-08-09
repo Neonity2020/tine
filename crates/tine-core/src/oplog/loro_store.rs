@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard};
-#[cfg(test)]
 use std::time::Instant;
 
 use loro::{kv_store_handle, KvStore, KvStoreHandle};
@@ -36,7 +36,6 @@ pub(crate) struct LoroStoreStats {
     pub range_scans: usize,
     pub history_page_reads: usize,
     pub history_blob_reads: usize,
-    #[cfg(test)]
     pub flush_nanos: u128,
 }
 
@@ -47,8 +46,7 @@ struct LoroStoreCounters {
     range_scans: AtomicUsize,
     history_page_reads: AtomicUsize,
     history_blob_reads: AtomicUsize,
-    #[cfg(test)]
-    flush_nanos: std::sync::atomic::AtomicU64,
+    flush_nanos: AtomicU64,
 }
 
 impl LoroStoreCounters {
@@ -59,7 +57,6 @@ impl LoroStoreCounters {
             range_scans: self.range_scans.load(Ordering::Relaxed),
             history_page_reads: self.history_page_reads.load(Ordering::Relaxed),
             history_blob_reads: self.history_blob_reads.load(Ordering::Relaxed),
-            #[cfg(test)]
             flush_nanos: u128::from(self.flush_nanos.load(Ordering::Relaxed)),
         }
     }
@@ -1201,16 +1198,16 @@ impl KvStore for AuthenticatedLoroStore {
 
     fn flush(&mut self) {
         self.counters.flush_calls.fetch_add(1, Ordering::Relaxed);
-        #[cfg(test)]
-        let flush_started = Instant::now();
+        let flush_started = activation_trace_enabled().then(Instant::now);
         if let Err(error) = self.flush_inner() {
             self.record_error(error);
         }
-        #[cfg(test)]
-        self.counters.flush_nanos.fetch_add(
-            u64::try_from(flush_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        if let Some(started) = flush_started {
+            self.counters.flush_nanos.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
     }
 
     fn take_error(&mut self) -> Option<String> {
@@ -1219,6 +1216,11 @@ impl KvStore for AuthenticatedLoroStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
     }
+}
+
+fn activation_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| cfg!(test) || std::env::var_os("TINE_ACTIVATION_TRACE").is_some())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

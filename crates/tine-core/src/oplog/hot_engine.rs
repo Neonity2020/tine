@@ -2695,7 +2695,7 @@ impl DetachedBootstrapAuthoringSession {
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                 );
                 let block_claim_index = Arc::new(
-                    BlockClaimIndexStore::for_scratch(&scratch)
+                    BlockClaimIndexStore::for_scratch(Arc::clone(&scratch))
                         .map_err(|error| EngineError::Archive(error.to_string()))?,
                 );
                 (Some(scratch_root), scratch, block_claim_index)
@@ -5615,47 +5615,49 @@ impl ReplayTimingStats {
         }
     }
 
-    #[cfg(test)]
     fn add_document_state_work(&mut self, work: &super::document_state::DocumentStateWork) {
-        self.external_checkpoint_phase_calls = self
-            .external_checkpoint_phase_calls
-            .saturating_add(work.external_checkpoint_phase_calls);
-        self.external_checkpoint_nonempty_calls = self
-            .external_checkpoint_nonempty_calls
-            .saturating_add(work.external_checkpoint_nonempty_calls);
-        self.external_checkpoint_documents = self
-            .external_checkpoint_documents
-            .saturating_add(work.external_checkpoint_documents);
-        self.checkpoint_chunks = self
-            .checkpoint_chunks
-            .saturating_add(work.checkpoint_chunks);
-        self.checkpoint_existing_hits = self
-            .checkpoint_existing_hits
-            .saturating_add(work.checkpoint_existing_hits);
-        self.checkpoint_staged_hits = self
-            .checkpoint_staged_hits
-            .saturating_add(work.checkpoint_staged_hits);
-        self.checkpoint_new_chunks = self
-            .checkpoint_new_chunks
-            .saturating_add(work.checkpoint_new_chunks);
-        self.blob_dedup_lsm_flushes = self
-            .blob_dedup_lsm_flushes
-            .saturating_add(work.blob_dedup_lsm_flushes);
-        self.blob_dedup_lsm_insert_nanos = self
-            .blob_dedup_lsm_insert_nanos
-            .saturating_add(work.blob_dedup_lsm_insert_nanos);
-        self.checkpoint_chunk_digest_nanos = self
-            .checkpoint_chunk_digest_nanos
-            .saturating_add(work.checkpoint_chunk_digest_nanos);
-        self.blob_dedup_lookup_nanos = self
-            .blob_dedup_lookup_nanos
-            .saturating_add(work.blob_dedup_lookup_nanos);
-        self.checkpoint_blob_append_nanos = self
-            .checkpoint_blob_append_nanos
-            .saturating_add(work.checkpoint_blob_append_nanos);
-        self.checkpoint_whole_digest_nanos = self
-            .checkpoint_whole_digest_nanos
-            .saturating_add(work.checkpoint_whole_digest_nanos);
+        #[cfg(test)]
+        {
+            self.external_checkpoint_phase_calls = self
+                .external_checkpoint_phase_calls
+                .saturating_add(work.external_checkpoint_phase_calls);
+            self.external_checkpoint_nonempty_calls = self
+                .external_checkpoint_nonempty_calls
+                .saturating_add(work.external_checkpoint_nonempty_calls);
+            self.external_checkpoint_documents = self
+                .external_checkpoint_documents
+                .saturating_add(work.external_checkpoint_documents);
+            self.checkpoint_chunks = self
+                .checkpoint_chunks
+                .saturating_add(work.checkpoint_chunks);
+            self.checkpoint_existing_hits = self
+                .checkpoint_existing_hits
+                .saturating_add(work.checkpoint_existing_hits);
+            self.checkpoint_staged_hits = self
+                .checkpoint_staged_hits
+                .saturating_add(work.checkpoint_staged_hits);
+            self.checkpoint_new_chunks = self
+                .checkpoint_new_chunks
+                .saturating_add(work.checkpoint_new_chunks);
+            self.blob_dedup_lsm_flushes = self
+                .blob_dedup_lsm_flushes
+                .saturating_add(work.blob_dedup_lsm_flushes);
+            self.blob_dedup_lsm_insert_nanos = self
+                .blob_dedup_lsm_insert_nanos
+                .saturating_add(work.blob_dedup_lsm_insert_nanos);
+            self.checkpoint_chunk_digest_nanos = self
+                .checkpoint_chunk_digest_nanos
+                .saturating_add(work.checkpoint_chunk_digest_nanos);
+            self.blob_dedup_lookup_nanos = self
+                .blob_dedup_lookup_nanos
+                .saturating_add(work.blob_dedup_lookup_nanos);
+            self.checkpoint_blob_append_nanos = self
+                .checkpoint_blob_append_nanos
+                .saturating_add(work.checkpoint_blob_append_nanos);
+            self.checkpoint_whole_digest_nanos = self
+                .checkpoint_whole_digest_nanos
+                .saturating_add(work.checkpoint_whole_digest_nanos);
+        }
         self.loro_external_flush_nanos = self
             .loro_external_flush_nanos
             .saturating_add(work.loro_external_flush_nanos);
@@ -21023,10 +21025,11 @@ impl ShardedHotEngine {
             .external_history_blob_reads
             .saturating_add(document.external_history_blob_reads);
         self.history_work.set(work);
-        #[cfg(test)]
-        self.record_replay_timing(|timing| {
-            timing.add_document_state_work(&document);
-        });
+        if self.activation_trace_enabled || cfg!(test) {
+            self.record_replay_timing(|timing| {
+                timing.add_document_state_work(&document);
+            });
+        }
     }
 
     fn record_author_snapshot_clone(&self, document: &LoroDoc) {
@@ -31392,6 +31395,14 @@ mod validation_tests {
             io.scratch_page_bytes_read <= page_count * 32 * 1024,
             "detached authoring reread cumulative scratch bytes: {io:?}"
         );
+        assert!(
+            scratch.page_append_batches.saturating_mul(10) < scratch.page_writes,
+            "detached authoring emitted near-record-granularity page writes: {scratch:?}"
+        );
+        assert!(
+            scratch.blob_append_batches.saturating_mul(10) < scratch.blob_writes,
+            "detached authoring emitted near-record-granularity blob writes: {scratch:?}"
+        );
         for (page_id, expected_content) in sampled_pages {
             let page = completed.engine.materialize_page(page_id).unwrap();
             assert_eq!(page.blocks[0].content, expected_content);
@@ -31456,7 +31467,6 @@ mod validation_tests {
         let completed = session.finish().unwrap();
         let finished = finish_started.elapsed();
         let work = completed.bootstrap_catalog_work_stats();
-        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
         let (sample_page, sample_content) = sample.unwrap();
         assert_eq!(
             completed
@@ -31467,12 +31477,23 @@ mod validation_tests {
                 .content,
             sample_content
         );
+        let scratch = completed.engine.scratch.as_ref().unwrap().stats();
+        assert!(
+            scratch.page_append_batches.saturating_mul(100) < scratch.page_writes,
+            "detached bootstrap emitted one physical page write per logical record: {scratch:?}"
+        );
+        assert!(
+            scratch.blob_append_batches.saturating_mul(100) < scratch.blob_writes,
+            "detached bootstrap emitted one physical blob write per logical record: {scratch:?}"
+        );
         eprintln!(
-            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} catalog_work={work:?}",
+            "detached_bootstrap_authoring_scale pages={total_pages} pages_per_part={pages_per_part} parts={part_count} cumulative_part_author_ms={part_author_ms:?} author_ms={:.3} finish_ms={:.3} scratch_reads={} scratch_writes={} scratch_page_append_batches={} scratch_blob_append_batches={} scratch_range_reads={} scratch_read_bytes={} scratch_written_bytes={} catalog_work={work:?}",
             authored.as_secs_f64() * 1_000.0,
             finished.as_secs_f64() * 1_000.0,
             scratch.page_reads,
             scratch.page_writes,
+            scratch.page_append_batches,
+            scratch.blob_append_batches,
             scratch.range_reads,
             scratch.page_bytes_read,
             scratch.page_bytes_written,
@@ -31811,11 +31832,17 @@ mod validation_tests {
                     detached_descriptor(&second, second_evidence, first_descriptor.post_frontier());
                 for (part, descriptor) in [(&first, first_descriptor), (&second, second_descriptor)]
                 {
-                    for object in part.objects() {
-                        store
-                            .publish_bootstrap_object_bytes(&object.encode().unwrap())
-                            .unwrap();
+                    let object_bytes = part
+                        .objects()
+                        .iter()
+                        .map(|object| object.encode().unwrap())
+                        .collect::<Vec<_>>();
+                    for object in &object_bytes {
+                        store.publish_bootstrap_object_bytes(object).unwrap();
                     }
+                    store
+                        .publish_bootstrap_part_pack_for_test(descriptor, &object_bytes)
+                        .unwrap();
                     store
                         .publish_bootstrap_part_artifacts(
                             descriptor,

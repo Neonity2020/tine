@@ -20,10 +20,10 @@ use super::{
 };
 
 pub const EXACT_LOGICAL_PAGE_NAME_BLOB_SCHEMA_VERSION: u32 = 1;
-pub const EXACT_LOGICAL_PAGE_NAME_REF_SCHEMA_VERSION: u32 = 1;
-pub const PAGE_NAME_OWNERSHIP_STORE_SCHEMA_VERSION: u32 = 1;
-pub const PAGE_NAME_OWNERSHIP_RECORD_SCHEMA_VERSION: u32 = 1;
-pub const PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION: u32 = 1;
+pub const EXACT_LOGICAL_PAGE_NAME_REF_SCHEMA_VERSION: u32 = 2;
+pub const PAGE_NAME_OWNERSHIP_STORE_SCHEMA_VERSION: u32 = 2;
+pub const PAGE_NAME_OWNERSHIP_RECORD_SCHEMA_VERSION: u32 = 2;
+pub const PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION: u32 = 2;
 pub const PAGE_NAME_CATALOG_FRONTIER_SCHEMA_VERSION: u32 = 1;
 pub const PAGE_NAME_CONFLICT_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PAGE_NAME_POINT_BATCH: usize = 100_000;
@@ -33,7 +33,8 @@ const MAX_EPHEMERAL_PAGE_NAME_RECORDS: usize = 4_096;
 
 const EXACT_NAME_BLOB_SUFFIX: &str = ".exact-page-name";
 const MAX_EXACT_NAME_BLOB_BYTES: u64 = 4 * 1024 * 1024 + 1024;
-const PAGE_NAME_INDEX_DOMAIN: &[u8] = b"tine/page-name-ownership-index/v1";
+const MAX_INLINE_EXACT_NAME_BYTES: usize = 64 * 1024;
+const PAGE_NAME_INDEX_DOMAIN: &[u8] = b"tine/page-name-ownership-index/v2";
 const STORE_CLAIM_FILE: &str = "page-name-index.claim";
 const NODES_DIR: &str = "nodes";
 const EXACT_NAMES_DIR: &str = "exact-names";
@@ -1300,6 +1301,8 @@ pub struct ExactLogicalPageNameRefV1 {
     encoded_len: u64,
     content_digest: ContentDigest,
     exact_name_digest: ExactLogicalPageNameDigest,
+    #[serde(default)]
+    inline_exact_name: Option<LogicalPageName>,
 }
 
 impl ExactLogicalPageNameRefV1 {
@@ -1346,6 +1349,7 @@ fn encode_exact_name_blob(
             encoded_len: bytes.len() as u64,
             content_digest: ContentDigest::of(&bytes),
             exact_name_digest: ExactLogicalPageNameDigest::of(name),
+            inline_exact_name: (bytes.len() <= MAX_INLINE_EXACT_NAME_BYTES).then(|| name.clone()),
         },
     ))
 }
@@ -1708,6 +1712,9 @@ impl PageNameOwnershipStore {
         name: &LogicalPageName,
     ) -> Result<ExactLogicalPageNameRefV1, StoreError> {
         let (bytes, name_ref) = encode_exact_name_blob(name)?;
+        if name_ref.inline_exact_name.is_some() {
+            return Ok(name_ref);
+        }
         let filename = exact_name_blob_filename(name_ref.content_digest);
         if let Some(publisher) = &self.detached_publisher {
             publisher.publish(
@@ -1733,6 +1740,10 @@ impl PageNameOwnershipStore {
         name_ref: &ExactLogicalPageNameRefV1,
     ) -> Result<LogicalPageName, StoreError> {
         name_ref.validate_version_and_length()?;
+        if let Some(name) = &name_ref.inline_exact_name {
+            validate_exact_name_ref(expected_key, name_ref, name)?;
+            return Ok(name.clone());
+        }
         let filename = exact_name_blob_filename(name_ref.content_digest);
         let bytes = read_optional_regular(
             &self.exact_names,
@@ -2484,6 +2495,7 @@ mod tests {
             encoded_len: bytes.len() as u64,
             content_digest,
             exact_name_digest: ExactLogicalPageNameDigest::of(name),
+            inline_exact_name: None,
         }
     }
 
@@ -2499,6 +2511,12 @@ mod tests {
         );
 
         let name_ref = index.put_exact_name(&name).unwrap();
+        assert_eq!(name_ref.inline_exact_name.as_ref(), Some(&name));
+        assert!(!path
+            .join(PAGE_NAME_OWNERSHIP_INDEX_DIR_FOR_TEST)
+            .join("exact-names")
+            .join(exact_name_blob_filename(name_ref.content_digest()))
+            .exists());
         assert_eq!(
             index.read_exact_name(name.key_digest(), &name_ref).unwrap(),
             name
@@ -2537,6 +2555,12 @@ mod tests {
 
         let maximum = LogicalPageName::parse("x".repeat(MAX_LOGICAL_PAGE_NAME_BYTES)).unwrap();
         let maximum_ref = index.put_exact_name(&maximum).unwrap();
+        assert!(maximum_ref.inline_exact_name.is_none());
+        assert!(path
+            .join(PAGE_NAME_OWNERSHIP_INDEX_DIR_FOR_TEST)
+            .join("exact-names")
+            .join(exact_name_blob_filename(maximum_ref.content_digest()))
+            .is_file());
         assert_eq!(
             index
                 .read_exact_name(maximum.key_digest(), &maximum_ref)
@@ -2564,7 +2588,7 @@ mod tests {
     fn blob_tamper_and_cross_key_substitution_fail_closed() {
         let (path, archive, index) = store("blob-tamper");
         let foo = LogicalPageName::parse("Foo").unwrap();
-        let foo_ref = index.put_exact_name(&foo).unwrap();
+        let foo_ref = seed_blob(&path, &foo, EXACT_LOGICAL_PAGE_NAME_BLOB_SCHEMA_VERSION);
         let root = index
             .insert_many(
                 &PageNameOwnershipRootV1::empty(),
@@ -2637,7 +2661,7 @@ mod tests {
 
     #[test]
     fn root_record_reference_and_blob_prior_future_versions_are_classified() {
-        for found in [0, 2] {
+        for found in [1, 3] {
             let (path, archive, index) = store(&format!("store-version-{found}"));
             drop(index);
             let claim = PageNameOwnershipStoreClaimV1 {
@@ -2651,10 +2675,10 @@ mod tests {
             )
             .unwrap();
             match (found, archive.open_page_name_ownership_index()) {
-                (0, Err(StoreError::UpgradeRequired { store, .. })) => {
+                (1, Err(StoreError::UpgradeRequired { store, .. })) => {
                     assert_eq!(store, "page-name ownership store")
                 }
-                (2, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
+                (3, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
                     assert_eq!(store, "page-name ownership store")
                 }
                 (_, result) => panic!("unexpected store version result: {result:?}"),
@@ -2663,7 +2687,7 @@ mod tests {
             crate::test_support::remove_dir_all(path);
         }
 
-        for found in [0, 2] {
+        for found in [1, 3] {
             let root = PageNameOwnershipRootV1 {
                 schema_version: found,
                 key_version: PAGE_NAME_KEY_VERSION,
@@ -2672,17 +2696,17 @@ mod tests {
             };
             let bytes = encode_canonical(&root).unwrap();
             match (found, PageNameOwnershipRootV1::decode(&bytes)) {
-                (0, Err(StoreError::UpgradeRequired { store, .. })) => {
+                (1, Err(StoreError::UpgradeRequired { store, .. })) => {
                     assert_eq!(store, "page-name ownership root")
                 }
-                (2, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
+                (3, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
                     assert_eq!(store, "page-name ownership root")
                 }
                 (_, result) => panic!("unexpected root version result: {result:?}"),
             }
         }
 
-        for found in [0, 2] {
+        for found in [1, 3] {
             let (path, archive, index) = store(&format!("record-version-{found}"));
             let name = LogicalPageName::parse("Versioned").unwrap();
             let key = name.key_digest();
@@ -2710,10 +2734,10 @@ mod tests {
                 entry_count: 1,
             };
             match (found, index.lookup(&root, key)) {
-                (0, Err(StoreError::UpgradeRequired { store, .. })) => {
+                (1, Err(StoreError::UpgradeRequired { store, .. })) => {
                     assert_eq!(store, "page-name ownership record")
                 }
-                (2, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
+                (3, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
                     assert_eq!(store, "page-name ownership record")
                 }
                 (_, result) => panic!("unexpected record version result: {result:?}"),
@@ -2723,7 +2747,7 @@ mod tests {
             crate::test_support::remove_dir_all(path);
         }
 
-        for found in [0, 2] {
+        for found in [1, 3] {
             let (path, archive, index) = store(&format!("ref-version-{found}"));
             let name = LogicalPageName::parse("Nested Ref").unwrap();
             let key = name.key_digest();
@@ -2753,10 +2777,10 @@ mod tests {
                 entry_count: 1,
             };
             match (found, index.lookup(&root, key)) {
-                (0, Err(StoreError::UpgradeRequired { store, .. })) => {
+                (1, Err(StoreError::UpgradeRequired { store, .. })) => {
                     assert_eq!(store, "exact logical page-name reference")
                 }
-                (2, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
+                (3, Err(StoreError::UnsupportedStoreVersion { store, .. })) => {
                     assert_eq!(store, "exact logical page-name reference")
                 }
                 (_, result) => panic!("unexpected reference version result: {result:?}"),

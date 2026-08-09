@@ -400,18 +400,9 @@ jobs:
           if (-not $exe) { throw "portable Tine executable is missing" }
           "TINE_APP=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "TINE_E2E_BUILD_RECEIPT=$env:RUNNER_TEMP\tine-receipt\tine.exe.build.json" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Install Edge WebDriver matching the hosted browser
+      - name: Install Edge WebDriver matching the WebView2 runtime
         shell: pwsh
-        run: |
-          $edgeExe = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
-          if (-not (Test-Path $edgeExe)) { throw "Microsoft Edge not found at $edgeExe" }
-          $version = (Get-Item $edgeExe).VersionInfo.ProductVersion
-          $driverDir = "$env:RUNNER_TEMP\edgedriver"
-          $zip = "$env:RUNNER_TEMP\edgedriver.zip"
-          Invoke-WebRequest "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip" -OutFile $zip
-          Expand-Archive $zip -DestinationPath $driverDir -Force
-          $driverDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$driverDir\msedgedriver.exe" --version
+        run: ./scripts/install-windows-webview2-driver.ps1
       - name: Run advisory Windows x64 real-app scenario
         env:
           TINE_E2E_MODE: release

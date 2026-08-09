@@ -630,12 +630,16 @@ fn validate_replacements(
         return Err(ReferenceCatalogError::NonCanonical);
     }
     for replacement in replacements {
-        if replacement.post_posting.as_ref().is_some_and(|posting| {
-            posting.source_page_id != replacement.page_id
-                || posting.encoded_byte_length == 0
+        if let Some(posting) = &replacement.post_posting {
+            let inline_empty = posting.encoded_byte_length == 0
+                && posting.fact_count == 0
+                && posting.digest == empty_posting_digest(posting.source_page_id)?;
+            if posting.source_page_id != replacement.page_id
                 || posting.encoded_byte_length > MAX_REFERENCE_OBJECT_BYTES
-        }) {
-            return Err(ReferenceCatalogError::MalformedTransition);
+                || (posting.encoded_byte_length == 0 && !inline_empty)
+            {
+                return Err(ReferenceCatalogError::MalformedTransition);
+            }
         }
     }
     Ok(())
@@ -663,6 +667,23 @@ struct PostingManifestV2 {
     source_page_id: PageId,
     fact_count: u64,
     chunks: Vec<PostingChunkRefV2>,
+}
+
+fn empty_posting_manifest(
+    source_page_id: PageId,
+) -> Result<(Vec<u8>, ContentDigest), ReferenceCatalogError> {
+    let bytes = encode_canonical(&PostingManifestV2 {
+        schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+        source_page_id,
+        fact_count: 0,
+        chunks: Vec::new(),
+    })?;
+    let digest = ContentDigest::of(&bytes);
+    Ok((bytes, digest))
+}
+
+fn empty_posting_digest(source_page_id: PageId) -> Result<ContentDigest, ReferenceCatalogError> {
+    empty_posting_manifest(source_page_id).map(|(_, digest)| digest)
 }
 
 #[derive(Debug)]
@@ -729,6 +750,15 @@ impl ReferenceCatalogStore {
         posting: &ReferenceSourcePostingV2,
     ) -> Result<ReferencePostingRefV2, ReferenceCatalogError> {
         posting.validate()?;
+        if posting.facts.is_empty() {
+            let (_, digest) = empty_posting_manifest(posting.source_page_id)?;
+            return Ok(ReferencePostingRefV2 {
+                source_page_id: posting.source_page_id,
+                digest,
+                encoded_byte_length: 0,
+                fact_count: 0,
+            });
+        }
         let mut chunks = Vec::new();
         let mut current = Vec::new();
         let mut estimated = 0usize;
@@ -834,6 +864,18 @@ impl ReferenceCatalogStore {
         &self,
         reference: &ReferencePostingRefV2,
     ) -> Result<ReferenceSourcePostingV2, ReferenceCatalogError> {
+        if reference.encoded_byte_length == 0 {
+            if reference.fact_count != 0
+                || reference.digest != empty_posting_digest(reference.source_page_id)?
+            {
+                return Err(ReferenceCatalogError::MalformedPosting);
+            }
+            return Ok(ReferenceSourcePostingV2 {
+                schema_version: REFERENCE_CATALOG_SCHEMA_VERSION,
+                source_page_id: reference.source_page_id,
+                facts: Vec::new(),
+            });
+        }
         let bytes = read_content_addressed(
             &self.postings,
             &posting_filename(reference.digest),
@@ -899,6 +941,14 @@ impl ReferenceCatalogStore {
         source_page_id: PageId,
         digest: ContentDigest,
     ) -> Result<ReferencePostingRefV2, ReferenceCatalogError> {
+        if digest == empty_posting_digest(source_page_id)? {
+            return Ok(ReferencePostingRefV2 {
+                source_page_id,
+                digest,
+                encoded_byte_length: 0,
+                fact_count: 0,
+            });
+        }
         let filename = posting_filename(digest);
         let bytes =
             read_optional_regular(&self.postings, &filename, MAX_REFERENCE_OBJECT_BYTES, None)
@@ -2793,6 +2843,32 @@ mod tests {
             ObjectStore::open(&path, WorkspaceId::from_uuid(Uuid::from_u128(0x100))).unwrap();
         let catalog = Arc::new(objects.open_reference_catalog().unwrap());
         (path, catalog)
+    }
+
+    #[test]
+    fn empty_posting_is_authenticated_without_an_immutable_file() {
+        let (_path, store) = store("inline-empty-posting");
+        let posting = extract_source_posting(
+            &ReferenceCatalogPolicyV1::default(),
+            source(page(1), "plain text without references"),
+        )
+        .unwrap();
+        assert!(posting.facts.is_empty());
+
+        let reference = store.publish_posting(&posting).unwrap();
+        assert_eq!(reference.encoded_byte_length, 0);
+        assert_eq!(reference.fact_count, 0);
+        assert!(!store
+            .postings
+            .try_exists(&posting_filename(reference.digest))
+            .unwrap());
+        assert_eq!(store.read_posting(&reference).unwrap(), posting);
+        assert_eq!(
+            store
+                .posting_reference(reference.source_page_id, reference.digest)
+                .unwrap(),
+            reference
+        );
     }
 
     fn dense_source(
