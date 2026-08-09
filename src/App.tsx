@@ -143,14 +143,19 @@ const safeClose = createSafeCloseCoordinator({
   },
   flushPdfWork: drainPdfWork,
   flushAll,
-  confirmDiscard: () => backend().confirm(
-    "Tine has unsaved changes that couldn't be saved (a conflict or a stuck save).\n\nClose this window anyway and lose them?",
+  confirmDiscard: (reason) => backend().confirm(
+    reason === "still-saving"
+      ? "Tine is still writing your changes and is taking longer than expected — a slow or network drive can do this.\n\nClosing now would lose whatever hasn't been written yet. Close anyway?"
+      : "Tine has unsaved changes that couldn't be saved (a conflict or a stuck save).\n\nClose this window anyway and lose them?",
     "Unsaved changes",
   ),
   flushSession,
   setTransition: setGraphTransitioning,
   notifyPdfFailure: () => {
     pushToast("Couldn't save pending PDF changes. The graph remains open.", "error");
+  },
+  notifyStillSaving: () => {
+    pushToast("Still saving your changes — closing in a moment.", "info");
   },
   notifyConfirmationFailure: () => {
     pushToast("Couldn't confirm closing the window. Your unsaved changes are still open.", "error");

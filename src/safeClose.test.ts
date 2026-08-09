@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { requestAndroidRootClose } from "./androidBack";
-import { createSafeCloseCoordinator, type SafeCloseDeps } from "./safeClose";
+import { createSafeCloseCoordinator, type DiscardReason, type SafeCloseDeps } from "./safeClose";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -20,6 +20,7 @@ function harness(overrides: Partial<SafeCloseDeps> = {}) {
     flushSession: vi.fn(async () => {}),
     setTransition: vi.fn((active) => transitions.push(active)),
     notifyPdfFailure: vi.fn(),
+    notifyStillSaving: vi.fn(),
     notifyConfirmationFailure: vi.fn(),
     runBounded: async (operation) => operation,
     ...overrides,
@@ -98,26 +99,71 @@ describe("GH #161 shared safe-close transaction", () => {
     expect(transitions).toEqual([true, false]);
   });
 
-  it("continues only after explicit discard when graph flush fails or times out", async () => {
-    for (const mode of ["failure", "timeout"] as const) {
-      const never = new Promise<boolean>(() => {});
-      const flushAll = mode === "failure" ? vi.fn(async () => false) : vi.fn(() => never);
-      const runBounded: SafeCloseDeps["runBounded"] = async (operation, timeoutMs, fallback) => {
-        if (mode === "timeout" && operation === never && timeoutMs === 4000) return fallback;
-        return operation;
-      };
-      const { deps, safeClose } = harness({
-        flushAll,
-        confirmDiscard: vi.fn(async () => true),
-        runBounded,
-      });
-      const exit = vi.fn(async () => {});
+  it("continues only after explicit discard when the graph flush fails", async () => {
+    const { deps, safeClose } = harness({
+      flushAll: vi.fn(async () => false),
+      confirmDiscard: vi.fn(async () => true),
+    });
+    const exit = vi.fn(async () => {});
 
-      await expect(requestAndroidRootClose(safeClose, exit, vi.fn())).resolves.toBe("exit_requested");
-      expect(deps.confirmDiscard).toHaveBeenCalledOnce();
-      expect(deps.flushSession).toHaveBeenCalledOnce();
-      expect(exit).toHaveBeenCalledOnce();
-    }
+    await expect(requestAndroidRootClose(safeClose, exit, vi.fn())).resolves.toBe("exit_requested");
+    expect(deps.confirmDiscard).toHaveBeenCalledExactlyOnceWith("failed");
+    expect(deps.flushSession).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledOnce();
+  });
+
+  // Direct Files data-safety audit, finding 11. This case previously shared the
+  // assertion above: a flush that had merely not finished within 4 s was
+  // reported to the user in the same words as one that could never succeed, and
+  // they were offered the same "close anyway and lose them". A slow or network
+  // filesystem, a fsync behind a busy disk, or simply many dirty pages can
+  // exceed that bound with nothing wrong — so the close now waits out a grace
+  // period first, and only then asks, in different words.
+  it("waits out a grace period before treating a slow flush as unsaved", async () => {
+    const landsLate = deferred<boolean>();
+    const waited: number[] = [];
+    const runBounded: SafeCloseDeps["runBounded"] = async (operation, timeoutMs, fallback) => {
+      if (operation !== landsLate.promise) return operation;
+      waited.push(timeoutMs);
+      // Only the soft bound expires; the grace period sees it through.
+      if (timeoutMs === 4000) return fallback;
+      return operation;
+    };
+    const { deps, safeClose } = harness({
+      flushAll: vi.fn(() => landsLate.promise),
+      confirmDiscard: vi.fn(async () => true),
+      runBounded,
+    });
+    const exit = vi.fn(async () => {});
+
+    const closing = requestAndroidRootClose(safeClose, exit, vi.fn());
+    await Promise.resolve();
+    landsLate.resolve(true);
+
+    await expect(closing).resolves.toBe("exit_requested");
+    expect(deps.notifyStillSaving).toHaveBeenCalledOnce();
+    expect(deps.confirmDiscard).not.toHaveBeenCalled();
+    expect(waited.filter((ms) => ms > 4000)).not.toEqual([]);
+    expect(deps.flushAll).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledOnce();
+  });
+
+  it("asks in different words when even the grace period runs out", async () => {
+    const never = new Promise<boolean>(() => {});
+    const runBounded: SafeCloseDeps["runBounded"] = async (operation, _timeoutMs, fallback) =>
+      (operation === never ? fallback : operation);
+    const reasons: DiscardReason[] = [];
+    const { deps, safeClose } = harness({
+      flushAll: vi.fn(() => never),
+      confirmDiscard: vi.fn(async (reason) => { reasons.push(reason); return true; }),
+      runBounded,
+    });
+    const exit = vi.fn(async () => {});
+
+    await expect(requestAndroidRootClose(safeClose, exit, vi.fn())).resolves.toBe("exit_requested");
+    expect(deps.notifyStillSaving).toHaveBeenCalledOnce();
+    expect(reasons).toEqual(["still-saving"]);
+    expect(exit).toHaveBeenCalledOnce();
   });
 
   it("treats confirmation failure as rejection and leaves edits open", async () => {
