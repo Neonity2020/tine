@@ -3206,6 +3206,31 @@
         ]
       },
       "notes": "Direct Files data-safety audit 2026-08-09, finding 17. Raising a conflict was gated on a per-page divergence proof; clearing one was gated on nothing, because only a user's click (or forgetPage) ever cleared a conflict. handleGraphChange's REMOVED branch calls markConflict with no proof at all, so an external editor writing by temp+rename, or a mid-delivery Syncthing pass, could park a page behind the banner permanently. doSave then refuses that page forever, and both banner buttons destroy something: 'Use disk version' the unsaved edit, 'Keep mine' a file it never needed to overwrite. Fixed by making the proof two-directional in ONE owner, applyDivergenceVerdict, used by both observation sites (legacy watcher and sparse-v2 epoch): a negative proof on a currently-conflicted page clears the conflict and reschedules the edit it was freezing. A third site cannot reintroduce the asymmetry. A file that returns with DIFFERENT content still conflicts."
+    },
+    {
+      "id": "REG-SHADOW-JOURNAL-TEXT-EXTENSIONS-20260809",
+      "title": "The direct shadow-journal rule asked two extensions while its managed twin asked three",
+      "family": "filesystem-safety",
+      "sources": {
+        "issues": [
+          21
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/graph.rs"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 15, landed as a CONSISTENCY fix with an explicit NEGATIVE result. Graph::is_shadow_journal (direct mode) hard-coded canonical candidates '{stem}.md' and '{stem}.org'; its managed twin managed_is_shadow_journal already asked configured_text_variant_paths, i.e. all of LOGSEQ_TEXT_EXTENSIONS = md/markdown/org. The audit predicted that in a '.markdown' graph a title-named leftover would therefore escape the #21 shadow rule and poison the (kind,name) cache. IT DOES NOT: probes at the observation boundary show load_named and journals_desc both still serve the canonical file for both extensions, because later layers mask the misclassification. The necessity gate is therefore NOT satisfied and no user-visible defect is claimed - the divergence between the two classifiers is real and was removed, and the three new tests pin the #21 rule per extension so that a change in whichever layer is currently masking it cannot silently take the guarantee with it."
     }
   ]
 }

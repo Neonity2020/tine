@@ -3439,3 +3439,92 @@ mod unlinked_references_see_code_blocks {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// Direct Files data-safety audit, finding 15. Two shadow-journal classifiers
+/// disagreed: the managed one asked every Logseq text extension, the direct one
+/// hard-coded `.md`/`.org`, though `.markdown` is first-class
+/// (`LOGSEQ_TEXT_EXTENSIONS`, and OG accepts it case-insensitively).
+///
+/// NOT a regression proof, and deliberately labelled as such: these three pass
+/// with and without the unification. The audit predicted that a `.markdown`
+/// canonical day would let a title-named leftover poison the (kind, name) cache,
+/// and it does not — `load_named` and `journals_desc` both still serve the
+/// canonical file, because later layers happen to mask the misclassification. So
+/// the divergence is real in the code and its predicted consequence is not
+/// reachable today. What these DO pin is the #21 rule itself, at the observation
+/// boundary, for every extension: whichever layer is currently masking it can
+/// move without silently taking the guarantee with it.
+mod shadow_journal_sees_every_text_extension {
+    use super::*;
+
+    fn graph_with_canonical(extension: &str) -> (std::path::PathBuf, Graph) {
+        let root = std::env::temp_dir().join(format!(
+            "tine-ds15-shadow-{}-{extension}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        // The canonical day, under a date-stem filename.
+        std::fs::write(
+            root.join(format!("journals/2026_06_26.{extension}")),
+            "- the canonical day\n",
+        )
+        .unwrap();
+        // …and a leftover whose NAME parses as that same day. Nothing on disk
+        // says which is authoritative, so the date-stem file wins by rule and
+        // this one must stay out of the (kind, name) cache.
+        std::fs::write(
+            root.join("pages/leftover.md"),
+            "title:: Jun 26th, 2026\n- the shadow's own text\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        (root, graph)
+    }
+
+    fn day_resolves_to_the_canonical_file(extension: &str) {
+        let (root, graph) = graph_with_canonical(extension);
+        // Reading the leftover by PATH is the ordinary way it gets seen: opening
+        // the stray file, or a watcher event on it. That read reconciles the
+        // parsed document into the (kind, name) cache unless the shadow rule
+        // stops it — which is where the two classifiers disagreed.
+        let leftover = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.rel_path == "pages/leftover.md")
+            .expect("the leftover is discovered");
+        let _ = graph.load_page(&leftover);
+
+        let loaded = graph
+            .load_named("Jun 26th, 2026", tine_core::PageKind::Journal)
+            .expect("load_named succeeds")
+            .expect("the day resolves to something");
+        let text = format!("{loaded:?}");
+        assert!(
+            text.contains("the canonical day"),
+            ".{extension}: the day resolved to the shadow instead of the canonical file"
+        );
+        assert!(
+            !text.contains("the shadow's own text"),
+            ".{extension}: the shadow leaked into the day's content"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_md_canonical_day_shadows_a_title_named_leftover() {
+        day_resolves_to_the_canonical_file("md");
+    }
+
+    #[test]
+    fn a_markdown_canonical_day_shadows_it_too() {
+        day_resolves_to_the_canonical_file("markdown");
+    }
+
+    #[test]
+    fn an_org_canonical_day_shadows_it_too() {
+        day_resolves_to_the_canonical_file("org");
+    }
+}

@@ -11789,9 +11789,19 @@ impl Graph {
         if is_date_stem {
             return false;
         }
-        let canon = self.journal_format.file_stem(date);
-        let dir = self.journals_path();
-        dir.join(format!("{canon}.md")).is_file() || dir.join(format!("{canon}.org")).is_file()
+        let canonical = self.journal_format.file_stem(date);
+        // Every Logseq text extension, not a hand-written md/org pair. `.markdown`
+        // is a first-class page extension (LOGSEQ_TEXT_EXTENSIONS, and OG accepts
+        // it case-insensitively), and the managed twin of this function already
+        // asked all three. The direct path asking only two meant a title-named
+        // leftover coexisting with a canonical `2026_06_26.markdown` was NOT
+        // recognised as a shadow, so it was reconciled into the (kind,name) cache
+        // and name resolution served the WRONG file for that day — exactly the #21
+        // defect this function exists to prevent, reachable only in a `.markdown`
+        // graph. (Direct Files data-safety audit, 2026-08-09, finding 15.)
+        configured_text_variant_paths(&self.journals_path(), &canonical)
+            .iter()
+            .any(|candidate| candidate.is_file())
     }
 
     /// The format (`Md`/`Org`) new pages and journals are created in, from
