@@ -41,7 +41,7 @@ export const WINDOWS_CORE_LIFECYCLE_WITNESS_NAMES = Object.freeze([
 
 export const WINDOWS_CORE_CAPTURE_WITNESS_NAMES = Object.freeze([
   "model::tests::inactive_bootstrap_capture_exact_64_mib_sparse_file_is_accepted",
-  "model::tests::inactive_bootstrap_capture_external_sort_has_fixed_rows_without_real_files",
+  "model::tests::inactive_bootstrap_capture_external_sort_is_buffer_bounded_without_real_files",
   "model::tests::inactive_bootstrap_capture_ignores_residue_is_idempotent_and_rejects_conflicting_seal",
   "model::tests::inactive_bootstrap_capture_is_deterministic_and_chunks_zero_one_and_many_files",
   "model::tests::inactive_bootstrap_capture_preserves_exact_nested_unicode_org_and_semantic_kinds",

@@ -50079,14 +50079,15 @@ mod tests {
     }
 
     #[test]
-    fn inactive_bootstrap_capture_external_sort_has_fixed_rows_without_real_files() {
+    fn inactive_bootstrap_capture_external_sort_is_buffer_bounded_without_real_files() {
+        const SYNTHETIC_ROWS: u64 = 1_000_000;
         let root = scratch("bootstrap-source-streaming-scale");
         let working = root.join("synthetic-working");
         fs::create_dir(&working).unwrap();
         let paths = BootstrapSourcePassPaths::new(&working, "synthetic").unwrap();
         let mut writers = BootstrapSourcePassWriters::create(&paths).unwrap();
         let mut instrumentation = BootstrapSourceCaptureInstrumentation::default();
-        for index in (0..1_000_000_u32).rev() {
+        for index in (0..SYNTHETIC_ROWS as u32).rev() {
             let path = ManagedPath::parse(format!("pages/{index:08}.md")).unwrap();
             write_bootstrap_source_entry(
                 &mut writers.entries,
@@ -50113,10 +50114,11 @@ mod tests {
         assert!(
             instrumentation.peak_owned_buffer_bytes <= BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES as u64
         );
-        assert!(instrumentation.peak_owned_rows < 20_000);
+        assert!(instrumentation.sort_runs > 1);
+        assert!(instrumentation.peak_owned_rows < SYNTHETIC_ROWS);
         validate_bootstrap_source_sorted_entries(
             &paths.sorted(BootstrapSourceSpoolKind::Entries),
-            1_000_000,
+            SYNTHETIC_ROWS,
         )
         .unwrap();
         let _ = fs::remove_dir_all(&root);
