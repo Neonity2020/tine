@@ -4506,39 +4506,47 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "measured 10k-page scan harness; run explicitly for a platform receipt"]
-    fn reconciliation_scan_measured_10k_page_harness() {
-        let temp = TempGraph::new(None);
-        for index in 0..10_000 {
-            temp.write(
-                &format!("pages/{index:05}.md"),
-                format!("- page {index:05}\n").as_bytes(),
+    #[ignore = "release-mode 1k/5k/10k full-scan scaling receipt"]
+    fn reconciliation_scan_measured_scaling_harness() {
+        let mut samples = Vec::new();
+        for count in [1_000_usize, 5_000, 10_000] {
+            let temp = TempGraph::new(None);
+            let mut expected = Vec::with_capacity(count);
+            for index in 0..count {
+                let path = format!("pages/nested/{index:05}.md");
+                let bytes = format!("- page {index:05}\n");
+                temp.write(&path, bytes.as_bytes());
+                expected.push(expected_row(&path, ManagedTextKind::Page, bytes.as_bytes()));
+            }
+            let source = FixtureExpectedSource::with_rows(expected);
+            let scan =
+                scan_graph_text(&temp.graph(), &source, GraphTextScanLimits::default()).unwrap();
+            println!(
+                "scan_{count} wall_ms={} peak_retained_rows={} peak_retained_bytes={} \
+                 peak_read_buffers={} peak_read_buffer_bytes={} bytes_read={} \
+                 bytes_hashed={} entries={} expected_rows={} candidates={}",
+                scan.wall_time.as_millis(),
+                scan.instrumentation.peak_retained_rows,
+                scan.instrumentation.peak_retained_bytes,
+                scan.instrumentation.peak_read_buffers,
+                scan.instrumentation.peak_read_buffer_bytes,
+                scan.instrumentation.bytes_read,
+                scan.instrumentation.bytes_hashed,
+                scan.instrumentation.directory_entries,
+                scan.instrumentation.expected_rows,
+                scan.instrumentation.candidates,
             );
+            assert_eq!(source.open_calls.get(), 1);
+            assert_eq!(scan.instrumentation.passes, 1);
+            assert_eq!(scan.instrumentation.eligible_files, count as u64);
+            assert_eq!(scan.instrumentation.expected_rows, count as u64);
+            assert!(scan.candidates.is_empty());
+            assert_eq!(scan.instrumentation.parser_invocations, 0);
+            samples.push(scan.wall_time);
         }
-        let scan = scan_graph_text(
-            &temp.graph(),
-            &FixtureExpectedSource::empty(),
-            GraphTextScanLimits::default(),
-        )
-        .unwrap();
-        println!(
-            "scan_10k wall_ms={} peak_retained_rows={} peak_retained_bytes={} \
-             peak_read_buffers={} peak_read_buffer_bytes={} bytes_read={} \
-             bytes_hashed={} entries={} candidates={}",
-            scan.wall_time.as_millis(),
-            scan.instrumentation.peak_retained_rows,
-            scan.instrumentation.peak_retained_bytes,
-            scan.instrumentation.peak_read_buffers,
-            scan.instrumentation.peak_read_buffer_bytes,
-            scan.instrumentation.bytes_read,
-            scan.instrumentation.bytes_hashed,
-            scan.instrumentation.directory_entries,
-            scan.instrumentation.candidates,
-        );
-        assert_eq!(scan.instrumentation.passes, 1);
-        assert_eq!(scan.instrumentation.eligible_files, 10_000);
-        assert_eq!(scan.candidates.len(), 10_000);
-        assert_eq!(scan.instrumentation.parser_invocations, 0);
+        assert!(samples[2] < Duration::from_secs(2));
+        assert!(samples[1] <= samples[0].saturating_mul(7) + Duration::from_millis(50));
+        assert!(samples[2] <= samples[1].saturating_mul(3) + Duration::from_millis(50));
     }
 
     fn scheduler_paths(paths: &[&str]) -> BTreeSet<ManagedPath> {

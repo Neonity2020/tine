@@ -31264,6 +31264,7 @@ fn atomic_update_with_hooks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[cfg(any(unix, windows))]
     fn handoff_binding(graph: &Graph, seed: u128) -> (WorkspaceId, ProjectionEndpointBinding) {
@@ -42395,6 +42396,123 @@ mod tests {
         let lease = graph.arm_graph_text_exact_feed(last_sequence).unwrap();
         graph.build_graph_text_exact_feed(&lease).unwrap();
         lease
+    }
+
+    #[test]
+    #[ignore = "release-mode 1k/5k/10k production census scaling receipt"]
+    fn graph_text_exact_feed_measured_scaling_harness() {
+        let mut samples = Vec::new();
+        for count in [1_000_usize, 5_000, 10_000] {
+            let root = scratch(&format!("exact-feed-scaling-{count}"));
+            fs::create_dir_all(root.join("content/nested pages/deep")).unwrap();
+            fs::create_dir_all(root.join("diary/archive")).unwrap();
+            fs::create_dir_all(root.join("other/资料/nested")).unwrap();
+            fs::create_dir_all(root.join("logseq")).unwrap();
+            fs::write(
+                root.join("logseq/config.edn"),
+                b"{:pages-directory \"content/nested pages\" :journals-directory \"diary/archive\"}\n",
+            )
+            .unwrap();
+            for index in 0..count {
+                let relative = match index % 3 {
+                    0 => format!("content/nested pages/deep/page-{index:05}.md"),
+                    1 => format!("diary/archive/2026_08_{:02}.org", index + 10),
+                    _ => format!("other/资料/nested/page-{index:05}.markdown"),
+                };
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let bytes = if index % 3 == 1 {
+                    format!("#+title: Journal {index}\n* item {index}\n")
+                } else {
+                    format!("- page {index}\n")
+                };
+                fs::write(path, bytes).unwrap();
+            }
+
+            let graph = Graph::open(&root);
+            reset_graph_text_admission_builder_counter_for_runtime_test();
+            let lease = graph.arm_graph_text_exact_feed(0).unwrap();
+            let build_started = Instant::now();
+            graph.build_graph_text_exact_feed(&lease).unwrap();
+            let build_elapsed = build_started.elapsed();
+            let census_enumerations = graph_text_admission_builder_enumerations_for_runtime_test();
+            let scan_started = Instant::now();
+            let pass = graph
+                .capture_reconciliation_scan_pass(
+                    crate::oplog::reconciliation_scan::GraphTextScanLimits::default(),
+                )
+                .unwrap();
+            let scan_elapsed = scan_started.elapsed();
+            assert_eq!(
+                graph_text_admission_builder_enumerations_for_runtime_test(),
+                census_enumerations,
+                "the reconciliation pass must reuse the queue-fenced census"
+            );
+            assert_eq!(pass.instrumentation.eligible_files, count as u64);
+            assert_eq!(
+                pass.instrumentation.bytes_read,
+                pass.instrumentation.bytes_hashed
+            );
+            println!(
+                "exact_feed_{count} build_ms={} scan_from_admission_ms={} entries={} files={} \
+                 bytes={} census_directories={census_enumerations}",
+                build_elapsed.as_millis(),
+                scan_elapsed.as_millis(),
+                pass.instrumentation.directory_entries,
+                pass.instrumentation.eligible_files,
+                pass.instrumentation.bytes_read,
+            );
+            samples.push((count, build_elapsed, scan_elapsed));
+            let _ = fs::remove_dir_all(root);
+        }
+
+        let (_, build_1k, scan_1k) = samples[0];
+        let (_, build_5k, scan_5k) = samples[1];
+        let (_, build_10k, scan_10k) = samples[2];
+        assert!(build_10k < Duration::from_secs(10));
+        assert!(scan_10k < Duration::from_secs(2));
+        assert!(build_5k <= build_1k.saturating_mul(7) + Duration::from_millis(100));
+        assert!(build_10k <= build_5k.saturating_mul(3) + Duration::from_millis(100));
+        assert!(scan_5k <= scan_1k.saturating_mul(7) + Duration::from_millis(50));
+        assert!(scan_10k <= scan_5k.saturating_mul(3) + Duration::from_millis(50));
+    }
+
+    #[test]
+    #[ignore = "set TINE_RECONCILIATION_GRAPH to a read-only real-world corpus"]
+    fn graph_text_exact_feed_real_graph_harness() {
+        let root = PathBuf::from(
+            std::env::var_os("TINE_RECONCILIATION_GRAPH")
+                .expect("TINE_RECONCILIATION_GRAPH must name the benchmark graph"),
+        );
+        let graph = Graph::open(&root);
+        reset_graph_text_admission_builder_counter_for_runtime_test();
+        let lease = graph.arm_graph_text_exact_feed(0).unwrap();
+        let build_started = Instant::now();
+        graph.build_graph_text_exact_feed(&lease).unwrap();
+        let build_elapsed = build_started.elapsed();
+        let census_enumerations = graph_text_admission_builder_enumerations_for_runtime_test();
+        let scan_started = Instant::now();
+        let pass = graph
+            .capture_reconciliation_scan_pass(
+                crate::oplog::reconciliation_scan::GraphTextScanLimits::default(),
+            )
+            .unwrap();
+        let scan_elapsed = scan_started.elapsed();
+        assert_eq!(
+            graph_text_admission_builder_enumerations_for_runtime_test(),
+            census_enumerations
+        );
+        println!(
+            "exact_feed_real_graph build_ms={} scan_from_admission_ms={} entries={} files={} \
+             bytes={} census_directories={census_enumerations}",
+            build_elapsed.as_millis(),
+            scan_elapsed.as_millis(),
+            pass.instrumentation.directory_entries,
+            pass.instrumentation.eligible_files,
+            pass.instrumentation.bytes_read,
+        );
+        assert!(build_elapsed < Duration::from_secs(5));
+        assert!(scan_elapsed < Duration::from_secs(2));
     }
 
     #[test]
