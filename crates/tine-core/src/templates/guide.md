@@ -3,14 +3,19 @@ icon:: 🧭
 - # Tine Guide
 	- Open this Guide beside your own graph when you want live examples without switching graphs.
 	- Each page is read-only here. Use **Copy the guide into your graph** on any Guide page when you want an editable, interlinked sandbox under `tine-guide/`.
-- ## Start here
+- ## Start
+  - [[Welcome to Tine]] — tour the basics hands-on: bullets, tasks, rich text, links, and live block references.
+  - [[Project/Roadmap]] — try a few example tasks for your first steps.
+- ## Workflows
   - [[Features/Sheets]] — create grids, tables, boards, queries, and formulas over ordinary bullets.
   - [[Features/Formulas]] — build read-only computed columns with the visual formula editor.
   - [[Features/Quick capture]] — set up a global capture box that files notes into your graph.
   - [[Features/PDF annotation]] — highlight PDFs and turn those highlights into linked note blocks.
+- ## Feature reference
   - [[Features/Plugins]] — install capability-limited extensions and token themes, review what they request, and keep them under your control.
   - [[Features/Managed sync]] — understand the separate **Testing only** opt-in that can add operation-backed sync while keeping your Markdown/Org graph in place.
   - [[Features/Tips & shortcuts]] — learn Ctrl+K, slash commands, tabs, sidebars, focus mode, and daily shortcuts.
+- ## Feature showcase
   - [[Feature showcase]] — inspect one live example of each supported Logseq rendering feature.
 - ## Create one yourself
   - 1. Open one of the Guide pages above and follow its numbered steps.
