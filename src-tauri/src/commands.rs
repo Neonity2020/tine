@@ -1125,7 +1125,12 @@ mod graph_wide_command_boundary_tests {
         let source = include_str!("commands.rs");
         // `delete_page` was omitted here until the 2026-08-09 perf audit (F3)
         // measured it at 757 ms on an 8,006-file graph, on the command thread.
-        for name in ["get_backlinks", "get_unlinked_refs", "rename_page", "delete_page"] {
+        for name in [
+            "get_backlinks",
+            "get_unlinked_refs",
+            "rename_page",
+            "delete_page",
+        ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("command stays async");
             let tail = &source[start..];
