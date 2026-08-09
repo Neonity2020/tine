@@ -107,27 +107,55 @@ export async function startWebdriverApplication(
       debuggerPort,
     ),
   };
-  const applicationProcess = spawn(application, [], {
-    env: applicationEnv,
-    stdio: "ignore",
-    windowsHide: false,
-  });
+  const applicationLogHandles = [];
+  const openApplicationLog = (variable) => {
+    const file = applicationEnv[variable];
+    if (!file) return "ignore";
+    const handle = fs.openSync(file, "w");
+    applicationLogHandles.push(handle);
+    return handle;
+  };
+  let applicationProcess;
+  try {
+    applicationProcess = spawn(application, [], {
+      env: applicationEnv,
+      stdio: [
+        "ignore",
+        openApplicationLog("TINE_E2E_APPLICATION_STDOUT_LOG"),
+        openApplicationLog("TINE_E2E_APPLICATION_STDERR_LOG"),
+      ],
+      windowsHide: false,
+    });
+  } catch (error) {
+    for (const handle of applicationLogHandles) fs.closeSync(handle);
+    throw error;
+  }
   try {
     await waitForDevTools(debuggerAddress, applicationProcess);
   } catch (error) {
     stopWebdriverApplication({ applicationProcess }, platform);
     throw error;
   }
-  return { env: applicationEnv, applicationProcess, debuggerAddress, userDataFolder };
+  return {
+    env: applicationEnv,
+    applicationProcess,
+    applicationLogHandles,
+    debuggerAddress,
+    userDataFolder,
+  };
 }
 
 export function stopWebdriverApplication(target, platform = process.platform) {
   const applicationProcess = target?.applicationProcess;
-  if (!applicationProcess || applicationProcess.exitCode !== null) return;
-  if (platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(applicationProcess.pid), "/T", "/F"], { stdio: "ignore" });
-  } else {
-    applicationProcess.kill("SIGKILL");
+  if (applicationProcess && applicationProcess.exitCode === null) {
+    if (platform === "win32") {
+      spawnSync("taskkill", ["/PID", String(applicationProcess.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      applicationProcess.kill("SIGKILL");
+    }
+  }
+  for (const handle of target?.applicationLogHandles || []) {
+    try { fs.closeSync(handle); } catch {}
   }
 }
 
