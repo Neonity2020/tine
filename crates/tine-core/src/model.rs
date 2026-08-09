@@ -42151,20 +42151,18 @@ mod tests {
             .unwrap();
         }
         let graph = Graph::open(&capture_root);
-        let permit = graph.admit_retained_managed_text_writer().unwrap();
-        let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
-        let capture_limit = capture.peak_build_charge.checked_add(16 * 1024).unwrap();
-        assert!(capture.peak_build_charge < capture_limit);
         reset_graph_text_admission_test_counters();
         assert_eq!(
             graph
-                .initial_shadow_raw_managed_text_inventory_with_limits(InitialShadowLimits {
-                    peak_build_bytes: capture_limit,
-                    ..INITIAL_SHADOW_LIMITS
-                })
+                .initial_shadow_raw_managed_text_inventory_with_limits(INITIAL_SHADOW_LIMITS)
                 .unwrap()
                 .len(),
             8
+        );
+        assert_eq!(
+            graph_text_admission_test_counters().builder_enumerations,
+            3,
+            "live admission must enumerate each graph root once"
         );
         assert!(matches!(
             &*graph.graph_text_admission.read().unwrap(),
