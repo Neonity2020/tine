@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
+- **Editing one block no longer rewrites blocks you never touched.** On a real-shaped 1,045-file graph, editing a block and undoing it failed to restore 96 of 983 files: an unbulleted `## Heading` gained a `- ` prefix, and in the worst case the file's indentation was pushed *into* the note text and the block gained a nesting level. Found by the 2026-08-09 Direct Files data-safety audit; the same measurement now reports zero damaged files.
+- **Typing no longer makes the next click slow.** Every save threw away Tine's index of which pages exist, and the only way to rebuild it was to re-read and re-parse the whole graph. So the first navigation or `[[` autocomplete after each typing pause stalled for about a quarter of a second on a 5,000-file graph, and longer on bigger ones. Found by the 2026-08-09 Direct Files performance audit.
 - Linked and Unlinked References no longer collapse themselves while you scroll or expand a group on a large graph; the section now keeps the state you put it in (GH #272).
 - Jumping to a block from the Quick Switcher (or any "go to block" action) now expands its collapsed parents, so the block is actually scrolled to and highlighted instead of the jump silently doing nothing (GH #258).
 - Pressing Enter inside a multi-line `$$ … $$` math environment now inserts a new line and keeps the block together, instead of splitting it and breaking the environment (GH #278).

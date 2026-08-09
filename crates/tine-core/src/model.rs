@@ -13937,6 +13937,30 @@ impl Graph {
         if alias_touched {
             *self.alias_cache.write().unwrap() = None;
         }
+        // Same treatment for the physical page inventory, and for the same
+        // reason as `block_ref_count_cache` above. `list_pages` is keyed on raw
+        // `cache_gen` equality, and its ONLY way to rebuild is to walk the graph
+        // text scope, re-read every file from disk and re-parse each one.
+        // Measured at ~35 µs/file, dead linear from 506 to 8,006 pages: 243 ms on
+        // a real 5,225-file graph, and `find_entry` rebuilds straight from it. So
+        // every ordinary save made the next navigation or `[[` autocomplete stall
+        // for a quarter of a second, repeating after every typing pause.
+        // (Direct Files perf audit, 2026-08-09, F1.)
+        //
+        // The inventory is a function of the file set plus each file's parsed
+        // identity, so it survives exactly the conditions the effective-identity
+        // index above already tests: an existing page whose content changed but
+        // whose identity, page-ness and failure set did not. Deliberately NOT
+        // re-tagged more broadly — a `title::` edit IS an identity change and
+        // does move an entry. `referenced_page_names` is likewise left to
+        // rebuild: it is genuinely derived from block content, so a content edit
+        // really can change it, and it recomputes from the warm in-memory cache
+        // rather than from disk.
+        if cache_built && !identity_changed && !is_new_page && !failures_changed {
+            if let Some((generation, _)) = self.page_list_cache.write().unwrap().as_mut() {
+                *generation = newgen;
+            }
+        }
         // Scoped query/backlink invalidation (#52): a content edit to one page
         // can't change a derived result the page doesn't participate in, so keep
         // those (advancing their generation) and recompute only the entries this
@@ -20356,7 +20380,15 @@ impl Graph {
                 bind_document_title_property(&mut doc, &page.name);
             }
         }
-        self.serialize_page_document(doc, path, existing, &[])
+        // Claim source-layout retention for every block the editor still holds
+        // by identity. Passing `&[]` here (as this did) left the retention
+        // machinery inert on the ordinary Direct save path, so editing ONE block
+        // rewrote untouched bytes elsewhere on the page — measured at 96 of 983
+        // files on a real-shaped graph. Identities are matched against the
+        // existing source by structural position, so a block the user actually
+        // moved simply fails to match and keeps today's behaviour.
+        let identities = doc::layout_identities_of(&doc);
+        self.serialize_page_document(doc, path, existing, &identities)
     }
 
     /// The one page serialization and corruption-firewall boundary used by

@@ -2969,3 +2969,208 @@ fn checked_graph_open_rejects_a_managed_sync_symlink() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
 }
+
+/// Editing one block must not rewrite bytes belonging to blocks the user never
+/// touched. Direct Files data-safety audit, 2026-08-09.
+///
+/// The retention machinery in `doc.rs` existed but every production call site
+/// passed an empty identity slice, so it was inert on the ordinary save path.
+/// Measured consequence on a real-shaped 1,045-file graph: editing one block and
+/// reverting it failed to restore the bytes of 96 of 983 files (9.8%).
+mod untouched_bytes_survive_an_edit {
+    use super::*;
+
+    /// A scratch graph root; `tine-core`'s test deps do not include `tempfile`.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "tine-untouched-bytes-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        root
+    }
+
+    fn edit_last_root(root: &std::path::Path, rel: &str, replacement: &str) -> String {
+        let graph = Graph::open(root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path(rel).unwrap().unwrap();
+        let last = page.blocks.len() - 1;
+        page.blocks[last].raw = replacement.into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        std::fs::read_to_string(root.join(rel)).unwrap()
+    }
+
+    /// The dominant shape: 88 of the 96 damaged files were a page-level
+    /// unbulleted `## Heading` that acquired a `- ` prefix.
+    #[test]
+    fn an_unbulleted_heading_keeps_its_missing_bullet() {
+        let root = scratch("unbulleted-heading");
+        let original = "- first bullet\n## Standalone heading\n- last bullet\n";
+        std::fs::write(root.join("pages/Note.md"), original).unwrap();
+
+        let after = edit_last_root(&root, "pages/Note.md", "last bullet edited");
+
+        assert_eq!(
+            after,
+            original.replace("- last bullet\n", "- last bullet edited\n"),
+            "editing the last block rewrote the untouched heading"
+        );
+    }
+
+    /// A heading living in a bullet's continuation body used to have the source
+    /// layout whitespace baked into its text (`\t  ## Section`) and gain a
+    /// nesting level. Both are gone; assert the text and the outline shape, not
+    /// the exact bytes — a whitespace-only separator line is still normalised to
+    /// an empty line, which is recorded as a follow-up.
+    #[test]
+    fn a_heading_inside_a_continuation_body_keeps_its_text_and_depth() {
+        let root = scratch("continuation-heading");
+        let original = "- intro\n\t- body line one\n\t  \n\t  ## Section\n\t  \n\t  more prose\n- tail\n";
+        std::fs::write(root.join("pages/Note.md"), original).unwrap();
+
+        let after = edit_last_root(&root, "pages/Note.md", "tail edited");
+
+        assert!(
+            !after.contains("- \t  ##"),
+            "source layout whitespace was injected into the block text: {after:?}"
+        );
+        assert!(
+            after.contains("\t  ## Section"),
+            "the heading lost its original indentation: {after:?}"
+        );
+        assert_eq!(
+            after.matches("## Section").count(),
+            1,
+            "the heading was duplicated: {after:?}"
+        );
+        assert!(
+            !after.contains("\t\t- "),
+            "the block gained a nesting level: {after:?}"
+        );
+    }
+
+    /// Necessity guard the other way: a save that changes nothing must still be
+    /// a byte-exact no-op. Retention must not start inventing layout.
+    #[test]
+    fn an_unchanged_save_is_still_byte_exact() {
+        let root = scratch("unchanged-save");
+        let original = "- first bullet\n## Standalone heading\n- last bullet\n";
+        std::fs::write(root.join("pages/Note.md"), original).unwrap();
+
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(root.join("pages/Note.md")).unwrap(), original);
+    }
+}
+
+/// A content-only save must not throw away the physical page inventory.
+/// Direct Files perf audit, 2026-08-09, F1.
+///
+/// `list_pages` is memoized on `cache_gen`, and its only rebuild path re-reads
+/// and re-parses every file in the graph (~35 µs/file, linear to 8,006 pages).
+/// Every save bumped the generation unconditionally, so the first navigation or
+/// `[[` autocomplete after any typing pause paid a whole-graph disk walk —
+/// 243 ms on a real 5,225-file graph.
+mod page_inventory_survives_a_content_save {
+    use super::*;
+    use std::time::Instant;
+
+    fn graph_with(pages: usize, tag: &str) -> (PathBuf, Graph) {
+        let root = std::env::temp_dir().join(format!(
+            "tine-inventory-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        for i in 0..pages {
+            std::fs::write(
+                root.join(format!("pages/Page {i}.md")),
+                format!("- body of page {i}\n- second block\n"),
+            )
+            .unwrap();
+        }
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        (root, graph)
+    }
+
+    fn save_first_block(graph: &Graph, rel: &str, raw: &str) {
+        let mut page = graph.load_by_path(rel).unwrap().unwrap();
+        page.blocks[0].raw = raw.into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+    }
+
+    /// The perf property, as a RATIO rather than an absolute bound: a shared box
+    /// makes absolute timings flaky, but a rebuild is ~350x a memo hit, so the
+    /// gap survives any load. The `title::` save is the control — it genuinely
+    /// changes the inventory and MUST still pay for a rebuild.
+    #[test]
+    fn a_content_only_save_keeps_the_inventory_warm() {
+        let (root, graph) = graph_with(400, "warm");
+        graph.list_pages();
+
+        save_first_block(&graph, "pages/Page 1.md", "edited body");
+        let start = Instant::now();
+        let after_content = graph.list_pages();
+        let content_only = start.elapsed();
+
+        save_first_block(&graph, "pages/Page 2.md", "title:: Renamed Page Two");
+        let start = Instant::now();
+        let after_title = graph.list_pages();
+        let identity_change = start.elapsed();
+
+        assert_eq!(after_content.len(), after_title.len());
+        assert!(
+            content_only * 5 < identity_change,
+            "a content-only save still paid for a whole-graph rebuild \
+             (content-only {content_only:?} vs identity-change {identity_change:?})"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Necessity guard: keeping the memo must not make it stale. A `title::`
+    /// edit moves the page's identity and the inventory has to follow.
+    #[test]
+    fn a_title_property_edit_still_updates_the_inventory() {
+        let (root, graph) = graph_with(20, "title");
+        assert!(graph.list_pages().iter().any(|p| p.name == "Page 3"));
+
+        save_first_block(&graph, "pages/Page 3.md", "title:: Totally Different");
+
+        let names: Vec<_> = graph.list_pages().into_iter().map(|p| p.name).collect();
+        assert!(
+            names.iter().any(|n| n == "Totally Different"),
+            "the renamed page never appeared in the inventory: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Necessity guard: a NEW file must appear even though the save that
+    /// preceded it was content-only.
+    #[test]
+    fn a_new_page_still_appears_in_the_inventory() {
+        let (root, graph) = graph_with(20, "new");
+        graph.list_pages();
+        save_first_block(&graph, "pages/Page 4.md", "edited body");
+        std::fs::write(root.join("pages/Brand New.md"), "- hello\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        assert!(graph.list_pages().iter().any(|p| p.name == "Brand New"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -73,6 +73,43 @@ pub(crate) struct StructuralLayoutIdentity {
     pub(crate) block_identity: String,
 }
 
+/// Read the structural locator -> block identity map straight off a document
+/// tree, so an ordinary editor save can claim the same source-layout retention
+/// the guarded projection path claims.
+///
+/// Without this the retention machinery below is inert on the Direct save path:
+/// every call site passed an empty identity slice, so
+/// `identity_bound_unbulleted_headings` was always empty and an unbulleted
+/// `## Heading` was re-emitted as `- ## Heading` the first time the user edited
+/// any *other* block on the page. On a real 1,045-file graph that rewrote
+/// untouched bytes in 96 files (9.8%) — see the 2026-08-09 Direct Files
+/// data-safety audit.
+///
+/// Blocks without a stable identity are skipped: an empty identity can never
+/// match a serialized block, and admitting one would let two unrelated blocks
+/// collide on the empty string.
+pub(crate) fn layout_identities_of(doc: &Document) -> Vec<StructuralLayoutIdentity> {
+    fn visit(blocks: &[DocBlock], locator: &mut Vec<u32>, out: &mut Vec<StructuralLayoutIdentity>) {
+        for (position, block) in blocks.iter().enumerate() {
+            let Ok(index) = u32::try_from(position) else {
+                return;
+            };
+            locator.push(index);
+            if !block.uuid.is_empty() {
+                out.push(StructuralLayoutIdentity {
+                    locator: locator.clone(),
+                    block_identity: block.uuid.clone(),
+                });
+            }
+            visit(&block.children, locator, out);
+            locator.pop();
+        }
+    }
+    let mut out = Vec::new();
+    visit(&doc.roots, &mut Vec::new(), &mut out);
+    out
+}
+
 #[derive(Clone, Debug)]
 struct IdentityBoundBlankLines {
     block_identity: String,
