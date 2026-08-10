@@ -3497,6 +3497,31 @@
         ]
       },
       "notes": "GH #254 increment 3, contract rule 2. ensurePageLoaded replaced the loaded instance whenever the requested path differed from the incumbent's, with no check that the incumbent held unsaved work. Reproduced: the incumbent's nodes are purged, the dirty mark SURVIVES and now belongs to the replacement's content, and a live conflict banner survives describing a file the editor no longer holds. The gate is the existing reloadDisposition predicate AND an empty editor-lease set - enumerating dirty/conflicted/saving kept losing, because IME composition holds text in the textarea until compositionend and the page-title rename holds its draft in component-local signals, so neither is visible to any store predicate. A component holding uncommitted input now declares itself with a lease keyed by a unique per-component handle, released idempotently from the component lifecycle rather than only from commit/cancel - a lease that outlives its component would refuse every later replacement forever. The gate is re-evaluated synchronously at the final replacement boundary because every caller awaits a backend read first and the incumbent can become dirty during that await. Necessity: both behavioural tests fail against the pre-fix code; the lease-hygiene and clean-replacement cases pass both ways by design and are not regression guards for the refusal itself."
+    },
+    {
+      "id": "REG-SYNC-ENROLLMENT-CHECKPOINT-INTEGRITY-MIGRATION-001",
+      "title": "Enrollment opens byte-exact v1/v5 histories, then lazily appends and audits canonical keyless v6/v3 integrity checkpoints",
+      "family": "sync-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/enrollment.rs::current_enrollment_claim_record_and_checkpoint_are_keyless_canonical_crc_v2_v6_v3",
+          "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_reopens_byte_exactly_then_lazily_appends_v6_without_rewriting_authority",
+          "crates/tine-core/src/oplog/enrollment.rs::legacy_v1_v5_mixed_suffix_opens_at_every_boundary_and_full_audit_pages_verify_both_codecs",
+          "crates/tine-core/src/oplog/enrollment.rs::enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_simulator_formats"
+        ],
+        "scenario": "sync.enrollment-keyless-integrity-with-frozen-legacy-suffix",
+        "failBefore": "source-proven"
+      },
+      "notes": "Fresh schema-v2 authority claims omit secret material and schema-v6 records use schema-v3 CRC-32/ISO-HDLC checkpoints. The permanent mixed-history fixture constructs exact v1 authority/v5 HMAC bytes using a test-only legacy signer, proves their bytes and OS identity survive reopen, opens every mixed-chain suffix boundary, appends current v6 records without rewriting the claim, and pages a complete audit across both codecs. Structural mismatch, noncanonical encodings, illegal record/checkpoint pairs, and altered CRCs refuse before lifecycle admission. A source guard permits production HMAC only in the frozen verifier module and permits signing only under cfg(test)."
     }
   ]
 }
