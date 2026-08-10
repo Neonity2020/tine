@@ -567,6 +567,9 @@ export type EditorInstallOptions = {
   bypassReplacementGate?: boolean;
   /** Surface/component ownership spanning the activation await. */
   isRequestLive?: () => boolean;
+  /** Awaited only after disk read and replacement activation have succeeded.
+   * Returning false compare-retires the minted activation without installing. */
+  beforeInstall?: () => Promise<boolean>;
 };
 
 /** Load a page into the editable working set through the activation boundary.
@@ -611,12 +614,25 @@ export async function ensurePageLoaded(
         // a best-effort retirement from an older destroyed editor may have failed,
         // and inheriting that stale core record would cross editor episodes.
         const intent: ActivationIntent = "replace";
-        handle = await backend().activateEditor(dto.path, intent);
+        handle = await backend().activateEditor(dto.path, intent, dto.rev ?? null);
       } else {
         handle = await backend().activateAbsentEditor(dto.name, dto.kind);
       }
     } catch {
       return { reason: "activation-failed", page: dto.name };
+    }
+  }
+
+  if (options.beforeInstall) {
+    let proceed = false;
+    try {
+      proceed = await options.beforeInstall();
+    } catch {
+      proceed = false;
+    }
+    if (!proceed) {
+      await retireMintedActivation(handle);
+      return { reason: "stale-instance", page: pageByName(dto.name)?.name ?? dto.name };
     }
   }
 
@@ -845,8 +861,11 @@ function pinnedPages(): Set<string> {
 /** Replace a page in the working set from a fresh DTO (e.g. resolving a conflict
  *  with the disk version, or a watcher reload). Updates the main view and any
  *  satellite that shows it, since they share `byId`. */
-export async function reloadPage(dto: PageDto): Promise<InstanceRefusal | null> {
-  return ensurePageLoaded(dto, { bypassReplacementGate: true });
+export async function reloadPage(
+  dto: PageDto,
+  options: Pick<EditorInstallOptions, "isRequestLive" | "beforeInstall"> = {},
+): Promise<InstanceRefusal | null> {
+  return ensurePageLoaded(dto, { ...options, bypassReplacementGate: true });
 }
 
 /** Apply a watcher-driven disk reload only if it is STILL safe at this instant.

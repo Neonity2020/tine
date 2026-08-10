@@ -3606,6 +3606,7 @@ pub(crate) async fn get_page_by_path(
 pub(crate) async fn activate_editor(
     path: String,
     intent: tine_core::ActivationIntent,
+    expected_revision: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::EditorActivationHandle>, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -3616,7 +3617,7 @@ pub(crate) async fn activate_editor(
             Some(_) => Ok(None),
             None => slot
                 .legacy_graph()?
-                .activate_editor(&path, intent)
+                .activate_editor(&path, intent, expected_revision.as_deref())
                 .map(Some)
                 .map_err(|error| error.to_string()),
         }

@@ -90,6 +90,10 @@ export interface PageDto {
 /** What an activation request means for a path that already has a live editor. */
 export type ActivationIntent = "reuse" | "replace";
 
+/** The exact revision of a DTO being installed, or null only for the mounted
+ * save fallback whose ordinary base-revision guard remains the write authority. */
+export type ActivationExpectedRevision = string | null;
+
 /** The outcome of activating an editor. */
 export interface EditorActivationHandle {
   activation: number;

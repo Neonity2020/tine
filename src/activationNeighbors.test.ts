@@ -65,7 +65,11 @@ describe("GH #254 increment 3 activation neighbours", () => {
     const installing = ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"));
 
     await tick();
-    expect(activate).toHaveBeenCalledWith("pages/other/Note.md", "replace");
+    expect(activate).toHaveBeenCalledWith(
+      "pages/other/Note.md",
+      "replace",
+      "rev-replacement",
+    );
     expect(pageByName("Note")?.path).toBe("pages/Note.md");
 
     markDirty("Note");
@@ -159,6 +163,7 @@ describe("GH #254 increment 3 activation neighbours", () => {
     await vi.waitFor(() => expect(activate).toHaveBeenCalledWith(
       "pages/Save race.md",
       "replace",
+      null,
     ));
 
     const replacement = reloadPage(page(
@@ -170,6 +175,7 @@ describe("GH #254 increment 3 activation neighbours", () => {
     await vi.waitFor(() => expect(activate).toHaveBeenCalledWith(
       "pages/Save race.md",
       "replace",
+      "rev-replacement",
     ));
     expect(await replacement).toBeNull();
 
@@ -233,7 +239,7 @@ describe("GH #254 increment 3 activation neighbours", () => {
     const loading = loadFeed([page("Feed", "journals/Feed.md", "feed")]);
 
     await tick();
-    expect(activate).toHaveBeenCalledWith("journals/Feed.md", "replace");
+    expect(activate).toHaveBeenCalledWith("journals/Feed.md", "replace", "rev-feed");
     expect(doc.feed).not.toContain("Feed");
     activation.resolve({ activation: 60, target: "journals/Feed.md", prospective: false });
     await loading;
@@ -298,7 +304,7 @@ describe("GH #254 increment 3 activation neighbours", () => {
     await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(1));
     await vi.waitFor(() => expect(pageByName("hls__doc")?.roots
       .map((id) => doc.byId[id]?.raw)).toEqual(["new"]));
-    expect(replace).toHaveBeenCalledWith("pages/hls__doc.md", "replace");
+    expect(replace).toHaveBeenCalledWith("pages/hls__doc.md", "replace", "rev-new");
     expect(editorActivationFor("hls__doc")).toBe(81);
   });
 });

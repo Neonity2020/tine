@@ -13,7 +13,7 @@ use tine_core::{ActivationIntent, Graph, PageDto};
 /// prospective target and writes nothing.
 fn as_editor(graph: &Graph, dto: &mut PageDto) {
     let handle = graph
-        .activate_editor(&dto.path, ActivationIntent::Replace)
+        .activate_editor(&dto.path, ActivationIntent::Replace, dto.rev.as_deref())
         .expect("the target is inside the graph");
     dto.activation = Some(handle.activation.as_u64());
 }
@@ -300,6 +300,10 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
         graph
             .save_page(&identity_bound, identity_bound.rev.as_deref())
             .unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&identity_bound)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
 
         // A syncer republishes the SAME bytes by temp+rename: new inode, state
         // the user was shown unchanged. "Keep mine" must go through. Refusing
@@ -308,7 +312,9 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
         let replacement = root.join("external/deep/.replacement.markdown");
         std::fs::write(&replacement, "- shown conflict\n").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        graph.force_save_page(&identity_bound).unwrap();
+        graph
+            .force_save_page_at_revision(&identity_bound, identity_bound.rev.as_deref(), shown)
+            .unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("keep mine over a republished inode"));
@@ -325,12 +331,19 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
         as_editor(&graph, &mut second);
         std::fs::write(&path, "- second shown conflict\n").unwrap();
         graph.save_page(&second, second.rev.as_deref()).unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&second)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
         let foreign = root.join("external/deep/.foreign.markdown");
         std::fs::write(&foreign, "- different winner\n").unwrap();
         std::fs::rename(&foreign, &path).unwrap();
         let before = std::fs::read(&path).unwrap();
         assert_eq!(
-            graph.force_save_page(&second).unwrap_err().kind(),
+            graph
+                .force_save_page_at_revision(&second, second.rev.as_deref(), shown)
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -1282,7 +1295,12 @@ fn save_refuses_to_clobber_external_change() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "- EXTERNAL EDIT");
 
     // "Keep mine" force-saves over it.
-    g.force_save_page(&dto).unwrap();
+    let shown = g
+        .outstanding_conflict_override(&dto)
+        .unwrap()
+        .expect("the refused save names the conflict shown to this editor");
+    g.force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+        .unwrap();
     assert!(std::fs::read_to_string(&path).unwrap().contains("one"));
 
     std::fs::remove_dir_all(&root).ok();
@@ -3416,7 +3434,13 @@ mod external_atomic_replacement {
             !root.join("pages/Note.md").exists(),
             "a deleted page must not be silently resurrected"
         );
-        graph.force_save_page(&page).unwrap();
+        let shown = graph
+            .outstanding_conflict_override(&page)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
+        graph
+            .force_save_page_at_revision(&page, base.as_deref(), shown)
+            .unwrap();
         assert!(std::fs::read_to_string(root.join("pages/Note.md"))
             .unwrap()
             .contains("mine"));

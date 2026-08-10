@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -1584,7 +1584,7 @@ export function mockBackend(): Backend {
     // Activation is a real identity in the app; the mock backend hands out
     // monotonic ones so store code that stamps and retires them behaves the same
     // way here. (GH #254 increment 3.)
-    async activateEditor(path: string, intent: "reuse" | "replace") {
+    async activateEditor(path: string, intent: "reuse" | "replace", _expectedRevision: ActivationExpectedRevision) {
       const live = mockActivations.get(path);
       if (intent === "reuse" && live !== undefined) {
         return { activation: live, target: path, prospective: false };

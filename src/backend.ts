@@ -4,6 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type {
+  ActivationExpectedRevision,
   ActivationIntent,
   AdvancedQueryResult,
   BacklinkFilterContext,
@@ -391,7 +392,11 @@ export interface Backend {
    *  mixed-purpose reads above: an activation exists exactly when a live editor
    *  does, so a read for export/preview/hydration cannot inherit an editor's
    *  override authority. (GH #254 increment 3.) */
-  activateEditor(path: string, intent: ActivationIntent): Promise<EditorActivationHandle | null>;
+  activateEditor(
+    path: string,
+    intent: ActivationIntent,
+    expectedRevision: ActivationExpectedRevision,
+  ): Promise<EditorActivationHandle | null>;
   /** Activate an editor for a page with no file yet, returning the prospective
    *  target it is live for. Reserves nothing on disk. */
   activateAbsentEditor(name: string, kind: PageKind): Promise<EditorActivationHandle | null>;
@@ -1081,8 +1086,16 @@ class TauriBackend implements Backend {
   getPageByPath(path: string) {
     return this.call<PageDto | null>("get_page_by_path", { path });
   }
-  activateEditor(path: string, intent: ActivationIntent) {
-    return this.call<EditorActivationHandle | null>("activate_editor", { path, intent });
+  activateEditor(
+    path: string,
+    intent: ActivationIntent,
+    expectedRevision: ActivationExpectedRevision,
+  ) {
+    return this.call<EditorActivationHandle | null>("activate_editor", {
+      path,
+      intent,
+      expectedRevision,
+    });
   }
   activateAbsentEditor(name: string, kind: PageKind) {
     return this.call<EditorActivationHandle | null>("activate_absent_editor", { name, kind });

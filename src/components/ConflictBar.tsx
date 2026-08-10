@@ -36,6 +36,7 @@ export function ConflictBar(): JSX.Element {
     // gone. (GH #254 increment 3.)
     const shown = shownObservationFor(name);
     const activation = editorActivationFor(name);
+    const baseline = saveBaselineFor(name);
     // Captured AT THE CLICK, so later input can be told apart from what the user
     // was actually looking at when they chose to discard it. This must be the
     // CONTENT-edit counter: `pageInstanceGeneration` advances only on page
@@ -50,6 +51,13 @@ export function ConflictBar(): JSX.Element {
     // the user's unsaved work with stale content and clears the banner.
     // (GH #254 increment 3, round 15.)
     const binding = graphBinding();
+    const clickIsLive = () => (
+      editGeneration(name) === generation
+      && pageInstanceGeneration(name) === instance
+      && shownObservationFor(name) === shown
+      && editorActivationFor(name) === activation
+      && graphBinding() === binding
+    );
     // Resolve the file this editor is actually pinned to. Two files can carry
     // one page name (the duplicate-day stray of #21, or same-titled pages in
     // different folders), and resolving by name reaches the backend's CANONICAL
@@ -57,79 +65,90 @@ export function ConflictBar(): JSX.Element {
     // user's edits to this one. Falling back to the name when the pinned file is
     // gone would do the same, so an absent pinned file drops the page instead.
     // A page with no pin (never saved) has only its name to resolve by.
-    if (page?.path && shown !== null && activation !== undefined) {
-      const outcome = await backend().presentConflictOverride(
-        page.path,
-        // The episode is { loaded_revision, activation }, so this must name the
-        // same baseline the refused save did or the equality refuses the very
-        // editor whose banner this is.
-        saveBaselineFor(name),
-        activation,
-        shown,
-      );
-      if (outcome === "superseded") {
-        // A newer observation is live, so re-observing surfaces it for the user
-        // to answer instead of installing bytes from underneath that winner.
-        dropObservation(name);
-        void reobserve(name);
-        return;
-      }
-      if (outcome === "withdrawn") {
-        // The shown authority disappeared with no successor. The discard can
-        // still complete when the pinned file has returned to this editor's
-        // loaded baseline: forget the dead observation, then use the same
-        // read/final-identity-check/install path as an authorised discard. In
-        // particular, do not re-observe here — that is a real guarded save and
-        // would write the retained draft over the baseline the user chose.
-        dropObservation(name);
-      }
-    }
     let dto;
     try {
       dto = page?.path
         ? await backend().getPageByPath(page.path)
         : await backend().getPage(name, page?.kind ?? "page");
     } catch {
-      // The observation was already consumed by the presentation above, so an
-      // unhandled read failure here would leave a dead banner with nothing
-      // scheduled — the silent no-op the contract forbids.
-      dropObservation(name);
-      void reobserve(name);
+      // Reads happen before native compare/consume. A failure therefore leaves
+      // the shown banner and retained draft untouched and cannot reverse the
+      // button into a save of "mine" when disk is back at baseline.
       return;
     }
-    // Re-check at the FINAL boundary, not only before the awaited read. The click
-    // authorised discarding what was on screen when it was clicked; typing during
-    // the await is not that. Typing cancels the whole discard — including the
-    // pre-click draft — and the page reverts to ordinary dirty-editor semantics,
-    // carried by the re-observing save rather than the ordinary one, which returns
-    // before the backend while the page is still conflicted.
-    if (
-      editGeneration(name) !== generation
-      || pageInstanceGeneration(name) !== instance
-      || graphBinding() !== binding
-    ) {
-      dropObservation(name);
-      void reobserve(name);
-      return;
-    }
+
+    const presentationPath = page?.path || dto?.path;
+    if (!page || shown === null || activation === undefined || !presentationPath) return;
+
     if (dto) {
-      const refusal = await reloadPage(dto);
+      let presented: "authorised" | "superseded" | "withdrawn" | null = null;
+      const refusal = await reloadPage(dto, {
+        // `ensurePageLoaded` invokes this again synchronously after BOTH awaited
+        // activation and presentation, in the same turn as installation. It is
+        // the actual D2 boundary: exact activation, edit generation, shown
+        // observation, graph binding, plus ensurePageLoaded's page-instance check.
+        isRequestLive: clickIsLive,
+        beforeInstall: async () => {
+          presented = await backend().presentConflictOverride(
+            presentationPath,
+            baseline,
+            activation,
+            shown,
+          );
+          if (presented === "superseded") return false;
+          if (presented === "withdrawn") {
+            // Equality is proved by the same DTO whose bytes would be installed.
+            // A divergent read must instead mint a fresh live observation.
+            return (dto.rev ?? null) === baseline;
+          }
+          return true;
+        },
+      });
       if (refusal) {
-        // Presentation already consumed the shown authority. A failed/stale
-        // replacement must not clear the banner or leave it dead.
-        dropObservation(name);
-        void reobserve(name);
+        // If presentation ran, its observation is spent/dead/superseded. Drop it
+        // before re-observing. If identity moved before presentation, retain it:
+        // the re-observing save itself safely supersedes or revives it.
+        if (presented !== null) dropObservation(name);
+        // Activation failure occurs before presentation and leaves a live banner;
+        // no save is needed or authorised. Identity aborts do require the guarded
+        // re-observing intent so post-click typing remains durable.
+        if (presented !== null || !clickIsLive()) void reobserve(name);
         return;
       }
+      // Both authorised and withdrawn-equal presentation consume/dead-end the
+      // local observation. The install completed the discard without a write.
+      dropObservation(name);
       clearConflict(name);
       // The real "Use disk version" transition: `reloadPage` then `clearConflict`
       // makes the page replaceable and produces no save at all, so nothing else
       // announces it. (GH #254 increment 3.)
       notifyPageBecameReplaceable(name);
     } else {
+      // There is no replacement activation for an absent file, so do the native
+      // presentation after the fallible read and synchronously re-check identity
+      // before accepting deletion. Withdrawn absence diverges from a present
+      // baseline and must re-observe rather than silently complete.
+      let presented: "authorised" | "superseded" | "withdrawn";
+      try {
+        presented = await backend().presentConflictOverride(
+          presentationPath,
+          baseline,
+          activation,
+          shown,
+        );
+      } catch {
+        void reobserve(name);
+        return;
+      }
+      if (presented !== "authorised" || !clickIsLive()) {
+        dropObservation(name);
+        void reobserve(name);
+        return;
+      }
       // The file is gone on disk (deleted/renamed externally). "Use disk version"
       // = accept that: drop the page and its unsaved edits from the store, rather
       // than clearing the conflict and leaving untracked content to be lost silently.
+      dropObservation(name);
       forgetPage(name);
     }
   };

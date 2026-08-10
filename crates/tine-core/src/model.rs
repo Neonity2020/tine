@@ -20605,6 +20605,7 @@ impl Graph {
         &self,
         rel: &str,
         intent: ActivationIntent,
+        expected_revision: Option<&str>,
     ) -> io::Result<EditorActivationHandle> {
         let abs = self.resolve_rel(rel).ok_or_else(|| {
             io::Error::new(
@@ -20612,7 +20613,34 @@ impl Graph {
                 "editor activation target is outside the graph",
             )
         })?;
-        let prospective = self.entry_for_path(&abs).is_none();
+        // A present-page installer passes the exact revision of the DTO it just
+        // read. Compare it at the native activation boundary so bytes changed
+        // between read and activation cannot give a stale DTO a live editor
+        // identity. `None` is the deliberately snapshot-less save fallback: it
+        // identifies the mounted editor only; the ordinary save's base-revision
+        // guard still decides whether bytes may land and mints any conflict under
+        // this activation. Absent editors use `activate_absent_editor` instead.
+        if let Some(expected_revision) = expected_revision {
+            let permit = self.admit_retained_managed_text_writer()?;
+            match self.managed_read_optional_text(&permit, &abs)? {
+                Some(content) if content_rev(&content) == expected_revision => {}
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "activation.snapshot_changed: the file changed after the page snapshot was read",
+                    ));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "activation.snapshot_missing: the expected page no longer exists",
+                    ));
+                }
+            }
+        }
+        // A successfully matched expected revision proves presence even if a
+        // concurrently cold/stale inventory has not indexed the file yet.
+        let prospective = expected_revision.is_none() && self.entry_for_path(&abs).is_none();
         let mut state = self.editor_activations.lock().unwrap();
         if intent == ActivationIntent::Reuse {
             if let Some(record) = state.live.get(&abs).and_then(|records| records.last()) {
@@ -21813,23 +21841,18 @@ impl Graph {
         }))
     }
 
-    /// Force with whatever authority is outstanding right now.
-    ///
-    /// Deliberately NOT the production path: "whatever is current" is exactly
-    /// the assumption finding 1 exploited. Tests use it to mean "the conflict I
-    /// just caused"; the app must name its observation explicitly through
-    /// `force_save_page_at_revision`.
+    /// Compatibility symbol for callers that have not migrated to explicit
+    /// conflict authority. It deliberately fails closed: choosing whatever
+    /// observation happens to be current could spend authority for a winner the
+    /// caller was never shown.
     pub fn force_save_page(&self, page: &PageDto) -> io::Result<String> {
-        let outstanding = self.outstanding_conflict_override(page)?;
-        self.force_save_page_at_revision(
-            page,
-            page.rev.as_deref(),
-            outstanding.unwrap_or(ConflictOverride {
-                // No token: let the consume step produce its own "missing or
-                // already consumed" refusal rather than a mismatch message.
-                observation_epoch: u64::MAX,
-            }),
-        )
+        if page.guide {
+            return Ok("guide-ephemeral".into());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "conflict_authority.explicit_required: force_save_page requires an explicitly captured observation; use force_save_page_at_revision",
+        ))
     }
 
     /// Save with the exact conflict snapshot shown to this editor episode as the
@@ -36357,14 +36380,17 @@ mod tests {
         fs::write(&replacement, &foreign_bytes).unwrap();
         let foreign_identity =
             canonical_projection_file_resource_id(&fs::File::open(&replacement).unwrap()).unwrap();
-        if force {
+        let shown = if force {
             fs::write(&path, "- shown force conflict\n").unwrap();
             let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
             assert_eq!(
                 direct_save_failure_code(&conflict),
                 "conflict.save_baseline_present"
             );
-        }
+            Some(gh254_shown(&conflict))
+        } else {
+            None
+        };
         MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             let replacement = replacement.clone();
@@ -36381,7 +36407,11 @@ mod tests {
         });
 
         let error = if force {
-            graph.force_save_page(&page)
+            graph.force_save_page_at_revision(
+                &page,
+                page.rev.as_deref(),
+                shown.expect("the forced arm captured its shown observation"),
+            )
         } else {
             graph.save_page(&page, page.rev.as_deref())
         }
@@ -50126,10 +50156,12 @@ mod tests {
                 format!("- external baseline\n  id:: {id}\n"),
             )
             .unwrap();
-            probe_graph
+            let conflict = probe_graph
                 .save_page(&probe_page, Some(&probe_rev))
                 .unwrap_err();
-            probe_graph.force_save_page(&probe_page).unwrap();
+            probe_graph
+                .force_save_page_at_revision(&probe_page, Some(&probe_rev), gh254_shown(&conflict))
+                .unwrap();
         } else {
             probe_graph
                 .save_page(&probe_page, Some(&probe_rev))
@@ -50165,7 +50197,13 @@ mod tests {
 
         set_managed_content_budget_limit(peak - 1);
         let error = if forced {
-            graph.force_save_page(&page).unwrap_err()
+            let shown = graph
+                .outstanding_conflict_override(&page)
+                .unwrap()
+                .expect("the refused save captured explicit force authority");
+            graph
+                .force_save_page_at_revision(&page, Some(&rev), shown)
+                .unwrap_err()
         } else {
             graph.save_page(&page, Some(&rev)).unwrap_err()
         };
@@ -50183,8 +50221,10 @@ mod tests {
 
         set_managed_content_budget_limit(peak);
         if forced {
-            graph.save_page(&page, Some(&rev)).unwrap_err();
-            graph.force_save_page(&page).unwrap();
+            let conflict = graph.save_page(&page, Some(&rev)).unwrap_err();
+            graph
+                .force_save_page_at_revision(&page, Some(&rev), gh254_shown(&conflict))
+                .unwrap();
         } else {
             graph.save_page(&page, Some(&rev)).unwrap();
         }
@@ -52420,7 +52460,11 @@ mod tests {
         // export/preview/hydration cannot inherit an editor's override authority.
         // The frontend does exactly this — activate, then stamp the DTO it saves.
         let handle = graph
-            .activate_editor("pages/Note.md", ActivationIntent::Replace)
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
             .unwrap();
         page.activation = Some(handle.activation.as_u64());
         page.blocks[0].raw = "mine".into();
@@ -52436,7 +52480,7 @@ mod tests {
     /// like one.
     fn as_editor(graph: &Graph, dto: &mut PageDto) {
         let handle = graph
-            .activate_editor(&dto.path, ActivationIntent::Replace)
+            .activate_editor(&dto.path, ActivationIntent::Replace, dto.rev.as_deref())
             .expect("a loaded page is path-pinned and inside the graph");
         dto.activation = Some(handle.activation.as_u64());
     }
@@ -52464,9 +52508,14 @@ mod tests {
         fs::write(&path, "- external winner\n").unwrap();
         let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&conflict), "conflict.save_baseline_present");
-        graph.force_save_page(&page).unwrap();
+        let shown = gh254_shown(&conflict);
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), shown)
+            .unwrap();
         assert!(
-            graph.force_save_page(&page).is_err(),
+            graph
+                .force_save_page_at_revision(&page, page.rev.as_deref(), shown)
+                .is_err(),
             "successful force must not replay its consumed token"
         );
         let _ = fs::remove_dir_all(root);
@@ -52476,7 +52525,7 @@ mod tests {
     fn gh254_force_binds_the_shown_bytes_not_only_the_revision_or_path() {
         let (root, path, graph, page) = gh254_loaded("substituted-baseline");
         fs::write(&path, "- shown winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         // Preserve the inode while changing its bytes. Revision-only force used
         // to overwrite this unseen second winner.
         EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
@@ -52485,7 +52534,9 @@ mod tests {
                 fs::write(path, "- unseen second winner\n")
             }));
         });
-        let error = graph.force_save_page(&page).unwrap_err();
+        let error = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
+            .unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.commit_recheck");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -52500,7 +52551,9 @@ mod tests {
         fs::remove_file(&path).unwrap();
         let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&conflict), "conflict.save_baseline_absent");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
+            .unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("mine"));
         assert!(graph.force_save_page(&page).is_err());
         let _ = fs::remove_dir_all(root);
@@ -52848,7 +52901,11 @@ mod tests {
         page.rev = Some(revision);
         graph.save_page(&page, page.rev.as_deref()).unwrap();
         let reused = graph
-            .activate_editor(&finished.target, ActivationIntent::Reuse)
+            .activate_editor(
+                &finished.target,
+                ActivationIntent::Reuse,
+                page.rev.as_deref(),
+            )
             .unwrap();
         assert_eq!(reused.activation, prospective.activation);
         assert!(
@@ -52872,10 +52929,10 @@ mod tests {
     fn gh254_activation_reuse_is_idempotent_and_replace_is_not() {
         let (root, _path, graph, _page) = gh254_loaded("intent");
         let first = graph
-            .activate_editor("pages/Note.md", ActivationIntent::Replace)
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
             .unwrap();
         let reused = graph
-            .activate_editor("pages/Note.md", ActivationIntent::Reuse)
+            .activate_editor("pages/Note.md", ActivationIntent::Reuse, None)
             .unwrap();
         assert_eq!(
             first.activation, reused.activation,
@@ -52883,7 +52940,7 @@ mod tests {
         );
 
         let replaced = graph
-            .activate_editor("pages/Note.md", ActivationIntent::Replace)
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
             .unwrap();
         assert_ne!(
             first.activation, replaced.activation,
@@ -52894,7 +52951,7 @@ mod tests {
             "A must remain live until the frontend installs B"
         );
         let reused_after_retiring_a = graph
-            .activate_editor("pages/Note.md", ActivationIntent::Reuse)
+            .activate_editor("pages/Note.md", ActivationIntent::Reuse, None)
             .unwrap();
         assert_eq!(
             reused_after_retiring_a.activation, replaced.activation,
@@ -52905,10 +52962,46 @@ mod tests {
     }
 
     #[test]
+    fn gh254_present_activation_refuses_a_snapshot_that_changed_after_read() {
+        let (root, path, graph, page) = gh254_loaded("activation-expected-snapshot");
+        fs::write(&path, "- winner after the DTO read\n").unwrap();
+
+        let error = graph
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let reused = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Reuse, None)
+            .unwrap();
+        assert_eq!(reused.activation.as_u64(), page.activation.unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_implicit_force_cannot_spend_a_newer_observation_the_caller_never_named() {
+        let (root, path, graph, page) = gh254_loaded("implicit-force-fails-closed");
+        fs::write(&path, "- shown winner e1\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+
+        fs::write(&path, "- unseen winner e2\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+
+        let error = graph.force_save_page(&page).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- unseen winner e2\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn gh254_token_cannot_cross_graph_instance_or_editor_episode() {
         let (root, path, graph, page) = gh254_loaded("scope");
         fs::write(&path, "- external winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
 
         let reopened = Graph::open(&root);
         reopened.warm_cache();
@@ -52923,7 +53016,7 @@ mod tests {
         // still live, so it can still answer it.
         graph.load_by_path("pages/Note.md").unwrap().unwrap();
         graph
-            .force_save_page(&page)
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
             .expect("an unrelated read must not cost the live editor its answer");
         let _ = fs::remove_dir_all(root);
     }
@@ -52972,10 +53065,10 @@ mod tests {
         graph.warm_cache();
 
         let note = graph
-            .activate_editor("pages/Note.md", ActivationIntent::Replace)
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
             .unwrap();
         let other = graph
-            .activate_editor("pages/Other.md", ActivationIntent::Replace)
+            .activate_editor("pages/Other.md", ActivationIntent::Replace, None)
             .unwrap();
 
         assert!(graph.rename_page("Note", "").is_err());
@@ -52983,10 +53076,10 @@ mod tests {
         assert!(graph.retire_editor_activation("pages/Other.md", other.activation));
 
         let note = graph
-            .activate_editor("pages/Note.md", ActivationIntent::Replace)
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
             .unwrap();
         let other = graph
-            .activate_editor("pages/Other.md", ActivationIntent::Replace)
+            .activate_editor("pages/Other.md", ActivationIntent::Replace, None)
             .unwrap();
         graph.rename_page("Note", "Renamed").unwrap();
 
@@ -52999,7 +53092,7 @@ mod tests {
             "a reference-rewritten satellite editor must be retired too"
         );
         let reopened = graph
-            .activate_editor("pages/Other.md", ActivationIntent::Reuse)
+            .activate_editor("pages/Other.md", ActivationIntent::Reuse, None)
             .unwrap();
         assert_ne!(
             reopened.activation, other.activation,
@@ -53060,12 +53153,14 @@ mod tests {
     fn gh254_force_accepts_a_same_byte_republication_and_targets_the_live_inode() {
         let (root, path, graph, page) = gh254_loaded("force-identity");
         fs::write(&path, "- shown winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         let replacement = path.with_file_name(".same-byte-new-inode");
         fs::write(&replacement, "- shown winner\n").unwrap();
         gh254_replace(&path, &replacement).unwrap();
 
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
+            .unwrap();
         assert!(
             fs::read_to_string(&path).unwrap().contains("mine"),
             "keep-mine did not land on the republished inode"
@@ -53196,12 +53291,14 @@ mod tests {
     fn gh254_force_refuses_a_different_byte_winner_on_a_new_inode() {
         let (root, path, graph, page) = gh254_loaded("force-identity-diff");
         fs::write(&path, "- shown winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let shown = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         let replacement = path.with_file_name(".different-byte-new-inode");
         fs::write(&replacement, "- a newer winner nobody saw\n").unwrap();
         gh254_replace(&path, &replacement).unwrap();
 
-        let error = graph.force_save_page(&page).unwrap_err();
+        let error = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&shown))
+            .unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.save_baseline_present");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -53210,7 +53307,9 @@ mod tests {
         );
         // The refusal minted a fresh conflict over the winner the user can now
         // actually see, so the second click resolves it deliberately.
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53221,7 +53320,9 @@ mod tests {
         fs::write(&path, "- s1 winner\n").unwrap();
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.save_baseline_present");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53231,7 +53332,9 @@ mod tests {
         fs::remove_file(path).unwrap();
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.save_baseline_absent");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53244,7 +53347,9 @@ mod tests {
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.commit_recheck");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53260,7 +53365,9 @@ mod tests {
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.replace_pre_retirement");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53274,7 +53381,9 @@ mod tests {
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.replace_retired_mismatch");
         assert_eq!(fs::read_to_string(&path).unwrap(), "- s5 winner\n");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53306,7 +53415,9 @@ mod tests {
                     "- s6 transient\n"
                 }
             );
-            graph.force_save_page(&page).unwrap();
+            graph
+                .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+                .unwrap();
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -53344,7 +53455,9 @@ mod tests {
         });
         let error = graph.save_page(&page, None).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.create_publication_collision");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, None, gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -53375,7 +53488,9 @@ mod tests {
                     "conflict.final_reread_present"
                 }
             );
-            graph.force_save_page(&page).unwrap();
+            graph
+                .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+                .unwrap();
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -53394,7 +53509,9 @@ mod tests {
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.replace_post_publication");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

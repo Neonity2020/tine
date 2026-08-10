@@ -1781,6 +1781,37 @@ describe("save engine (persistence)", () => {
     expect(isConflicted("Test")).toBe(true);
   });
 
+  it("mints a snapshot-less save fallback so a diverged editor raises an answerable conflict", async () => {
+    loadSingle({
+      name: "Fallback",
+      kind: "page",
+      title: "Fallback",
+      pre_block: null,
+      path: "pages/Fallback.md",
+      rev: "loaded-revision",
+      blocks: [blk("retained draft")],
+    });
+    markDirty("Fallback");
+    const activate = vi.spyOn(backend(), "activateEditor").mockResolvedValue({
+      activation: 7001,
+      target: "pages/Fallback.md",
+      prospective: false,
+    });
+    saveSpy.mockRejectedValueOnce(new Error("conflict:77"));
+
+    expect(await flushPage("Fallback")).toBe(false);
+    expect(activate).toHaveBeenCalledWith("pages/Fallback.md", "replace", null);
+    expect(saveSpy.mock.calls[0][0]).toMatchObject({ activation: 7001 });
+    expect(saveSpy.mock.calls[0][1]).toBe("loaded-revision");
+    expect(conflicts()).toContain("Fallback");
+
+    saveSpy.mockResolvedValueOnce("winner-replaced");
+    expect(await forceSave("Fallback")).toBe(true);
+    expect(saveSpy.mock.calls[1][0]).toMatchObject({ activation: 7001 });
+    expect(saveSpy.mock.calls[1][2]).toBe(true);
+    expect(saveSpy.mock.calls[1][3]).toBe(77);
+  });
+
   it("a transient error retries automatically before showing a save failure", async () => {
     load([blk("x")]);
     markDirty("Test");
@@ -2302,5 +2333,25 @@ describe("a watcher reload re-checks safety at the moment it applies", () => {
     });
     expect(await reloadPageIfStillSafe("Clean", disk("Clean", "from disk"))).toBe(true);
     expect(pageByName("Clean")!.roots.map((id) => doc.byId[id].raw)).toEqual(["from disk"]);
+  });
+
+  it("does not install a DTO whose exact read snapshot changed before activation", async () => {
+    const stale = {
+      ...disk("Stale", "bytes from the completed read"),
+      path: "pages/Stale.md",
+      rev: "revision-from-the-read",
+    };
+    const activate = vi.spyOn(backend(), "activateEditor").mockImplementation(
+      async (_path, _intent, expected) => {
+        if (expected === stale.rev) throw new Error("activation.snapshot_changed");
+        return { activation: 4001, target: stale.path, prospective: false };
+      },
+    );
+
+    const refusal = await ensurePageLoaded(stale);
+
+    expect(refusal).toEqual({ reason: "activation-failed", page: "Stale" });
+    expect(activate).toHaveBeenCalledWith(stale.path, "replace", stale.rev);
+    expect(pageByName("Stale")).toBeUndefined();
   });
 });

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { ConflictBar } from "./ConflictBar";
-import { markConflict, conflicts, clearConflict } from "../ui";
+import { conflicts, clearConflict } from "../ui";
 import { backend } from "../backend";
 import { loadSingle, resetStore, pageByName, doc, setRaw } from "../store";
 import { flushPage, isDirty } from "../persistence";
@@ -34,18 +34,9 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     title: sharedName,
     pre_block: null,
     path,
-    rev: `rev-of-${path}`,
+    rev: `rev-of-${path}:${text}`,
     blocks: [{ id: `block-of-${path}`, raw: text, collapsed: false, children: [], properties: [] }],
   });
-
-  function mountWithStrayLoaded() {
-    loadSingle(page(strayPath, "the stray's text"));
-    markConflict(sharedName);
-    const root = document.createElement("div");
-    document.body.append(root);
-    const dispose = render(() => <ConflictBar />, root);
-    return { root, dispose };
-  }
 
   async function mountWithObservedDirectConflict() {
     loadSingle(page(strayPath, "the loaded disk baseline"));
@@ -96,6 +87,91 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     dispose();
   });
 
+  it("re-observes instead of installing a divergent disk snapshot when authority was withdrawn", async () => {
+    const { root, dispose, savePage } = await mountWithObservedDirectConflict();
+    const divergent = page(strayPath, "a newer winner that was never authorised");
+    vi.spyOn(backend(), "presentConflictOverride").mockResolvedValue("withdrawn");
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(divergent);
+    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+
+    await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the retained local draft");
+    expect(conflicts()).toContain(sharedName);
+    dispose();
+  });
+
+  it("keeps post-click typing when replacement activation finishes later", async () => {
+    const { root, dispose, savePage } = await mountWithObservedDirectConflict();
+    vi.spyOn(backend(), "presentConflictOverride").mockResolvedValue("authorised");
+    vi.spyOn(backend(), "getPageByPath")
+      .mockResolvedValue(page(strayPath, "the authorised disk winner"));
+    let releaseActivation: (handle: { activation: number; target: string; prospective: boolean }) => void = () => {};
+    const activate = vi.spyOn(backend(), "activateEditor").mockReturnValue(
+      new Promise((resolve) => {
+        releaseActivation = resolve;
+      }),
+    );
+    const retire = vi.spyOn(backend(), "retireEditorActivation").mockResolvedValue(true);
+    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await vi.waitFor(() => expect(activate).toHaveBeenCalledTimes(1));
+    const incumbent = pageByName(sharedName)!;
+    setRaw(incumbent.roots[0], "typing after the discard click must survive");
+    releaseActivation({ activation: 9002, target: strayPath, prospective: false });
+
+    await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe(
+      "typing after the discard click must survive",
+    );
+    expect(conflicts()).toContain(sharedName);
+    expect(retire).toHaveBeenCalledWith(strayPath, 9002);
+    dispose();
+  });
+
+  it("does not consume or save when the pre-consume disk read fails", async () => {
+    const { root, dispose, savePage } = await mountWithObservedDirectConflict();
+    const present = vi.spyOn(backend(), "presentConflictOverride").mockResolvedValue("authorised");
+    vi.spyOn(backend(), "getPageByPath").mockRejectedValue(new Error("read failed"));
+    const saveCallsBeforeClick = savePage.mock.calls.length;
+
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(present).not.toHaveBeenCalled();
+    expect(savePage).toHaveBeenCalledTimes(saveCallsBeforeClick);
+    expect(conflicts()).toContain(sharedName);
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the retained local draft");
+    dispose();
+  });
+
+  it("does not consume or save when replacement activation fails", async () => {
+    const { root, dispose, savePage } = await mountWithObservedDirectConflict();
+    const present = vi.spyOn(backend(), "presentConflictOverride").mockResolvedValue("authorised");
+    vi.spyOn(backend(), "getPageByPath")
+      .mockResolvedValue(page(strayPath, "the disk winner"));
+    vi.spyOn(backend(), "activateEditor").mockRejectedValue(new Error("activation failed"));
+    const saveCallsBeforeClick = savePage.mock.calls.length;
+
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(present).not.toHaveBeenCalled();
+    expect(savePage).toHaveBeenCalledTimes(saveCallsBeforeClick);
+    expect(conflicts()).toContain(sharedName);
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the retained local draft");
+    dispose();
+  });
+
   it("re-observes a superseded conflict instead of installing disk bytes", async () => {
     const { root, dispose, savePage } = await mountWithObservedDirectConflict();
     const present = vi.spyOn(backend(), "presentConflictOverride")
@@ -108,7 +184,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
 
     await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
     expect(present).toHaveBeenCalledWith(strayPath, expect.any(String), expect.any(Number), 41);
-    expect(getPageByPath).not.toHaveBeenCalled();
+    expect(getPageByPath).toHaveBeenCalledWith(strayPath);
     const live = pageByName(sharedName);
     expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the retained local draft");
     expect(conflicts()).toContain(sharedName);
@@ -131,7 +207,8 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     );
     const { notifyGraphRebound } = await import("../modeHooks");
 
-    const { root, dispose } = mountWithStrayLoaded();
+    const { root, dispose, savePage } = await mountWithObservedDirectConflict();
+    savePage.mockRejectedValueOnce(new Error("conflict:42"));
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
     await Promise.resolve();
 
@@ -140,6 +217,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     landRead(page(strayPath, "bytes from the graph that was replaced"));
     await Promise.resolve();
     await Promise.resolve();
+    await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
 
     // ...so those bytes must not be installed over the editor's content, and the
     // banner must not be silently cleared as though the discard succeeded.
@@ -162,7 +240,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     const getPage = vi.spyOn(backend(), "getPage")
       .mockResolvedValue(page(canonicalPath, "the CANONICAL day, a different file"));
 
-    const { root, dispose } = mountWithStrayLoaded();
+    const { root, dispose } = await mountWithObservedDirectConflict();
     const actions = root.querySelectorAll<HTMLButtonElement>(".conflict-btn");
     expect(actions[0].textContent?.trim()).toBe("Use current version");
     expect(actions[1].textContent?.trim()).toBe("Keep mine");
@@ -184,7 +262,7 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     const getPage = vi.spyOn(backend(), "getPage")
       .mockResolvedValue(page(canonicalPath, "the CANONICAL day, a different file"));
 
-    const { root, dispose } = mountWithStrayLoaded();
+    const { root, dispose } = await mountWithObservedDirectConflict();
     root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
 
     await vi.waitFor(() => expect(pageByName(sharedName)).toBeUndefined());
@@ -197,9 +275,13 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
   it("still resolves an unpinned page by name", async () => {
     const withoutPath: PageDto = { ...page(canonicalPath, "text"), path: undefined };
     loadSingle(withoutPath);
-    markConflict(sharedName);
+    const loaded = pageByName(sharedName)!;
+    setRaw(loaded.roots[0], "the retained local draft");
+    vi.spyOn(backend(), "savePage").mockRejectedValueOnce(new Error("conflict:41"));
+    expect(await flushPage(sharedName)).toBe(false);
     const getPageByPath = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(null);
-    const getPage = vi.spyOn(backend(), "getPage").mockResolvedValue(withoutPath);
+    const getPage = vi.spyOn(backend(), "getPage")
+      .mockResolvedValue(page(canonicalPath, "disk text"));
 
     const root = document.createElement("div");
     document.body.append(root);

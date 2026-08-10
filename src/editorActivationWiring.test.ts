@@ -51,7 +51,7 @@ describe("editor activation wiring (GH #254 increment 3)", () => {
     const saved = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
     await flushPage("Note");
 
-    expect(activate).toHaveBeenCalledWith("pages/Note.md", "replace");
+    expect(activate).toHaveBeenCalledWith("pages/Note.md", "replace", "rev-1");
     expect(editorActivationFor("Note")).toBe(77);
     // The half that matters: it reached the wire. A registry entry nobody stamps
     // onto the DTO leaves the override path just as refused as no registry at all.

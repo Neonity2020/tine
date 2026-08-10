@@ -635,7 +635,12 @@ async function ensureEditorActivation(name: string): Promise<void> {
       // legitimately reuse. Minting replaces any stale core record left by a
       // failed best-effort retirement instead of inheriting another editor's
       // conflict authority.
-      ? await backend().activateEditor(page.path, "replace")
+      // Snapshot-less by design. This is the save-time fallback for an already
+      // mounted editor, not installation of a DTO. The ordinary save below still
+      // compares its captured base revision, so divergence raises an answerable
+      // conflict under the newly minted activation instead of blessing stale
+      // bytes or leaving the banner without a live editor identity.
+      ? await backend().activateEditor(page.path, "replace", null)
       : await backend().activateAbsentEditor(name, page.kind);
     // Re-check across the await. A graph switch or a re-install makes this a
     // DIFFERENT editor, and recording the handle then would hand one editor's
