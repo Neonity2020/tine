@@ -31469,11 +31469,16 @@ pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
     // makes the code mean what it says.
     //
     // The arms that predate this still use `contains`, and the same weakness
-    // reaches them: a page named `editor conflict: save baseline present.md`
-    // can put a banner-class code on an unrelated failure. Anchoring those too
-    // would reclassify legitimately WRAPPED errors (several are composed as
-    // `{primary}; …`) and needs its own packet with its own verification; it is
-    // recorded rather than done here.
+    // reaches them — and it is DATA-LOSS-CAPABLE, not merely cosmetic. A page
+    // named `path-pinned page does not match its captured exact owner.md` makes
+    // an unrelated exact-identity restore failure classify as
+    // `conflict.pinned_owner`; `direct_save_error_message` collapses that to a
+    // bare `conflict`, and the false banner it raises offers "Use disk version",
+    // which discards the unsaved edit. (A colon-bearing exemplar would not work:
+    // raw `:` paths are non-portable and encoded.) Anchoring those arms would
+    // reclassify the errors legitimately composed as `{primary}; …`, so it needs
+    // its own packet and its own verification; it is recorded, not done here.
+    // (GH #254 increment 2, sixth re-verification, HIGH backlog.)
     let starts = |needle: &str| message.starts_with(needle);
     if has("is a symlink or reparse point") {
         "precheck.symlink"

@@ -332,19 +332,20 @@ export function isRetryableSaveFailure(error: unknown): boolean {
  *  override, and its handler would keep re-observing a save that can never
  *  succeed. (GH #254 increment 2, fourth correction-delta re-verification.)
  *
- *  Returns the whole message when there is no code separator, which is the
- *  banner-class `conflict` / `conflict:<n>` shape; those are matched before this
- *  is consulted. */
+ *  Returns `""` when there is no code separator or the prefix is not code-shaped
+ *  — including the banner-class `conflict` / `conflict:<n>` shape, which is
+ *  matched by `conflictObservationEpoch` before this is consulted. */
 function directSaveFailureCode(error: unknown): string {
   const message = String(error).replace(/^Error: /, "");
   const separator = message.indexOf(": ");
   if (separator <= 0) return ""; // no code at all — never a family
   const code = message.slice(0, separator);
-  // A bounded code is `family.condition`, lower-case and underscored. Requiring
+  // A bounded code is dot-separated, lower-case and underscored — usually
+  // `family.condition`, but `unknown` is a genuine single-segment one. Requiring
   // the SHAPE means an error that merely opens with code-like prose cannot be
   // read as one: without it, `Error("conflict_authority.spent while reporting
   // …")` was accepted whole and routed into the authority handler.
-  return /^[a-z][a-z_]*\.[a-z][a-z_]*$/.test(code) ? code : "";
+  return /^[a-z][a-z_]*(\.[a-z][a-z_]*)*$/.test(code) ? code : "";
 }
 
 /** The observation epoch a banner-class conflict was raised at.
