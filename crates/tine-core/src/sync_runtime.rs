@@ -8687,6 +8687,28 @@ impl RuntimeActor {
         self.managed_application_query_instrumentation.set(current);
     }
 
+    fn finish_managed_application_query_page_hydration(
+        &self,
+        current: ApplicationCurrentPage,
+    ) -> ApplicationCurrentPage {
+        #[cfg(test)]
+        self.note_managed_application_query_exact_page_load();
+        current
+    }
+
+    fn finish_managed_application_query_exact_load(
+        &self,
+        current: ApplicationExactLoad,
+    ) -> ApplicationExactLoad {
+        match current {
+            ApplicationExactLoad::Loaded(current) => ApplicationExactLoad::Loaded(
+                self.finish_managed_application_query_page_hydration(current),
+            ),
+            ApplicationExactLoad::Missing => ApplicationExactLoad::Missing,
+            ApplicationExactLoad::Ambiguous => ApplicationExactLoad::Ambiguous,
+        }
+    }
+
     #[cfg(test)]
     fn note_managed_application_simple_query_scope(
         &self,
@@ -10896,24 +10918,28 @@ impl RuntimeActor {
                 .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
             ensure_editor_frontier(runtime, read.acceptance_sequence())
                 .map_err(map_editor_application_error)?;
-            match read
+            let projected = match read
                 .pages_by_path(&path, 2)
                 .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
                 .as_slice()
             {
-                [page] if page.path == path => {
-                    return self
-                        .load_application_page_id_ready(page.page_id)
-                        .map(ApplicationExactLoad::Loaded)
-                }
-                [] => {}
+                [page] if page.path == path => Some(
+                    self.load_application_page_id_untracked_ready(page.page_id)
+                        .map(ApplicationExactLoad::Loaded),
+                ),
+                [] => None,
                 // Duplicate or malformed projected rows are exceptional. Keep
                 // the established authenticated catalog route for them rather
                 // than making SQLite decide their exact-path semantics.
-                _ => {}
+                _ => None,
+            };
+            if let Some(projected) = projected {
+                return projected
+                    .map(|current| self.finish_managed_application_query_exact_load(current));
             }
         }
-        self.load_hot_application_exact_ready(&path)
+        self.load_hot_application_exact_untracked_ready(&path)
+            .map(|current| self.finish_managed_application_query_exact_load(current))
     }
 
     fn load_application_save_exact_ready(
@@ -10957,6 +10983,14 @@ impl RuntimeActor {
         &self,
         path: &ManagedPath,
     ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
+        self.load_hot_application_exact_untracked_ready(path)
+            .map(|current| self.finish_managed_application_query_exact_load(current))
+    }
+
+    fn load_hot_application_exact_untracked_ready(
+        &self,
+        path: &ManagedPath,
+    ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
         let runtime = self
             .runtime
             .as_ref()
@@ -10981,12 +11015,18 @@ impl RuntimeActor {
         if current.editor.page.path != *path {
             return Err(SyncApplicationPageRequestError::ActorRefused);
         }
-        #[cfg(test)]
-        self.note_managed_application_query_exact_page_load();
         Ok(ApplicationExactLoad::Loaded(current))
     }
 
     fn load_application_page_id_ready(
+        &self,
+        page_id: PageId,
+    ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
+        self.load_application_page_id_untracked_ready(page_id)
+            .map(|current| self.finish_managed_application_query_page_hydration(current))
+    }
+
+    fn load_application_page_id_untracked_ready(
         &self,
         page_id: PageId,
     ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
@@ -11002,8 +11042,6 @@ impl RuntimeActor {
         )
         .map_err(map_editor_application_error)?
         .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
-        #[cfg(test)]
-        self.note_managed_application_query_exact_page_load();
         Ok(current)
     }
 
@@ -29816,7 +29854,13 @@ mod tests {
         }
 
         fn copied_graph(label: &str, seed: u128, source: &Path) -> Self {
-            assert!(source.is_dir(), "graph-copy source must be a directory");
+            let source_type = fs::symlink_metadata(source)
+                .expect("graph-copy source metadata must be readable")
+                .file_type();
+            assert!(
+                source_type.is_dir(),
+                "graph-copy source must be a real directory, not a symlink or other entry"
+            );
             let fixture = Self::nested_unicode(label, seed);
             fs::remove_dir_all(&fixture.graph_root).unwrap();
             copy_provider_tree(source, &fixture.graph_root);
@@ -29841,13 +29885,58 @@ mod tests {
             entries.sort_by_key(std::fs::DirEntry::file_name);
             for entry in entries {
                 let target = destination.join(entry.file_name());
-                if entry.file_type().unwrap().is_dir() {
+                let file_type = entry.file_type().unwrap();
+                assert!(
+                    !file_type.is_symlink(),
+                    "refusing to copy graph symlink: {}",
+                    entry.path().display()
+                );
+                if file_type.is_dir() {
                     pending.push((entry.path(), target));
                 } else {
+                    assert!(
+                        file_type.is_file(),
+                        "refusing to copy non-regular graph entry: {}",
+                        entry.path().display()
+                    );
                     fs::copy(entry.path(), target).unwrap();
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_provider_tree_rejects_symlink_without_copying_target() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ActivationFixture::empty("copy-provider-tree-symlink", 0xa2f1);
+        let source = fixture.root.join("copy-source");
+        let outside = fixture.root.join("outside-target.md");
+        let destination = fixture.root.join("copy-destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(&outside, "target must remain outside the copied graph\n").unwrap();
+        symlink(&outside, source.join("escape.md")).unwrap();
+
+        let refusal = std::panic::catch_unwind(|| copy_provider_tree(&source, &destination))
+            .expect_err("graph copy accepted a symlink entry");
+        let refusal = refusal
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| refusal.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string graph-copy refusal");
+        assert!(
+            refusal.contains("refusing to copy graph symlink"),
+            "graph copy reached the wrong failure instead of rejecting the symlink before copy: {refusal}"
+        );
+        assert!(
+            !destination.join("escape.md").exists(),
+            "graph copy opened and copied the symlink target"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "target must remain outside the copied graph\n"
+        );
     }
 
     fn clear_provider_namespace(fixture: &ActivationFixture, namespace: &str) {
@@ -39837,6 +39926,7 @@ mod tests {
         fixture: &ActivationFixture,
         label: &str,
         samples: usize,
+        expected_total_pages: Option<usize>,
         expected_task_candidate_pages: Option<usize>,
     ) {
         const MAX_ROWS: usize = 20_000;
@@ -39851,6 +39941,39 @@ mod tests {
         let direct_indexed = direct.run_query_bounded(indexed, MAX_ROWS, MAX_BYTES);
         let direct_regex_all = direct.run_query_bounded(regex_all, MAX_ROWS, MAX_BYTES);
         let direct_graph_search = direct.run_graph_search(graph_search_source, 0, MAX_ROWS, false);
+        if let Some(expected_total_pages) = expected_total_pages {
+            assert_eq!(
+                total_pages, expected_total_pages,
+                "synthetic query fixture did not activate at its configured scale: {label}"
+            );
+            let expected_task_candidate_pages = expected_task_candidate_pages
+                .expect("synthetic query fixture must declare its task density");
+            assert!(
+                direct_indexed.total > 0,
+                "synthetic indexed Direct query must be nonempty: {label}"
+            );
+            assert_eq!(
+                direct_indexed.total, expected_task_candidate_pages,
+                "synthetic indexed Direct total drifted: {label}"
+            );
+            assert_eq!(
+                direct_regex_all.total, total_pages,
+                "synthetic Regex-All Direct total must equal the configured page scale: {label}"
+            );
+            let direct_graph_blocks = direct_graph_search
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit, crate::query_plan::QueryHit::Block { .. }))
+                .count();
+            assert!(
+                direct_graph_blocks > 0,
+                "synthetic graph block search must be nonempty: {label}"
+            );
+            assert_eq!(
+                direct_graph_blocks, total_pages,
+                "synthetic graph block-search Direct total must equal the configured page scale: {label}"
+            );
+        }
 
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(
@@ -39950,12 +40073,12 @@ mod tests {
                     "task candidate density drifted: {counters:?}"
                 );
             }
-            assert!(
-                counters.exact_page_loads
-                    <= counters
-                        .indexed_candidate_pages
-                        .saturating_add(counters.overlay_pages),
-                "indexed task query exact-loads more pages than its distinct unmasked candidates plus overlay: {counters:?}"
+            assert_eq!(
+                counters.exact_page_loads,
+                counters
+                    .indexed_candidate_pages
+                    .saturating_add(counters.overlay_pages),
+                "indexed task query must hydrate each distinct unmasked candidate and overlay page exactly once: {counters:?}"
             );
             indexed_samples.push(elapsed);
             indexed_counters.push(counters);
@@ -39974,9 +40097,9 @@ mod tests {
                 counters.inventory_pages, total_pages,
                 "Regex-All inventory did not cover each page exactly once: {counters:?}"
             );
-            assert!(
-                counters.exact_page_loads <= total_pages,
-                "Regex-All exact-loaded a page more than once: {counters:?}"
+            assert_eq!(
+                counters.exact_page_loads, total_pages,
+                "Regex-All must hydrate every inventoried page exactly once: {counters:?}"
             );
             regex_all_samples.push(elapsed);
             regex_all_counters.push(counters);
@@ -40002,9 +40125,9 @@ mod tests {
                 counters.inventory_pages, total_pages,
                 "graph-search inventory did not cover each page exactly once: {counters:?}"
             );
-            assert!(
-                counters.exact_page_loads <= total_pages,
-                "graph search exact-loaded a page more than once: {counters:?}"
+            assert_eq!(
+                counters.exact_page_loads, total_pages,
+                "graph block search must hydrate every inventoried page exactly once: {counters:?}"
             );
             graph_search_samples.push(elapsed);
             graph_search_counters.push(counters);
@@ -40078,6 +40201,7 @@ mod tests {
                     &fixture,
                     &format!("synthetic-{total_pages}-{density}"),
                     samples,
+                    Some(total_pages),
                     Some(candidate_pages),
                 );
             }
@@ -40093,7 +40217,13 @@ mod tests {
             );
             let fixture =
                 ActivationFixture::copied_graph("managed-query-search-real-copy", 0xa2f0, &source);
-            managed_query_search_manual_receipt(&fixture, "explicit-real-copy", samples, None);
+            managed_query_search_manual_receipt(
+                &fixture,
+                "explicit-real-copy",
+                samples,
+                None,
+                None,
+            );
         }
     }
 
