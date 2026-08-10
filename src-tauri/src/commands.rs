@@ -76,6 +76,25 @@ fn enforce_result_bridge_budget(groups: &[RefGroup]) -> Result<(), String> {
     Ok(())
 }
 
+fn enforce_optional_result_bridge_budget(groups: &[Option<RefGroup>]) -> Result<(), String> {
+    let rows = groups
+        .iter()
+        .flatten()
+        .map(|group| group.blocks.len())
+        .sum::<usize>();
+    let bytes = groups
+        .iter()
+        .flatten()
+        .map(|group| tine_core::model::ref_groups_estimated_bytes(std::slice::from_ref(group)))
+        .sum::<usize>();
+    if rows > RESULT_BRIDGE_MAX_ROWS || bytes > RESULT_BRIDGE_MAX_BYTES {
+        return Err(format!(
+            "result-too-large: {rows} matching blocks (~{bytes} bytes); narrow the query or add (sample N) (limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)"
+        ));
+    }
+    Ok(())
+}
+
 fn bounded_groups_or_error(
     result: tine_core::model::BoundedRefGroups,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
@@ -135,8 +154,8 @@ fn enforce_query_execution_budget(
 #[cfg(test)]
 mod result_bridge_budget_tests {
     use super::{
-        enforce_result_bridge_budget, validate_query_source, RESULT_BRIDGE_MAX_BYTES,
-        RESULT_BRIDGE_MAX_ROWS,
+        enforce_optional_result_bridge_budget, enforce_result_bridge_budget, validate_query_source,
+        RESULT_BRIDGE_MAX_BYTES, RESULT_BRIDGE_MAX_ROWS,
     };
     use tine_core::{BlockDto, PageKind, RefGroup};
 
@@ -153,6 +172,17 @@ mod result_bridge_budget_tests {
     fn rejects_oversized_result_count_before_ipc() {
         let groups = [group(vec![BlockDto::default(); RESULT_BRIDGE_MAX_ROWS + 1])];
         assert!(enforce_result_bridge_budget(&groups)
+            .unwrap_err()
+            .starts_with("result-too-large:"));
+    }
+
+    #[test]
+    fn optional_results_are_budgeted_without_cloning_present_groups() {
+        let groups = [
+            None,
+            Some(group(vec![BlockDto::default(); RESULT_BRIDGE_MAX_ROWS + 1])),
+        ];
+        assert!(enforce_optional_result_bridge_budget(&groups)
             .unwrap_err()
             .starts_with("result-too-large:"));
     }
@@ -1193,6 +1223,9 @@ mod managed_actor_command_boundary_tests {
             "page_icons",
             "existing_page_names",
             "quick_switch",
+            "resolve_block",
+            "resolve_blocks",
+            "preview_block",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1226,6 +1259,9 @@ mod managed_actor_command_boundary_tests {
             "page_icons",
             "existing_page_names",
             "quick_switch",
+            "resolve_block",
+            "resolve_blocks",
+            "preview_block",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");
@@ -1864,21 +1900,37 @@ pub(crate) async fn journal_content_days(state: GraphContext<'_>) -> Result<Vec<
 }
 
 #[tauri::command]
-pub(crate) fn resolve_block(
+pub(crate) async fn resolve_block(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Option<RefGroup>, String> {
-    with_read_graph(&state, |g| {
-        let group = g.resolve_block(&uuid);
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let group = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ResolveBlocks {
+                    uuids: vec![uuid.clone()],
+                },
+            )? {
+                SyncApplicationNavigationReply::ResolveBlocks(mut groups) => groups.pop().flatten(),
+                _ => return Err("managed block resolution returned the wrong reply kind".into()),
+            },
+            None => slot.legacy_graph()?.resolve_block(&uuid),
+        };
         if let Some(group) = &group {
             enforce_result_bridge_budget(std::slice::from_ref(group))?;
         }
         Ok(group)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn resolve_blocks(
+pub(crate) async fn resolve_blocks(
     uuids: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<Option<RefGroup>>, String> {
@@ -1888,44 +1940,80 @@ pub(crate) fn resolve_blocks(
             uuids.len()
         ));
     }
-    with_read_graph(&state, |g| {
-        let (groups, exceeded, total) = tine_core::query::resolve_blocks_bounded(
-            g,
-            &uuids,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        );
-        if exceeded {
-            Err(format!("result-too-large: {total} resolved block-reference rows exceed the construction budget"))
-        } else {
-            Ok(groups)
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ResolveBlocks { uuids },
+            )? {
+                SyncApplicationNavigationReply::ResolveBlocks(groups) => {
+                    enforce_optional_result_bridge_budget(&groups)?;
+                    Ok(groups)
+                }
+                _ => Err("managed block resolution returned the wrong reply kind".into()),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                let (groups, exceeded, total) = tine_core::query::resolve_blocks_bounded(
+                    &graph,
+                    &uuids,
+                    RESULT_BRIDGE_MAX_ROWS,
+                    RESULT_BRIDGE_MAX_BYTES,
+                );
+                if exceeded {
+                    Err(format!("result-too-large: {total} resolved block-reference rows exceed the construction budget"))
+                } else {
+                    Ok(groups)
+                }
+            }
         }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Explicit, bounded subtree resolution for hover previews. Ordinary
 /// `resolve_block(s)` stays shallow so a page containing nested references
 /// cannot multiply the same descendants across the IPC bridge.
 #[tauri::command]
-pub(crate) fn preview_block(
+pub(crate) async fn preview_block(
     uuid: String,
     max_nodes: usize,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::BlockPreview>, String> {
     const MAX_PREVIEW_NODES: usize = 2_000;
-    with_read_graph(&state, |g| {
-        // Leave room for RefGroup/page/serializer overhead, then assert the
-        // shared bridge invariant as a second line of defense.
-        let preview = g.preview_block_with_budget(
-            &uuid,
-            max_nodes.clamp(1, MAX_PREVIEW_NODES),
-            RESULT_BRIDGE_MAX_BYTES.saturating_sub(4 * 1024),
-        );
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let max_nodes = max_nodes.clamp(1, MAX_PREVIEW_NODES);
+        let max_bytes = RESULT_BRIDGE_MAX_BYTES.saturating_sub(4 * 1024);
+        let preview = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::PreviewBlock {
+                    uuid,
+                    max_nodes,
+                    max_bytes,
+                },
+            )? {
+                SyncApplicationNavigationReply::PreviewBlock(preview) => preview,
+                _ => return Err("managed block preview returned the wrong reply kind".into()),
+            },
+            None => slot
+                .legacy_graph()?
+                .preview_block_with_budget(&uuid, max_nodes, max_bytes),
+        };
         if let Some(preview) = &preview {
             enforce_result_bridge_budget(std::slice::from_ref(&preview.group))?;
         }
         Ok(preview)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

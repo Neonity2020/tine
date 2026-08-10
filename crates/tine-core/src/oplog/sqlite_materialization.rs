@@ -2016,6 +2016,16 @@ impl<'a> SqliteMaterializedRead<'a> {
             .transpose()
     }
 
+    pub fn block_by_logseq_uuid(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Option<MaterializedBlockRow>, MaterializationError> {
+        self.inner
+            .block_by_logseq_uuid(logseq_uuid.as_uuid().into_bytes())?
+            .map(block_row_from_storage)
+            .transpose()
+    }
+
     pub fn pages_by_name(
         &self,
         name: &str,

@@ -42,8 +42,8 @@ use crate::fast_commit::{
     forbidden_commit_work, graph_wide_commit_work, ForbiddenCommitWork, GraphWideCommitWork,
 };
 use crate::model::{
-    sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, Format, Graph, PageDto,
-    PageEntry, PageKind,
+    sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, BlockPreview, Format, Graph,
+    PageDto, PageEntry, PageKind, RefGroup,
 };
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
@@ -1813,9 +1813,24 @@ pub enum SyncApplicationPageInventoryOutcome {
 pub enum SyncApplicationNavigationRequest {
     ReferencedPageNames,
     PageAliases,
-    PageIcons { names: Vec<String> },
-    ExistingPageNames { names: Vec<String> },
-    QuickSwitch { query: String, limit: usize },
+    PageIcons {
+        names: Vec<String>,
+    },
+    ExistingPageNames {
+        names: Vec<String>,
+    },
+    QuickSwitch {
+        query: String,
+        limit: usize,
+    },
+    ResolveBlocks {
+        uuids: Vec<String>,
+    },
+    PreviewBlock {
+        uuid: String,
+        max_nodes: usize,
+        max_bytes: usize,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1831,6 +1846,8 @@ pub enum SyncApplicationNavigationReply {
     PageIcons(HashMap<String, String>),
     ExistingPageNames(Vec<String>),
     QuickSwitch(Vec<PageEntry>),
+    ResolveBlocks(Vec<Option<RefGroup>>),
+    PreviewBlock(Option<BlockPreview>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4349,6 +4366,29 @@ fn validate_application_navigation_request(
         SyncApplicationNavigationRequest::QuickSwitch { query, limit } => {
             (&[][..], Some(query.as_str()), Some(*limit))
         }
+        SyncApplicationNavigationRequest::ResolveBlocks { uuids } => {
+            (uuids.as_slice(), None, Some(uuids.len()))
+        }
+        SyncApplicationNavigationRequest::PreviewBlock {
+            uuid,
+            max_nodes,
+            max_bytes,
+        } => {
+            if *max_nodes == 0
+                || *max_nodes > MAX_SYNC_APPLICATION_PAGE_BLOCKS
+                || *max_bytes == 0
+                || *max_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+            {
+                return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                    SyncEditorRequestSize {
+                        blocks: *max_nodes,
+                        text_bytes: *max_bytes,
+                        ..SyncEditorRequestSize::default()
+                    },
+                ));
+            }
+            (&[][..], Some(uuid.as_str()), None)
+        }
     };
     if names.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(
@@ -6190,6 +6230,89 @@ enum ApplicationExactLoad {
 
 type ApplicationNavigationOverlay = BTreeMap<ManagedPath, Option<(PageId, PageDto)>>;
 
+fn find_application_blocks<'a>(
+    blocks: &'a [BlockDto],
+    wanted: &HashSet<&str>,
+) -> HashMap<String, &'a BlockDto> {
+    let mut found = HashMap::new();
+    let mut stack = blocks.iter().rev().collect::<Vec<_>>();
+    while let Some(block) = stack.pop() {
+        let explicit_ids = block
+            .properties
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("id"))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        if explicit_ids.is_empty() {
+            if wanted.contains(block.id.as_str()) {
+                found.entry(block.id.clone()).or_insert(block);
+            }
+        } else {
+            for id in explicit_ids {
+                if wanted.contains(id) {
+                    found.entry(id.to_owned()).or_insert(block);
+                }
+            }
+        }
+        stack.extend(block.children.iter().rev());
+    }
+    found
+}
+
+fn shallow_application_block(block: &BlockDto) -> BlockDto {
+    BlockDto {
+        id: block.id.clone(),
+        raw: block.raw.clone(),
+        collapsed: block.collapsed,
+        children: Vec::new(),
+        breadcrumb: Vec::new(),
+        page_property: block.page_property,
+        marker: block.marker.clone(),
+        priority: block.priority.clone(),
+        heading_level: block.heading_level,
+        scheduled: block.scheduled.clone(),
+        deadline: block.deadline.clone(),
+        tags: block.tags.clone(),
+        properties: block.properties.clone(),
+    }
+}
+
+fn application_subtree_nodes(root: &BlockDto) -> usize {
+    let mut total = 0_usize;
+    let mut stack = vec![root];
+    while let Some(block) = stack.pop() {
+        total = total.saturating_add(1);
+        stack.extend(block.children.iter());
+    }
+    total
+}
+
+fn clone_application_subtree_bounded(
+    block: &BlockDto,
+    remaining_nodes: &mut usize,
+    remaining_bytes: &mut usize,
+) -> Option<BlockDto> {
+    if *remaining_nodes == 0 {
+        return None;
+    }
+    let mut dto = shallow_application_block(block);
+    let bytes = crate::model::block_dto_estimated_bytes(&dto);
+    if bytes > *remaining_bytes {
+        return None;
+    }
+    *remaining_nodes -= 1;
+    *remaining_bytes -= bytes;
+    for child in &block.children {
+        let Some(child) =
+            clone_application_subtree_bounded(child, remaining_nodes, remaining_bytes)
+        else {
+            break;
+        };
+        dto.children.push(child);
+    }
+    Some(dto)
+}
+
 fn navigation_property_references(text: &str, output: &mut Vec<(String, String)>) {
     for line in text.lines() {
         let Some((key, value)) = crate::doc::parse_property_line(line) else {
@@ -7911,8 +8034,154 @@ impl RuntimeActor {
                     ),
                 )
             }
+            SyncApplicationNavigationRequest::ResolveBlocks { uuids } => {
+                SyncApplicationNavigationReply::ResolveBlocks(
+                    self.application_resolve_blocks_ready(&uuids)?,
+                )
+            }
+            SyncApplicationNavigationRequest::PreviewBlock {
+                uuid,
+                max_nodes,
+                max_bytes,
+            } => SyncApplicationNavigationReply::PreviewBlock(
+                self.application_preview_block_ready(&uuid, max_nodes, max_bytes)?,
+            ),
         };
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
+    }
+
+    fn application_block_candidates_ready(
+        &self,
+        uuids: &[String],
+        retain_subtrees: bool,
+    ) -> Result<HashMap<String, (String, PageKind, BlockDto)>, SyncApplicationPageRequestError>
+    {
+        let wanted = uuids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let overlay = self.application_navigation_overlay_ready()?;
+        let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
+        let mut resolved = HashMap::new();
+
+        // The committed overlay is the exact current suffix. Search it first,
+        // and mask every affected SQLite page even when the UUID was removed.
+        for current in overlay.values().flatten() {
+            let page = &current.1;
+            for (uuid, block) in find_application_blocks(&page.blocks, &wanted) {
+                let block = if retain_subtrees {
+                    block.clone()
+                } else {
+                    shallow_application_block(block)
+                };
+                resolved
+                    .entry(uuid)
+                    .or_insert_with(|| (page.name.clone(), page.kind, block));
+            }
+        }
+
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        let mut candidates: HashMap<PageId, Vec<String>> = HashMap::new();
+        for uuid in wanted {
+            if resolved.contains_key(uuid) {
+                continue;
+            }
+            let Ok(uuid_value) = Uuid::parse_str(uuid) else {
+                continue;
+            };
+            let logseq_uuid = LogseqUuid::from_uuid(uuid_value);
+            let Some(block) = read
+                .block_by_logseq_uuid(logseq_uuid)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+            else {
+                continue;
+            };
+            let Some(page) = read
+                .page(block.page_id)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+            else {
+                return Err(SyncApplicationPageRequestError::ActorRefused);
+            };
+            if !masked_paths.contains(&page.path) {
+                candidates
+                    .entry(block.page_id)
+                    .or_default()
+                    .push(uuid.to_owned());
+            }
+        }
+        drop(read);
+
+        for (page_id, candidate_uuids) in candidates {
+            let page = self.load_application_page_id_ready(page_id)?.page;
+            let candidate_set = candidate_uuids
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            // SQLite only located a candidate. The parser-owned DTO must still
+            // prove the exact spelling and current block membership.
+            for (uuid, block) in find_application_blocks(&page.blocks, &candidate_set) {
+                let block = if retain_subtrees {
+                    block.clone()
+                } else {
+                    shallow_application_block(block)
+                };
+                resolved.insert(uuid, (page.name.clone(), page.kind, block));
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn application_resolve_blocks_ready(
+        &self,
+        uuids: &[String],
+    ) -> Result<Vec<Option<RefGroup>>, SyncApplicationPageRequestError> {
+        let candidates = self.application_block_candidates_ready(uuids, false)?;
+        Ok(uuids
+            .iter()
+            .map(|uuid| {
+                candidates.get(uuid).map(|(page, kind, block)| RefGroup {
+                    page: page.clone(),
+                    kind: *kind,
+                    blocks: vec![shallow_application_block(block)],
+                    evidence: Vec::new(),
+                })
+            })
+            .collect())
+    }
+
+    fn application_preview_block_ready(
+        &self,
+        uuid: &str,
+        max_nodes: usize,
+        max_bytes: usize,
+    ) -> Result<Option<BlockPreview>, SyncApplicationPageRequestError> {
+        let candidates = self.application_block_candidates_ready(&[uuid.to_owned()], true)?;
+        let Some((page, kind, block)) = candidates.get(uuid) else {
+            return Ok(None);
+        };
+        let total = application_subtree_nodes(block);
+        let mut remaining_nodes = max_nodes;
+        let mut remaining_bytes = max_bytes;
+        let blocks =
+            clone_application_subtree_bounded(block, &mut remaining_nodes, &mut remaining_bytes)
+                .into_iter()
+                .collect::<Vec<_>>();
+        let emitted = max_nodes.saturating_sub(remaining_nodes);
+        Ok(Some(BlockPreview {
+            group: RefGroup {
+                page: page.clone(),
+                kind: *kind,
+                blocks,
+                evidence: Vec::new(),
+            },
+            truncated: total.saturating_sub(emitted),
+        }))
     }
 
     fn application_navigation_pages_ready(
@@ -17655,6 +17924,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             "managed navigation must share Direct Files quick-switch semantics"
         );
+        let requested = vec![
+            genuine.to_owned(),
+            genuine.to_owned(),
+            genuine.to_ascii_uppercase(),
+            Uuid::nil().to_string(),
+        ];
+        let SyncApplicationNavigationReply::ResolveBlocks(resolved) =
+            navigation(SyncApplicationNavigationRequest::ResolveBlocks {
+                uuids: requested.clone(),
+            })
+        else {
+            panic!("wrong block-resolution reply")
+        };
+        let direct_resolved = graph.resolve_blocks(&requested);
+        let (managed_page, _) = load_application_logical(&handle, "Ordinary Ω", SyncPageKind::Page);
+        let managed_frontend_id = managed_page.blocks[0].id.clone();
+        assert_eq!(resolved.len(), direct_resolved.len());
+        for (actual, expected) in resolved.iter().zip(&direct_resolved) {
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => {
+                    assert_eq!(actual.page, expected.page);
+                    assert_eq!(actual.kind, expected.kind);
+                    // Managed pages expose an imported Logseq UUID as their
+                    // frontend identity, while Direct Files retains the
+                    // parser's runtime identity. Resolution must use the ID
+                    // of the page shape that its own mode will hydrate.
+                    assert_eq!(actual.blocks[0].id, managed_frontend_id);
+                    assert_eq!(actual.blocks[0].raw, expected.blocks[0].raw);
+                    assert!(actual.blocks[0].children.is_empty());
+                }
+                (None, None) => {}
+                pair => panic!("managed/direct block resolution differs: {pair:?}"),
+            }
+        }
+        let SyncApplicationNavigationReply::PreviewBlock(preview) =
+            navigation(SyncApplicationNavigationRequest::PreviewBlock {
+                uuid: genuine.into(),
+                max_nodes: 1,
+                max_bytes: 60 * 1024,
+            })
+        else {
+            panic!("wrong block-preview reply")
+        };
+        let preview = preview.expect("managed preview resolves explicit Logseq UUID");
+        assert_eq!(preview.group.page, "Ordinary Ω");
+        assert_eq!(preview.group.blocks[0].id, genuine);
+        assert!(preview.group.blocks[0].children.is_empty());
+        assert_eq!(preview.truncated, 1);
         for path in [
             "content/nested pages/Ordinary Ω.md",
             "diary/日記/2026_07_30.org",
@@ -17736,16 +18053,20 @@ mod tests {
         let fixture = RuntimeHostFixture::safe("sync-runtime-application-navigation-frontier");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
         drive_initial_feed(&handle);
+        let identity = "8d6e1991-2c3a-4efe-b3d2-6f5a7bc8a901";
         admit_external_page(
             &handle,
             &fixture,
             "content/nested pages/Navigation.md",
-            b"icon:: old\nalias:: Old Alias\n\n- mentions [[Old Phantom]]\n",
+            format!(
+                "icon:: old\nalias:: Old Alias\n\n- mentions [[Old Phantom]]\n  id:: {identity}\n"
+            )
+            .as_bytes(),
         );
         let (mut page, revision) =
             load_application_exact(&handle, "content/nested pages/Navigation.md");
         page.pre_block = Some("icon:: new\nalias:: New Alias".into());
-        page.blocks[0].raw = "- mentions [[New Phantom]]".into();
+        page.blocks[0].raw = format!("- mentions [[New Phantom]]\n  id:: {identity}");
         let saved = handle
             .save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::Existing {
@@ -17781,6 +18102,16 @@ mod tests {
         };
         assert!(names.iter().any(|name| name == "New Phantom"));
         assert!(!names.iter().any(|name| name == "Old Phantom"));
+        let SyncApplicationNavigationReply::ResolveBlocks(resolved) =
+            loaded(SyncApplicationNavigationRequest::ResolveBlocks {
+                uuids: vec![identity.into()],
+            })
+        else {
+            panic!("wrong block-resolution reply")
+        };
+        assert!(resolved[0]
+            .as_ref()
+            .is_some_and(|group| group.blocks[0].raw.contains("New Phantom")));
         let SyncApplicationNavigationReply::PageIcons(icons) =
             loaded(SyncApplicationNavigationRequest::PageIcons {
                 names: vec!["Navigation".into(), "New Alias".into()],
