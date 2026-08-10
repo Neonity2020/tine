@@ -406,6 +406,34 @@ struct ManagedApplicationQueryInstrumentation {
 }
 
 #[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedTaskQueryOverlaySnapshot {
+    entries: Vec<ManagedTaskQueryOverlayEntrySnapshot>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedTaskQueryOverlayEntrySnapshot {
+    path: String,
+    sequence: u64,
+    state: ManagedTaskQueryOverlayStateSnapshot,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ManagedTaskQueryOverlayStateSnapshot {
+    Complete {
+        page_id: PageId,
+        name: String,
+        kind: ManagedTextKind,
+        format: Format,
+        preamble: Option<String>,
+        blocks: Vec<(BlockId, Option<BlockId>, String, String, Option<LogseqUuid>)>,
+    },
+    Incomplete,
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ManagedApplicationSaveStageTimings {
     actor_total: Duration,
@@ -3765,6 +3793,20 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn managed_task_query_overlay_snapshot(
+        &self,
+    ) -> Result<ManagedTaskQueryOverlaySnapshot, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ManagedTaskQueryOverlaySnapshot {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn tick_provider_for_test(&self) -> Result<SyncRuntimeTick, SyncRuntimeRequestError> {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
@@ -6603,6 +6645,10 @@ enum ActorRequest {
         reply: mpsc::Sender<ManagedApplicationQueryInstrumentation>,
     },
     #[cfg(test)]
+    ManagedTaskQueryOverlaySnapshot {
+        reply: mpsc::Sender<ManagedTaskQueryOverlaySnapshot>,
+    },
+    #[cfg(test)]
     TickProviderForTest {
         reply: mpsc::Sender<SyncRuntimeTick>,
     },
@@ -6900,6 +6946,11 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
+            ActorRequest::ManagedTaskQueryOverlaySnapshot { reply } => {
+                let _ = reply.send(actor.managed_task_query_overlay_snapshot());
+                false
+            }
+            #[cfg(test)]
             ActorRequest::TickProviderForTest { reply } => {
                 if !actor.provider_has_work()
                     && actor.provider_accepted_manifest_revalidation_ready
@@ -6977,11 +7028,53 @@ enum PendingManagedLocalCommit {
     Response(TrustedLocalCommitted),
 }
 
+/// Parser-owned input retained for one exact, not-yet-materialized page.
+///
+/// This is deliberately shallow: Q2 can reconstruct candidate blocks and
+/// their ancestry without reparsing a complete page at query time, but it
+/// cannot obtain task semantics from SQLite's derived facets.
+#[derive(Clone, Debug)]
+struct LatestTaskQueryOverlayPage {
+    page_id: PageId,
+    name: String,
+    path: ManagedPath,
+    kind: ManagedTextKind,
+    format: Format,
+    preamble: Option<String>,
+    blocks: BTreeMap<BlockId, LatestTaskQueryOverlayBlock>,
+}
+
+#[derive(Clone, Debug)]
+struct LatestTaskQueryOverlayBlock {
+    block_id: BlockId,
+    parent: Option<BlockId>,
+    order: String,
+    content: String,
+    logseq_uuid: Option<LogseqUuid>,
+}
+
+/// Every locally newest projection frame has one entry.  An incomplete entry
+/// is authority too: it prevents a later sparse reader from accidentally
+/// combining a stale SQLite row with a hot frame it cannot fully re-evaluate.
+#[derive(Clone, Debug)]
+enum LatestTaskQueryOverlayState {
+    Complete(LatestTaskQueryOverlayPage),
+    Incomplete,
+}
+
+#[derive(Clone, Debug)]
+struct LatestTaskQueryOverlayEntry {
+    sequence: u64,
+    path: ManagedPath,
+    state: LatestTaskQueryOverlayState,
+}
+
 struct ManagedLocalRuntimeState {
     directory: Dir,
     journal: ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
     frames: VecDeque<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     latest_projection_frames: BTreeMap<String, LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
+    latest_task_query_overlay: BTreeMap<String, LatestTaskQueryOverlayEntry>,
     checkpoint: ManagedLocalDrainCheckpoint,
     checkpoint_batch_id: Option<BatchId>,
     continuation: Option<ManagedLocalDrainContinuation>,
@@ -7011,6 +7104,144 @@ impl ManagedLocalRuntimeState {
             .as_ref()
             .map(|continuation| format!("{:?}", continuation.stage()).to_ascii_lowercase())
             .or_else(|| (!self.frames.is_empty()).then(|| "authenticate".into()))
+    }
+
+    fn note_latest_projection_frame(
+        &mut self,
+        path: ManagedPath,
+        frame: LocalJournalFrame<ManagedLocalJournalPayloadKind>,
+    ) {
+        let key = path.as_str().to_owned();
+        self.latest_projection_frames
+            .insert(key.clone(), frame.clone());
+        self.latest_task_query_overlay.insert(
+            key,
+            LatestTaskQueryOverlayEntry {
+                sequence: frame.sequence(),
+                path,
+                state: LatestTaskQueryOverlayState::Incomplete,
+            },
+        );
+    }
+
+    fn install_latest_task_query_overlay(
+        &mut self,
+        sequence: u64,
+        page: LatestTaskQueryOverlayPage,
+    ) {
+        let key = page.path.as_str().to_owned();
+        if self
+            .latest_projection_frames
+            .get(&key)
+            .is_some_and(|frame| frame.sequence() == sequence)
+            && self
+                .latest_task_query_overlay
+                .get(&key)
+                .is_some_and(|entry| entry.sequence == sequence)
+        {
+            self.latest_task_query_overlay.insert(
+                key,
+                LatestTaskQueryOverlayEntry {
+                    sequence,
+                    path: page.path.clone(),
+                    state: LatestTaskQueryOverlayState::Complete(page),
+                },
+            );
+        }
+    }
+
+    fn retire_latest_task_query_overlay(&mut self, path: &ManagedPath, sequence: u64) {
+        let key = path.as_str();
+        if self
+            .latest_task_query_overlay
+            .get(key)
+            .is_some_and(|entry| entry.sequence == sequence)
+        {
+            self.latest_task_query_overlay.remove(key);
+        }
+    }
+}
+
+fn latest_task_query_overlay_page_from_application(
+    current: &ApplicationCurrentPage,
+) -> Result<LatestTaskQueryOverlayPage, ()> {
+    let parsed = flatten_application_blocks(&current.page.blocks);
+    if parsed.len() != current.editor.dto.blocks.len()
+        || parsed.len() != current.editor.blocks.len()
+    {
+        return Err(());
+    }
+    let materialized = current
+        .editor
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    let mut blocks = BTreeMap::new();
+    for (index, parsed_block) in parsed.iter().enumerate() {
+        let SyncEditorBlockKey::Existing(id) = &current.editor.dto.blocks[index].key else {
+            return Err(());
+        };
+        let block_id = parse_editor_block_id(id).map_err(|_| ())?;
+        let materialized = materialized.get(&block_id).ok_or(())?;
+        if materialized.content != parsed_block.block.raw
+            || blocks
+                .insert(
+                    block_id,
+                    LatestTaskQueryOverlayBlock {
+                        block_id,
+                        parent: materialized.parent,
+                        order: materialized.order.clone(),
+                        content: parsed_block.block.raw.clone(),
+                        logseq_uuid: materialized.logseq_uuid,
+                    },
+                )
+                .is_some()
+        {
+            return Err(());
+        }
+    }
+    Ok(LatestTaskQueryOverlayPage {
+        page_id: current.editor.page.page_id,
+        name: current.page.name.clone(),
+        path: current.editor.page.path.clone(),
+        kind: current.editor.page.kind,
+        format: current.page.format,
+        preamble: current.page.pre_block.clone(),
+        blocks,
+    })
+}
+
+fn latest_task_query_overlay_after_recovery(
+    runtime: &PromotedLocalRuntime,
+    graph: &Graph,
+    path: ManagedPath,
+    sequence: u64,
+) -> LatestTaskQueryOverlayEntry {
+    let state = match runtime.engine().current_page_at_path(&path) {
+        Ok(CurrentPageAtPath::ExactOwner(owner)) => {
+            match load_hot_source_authenticated_application_page(runtime, graph, owner.page_id()) {
+                Ok(Some(current)) if current.editor.page.path == path => {
+                    latest_task_query_overlay_page_from_application(&current)
+                        .map(LatestTaskQueryOverlayState::Complete)
+                        .unwrap_or(LatestTaskQueryOverlayState::Incomplete)
+                }
+                Ok(None) | Ok(Some(_)) | Err(_) => LatestTaskQueryOverlayState::Incomplete,
+            }
+        }
+        Ok(CurrentPageAtPath::Released(_) | CurrentPageAtPath::Unowned) => {
+            LatestTaskQueryOverlayState::Incomplete
+        }
+        Ok(
+            CurrentPageAtPath::PortableCollision(_)
+            | CurrentPageAtPath::ReleasedPortableCollision(_),
+        )
+        | Err(_) => LatestTaskQueryOverlayState::Incomplete,
+    };
+    LatestTaskQueryOverlayEntry {
+        sequence,
+        path,
+        state,
     }
 }
 
@@ -8821,6 +9052,7 @@ fn open_managed_local_runtime(
             journal,
             frames: VecDeque::new(),
             latest_projection_frames: BTreeMap::new(),
+            latest_task_query_overlay: BTreeMap::new(),
             checkpoint,
             checkpoint_batch_id,
             continuation: None,
@@ -8877,6 +9109,7 @@ fn open_managed_local_runtime(
 
     let mut frames = VecDeque::new();
     let mut latest_projection_frames = BTreeMap::new();
+    let mut latest_task_query_overlay = BTreeMap::new();
     for frame in recovered_frames.iter().skip(checkpointed) {
         let record = decode_managed_local_record(frame).map_err(|error| {
             format!(
@@ -8885,9 +9118,16 @@ fn open_managed_local_runtime(
                 frame.sequence()
             )
         })?;
-        latest_projection_frames.insert(
-            record.projection().intent().path().as_str().to_owned(),
-            frame.clone(),
+        let path = record.projection().intent().path().clone();
+        let key = path.as_str().to_owned();
+        latest_projection_frames.insert(key.clone(), frame.clone());
+        latest_task_query_overlay.insert(
+            key,
+            LatestTaskQueryOverlayEntry {
+                sequence: frame.sequence(),
+                path,
+                state: LatestTaskQueryOverlayState::Incomplete,
+            },
         );
     }
     for frame in recovered_frames.into_iter().skip(checkpointed) {
@@ -8940,11 +9180,26 @@ fn open_managed_local_runtime(
         frames.push_back(frame);
     }
 
+    // This is an open-time recovery seam, before the actor can admit
+    // application requests.  Recreate only exact hot-page authority; a
+    // malformed or ambiguous entry deliberately remains `Incomplete` so a
+    // future sparse reader can take one whole-query fallback.
+    drop(session);
+    for entry in latest_task_query_overlay.values_mut() {
+        *entry = latest_task_query_overlay_after_recovery(
+            runtime,
+            graph,
+            entry.path.clone(),
+            entry.sequence,
+        );
+    }
+
     Ok(ManagedLocalRuntimeState {
         directory,
         journal,
         frames,
         latest_projection_frames,
+        latest_task_query_overlay,
         checkpoint,
         checkpoint_batch_id,
         continuation: None,
@@ -9387,6 +9642,55 @@ impl RuntimeActor {
     #[cfg(test)]
     fn managed_application_query_instrumentation(&self) -> ManagedApplicationQueryInstrumentation {
         self.managed_application_query_instrumentation.get()
+    }
+
+    #[cfg(test)]
+    fn managed_task_query_overlay_snapshot(&self) -> ManagedTaskQueryOverlaySnapshot {
+        let entries = self
+            .managed_local
+            .as_ref()
+            .map(|managed| {
+                managed
+                    .latest_task_query_overlay
+                    .values()
+                    .map(|entry| {
+                        let state = match &entry.state {
+                            LatestTaskQueryOverlayState::Complete(page) => {
+                                ManagedTaskQueryOverlayStateSnapshot::Complete {
+                                    page_id: page.page_id,
+                                    name: page.name.clone(),
+                                    kind: page.kind,
+                                    format: page.format,
+                                    preamble: page.preamble.clone(),
+                                    blocks: page
+                                        .blocks
+                                        .values()
+                                        .map(|block| {
+                                            (
+                                                block.block_id,
+                                                block.parent,
+                                                block.order.clone(),
+                                                block.content.clone(),
+                                                block.logseq_uuid,
+                                            )
+                                        })
+                                        .collect(),
+                                }
+                            }
+                            LatestTaskQueryOverlayState::Incomplete => {
+                                ManagedTaskQueryOverlayStateSnapshot::Incomplete
+                            }
+                        };
+                        ManagedTaskQueryOverlayEntrySnapshot {
+                            path: entry.path.as_str().to_owned(),
+                            sequence: entry.sequence,
+                            state,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ManagedTaskQueryOverlaySnapshot { entries }
     }
 
     #[cfg(test)]
@@ -13689,32 +13993,35 @@ impl RuntimeActor {
                 }
             }
             PendingManagedLocalCommit::Response(committed) => {
-                if self
-                    .application_from_trusted_local_commit(&committed)
-                    .is_ok()
-                {
-                    return Ok(true);
+                match self.application_from_trusted_local_commit(&committed) {
+                    Ok(application) => {
+                        self.install_latest_task_query_overlay(committed.sequence(), &application);
+                        return Ok(true);
+                    }
+                    Err(_) => {
+                        self.managed_local
+                            .as_mut()
+                            .expect("managed-local runtime remains installed")
+                            .pending_commit = Some(PendingManagedLocalCommit::Response(committed));
+                        return Ok(false);
+                    }
                 }
-                self.managed_local
-                    .as_mut()
-                    .expect("managed-local runtime remains installed")
-                    .pending_commit = Some(PendingManagedLocalCommit::Response(committed));
-                return Ok(false);
             }
         };
         match outcome {
             TrustedLocalCommitOutcome::Committed(committed) => {
-                if self
-                    .application_from_trusted_local_commit(&committed)
-                    .is_ok()
-                {
-                    Ok(true)
-                } else {
-                    self.managed_local
-                        .as_mut()
-                        .expect("managed-local runtime remains installed")
-                        .pending_commit = Some(PendingManagedLocalCommit::Response(committed));
-                    Ok(false)
+                match self.application_from_trusted_local_commit(&committed) {
+                    Ok(application) => {
+                        self.install_latest_task_query_overlay(committed.sequence(), &application);
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        self.managed_local
+                            .as_mut()
+                            .expect("managed-local runtime remains installed")
+                            .pending_commit = Some(PendingManagedLocalCommit::Response(committed));
+                        Ok(false)
+                    }
                 }
             }
             TrustedLocalCommitOutcome::CommittedPendingProjection(pending) => {
@@ -14162,13 +14469,8 @@ impl RuntimeActor {
         let queued_frame =
             LocalJournalFrame::new(managed.journal.device_id(), sequence, payload_kind, payload);
         let queued_record = decode_managed_editor_record(&queued_frame)?;
-        managed.latest_projection_frames.insert(
-            queued_record
-                .projection()
-                .intent()
-                .path()
-                .as_str()
-                .to_owned(),
+        managed.note_latest_projection_frame(
+            queued_record.projection().intent().path().clone(),
             queued_frame.clone(),
         );
         managed.frames.push_back(queued_frame);
@@ -14178,6 +14480,10 @@ impl RuntimeActor {
                 TrustedLocalCommitOutcome::Committed(committed) => {
                     match self.application_from_trusted_local_commit(&committed) {
                         Ok(application) => {
+                            self.install_latest_task_query_overlay(
+                                committed.sequence(),
+                                &application,
+                            );
                             let page = application.editor.dto.clone();
                             self.prepared_application_reply =
                                 Some((batch_id.to_string(), application));
@@ -14322,6 +14628,19 @@ impl RuntimeActor {
             MAX_SYNC_APPLICATION_PAGE_BLOCKS,
         )?;
         join_application_page(parsed, editor).map_err(|_| SyncEditorRequestError::ActorRefused)
+    }
+
+    fn install_latest_task_query_overlay(
+        &mut self,
+        sequence: u64,
+        current: &ApplicationCurrentPage,
+    ) {
+        let Ok(page) = latest_task_query_overlay_page_from_application(current) else {
+            return;
+        };
+        if let Some(managed) = self.managed_local.as_mut() {
+            managed.install_latest_task_query_overlay(sequence, page);
+        }
     }
 
     fn tick_managed_local_derivative(&mut self) -> Option<SyncRuntimeTick> {
@@ -14546,6 +14865,10 @@ impl RuntimeActor {
                     managed
                         .latest_projection_frames
                         .remove(record.projection().intent().path().as_str());
+                    managed.retire_latest_task_query_overlay(
+                        record.projection().intent().path(),
+                        completion.sequence,
+                    );
                 }
                 managed.continuation = None;
                 managed.authorship_complete.remove(&completion.batch_id);
@@ -22726,6 +23049,193 @@ mod tests {
             path: String::new(),
             guide: false,
         }
+    }
+
+    #[test]
+    fn managed_task_query_overlay_tracks_exact_existing_pages_and_retires_after_drain() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-task-query-overlay");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        let page = new_application_page(
+            "Overlay Authority",
+            SyncPageKind::Page,
+            Some("query:: overlay"),
+            vec![
+                BlockDto {
+                    id: "overlay-parent".into(),
+                    raw: "parent".into(),
+                    children: vec![BlockDto {
+                        id: "overlay-child".into(),
+                        raw:
+                            "TODO [#A] child SCHEDULED: <2026-08-10 Mon> DEADLINE: <2026-08-12 Wed>"
+                                .into(),
+                        ..BlockDto::default()
+                    }],
+                    ..BlockDto::default()
+                },
+                BlockDto {
+                    id: "overlay-second-root".into(),
+                    raw: "TODO second root".into(),
+                    ..BlockDto::default()
+                },
+            ],
+        );
+        let (mut page, revision) = accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::New {
+                        name: "Overlay Authority".into(),
+                        page_kind: SyncPageKind::Page,
+                    },
+                    page,
+                })
+                .unwrap(),
+            "Overlay Authority",
+            SyncPageKind::Page,
+        );
+        // New-page writes use the ordinary fully published transaction path;
+        // there is no absent-target managed-local frame to mask.
+        assert!(handle
+            .managed_task_query_overlay_snapshot()
+            .unwrap()
+            .entries
+            .is_empty());
+
+        assert!(page.blocks.iter().all(|block| !block.id.is_empty()));
+        assert!(page.blocks[0]
+            .children
+            .iter()
+            .all(|block| !block.id.is_empty()));
+        assert_ne!(page.blocks[0].id, page.blocks[1].id);
+        assert_ne!(page.blocks[0].id, page.blocks[0].children[0].id);
+        assert_ne!(page.blocks[1].id, page.blocks[0].children[0].id);
+
+        let second = page.blocks.remove(1);
+        page.blocks[0].children.push(second);
+        let path = page.path.clone();
+        let (_, _) = accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: path.clone(),
+                        revision,
+                    },
+                    page,
+                })
+                .unwrap(),
+            "Overlay Authority",
+            SyncPageKind::Page,
+        );
+
+        let snapshot = handle.managed_task_query_overlay_snapshot().unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        let entry = &snapshot.entries[0];
+        assert_eq!(entry.path, path);
+        match &entry.state {
+            ManagedTaskQueryOverlayStateSnapshot::Complete {
+                page_id: _,
+                name,
+                kind,
+                format,
+                preamble,
+                blocks,
+            } => {
+                assert_eq!(name, "Overlay Authority");
+                assert_eq!(*kind, ManagedTextKind::Page);
+                assert_eq!(*format, Format::Md);
+                assert_eq!(preamble.as_deref(), Some("query:: overlay"));
+                assert_eq!(blocks.len(), 3);
+                assert!(blocks.iter().any(|(_, parent, _, content, _)| {
+                    parent.is_some()
+                        && content.contains("TODO [#A] child")
+                        && content.contains("SCHEDULED:")
+                        && content.contains("DEADLINE:")
+                }));
+                assert!(blocks
+                    .iter()
+                    .any(|(_, parent, _, content, _)| parent.is_some()
+                        && content == "TODO second root"));
+            }
+            ManagedTaskQueryOverlayStateSnapshot::Incomplete => {
+                panic!("accepted exact page did not construct a shallow overlay")
+            }
+        }
+
+        for _ in 0..64 {
+            if handle.status().unwrap().managed_local_pending == 0 {
+                break;
+            }
+            let _ = handle.tick().unwrap();
+        }
+        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+        assert!(handle
+            .managed_task_query_overlay_snapshot()
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_task_query_overlay_stays_at_exact_existing_page_seams() {
+        let source = include_str!("sync_runtime.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production source has its test boundary");
+        let simple_query = production
+            .split_once("    fn application_simple_query_ready(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn application_all_query_pages_ready(")
+                    .map(|(body, _)| body)
+            })
+            .expect("simple query retains a narrow boundary");
+        assert!(
+            !simple_query.contains("latest_task_query_overlay"),
+            "Q1 must not add a query-time overlay path before Q2"
+        );
+
+        let editor = production
+            .split_once("    fn execute_editor_transaction(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn finish_trusted_local_editor_outcome(")
+                    .map(|(body, _)| body)
+            })
+            .expect("editor transaction retains a narrow boundary");
+        assert!(editor.contains("Some(target_page)"));
+        assert!(editor.contains("None => TrustedLocalRuntimeAttempt::Declined"));
+
+        let unit = production
+            .split_once("    fn execute_application_unit_transaction(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn trash_application_journal_file(")
+                    .map(|(body, _)| body)
+            })
+            .expect("application unit transaction retains a narrow boundary");
+        assert!(unit.contains("SyncLocalMutationOutcome::Durable"));
+        assert!(unit.contains("settle_application_publication"));
+
+        let recovery = production
+            .split_once("fn open_managed_local_runtime(")
+            .and_then(|(_, tail)| tail.split_once("\nimpl RuntimeActor").map(|(body, _)| body))
+            .expect("managed-local open retains a narrow boundary");
+        assert!(recovery.contains("latest_task_query_overlay_after_recovery"));
+        assert!(recovery.contains("drop(session)"));
+
+        let drain = production
+            .split_once("    fn tick_managed_local_derivative(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn compact_drained_managed_local_journal(")
+                    .map(|(body, _)| body)
+            })
+            .expect("managed-local drain retains a narrow boundary");
+        assert!(drain.contains("retire_latest_task_query_overlay"));
     }
 
     #[test]

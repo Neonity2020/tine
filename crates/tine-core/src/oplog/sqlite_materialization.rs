@@ -1994,6 +1994,32 @@ pub struct MaterializedTaskCandidatePageRow {
     pub page_id: PageId,
 }
 
+/// One physical task-index candidate, converted at Tine's managed-storage
+/// boundary. The raw block text deliberately remains parser-owned input; task
+/// facets are not accepted from SQLite as query semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedTaskCandidateBlockRow {
+    pub block_id: BlockId,
+    pub page_id: PageId,
+    pub parent: Option<BlockId>,
+    pub order: String,
+    pub content: String,
+    pub logseq_uuid: Option<LogseqUuid>,
+    pub page_name: String,
+    pub page_path: ManagedPath,
+    pub page_kind: ManagedTextKind,
+}
+
+/// The deliberately text-free structural record used for a bounded ancestor
+/// walk by a caller that already owns the candidate's parser input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockStructureRow {
+    pub block_id: BlockId,
+    pub page_id: PageId,
+    pub parent: Option<BlockId>,
+    pub order: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPropertyRow {
     pub owner: MaterializedEntityId,
@@ -2439,6 +2465,36 @@ impl<'a> SqliteMaterializedRead<'a> {
             .collect()
     }
 
+    pub fn task_candidate_blocks_after(
+        &self,
+        marker: &str,
+        after: Option<(PageId, BlockId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedTaskCandidateBlockRow>, MaterializationError> {
+        convert_rows(
+            self.inner
+                .task_candidate_blocks_after_with_header_validation(
+                    marker,
+                    after.map(|(page, block)| {
+                        (page.as_uuid().into_bytes(), block.as_uuid().into_bytes())
+                    }),
+                    limit,
+                    validate_storage_page_header,
+                )?,
+            task_candidate_block_row_from_storage,
+        )
+    }
+
+    pub fn block_structure(
+        &self,
+        block_id: BlockId,
+    ) -> Result<Option<MaterializedBlockStructureRow>, MaterializationError> {
+        self.inner
+            .block_structure(block_id.as_uuid().into_bytes())?
+            .map(block_structure_row_from_storage)
+            .transpose()
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -2666,6 +2722,39 @@ fn task_row_from_storage(
     })
 }
 
+fn task_candidate_block_row_from_storage(
+    row: storage::PhysicalTaskCandidateBlockRow,
+) -> Result<MaterializedTaskCandidateBlockRow, MaterializationError> {
+    Ok(MaterializedTaskCandidateBlockRow {
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        parent: row
+            .parent
+            .map(|id| BlockId::from_uuid(Uuid::from_bytes(id))),
+        order: row.order,
+        content: row.content,
+        logseq_uuid: row
+            .logseq_uuid
+            .map(|id| LogseqUuid::from_uuid(Uuid::from_bytes(id))),
+        page_name: row.page_name,
+        page_path: ManagedPath::parse(row.page_path).map_err(typed_sql_decode_error)?,
+        page_kind: text_kind_from_sql(row.page_text_kind).map_err(typed_sql_decode_error)?,
+    })
+}
+
+fn block_structure_row_from_storage(
+    row: storage::PhysicalBlockStructureRow,
+) -> Result<MaterializedBlockStructureRow, MaterializationError> {
+    Ok(MaterializedBlockStructureRow {
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        parent: row
+            .parent
+            .map(|id| BlockId::from_uuid(Uuid::from_bytes(id))),
+        order: row.order,
+    })
+}
+
 fn search_hit_from_storage(
     row: storage::PhysicalSearchHit,
 ) -> Result<MaterializedSearchHit, MaterializationError> {
@@ -2882,6 +2971,67 @@ mod tests {
             ContentDigest::of(b"external UUID authority"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn task_candidate_and_structure_rows_keep_typed_authority_boundaries() {
+        let page = page_id(1);
+        let parent = block_id(2);
+        let block = block_id(3);
+        let uuid = LogseqUuid::from_uuid(Uuid::from_u128(4));
+        let candidate = storage::PhysicalTaskCandidateBlockRow {
+            block_id: block.as_uuid().into_bytes(),
+            page_id: page.as_uuid().into_bytes(),
+            parent: Some(parent.as_uuid().into_bytes()),
+            order: "a".into(),
+            content: "TODO parser-owned semantics".into(),
+            logseq_uuid: Some(uuid.as_uuid().into_bytes()),
+            page_name: "Task page".into(),
+            page_path: "nested/task.md".into(),
+            page_text_kind: 0,
+        };
+        assert_eq!(
+            task_candidate_block_row_from_storage(candidate).unwrap(),
+            MaterializedTaskCandidateBlockRow {
+                block_id: block,
+                page_id: page,
+                parent: Some(parent),
+                order: "a".into(),
+                content: "TODO parser-owned semantics".into(),
+                logseq_uuid: Some(uuid),
+                page_name: "Task page".into(),
+                page_path: ManagedPath::parse("nested/task.md").unwrap(),
+                page_kind: ManagedTextKind::Page,
+            }
+        );
+        assert_eq!(
+            block_structure_row_from_storage(storage::PhysicalBlockStructureRow {
+                block_id: block.as_uuid().into_bytes(),
+                page_id: page.as_uuid().into_bytes(),
+                parent: Some(parent.as_uuid().into_bytes()),
+                order: "a".into(),
+            })
+            .unwrap(),
+            MaterializedBlockStructureRow {
+                block_id: block,
+                page_id: page,
+                parent: Some(parent),
+                order: "a".into(),
+            }
+        );
+
+        let invalid_header = storage::PhysicalTaskCandidateBlockRow {
+            block_id: block.as_uuid().into_bytes(),
+            page_id: page.as_uuid().into_bytes(),
+            parent: None,
+            order: "a".into(),
+            content: String::new(),
+            logseq_uuid: None,
+            page_name: "Task page".into(),
+            page_path: "/not-a-managed-path.md".into(),
+            page_text_kind: 99,
+        };
+        assert!(task_candidate_block_row_from_storage(invalid_header).is_err());
     }
 
     #[test]
