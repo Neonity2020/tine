@@ -40325,9 +40325,7 @@ mod tests {
             TOTAL_PAGES,
             4,
         );
-        let direct = Graph::open(&fixture.graph_root);
-        let mut expected = direct.run_graph_search("query-density-page", 0, MAX_ROWS, false);
-        let overlay_path = direct
+        let overlay_path = Graph::open(&fixture.graph_root)
             .list_pages()
             .into_iter()
             .next()
@@ -40347,13 +40345,47 @@ mod tests {
         let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
         let handle = opened.handle.expect("managed reopen retains its actor");
-        let (page, revision) = load_application_exact(&handle, &overlay_path);
+        let (mut page, revision) = load_application_exact(&handle, &overlay_path);
         let original_raw = page.blocks[0].raw.clone();
-        let _ = save_application_block_text(&handle, page, revision, &original_raw);
+        let edited_raw = format!("{original_raw} active-overlay-edit");
+        page.blocks[0].raw = edited_raw.clone();
+        let save = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision: revision.clone(),
+                },
+                page,
+            })
+            .unwrap();
+        let SyncApplicationPageSaveOutcome::Saved {
+            page: saved_page,
+            revision: saved_revision,
+            ..
+        } = save
+        else {
+            panic!("the overlay fixture edit was not accepted as a changed save: {save:?}")
+        };
+        assert_eq!(saved_page.blocks[0].raw, edited_raw);
+        assert_ne!(
+            saved_revision, revision,
+            "the overlay fixture must advance the page revision"
+        );
         assert_eq!(
             handle.status().unwrap().managed_local_pending,
             1,
             "the query must run with a real, undrained local overlay"
+        );
+        let direct = Graph::open(&fixture.graph_root);
+        let mut expected = direct.run_graph_search("query-density-page", 0, MAX_ROWS, false);
+        assert_eq!(
+            expected
+                .hits
+                .iter()
+                .filter(|hit| matches!(hit, crate::query_plan::QueryHit::Block { .. }))
+                .count(),
+            TOTAL_PAGES,
+            "the changed direct-file fixture must retain one matching block per page"
         );
 
         handle
