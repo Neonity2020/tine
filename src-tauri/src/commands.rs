@@ -4,8 +4,8 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_config_graph, with_filesystem_graph, with_graph, with_read_graph,
-    with_trash_graph, AppState, GraphContext,
+    slot_for_context, with_config_graph, with_filesystem_graph, with_graph, with_trash_graph,
+    AppState, GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;

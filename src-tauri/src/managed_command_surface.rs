@@ -30,8 +30,6 @@ pub(crate) enum ManagedRouting {
     /// Requires the legacy write authority: refused outright under a managed
     /// binding, with `SPARSE_V2_UNSUPPORTED`. This is the list M5 tracks.
     LegacyOnly,
-    /// Reads the graph, served from the managed read-only view.
-    ReadOnly,
     /// Writes `logseq/config.edn`, which is outside the oplog's document domain.
     ConfigWrite,
     /// Writes the recoverable trash tree, which is outside it too.
@@ -44,9 +42,7 @@ pub(crate) enum ManagedRouting {
     NoGraphSlot,
 }
 
-use ManagedRouting::{
-    ConfigWrite, Filesystem, LegacyOnly, ManagedRouted, NoGraphSlot, ReadOnly, TrashWrite,
-};
+use ManagedRouting::{ConfigWrite, Filesystem, LegacyOnly, ManagedRouted, NoGraphSlot, TrashWrite};
 
 /// The sources whose commands can reach a graph slot. The Android media,
 /// folder-picker and system-bar commands are deliberately outside this list;
@@ -312,8 +308,6 @@ const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("with_config_graph(", ConfigWrite),
     ("with_trash_graph(", TrashWrite),
     ("with_filesystem_graph(", Filesystem),
-    ("with_read_graph(", ReadOnly),
-    ("read_graph_cloned(", ReadOnly),
 ];
 
 const MARKER_PRECEDENCE: &[ManagedRouting] = &[
@@ -322,7 +316,6 @@ const MARKER_PRECEDENCE: &[ManagedRouting] = &[
     ConfigWrite,
     TrashWrite,
     Filesystem,
-    ReadOnly,
 ];
 
 /// Read every `#[tauri::command]` out of one source and classify it by the
