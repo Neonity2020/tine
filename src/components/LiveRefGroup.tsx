@@ -9,6 +9,7 @@ import { graphEpoch, graphMeta } from "../ui";
 import { OccurrenceControls } from "./ReferenceEvidence";
 import { startEditing } from "../editorController";
 import { isBuiltinHidden, rawOffsetToVisibleOffset } from "../editor/properties";
+import { graphBinding } from "../persistence";
 import { visibleBody } from "../render/block";
 import { LinkDepthContext } from "./linkDepth";
 
@@ -43,7 +44,11 @@ export function LiveRefGroup(props: {
 }): JSX.Element {
   const linkDepth = useContext(LinkDepthContext);
   const [near, setNear] = createSignal(false);
+  let active = true;
   let el: HTMLDivElement | undefined;
+  onCleanup(() => {
+    active = false;
+  });
   onMount(() => {
     if (!el) return;
     const node = el;
@@ -59,17 +64,29 @@ export function LiveRefGroup(props: {
       if (occupied) return occupied.kind === k && (!path || occupied.path === path);
       const epoch = graphEpoch();
       const root = graphMeta()?.root ?? "";
+      const binding = graphBinding();
       const dto = path ? await backend().getPageByPath(path) : await backend().getPage(p, k);
       // The component may have unmounted while this read was in flight. Never
       // let an old graph's DTO enter the new graph's shared working set.
-      if (graphEpoch() !== epoch || (graphMeta()?.root ?? "") !== root) return false;
+      if (
+        !active
+        || graphEpoch() !== epoch
+        || (graphMeta()?.root ?? "") !== root
+        || graphBinding() !== binding
+      ) return false;
       // Page names are not unique across kinds, while the frontend working set
       // is name-keyed. Refuse a page/journal twin that occupied the slot during
       // the await, and reject a mismatched backend response defensively.
       const after = pageByName(p);
       if (after) return after.kind === k && (!path || after.path === path);
       if (!dto || dto.name !== p || dto.kind !== k || (path && dto.path !== path)) return false;
-      ensurePageLoaded(dto);
+      const refusal = await ensurePageLoaded(dto, {
+        expectedGraphBinding: binding,
+        isRequestLive: () => active
+          && graphEpoch() === epoch
+          && (graphMeta()?.root ?? "") === root,
+      });
+      if (refusal) return false;
       const loaded = pageByName(p);
       return loaded?.kind === k && (!path || loaded.path === path);
     }

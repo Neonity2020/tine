@@ -8,8 +8,20 @@
 // page snapshot (pageToDto) and the loaded flag (doc.loaded) — used at call time,
 // so the store↔persistence import cycle resolves cleanly.
 
-import { doc, pageByName, pageInstanceGeneration, pageToDto } from "./store";
+import {
+  doc,
+  bumpEditGeneration,
+  editorActivationFor,
+  peekPageInstanceGeneration,
+  setProspectiveTarget,
+  pageByName,
+  pageInstanceGeneration,
+  pageToDto,
+  setEditorActivation,
+  sweepReplaceable,
+} from "./store";
 import { backend } from "./backend";
+import { onGraphRebound } from "./modeHooks";
 import { markConflict, clearConflict, isConflicted, conflicts, bumpDataRev, bumpPageInventoryRev, pushToast } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
@@ -32,6 +44,16 @@ const deletedPages = new Set<string>();
 // baseline update if the graph changed under it; resetSaveState also clears
 // `dirty` so a stray queued save becomes a no-op.
 let graphToken = 0;
+// Which GRAPH the app is bound to — a different question from `graphToken`, and
+// deliberately a different counter.
+//
+// `graphToken` is the SAVE-INVALIDATION epoch: `doSave` captures it, and on
+// failure restores the dirty mark only if it still matches. Moving it therefore
+// does not merely invalidate a save, it makes a FAILED save stop tracking the
+// edit as unsaved — neither written nor pending, and silently discarded at
+// close. Reusing it as the binding identity turned an in-place graph reopen into
+// exactly that data loss. (GH #254 increment 3, round 14.)
+let graphBindingRev = 0;
 // Per-page save queue: writes for one page run strictly one-after-another (never
 // concurrently) and each runs against the LATEST store state.
 const saveChain = new Map<string, Promise<boolean>>();
@@ -71,7 +93,18 @@ const heldSources = new Set<string>();
 // click belongs to a winner the user never saw.
 type ConflictObservation =
   | { kind: "direct"; epoch: number | null }
-  | { kind: "managed"; observation: { path: string; revision: string } | null };
+  | {
+      kind: "managed";
+      identity: number;
+      observation: { path: string; revision: string } | null;
+    };
+
+export type ManagedConflictObservationSnapshot = {
+  readonly identity: number;
+  readonly observation:
+    | { readonly kind: "observed"; readonly path: string; readonly revision: string }
+    | { readonly kind: "unobserved" };
+};
 
 const heldForcedSaves = new Map<string, ConflictObservation | null>();
 const heldByDest = new Map<string, string[]>();
@@ -82,6 +115,7 @@ const heldByDest = new Map<string, string[]>();
 // minted for a NEWER external winner, and overwrites bytes nobody was shown.
 // (GH #254 increment 2, adversarial implementation verification, finding 1.)
 const conflictObservation = new Map<string, ConflictObservation>();
+let managedConflictObservationClock = 0;
 
 // ---------------------------------------------------------------------------
 // Accessors — store.ts mutations call these instead of touching the guards.
@@ -92,9 +126,20 @@ export function isDirty(name: string): boolean {
   return dirty.has(name);
 }
 /** Mark a page dirty and schedule a debounced save. */
-export function markDirty(name: string) {
+export function markDirty(name: string, opts: { content?: boolean } = {}) {
   const page = pageByName(name);
   if (page?.readOnly || page?.guide) return;
+  // Every content mutation moves the edit generation, not just `setRaw`: a paste,
+  // an outline insert, a block move are all input the user made after clicking
+  // "Use disk version", and a counter that only tracks typing lets them be
+  // destroyed.
+  //
+  // But BOOKKEEPING must not move it. Re-arming an existing draft after clearing
+  // a false-positive banner changes nothing the user wrote, and counting it as
+  // post-click input cancels a discard the user never interrupted — reproduced
+  // writing the local draft where the disk winner was requested.
+  // (GH #254 increment 3.)
+  if (opts.content !== false) bumpEditGeneration(name);
   dirty.add(name);
   scheduleSave();
 }
@@ -103,6 +148,7 @@ export function markDirty(name: string) {
 export function addDirty(name: string) {
   const page = pageByName(name);
   if (page?.readOnly || page?.guide) return;
+  bumpEditGeneration(name);
   dirty.add(name);
 }
 /** Pages with pending edits (so the working-set cap can pin them). */
@@ -190,7 +236,8 @@ export async function applyDivergenceVerdict(name: string, stored: StoredPageSta
   // will ever write, and `flushAll` (which consults only `dirty`, in-flight
   // saves and `conflicts`) would then report the graph as safely landed and let
   // a close discard it.
-  markDirty(name);
+  // Bookkeeping, not input: this re-arms an existing draft, it does not change it.
+  markDirty(name, { content: false });
 }
 /** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
  *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
@@ -241,6 +288,17 @@ function releaseSourcesFor(dest: string) {
       continue;
     }
     dirty.add(s); // its removal (and any held edit) can write now
+    if (isConflicted(s)) {
+      // A conflicted source cannot travel the ORDINARY route: `doSave` returns at
+      // the conflicted-page guard before reaching the backend, so scheduling one
+      // leaves the page dirty behind a banner whose authority may already be dead,
+      // with nothing to clear it — the retry timer requires `!isConflicted` too.
+      // Re-observe instead: that intent exists precisely to bypass the guard, and
+      // it either lands or mints a fresh banner the user can answer.
+      // (GH #254 increment 3, D5.)
+      void enqueueSave(s, { kind: "reobserve" });
+      continue;
+    }
     any = true;
   }
   if (any) scheduleSave();
@@ -249,6 +307,75 @@ function releaseSourcesFor(dest: string) {
 export function setBaseRev(name: string, rev: string | null) {
   baseRev.set(name, rev);
 }
+/** Has this page been deleted? A deleted page must never be recreated by anything
+ *  that was already in flight when the deletion landed. */
+export function isTombstoned(name: string): boolean {
+  return deletedPages.has(name);
+}
+
+/**
+ * Which GRAPH the app is bound to. Changes only when the binding actually
+ * changes (`resetSaveState`, i.e. a graph switch or reload).
+ *
+ * Deliberately not `graphEpoch()`, which is a RENDER epoch: changing typography
+ * mode, the journal title format, or a setting bumps it to repaint open pages,
+ * without the graph moving at all. Work that must not cross a graph switch has
+ * to key off the binding — keying off the render epoch means a user toggling a
+ * display preference invalidates in-flight work that was perfectly valid.
+ * (GH #254 increment 3, round 12.)
+ */
+export function graphBinding(): number {
+  return graphBindingRev;
+}
+
+/**
+ * Declare that the graph has been REBOUND without a full store reset.
+ *
+ * `changeJournalTitleFormat` is the case: the backend rewrites `config.edn`,
+ * reopens the graph, and may migrate journal filenames — so work in flight
+ * against the old binding is now aimed at paths that may no longer exist. The
+ * frontend only bumped the render epoch there, which is why keying anything off
+ * the epoch LOOKED equivalent: it accidentally covered this. Keying off the
+ * binding is correct, but only if every real rebind says so.
+ *
+ * Deliberately not `resetSaveState()`: this is a rebind, not a graph switch, and
+ * dropping the user's dirty state would lose edits the reopen did not touch.
+ * (GH #254 increment 3, round 13.)
+ */
+export function bumpGraphBinding(): void {
+  graphBindingRev++;
+}
+
+// A backend reopen is a rebind; the binding must move with it.
+onGraphRebound(bumpGraphBinding);
+
+/** Which FILE a tombstone was raised for, when the delete named one. */
+const deletedPagePaths = new Map<string, string>();
+
+/** Refuse only the exact deleted file when the tombstone named a path. */
+export function isTombstonedFile(name: string, path?: string): boolean {
+  if (!deletedPages.has(name)) return false;
+  const deleted = deletedPagePaths.get(name);
+  if (!deleted || !path) return true;
+  return deleted === path;
+}
+
+/** Does a tombstone provably cover this file? Unknown path proceeds when the
+ * tombstone names another exact file, allowing the read to decide. */
+export function tombstoneCovers(name: string, path?: string): boolean {
+  if (!deletedPages.has(name)) return false;
+  const deleted = deletedPagePaths.get(name);
+  if (!deleted) return true;
+  return deleted === path;
+}
+
+/** Publish a tombstone directly for lifecycle tests and already-proven callers. */
+export function tombstone(name: string, path?: string): void {
+  deletedPages.add(name);
+  if (path) deletedPagePaths.set(name, path);
+  else deletedPagePaths.delete(name);
+}
+
 /** Atomically retire one quiescent page from persistence.
  *
  * Delete calls this synchronously after its awaited drain and exact-instance
@@ -257,9 +384,13 @@ export function setBaseRev(name: string, rev: string | null) {
  * turn that publishes the marker. A caller may explicitly allow an already
  * captured conflict-resolution delete; ordinary deletes still reject a conflict
  * raised during their awaited drain. */
-export function tombstoneIfQuiescent(name: string, allowConflicted = false): boolean {
+export function tombstoneIfQuiescent(
+  name: string,
+  allowConflicted = false,
+  path?: string,
+): boolean {
   if (
-    dirty.has(name)
+    (dirty.has(name) && !allowConflicted)
     || saveChain.has(name)
     || (!allowConflicted && isConflicted(name))
     || deletedPages.has(name)
@@ -267,11 +398,18 @@ export function tombstoneIfQuiescent(name: string, allowConflicted = false): boo
     return false;
   }
   deletedPages.add(name);
+  // Always REPLACE the recorded file, never merge with an older tombstone's: a
+  // pathless delete means "every file with this name", and inheriting a stale
+  // path from a previous tombstone would silently narrow it to one file — the
+  // wrong one, letting the others be resurrected. (GH #254 increment 3.)
+  if (path) deletedPagePaths.set(name, path);
+  else deletedPagePaths.delete(name);
   return true;
 }
 /** Lift a delete tombstone (page re-created, or the delete failed). */
 export function untombstone(name: string) {
   deletedPages.delete(name);
+  deletedPagePaths.delete(name);
 }
 /** Drop a page's dirty + baseline state — its content is leaving the working set. */
 export function forgetSaveState(name: string) {
@@ -294,10 +432,12 @@ export function resetSaveState() {
   }
   graphToken++;
   reopenRequired = false;
+  graphBindingRev++; // a switch is also a rebind
   dirty.clear();
   baseRev.clear();
   conflictObservation.clear();
   deletedPages.clear();
+  deletedPagePaths.clear();
   heldSources.clear();
   heldByDest.clear();
   transientFailures.clear();
@@ -516,6 +656,147 @@ export function canForceSave(name: string): boolean {
     : observation.observation !== null;
 }
 
+/** The exact observation the banner for `name` is showing, captured AT THE CLICK.
+ *
+ *  Read at click time, never later: a re-observation running ahead of a queued
+ *  request replaces the entry with an epoch minted for a winner the user never
+ *  saw, and answering with that would discard exactly that winner. */
+export function shownObservationFor(name: string): number | null {
+  const observation = conflictObservation.get(name);
+  return observation?.kind === "direct" ? observation.epoch : null;
+}
+
+/** Storage protocol represented by the conflict banner for `name`. */
+export function conflictObservationKindFor(name: string): ConflictObservation["kind"] | null {
+  return conflictObservation.get(name)?.kind ?? null;
+}
+
+/** Capture the exact managed observation represented by the current banner.
+ *
+ * The identity distinguishes two actor observations even when they report the
+ * same path/revision (or are both explicitly unobserved). The returned value is
+ * a detached typed snapshot, not the mutable map entry used by persistence.
+ */
+export function managedConflictObservationSnapshotFor(
+  name: string,
+): ManagedConflictObservationSnapshot | null {
+  const current = conflictObservation.get(name);
+  if (current?.kind !== "managed") return null;
+  return {
+    identity: current.identity,
+    observation: current.observation
+      ? {
+          kind: "observed",
+          path: current.observation.path,
+          revision: current.observation.revision,
+        }
+      : { kind: "unobserved" },
+  };
+}
+
+/** Is `snapshot` still the exact managed observation shown for `name`? */
+export function managedConflictObservationMatches(
+  name: string,
+  snapshot: ManagedConflictObservationSnapshot,
+): boolean {
+  const current = conflictObservation.get(name);
+  if (current?.kind !== "managed" || current.identity !== snapshot.identity) return false;
+  if (snapshot.observation.kind === "unobserved") return current.observation === null;
+  return current.observation?.path === snapshot.observation.path
+    && current.observation.revision === snapshot.observation.revision;
+}
+
+/**
+ * Make sure `name`'s editor has an activation, minting one if it has none.
+ *
+ * Idempotent, so ordinary re-saves never churn the token a live banner is bound
+ * to. Failure is deliberately non-fatal: the ordinary path's base-revision guard
+ * is unchanged and remains its own authority, so a user never loses a save
+ * because an identity could not be minted — only the override path is
+ * unavailable.
+ */
+async function ensureEditorActivation(name: string): Promise<void> {
+  if (editorActivationFor(name) !== undefined) return;
+  const page = pageByName(name);
+  if (!page) return;
+  // The BINDING, not the save epoch. These two checks ask "is this still the
+  // same graph?", which is a different question from "is this save still valid?"
+  // — and since the two counters were split, `graphToken` deliberately does not
+  // move on an in-place reopen. Asking it here let an activation minted by the
+  // OLD `Graph` be installed and sent to `savePage` after the backend replaced
+  // it. (GH #254 increment 3, round 15.)
+  const token = graphBindingRev;
+  // The page's path cannot see a SAME-PATH content replacement — `reloadPage` and
+  // the watcher-approved reload both install a new editor at the same path — so
+  // the instance generation is required as well. Peeked, never read through the
+  // lazily-creating accessor: that would mint a generation where none existed and
+  // mutate the identity cut retirement compares.
+  const pathAtStart = page.path ?? "";
+  const instanceAtStart = peekPageInstanceGeneration(name);
+  try {
+    const handle = page.path
+      // No local activation means there is nothing this exact instance may
+      // legitimately reuse. Minting replaces any stale core record left by a
+      // failed best-effort retirement instead of inheriting another editor's
+      // conflict authority.
+      // Snapshot-less by design. This is the save-time fallback for an already
+      // mounted editor, not installation of a DTO. The ordinary save below still
+      // compares its captured base revision, so divergence raises an answerable
+      // conflict under the newly minted activation instead of blessing stale
+      // bytes or leaving the banner without a live editor identity.
+      ? await backend().activateEditor(page.path, "replace", null)
+      : await backend().activateAbsentEditor(name, page.kind);
+    // Re-check across the await. A graph switch or a re-install makes this a
+    // DIFFERENT editor, and recording the handle then would hand one editor's
+    // identity to another — reproduced writing a replacement graph's page.
+    if (
+      handle &&
+      editorActivationFor(name) === undefined &&
+      graphBindingRev === token &&
+      (pageByName(name)?.path ?? "") === pathAtStart &&
+      peekPageInstanceGeneration(name) === instanceAtStart
+    ) {
+      setEditorActivation(name, handle.activation);
+      // An ABSENT editor must also carry the prospective target it is live for.
+      // Recorded beside the activation and read at the DTO boundary — NOT written
+      // onto the store page, which was tried and reverted: mutating the page while
+      // a save builds its snapshot disturbs cut retirement, which is
+      // authority-bound to the exact loaded instance. (GH #254 increment 3.)
+      if (handle.prospective && handle.target) setProspectiveTarget(name, handle.target);
+    } else if (handle) {
+      // The core minted this identity, but the exact editor that requested it
+      // disappeared while IPC was in flight. Leaving it live lets a later Reuse
+      // hand an unowned activation to another editor of the same path.
+      await backend()
+        .retireEditorActivation(handle.target, handle.activation)
+        .catch(() => {});
+    }
+  } catch {
+    // Non-fatal, as above.
+  }
+}
+
+/** The load baseline the editor's conflict episode was minted under.
+ *
+ *  The episode is `{ loaded_revision, activation }`, so presenting an observation
+ *  has to name the same revision the refused save did or the episode equality
+ *  refuses the very editor whose banner it is. */
+export function saveBaselineFor(name: string): string | null {
+  return baseRev.get(name) ?? null;
+}
+
+/** Forget a spent or dead observation without touching the banner. */
+export function dropObservation(name: string): void {
+  conflictObservation.delete(name);
+}
+
+/** Re-observe `name`: the guarded save that bypasses the conflicted-page early
+ *  return, so a page whose authority died still reaches the backend and either
+ *  lands or raises a fresh banner. */
+export function reobserve(name: string): Promise<boolean> {
+  return enqueueSave(name, { kind: "reobserve" });
+}
+
 function enqueueSave(
   name: string,
   intent: SaveIntent = ORDINARY,
@@ -529,6 +810,14 @@ function enqueueSave(
   saveChain.set(name, next);
   void next.finally(() => {
     if (saveChain.get(name) === next) saveChain.delete(name);
+    // Announce only once this save is genuinely out of the queue. Announcing from
+    // the success path instead — even deferred a microtask — still ran while the
+    // entry was present, so the re-verification correctly dropped the event and
+    // the waiting request was never re-driven. (GH #254 increment 3.)
+    // Sweep rather than announce one name: a save frees the page it wrote AND can
+    // release others (the cross-page move barrier), and the sweep re-verifies each
+    // watched page anyway, so it cannot announce something that is not ready.
+    sweepReplaceable();
   });
   return next;
 }
@@ -560,6 +849,29 @@ async function doSave(
     return false;
   }
   const token = graphToken;
+  // The BINDING for the activation window, separately from the save epoch above:
+  // a reopen replaces the `Graph` (and its activation registry) without
+  // invalidating this save, so the two questions need their own counters here
+  // too. (GH #254 increment 3, round 15.)
+  const bindingAtStart = graphBindingRev;
+  const activationInstanceAtStart = peekPageInstanceGeneration(name);
+  const activationPathAtStart = pageByName(name)?.path ?? "";
+  // Acquire this editor's identity before the DTO is built, so `pageToDto` can
+  // stamp it. Keyed through the STORE's registry, never by path alone: a copied
+  // DTO does not travel this path, never acquires an identity, and is refused on
+  // the override path for presenting none. (GH #254 increment 3.)
+  if (editorActivationFor(name) === undefined) await ensureEditorActivation(name);
+  // Acquisition is an awaited IPC, so the world can move under it. Refusing to
+  // RECORD a stale identity is not enough — the save must abandon too, or it
+  // serializes the replacement graph's bytes and writes them anyway (reproduced,
+  // with `activation: undefined`, which is exactly why an identity check alone
+  // could not catch it). (GH #254 increment 3.)
+  if (
+    graphToken !== token
+    || graphBindingRev !== bindingAtStart
+    || peekPageInstanceGeneration(name) !== activationInstanceAtStart
+    || (pageByName(name)?.path ?? "") !== activationPathAtStart
+  ) return false;
   const dto = measureIssue248("frontend.pageToDtoMs", () => pageToDto(name));
   if (!dto) {
     // Two very different reasons, and they must not share an outcome (audit
@@ -585,9 +897,11 @@ async function doSave(
   }
   dirty.delete(name);
   const baseline = baseRev.get(name) ?? null;
+  const issuingInstance = peekPageInstanceGeneration(name);
+  const issuingActivation = dto.activation;
   try {
     const observation = intent.kind === "force" ? intent.observation : null;
-    const rev = await measureIssue248Async("frontend.savePageAwaitMs", () =>
+    const saved = await measureIssue248Async("frontend.savePageAwaitMs", () =>
       backend().savePage(
         dto,
         baseline,
@@ -596,10 +910,35 @@ async function doSave(
         observation?.kind === "managed" ? observation.observation : null,
       )
     );
+    const rev = typeof saved === "string" ? saved : saved.revision;
     // A reload/rename/delete/rebind while savePage was in flight invalidates the
     // retirement proof even if those bytes landed. Never let that stale success
     // authorize identity reuse or update the replacement instance's baseline.
-    if (expectedCutSource && !cutSourceUsable(expectedCutSource)) return false;
+    const cutStillUsable = !expectedCutSource || cutSourceUsable(expectedCutSource);
+    const exactIssuerStillLive = cutStillUsable
+      && graphBindingRev === bindingAtStart
+      && peekPageInstanceGeneration(name) === issuingInstance
+      && editorActivationFor(name) === issuingActivation;
+    if (typeof saved !== "string" && saved.activation) {
+      if (exactIssuerStillLive) {
+        // A first-create response may resolve/retarget the activation. It belongs
+        // only to the exact page instance and graph binding that issued this save;
+        // a late success must never bless a replacement editor.
+        setEditorActivation(name, saved.activation.activation);
+        setProspectiveTarget(name, saved.activation.target);
+      } else {
+        // The save landed, but its editor disappeared while it was in flight.
+        // Retire the returned exact handle so the successful response cannot
+        // leave unowned override authority behind.
+        await backend()
+          .retireEditorActivation(saved.activation.target, saved.activation.activation)
+          .catch(() => {});
+      }
+    }
+    // The durable save may have completed, but its caller no longer owns the
+    // current frontend instance. Do not update that replacement's baseline,
+    // clear its conflict, or release move barriers on its behalf.
+    if (!exactIssuerStillLive) return false;
     if (token === graphToken) {
       baseRev.set(name, rev);
       if (baseline === null) bumpPageInventoryRev();
@@ -665,7 +1004,11 @@ async function doSave(
         // not get replacement authority. The non-destructive draft remains
         // parked and Use current remains available.
       }
-      conflictObservation.set(name, { kind: "managed", observation: managedObservation });
+      conflictObservation.set(name, {
+        kind: "managed",
+        identity: ++managedConflictObservationClock,
+        observation: managedObservation,
+      });
       // Re-notify an already visible banner so its Keep mine enabled state
       // reflects this newly observed (or now unobservable) managed owner.
       if (isConflicted(name)) clearConflict(name);
@@ -790,7 +1133,10 @@ export async function flushPage(name: string): Promise<boolean> {
  * bounded; graph-wide flushAll semantics (assets and unrelated drafts) are not
  * part of deleting one page. */
 export async function flushPageToQuiescence(name: string): Promise<boolean> {
-  if (!doc.loaded || isConflicted(name) || deletedPages.has(name)) return false;
+  if (isConflicted(name) || deletedPages.has(name)) return false;
+  // A clean satellite page needs no write to be quiescent. A dirty or saving
+  // page still requires an armed main store so its draft can actually drain.
+  if (!doc.loaded && (dirty.has(name) || saveChain.has(name))) return false;
   for (let attempt = 0; attempt < 4; attempt++) {
     if (isConflicted(name) || deletedPages.has(name)) return false;
     const inFlight = saveChain.get(name);

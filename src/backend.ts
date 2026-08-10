@@ -2,11 +2,17 @@
 // browser (Vite dev / Playwright screenshots) we fall back to an in-memory mock
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
+import { notifyGraphRebound } from "./modeHooks";
 import type {
+  ActivationExpectedRevision,
+  ActivationIntent,
   AdvancedQueryResult,
   BacklinkFilterContext,
   BacklinkFilterTarget,
   AssetInfo,
+  EditorActivationHandle,
+  SavePageResult,
+  PageKind,
   GraphMeta,
   GuideCopyResult,
   GuidePage,
@@ -262,7 +268,7 @@ export interface Backend {
     force?: boolean,
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
-  ): Promise<string>;
+  ): Promise<SavePageResult>;
   managedSyncStatus(): Promise<ManagedSyncStatus | null>;
   managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
@@ -382,6 +388,30 @@ export interface Backend {
   /** Load a page from a SPECIFIC file by its graph-root-relative path — reaches a
    *  duplicate-day stray that shares a (kind,name) with the canonical file (#21). */
   getPageByPath(path: string): Promise<PageDto | null>;
+  /** Activate an editor over an existing file. Deliberately separate from the
+   *  mixed-purpose reads above: an activation exists exactly when a live editor
+   *  does, so a read for export/preview/hydration cannot inherit an editor's
+   *  override authority. (GH #254 increment 3.) */
+  activateEditor(
+    path: string,
+    intent: ActivationIntent,
+    expectedRevision: ActivationExpectedRevision,
+  ): Promise<EditorActivationHandle | null>;
+  /** Activate an editor for a page with no file yet, returning the prospective
+   *  target it is live for. Reserves nothing on disk. */
+  activateAbsentEditor(name: string, kind: PageKind): Promise<EditorActivationHandle | null>;
+  /** Compare-and-retire: retires only if `activation` is still the live one, and
+   *  reports whether it was. A retirement racing a newer activation must not
+   *  revoke the newer editor. */
+  retireEditorActivation(path: string, activation: number): Promise<boolean>;
+  /** Present a conflict observation and learn its fate WITHOUT writing. The
+   *  "Use disk version" half of the authority contract. */
+  presentConflictOverride(
+    path: string,
+    baseRev: string | null,
+    activation: number,
+    conflictEpoch: number,
+  ): Promise<"authorised" | "superseded" | "withdrawn">;
   /** Append the blocks of `src` (graph-root-relative path) onto `dst`, then trash
    *  `src` — fold a duplicate-day stray into the canonical day (#21). */
   mergePages(src: string, dst: string): Promise<void>;
@@ -609,6 +639,26 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/**
+ * Core commands that REOPEN the graph (`refresh_graph` on the Rust side), so the
+ * frontend's graph-scoped state — editor activations, resolved paths — belongs
+ * to a `Graph` that no longer exists once they return.
+ *
+ * Kept as an explicit list because it is a claim about the backend: each of
+ * these was verified to reach `refresh_graph`. Adding a command that reopens the
+ * graph without adding it here reintroduces the round-15 blockers.
+ */
+const REBINDING_COMMANDS = new Set([
+  "set_journal_title_format",
+  "set_preferred_format",
+  "set_timetracking_enabled",
+  "set_show_brackets",
+  "set_doc_mode_enter_for_new_block",
+  "set_logical_outdenting",
+  "set_guide_announced",
+  "restore_backup",
+]);
+
 class TauriBackend implements Backend {
   private invoke!: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
   private convertFileSrc!: (path: string, protocol?: string) => string;
@@ -631,7 +681,19 @@ class TauriBackend implements Backend {
     const leasedArgs = bindingGeneration
       ? { ...(args ?? {}), bindingGeneration }
       : args;
-    return this.invoke<T>(cmd, leasedArgs);
+    const result = await this.invoke<T>(cmd, leasedArgs);
+    // A command that makes the core REBIND — `refresh_graph` installs a fresh
+    // `Graph`, with a fresh (empty) editor-activation registry — must announce
+    // it, or this side keeps tokens naming editors the core has never heard of
+    // and paths that may have been migrated.
+    //
+    // Announced HERE, at the one boundary every such command crosses, rather
+    // than at each call site: the frontend entry points are fire-and-forget
+    // `void backend().setX(...)`, six of the seven never announced, and the
+    // seventh only did because it happened to be the one under review.
+    // (GH #254 increment 3, round 15.)
+    if (REBINDING_COMMANDS.has(cmd)) notifyGraphRebound();
+    return result;
   }
 
   async loadGraph(path: string) {
@@ -752,7 +814,7 @@ class TauriBackend implements Backend {
     managedConflictObservation: { path: string; revision: string } | null = null,
   ) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
-      this.call<string>("save_page", {
+      this.call<SavePageResult>("save_page", {
         page,
         baseRev,
         force,
@@ -1023,6 +1085,36 @@ class TauriBackend implements Backend {
   }
   getPageByPath(path: string) {
     return this.call<PageDto | null>("get_page_by_path", { path });
+  }
+  activateEditor(
+    path: string,
+    intent: ActivationIntent,
+    expectedRevision: ActivationExpectedRevision,
+  ) {
+    return this.call<EditorActivationHandle | null>("activate_editor", {
+      path,
+      intent,
+      expectedRevision,
+    });
+  }
+  activateAbsentEditor(name: string, kind: PageKind) {
+    return this.call<EditorActivationHandle | null>("activate_absent_editor", { name, kind });
+  }
+  retireEditorActivation(path: string, activation: number) {
+    return this.call<boolean>("retire_editor_activation", { path, activation });
+  }
+  presentConflictOverride(
+    path: string,
+    baseRev: string | null,
+    activation: number,
+    conflictEpoch: number,
+  ) {
+    return this.call<"authorised" | "superseded" | "withdrawn">("present_conflict_override", {
+      path,
+      baseRev,
+      activation,
+      conflictEpoch,
+    });
   }
   mergePages(src: string, dst: string) {
     return this.call<void>("merge_pages", { src, dst });

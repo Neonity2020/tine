@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, type FeedPage } from "../store";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, takeEditorLease, type FeedPage } from "../store";
 import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
@@ -27,6 +27,7 @@ import { copyGuideIntoGraph, ensureGuidePagesLoaded, isGuidePageName } from "../
 import { isPropertiesOnly, splitPagePreamble } from "../editor/properties";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { PagePropertyValue } from "./PagePropertyValue";
+import { graphBinding } from "../persistence";
 
 export const FEED_PAGE = 3;
 let journalAsOfDay: number | null = null;
@@ -41,6 +42,7 @@ let pendingFeedRestart = false;
  * before navigation/graph switch cannot update the shared feed store. */
 export interface JournalsFeedOwner {
   graphEpoch: number;
+  graphBinding: number;
   isLive: () => boolean;
 }
 
@@ -60,7 +62,9 @@ function responseMatches(day: number, response: JournalFeedPage): boolean {
 }
 
 function ownerIsLive(owner: JournalsFeedOwner): boolean {
-  return graphEpoch() === owner.graphEpoch && owner.isLive();
+  return graphEpoch() === owner.graphEpoch
+    && graphBinding() === owner.graphBinding
+    && owner.isLive();
 }
 
 /** The single start-over owner for route loads, watcher changes and calendar
@@ -91,7 +95,10 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
     // otherwise the intentionally reactive pending-retry effect observes the
     // old true value during that store write and starts a duplicate restart.
     pendingFeedRestart = false;
-    loadFeed(withToday(response.pages), { endEdit: false });
+    await loadFeed(withToday(response.pages), {
+      endEdit: false,
+      expectedGraphBinding: owner.graphBinding,
+    });
     journalAsOfDay = response.as_of_day;
     nextBeforeDay = response.next_before_day;
     feedDone = response.done;
@@ -106,6 +113,7 @@ async function restartJournalFeed(owner: JournalsFeedOwner, retried = false): Pr
 
 let journalRefreshFlight: {
   graphEpoch: number;
+  graphBinding: number;
   day: number;
   owner: JournalsFeedOwner;
   promise: Promise<void>;
@@ -122,6 +130,7 @@ async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promis
   if (
     current
     && current.graphEpoch === owner.graphEpoch
+    && current.graphBinding === owner.graphBinding
     && current.day === day
     && ownerIsLive(current.owner)
   ) {
@@ -139,6 +148,7 @@ async function refreshJournalFeedForCurrentDay(owner: JournalsFeedOwner): Promis
 
   const flight = {
     graphEpoch: owner.graphEpoch,
+    graphBinding: owner.graphBinding,
     day,
     owner,
     promise: Promise.resolve(),
@@ -219,11 +229,13 @@ export function PageView(): JSX.Element {
   const currentRoute = createMemo(() => router.route(), undefined, { equals: sameRoute });
   const journalOwner = (route = currentRoute(), epoch = graphEpoch()): JournalsFeedOwner => ({
     graphEpoch: epoch,
+    graphBinding: graphBinding(),
     isLive: () => surfaceAlive && sameRoute(currentRoute(), route),
   });
   createEffect(() => {
     const r = currentRoute();
     const epoch = graphEpoch(); // reload when the open graph changes
+    const binding = graphBinding();
     setReady(false);
     setLoadError(null);
     // Surface keys are STATIC per pane (matching PaneLeaf's frozen provider
@@ -283,7 +295,10 @@ export function PageView(): JSX.Element {
           // null = page doesn't exist yet → start a fresh empty page. A failed
           // read throws and is caught below, so we never overwrite a page whose
           // load errored with empty content.
-          loadRoutedPage(dto ? toLoadablePage(dto, r.name) : emptyPage(r.name, r.pageKind));
+          await loadRoutedPage(
+            dto ? toLoadablePage(dto, r.name) : emptyPage(r.name, r.pageKind),
+            binding,
+          );
         }
         if (!sameRoute(currentRoute(), r)) return;
         setLoadedRoute(r);
@@ -311,19 +326,20 @@ export function PageView(): JSX.Element {
     }
     if (loadingGeneration !== null || feedDone || nextBeforeDay === null) return;
     const generation = feedGeneration;
+    const binding = graphBinding();
     const asOfDay = journalAsOfDay;
     const cursor = nextBeforeDay;
     loadingGeneration = generation;
     try {
       const response = await backend().journalFeedPage(FEED_PAGE, cursor);
       if (
-        generation !== feedGeneration || !ownerIsLive(owner) || asOfDay === null ||
+        generation !== feedGeneration || binding !== graphBinding() || !ownerIsLive(owner) || asOfDay === null ||
         cursor !== nextBeforeDay || response.as_of_day !== asOfDay || !responseMatches(asOfDay, response)
       ) {
         if (generation === feedGeneration && ownerIsLive(owner)) await refreshJournalFeedForCurrentDay(owner);
         return;
       }
-      if (response.pages.length) appendFeed(response.pages);
+      if (response.pages.length) await appendFeed(response.pages, binding);
       nextBeforeDay = response.next_before_day;
       feedDone = response.done;
     } catch {
@@ -645,6 +661,21 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
       ensureEmptyBlock(props.page.name, { afterProperties: true });
     }
   });
+  // The title draft lives in a component-local signal and an <input>, so it is
+  // invisible to every store predicate: not dirty, not conflicted, not saving.
+  // Without a lease, replacing the page unmounts the input and the typed title is
+  // gone with nothing having looked unsaved. The lease is what makes that state
+  // declare itself. (GH #254 increment 3.)
+  let releaseTitleLease: (() => void) | null = null;
+  const dropTitleLease = () => {
+    releaseTitleLease?.();
+    releaseTitleLease = null;
+  };
+  // Driven by the component lifecycle, not only by commit and cancel: disposing a
+  // mounted page removes this section without running either, and a lease that
+  // outlived its component would refuse every later replacement forever.
+  onCleanup(dropTitleLease);
+
   const startRename = () => {
     if (renameInFlight) return;
     if (props.page.guide || props.page.readOnly) return;
@@ -653,12 +684,15 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
     renameCancelled = false;
     setNewName(props.page.name);
     setRenaming(true);
+    dropTitleLease();
+    releaseTitleLease = takeEditorLease(props.page.name);
   };
   const commitRename = async () => {
     if (renameSubmitted || renameCancelled || renameInFlight) return;
     const next = newName().trim();
     renameSubmitted = true;
     setRenaming(false);
+    dropTitleLease();
     if (!next || next === props.page.name) return;
     renameInFlight = true;
     try {
@@ -703,6 +737,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
                 else if (e.key === "Escape") {
                   renameCancelled = true;
                   setRenaming(false);
+                  dropTitleLease();
                 }
               }}
               onBlur={() => void commitRename()}

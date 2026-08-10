@@ -2,6 +2,7 @@ import { backend } from "../backend";
 import { ensurePageLoaded, pageByName } from "../store";
 import type { RefGroup } from "../types";
 import { graphEpoch, graphMeta } from "../ui";
+import { graphBinding } from "../persistence";
 
 export const SHEET_RENDER_PAGE = 200;
 const HYDRATE_CONCURRENCY = 4;
@@ -246,8 +247,10 @@ function limited(scope: string, task: () => Promise<void>): Promise<void> {
   });
 }
 
-function sameGraph(root: string, epoch: number): boolean {
-  return graphEpoch() === epoch && (graphMeta()?.root ?? "") === root;
+function sameGraph(root: string, epoch: number, binding: number): boolean {
+  return graphEpoch() === epoch
+    && (graphMeta()?.root ?? "") === root
+    && graphBinding() === binding;
 }
 
 function releaseClaim(claimKey: string, identity: string): void {
@@ -294,7 +297,8 @@ export async function hydrateVisibleQueryPages(
   await Promise.all(pending.map((group) => {
     const epoch = graphEpoch();
     const root = graphMeta()?.root ?? "";
-    const scope = `${root}\0${epoch}`;
+    const binding = graphBinding();
+    const scope = `${root}\0${epoch}\0${binding}`;
     const identity = groupIdentity(group);
     const key = `${scope}\0${identity}`;
     const existing = pageHydrations.get(key);
@@ -310,19 +314,23 @@ export async function hydrateVisibleQueryPages(
 
     const job = limited(scope, async () => {
       // A stale queued task must die before IPC, not merely discard afterward.
-      if (!sameGraph(root, epoch)) return;
+      if (!sameGraph(root, epoch, binding)) return;
       const occupied = pageByName(group.page);
       if (occupied && occupied.kind === group.kind && (!group.path || occupied.path === group.path)) return;
       const dto = group.path
         ? await backend().getPageByPath(group.path)
         : await backend().getPage(group.page, group.kind);
-      if (!sameGraph(root, epoch)) return;
+      if (!sameGraph(root, epoch, binding)) return;
       // Recheck occupancy after the await: another surface may have loaded a
       // same-name twin meanwhile. Never replace or alias that identity.
       const after = pageByName(group.page);
       if (after && (!group.path || after.path === group.path)) return;
       if (!dto || dto.name !== group.page || dto.kind !== group.kind || (group.path && dto.path !== group.path)) return;
-      ensurePageLoaded(dto);
+      // Consume the refusal rather than assuming installation. Hydration is
+      // DTO-only and may stay so; a later interaction re-drives it. What it must
+      // not do is proceed as though the page it asked for is now loaded.
+      // (GH #254 increment 3.)
+      if (await ensurePageLoaded(dto, { expectedGraphBinding: binding })) return;
     }).finally(() => {
       pageHydrations.delete(key);
       releaseClaim(claimKey, identity);

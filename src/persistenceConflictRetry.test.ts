@@ -25,11 +25,23 @@ let draftPath = "pages/Notes.md";
 
 vi.mock("./store", () => ({
   doc: { loaded: true, pages: [] },
+  // The save path acquires the editor's activation before building the DTO
+  // (GH #254 increment 3). These stubs say "this editor already holds one", so
+  // these tests keep exercising the conflict/barrier behaviour they are about.
+  editorActivationFor: () => 1,
+  setEditorActivation: () => {},
+  setProspectiveTarget: () => {},
+  bumpEditGeneration: () => {},
+  peekPageInstanceGeneration: () => 1,
+  retryPendingBlockRefStamps: () => {},
+  notifyPageBecameReplaceable: () => {},
+  sweepReplaceable: () => {},
   pageByName: (name: string) => ({ name, kind: "page", path: draftPath }),
   pageInstanceGeneration: () => 1,
   pageToDto: (name: string) => ({
     name, kind: "page", title: name, pre_block: null, blocks: [],
     format: "markdown", path: draftPath, guide: false, read_only: false,
+    activation: 1,
   }),
 }));
 

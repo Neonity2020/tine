@@ -22714,6 +22714,7 @@ mod tests {
         blocks: Vec<BlockDto>,
     ) -> PageDto {
         PageDto {
+            activation: None,
             name: name.into(),
             kind: sync_model_page_kind(page_kind),
             title: name.into(),
