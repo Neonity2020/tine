@@ -1976,6 +1976,9 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     /// One when this database was seeded from the retained terminal accepted
     /// state, zero when it replayed the archive parts.
     pub(crate) terminal_constructions: usize,
+    /// One when durable bootstrap parts were authenticated one at a time and
+    /// only their exact terminal profile was materialized into SQLite.
+    pub(crate) terminal_archive_replays: usize,
     /// Per-part intermediate page/reference materializations run through
     /// ordinary event DML. Terminal construction must leave this at zero.
     pub(crate) intermediate_page_materializations: usize,
@@ -4529,6 +4532,164 @@ impl SqliteFrontier {
         Ok((instrumentation, bootstrap))
     }
 
+    /// Rebuild a fresh inactive bootstrap from durable parts without
+    /// materializing their intentionally incomplete intermediate reference
+    /// catalogs. Every part is still loaded, authenticated, and applied to the
+    /// accepted-prefix tables in order; page/reference rows are seeded once
+    /// from the exact authenticated terminal root.
+    fn terminal_archive_stream(
+        &mut self,
+        source: &RebuildSource<'_>,
+    ) -> Result<
+        (
+            RebuildInstrumentation,
+            BootstrapSqliteRebuildInstrumentation,
+        ),
+        ProjectionError,
+    > {
+        if !matches!(
+            source.loader,
+            RebuildLoader::InactiveBootstrap { .. }
+                | RebuildLoader::PromotedBootstrapAnchored { .. }
+        ) {
+            return Err(ProjectionError::Rebuild(
+                "terminal archive replay requires bootstrap-anchored authority".into(),
+            ));
+        }
+        let engine = source.engine;
+        let mut instrumentation = RebuildInstrumentation::default();
+        let writes_before = self.physical.write_instrumentation();
+        self.physical.begin_candidate_build()?;
+        self.physical.begin_terminal_bootstrap_construction()?;
+        let prefix_started = std::time::Instant::now();
+        let mut provenance = Vec::new();
+        let mut terminal_documents = BTreeMap::new();
+        let mut cursor = source.cursor()?;
+        while let Some(event) = cursor.next_event()? {
+            instrumentation.accepted_events_validated += 1;
+            instrumentation.max_live_events = instrumentation.max_live_events.max(1);
+            instrumentation.max_live_evidence_records =
+                instrumentation.max_live_evidence_records.max(1);
+            authenticate_event_for_engine(engine, &event)?;
+            let (_, apply_stats) = self.apply_terminal_prefix_candidate_with_stats(&event)?;
+            for document in event.affected_documents() {
+                terminal_documents.insert(
+                    document.document_id().as_uuid().into_bytes(),
+                    storage_frontier::PhysicalFrontierDocument {
+                        document_id: document.document_id().as_uuid().into_bytes(),
+                        canonical_bytes: encode_frontier_document(document)?,
+                    },
+                );
+            }
+            instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
+            instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
+            instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
+            instrumentation.cleanup_fts_rowids += apply_stats.cleanup_fts_rowids;
+            instrumentation.reference_coverage_inductive_checks +=
+                apply_stats.reference_coverage_inductive_checks;
+            instrumentation.reference_coverage_full_scans +=
+                apply_stats.reference_coverage_full_scans;
+            provenance.push(storage_frontier::PhysicalTerminalConstructionBatch {
+                acceptance_sequence: event.acceptance_sequence(),
+                batch_id: event.batch_id().as_uuid().into_bytes(),
+                input_digest: super::MaterializationChange::new(
+                    event.batch_id(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .and_then(|change| change.digest())?,
+            });
+            instrumentation.accepted_events_applied += 1;
+            maybe_abort_rebuild_test(instrumentation.accepted_events_applied);
+        }
+        let (page_reads, page_bytes, max_page_bytes) = cursor.page_stats();
+        instrumentation.accepted_sequence_page_reads = page_reads;
+        instrumentation.accepted_sequence_bytes_read = page_bytes;
+        instrumentation.max_accepted_sequence_page_bytes = max_page_bytes;
+        let mut bootstrap = cursor.bootstrap_instrumentation();
+        bootstrap.terminal_archive_replays = 1;
+
+        let reached = read_frontier_root(&self.physical)?;
+        if reached != source.exact_frontier_root
+            || reached.acceptance_sequence() != source.accepted_batch_count
+        {
+            return Err(ProjectionError::Rebuild(
+                "terminal archive prefix did not reach the authenticated frontier root".into(),
+            ));
+        }
+        let terminal_physical_root = lower_physical_frontier_root(&reached)?;
+        let terminal_documents = terminal_documents.into_values().collect::<Vec<_>>();
+        self.physical
+            .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)?;
+        bootstrap.terminal_frontier_bulk_seeds = 1;
+        bootstrap.terminal_frontier_documents_seeded = terminal_documents.len();
+        trace_terminal_phase("archive accepted prefix seed", prefix_started);
+
+        let _ = super::hot_engine::take_current_path_cursor_probe();
+        let rows_started = std::time::Instant::now();
+        let coverage_count = self.seed_terminal_rows(
+            engine,
+            &source.exact_frontier_root,
+            &provenance,
+            &mut instrumentation,
+            &mut bootstrap,
+        )?;
+        trace_terminal_phase("archive terminal row seed", rows_started);
+        let cursor_probe = super::hot_engine::take_current_path_cursor_probe();
+        bootstrap.terminal_catalog_rows_authenticated = cursor_probe.rows;
+        bootstrap.terminal_catalog_document_validations = cursor_probe.catalog_document_validations;
+
+        self.reference_coverage = Some(InductiveReferenceCoverage {
+            applied_through: source.accepted_batch_count,
+            rows: coverage_count,
+        });
+        if instrumentation.cleanup_page_attempts != 0
+            || instrumentation.cleanup_owned_rows != 0
+            || instrumentation.cleanup_fts_rowids != 0
+            || instrumentation.reference_coverage_inductive_checks != 0
+            || instrumentation.reference_coverage_full_scans != 0
+            || bootstrap.intermediate_page_materializations != 0
+            || bootstrap.terminal_frontier_bulk_seeds != 1
+            || bootstrap.terminal_frontier_documents_seeded
+                != usize::try_from(source.exact_frontier_root.document_count()).map_err(|_| {
+                    ProjectionError::Rebuild(
+                        "terminal frontier document count exceeds platform usize".into(),
+                    )
+                })?
+            || bootstrap.terminal_materializations != 1
+            || bootstrap.terminal_reference_index_traversals != 1
+            || bootstrap.terminal_reference_index_entries != bootstrap.terminal_pages_materialized
+        {
+            return Err(ProjectionError::Rebuild(
+                "terminal archive structural accounting invariant failed".into(),
+            ));
+        }
+        let window_bound = bootstrap
+            .terminal_catalog_rows_authenticated
+            .div_ceil(TERMINAL_CATALOG_CURSOR_PAGE_ROWS)
+            .saturating_add(bootstrap.terminal_materialization_chunks)
+            .saturating_add(1);
+        if bootstrap.terminal_catalog_rows_authenticated != bootstrap.terminal_pages_materialized
+            || bootstrap.terminal_catalog_document_validations > window_bound
+        {
+            return Err(ProjectionError::Rebuild(format!(
+                "terminal archive catalog authority is not bounded by its read window: \
+                 rows {} pages {} validations {} bound {window_bound}",
+                bootstrap.terminal_catalog_rows_authenticated,
+                bootstrap.terminal_pages_materialized,
+                bootstrap.terminal_catalog_document_validations,
+            )));
+        }
+        self.finish_fresh_candidate(source, coverage_count, &mut instrumentation)?;
+        self.physical.finish_candidate_build()?;
+        record_candidate_write_instrumentation(
+            &mut instrumentation,
+            writes_before,
+            self.physical.write_instrumentation(),
+        );
+        Ok((instrumentation, bootstrap))
+    }
+
     /// Stream the complete terminal page and reference rows in bounded chunks.
     ///
     /// The page set is the engine's authenticated current-path catalog at the
@@ -4817,6 +4978,13 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
+        if matches!(
+            source.loader,
+            RebuildLoader::InactiveBootstrap { .. }
+                | RebuildLoader::PromotedBootstrapAnchored { .. }
+        ) {
+            return self.terminal_archive_stream(source);
+        }
         let mut instrumentation = RebuildInstrumentation::default();
         let mut intermediate_page_materializations = 0_usize;
         let inactive_bulk = matches!(source.loader, RebuildLoader::InactiveBootstrap { .. });

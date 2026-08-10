@@ -36865,6 +36865,34 @@ mod tests {
             receipt.phase_ms,
             receipt.construction,
         );
+        assert_eq!(receipt.construction.sqlite.terminal_constructions, 1);
+        assert_eq!(receipt.construction.sqlite.terminal_archive_replays, 0);
+        assert_eq!(
+            receipt.construction.sqlite.terminal_construction_refusals,
+            0
+        );
+        assert_eq!(
+            receipt
+                .construction
+                .sqlite
+                .intermediate_page_materializations,
+            0
+        );
+        assert_eq!(
+            receipt.construction.sqlite.terminal_pages_materialized,
+            receipt.source_files
+        );
+        assert_eq!(
+            receipt
+                .construction
+                .sqlite
+                .terminal_reference_index_traversals,
+            1
+        );
+        receipt
+            .construction
+            .sqlite
+            .assert_catalog_authority_is_window_bounded();
         assert!(
             receipt.total_ms < 10_000,
             "real-graph managed activation exceeded 10 seconds: {receipt:?}"

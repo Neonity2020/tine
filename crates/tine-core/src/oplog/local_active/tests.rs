@@ -10025,6 +10025,7 @@ mod terminal_construction {
         let replay = build_projection(fixture, "replay", None);
 
         assert_eq!(terminal.bootstrap.terminal_constructions, 1);
+        assert_eq!(terminal.bootstrap.terminal_archive_replays, 0);
         assert_eq!(terminal.bootstrap.terminal_construction_refusals, 0);
         assert_eq!(terminal.bootstrap.bootstrap_part_reads, 0);
         assert_eq!(terminal.bootstrap.bootstrap_object_reads, 0);
@@ -10042,18 +10043,28 @@ mod terminal_construction {
             .bootstrap
             .assert_catalog_authority_is_window_bounded();
 
-        // The replay path is exercised separately and keeps reporting the work
-        // terminal construction deleted.
+        // Durable replay authenticates every part but materializes only the
+        // exact terminal profile, just like the same-process construction.
         assert_eq!(replay.bootstrap.terminal_constructions, 0);
+        assert_eq!(replay.bootstrap.terminal_archive_replays, 1);
         assert_eq!(
             replay.bootstrap.bootstrap_part_reads,
             replay.observation.accepted_batch_count
         );
+        assert_eq!(replay.bootstrap.intermediate_page_materializations, 0);
+        assert_eq!(replay.bootstrap.terminal_materializations, 1);
         assert_eq!(
-            replay.bootstrap.intermediate_page_materializations,
-            replay.observation.accepted_batch_count
+            replay.bootstrap.terminal_pages_materialized,
+            replay.observation.pages.len()
         );
-        assert_eq!(replay.bootstrap.terminal_materializations, 0);
+        assert_eq!(replay.bootstrap.terminal_frontier_bulk_seeds, 1);
+        assert_eq!(
+            replay.bootstrap.max_live_bootstrap_parts,
+            usize::from(replay.bootstrap.bootstrap_part_reads != 0)
+        );
+        replay
+            .bootstrap
+            .assert_catalog_authority_is_window_bounded();
 
         // One candidate transaction and one durability barrier on both paths.
         for built in [&terminal, &replay] {
@@ -10241,6 +10252,7 @@ mod terminal_construction_interruption {
                 "{cut:?} must be recorded as a discarded private candidate"
             );
             assert_eq!(interrupted.bootstrap().terminal_constructions, 0);
+            assert_eq!(interrupted.bootstrap().terminal_archive_replays, 1);
             assert_eq!(
                 interrupted.bootstrap().bootstrap_part_reads,
                 interrupted.observation().accepted_batch_count,
@@ -10340,6 +10352,7 @@ mod terminal_construction_interruption {
         let substituted = build_projection(&fixture, "substituted", Some(&foreign));
         assert_eq!(substituted.bootstrap().terminal_construction_refusals, 1);
         assert_eq!(substituted.bootstrap().terminal_constructions, 0);
+        assert_eq!(substituted.bootstrap().terminal_archive_replays, 1);
         let clean = build_projection(&fixture, "clean", None);
         assert_eq!(substituted.observation(), clean.observation());
         assert!(candidate_residue(fixture.root.path()).is_empty());
@@ -10375,6 +10388,7 @@ mod terminal_construction_interruption {
 
         let rebuilt = build_projection_at(&fixture, &path, "rebuild", None);
         assert_eq!(rebuilt.bootstrap().terminal_constructions, 0);
+        assert_eq!(rebuilt.bootstrap().terminal_archive_replays, 1);
         assert_eq!(
             rebuilt.bootstrap().bootstrap_part_reads,
             rebuilt.observation().accepted_batch_count
