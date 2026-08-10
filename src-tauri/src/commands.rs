@@ -1335,6 +1335,7 @@ mod graph_wide_command_boundary_tests {
             "run_query",
             "run_advanced_query",
             "export_query_subtrees",
+            "list_orphan_assets",
             "run_graph_search",
             "search",
             "rename_page",
@@ -1382,6 +1383,7 @@ mod managed_actor_command_boundary_tests {
             "run_query",
             "run_advanced_query",
             "export_query_subtrees",
+            "list_orphan_assets",
             "run_graph_search",
             "search",
         ] {
@@ -1430,6 +1432,7 @@ mod managed_actor_command_boundary_tests {
             "run_query",
             "run_advanced_query",
             "export_query_subtrees",
+            "list_orphan_assets",
             "run_graph_search",
             "search",
         ] {
@@ -3065,10 +3068,25 @@ mod editor_argv_tests {
 
 /// Orphaned `assets/` files (no block references them) for the cleanup UI.
 #[tauri::command]
-pub(crate) fn list_orphan_assets(
+pub(crate) async fn list_orphan_assets(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::AssetInfo>, String> {
-    with_read_graph(&state, |g| Ok(g.orphan_assets()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                match sparse_navigation(handle, SyncApplicationNavigationRequest::OrphanAssets)? {
+                    SyncApplicationNavigationReply::OrphanAssets(assets) => Ok(assets),
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => Ok(slot.legacy_graph()?.orphan_assets()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Move an orphaned asset to the recoverable trash.

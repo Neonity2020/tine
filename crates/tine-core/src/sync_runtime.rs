@@ -42,7 +42,7 @@ use crate::fast_commit::{
     forbidden_commit_work, graph_wide_commit_work, ForbiddenCommitWork, GraphWideCommitWork,
 };
 use crate::model::{
-    sync_conflict_base, AcceptedExternalDocumentIdentity, BacklinkFilterContext,
+    sync_conflict_base, AcceptedExternalDocumentIdentity, AssetInfo, BacklinkFilterContext,
     BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
@@ -1881,6 +1881,7 @@ pub enum SyncApplicationNavigationRequest {
         max_nodes: usize,
         max_bytes: usize,
     },
+    OrphanAssets,
     GraphSearch {
         source: String,
         page_limit: usize,
@@ -1938,6 +1939,7 @@ pub enum SyncApplicationNavigationReply {
     SimpleQuery(SyncApplicationBoundedRefGroups),
     AdvancedQuery(SyncApplicationBoundedAdvancedResult),
     ExportQuerySubtrees(crate::query::QueryExportBatch),
+    OrphanAssets(Vec<AssetInfo>),
     GraphSearch(crate::query_plan::QueryExecution),
     BlockSearch(Vec<RefGroup>),
 }
@@ -4653,7 +4655,8 @@ fn validate_application_navigation_request(
     let (names, query, limit) = match request {
         SyncApplicationNavigationRequest::ReferencedPageNames { .. }
         | SyncApplicationNavigationRequest::PageAliases
-        | SyncApplicationNavigationRequest::ListTemplates => (&[][..], None, None),
+        | SyncApplicationNavigationRequest::ListTemplates
+        | SyncApplicationNavigationRequest::OrphanAssets => (&[][..], None, None),
         SyncApplicationNavigationRequest::PageIcons { names }
         | SyncApplicationNavigationRequest::ExistingPageNames { names } => {
             (names.as_slice(), None, None)
@@ -8715,6 +8718,11 @@ impl RuntimeActor {
                     max_bytes,
                 )?,
             ),
+            SyncApplicationNavigationRequest::OrphanAssets => {
+                SyncApplicationNavigationReply::OrphanAssets(
+                    self.application_orphan_assets_ready()?,
+                )
+            }
             SyncApplicationNavigationRequest::GraphSearch {
                 source,
                 page_limit,
@@ -9935,6 +9943,17 @@ impl RuntimeActor {
             max_nodes,
             max_bytes,
         ))
+    }
+
+    fn application_orphan_assets_ready(
+        &self,
+    ) -> Result<Vec<AssetInfo>, SyncApplicationPageRequestError> {
+        let pages = self.application_all_query_pages_ready()?;
+        let mut referenced = HashSet::new();
+        for source in &pages {
+            crate::model::collect_application_page_asset_refs(&source.page, &mut referenced);
+        }
+        Ok(self.graph.orphan_assets_with_references(&referenced))
     }
 
     fn application_graph_search_ready(
@@ -19806,10 +19825,14 @@ mod tests {
             &fixture,
             "content/nested pages/Ref source.md",
             format!(
-                "related:: [[Compass]]\nnote:: Ordinary Ω\n\n- first Ordinary Ω [[Compass]] (({genuine})) and (({genuine})) plus (({dangling}))\n  - nested Cafe\u{301} and ++ [[Compass]] {{{{embed (({genuine}))}}}}\n"
+                "related:: [[Compass]]\nnote:: Ordinary Ω\n\n- first Ordinary Ω [[Compass]] (({genuine})) and (({genuine})) plus (({dangling})) ![used](../assets/used image.png)\n  - nested Cafe\u{301} and ++ [[Compass]] {{{{embed (({genuine}))}}}}\n"
             )
             .as_bytes(),
         );
+        fs::create_dir_all(fixture.graph_root().join("assets/nested-sidecar")).unwrap();
+        fs::write(fixture.graph_root().join("assets/used image.png"), b"used").unwrap();
+        fs::write(fixture.graph_root().join("assets/orphan.png"), b"orphan").unwrap();
+        fs::write(fixture.graph_root().join("assets/state.edn"), b"{}").unwrap();
         admit_external_page(
             &handle,
             &fixture,
@@ -19989,6 +20012,16 @@ mod tests {
             serde_json::to_value(&managed_templates).unwrap(),
             serde_json::to_value(graph.templates()).unwrap(),
             "managed template discovery must share Direct Files parser semantics"
+        );
+        let SyncApplicationNavigationReply::OrphanAssets(managed_orphans) =
+            navigation(SyncApplicationNavigationRequest::OrphanAssets)
+        else {
+            panic!("wrong orphan-assets reply")
+        };
+        assert_eq!(
+            serde_json::to_value(managed_orphans).unwrap(),
+            serde_json::to_value(graph.orphan_assets()).unwrap(),
+            "managed orphan discovery must share Direct Files raw-reference and filesystem semantics"
         );
         for autocomplete in [false, true] {
             let hidden_properties = if autocomplete {
@@ -20492,6 +20525,10 @@ mod tests {
         let fixture = RuntimeHostFixture::safe("sync-runtime-application-navigation-frontier");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
         drive_initial_feed(&handle);
+        fs::create_dir_all(fixture.graph_root().join("assets")).unwrap();
+        fs::write(fixture.graph_root().join("assets/saved.png"), b"saved").unwrap();
+        fs::write(fixture.graph_root().join("assets/created.png"), b"created").unwrap();
+        fs::write(fixture.graph_root().join("assets/orphan.png"), b"orphan").unwrap();
         let identity = "8d6e1991-2c3a-4efe-b3d2-6f5a7bc8a901";
         let old_reference = "6c21b410-dcf1-4fe5-83be-9ed1c179f50a";
         let new_reference = "d543a5e9-0ed4-40a7-83b0-c33014a8599f";
@@ -20508,7 +20545,7 @@ mod tests {
             load_application_exact(&handle, "content/nested pages/Navigation.md");
         page.pre_block = Some("icon:: new\nalias:: New Alias\npageFacet:: new-page".into());
         page.blocks[0].raw = format!(
-            "DONE mentions New Plain [[New Phantom]] (({new_reference}))\nTemplate:: New template\nnew_prop:: new-value\nid:: {identity}"
+            "DONE mentions New Plain [[New Phantom]] (({new_reference})) ![saved](../assets/saved.png)\nTemplate:: New template\nnew_prop:: new-value\nid:: {identity}"
         );
         let saved = handle
             .save_application_page(SyncApplicationPageSaveRequest {
@@ -20788,10 +20825,17 @@ mod tests {
             .groups
             .iter()
             .any(|group| group.page == "Navigation"));
+        let SyncApplicationNavigationReply::OrphanAssets(orphans) =
+            loaded(SyncApplicationNavigationRequest::OrphanAssets)
+        else {
+            panic!("wrong immediate orphan-assets reply")
+        };
+        assert!(!orphans.iter().any(|asset| asset.name == "saved.png"));
+        assert!(orphans.iter().any(|asset| asset.name == "created.png"));
 
         let mut created_block = BlockDto::default();
         created_block.raw = format!(
-            "TODO links Created Plain [[Created Phantom]] (({new_reference}))\ntemplate:: Created template\ncreated_prop:: created-value"
+            "TODO links Created Plain [[Created Phantom]] (({new_reference})) ![created](../assets/created.png)\ntemplate:: Created template\ncreated_prop:: created-value"
         );
         let created = handle
             .save_application_page(SyncApplicationPageSaveRequest {
@@ -20951,6 +20995,14 @@ mod tests {
             .groups
             .iter()
             .any(|group| group.page == "Created Navigation"));
+        let SyncApplicationNavigationReply::OrphanAssets(orphans) =
+            loaded(SyncApplicationNavigationRequest::OrphanAssets)
+        else {
+            panic!("wrong created orphan-assets reply")
+        };
+        assert!(!orphans.iter().any(|asset| asset.name == "saved.png"));
+        assert!(!orphans.iter().any(|asset| asset.name == "created.png"));
+        assert!(orphans.iter().any(|asset| asset.name == "orphan.png"));
         assert!(!todo_query
             .groups
             .iter()

@@ -15949,6 +15949,13 @@ impl Graph {
                 }
             }
         });
+        self.orphan_assets_with_references(&referenced)
+    }
+
+    pub(crate) fn orphan_assets_with_references(
+        &self,
+        referenced: &std::collections::HashSet<String>,
+    ) -> Vec<AssetInfo> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir(self.assets_path()) else {
             return out;
@@ -23979,6 +23986,24 @@ fn collect_block_asset_refs(b: &DocBlock, into: &mut std::collections::HashSet<S
     collect_asset_refs(&b.raw, into);
     for c in &b.children {
         collect_block_asset_refs(c, into);
+    }
+}
+
+pub(crate) fn collect_application_page_asset_refs(
+    page: &PageDto,
+    into: &mut std::collections::HashSet<String>,
+) {
+    if let Some(pre_block) = page.pre_block.as_deref() {
+        collect_asset_refs(pre_block, into);
+    }
+    fn collect(block: &BlockDto, into: &mut std::collections::HashSet<String>) {
+        collect_asset_refs(&block.raw, into);
+        for child in &block.children {
+            collect(child, into);
+        }
+    }
+    for block in &page.blocks {
+        collect(block, into);
     }
 }
 

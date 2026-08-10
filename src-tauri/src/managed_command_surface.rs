@@ -142,7 +142,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("list_installed_plugins", NoGraphSlot),
     ("list_journal_conflicts", Filesystem),
     ("list_known_graphs", NoGraphSlot),
-    ("list_orphan_assets", ReadOnly),
+    ("list_orphan_assets", ManagedRouted),
     ("list_pages", ManagedRouted),
     ("list_spellcheck_dictionaries", NoGraphSlot),
     ("list_sync_conflicts", Filesystem),
