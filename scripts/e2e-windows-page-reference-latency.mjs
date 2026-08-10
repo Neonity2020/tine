@@ -148,8 +148,10 @@ try {
   // The navigation click can leave the pointer over a page-reference at the
   // same screen coordinates, opening a hover peek above the target row. Close
   // that real transient, then use WebDriver for the edit-entry click as well as
-  // the measured keys; Element.click() alone does not emit Tine's mousedown
+  // the measured keys; DOM Element.click() alone does not emit Tine's mousedown
   // edit gesture on historical candidates.
+  await browser.$("h1.page-title").moveTo();
+  await sleep(750);
   if (await browser.$(".peek-popup").isExisting()) {
     await browser.keys(["Escape"]);
     await browser.$(".peek-popup").waitForExist({ reverse: true, timeout: 5_000 });
