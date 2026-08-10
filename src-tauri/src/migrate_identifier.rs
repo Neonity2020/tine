@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The identifier Tine currently ships under (must match tauri.conf.json).
-const CURRENT_IDENTIFIER: &str = "page.tine.Tine";
+pub(crate) const CURRENT_IDENTIFIER: &str = "page.tine.Tine";
 
 /// Identifiers Tine shipped under before, NEWEST FIRST. We migrate from the most
 /// recent one that still holds our data, so a user who upgraded through the whole

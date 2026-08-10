@@ -11,6 +11,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { waitForFileText as waitForPersistedFileText } from "./e2e-file-poll.mjs";
+import { ensureDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 if (process.platform !== "linux") throw new Error("sparse-v2 recovery native proof is Linux-only");
 if (!process.env.TINE_APP) throw new Error("HARNESS UNAVAILABLE: sparse-v2 recovery requires the exact candidate in TINE_APP");

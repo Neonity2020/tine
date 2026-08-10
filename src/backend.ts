@@ -103,6 +103,13 @@ export interface GraphSourceFile {
   bytes: number;
 }
 
+/** The reference-name inventory, digest-gated. `names` is null exactly when the
+ *  digest the caller presented still describes the current set. */
+export interface ReferencedPageNames {
+  digest: number;
+  names: string[] | null;
+}
+
 export type GraphFolderPickResult =
   | { status: "picked"; path: string }
   | { status: "permission-requested" | "permission-needed" | "cancelled" | "refused"; path?: string };
@@ -218,8 +225,12 @@ export interface Backend {
    *  the created graph's root path to then `loadGraph`. Creates the graph in
    *  `dir` if empty, else in a fresh `tine-demo` subfolder. */
   createGraph(dir: string): Promise<string>;
-  /** Page names that exist only through references in the warmed graph cache. */
-  referencedPageNames(): Promise<string[]>;
+  /** Page names that exist only through references in the warmed graph cache.
+   *  Pass the digest of the set you already hold: the answer omits `names`
+   *  entirely when nothing changed, which is the usual case between saves and
+   *  saves several thousand strings of IPC and JSON parsing on the UI thread.
+   *  A `null` `names` means "keep what you have", never "the set is empty". */
+  referencedPageNames(knownDigest?: number | null): Promise<ReferencedPageNames>;
   listPages(): Promise<PageEntry[]>;
   journalFeedPage(limit: number, beforeDay: number | null): Promise<import("./types").JournalFeedPage>;
   /** Journal date-keys (yyyymmdd) whose page has real content. */
@@ -231,7 +242,7 @@ export interface Backend {
   /** Save a page. `baseRev` is the file hash the editor loaded; the backend
    *  rejects with "conflict" if the file changed on disk since then (unless
    *  `force`). Returns the new on-disk rev to use as the next baseline. */
-  savePage(page: PageDto, baseRev: string | null, force?: boolean): Promise<string>;
+  savePage(page: PageDto, baseRev: string | null, force?: boolean, conflictEpoch?: number | null): Promise<string>;
   managedSyncStatus(): Promise<ManagedSyncStatus | null>;
   managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
@@ -508,6 +519,11 @@ export interface Backend {
    *  page.tine.Tine (so the UI can explain that some app-level prefs may need
    *  re-setting). Self-clears after the first call. */
   takeIdentifierMigrationNotice(): Promise<boolean>;
+  /** The directory this launch had to fall back to, exactly ONCE, when the
+   *  normal app-data home could not be written (Tauri would otherwise have
+   *  panicked before any window existed). `null` on every ordinary launch.
+   *  Self-clears after the first call. */
+  takeDataHomeFallbackNotice(): Promise<string | null>;
   /** What the backend knows about the rendering path, for the CPU-rendering
    *  warning (see `gpu.ts`). A silent driver fallback is detected in the webview
    *  (WebGL renderer); this just supplies why/where context for the message. */
@@ -682,8 +698,10 @@ class TauriBackend implements Backend {
   createGraph(dir: string) {
     return this.call<string>("create_graph", { dir });
   }
-  referencedPageNames() {
-    return this.call<string[]>("referenced_page_names");
+  referencedPageNames(knownDigest?: number | null) {
+    return this.call<ReferencedPageNames>("referenced_page_names", {
+      knownDigest: knownDigest ?? null,
+    });
   }
   listPages() {
     return this.call<PageEntry[]>("list_pages");
@@ -700,9 +718,9 @@ class TauriBackend implements Backend {
   graphSourceFiles(includeJournals: boolean) {
     return this.call<GraphSourceFile[]>("graph_source_files", { includeJournals });
   }
-  savePage(page: PageDto, baseRev: string | null, force = false) {
+  savePage(page: PageDto, baseRev: string | null, force = false, conflictEpoch: number | null = null) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
-      this.call<string>("save_page", { page, baseRev, force })
+      this.call<string>("save_page", { page, baseRev, force, conflictEpoch })
     );
   }
   managedSyncStatus() {
@@ -1156,6 +1174,9 @@ class TauriBackend implements Backend {
   }
   takeIdentifierMigrationNotice() {
     return this.call<boolean>("take_identifier_migration_notice");
+  }
+  takeDataHomeFallbackNotice() {
+    return this.call<string | null>("take_data_home_fallback_notice");
   }
   gpuEnv() {
     return this.call<GpuEnv>("gpu_env");

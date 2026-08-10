@@ -71,7 +71,6 @@ import {
   pageInventoryRev,
   bumpPageInventoryRev,
   installPaneTracker,
-  markConflict,
   pushToast,
   refreshSyncConflicts,
   graphEpoch,
@@ -94,7 +93,7 @@ import {
   reloadPageIfStillSafe,
   restoreTodayJournalInFeed,
 } from "./store";
-import { applyDivergenceVerdict, isSaving } from "./persistence";
+import { applyDivergenceVerdict, isSaving, reconcileExternalChange } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
 import { backend, isTauri, type GraphChange } from "./backend";
 import { parserFailed } from "./render/parse";
@@ -209,7 +208,10 @@ export async function handleGraphChange(c: GraphChange) {
   if (c.removed) {
     const disp = reloadDisposition(c.name);
     if (disp === "conflict") {
-      markConflict(c.name);
+      // The file is gone under an unsaved edit. Let the guarded save decide and
+      // raise the banner: only its refusal carries the authority "Keep mine"
+      // must present (see `reconcileExternalChange`).
+      await reconcileExternalChange(c.name);
       if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
       return;
     }
@@ -244,7 +246,7 @@ export async function handleGraphChange(c: GraphChange) {
     // conflict here blocks every subsequent save of the very edit it warns about.
     if (!isSaving(c.name)) {
       const current = await backend().getPage(c.name, c.kind);
-      applyDivergenceVerdict(c.name, { exists: !!current, rev: current?.rev ?? null });
+      await applyDivergenceVerdict(c.name, { exists: !!current, rev: current?.rev ?? null });
     }
     if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
     return;
@@ -303,7 +305,7 @@ export async function handleSparseV2Changed() {
       // blocking its saves — the epoch alone says only that SOMETHING was
       // admitted, which is usually our own write coming back — and lift an
       // existing conflict when the proof comes back negative.
-      applyDivergenceVerdict(route.name, { exists: !!dto, rev: dto?.rev ?? null });
+      await applyDivergenceVerdict(route.name, { exists: !!dto, rev: dto?.rev ?? null });
       continue;
     }
     if (dto) reloadPageIfStillSafe(route.name, toLoadablePage(dto, route.name));
@@ -605,6 +607,25 @@ export function App(): JSX.Element {
         pushToast(
           "Tine was renamed under the hood, so we moved your settings and backups across. A few app-level preferences (e.g. keyboard shortcuts) might need setting again — sorry about that!",
           "info",
+          { sticky: true }
+        );
+      }
+    } catch {
+      // Non-Tauri/mock or an older backend without the command: nothing to notify.
+    }
+  });
+
+  // The normal app-data home was not writable, so this launch put settings, the
+  // session and the WebView store somewhere else rather than crashing on the way
+  // up. Sticky: the relocation lasts only as long as the permissions problem, so
+  // the user needs to know where their state went and why.
+  onMount(async () => {
+    try {
+      const fallback = await backend().takeDataHomeFallbackNotice();
+      if (fallback) {
+        pushToast(
+          `Tine could not write its usual application-data folder, so this session is keeping settings and backups in ${fallback} instead. Fixing the permissions on that folder restores the normal location.`,
+          "warn",
           { sticky: true }
         );
       }

@@ -5,12 +5,15 @@ const backendMock = vi.hoisted(() => ({
   listPages: vi.fn(async () => [{
     name: "test", kind: "page", date_key: null, path: "pages/test.md",
   }]),
-  referencedPageNames: vi.fn(async () => [
-    "test",
-    "test/testy test",
-    "test/testy tester",
-    "test/testy test/another",
-  ]),
+  referencedPageNames: vi.fn(async () => ({
+    digest: 1,
+    names: [
+      "test",
+      "test/testy test",
+      "test/testy tester",
+      "test/testy test/another",
+    ],
+  })),
 }));
 
 vi.mock("../backend", () => ({ backend: () => backendMock }));

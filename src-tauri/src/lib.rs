@@ -7,6 +7,7 @@ mod android_media;
 mod android_system_bars;
 mod backup;
 mod commands;
+mod data_home;
 mod debug;
 mod graph;
 #[cfg(target_os = "ios")]
@@ -477,6 +478,12 @@ pub fn run() {
     // (localStorage) + settings + backups. Records a one-shot flag; the frontend
     // toasts about the (possible) prefs reset. Android intentionally keeps
     // page.tine.app and run_early() is a no-op there.
+    // Tauri creates the WebView user-data dir inside its own setup() and panics
+    // if it cannot; a user whose app-data home is unwritable got a hard crash at
+    // launch. Probe it first — and relocate for this launch if needed — before
+    // anything else resolves that path, the migration below included.
+    data_home::ensure_usable(migrate_identifier::CURRENT_IDENTIFIER);
+
     migrate_identifier::run_early();
 
     // Wayland resolves the shell/titlebar icon by matching a window app ID to a
@@ -826,6 +833,7 @@ pub fn run() {
             load_plugin_registry_cache,
             store_plugin_registry_cache,
             migrate_identifier::take_identifier_migration_notice,
+            data_home::take_data_home_fallback_notice,
             gpu_env,
             get_smooth_scroll,
             set_smooth_scroll,

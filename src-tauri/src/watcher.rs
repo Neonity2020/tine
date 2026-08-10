@@ -85,6 +85,34 @@ const RETRY_BACKOFF: [Duration; 6] = [
     Duration::from_secs(8),
 ];
 
+/// How long the inotify branch may block while a graph root it WANTS to watch is
+/// still unwatched. Matches the poll branch's ceiling: this is a recovery cadence
+/// for a root the kernel refused, not a polling strategy.
+const UNWATCHED_ROOT_RETRY: Duration = Duration::from_secs(3);
+
+/// How long to wait for the next cycle in the inotify branch.
+///
+/// A root whose `watch()` failed is retried on the next cycle — it is never
+/// inserted into `watched` — but a cycle only begins when something wakes this
+/// thread, and in the inotify branch that means an event from a root that IS
+/// watched. With a single graph that is self-correcting: the failure leaves
+/// `watched` empty, which takes the bounded poll branch instead. With two graphs
+/// open it is not. inotify limits are per-user (`fs.inotify.max_user_watches`),
+/// so opening a second large graph is exactly how one root fails while the other
+/// is healthy — and then the failing graph stays invisible to external changes
+/// until the healthy one happens to change, which on a quiet graph is never.
+///
+/// So bound the wait whenever a desired root is unwatched. (Direct Files
+/// data-safety audit 2026-08-09, finding 16, in its reachable form: the blindness
+/// is not permanent and there IS a poll fallback, but only when EVERY root fails.)
+fn inotify_cycle_wait(retry_wait: Option<Duration>, unwatched_root: bool) -> Option<Duration> {
+    match (retry_wait, unwatched_root) {
+        (Some(wait), true) => Some(wait.min(UNWATCHED_ROOT_RETRY)),
+        (None, true) => Some(UNWATCHED_ROOT_RETRY),
+        (wait, false) => wait,
+    }
+}
+
 #[derive(Default)]
 struct RetrySchedule {
     failures: usize,
@@ -1258,7 +1286,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             .filter_map(|graph| graph.retry.remaining(now)),
                     )
                     .min();
-                let woke_for_event = match retry_wait {
+                let wait_for =
+                    inotify_cycle_wait(retry_wait, desired.difference(&watched).next().is_some());
+                let woke_for_event = match wait_for {
                     Some(wait) => rx.recv_timeout(wait).is_ok(),
                     None => rx.recv().is_ok(),
                 };
@@ -1606,6 +1636,43 @@ mod tests {
         assert_eq!(retry.failures, 0);
         assert!(!retry.take_due(start));
         assert!(retry.take_due(start + Duration::from_millis(10)));
+    }
+
+    // Direct Files data-safety audit 2026-08-09, finding 16, in its reachable
+    // form. The blindness the audit predicted is not permanent and there IS a
+    // fallback — but only when EVERY root fails, which empties `watched` and
+    // takes the bounded poll branch. The reachable case is mixed: with two
+    // graphs open (inotify watch limits are per-user, so a second large graph is
+    // exactly how one root fails while the other is fine), the inotify branch
+    // blocked forever on an event from the HEALTHY root, and the failing graph
+    // stayed invisible until that other graph happened to change.
+    //
+    // Two gaps, stated rather than papered over. These cover the wait POLICY,
+    // not a real kernel `watch()` failure — exhausting fs.inotify.max_user_watches
+    // needs privileges this box does not have — and not the wiring that feeds
+    // `desired.difference(&watched)` into it. They are therefore a specification
+    // of the rule, not fail-before evidence: `inotify_cycle_wait` did not exist
+    // before this change, so there is no earlier build they could have failed
+    // against. Do not read them as a regression guard for the loop itself.
+    #[test]
+    fn an_unwatched_root_bounds_the_wait_so_its_retry_actually_runs() {
+        // Everything watched: block until the kernel says something, as before.
+        assert_eq!(inotify_cycle_wait(None, false), None);
+        // A root we want and do not have: never block indefinitely.
+        assert_eq!(inotify_cycle_wait(None, true), Some(UNWATCHED_ROOT_RETRY));
+    }
+
+    #[test]
+    fn an_unwatched_root_never_delays_a_sooner_scheduled_retry() {
+        let sooner = Duration::from_millis(250);
+        assert_eq!(inotify_cycle_wait(Some(sooner), true), Some(sooner));
+        assert_eq!(inotify_cycle_wait(Some(sooner), false), Some(sooner));
+        let later = UNWATCHED_ROOT_RETRY * 4;
+        assert_eq!(
+            inotify_cycle_wait(Some(later), true),
+            Some(UNWATCHED_ROOT_RETRY)
+        );
+        assert_eq!(inotify_cycle_wait(Some(later), false), Some(later));
     }
 
     #[test]

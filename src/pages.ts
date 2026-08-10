@@ -27,6 +27,14 @@ const pageInventory = createRoot(() => {
       return epoch === graphEpoch() && inventory === pageInventoryRev() ? pages : [];
     }
   );
+  // The last set the backend handed us, with the digest that identified it. This
+  // resource re-runs after every typing lull — it is keyed on `dataRev`, which a
+  // save bumps — and the answer almost never changes, because typing inside a
+  // block rarely adds or removes a `[[link]]`. Presenting the digest lets the
+  // backend reply with an integer instead of several thousand strings that would
+  // be JSON-parsed on the UI thread. (Direct Files performance audit 2026-08-09,
+  // finding F7.) Reset on a graph switch: digests are per-graph.
+  let known: { epoch: number; digest: number; names: string[] } | null = null;
   const [referencedNames] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev(), inventory: pageInventoryRev() }),
     async ({ epoch, revision, inventory }) => {
@@ -35,7 +43,16 @@ const pageInventory = createRoot(() => {
       // result cannot get memoized for this frontend revision.
       if (!(await waitForWarmCache(epoch))) return [];
       if (epoch !== graphEpoch() || revision !== dataRev() || inventory !== pageInventoryRev()) return [];
-      const names = await backend().referencedPageNames().catch(() => [] as string[]);
+      const carried = known?.epoch === epoch ? known : null;
+      const answer = await backend()
+        .referencedPageNames(carried?.digest ?? null)
+        .catch(() => null);
+      if (!answer) return carried?.names ?? [];
+      // A null `names` means "unchanged", so it may only be honoured against the
+      // set that digest described. Without a carried set there is nothing to
+      // reuse, and treating it as empty would erase the inventory.
+      const names = answer.names ?? carried?.names ?? [];
+      known = { epoch, digest: answer.digest, names };
       return epoch === graphEpoch() && revision === dataRev() && inventory === pageInventoryRev()
         ? names
         : [];

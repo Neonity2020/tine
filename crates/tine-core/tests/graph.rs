@@ -279,13 +279,39 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
             .load_by_path("external/deep/Exact.markdown")
             .unwrap()
             .unwrap();
-        identity_bound.blocks[0].raw = "must not replace a new inode".into();
+        identity_bound.blocks[0].raw = "keep mine over a republished inode".into();
+        std::fs::write(&path, "- shown conflict\n").unwrap();
+        graph
+            .save_page(&identity_bound, identity_bound.rev.as_deref())
+            .unwrap_err();
+
+        // A syncer republishes the SAME bytes by temp+rename: new inode, state
+        // the user was shown unchanged. "Keep mine" must go through. Refusing
+        // would be stricter than an ordinary save, which treats a same-byte
+        // republication as the state it already has (GH #254 increment 2).
         let replacement = root.join("external/deep/.replacement.markdown");
-        std::fs::write(&replacement, "- external winner\n").unwrap();
+        std::fs::write(&replacement, "- shown conflict\n").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
+        graph.force_save_page(&identity_bound).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("keep mine over a republished inode"));
+
+        // A DIFFERENT-byte winner on a new inode is still refused, and the file
+        // is left exactly as that winner wrote it.
+        let mut second = graph
+            .load_by_path("external/deep/Exact.markdown")
+            .unwrap()
+            .unwrap();
+        second.blocks[0].raw = "must not replace a different winner".into();
+        std::fs::write(&path, "- second shown conflict\n").unwrap();
+        graph.save_page(&second, second.rev.as_deref()).unwrap_err();
+        let foreign = root.join("external/deep/.foreign.markdown");
+        std::fs::write(&foreign, "- different winner\n").unwrap();
+        std::fs::rename(&foreign, &path).unwrap();
         let before = std::fs::read(&path).unwrap();
         assert_eq!(
-            graph.force_save_page(&identity_bound).unwrap_err().kind(),
+            graph.force_save_page(&second).unwrap_err().kind(),
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -3219,9 +3245,8 @@ mod page_inventory_survives_a_content_save {
 /// frontend classifies as transient and retries forever, so the page silently
 /// stopped saving. Direct Files data-safety audit, 2026-08-09, finding 2.
 ///
-/// This covers only the ORDINARY save half, which the contract verifier
-/// certified as an independently safe increment. Force-save ("Keep mine") and
-/// the trusted journal projection are deliberately untouched.
+/// Increment 2 adds one-shot exact-snapshot authority to the conflict half;
+/// trusted journal projection remains deliberately separate.
 mod external_atomic_replacement {
     use super::*;
 
@@ -3309,7 +3334,11 @@ mod external_atomic_replacement {
 
         page.blocks[0].raw = "mine".into();
         let error = graph.save_page(&page, base.as_deref()).unwrap_err();
-        assert_eq!(error.to_string(), "conflict", "must be the resolvable code");
+        assert_eq!(
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_present",
+            "must be a resolvable minted-authority code"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
             "- from another device\n",
@@ -3330,27 +3359,18 @@ mod external_atomic_replacement {
         std::fs::write(root.join("pages/Note.md"), "- edited in place\n").unwrap();
 
         page.blocks[0].raw = "mine".into();
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
         assert_eq!(
-            graph
-                .save_page(&page, base.as_deref())
-                .unwrap_err()
-                .to_string(),
-            "conflict"
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_present"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Necessity guard: an externally DELETED target must still refuse rather
-    /// than silently resurrecting the page.
-    ///
-    /// It refuses, but NOT with the resolvable `conflict` code — it fails
-    /// earlier, in the name-only-creation identity check. Verified to be
-    /// identical before and after this change, so it is pre-existing and out of
-    /// scope here. Closing it properly needs the absent-target override
-    /// authority the contract verifier called blocker A, which belongs to the
-    /// GH #254 project. Asserted as-is so a future change to it is deliberate.
+    /// An external deletion is a resolvable `Absent` conflict. It must not be
+    /// resurrected until the user explicitly chooses Keep mine.
     #[test]
-    fn an_external_delete_still_refuses_without_resurrecting() {
+    fn an_external_delete_mints_absent_authority_without_resurrecting() {
         let root = scratch("deleted");
         let (graph, mut page) = open_with(&root, "- original\n");
         let base = page.rev.clone();
@@ -3358,19 +3378,19 @@ mod external_atomic_replacement {
         std::fs::remove_file(root.join("pages/Note.md")).unwrap();
 
         page.blocks[0].raw = "mine".into();
-        let error = graph
-            .save_page(&page, base.as_deref())
-            .unwrap_err()
-            .to_string();
-        assert_ne!(error, "", "the save must refuse");
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
+        assert_eq!(
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_absent"
+        );
         assert!(
             !root.join("pages/Note.md").exists(),
             "a deleted page must not be silently resurrected"
         );
-        assert_eq!(
-            error, "effective page identity evidence is stale or incomplete for name-only creation",
-            "pre-existing refusal code; see the doc comment before changing this"
-        );
+        graph.force_save_page(&page).unwrap();
+        assert!(std::fs::read_to_string(root.join("pages/Note.md"))
+            .unwrap()
+            .contains("mine"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

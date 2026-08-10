@@ -65,6 +65,9 @@ describe("save failure classification", () => {
     // resolve on their own.
     expect(isRetryableSaveFailure("precheck.interrupted: inventory changed")).toBe(true);
     expect(isRetryableSaveFailure("identity.changed_since_load: ...")).toBe(true);
+    expect(
+      isRetryableSaveFailure("conflict_retry.replace_pre_retirement: continued delivery churn")
+    ).toBe(true);
     expect(isRetryableSaveFailure("unknown: disk full")).toBe(true);
     expect(isRetryableSaveFailure(new Error("EBUSY"))).toBe(true);
   });

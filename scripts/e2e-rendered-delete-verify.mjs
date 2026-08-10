@@ -10,20 +10,15 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const G = "/tmp/txdg-rdv-g";
 const APP = process.env.TINE_APP || path.join(ROOT, "target/release/tine");
 const TD = process.env.TAURI_DRIVER || path.resolve(ROOT, "..", ".toolchain", "cargo", "bin", "tauri-driver");
 const WEBKIT_DRIVER = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
-
-let xvfb;
-async function ensureDisplay() {
-  if (process.env.DISPLAY) return;
-  process.env.DISPLAY = ":98";
-  xvfb = spawn("Xvfb", [":98", "-screen", "0", "1400x1000x24"], { stdio: "ignore" });
-  await sleep(1200);
-}
 
 const FIXTURE = "- 0123456789 abcdefghij\n- bold **marker** and [[Page Link]] end\n";
 function seed() {
@@ -175,4 +170,4 @@ await sleep(300);
 
 await browser.deleteSession();
 td.kill();
-if (xvfb) xvfb.kill();
+stopDisplay();

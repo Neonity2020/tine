@@ -5,6 +5,9 @@ import { spawn } from "node:child_process";
 import { remote } from "webdriverio";
 import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
+import { ensureDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 const G = "/tmp/tgraph-jf";
 const APP = process.env.TINE_APP || `${process.env.HOME}/research/tine`;

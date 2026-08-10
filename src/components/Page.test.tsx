@@ -161,6 +161,8 @@ describe("Journals feed generation lifecycle", () => {
         }),
         "sparse-load-rev",
         false,
+        // Not a forced save, so it presents no conflict observation (GH #254).
+        null,
       );
     } finally {
       mounted.dispose();

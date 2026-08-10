@@ -2,7 +2,7 @@
 // outside Tauri (browser dev / Playwright screenshots). Mirrors the real
 // backend's shape so the UI behaves identically.
 
-import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope } from "./backend";
+import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
 import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
@@ -831,8 +831,12 @@ export function mockBackend(): Backend {
     async defaultGraphParent(): Promise<string> {
       return "/mock";
     },
-    async referencedPageNames(): Promise<string[]> {
-      return mockReferencedPageNames(all);
+    async referencedPageNames(knownDigest?: number | null): Promise<ReferencedPageNames> {
+      const names = mockReferencedPageNames(all);
+      // Same contract as the backend: a stable digest for a stable set, and no
+      // payload when the caller already has it.
+      const digest = names.length * 1000003 + names.join("\u0000").length;
+      return { digest, names: knownDigest === digest ? null : names };
     },
     async listPages(): Promise<PageEntry[]> {
       return all.map(mockPageEntry);
@@ -875,7 +879,7 @@ export function mockBackend(): Backend {
       }
       return files.map((f) => ({ ...f, bytes: new TextEncoder().encode(f.text).length }));
     },
-    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean): Promise<string> {
+    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<string> {
       return "mock-rev"; // no-op in mock
     },
     async managedSyncStatus() {
@@ -1732,6 +1736,9 @@ export function mockBackend(): Backend {
     },
     async takeIdentifierMigrationNotice(): Promise<boolean> {
       return false;
+    },
+    async takeDataHomeFallbackNotice(): Promise<string | null> {
+      return null;
     },
     async gpuEnv(): Promise<GpuEnv> {
       return { software_forced: false, appimage: false };

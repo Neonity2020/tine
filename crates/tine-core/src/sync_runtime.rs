@@ -44,7 +44,7 @@ use crate::fast_commit::{
 use crate::model::{
     sync_conflict_base, AcceptedExternalDocumentIdentity, BacklinkFilterContext,
     BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
-    RefGroup, ReferenceBlockEvidence, ReferenceKind, TemplateDto,
+    RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
@@ -1814,7 +1814,9 @@ pub enum SyncApplicationPageInventoryOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SyncApplicationNavigationRequest {
-    ReferencedPageNames,
+    ReferencedPageNames {
+        known_digest: Option<u64>,
+    },
     PageAliases,
     PageIcons {
         names: Vec<String>,
@@ -1896,7 +1898,7 @@ pub struct SyncApplicationBoundedRefGroups {
     deny_unknown_fields
 )]
 pub enum SyncApplicationNavigationReply {
-    ReferencedPageNames(Vec<String>),
+    ReferencedPageNames(ReferencedPageNames),
     PageAliases(Vec<(String, String)>),
     PageIcons(HashMap<String, String>),
     ExistingPageNames(Vec<String>),
@@ -4565,7 +4567,7 @@ fn validate_application_navigation_request(
         return Ok(());
     }
     let (names, query, limit) = match request {
-        SyncApplicationNavigationRequest::ReferencedPageNames
+        SyncApplicationNavigationRequest::ReferencedPageNames { .. }
         | SyncApplicationNavigationRequest::PageAliases
         | SyncApplicationNavigationRequest::ListTemplates => (&[][..], None, None),
         SyncApplicationNavigationRequest::PageIcons { names }
@@ -8452,9 +8454,10 @@ impl RuntimeActor {
             return Ok(SyncApplicationNavigationOutcome::Deferred { state });
         }
         let reply = match request {
-            SyncApplicationNavigationRequest::ReferencedPageNames => {
+            SyncApplicationNavigationRequest::ReferencedPageNames { known_digest } => {
+                let names = self.application_navigation_reference_names_ready()?;
                 SyncApplicationNavigationReply::ReferencedPageNames(
-                    self.application_navigation_reference_names_ready()?,
+                    ReferencedPageNames::answer_for(&names, known_digest),
                 )
             }
             SyncApplicationNavigationRequest::PageAliases => {
@@ -19666,16 +19669,29 @@ mod tests {
             other => panic!("application navigation was not ready: {other:?}"),
         };
         let SyncApplicationNavigationReply::ReferencedPageNames(referenced) =
-            navigation(SyncApplicationNavigationRequest::ReferencedPageNames)
+            navigation(SyncApplicationNavigationRequest::ReferencedPageNames {
+                known_digest: None,
+            })
         else {
             panic!("wrong referenced-name reply")
         };
+        let referenced_digest = referenced.digest;
+        let referenced = referenced.names.expect("first answer carries names");
         assert!(referenced
             .iter()
             .any(|name| name.eq_ignore_ascii_case("gateway")));
         assert!(referenced
             .iter()
             .any(|name| name.eq_ignore_ascii_case("compass")));
+        let SyncApplicationNavigationReply::ReferencedPageNames(unchanged) =
+            navigation(SyncApplicationNavigationRequest::ReferencedPageNames {
+                known_digest: Some(referenced_digest),
+            })
+        else {
+            panic!("wrong unchanged referenced-name reply")
+        };
+        assert_eq!(unchanged.digest, referenced_digest);
+        assert!(unchanged.names.is_none());
         let SyncApplicationNavigationReply::PageAliases(aliases) =
             navigation(SyncApplicationNavigationRequest::PageAliases)
         else {
@@ -20255,10 +20271,11 @@ mod tests {
         );
         assert!(!aliases.iter().any(|(alias, _)| alias == "old alias"));
         let SyncApplicationNavigationReply::ReferencedPageNames(names) =
-            loaded(SyncApplicationNavigationRequest::ReferencedPageNames)
+            loaded(SyncApplicationNavigationRequest::ReferencedPageNames { known_digest: None })
         else {
             panic!("wrong referenced-name reply")
         };
+        let names = names.names.expect("first answer carries names");
         assert!(names.iter().any(|name| name == "New Phantom"));
         assert!(!names.iter().any(|name| name == "Old Phantom"));
         let SyncApplicationNavigationReply::Backlinks(old_backlinks) =
@@ -20501,10 +20518,11 @@ mod tests {
         };
         assert_eq!(existing, vec!["Created Navigation", "Created Alias"]);
         let SyncApplicationNavigationReply::ReferencedPageNames(names) =
-            loaded(SyncApplicationNavigationRequest::ReferencedPageNames)
+            loaded(SyncApplicationNavigationRequest::ReferencedPageNames { known_digest: None })
         else {
             panic!("wrong referenced-name reply")
         };
+        let names = names.names.expect("first answer carries names");
         assert!(names.iter().any(|name| name == "Created Phantom"));
         let SyncApplicationNavigationReply::Backlinks(created_backlinks) =
             loaded(SyncApplicationNavigationRequest::Backlinks {
