@@ -1,15 +1,32 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { ConflictBar } from "./ConflictBar";
+import { Block } from "./Block";
+import { PageView } from "./Page";
 import { conflicts, clearConflict } from "../ui";
 import { backend } from "../backend";
 import { loadSingle, resetStore, pageByName, doc, setRaw } from "../store";
-import { flushPage, isDirty } from "../persistence";
+import {
+  canForceSave,
+  flushPage,
+  isDirty,
+  managedConflictObservationSnapshotFor,
+  reobserve,
+  shownObservationFor,
+} from "../persistence";
+import { startEditing } from "../editorController";
+import { mainPaneRouter, resetTabsToJournals } from "../router";
+import { initParser } from "../render/parse";
 import type { PageDto } from "../types";
+
+beforeAll(async () => {
+  await initParser();
+});
 
 afterEach(() => {
   for (const name of conflicts()) clearConflict(name);
   resetStore();
+  resetTabsToJournals();
   document.body.innerHTML = "";
   vi.restoreAllMocks();
 });
@@ -57,6 +74,25 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     document.body.append(root);
     const dispose = render(() => <ConflictBar />, root);
     return { root, dispose, savePage };
+  }
+
+  async function prepareObservedDirectConflict(dto: PageDto = page(strayPath, "the loaded disk baseline")) {
+    loadSingle(dto);
+    const loaded = pageByName(dto.name);
+    expect(loaded).toBeDefined();
+    setRaw(loaded!.roots[0], "the retained local draft");
+    const savePage = vi.spyOn(backend(), "savePage")
+      .mockRejectedValueOnce(new Error("conflict:41"));
+    expect(await flushPage(dto.name)).toBe(false);
+    expect(conflicts()).toEqual([dto.name]);
+    return savePage;
+  }
+
+  function mountConflictWith(editor: () => ReturnType<typeof ConflictBar>) {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <><ConflictBar />{editor()}</>, root);
+    return { root, dispose };
   }
 
   it("adopts the pinned baseline without writing when the shown authority was withdrawn", async () => {
@@ -130,6 +166,229 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     );
     expect(conflicts()).toContain(sharedName);
     expect(retire).toHaveBeenCalledWith(strayPath, 9002);
+    dispose();
+  });
+
+  it("keeps a title draft and its conflict when the rename lease starts during activation", async () => {
+    const titleName = "Rename during discard";
+    const titlePath = "pages/Rename during discard.md";
+    const diskBaseline: PageDto = {
+      name: titleName,
+      kind: "page",
+      title: titleName,
+      pre_block: null,
+      path: titlePath,
+      rev: "title-baseline",
+      blocks: [{
+        id: "title-discard-block",
+        raw: "the loaded disk baseline",
+        collapsed: false,
+        children: [],
+        properties: [],
+      }],
+    };
+    const savePage = await prepareObservedDirectConflict(diskBaseline);
+    const getPageByPath = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(diskBaseline);
+    vi.spyOn(backend(), "getBacklinks").mockResolvedValue([]);
+    vi.spyOn(backend(), "getUnlinkedRefs").mockResolvedValue([]);
+    mainPaneRouter.openFile(titlePath, titleName, "page", { inPlace: true });
+    const { root, dispose } = mountConflictWith(() => <PageView />);
+    await vi.waitFor(() => expect(root.querySelector(".page-title")).not.toBeNull());
+
+    let releaseActivation!: (value: { activation: number; target: string; prospective: boolean }) => void;
+    const pendingActivation = new Promise<{ activation: number; target: string; prospective: boolean }>((resolve) => {
+      releaseActivation = resolve;
+    });
+    vi.spyOn(backend(), "activateEditor").mockReturnValueOnce(pendingActivation);
+    const present = vi.spyOn(backend(), "presentConflictOverride").mockResolvedValue("authorised");
+    getPageByPath.mockResolvedValue({ ...diskBaseline, rev: "disk-winner", blocks: [
+      { id: "disk-title-winner", raw: "the disk winner", collapsed: false, children: [], properties: [] },
+    ] });
+    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await vi.waitFor(() => expect(backend().activateEditor).toHaveBeenCalled());
+    root.querySelector<HTMLElement>(".page-title")!.dispatchEvent(
+      new MouseEvent("dblclick", { bubbles: true }),
+    );
+    const input = root.querySelector<HTMLInputElement>(".page-title-input")!;
+    input.value = "post-click title draft";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    releaseActivation({ activation: 9003, target: titlePath, prospective: false });
+
+    await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
+    expect(input.isConnected).toBe(true);
+    expect(input.value).toBe("post-click title draft");
+    expect(conflicts()).toContain(titleName);
+    expect(shownObservationFor(titleName)).toBe(42);
+    expect(present).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("keeps an active IME composition and restores an answerable conflict after presentation", async () => {
+    const { dispose, savePage } = await mountWithObservedDirectConflict();
+    const blockId = pageByName(sharedName)!.roots[0];
+    dispose();
+    startEditing(blockId, 0);
+    const mounted = mountConflictWith(() => <Block id={blockId} />);
+    const textarea = mounted.root.querySelector<HTMLTextAreaElement>("textarea.block-editor")!;
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(
+      page(strayPath, "the authorised disk winner"),
+    );
+    vi.spyOn(backend(), "activateEditor").mockResolvedValue({
+      activation: 9004,
+      target: strayPath,
+      prospective: false,
+    });
+    let releasePresentation!: (value: "authorised") => void;
+    const presentation = new Promise<"authorised">((resolve) => {
+      releasePresentation = resolve;
+    });
+    const present = vi.spyOn(backend(), "presentConflictOverride").mockReturnValue(presentation);
+    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+
+    mounted.root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await vi.waitFor(() => expect(present).toHaveBeenCalledTimes(1));
+    textarea.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    textarea.value = "post-click composing text";
+    const composing = new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertCompositionText",
+      data: "字",
+    });
+    Object.defineProperty(composing, "isComposing", { value: true });
+    textarea.dispatchEvent(composing);
+    releasePresentation("authorised");
+
+    await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
+    expect(textarea.isConnected).toBe(true);
+    expect(textarea.value).toBe("post-click composing text");
+    expect(conflicts()).toContain(sharedName);
+    expect(shownObservationFor(sharedName)).toBe(42);
+    mounted.dispose();
+  });
+
+  it("installs managed current bytes without Direct presentation or activation", async () => {
+    loadSingle(page(strayPath, "the managed baseline"));
+    setRaw(pageByName(sharedName)!.roots[0], "the retained managed draft");
+    const activate = vi.spyOn(backend(), "activateEditor").mockResolvedValue(null);
+    const current = page(strayPath, "the current managed DTO");
+    const getPageByPath = vi.spyOn(backend(), "getPageByPath").mockResolvedValue(current);
+    const savePage = vi.spyOn(backend(), "savePage")
+      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"));
+    expect(await flushPage(sharedName)).toBe(false);
+    expect(conflicts()).toEqual([sharedName]);
+    activate.mockClear();
+    const present = vi.spyOn(backend(), "presentConflictOverride");
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <ConflictBar />, root);
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+
+    await vi.waitFor(() => expect(conflicts()).toEqual([]));
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the current managed DTO");
+    expect(savePage).toHaveBeenCalledTimes(1);
+    expect(getPageByPath).toHaveBeenCalledTimes(2);
+    expect(present).not.toHaveBeenCalled();
+    expect(activate).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("keeps a post-click managed edit when the current DTO read finishes later", async () => {
+    loadSingle(page(strayPath, "the managed baseline"));
+    setRaw(pageByName(sharedName)!.roots[0], "the retained managed draft");
+    const activate = vi.spyOn(backend(), "activateEditor").mockResolvedValue(null);
+    const observed = page(strayPath, "the managed winner observed at conflict");
+    let releaseRead!: (dto: PageDto) => void;
+    const heldRead = new Promise<PageDto>((resolve) => {
+      releaseRead = resolve;
+    });
+    const getPageByPath = vi.spyOn(backend(), "getPageByPath")
+      .mockResolvedValueOnce(observed)
+      .mockReturnValueOnce(heldRead);
+    const savePage = vi.spyOn(backend(), "savePage")
+      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"));
+    expect(await flushPage(sharedName)).toBe(false);
+    expect(conflicts()).toEqual([sharedName]);
+    activate.mockClear();
+    const present = vi.spyOn(backend(), "presentConflictOverride");
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <ConflictBar />, root);
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await vi.waitFor(() => expect(getPageByPath).toHaveBeenCalledTimes(2));
+
+    const incumbent = pageByName(sharedName)!;
+    setRaw(incumbent.roots[0], "the post-click managed edit");
+    releaseRead(page(strayPath, "stale managed bytes from the click"));
+    await heldRead;
+    await Promise.resolve();
+
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the post-click managed edit");
+    expect(conflicts()).toEqual([sharedName]);
+    expect(savePage).toHaveBeenCalledTimes(1);
+    expect(present).not.toHaveBeenCalled();
+    expect(activate).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("keeps a newer managed observation when an older click read finishes later", async () => {
+    loadSingle(page(strayPath, "the managed baseline"));
+    setRaw(pageByName(sharedName)!.roots[0], "the retained managed draft");
+    const activate = vi.spyOn(backend(), "activateEditor").mockResolvedValue(null);
+    const firstWinner = page(strayPath, "the first managed winner");
+    const newerWinner = page(strayPath, "the newer managed winner");
+    let releaseRead!: (dto: PageDto) => void;
+    const heldRead = new Promise<PageDto>((resolve) => {
+      releaseRead = resolve;
+    });
+    const getPageByPath = vi.spyOn(backend(), "getPageByPath")
+      .mockResolvedValueOnce(firstWinner)
+      .mockReturnValueOnce(heldRead)
+      .mockResolvedValueOnce(newerWinner);
+    const savePage = vi.spyOn(backend(), "savePage")
+      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"))
+      .mockRejectedValueOnce(new Error("managed.conflict: stale_base"));
+    expect(await flushPage(sharedName)).toBe(false);
+    expect(conflicts()).toEqual([sharedName]);
+    activate.mockClear();
+    const present = vi.spyOn(backend(), "presentConflictOverride");
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <ConflictBar />, root);
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await vi.waitFor(() => expect(getPageByPath).toHaveBeenCalledTimes(2));
+
+    expect(await reobserve(sharedName)).toBe(false);
+    expect(getPageByPath).toHaveBeenCalledTimes(3);
+    expect(conflicts()).toEqual([sharedName]);
+    expect(canForceSave(sharedName)).toBe(true);
+    const newerObservation = managedConflictObservationSnapshotFor(sharedName);
+    expect(newerObservation?.observation).toEqual({
+      kind: "observed",
+      path: strayPath,
+      revision: newerWinner.rev,
+    });
+    // Re-observation itself goes through the ordinary save setup. Measure only
+    // the older discard callback from the point its held actor read is released.
+    activate.mockClear();
+    releaseRead(page(strayPath, "stale managed bytes from the older click"));
+    await heldRead;
+    await Promise.resolve();
+
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the retained managed draft");
+    expect(conflicts()).toEqual([sharedName]);
+    expect(canForceSave(sharedName)).toBe(true);
+    expect(managedConflictObservationSnapshotFor(sharedName)).toEqual(newerObservation);
+    expect(savePage).toHaveBeenCalledTimes(2);
+    expect(present).not.toHaveBeenCalled();
+    expect(activate).not.toHaveBeenCalled();
     dispose();
   });
 

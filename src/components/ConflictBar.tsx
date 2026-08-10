@@ -5,6 +5,9 @@ import {
   dropObservation,
   reobserve,
   saveBaselineFor,
+  conflictObservationKindFor,
+  managedConflictObservationMatches,
+  managedConflictObservationSnapshotFor,
   shownObservationFor,
   graphBinding,
 } from "../persistence";
@@ -12,9 +15,11 @@ import {
   canForceSave,
   notifyPageBecameReplaceable,
   editGeneration,
+  editorTransactionGeneration,
   editorActivationFor,
   forceSave,
   forgetPage,
+  installManagedConflictVersion,
   pageByName,
   pageInstanceGeneration,
   reloadPage,
@@ -28,6 +33,8 @@ import {
 export function ConflictBar(): JSX.Element {
   const reload = async (name: string) => {
     const page = pageByName(name);
+    const observationKind = conflictObservationKindFor(name);
+    const managedObservation = managedConflictObservationSnapshotFor(name);
     // "Use disk version" is an authority-answering action, exactly like "Keep
     // mine", so it PRESENTS the observation it was clicked under and lets the
     // backend decide. A locally recorded epoch cannot be trusted here: the
@@ -43,6 +50,7 @@ export function ConflictBar(): JSX.Element {
     // install/retire, so typing leaves it unchanged and the final check below
     // would wave through exactly the input it exists to protect.
     const generation = editGeneration(name);
+    const transactionGeneration = editorTransactionGeneration(name);
     const instance = pageInstanceGeneration(name);
     // The GRAPH BINDING, required by acceptance row D2 and never actually
     // captured here. A reopen between the click and the read replaces the core's
@@ -53,10 +61,19 @@ export function ConflictBar(): JSX.Element {
     const binding = graphBinding();
     const clickIsLive = () => (
       editGeneration(name) === generation
+      && editorTransactionGeneration(name) === transactionGeneration
       && pageInstanceGeneration(name) === instance
       && shownObservationFor(name) === shown
       && editorActivationFor(name) === activation
       && graphBinding() === binding
+    );
+    const managedClickIsLive = () => (
+      editGeneration(name) === generation
+      && editorTransactionGeneration(name) === transactionGeneration
+      && pageInstanceGeneration(name) === instance
+      && graphBinding() === binding
+      && managedObservation !== null
+      && managedConflictObservationMatches(name, managedObservation)
     );
     // Resolve the file this editor is actually pinned to. Two files can carry
     // one page name (the duplicate-day stray of #21, or same-titled pages in
@@ -77,8 +94,34 @@ export function ConflictBar(): JSX.Element {
       return;
     }
 
-    const presentationPath = page?.path || dto?.path;
-    if (!page || shown === null || activation === undefined || !presentationPath) return;
+    if (!page) return;
+
+    // Managed conflict authority is revision-based and lives in the managed
+    // actor. It has no Direct Files observation epoch or editor activation, so
+    // requiring either makes this button a silent no-op. Preserve the existing
+    // managed-safe discard path explicitly and keep Direct presentation/force
+    // semantics out of it.
+    if (observationKind === "managed") {
+      // This is the true managed install boundary. The DTO read above is the
+      // only await in this branch; re-check the complete click identity now and
+      // publish synchronously so neither local input nor a replacement banner
+      // can be answered by an older callback.
+      if (!managedClickIsLive()) return;
+      if (dto) {
+        installManagedConflictVersion(dto);
+        dropObservation(name);
+        clearConflict(name);
+        notifyPageBecameReplaceable(name);
+      } else {
+        dropObservation(name);
+        forgetPage(name);
+      }
+      return;
+    }
+
+    const presentationPath = page.path || dto?.path;
+    if (!presentationPath) return;
+    if (observationKind !== "direct" || shown === null || activation === undefined) return;
 
     if (dto) {
       let presented: "authorised" | "superseded" | "withdrawn" | null = null;

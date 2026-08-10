@@ -180,6 +180,14 @@ const pageInstanceGenerations = new Map<string, number>();
 let editClock = 0;
 const editGenerations = new Map<string, number>();
 
+// Advances whenever a component-local editor transaction starts. Unlike the
+// content-edit generation above, this also covers input that intentionally has
+// not reached the store yet: a title-rename draft and an active IME composition.
+// A discard click captures both generations so it can authorise the state the
+// user saw without authorising a new local transaction begun during an await.
+let editorTransactionClock = 0;
+const editorTransactionGenerations = new Map<string, number>();
+
 /** Current content-edit generation for a page. */
 export function editGeneration(name: string): number {
   return editGenerations.get(name) ?? 0;
@@ -187,6 +195,11 @@ export function editGeneration(name: string): number {
 
 export function bumpEditGeneration(name: string): void {
   editGenerations.set(name, ++editClock);
+}
+
+/** Current component-local editor-transaction generation for a page. */
+export function editorTransactionGeneration(name: string): number {
+  return editorTransactionGenerations.get(name) ?? 0;
 }
 
 /** The page-instance generation WITHOUT creating one for a page that has none.
@@ -206,6 +219,7 @@ function activatePageInstance(name: string): number {
 function retirePageInstance(name: string): void {
   ++pageInstanceClock;
   pageInstanceGenerations.delete(name);
+  editorTransactionGenerations.delete(name);
 }
 
 /** Current exact loaded-page generation, or null when that page is absent. */
@@ -623,6 +637,19 @@ export async function ensurePageLoaded(
     }
   }
 
+  // Presentation spends one-shot conflict authority, so identity must be
+  // re-checked after activation and BEFORE that fallible/consuming operation.
+  // The same check still runs again below after presentation, closing changes
+  // that race the presentation await itself.
+  if (
+    binding !== graphBinding()
+    || options.isRequestLive?.() === false
+    || !isExactCapturedInstance(dto.name, captured)
+  ) {
+    await retireMintedActivation(handle);
+    return { reason: "stale-instance", page: pageByName(dto.name)?.name ?? dto.name };
+  }
+
   if (options.beforeInstall) {
     let proceed = false;
     try {
@@ -868,6 +895,17 @@ export async function reloadPage(
   return ensurePageLoaded(dto, { ...options, bypassReplacementGate: true });
 }
 
+/** Install the managed actor's current DTO after an explicit discard choice.
+ *
+ * Managed conflicts have revision authority of their own and deliberately do
+ * not mint Direct Files editor activations or observation epochs. Keep this
+ * narrow installer separate from the Direct read → activate → present protocol.
+ */
+export function installManagedConflictVersion(dto: PageDto): void {
+  upsertPage(dto);
+  evictIfNeeded();
+}
+
 /** Apply a watcher-driven disk reload only if it is STILL safe at this instant.
  *
  *  `reloadDisposition` is correct, but the watcher sites read its verdict and
@@ -1067,6 +1105,7 @@ const editorLeases = new Map<string, Set<symbol>>();
  */
 export function takeEditorLease(pageName: string): () => void {
   const handle = Symbol("editor-lease");
+  editorTransactionGenerations.set(pageName, ++editorTransactionClock);
   let leases = editorLeases.get(pageName);
   if (!leases) {
     leases = new Set();
@@ -1145,6 +1184,7 @@ export function hasEditorLease(pageName: string): boolean {
 /** Drop every lease — graph reset and teardown. */
 export function clearAllEditorLeases(): void {
   editorLeases.clear();
+  editorTransactionGenerations.clear();
 }
 
 /**

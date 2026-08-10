@@ -78,6 +78,7 @@ import {
   collapsibleDescendantIds,
   setCollapsedDescendants,
   blockExternalId,
+  takeEditorLease,
   type OutlineScope,
 } from "../store";
 import {
@@ -2359,7 +2360,17 @@ export function Editor(props: { id: string }): JSX.Element {
   // commit at compositionend instead.
   let compositionActive = false;
   let compositionEndValue: string | null = null;
+  let releaseCompositionLease: (() => void) | null = null;
+  const dropCompositionLease = () => {
+    releaseCompositionLease?.();
+    releaseCompositionLease = null;
+  };
+  onCleanup(dropCompositionLease);
   const onCompositionStart = () => {
+    if (!compositionActive) {
+      const pageName = doc.byId[props.id]?.page;
+      if (pageName) releaseCompositionLease = takeEditorLease(pageName);
+    }
     compositionActive = true;
     compositionEndValue = null;
     clearTimeout(acTimer);
@@ -2423,6 +2434,7 @@ export function Editor(props: { id: string }): JSX.Element {
     commit(ref.value);
     autosize();
     refreshAutocompleteAfterInput();
+    dropCompositionLease();
   };
   const onCompositionEnd = () => {
     compositionActive = false;

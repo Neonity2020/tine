@@ -88,7 +88,18 @@ const heldSources = new Set<string>();
 // click belongs to a winner the user never saw.
 type ConflictObservation =
   | { kind: "direct"; epoch: number | null }
-  | { kind: "managed"; observation: { path: string; revision: string } | null };
+  | {
+      kind: "managed";
+      identity: number;
+      observation: { path: string; revision: string } | null;
+    };
+
+export type ManagedConflictObservationSnapshot = {
+  readonly identity: number;
+  readonly observation:
+    | { readonly kind: "observed"; readonly path: string; readonly revision: string }
+    | { readonly kind: "unobserved" };
+};
 
 const heldForcedSaves = new Map<string, ConflictObservation | null>();
 const heldByDest = new Map<string, string[]>();
@@ -99,6 +110,7 @@ const heldByDest = new Map<string, string[]>();
 // minted for a NEWER external winner, and overwrites bytes nobody was shown.
 // (GH #254 increment 2, adversarial implementation verification, finding 1.)
 const conflictObservation = new Map<string, ConflictObservation>();
+let managedConflictObservationClock = 0;
 
 // ---------------------------------------------------------------------------
 // Accessors — store.ts mutations call these instead of touching the guards.
@@ -602,6 +614,46 @@ export function shownObservationFor(name: string): number | null {
   return observation?.kind === "direct" ? observation.epoch : null;
 }
 
+/** Storage protocol represented by the conflict banner for `name`. */
+export function conflictObservationKindFor(name: string): ConflictObservation["kind"] | null {
+  return conflictObservation.get(name)?.kind ?? null;
+}
+
+/** Capture the exact managed observation represented by the current banner.
+ *
+ * The identity distinguishes two actor observations even when they report the
+ * same path/revision (or are both explicitly unobserved). The returned value is
+ * a detached typed snapshot, not the mutable map entry used by persistence.
+ */
+export function managedConflictObservationSnapshotFor(
+  name: string,
+): ManagedConflictObservationSnapshot | null {
+  const current = conflictObservation.get(name);
+  if (current?.kind !== "managed") return null;
+  return {
+    identity: current.identity,
+    observation: current.observation
+      ? {
+          kind: "observed",
+          path: current.observation.path,
+          revision: current.observation.revision,
+        }
+      : { kind: "unobserved" },
+  };
+}
+
+/** Is `snapshot` still the exact managed observation shown for `name`? */
+export function managedConflictObservationMatches(
+  name: string,
+  snapshot: ManagedConflictObservationSnapshot,
+): boolean {
+  const current = conflictObservation.get(name);
+  if (current?.kind !== "managed" || current.identity !== snapshot.identity) return false;
+  if (snapshot.observation.kind === "unobserved") return current.observation === null;
+  return current.observation?.path === snapshot.observation.path
+    && current.observation.revision === snapshot.observation.revision;
+}
+
 /**
  * Make sure `name`'s editor has an activation, minting one if it has none.
  *
@@ -888,7 +940,11 @@ async function doSave(
         // not get replacement authority. The non-destructive draft remains
         // parked and Use current remains available.
       }
-      conflictObservation.set(name, { kind: "managed", observation: managedObservation });
+      conflictObservation.set(name, {
+        kind: "managed",
+        identity: ++managedConflictObservationClock,
+        observation: managedObservation,
+      });
       // Re-notify an already visible banner so its Keep mine enabled state
       // reflects this newly observed (or now unobservable) managed owner.
       if (isConflicted(name)) clearConflict(name);
