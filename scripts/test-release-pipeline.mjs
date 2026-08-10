@@ -315,19 +315,16 @@ assert.equal(yamlScalar(yamlBlock(nextestInstall, "with", 8), "tool", 10), "next
 const windowsCoreCompile = yamlNamedStep(windowsCompile, "Windows core test targets compile (all; release gate)");
 assert.equal(yamlScalar(windowsCoreCompile, "if", 8), "inputs.windows_test_name == ''");
 assert.equal(yamlScalar(windowsCoreCompile, "run", 8), "cargo test -p tine-core --no-run");
-const windowsStorageCompile = yamlNamedStep(windowsCompile, "Windows storage test targets compile (all; release gate)");
-assert.equal(yamlScalar(windowsStorageCompile, "if", 8), "inputs.windows_test_name == ''");
-assert.equal(yamlScalar(windowsStorageCompile, "run", 8), "cargo test -p tine-storage --no-run");
 const windowsCoreSmoke = yamlNamedStep(
   windowsCompile,
-  "Windows core + storage smoke (isolated contract selections; release gate)"
+  "Windows core/storage integration smoke (isolated contract selection; release gate)"
 );
 assert.equal(yamlScalar(windowsCoreSmoke, "if", 8), "inputs.windows_test_name == ''");
 assert.equal(yamlScalar(windowsCoreSmoke, "run", 8), "node scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke");
 assert.doesNotMatch(
-  [yamlScalar(windowsCoreCompile, "run", 8), yamlScalar(windowsStorageCompile, "run", 8), yamlScalar(windowsCoreSmoke, "run", 8)].join("\n"),
+  [yamlScalar(windowsCoreCompile, "run", 8), yamlScalar(windowsCoreSmoke, "run", 8)].join("\n"),
   /continue-on-error|retries|--skip/,
-  "Windows release coverage masks a failed compile, smoke, or storage test"
+  "Windows release coverage masks a failed compile or integration smoke"
 );
 assert.doesNotMatch(
   windowsCompile.join("\n"),
@@ -422,23 +419,8 @@ assert.equal(
   yamlScalar(yamlBlock(yamlNamedStep(linuxCoreShards, "Install cargo-nextest 0.9.143"), "with", 8), "tool", 10),
   "nextest@0.9.143"
 );
-// tine-storage's suite was compiled but never executed by any job until
-// 2026-08-07. Assert the job exists, runs the whole package unpartitioned, and
-// is release-required — a job outside REQUIRED_FULL_CI_JOBS can go red without
-// blocking a tag, which is the same coverage hole in a different place.
-const linuxStorage = yamlBlock(ciJobs, "linux-storage-nextest", 2);
-assert.equal(yamlScalar(linuxStorage, "name", 4), "Full CI / Linux tine-storage nextest");
-assert.equal(yamlScalar(linuxStorage, "if", 4), "github.event_name == 'workflow_dispatch' && inputs.scope == 'full'");
-assert.equal(
-  yamlScalar(yamlNamedStep(linuxStorage, "Linux tine-storage nextest / complete semantic suite"), "run", 8),
-  "cargo nextest run --profile ci --package tine-storage"
-);
-assert.ok(
-  REQUIRED_FULL_CI_JOBS.includes("Full CI / Linux tine-storage nextest"),
-  "the Linux storage suite runs but is not required for exact-SHA release evidence"
-);
 assert.doesNotMatch(
-  [linuxCoreContract, linuxCoreShards, linuxStorage, windowsCompile].map((job) => job.join("\n")).join("\n"),
+  [linuxCoreContract, linuxCoreShards, windowsCompile].map((job) => job.join("\n")).join("\n"),
   /continue-on-error:/,
   "nextest release evidence hides a failed contract or test job"
 );
@@ -584,7 +566,7 @@ assert.throws(
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{ run: successfulFullCiRun, jobs: successfulFullCiJobs.slice(0, 1) }]),
-  /Full CI \/ Windows compile \+ storage smoke \+ core smoke concluded missing/
+  /Full CI \/ Windows core compile \+ integration smoke concluded missing/
 );
 assert.throws(
   () => selectExactCiEvidence(commit, [{
@@ -819,6 +801,27 @@ assert.match(
   "release preflight cannot determine the previous release from a shallow checkout"
 );
 assert.match(preflight, /check-bench-policy\.mjs/, "release preflight omits the performance-baseline currency guard");
+assert.match(preflight, /check-storage-pin\.mjs/, "release preflight omits the certified storage-pin guard");
+assert.match(
+  releaseWorkflow,
+  /name: Certified tine-storage pin is current[\s\S]*?node scripts\/check-storage-pin\.mjs/,
+  "release workflow does not check the certified storage pin before packaging"
+);
+assert.match(
+  ciWorkflow,
+  /name: Certified tine-storage pin is current[\s\S]*?node scripts\/check-storage-pin\.mjs/,
+  "full CI does not check the certified storage pin"
+);
+assert.match(
+  ciWorkflow,
+  /name: Release and offline-source contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
+  "ordinary CI does not exercise the storage-pin negative fixtures"
+);
+assert.match(
+  releaseWorkflow,
+  /name: Release pipeline contract fixtures[\s\S]*?node scripts\/test-storage-pin\.mjs/,
+  "release preflight does not exercise the storage-pin negative fixtures"
+);
 
 function makeInput(base) {
   const input = path.join(base, "input");

@@ -12,7 +12,7 @@ The frozen release candidate receives the exhaustive pass.
 | Non-doc pull request | `ci` → `PR validation / Linux unit and contract checks` | TypeScript, frontend and Rust-core tests plus cheap generated-artifact/release contract guards. No Windows, Android, performance, Flatpak build, or release packaging. |
 | Docs/image-only pull request | No app CI | Avoid runner work for prose and image-only changes. A Flatpak/website metadata PR still gets its path-specific lightweight validator. |
 | Push to `master` | No app test/build workflow | Merging does not repeat CI after the reviewed commit. Website pushes may still deploy Pages; issue automation is separate from app CI. |
-| Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards and the complete unpartitioned `tine-storage` suite, Windows compile-all `tine-core` and `tine-storage` test targets + contract-selected isolated core/storage smoke, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence. |
+| Manual `ci`, scope `full` | Linux contracts/tests plus four deterministic process-isolated `tine-core` nextest shards, Windows compile-all `tine-core` targets + contract-selected cross-layer integration smoke, Android core compile, same-runner performance A/B | Required exact-SHA release-candidate evidence against the certified `tine-storage` pin. |
 | Manual `ci`, focused scope | Only `windows`, `android`, or `performance` | Platform/performance proof while developing relevant changes. A focused run never satisfies the release gate. |
 | Manual `ui-e2e` | Complete or scenario-focused Linux/Windows real-app proof | UI/harness debugging between releases without starting ordinary full CI. |
 | Manual `Flatpak build test` | Real offline Flatpak build | Focused packaging proof. The release workflow calls the same workflow as a hard gate. |
@@ -58,44 +58,32 @@ deterministic fixtures.
 
 ## Windows release scope
 
-Linux is the complete behavior matrix for both crates: its nextest inventory
-contract proves every non-ignored `tine-core` test runs exactly once across four
-isolated shards, and every non-ignored `tine-storage` test runs in one
-unpartitioned job. The storage half is newer than the rest of this document —
-until 2026-08-07 no job on any platform executed the storage suite, because
-Linux ran only `--package tine-core` while Windows compiled the storage targets
-with `--no-run`. The contract now also asserts that the tests Windows defers are
-executed on Linux, so a deferral cannot quietly mean "covered nowhere".
+Linux is Tine's complete behavior matrix: its nextest inventory contract proves
+every non-ignored `tine-core` test runs exactly once across four isolated
+shards. Those tests exercise Tine's semantic and lifecycle integration with the
+exact certified `tine-storage` pin. The package's own complete Linux, Windows,
+Android, format, crash-cut, and API matrix runs when a storage version is cut;
+ordinary Tine releases do not pay for it again.
 
-Windows is a deliberately narrower, blocking compatibility
-gate: it compiles every `tine-core` and `tine-storage` test target and runs
-declared core and storage smoke selections under nextest isolation. The core
-selection contains every explicitly Windows-named core test plus the
+Windows is a deliberately narrower, blocking compatibility gate: it compiles
+every `tine-core` test target against the pin and runs a declared cross-layer
+smoke selection under nextest isolation. The selection contains every explicitly Windows-named core test plus the
 bootstrap-capture, bootstrap-preparation, durability, and lifecycle witnesses
-that caught the v0.6.90 Windows failures. The storage selection covers narrow
-locking, directory-durability, journal durability/restart, and duplicate-open
-contracts.
+that caught the v0.6.90 Windows failures.
 
 `scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke` lists the
-actual Windows inventories before executing the smoke. It fails if an explicitly
-Windows-named core or storage test, or a declared witness, is added, renamed,
-removed, or omitted from the exact selection/classification; it then runs the
-verified core and storage sets with nextest's zero-retry, fail-on-timeout
-profile. The sole currently deferred Windows-named storage test is explicitly
-recorded in the contract rather than suppressed. This is neither an advisory
+actual Windows core inventory before executing the smoke. It fails if an
+explicitly Windows-named core test or declared witness is added, renamed,
+removed, or omitted; it then runs that verified core/storage integration set
+with nextest's zero-retry, fail-on-timeout profile. This is neither an advisory
 subset nor a retry mask.
 
-Full runtime parity for all `tine-core` and `tine-storage` tests on Windows is
-explicitly deferred. Some platform-neutral test fixtures currently encode
-Unix-like file/identity assumptions; they remain fully blocking on Linux and do
-not become a Windows Tine release requirement merely by being present in either
-crate. Once `tine-storage` is independently versioned and pinned, its complete
-cross-platform suite belongs to storage-version certification; ordinary Tine
-releases should compile and integration-smoke the pinned version, while a storage
-version or pin change forces recertification. Until then the crate remains an
-in-tree path dependency, so Tine CI cannot honestly reuse certification from an
-earlier storage version. Promoting a broader Windows matrix is a separate
-compatibility project, not a quiet gate expansion during a release.
+Full runtime parity for all `tine-core` tests on Windows is explicitly deferred.
+Some platform-neutral core fixtures encode Unix-like file/identity assumptions;
+they remain fully blocking on Linux. The complete cross-platform physical suite
+is required by `tine-storage` certification before Tine can advance its pin.
+Promoting a broader Windows core matrix is a separate compatibility project,
+not a quiet gate expansion during a release.
 
 ## Between releases
 

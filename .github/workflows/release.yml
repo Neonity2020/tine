@@ -71,12 +71,15 @@ jobs:
         run: node scripts/check-flatpak-node-sources.mjs
       - name: Flatpak offline Cargo sources are current
         run: node scripts/check-flatpak-cargo-sources.mjs
+      - name: Certified tine-storage pin is current
+        run: node scripts/check-storage-pin.mjs
       - name: lsdoc WASM pin is current
         run: node scripts/check-wasm-pin.mjs
       - name: lsdoc oracle bytes and cross-platform EOL policy are current
         run: node scripts/check-lsdoc-oracle-sync.mjs
       - name: Release pipeline contract fixtures
         run: |
+          node scripts/test-storage-pin.mjs
           node scripts/test-release-pipeline.mjs
           node scripts/test-env-toolchain-fallback.mjs
 

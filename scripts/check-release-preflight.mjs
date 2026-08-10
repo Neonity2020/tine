@@ -41,6 +41,13 @@ const versions = new Map([
 const expected = tauri.version;
 const problems = [];
 
+const storagePin = spawnSync(process.execPath, [path.join(root, "scripts", "check-storage-pin.mjs")], {
+  encoding: "utf8",
+});
+if (storagePin.status !== 0) {
+  problems.push(`check-storage-pin.mjs failed:\n${storagePin.stderr || storagePin.stdout}`);
+}
+
 const benchPolicy = spawnSync(process.execPath, [path.join(root, "scripts", "check-bench-policy.mjs")], {
   encoding: "utf8",
   env: process.env,

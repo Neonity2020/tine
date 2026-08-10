@@ -833,6 +833,22 @@
     ],
     "stability": "burn-in"
   },
+  "scripts/e2e-windows-page-reference-latency.mjs": {
+    "contracts": [
+      {
+        "class": "core-operation",
+        "userOutcome": "On the reporter-scale Windows fixture, literal page-reference typing reaches the editor and paints autocomplete candidates while collecting per-key and backend timing evidence.",
+        "blocking": true
+      }
+    ],
+    "acceptableVariations": [
+      "Hosted Windows scheduling, WebView2 startup, disk throughput, and individual timing samples may vary."
+    ],
+    "nonRequirements": [
+      "Exact popup geometry, candidate styling, or equality to one machine's millisecond timings."
+    ],
+    "stability": "burn-in"
+  },
   "scripts/e2e-windows-smoke.mjs": {
    "contracts": [
     {

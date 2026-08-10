@@ -2196,7 +2196,7 @@
           "crates/tine-core/src/oplog/import.rs::inactive_streaming_bootstrap_preseal_crash_retries_exactly",
           "crates/tine-core/src/oplog/import.rs::inactive_streaming_bootstrap_repeated_run_reuses_exact_seal",
           "crates/tine-core/src/oplog/local_active/tests.rs::authoritative_snapshot_prunes_lock_namespaces_before_reading_files",
-          "crates/tine-storage/src/filesystem.rs::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit",
+          "docs/dependency-receipts/tine-storage-v0.1.0.txt#filesystem::nonblocking_lock_contention_classifier_is_narrow_and_platform_explicit",
           "crates/tine-core/src/oplog/enrollment.rs::a_second_live_session_cannot_write_the_journal_and_dropping_one_releases_it",
           "crates/tine-core/src/oplog/sqlite.rs::separate_process_workspace_lease_contends_and_crash_releases"
         ],
@@ -2709,7 +2709,7 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "crates/tine-storage/src/formats.rs::format_identity_is_pinned",
+          "docs/dependency-receipts/tine-storage-v0.1.0.txt#formats::format_identity_is_pinned",
           "crates/tine-core/src/oplog/sqlite.rs::ordinary_drained_saves_match_clean_archive_replay_across_rich_shapes"
         ],
         "scenario": "managed.alias-binding-provenance",
