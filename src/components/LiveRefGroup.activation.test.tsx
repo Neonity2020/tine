@@ -61,6 +61,7 @@ describe("LiveRefGroup editor activation", () => {
     await vi.waitFor(() => expect(backend().activateEditor).toHaveBeenCalledWith(
       "pages/Source.md",
       "replace",
+      "rev-source block",
     ));
     expect(pageByName("Source")).toBeUndefined();
 
