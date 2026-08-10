@@ -164,9 +164,7 @@ try {
     for (const block of blocks.slice(markerIndex + 1)) {
       const content = block.querySelector(":scope > .block-main .block-content");
       if (content instanceof HTMLElement && !content.textContent?.trim()) {
-        const wrapper = content.closest(".block-content-wrapper");
-        if (!(wrapper instanceof HTMLElement)) return false;
-        wrapper.dataset.e2eIssue295EditorTarget = "true";
+        content.dataset.e2eIssue295EditorTarget = "true";
         return true;
       }
     }
