@@ -3395,20 +3395,27 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncEditorRequestError::ActorUnavailable)?
     }
 
+    /// Serialize one typed application request through the actor and preserve
+    /// the common unavailable/refusal boundary in one place.
+    fn application_request<T>(
+        &self,
+        request: impl FnOnce(mpsc::Sender<Result<T, SyncApplicationPageRequestError>>) -> ActorRequest,
+    ) -> Result<T, SyncApplicationPageRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(request(reply_sender))
+            .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
     /// Return the complete parser-owned application inventory without routing
     /// it through the capped sparse query API.
     pub fn application_page_inventory(
         &self,
     ) -> Result<SyncApplicationPageInventoryOutcome, SyncApplicationPageRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::ApplicationPageInventory {
-            reply: reply_sender,
-        })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+        self.application_request(|reply| ActorRequest::ApplicationPageInventory { reply })
     }
 
     /// Answer page navigation/autocomplete from the exact managed projection,
@@ -3429,17 +3436,11 @@ impl SyncRuntimeHandle {
         let cancellation = lane.map(|lane| {
             begin_application_search_cancellation(&self.inner.application_search_lanes, lane)
         });
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::ApplicationNavigation {
+        self.application_request(|reply| ActorRequest::ApplicationNavigation {
             request,
             cancellation,
-            reply: reply_sender,
+            reply,
         })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
     }
 
     /// Load one canonical application DTO by logical identity or exact managed
@@ -3449,17 +3450,8 @@ impl SyncRuntimeHandle {
         &self,
         request: SyncApplicationPageLoadRequest,
     ) -> Result<SyncApplicationPageLoadOutcome, SyncApplicationPageRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
         validate_application_load_request(&request)?;
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::LoadApplicationPage {
-            request,
-            reply: reply_sender,
-        })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+        self.application_request(|reply| ActorRequest::LoadApplicationPage { request, reply })
     }
 
     /// Save one complete frontend page through the actor's existing semantic
@@ -3471,17 +3463,8 @@ impl SyncRuntimeHandle {
         &self,
         request: SyncApplicationPageSaveRequest,
     ) -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
         validate_application_save_request(&request)?;
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::SaveApplicationPage {
-            request,
-            reply: reply_sender,
-        })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+        self.application_request(|reply| ActorRequest::SaveApplicationPage { request, reply })
     }
 
     /// Perform one page-identity mutation through the same actor and semantic
@@ -3491,16 +3474,7 @@ impl SyncRuntimeHandle {
         request: SyncApplicationGraphMutationRequest,
     ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
         validate_application_graph_mutation_request(&request)?;
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::MutateApplicationGraph {
-            request,
-            reply: reply_sender,
-        })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+        self.application_request(|reply| ActorRequest::MutateApplicationGraph { request, reply })
     }
 
     /// Persist the asset-side PDF view state in the same ordered application
@@ -3526,18 +3500,12 @@ impl SyncRuntimeHandle {
                 },
             ));
         }
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::WriteApplicationPdfViewState {
+        self.application_request(|reply| ActorRequest::WriteApplicationPdfViewState {
             pdf_filename,
             page,
             scale,
-            reply: reply_sender,
+            reply,
         })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
     }
 
     pub fn open_application_pdf(
@@ -3559,17 +3527,11 @@ impl SyncRuntimeHandle {
                 },
             ));
         }
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::OpenApplicationPdf {
+        self.application_request(|reply| ActorRequest::OpenApplicationPdf {
             pdf_filename,
             label,
-            reply: reply_sender,
+            reply,
         })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
     }
 
     pub fn write_application_pdf_highlights(
@@ -3606,33 +3568,19 @@ impl SyncRuntimeHandle {
                 },
             ));
         }
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::WriteApplicationPdfHighlights {
+        self.application_request(|reply| ActorRequest::WriteApplicationPdfHighlights {
             pdf_filename,
             label,
             highlights,
             base_ids,
-            reply: reply_sender,
+            reply,
         })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
     }
 
     pub fn publish_application_html(
         &self,
     ) -> Result<SyncApplicationPublishOutcome, SyncApplicationPageRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::PublishApplicationHtml {
-            reply: reply_sender,
-        })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+        self.application_request(|reply| ActorRequest::PublishApplicationHtml { reply })
     }
 
     pub fn copy_application_guide(
@@ -3652,16 +3600,7 @@ impl SyncRuntimeHandle {
                 },
             ));
         }
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::CopyApplicationGuide {
-            title,
-            reply: reply_sender,
-        })
-        .map_err(map_application_actor_error)?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+        self.application_request(|reply| ActorRequest::CopyApplicationGuide { title, reply })
     }
 
     /// A public request may be too large to retain verbatim, but that never
