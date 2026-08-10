@@ -2034,7 +2034,26 @@ pub fn page_print_html(graph: &Graph, name: &str, opts: PrintOpts) -> io::Result
     };
     let content = fs::read_to_string(&entry.path)?;
     let parsed = doc::parse(&content);
-    let slug = slug(&entry.name);
+    Ok(Some(page_print_html_document(
+        graph,
+        &entry.name,
+        &parsed,
+        opts,
+    )))
+}
+
+/// Render one already-authoritative page document. Managed storage uses this
+/// after loading the exact current page through its actor, so printing an edit
+/// does not wait for the filesystem projection or construct the Direct Files
+/// parsed graph. Direct Files enters through [`page_print_html`] and therefore
+/// shares this renderer byte-for-byte.
+pub(crate) fn page_print_html_document(
+    graph: &Graph,
+    name: &str,
+    parsed: &doc::Document,
+    opts: PrintOpts,
+) -> String {
+    let slug = slug(name);
     let mut refs = RefIndex::new();
     collect_block_refs(&parsed.roots, &slug, &mut refs);
     let print_asset_budget = RefCell::new(PrintAssetBudget::standard());
@@ -2060,19 +2079,15 @@ pub fn page_print_html(graph: &Graph, name: &str, opts: PrintOpts) -> io::Result
             &mut body,
             &ctx,
             &slug,
-            &entry.name,
+            name,
             &mut counter,
             &mut blocks,
             opts,
         );
     }
     body.push_str("</ul>");
-    let heading = format!("<h1 class=\"page\">{}</h1>", esc(&entry.name));
-    Ok(Some(print_shell(
-        &entry.name,
-        &format!("{heading}{body}"),
-        opts,
-    )))
+    let heading = format!("<h1 class=\"page\">{}</h1>", esc(name));
+    print_shell(name, &format!("{heading}{body}"), opts)
 }
 
 /// Options for the single-page print/PDF export, chosen in the pre-export dialog.
@@ -3768,6 +3783,25 @@ mod tests {
             .page_print_html("Report", PrintOpts::default())
             .unwrap()
             .expect("page exists");
+        let page = g
+            .load_named("Report", PageKind::Page)
+            .unwrap()
+            .expect("page DTO exists");
+        assert_eq!(
+            g.page_print_html_page(&page, PrintOpts::default()).unwrap(),
+            html,
+            "actor-owned DTO and Direct Files source must share one renderer"
+        );
+        let mut current = page;
+        current.blocks[1].raw = "Actor-current text".into();
+        let current_html = g
+            .page_print_html_page(&current, PrintOpts::default())
+            .unwrap();
+        assert!(current_html.contains("Actor-current text"));
+        assert!(
+            !current_html.contains("Some <strong>bold</strong> text"),
+            "printing an actor-owned edit must not fall back to projected disk bytes"
+        );
 
         // Self-contained: inlined stylesheet + inlined image, no sidebar / app scripts /
         // external style.css.

@@ -1336,6 +1336,7 @@ mod graph_wide_command_boundary_tests {
             "run_advanced_query",
             "export_query_subtrees",
             "list_orphan_assets",
+            "page_print_html",
             "run_graph_search",
             "search",
             "rename_page",
@@ -1384,6 +1385,8 @@ mod managed_actor_command_boundary_tests {
             "run_advanced_query",
             "export_query_subtrees",
             "list_orphan_assets",
+            "open_page_file",
+            "page_print_html",
             "run_graph_search",
             "search",
         ] {
@@ -1411,7 +1414,7 @@ mod managed_actor_command_boundary_tests {
     }
 
     #[test]
-    fn managed_navigation_commands_never_fall_back_to_the_broad_parsed_cache() {
+    fn managed_semantic_read_commands_never_fall_back_to_the_broad_parsed_cache() {
         let source = include_str!("commands.rs");
         for name in [
             "referenced_page_names",
@@ -1433,6 +1436,8 @@ mod managed_actor_command_boundary_tests {
             "run_advanced_query",
             "export_query_subtrees",
             "list_orphan_assets",
+            "open_page_file",
+            "page_print_html",
             "run_graph_search",
             "search",
         ] {
@@ -1442,8 +1447,8 @@ mod managed_actor_command_boundary_tests {
             let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
             let command = &tail[..end];
             assert!(
-                command.contains("sparse_navigation("),
-                "{name} must use the exact managed navigation boundary"
+                command.contains("sparse_application_handle("),
+                "{name} must dispatch through an exact managed actor boundary"
             );
             assert!(
                 !command.contains("with_read_graph(") && !command.contains("read_graph_cloned("),
@@ -1462,16 +1467,43 @@ pub(crate) fn publish_html(state: GraphContext<'_>) -> Result<(String, usize), S
 /// for the print-to-PDF export, with the dialog's options. `Err("no-page")` if the
 /// page doesn't exist.
 #[tauri::command]
-pub(crate) fn page_print_html(
+pub(crate) async fn page_print_html(
     name: String,
     opts: tine_core::publish::PrintOpts,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_read_graph(&state, |g| {
-        g.page_print_html(&name, opts)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "no-page".to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let entry = sparse_page_inventory(handle)?
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| "no-page".to_string())?;
+                let page = load_sparse_page(
+                    handle,
+                    SyncApplicationPageSelector::ExactPath {
+                        path: entry.rel_path,
+                    },
+                )?
+                .ok_or_else(|| "no-page".to_string())?;
+                slot.with_filesystem_graph(|graph| {
+                    graph
+                        .page_print_html_page(&page, opts)
+                        .map_err(|error| error.to_string())
+                })
+            }
+            None => slot
+                .legacy_graph()?
+                .page_print_html(&name, opts)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "no-page".to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -2685,18 +2717,41 @@ pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), St
 /// and canonicalizes the graph-relative identity; the WebView never supplies an
 /// arbitrary absolute path.
 #[tauri::command]
-pub(crate) fn open_page_file(
+pub(crate) async fn open_page_file(
     name: String,
     kind: PageKind,
     path: Option<String>,
     reveal: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_read_graph(&state, |graph| {
-        graph
-            .page_source_file(&name, kind, path.as_deref())
-            .map_err(|error| error.to_string())
-    })?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let page = load_sparse_page(
+                    handle,
+                    SyncApplicationPageSelector::Logical {
+                        name,
+                        page_kind: kind.into(),
+                    },
+                )?
+                .ok_or_else(|| "no-page".to_string())?;
+                slot.with_filesystem_graph(|graph| {
+                    graph
+                        .page_source_file(&page.name, page.kind, Some(&page.path))
+                        .map_err(|error| error.to_string())
+                })
+            }
+            None => slot
+                .legacy_graph()?
+                .page_source_file(&name, kind, path.as_deref())
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     #[cfg(desktop)]
     {
         if reveal {

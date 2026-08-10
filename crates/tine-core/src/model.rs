@@ -15072,6 +15072,23 @@ impl Graph {
         crate::publish::page_print_html(self, name, opts)
     }
 
+    /// Render an actor-owned page DTO without consulting this Graph's parsed
+    /// page cache. The Graph supplies only root/config/asset capabilities to the
+    /// shared print renderer.
+    pub fn page_print_html_page(
+        &self,
+        page: &PageDto,
+        opts: crate::publish::PrintOpts,
+    ) -> io::Result<String> {
+        let document = Document {
+            pre_block: page.pre_block.clone(),
+            roots: dto_blocks_to_doc_checked(&page.blocks, matches!(page.format, Format::Org))?,
+        };
+        Ok(crate::publish::page_print_html_document(
+            self, &page.name, &document, opts,
+        ))
+    }
+
     /// Rename a page, OG-style. Moves its file to the new name and rewrites every
     /// reference across pages AND journals — inline `[[old]]`/`#old`, the page's
     /// OWN self/sibling refs, and bare `tags:: old` property refs — and CASCADES
