@@ -1118,27 +1118,71 @@ pub(crate) async fn get_unlinked_refs(
 pub(crate) async fn block_ref_counts(
     state: GraphContext<'_>,
 ) -> Result<Arc<std::collections::HashMap<String, usize>>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
-    tauri::async_runtime::spawn_blocking(move || graph.block_ref_counts())
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BlockReferenceCounts,
+            )? {
+                SyncApplicationNavigationReply::BlockReferenceCounts(counts) => {
+                    Ok(Arc::new(counts))
+                }
+                _ => Err("managed block-reference counts returned the wrong reply kind".into()),
+            },
+            None => slot
+                .legacy_graph()?
+                .block_ref_counts()
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// The blocks that reference block `uuid`, grouped by page (the badge's referrers
 /// panel). Lazy: called only when a badge is clicked open.
 #[tauri::command]
-pub(crate) fn block_referrers(
+pub(crate) async fn block_referrers(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    with_read_graph(&state, |g| {
-        bounded_groups_or_error(g.block_referrers_bounded(
-            &uuid,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BlockReferrers {
+                    uuid,
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::BlockReferrers(result) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                _ => Err("managed block referrers returned the wrong reply kind".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.block_referrers_bounded(
+                &uuid,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Deleting one page is graph-wide work: it re-derives the page inventory and
@@ -1191,6 +1235,8 @@ mod graph_wide_command_boundary_tests {
         for name in [
             "get_backlinks",
             "get_unlinked_refs",
+            "block_ref_counts",
+            "block_referrers",
             "rename_page",
             "delete_page",
         ] {
@@ -1226,6 +1272,8 @@ mod managed_actor_command_boundary_tests {
             "resolve_block",
             "resolve_blocks",
             "preview_block",
+            "block_ref_counts",
+            "block_referrers",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1262,6 +1310,8 @@ mod managed_actor_command_boundary_tests {
             "resolve_block",
             "resolve_blocks",
             "preview_block",
+            "block_ref_counts",
+            "block_referrers",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");

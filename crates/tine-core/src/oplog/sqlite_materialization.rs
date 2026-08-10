@@ -1933,6 +1933,18 @@ pub struct MaterializedReferrerRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockReferenceCountRow {
+    pub raw_uuid_claim: LogseqUuid,
+    pub distinct_source_blocks: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockReferrerCandidateRow {
+    pub source_page_id: PageId,
+    pub source_block_id: BlockId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPropertyRow {
     pub owner: MaterializedEntityId,
     pub page_id: PageId,
@@ -2199,6 +2211,54 @@ impl<'a> SqliteMaterializedRead<'a> {
         )
     }
 
+    pub fn block_reference_counts_after(
+        &self,
+        after: Option<LogseqUuid>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockReferenceCountRow>, MaterializationError> {
+        self.inner
+            .block_reference_counts_after(after.map(|uuid| uuid.as_uuid().into_bytes()), limit)?
+            .into_iter()
+            .map(block_reference_count_row_from_storage)
+            .collect()
+    }
+
+    pub fn block_reference_counts_for_source_page_after(
+        &self,
+        source_page_id: PageId,
+        after: Option<LogseqUuid>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockReferenceCountRow>, MaterializationError> {
+        self.inner
+            .block_reference_counts_for_source_page_after(
+                source_page_id.as_uuid().into_bytes(),
+                after.map(|uuid| uuid.as_uuid().into_bytes()),
+                limit,
+            )?
+            .into_iter()
+            .map(block_reference_count_row_from_storage)
+            .collect()
+    }
+
+    pub fn block_referrer_candidates_after(
+        &self,
+        raw_uuid_claim: LogseqUuid,
+        after: Option<(PageId, BlockId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockReferrerCandidateRow>, MaterializationError> {
+        self.inner
+            .block_referrer_candidates_after(
+                raw_uuid_claim.as_uuid().into_bytes(),
+                after.map(|(page, block)| {
+                    (page.as_uuid().into_bytes(), block.as_uuid().into_bytes())
+                }),
+                limit,
+            )?
+            .into_iter()
+            .map(block_referrer_candidate_row_from_storage)
+            .collect()
+    }
+
     pub fn properties(
         &self,
         owner: MaterializedEntityId,
@@ -2371,6 +2431,24 @@ fn referrer_row_from_storage(
         source: entity_from_storage(row.source),
         source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
         kind: MaterializedReferenceKind::from_sql(row.kind)?,
+    })
+}
+
+fn block_reference_count_row_from_storage(
+    row: storage::PhysicalBlockReferenceCountRow,
+) -> Result<MaterializedBlockReferenceCountRow, MaterializationError> {
+    Ok(MaterializedBlockReferenceCountRow {
+        raw_uuid_claim: LogseqUuid::from_uuid(Uuid::from_bytes(row.raw_uuid_claim)),
+        distinct_source_blocks: row.distinct_source_blocks,
+    })
+}
+
+fn block_referrer_candidate_row_from_storage(
+    row: storage::PhysicalBlockReferrerCandidateRow,
+) -> Result<MaterializedBlockReferrerCandidateRow, MaterializationError> {
+    Ok(MaterializedBlockReferrerCandidateRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        source_block_id: BlockId::from_uuid(Uuid::from_bytes(row.source_block_id)),
     })
 }
 
