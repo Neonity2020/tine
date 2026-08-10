@@ -279,6 +279,12 @@ function releaseSourcesFor(dest: string) {
 export function setBaseRev(name: string, rev: string | null) {
   baseRev.set(name, rev);
 }
+/** Has this page been deleted? A deleted page must never be recreated by anything
+ *  that was already in flight when the deletion landed. */
+export function isTombstoned(name: string): boolean {
+  return deletedPages.has(name);
+}
+
 /** Atomically retire one quiescent page from persistence.
  *
  * Delete calls this synchronously after its awaited drain and exact-instance
