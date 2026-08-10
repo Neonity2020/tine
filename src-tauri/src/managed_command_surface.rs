@@ -154,7 +154,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("open_external", NoGraphSlot),
     ("open_graph_window", NoGraphSlot),
     ("open_page_file", ManagedRouted),
-    ("open_pdf", LegacyOnly),
+    ("open_pdf", ManagedRouted),
     ("page_aliases", ManagedRouted),
     ("page_icons", ManagedRouted),
     ("page_print_html", ManagedRouted),
@@ -257,10 +257,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
         "legacy-only by construction: reports the migration",
     ),
     ("merge_pages", "multi-page mutation: oplog transaction"),
-    (
-        "open_pdf",
-        "asset-domain write, still on the legacy authority",
-    ),
     (
         "publish_html",
         "writes publish/, outside the oplog's domain, still on the legacy authority",

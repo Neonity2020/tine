@@ -1962,6 +1962,13 @@ pub enum SyncApplicationUnitOutcome {
     Deferred { state: SyncEditorDeferred },
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationPdfOpenOutcome {
+    Ready { state: crate::pdf::PdfState },
+    Deferred { state: SyncEditorDeferred },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SyncApplicationPageSelector {
@@ -3448,6 +3455,38 @@ impl SyncRuntimeHandle {
             pdf_filename,
             page,
             scale,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
+    pub fn open_application_pdf(
+        &self,
+        pdf_filename: String,
+        label: String,
+    ) -> Result<SyncApplicationPdfOpenOutcome, SyncApplicationPageRequestError> {
+        let text_bytes = pdf_filename.len().saturating_add(label.len());
+        if pdf_filename.is_empty() {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidName,
+            ));
+        }
+        if text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    text_bytes,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::OpenApplicationPdf {
+            pdf_filename,
+            label,
             reply: reply_sender,
         })
         .map_err(map_application_actor_error)?;
@@ -6152,6 +6191,11 @@ enum ActorRequest {
         scale: f64,
         reply: mpsc::Sender<Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError>>,
     },
+    OpenApplicationPdf {
+        pdf_filename: String,
+        label: String,
+        reply: mpsc::Sender<Result<SyncApplicationPdfOpenOutcome, SyncApplicationPageRequestError>>,
+    },
     LoadEditorPage {
         request: SyncEditorLoadRequest,
         reply: mpsc::Sender<Result<SyncEditorLoadOutcome, SyncEditorRequestError>>,
@@ -6329,6 +6373,15 @@ fn run_actor_loop(
                 reply,
             } => {
                 let result = actor.write_application_pdf_view_state(&pdf_filename, page, scale);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::OpenApplicationPdf {
+                pdf_filename,
+                label,
+                reply,
+            } => {
+                let result = actor.open_application_pdf(&pdf_filename, &label);
                 let _ = reply.send(result);
                 false
             }
@@ -10857,6 +10910,96 @@ impl RuntimeActor {
             .write_pdf_view_state_asset_only(pdf_filename, page, scale)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_view_state"))?;
         Ok(SyncApplicationUnitOutcome::Applied)
+    }
+
+    fn open_application_pdf(
+        &mut self,
+        pdf_filename: &str,
+        label: &str,
+    ) -> Result<SyncApplicationPdfOpenOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationPdfOpenOutcome::Deferred { state });
+        }
+        let state = self
+            .graph
+            .open_pdf_asset_only(pdf_filename)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_sidecar_open"))?;
+        let key = crate::pdf::asset_key(pdf_filename);
+        let name = crate::pdf::hls_page_name(&key);
+        let current = {
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            editor_name_state(runtime, &self.graph, name.clone(), SyncPageKind::Page)
+                .map_err(map_editor_application_error)?
+        };
+        match current {
+            EditorNameState::Exact(_) => return Ok(SyncApplicationPdfOpenOutcome::Ready { state }),
+            EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "pdf_hls_page_identity",
+                ))
+            }
+            EditorNameState::Missing { .. } => {}
+        }
+
+        if self.graph.pdf_legacy_key_is_unambiguous(pdf_filename) {
+            let legacy_name =
+                crate::pdf::hls_page_name(&crate::pdf::legacy_asset_key(pdf_filename));
+            let legacy = {
+                let runtime = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+                editor_name_state(runtime, &self.graph, legacy_name, SyncPageKind::Page)
+                    .map_err(map_editor_application_error)?
+            };
+            match legacy {
+                EditorNameState::Exact(_) => {
+                    return Ok(SyncApplicationPdfOpenOutcome::Ready { state })
+                }
+                EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "pdf_legacy_hls_page_identity",
+                    ))
+                }
+                EditorNameState::Missing { .. } => {}
+            }
+        }
+
+        let format = self.graph.preferred_format();
+        let document = crate::pdf::hls_page_document_for_format(
+            pdf_filename,
+            label,
+            &state.highlights,
+            format,
+        );
+        let page = crate::model::generated_document_page_dto(
+            &name,
+            format,
+            document,
+            "managed-pdf-open-v1",
+        )
+        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_hls_page_build"))?;
+        match self.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::New {
+                name,
+                page_kind: SyncPageKind::Page,
+            },
+            page,
+        })? {
+            SyncApplicationPageSaveOutcome::Saved { .. }
+            | SyncApplicationPageSaveOutcome::Unchanged { .. } => {
+                Ok(SyncApplicationPdfOpenOutcome::Ready { state })
+            }
+            SyncApplicationPageSaveOutcome::Deferred { state: deferred } => {
+                Ok(SyncApplicationPdfOpenOutcome::Deferred { state: deferred })
+            }
+            SyncApplicationPageSaveOutcome::Conflict { .. } => Err(
+                SyncApplicationPageRequestError::ActorRefusedAt("pdf_hls_page_commit"),
+            ),
+        }
     }
 
     fn settle_application_publication(
@@ -20098,23 +20241,6 @@ mod tests {
             serde_json::to_value(graph.orphan_assets()).unwrap(),
             "managed orphan discovery must share Direct Files raw-reference and filesystem semantics"
         );
-        assert_eq!(
-            handle
-                .write_application_pdf_view_state("paper.pdf".into(), 7, 1.75)
-                .unwrap(),
-            SyncApplicationUnitOutcome::Applied
-        );
-        let pdf_state = crate::pdf::parse_pdf_state(
-            &fs::read_to_string(
-                fixture
-                    .graph_root()
-                    .join("assets")
-                    .join(format!("{}.edn", crate::pdf::asset_key("paper.pdf"))),
-            )
-            .unwrap(),
-        );
-        assert_eq!(pdf_state.page, Some(7));
-        assert_eq!(pdf_state.scale, Some(1.75));
         for autocomplete in [false, true] {
             let hidden_properties = if autocomplete {
                 vec!["custom".to_owned()]
@@ -20606,6 +20732,66 @@ mod tests {
             )
             .unwrap();
         drop(connection);
+        assert_eq!(
+            handle
+                .write_application_pdf_view_state("paper.pdf".into(), 7, 1.75)
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let pdf_state = crate::pdf::parse_pdf_state(
+            &fs::read_to_string(
+                fixture
+                    .graph_root()
+                    .join("assets")
+                    .join(format!("{}.edn", crate::pdf::asset_key("paper.pdf"))),
+            )
+            .unwrap(),
+        );
+        assert_eq!(pdf_state.page, Some(7));
+        assert_eq!(pdf_state.scale, Some(1.75));
+        let SyncApplicationPdfOpenOutcome::Ready { state: opened } = handle
+            .open_application_pdf("paper.pdf".into(), "Paper label".into())
+            .unwrap()
+        else {
+            panic!("managed PDF open unexpectedly deferred")
+        };
+        assert_eq!(opened.page, Some(7));
+        assert_eq!(opened.scale, Some(1.75));
+        let hls_name = crate::pdf::hls_page_name(&crate::pdf::asset_key("paper.pdf"));
+        let (hls, _) = load_application_logical(&handle, &hls_name, SyncPageKind::Page);
+        assert!(hls
+            .pre_block
+            .as_deref()
+            .is_some_and(|preamble| preamble.contains("../assets/paper.pdf")));
+        assert!(matches!(
+            handle
+                .open_application_pdf("paper.pdf".into(), "Paper label".into())
+                .unwrap(),
+            SyncApplicationPdfOpenOutcome::Ready { .. }
+        ));
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/hls__my_paper.md",
+            b"file:: [Legacy](../assets/My Paper.pdf)\n\n- legacy annotation notes\n",
+        );
+        assert!(matches!(
+            handle
+                .open_application_pdf("My Paper.pdf".into(), "My Paper".into())
+                .unwrap(),
+            SyncApplicationPdfOpenOutcome::Ready { .. }
+        ));
+        assert!(matches!(
+            handle
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::Logical {
+                        name: crate::pdf::hls_page_name(&crate::pdf::asset_key("My Paper.pdf")),
+                        page_kind: SyncPageKind::Page,
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Missing { .. }
+        ));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

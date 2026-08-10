@@ -16453,32 +16453,7 @@ impl Graph {
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let page_lock = self.page_lock(&page_path);
         let _guard = page_lock.lock().unwrap();
-
-        fs::create_dir_all(self.assets_path())?;
-        let sidecar_path = self.pdf_sidecar_for_update(pdf_filename)?;
-        self.ensure_asset_write_target(&sidecar_path)?;
-        let mut sidecar = read_optional_text(&sidecar_path)?;
-        if let Some(raw) = &sidecar {
-            validate_highlight_edn(raw)?;
-        } else {
-            let skeleton = crate::pdf::write_highlights(&[], "");
-            // Recheck immediately before publish so an external creator wins.
-            if let Some(external) = read_optional_text(&sidecar_path)? {
-                validate_highlight_edn(&external)?;
-                sidecar = Some(external);
-            } else {
-                match atomic_write_new(&sidecar_path, skeleton.as_bytes()) {
-                    Ok(()) => sidecar = Some(skeleton),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        let external = read_optional_text(&sidecar_path)?.ok_or(error)?;
-                        validate_highlight_edn(&external)?;
-                        sidecar = Some(external);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        let state = crate::pdf::parse_pdf_state(sidecar.as_deref().unwrap_or(""));
+        let state = self.open_pdf_asset_only(pdf_filename)?;
 
         // Do not create a new-key page on top of an unmigrated legacy page: the
         // normal highlight write carries its notes forward under one guarded merge.
@@ -16510,6 +16485,41 @@ impl Graph {
             self.drop_self_write_marker(&page_path, &page_rev);
         }
         Ok(state)
+    }
+
+    /// Initialize/read only OG's asset-side PDF sidecar. Managed storage calls
+    /// this inside its actor and creates the HLS graph page through the oplog.
+    pub(crate) fn open_pdf_asset_only(
+        &self,
+        pdf_filename: &str,
+    ) -> io::Result<crate::pdf::PdfState> {
+        fs::create_dir_all(self.assets_path())?;
+        let sidecar_path = self.pdf_sidecar_for_update(pdf_filename)?;
+        self.ensure_asset_write_target(&sidecar_path)?;
+        let mut sidecar = read_optional_text(&sidecar_path)?;
+        if let Some(raw) = &sidecar {
+            validate_highlight_edn(raw)?;
+        } else {
+            let skeleton = crate::pdf::write_highlights(&[], "");
+            // Recheck immediately before publish so an external creator wins.
+            if let Some(external) = read_optional_text(&sidecar_path)? {
+                validate_highlight_edn(&external)?;
+                sidecar = Some(external);
+            } else {
+                match atomic_write_new(&sidecar_path, skeleton.as_bytes()) {
+                    Ok(()) => sidecar = Some(skeleton),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let external = read_optional_text(&sidecar_path)?.ok_or(error)?;
+                        validate_highlight_edn(&external)?;
+                        sidecar = Some(external);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(crate::pdf::parse_pdf_state(
+            sidecar.as_deref().unwrap_or(""),
+        ))
     }
 
     /// Persist only OG's last-view page/scale fields. The hls-page lock is shared
@@ -16599,6 +16609,12 @@ impl Graph {
             }
             crate::pdf::asset_key(filename) == candidate_key
         })
+    }
+
+    pub(crate) fn pdf_legacy_key_is_unambiguous(&self, pdf_filename: &str) -> bool {
+        let key = crate::pdf::asset_key(pdf_filename);
+        let legacy = crate::pdf::legacy_asset_key(pdf_filename);
+        legacy != key && !self.asset_key_in_use_by_pdf(&legacy)
     }
 
     /// Read the PDF-name collision input that can select a managed HLS page from
@@ -23789,6 +23805,31 @@ pub fn markdown_page_dto(name: &str, title: &str, markdown: &str) -> io::Result<
         blocks,
         rev: None,
         format: Format::Md,
+        read_only: false,
+        path: String::new(),
+        guide: false,
+    })
+}
+
+/// Convert one application-generated document into a new-page DTO. Durable
+/// block identities are deliberately not selected here: the managed actor
+/// treats these runtime IDs only as temporary request labels and allocates the
+/// real identities in its semantic transaction.
+pub(crate) fn generated_document_page_dto(
+    name: &str,
+    format: Format,
+    mut document: Document,
+    identity_namespace: &str,
+) -> io::Result<PageDto> {
+    assign_virtual_doc_runtime_ids(&mut document.roots, identity_namespace, name)?;
+    Ok(PageDto {
+        name: name.to_owned(),
+        kind: PageKind::Page,
+        title: name.to_owned(),
+        pre_block: document.pre_block,
+        blocks: doc_blocks_to_dto_checked(&document.roots)?,
+        rev: None,
+        format,
         read_only: false,
         path: String::new(),
         guide: false,

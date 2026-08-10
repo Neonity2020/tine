@@ -20,7 +20,7 @@ use tine_core::sync_runtime::{
     SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
     SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
     SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
-    SyncApplicationUnitOutcome, SyncRuntimeHandle,
+    SyncApplicationPdfOpenOutcome, SyncApplicationUnitOutcome, SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -1336,6 +1336,7 @@ mod graph_wide_command_boundary_tests {
             "run_advanced_query",
             "export_query_subtrees",
             "list_orphan_assets",
+            "open_pdf",
             "page_print_html",
             "run_graph_search",
             "search",
@@ -1386,6 +1387,7 @@ mod managed_actor_command_boundary_tests {
             "run_advanced_query",
             "export_query_subtrees",
             "list_orphan_assets",
+            "open_pdf",
             "open_page_file",
             "page_print_html",
             "run_graph_search",
@@ -1438,6 +1440,7 @@ mod managed_actor_command_boundary_tests {
             "run_advanced_query",
             "export_query_subtrees",
             "list_orphan_assets",
+            "open_pdf",
             "open_page_file",
             "page_print_html",
             "run_graph_search",
@@ -3629,14 +3632,34 @@ pub(crate) fn read_highlights(
 }
 
 #[tauri::command]
-pub(crate) fn open_pdf(
+pub(crate) async fn open_pdf(
     pdf: String,
     label: String,
     state: GraphContext<'_>,
 ) -> Result<tine_core::pdf::PdfState, String> {
-    with_graph(&state, |g| {
-        g.open_pdf(&pdf, &label).map_err(|e| e.to_string())
+    let (app, window_label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &window_label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .open_application_pdf(pdf, label)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationPdfOpenOutcome::Ready { state } => Ok(state),
+                SyncApplicationPdfOpenOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating PDF notes. Try again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .open_pdf(&pdf, &label)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
