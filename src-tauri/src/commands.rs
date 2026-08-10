@@ -4,8 +4,8 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_config_graph, with_graph, with_read_graph, with_trash_graph, AppState,
-    GraphContext,
+    slot_for_context, with_config_graph, with_filesystem_graph, with_graph, with_read_graph,
+    with_trash_graph, AppState, GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -801,7 +801,7 @@ pub(crate) fn graph_source_files(
     state: GraphContext<'_>,
 ) -> Result<Vec<GraphSourceFile>, String> {
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         let mut out: Vec<GraphSourceFile> = Vec::new();
         let mut roots = vec![g.pages_path()];
         if include_journals {
@@ -1959,7 +1959,7 @@ pub(crate) fn set_journal_title_format(
 
 #[tauri::command]
 pub(crate) fn read_custom_css(state: GraphContext<'_>) -> Result<String, String> {
-    with_read_graph(&state, |g| Ok(g.custom_css()))
+    with_filesystem_graph(&state, |g| Ok(g.custom_css()))
 }
 
 #[tauri::command]
@@ -2363,7 +2363,7 @@ pub(crate) fn read_asset(
     // Return RAW bytes (not a JSON number[]), so a multi-MB PDF/image isn't
     // serialized element-by-element and re-parsed on the JS side — the frontend
     // receives an ArrayBuffer directly.
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         max_bytes
             .map_or_else(
                 || g.read_asset(&name),
@@ -2380,9 +2380,7 @@ pub(crate) fn read_asset(
 #[tauri::command]
 pub(crate) fn stream_asset_path(name: String, state: GraphContext<'_>) -> Result<String, String> {
     let slot = slot_for_context(&state)?;
-    slot.legacy_graph()?
-        .stream_asset_path(&name)
-        .map_err(|e| e.to_string())?;
+    slot.with_filesystem_graph(|graph| graph.stream_asset_path(&name).map_err(|e| e.to_string()))?;
     Ok(format!("{}/{}", slot.binding_generation, name))
 }
 
@@ -2527,7 +2525,7 @@ pub(crate) fn import_asset(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.import_asset(std::path::Path::new(&path), name.as_deref())
             .map_err(|e| e.to_string())
     })
@@ -2601,7 +2599,7 @@ pub(crate) fn import_native_capture(
         ));
     }
     let mut capture = capture.into_std();
-    let stored = with_read_graph(&state, |graph| {
+    let stored = with_filesystem_graph(&state, |graph| {
         graph
             .import_asset_file(&mut capture, &name, max_bytes)
             .map_err(|error| error.to_string())
@@ -2651,7 +2649,7 @@ pub(crate) fn read_text_file(path: String) -> Result<String, String> {
 /// (canonicalized) so a crafted name can't open a file outside the graph.
 #[tauri::command]
 pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    let target = with_read_graph(&state, |g| {
+    let target = with_filesystem_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -2729,7 +2727,7 @@ pub(crate) fn edit_asset_external(
     command: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_read_graph(&state, |g| {
+    let target = with_filesystem_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -3084,7 +3082,7 @@ pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), S
 pub(crate) fn asset_trash_stats(
     state: GraphContext<'_>,
 ) -> Result<tine_core::model::TrashStats, String> {
-    with_read_graph(&state, |g| Ok(g.asset_trash_stats()))
+    with_filesystem_graph(&state, |g| Ok(g.asset_trash_stats()))
 }
 
 /// Permanently delete everything in the asset trash; returns files removed.
@@ -3099,7 +3097,7 @@ pub(crate) fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, String> 
 pub(crate) fn list_journal_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::JournalConflict>, String> {
-    with_read_graph(&state, |g| Ok(g.journal_conflicts()))
+    with_filesystem_graph(&state, |g| Ok(g.journal_conflicts()))
 }
 
 /// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
@@ -3108,7 +3106,7 @@ pub(crate) fn list_journal_conflicts(
 pub(crate) fn list_sync_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::SyncConflict>, String> {
-    with_read_graph(&state, |g| Ok(g.list_sync_conflicts()))
+    with_filesystem_graph(&state, |g| Ok(g.list_sync_conflicts()))
 }
 
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
@@ -3119,7 +3117,7 @@ pub(crate) fn sync_conflict_diff(
     conflict: String,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.sync_conflict_diff(&winner, &conflict)
             .map_err(|e| e.to_string())
     })
@@ -3179,7 +3177,7 @@ pub(crate) fn trash_journal_file(name: String, state: GraphContext<'_>) -> Resul
 /// duplicate day's files before reconciling.
 #[tauri::command]
 pub(crate) fn read_journal_file(name: String, state: GraphContext<'_>) -> Result<String, String> {
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.read_journal_file(&name).map_err(|e| e.to_string())
     })
 }
@@ -3541,7 +3539,7 @@ pub(crate) fn save_asset(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
-    with_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.save_asset(&name, &bytes).map_err(|e| e.to_string())
     })
 }
@@ -3551,7 +3549,7 @@ pub(crate) fn read_highlights(
     pdf: String,
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::pdf::Highlight>, String> {
-    with_graph(&state, |g| Ok(g.read_highlights(&pdf)))
+    with_filesystem_graph(&state, |g| Ok(g.read_highlights(&pdf)))
 }
 
 #[tauri::command]
@@ -3602,7 +3600,7 @@ pub(crate) fn save_pdf_area_image(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
-    with_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
             .map_err(|e| e.to_string())
     })

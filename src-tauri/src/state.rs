@@ -316,7 +316,7 @@ impl GraphSlot {
         &self,
         f: impl FnOnce(&Graph) -> Result<T, String>,
     ) -> Result<T, String> {
-        self.with_read_graph(f)
+        self.with_filesystem_graph(f)
     }
 
     /// Move something into (or clear) the recoverable trash under whichever
@@ -331,7 +331,31 @@ impl GraphSlot {
         &self,
         f: impl FnOnce(&Graph) -> Result<T, String>,
     ) -> Result<T, String> {
-        self.with_read_graph(f)
+        self.with_filesystem_graph(f)
+    }
+
+    /// Run one point-addressed filesystem/config/asset operation. Managed mode
+    /// opens a short-lived root capability and never retains a parsed-page
+    /// cache; graph-semantic commands must use the application actor instead.
+    pub(crate) fn with_filesystem_graph<T>(
+        &self,
+        f: impl FnOnce(&Graph) -> Result<T, String>,
+    ) -> Result<T, String> {
+        match &self.authority {
+            GraphAuthority::Legacy(_) => {
+                let lease = self.legacy_graph()?;
+                f(&lease)
+            }
+            GraphAuthority::SparseV2(_) => {
+                let graph = Graph::open_derived_read_only(&self.graph_root);
+                f(&graph)
+            }
+        }
+    }
+
+    pub(crate) fn refresh_filesystem_meta(&self) {
+        let graph = Graph::open_derived_read_only(&self.graph_root);
+        *self.graph_meta.write().unwrap() = graph.meta();
     }
 
     /// An owned read handle, for the read commands that hand the graph to
@@ -753,6 +777,15 @@ pub(crate) fn with_read_graph<T>(
     slot_for_context(ctx)?.with_read_graph(f)
 }
 
+/// Run one non-graph-semantic filesystem/config/asset operation. Managed mode
+/// uses a short-lived root capability and never opens the retained parsed view.
+pub(crate) fn with_filesystem_graph<T>(
+    ctx: &GraphContext<'_>,
+    f: impl FnOnce(&Graph) -> Result<T, String>,
+) -> Result<T, String> {
+    slot_for_context(ctx)?.with_filesystem_graph(f)
+}
+
 /// Run a `logseq/config.edn` write under either authority. See
 /// [`GraphSlot::with_config_graph`] for why a managed binding may answer it.
 pub(crate) fn with_config_graph<T>(
@@ -787,7 +820,7 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
         // Deliberately NOT done here: `migrate_journal_filenames_checked`. That
         // renames journal files, which is a graph-text mutation the oplog owns;
         // it stays refused until managed renames exist.
-        old.reopen_derived_read_graph();
+        old.refresh_filesystem_meta();
         poke_watcher(&ctx.state);
         return Ok(());
     }
@@ -990,15 +1023,19 @@ mod tests {
             root.join("journals/2026_08_07.md").exists(),
             "the refused journal deletion must not have touched the file"
         );
+        assert_eq!(
+            slot.take_managed_broad_cache_touches(),
+            ManagedBroadCacheTouches::default(),
+            "filesystem/config/trash capabilities must not open the retained parsed cache"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A `Graph` reads `logseq/config.edn` when it opens, so a settings change
-    /// has to rebuild the managed read-only view — invalidating its parse is not
-    /// enough, and a stale view answers with the previous configuration.
+    /// Settings refresh updates the stored metadata from a short-lived config
+    /// capability; it must not rebuild the obsolete retained parsed view.
     #[test]
-    fn a_managed_settings_change_rebuilds_the_read_only_view() {
+    fn a_managed_settings_change_refreshes_meta_without_the_parsed_view() {
         let root = std::env::temp_dir().join(format!(
             "tine-managed-config-reopen-{}-{:?}",
             std::process::id(),
@@ -1007,37 +1044,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let slot = managed_slot(&root);
 
-        let before = slot
-            .with_read_graph(|graph| Ok(graph.config.start_of_week))
-            .expect("a managed binding answers a configuration read");
+        let before = slot.graph_meta().start_of_week;
 
         slot.with_config_graph(|graph| graph.set_start_of_week(3).map_err(|e| e.to_string()))
             .expect("a managed binding must be able to persist a setting");
         assert_ne!(before, 3, "fixture must actually change the value");
-        assert_eq!(
-            slot.with_read_graph(|graph| Ok(graph.config.start_of_week))
-                .unwrap(),
-            before,
-            "the already-open view still holds the configuration it opened with"
-        );
-
         assert_eq!(
             slot.graph_meta().start_of_week,
             before,
             "and so does the snapshot load_graph hands back"
         );
 
-        slot.reopen_derived_read_graph();
-        assert_eq!(
-            slot.with_read_graph(|graph| Ok(graph.config.start_of_week))
-                .unwrap(),
-            3,
-            "after the reopen the view must answer with the new configuration"
-        );
+        slot.refresh_filesystem_meta();
         assert_eq!(
             slot.graph_meta().start_of_week,
             3,
             "a window reloading this root must not be told the old setting"
+        );
+        assert_eq!(
+            slot.take_managed_broad_cache_touches(),
+            ManagedBroadCacheTouches::default(),
+            "config refresh must not open/reopen the retained parsed cache"
         );
 
         let _ = std::fs::remove_dir_all(&root);
