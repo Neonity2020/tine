@@ -24449,6 +24449,9 @@ impl TrashEntryKind {
 fn managed_trash_filesystem_error(error: FilesystemError) -> io::Error {
     match error {
         FilesystemError::Io(error) => error,
+        FilesystemError::DurableNameOperationUnavailable(message) => {
+            io::Error::new(io::ErrorKind::Unsupported, message)
+        }
         FilesystemError::UnsafeEntry(message) => io::Error::new(io::ErrorKind::InvalidData, message),
         FilesystemError::StoredLengthMismatch {
             path,

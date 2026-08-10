@@ -5,6 +5,17 @@ import path from "node:path";
 export const STORAGE_REPOSITORY = "https://github.com/martinkoutecky/tine-storage";
 export const STORAGE_PIN_METADATA = "docs/dependency-receipts/tine-storage.json";
 export const STORAGE_REQUIRED_JOBS = "linux-complete,windows-complete,android-compile,api-semver";
+// The complete manifest hash pins every persistent format. These v0.2 journal
+// values are also explicit so a superficially valid non-v2 receipt fails with a
+// useful diagnostic before Tine starts consuming the frontier protocol.
+export const STORAGE_REQUIRED_V2_FORMATS = new Map([
+  ["LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION", "2"],
+  ["LOCAL_JOURNAL_SEGMENT_V2_MAGIC", "TINEJNL2"],
+  ["LOCAL_JOURNAL_FRONTIER_V2_MAGIC", "TINEFRT2"],
+  ["LOCAL_JOURNAL_SEGMENT_HEADER_BYTES", "136"],
+  ["LOCAL_JOURNAL_FRONTIER_BYTES", "240"],
+  ["LOCAL_JOURNAL_FRONTIER_SUFFIX", ".frontier-v2"],
+]);
 
 function sha256(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
@@ -31,6 +42,10 @@ function lockPackages(lock) {
 
 function receiptField(receipt, name) {
   return receipt.match(new RegExp(`^${name}=(.+)$`, "m"))?.[1];
+}
+
+function formatValue(manifest, required) {
+  return manifest.match(new RegExp(`^${required}\\t[^\\n]*\\t([^\\t\\n]+)$`, "m"))?.[1];
 }
 
 export function storagePinProblems(root) {
@@ -154,6 +169,14 @@ export function storagePinProblems(root) {
       "SQLITE_SCHEMA_VERSION",
     ]) {
       if (!new RegExp(`^${required}\\t`, "m").test(manifest)) problems.push(`persistent-format receipt omits ${required}`);
+    }
+    for (const [required, expected] of STORAGE_REQUIRED_V2_FORMATS) {
+      const actual = formatValue(manifest, required);
+      if (actual === undefined) {
+        problems.push(`persistent-format receipt omits ${required}`);
+      } else if (actual !== expected) {
+        problems.push(`persistent-format receipt has ${required}=${actual}; expected ${expected}`);
+      }
     }
   }
   if (metadata.release !== `${STORAGE_REPOSITORY}/releases/tag/${tag}`) problems.push("pin metadata release URL is not canonical");

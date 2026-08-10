@@ -8275,6 +8275,9 @@ pub(crate) fn filesystem_error_without_collision(
 ) -> StoreError {
     match error {
         tine_storage::FilesystemError::Io(error) => StoreError::Io(error),
+        tine_storage::FilesystemError::DurableNameOperationUnavailable(message) => {
+            StoreError::Io(std::io::Error::new(ErrorKind::Unsupported, message))
+        }
         tine_storage::FilesystemError::UnsafeEntry(message) => StoreError::UnsafeEntry(message),
         tine_storage::FilesystemError::StoredLengthMismatch {
             path,
