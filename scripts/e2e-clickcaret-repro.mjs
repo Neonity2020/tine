@@ -11,6 +11,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const G = "/tmp/txdg-clickrepro-g";
@@ -21,20 +24,6 @@ const TD = process.env.TAURI_DRIVER ||
   (CARGO_TAURI_DRIVER && fs.existsSync(CARGO_TAURI_DRIVER) ? CARGO_TAURI_DRIVER : "tauri-driver");
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4446);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4447);
-
-let xvfb;
-async function ensureDisplay() {
-  if (process.env.DISPLAY) return;
-  for (const display of [":97", ":98", ":99", ":100"]) {
-    const logfd = fs.openSync(`/tmp/xvfb-clickrepro${display.slice(1)}.log`, "w");
-    let err = "";
-    const child = spawn("Xvfb", [display, "-screen", "0", "1400x1000x24"], { stdio: ["ignore", logfd, logfd] });
-    child.on("error", (e) => { err = e.message; });
-    await sleep(900);
-    if (!err && child.exitCode == null) { xvfb = child; process.env.DISPLAY = display; return; }
-  }
-  throw new Error("Xvfb failed to start");
-}
 
 const PAGE = `- **bold** rest of line
   second line here
@@ -291,5 +280,5 @@ try {
 } finally {
   try { if (browser) await browser.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}
-  if (xvfb) xvfb.kill();
+  stopDisplay();
 }

@@ -27,6 +27,14 @@ const pageInventory = createRoot(() => {
       return epoch === graphEpoch() && inventory === pageInventoryRev() ? pages : [];
     }
   );
+  // The last set the backend handed us, with the digest that identified it. This
+  // resource re-runs after every typing lull — it is keyed on `dataRev`, which a
+  // save bumps — and the answer almost never changes, because typing inside a
+  // block rarely adds or removes a `[[link]]`. Presenting the digest lets the
+  // backend reply with an integer instead of several thousand strings that would
+  // be JSON-parsed on the UI thread. (Direct Files performance audit 2026-08-09,
+  // finding F7.) Reset on a graph switch: digests are per-graph.
+  let known: { epoch: number; digest: number; names: string[] } | null = null;
   const [referencedNames] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev(), inventory: pageInventoryRev() }),
     async ({ epoch, revision, inventory }) => {
@@ -35,7 +43,16 @@ const pageInventory = createRoot(() => {
       // result cannot get memoized for this frontend revision.
       if (!(await waitForWarmCache(epoch))) return [];
       if (epoch !== graphEpoch() || revision !== dataRev() || inventory !== pageInventoryRev()) return [];
-      const names = await backend().referencedPageNames().catch(() => [] as string[]);
+      const carried = known?.epoch === epoch ? known : null;
+      const answer = await backend()
+        .referencedPageNames(carried?.digest ?? null)
+        .catch(() => null);
+      if (!answer) return carried?.names ?? [];
+      // A null `names` means "unchanged", so it may only be honoured against the
+      // set that digest described. Without a carried set there is nothing to
+      // reuse, and treating it as empty would erase the inventory.
+      const names = answer.names ?? carried?.names ?? [];
+      known = { epoch, digest: answer.digest, names };
       return epoch === graphEpoch() && revision === dataRev() && inventory === pageInventoryRev()
         ? names
         : [];
@@ -80,10 +97,37 @@ function parentPathLabel(p: PageEntry): string {
   return slash >= 0 ? `${rel.slice(0, slash)}/` : root;
 }
 
+/** Disambiguating labels for a whole page list, in ONE pass over it.
+ *
+ *  Two pages can share a display name (same title in different folders, or the
+ *  same stem as `.md` and `.org`); such a row grows a parent sub-path, and if
+ *  that is still ambiguous, its full path. Deciding that per row means scanning
+ *  the entire list per row — O(rows × pages), which the sidebar paid on every
+ *  render: 21 ms at 5,000 pages, 39 ms at 20,000, for 300 visible rows.
+ *
+ *  Counting first makes each row a map lookup. (Direct Files performance audit,
+ *  2026-08-09, finding F9.) */
+export function pageListLabels(pages: PageEntry[]): (p: PageEntry) => string {
+  const nameKey = (p: PageEntry) => `${p.kind} ${p.name}`;
+  const parentKey = (p: PageEntry) => `${nameKey(p)} ${parentPathLabel(p)}`;
+  const byName = new Map<string, number>();
+  const byNameAndParent = new Map<string, number>();
+  for (const p of pages) {
+    byName.set(nameKey(p), (byName.get(nameKey(p)) ?? 0) + 1);
+    byNameAndParent.set(parentKey(p), (byNameAndParent.get(parentKey(p)) ?? 0) + 1);
+  }
+  // Keyed by VALUE, not identity: a caller may hold a copy of an entry rather
+  // than the array element itself, and that must not silently change its label.
+  return (p) => {
+    if ((byName.get(nameKey(p)) ?? 0) < 2) return p.name;
+    const parent = parentPathLabel(p);
+    const unique = (byNameAndParent.get(parentKey(p)) ?? 0) === 1;
+    return `${p.name} — ${unique ? parent : p.path}`;
+  };
+}
+
+/** Single-row form, for callers that hold no precomputed index. Same answer as
+ *  `pageListLabels`; a list-rendering caller should build the index once. */
 export function pageListLabel(p: PageEntry, pages: PageEntry[]): string {
-  const same = pages.filter((x) => x.kind === p.kind && x.name === p.name);
-  if (same.length < 2) return p.name;
-  const label = parentPathLabel(p);
-  const unique = same.filter((x) => parentPathLabel(x) === label).length === 1;
-  return `${p.name} — ${unique ? label : p.path}`;
+  return pageListLabels(pages)(p);
 }

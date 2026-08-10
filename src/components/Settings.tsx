@@ -110,6 +110,7 @@ import { ShortcutsSettingsPane } from "./HelpShortcuts";
 import { switchGraph, loadGraphPath } from "../graph";
 import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
+import { dbg } from "../debug";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2Status } from "../types";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
@@ -2201,15 +2202,20 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     setGraphTransitioning(true);
     let unlisten: (() => void) | undefined;
     try {
-      if (!(await flushAll())) {
+      dbg("managed storage setup: flushing pending writes");
+      const flushed = await flushAll();
+      dbg(`managed storage setup: pending-write flush completed (${flushed ? "clean" : "refused"})`);
+      if (!flushed) {
         pushToast("Resolve pending save conflicts before enabling Tine-managed storage.", "error");
         return;
       }
+      dbg("managed storage setup: awaiting native confirmation");
       const confirmed = await backend().confirm(
         `Enable Tine-managed storage for this graph?\n\n` +
           `Tine first verifies a private operation history, local index, backup, and exact Markdown reconstruction. ` +
           `Existing Markdown/Org files stay in place and remain Logseq-compatible.`
       );
+      dbg(`managed storage setup: native confirmation completed (${confirmed ? "accepted" : "cancelled"})`);
       if (!confirmed) return;
       const generation = status()?.binding_generation;
       if (generation !== undefined) {
@@ -2223,7 +2229,9 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           // is unavailable in an older or closing WebView.
         }
       }
+      dbg("managed storage setup: invoking native activation");
       const result = await backend().activateSparseV2();
+      dbg(`managed storage setup: native activation returned (${result.state})`);
       setStatus(result);
       refreshAuthorityState();
       if (result.state === "active") {

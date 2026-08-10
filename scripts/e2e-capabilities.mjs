@@ -1,7 +1,22 @@
 import fs from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
+
+export async function freeLoopbackPort(excluded = new Set()) {
+  while (true) {
+    const port = await new Promise((resolve, reject) => {
+      const server = net.createServer();
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        server.close(() => resolve(address.port));
+      });
+    });
+    if (!excluded.has(port)) return port;
+  }
+}
 
 export function tauriCapabilities(
   application,
@@ -46,8 +61,8 @@ export function tauriCapabilities(
   };
 }
 
-function windowsUserDataFolder(session) {
-  const root = process.env.E2E_WEBVIEW_USER_DATA_ROOT;
+export function windowsUserDataFolder(session, env = process.env) {
+  const root = env.E2E_WEBVIEW_USER_DATA_ROOT;
   if (!root) throw new Error("Windows WebView2 E2E requires E2E_WEBVIEW_USER_DATA_ROOT");
   const userDataFolder = path.join(root, session.replaceAll(/[^A-Za-z0-9_-]/g, "-"));
   fs.mkdirSync(userDataFolder, { recursive: true });
@@ -95,7 +110,7 @@ export async function startWebdriverApplication(
 ) {
   if (platform !== "win32") return { env, applicationProcess: undefined, debuggerAddress: undefined };
 
-  const userDataFolder = windowsUserDataFolder(session);
+  const userDataFolder = windowsUserDataFolder(session, env);
   const debuggerAddress = `127.0.0.1:${debuggerPort}`;
   const applicationEnv = {
     ...env,
@@ -107,27 +122,55 @@ export async function startWebdriverApplication(
       debuggerPort,
     ),
   };
-  const applicationProcess = spawn(application, [], {
-    env: applicationEnv,
-    stdio: "ignore",
-    windowsHide: false,
-  });
+  const applicationLogHandles = [];
+  const openApplicationLog = (variable) => {
+    const file = applicationEnv[variable];
+    if (!file) return "ignore";
+    const handle = fs.openSync(file, "w");
+    applicationLogHandles.push(handle);
+    return handle;
+  };
+  let applicationProcess;
+  try {
+    applicationProcess = spawn(application, [], {
+      env: applicationEnv,
+      stdio: [
+        "ignore",
+        openApplicationLog("TINE_E2E_APPLICATION_STDOUT_LOG"),
+        openApplicationLog("TINE_E2E_APPLICATION_STDERR_LOG"),
+      ],
+      windowsHide: false,
+    });
+  } catch (error) {
+    for (const handle of applicationLogHandles) fs.closeSync(handle);
+    throw error;
+  }
   try {
     await waitForDevTools(debuggerAddress, applicationProcess);
   } catch (error) {
     stopWebdriverApplication({ applicationProcess }, platform);
     throw error;
   }
-  return { env: applicationEnv, applicationProcess, debuggerAddress, userDataFolder };
+  return {
+    env: applicationEnv,
+    applicationProcess,
+    applicationLogHandles,
+    debuggerAddress,
+    userDataFolder,
+  };
 }
 
 export function stopWebdriverApplication(target, platform = process.platform) {
   const applicationProcess = target?.applicationProcess;
-  if (!applicationProcess || applicationProcess.exitCode !== null) return;
-  if (platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(applicationProcess.pid), "/T", "/F"], { stdio: "ignore" });
-  } else {
-    applicationProcess.kill("SIGKILL");
+  if (applicationProcess && applicationProcess.exitCode === null) {
+    if (platform === "win32") {
+      spawnSync("taskkill", ["/PID", String(applicationProcess.pid), "/T", "/F"], { stdio: "ignore" });
+    } else {
+      applicationProcess.kill("SIGKILL");
+    }
+  }
+  for (const handle of target?.applicationLogHandles || []) {
+    try { fs.closeSync(handle); } catch {}
   }
 }
 
@@ -138,6 +181,29 @@ export function webdriverServerArgs(port, nativePort, nativeDriver, platform = p
     "--native-port", String(nativePort),
     "--native-driver", nativeDriver,
   ];
+}
+
+export async function selectWebdriverWindowWithSelector(browser, selector, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  const observations = [];
+  while (Date.now() < deadline) {
+    for (const handle of await browser.getWindowHandles()) {
+      try {
+        await browser.switchToWindow(handle);
+        const title = await browser.getTitle();
+        const url = await browser.getUrl();
+        const matched = await browser.$(selector).isExisting();
+        observations.push({ handle, title, url, matched });
+        if (matched) return handle;
+      } catch (error) {
+        observations.push({ handle, error: String(error) });
+      }
+    }
+    await sleep(100);
+  }
+  throw new Error(
+    `no WebDriver window exposed ${selector}: ${JSON.stringify(observations.slice(-20))}`,
+  );
 }
 
 export function windowsWebviewProfileSnapshot(root) {

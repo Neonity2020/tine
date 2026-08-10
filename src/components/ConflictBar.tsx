@@ -10,8 +10,17 @@ import { reloadPage, forceSave, pageByName, forgetPage } from "../store";
 // or a query result), or its edits would be silently stuck and lost on close.
 export function ConflictBar(): JSX.Element {
   const reload = async (name: string) => {
-    const kind = pageByName(name)?.kind ?? "page";
-    const dto = await backend().getPage(name, kind);
+    const page = pageByName(name);
+    // Resolve the file this editor is actually pinned to. Two files can carry
+    // one page name (the duplicate-day stray of #21, or same-titled pages in
+    // different folders), and resolving by name reaches the backend's CANONICAL
+    // owner — which would re-point the tab at a different file and discard the
+    // user's edits to this one. Falling back to the name when the pinned file is
+    // gone would do the same, so an absent pinned file drops the page instead.
+    // A page with no pin (never saved) has only its name to resolve by.
+    const dto = page?.path
+      ? await backend().getPageByPath(page.path)
+      : await backend().getPage(name, page?.kind ?? "page");
     if (dto) {
       reloadPage(dto);
       clearConflict(name);

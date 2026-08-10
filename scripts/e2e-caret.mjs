@@ -21,6 +21,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 const MODE = process.env.CARET_MODE || "page";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -71,42 +74,6 @@ function journalFileStem(d) {
 
 function logseqDate(d) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${WEEKDAYS[d.getDay()]}`;
-}
-
-let xvfb;
-async function ensureDisplay() {
-  if (process.env.DISPLAY) return;
-  const displays = process.env.XVFB_DISPLAY
-    ? [process.env.XVFB_DISPLAY]
-    : [":98", ":99", ":100", ":101"];
-  let lastLog = "/tmp/xvfb-caret.log";
-  let lastError = "";
-  for (const display of displays) {
-    const suffix = display.replace(/[^0-9]/g, "") || "x";
-    lastLog = `/tmp/xvfb-caret-${suffix}.log`;
-    const xvfbLog = fs.openSync(lastLog, "w");
-    let spawnError = "";
-    const child = spawn("Xvfb", [display, "-screen", "0", "1400x1000x24"], {
-      stdio: ["ignore", xvfbLog, xvfbLog],
-    });
-    child.on("error", (e) => {
-      spawnError = e.message;
-    });
-    await sleep(900);
-    if (spawnError) {
-      lastError = spawnError;
-      continue;
-    }
-    if (child.exitCode == null) {
-      xvfb = child;
-      process.env.DISPLAY = display;
-      return;
-    }
-    lastError = `display ${display} exited with code ${child.exitCode}`;
-  }
-  if (lastError) {
-    throw new Error(`Xvfb failed to start (${lastError}); see ${lastLog}`);
-  }
 }
 
 // ---- Fixtures ----------------------------------------------------------------
@@ -805,5 +772,5 @@ try {
 } finally {
   try { await browser?.deleteSession(); } catch {}
   try { process.kill(-td.pid, "SIGKILL"); } catch {}
-  xvfb?.kill("SIGKILL");
+  stopDisplay();
 }

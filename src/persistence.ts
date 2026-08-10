@@ -10,7 +10,7 @@
 
 import { doc, pageByName, pageInstanceGeneration, pageToDto } from "./store";
 import { backend } from "./backend";
-import { markConflict, isConflicted, conflicts, bumpDataRev, bumpPageInventoryRev, pushToast } from "./ui";
+import { markConflict, clearConflict, isConflicted, conflicts, bumpDataRev, bumpPageInventoryRev, pushToast } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
 
@@ -38,6 +38,11 @@ const saveChain = new Map<string, Promise<boolean>>();
 const transientFailures = new Map<string, number>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+// When the current run of edits first went dirty, so the debounce below can be
+// coalescing without being indefinitely postponable. Null whenever no save is
+// armed — every drain path (`flushAll`, `resetSaveState`, the timer itself)
+// clears `saveTimer`, so the next edit starts a fresh burst.
+let burstStartedAt: number | null = null;
 let dataRevTimer: ReturnType<typeof setTimeout> | null = null;
 const assetWriteChain = new Set<Promise<boolean>>();
 // Cross-page move barrier (audit C#1): while a moved subtree's DESTINATION write is not
@@ -55,8 +60,19 @@ const heldSources = new Set<string>();
 // override of the first must not override the second. Dropping the resolution
 // would strand the page (a conflicted page is skipped by the ordinary save
 // path), so remember it and re-issue it the moment the dest is durable.
-const heldForcedSaves = new Set<string>();
+// A "keep mine" the move barrier deferred, WITH the observation epoch the user
+// clicked under. Re-issuing it later must present that epoch and not whatever is
+// current by then: an epoch minted after the click belongs to a winner the user
+// never saw. (GH #254 increment 2, third correction-delta re-verification.)
+const heldForcedSaves = new Map<string, number | null>();
 const heldByDest = new Map<string, string[]>();
+// Which conflict observation each banner is showing. "Keep mine" presents this
+// back so the override answers the conflict the USER SAW. Without it, a second
+// force request issued under one banner — a double click, the button is not
+// disabled while its request is pending — consumes authority the first request
+// minted for a NEWER external winner, and overwrites bytes nobody was shown.
+// (GH #254 increment 2, adversarial implementation verification, finding 1.)
+const conflictObservation = new Map<string, number>();
 
 // ---------------------------------------------------------------------------
 // Accessors — store.ts mutations call these instead of touching the guards.
@@ -130,6 +146,43 @@ export function divergedFromBaseline(name: string, stored: StoredPageState): boo
   if (!stored.exists) return baseline !== null;
   return stored.rev !== baseline;
 }
+
+/** Apply that verdict — in BOTH directions.
+ *
+ *  Raising a conflict was already gated on the proof above; clearing one was not
+ *  gated on anything, because nothing but a user's click ever cleared a
+ *  conflict. So a page could be parked behind the banner permanently by an event
+ *  that never meant anything: a removal event carries no divergence proof at all
+ *  (`handleGraphChange`), and an editor writing by temp+rename, or a
+ *  mid-delivery sync pass, produces exactly that. The page then refuses every
+ *  ordinary save, and both buttons on the banner destroy something — "Use disk
+ *  version" the edit, "Keep mine" a file it never needed to overwrite.
+ *
+ *  When the disk provably holds this editor's own baseline again, the banner's
+ *  claim ("the file changed under you") is false, so it goes, and the edit it
+ *  was freezing is scheduled like any other. One owner for both directions means
+ *  a later third observation site cannot reintroduce the asymmetry.
+ *  (Direct Files data-safety audit, 2026-08-09, finding 17.)
+ *
+ *  The raising direction does not raise the banner itself — see
+ *  `reconcileExternalChange` for why only the backend's own refusal may. */
+export async function applyDivergenceVerdict(name: string, stored: StoredPageState): Promise<void> {
+  if (divergedFromBaseline(name, stored)) {
+    await reconcileExternalChange(name);
+    return;
+  }
+  if (!isConflicted(name)) return;
+  clearConflict(name);
+  // Re-arm unconditionally rather than only for a page still in `dirty`. A
+  // conflicted page's edit is by definition NOT on disk, and `doSave` removes a
+  // page from `dirty` before awaiting the backend and does not put it back on a
+  // banner-class conflict — so the page whose banner we just lifted is usually
+  // unsaved AND unmarked. Leaving it that way strands a live edit that nothing
+  // will ever write, and `flushAll` (which consults only `dirty`, in-flight
+  // saves and `conflicts`) would then report the graph as safely landed and let
+  // a close discard it.
+  markDirty(name);
+}
 /** Hold `sources`' saves until `dest` is durably written (cross-page move barrier,
  *  audit C#1). `releaseSourcesFor(dest)` fires from doSave's success path. */
 export function holdSourcesForDest(dest: string, sources: string[]) {
@@ -162,12 +215,20 @@ function releaseSourcesFor(dest: string) {
   let any = false;
   for (const s of srcs) {
     if (!heldSources.delete(s)) continue;
-    if (heldForcedSaves.delete(s)) {
+    if (heldForcedSaves.has(s)) {
       // A "keep mine" the barrier deferred. Re-issue it now rather than letting
       // `scheduleSave` pick it up: the page is still marked conflicted, and the
       // ordinary path skips a conflicted page, so this resolution would
-      // otherwise be silently lost.
-      void forceSave(s);
+      // otherwise be silently lost. It carries the epoch the user clicked under,
+      // so if the disk moved while the barrier held it, the backend refuses and
+      // the refusal below re-raises a banner the user can decide on again.
+      const observation = heldForcedSaves.get(s) ?? null;
+      heldForcedSaves.delete(s);
+      dirty.add(s); // a force writes the store's state; keep it visible as unsaved
+      void enqueueSave(s, { kind: "force", observation }).then((ok) => {
+        if (ok) clearConflict(s);
+        else pushToast(`Couldn't overwrite “${s}”.`, "error");
+      });
       continue;
     }
     dirty.add(s); // its removal (and any held edit) can write now
@@ -191,6 +252,7 @@ export function untombstone(name: string) {
 export function forgetSaveState(name: string) {
   dirty.delete(name);
   baseRev.delete(name);
+  conflictObservation.delete(name);
   clearTransientRetry(name);
 }
 /** Cancel timers, invalidate in-flight saves (bump the graph token), and clear
@@ -208,6 +270,7 @@ export function resetSaveState() {
   graphToken++;
   dirty.clear();
   baseRev.clear();
+  conflictObservation.clear();
   deletedPages.clear();
   heldSources.clear();
   heldByDest.clear();
@@ -260,6 +323,44 @@ export function isRetryableSaveFailure(error: unknown): boolean {
   ].some((code) => message.includes(code));
 }
 
+/** The bounded failure code the Direct backend prefixes to a save error.
+ *
+ *  `direct_save_error_message` emits `"{code}: {raw error}"`, and many raw errors
+ *  carry a graph-relative PATH. So a family test has to read the code, not search
+ *  the whole string: a page legitimately named `conflict_authority.notes` would
+ *  otherwise make an unrelated `precheck.symlink` failure look like a spent
+ *  override, and its handler would keep re-observing a save that can never
+ *  succeed. (GH #254 increment 2, fourth correction-delta re-verification.)
+ *
+ *  Returns `""` when there is no code separator or the prefix is not code-shaped
+ *  — including the banner-class `conflict` / `conflict:<n>` shape, which is
+ *  matched by `conflictObservationEpoch` before this is consulted. */
+function directSaveFailureCode(error: unknown): string {
+  const message = String(error).replace(/^Error: /, "");
+  const separator = message.indexOf(": ");
+  if (separator <= 0) return ""; // no code at all — never a family
+  const code = message.slice(0, separator);
+  // A bounded code is dot-separated, lower-case and underscored — usually
+  // `family.condition`, but `unknown` is a genuine single-segment one. Requiring
+  // the SHAPE means an error that merely opens with code-like prose cannot be
+  // read as one: without it, `Error("conflict_authority.spent while reporting
+  // …")` was accepted whole and routed into the authority handler.
+  return /^[a-z][a-z_]*(\.[a-z][a-z_]*)*$/.test(code) ? code : "";
+}
+
+/** The observation epoch a banner-class conflict was raised at.
+ *
+ *  `conflict:<n>` is the whole contract for the keep-mine/use-disk banner; the
+ *  bare `conflict` is the legacy shape and means the backend minted authority it
+ *  could not name, so no override may be presented for it. Returns null when the
+ *  error is not banner class at all, and -1 for the unnameable legacy shape. */
+function conflictObservationEpoch(error: unknown): number | null {
+  const message = String(error).replace(/^Error: /, "");
+  if (message === "conflict") return -1;
+  const match = /^conflict:(\d+)$/.exec(message);
+  return match ? Number(match[1]) : null;
+}
+
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
   if (!isRetryableSaveFailure(error)) {
     transientFailures.delete(name);
@@ -306,15 +407,41 @@ function cutSourceUsable(expected: ClipboardSourcePage): boolean {
     && !isConflicted(expected.name);
 }
 
+/** Why a save is being run.
+ *
+ *  - `ordinary` — the user's pending edit. Skipped for a clean page and refused
+ *    for a conflicted one.
+ *  - `reobserve` — the disk changed under a page whose banner is already up, so
+ *    the authority that banner stands on has just been revoked. Runs the SAME
+ *    base-revision-guarded write, which cannot clobber; its refusal mints the
+ *    replacement epoch, and its success means the banner was stale.
+ *  - `force` — the user chose "Keep mine". Overwrites, presenting the epoch the
+ *    banner showed. */
+type SaveIntent =
+  | { kind: "ordinary" }
+  | { kind: "reobserve" }
+  | { kind: "force"; observation: number | null };
+
+const ORDINARY: SaveIntent = { kind: "ordinary" };
+
+/** Capture the epoch the visible banner is showing, at the moment the user acts.
+ *  Reading it later — when the queued request finally reaches the backend — is
+ *  the bug: a re-observation running ahead of it in the queue replaces the entry
+ *  with an epoch minted for a winner the user never saw, and the force would
+ *  then be authorised to discard exactly that. */
+function forceIntent(name: string): SaveIntent {
+  return { kind: "force", observation: conflictObservation.get(name) ?? null };
+}
+
 function enqueueSave(
   name: string,
-  force = false,
+  intent: SaveIntent = ORDINARY,
   expectedCutSource?: ClipboardSourcePage,
 ): Promise<boolean> {
   const prev = saveChain.get(name) ?? Promise.resolve(true);
   const next = prev.then(
-    () => doSave(name, force, expectedCutSource),
-    () => doSave(name, force, expectedCutSource),
+    () => doSave(name, intent, expectedCutSource),
+    () => doSave(name, intent, expectedCutSource),
   );
   saveChain.set(name, next);
   void next.finally(() => {
@@ -329,20 +456,24 @@ function enqueueSave(
  *  conflict marks it (no clobber); on a transient error keeps it dirty + toasts. */
 async function doSave(
   name: string,
-  force: boolean,
+  intent: SaveIntent,
   expectedCutSource?: ClipboardSourcePage,
 ): Promise<boolean> {
+  const force = intent.kind === "force";
   // A cut-retirement save is authority-bound to the exact loaded page instance.
   // Check when this queued operation actually reaches its snapshot boundary, not
   // only when the caller enqueues it: another save may have been ahead of it.
   if (expectedCutSource && !cutSourceUsable(expectedCutSource)) return false;
   if (deletedPages.has(name)) return true; // tombstoned — never recreate a deleted page
-  if (!force && !dirty.has(name)) return true; // already saved by a prior link
-  if (isConflicted(name) && !force) return false;
+  // A re-observation must reach the backend even though the page is clean or
+  // already conflicted: those are exactly the states a banner leaves behind, and
+  // only a fresh refusal can mint the authority the visible banner needs.
+  if (intent.kind === "ordinary" && !dirty.has(name)) return true; // saved by a prior link
+  if (intent.kind === "ordinary" && isConflicted(name)) return false;
   // A cross-page move source: hold its save until the destination is durable (C#1).
   // Stays dirty, so it writes the moment `releaseSourcesFor(dest)` frees it.
   if (heldSources.has(name)) {
-    if (force) heldForcedSaves.add(name);
+    if (intent.kind === "force") heldForcedSaves.set(name, intent.observation);
     return false;
   }
   const token = graphToken;
@@ -373,7 +504,7 @@ async function doSave(
   try {
     const baseline = baseRev.get(name) ?? null;
     const rev = await measureIssue248Async("frontend.savePageAwaitMs", () =>
-      backend().savePage(dto, baseline, force)
+      backend().savePage(dto, baseline, force, intent.kind === "force" ? intent.observation : null)
     );
     // A reload/rename/delete/rebind while savePage was in flight invalidates the
     // retirement proof even if those bytes landed. Never let that stale success
@@ -384,6 +515,12 @@ async function doSave(
       if (baseline === null) bumpPageInventoryRev();
     }
     clearTransientRetry(name);
+    conflictObservation.delete(name);
+    // The bytes landed, so any banner still up is answered. Only a re-observation
+    // can arrive here with one raised (the ordinary path refuses a conflicted
+    // page and a force is followed by its own clear), and leaving it would park
+    // the page behind a warning about a change that is now written.
+    if (isConflicted(name)) clearConflict(name);
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
@@ -395,9 +532,52 @@ async function doSave(
     // options cannot resolve any of them AND stops the page saving from then on.
     // Those now arrive with their own bounded code and fall through to the
     // retry/toast path below.
-    if (String(e) === "conflict" || String(e) === "Error: conflict") {
+    const observed = conflictObservationEpoch(e);
+    if (observed !== null) {
       clearTransientRetry(name);
+      if (observed >= 0) conflictObservation.set(name, observed);
+      else conflictObservation.delete(name);
       markConflict(name);
+    } else if (directSaveFailureCode(e).startsWith("conflict_authority.")) {
+      // The force named an observation the disk has since moved past — a later
+      // external write, or a read, revoked it before the click reached the
+      // backend. The refusal is right: that authority was for a state the user
+      // is no longer looking at. But the banner it answers is now dead, and
+      // leaving it up is the unresolvable tail again: every further "Keep mine"
+      // presents the same spent epoch, the ordinary retry is forbidden while the
+      // page is conflicted, and only the destructive button still works.
+      //
+      // So drop the dead epoch and observe again. A still-divergent disk raises
+      // a FRESH banner with live authority, describing the state that is
+      // actually there now; a disk the guard accepts simply takes the edit. The
+      // user re-decides against what they can see, which is the whole contract.
+      // (GH #254 increment 2, third correction-delta re-verification.)
+      clearTransientRetry(name);
+      conflictObservation.delete(name);
+      if (token === graphToken) {
+        dirty.add(name); // the edit is still unwritten
+        void reconcileExternalChange(name);
+      }
+    } else if (directSaveFailureCode(e).startsWith("conflict_retry.")) {
+      // The backend could not coherently observe the winner, so it minted no
+      // authority — and a force that reached here has already CONSUMED the
+      // token its banner was standing on. Leaving that banner up is the
+      // unresolvable state C5 exists to prevent: "Keep mine" is permanently
+      // dead (its authority is spent), the retry below refuses to run while the
+      // page is conflicted, and the only live button, "Use disk version",
+      // discards the user's edits.
+      //
+      // So retract the spent banner and let the ordinary retry decide. The edit
+      // stays dirty and unwritten; if the disk really has diverged, the retry's
+      // own base_rev guard raises a FRESH conflict with a fresh token, which is
+      // a banner the user can actually act on. (GH #254 increment 2,
+      // adversarial implementation verification, finding 3.)
+      clearConflict(name);
+      conflictObservation.delete(name);
+      if (token === graphToken) {
+        dirty.add(name);
+        scheduleTransientRetry(name, token, e);
+      }
     } else if (token === graphToken) {
       dirty.add(name); // keep pending — retried on next edit / flush
       scheduleTransientRetry(name, token, e);
@@ -406,11 +586,27 @@ async function doSave(
   }
 }
 
+/** How long an edit waits for the typing to settle before it is written. */
+const SAVE_DEBOUNCE_MS = 400;
+/** …and the longest a run of edits can postpone that write by continuing.
+ *
+ *  Without a ceiling the debounce re-arms on every keystroke, so a fluent
+ *  typist never pauses long enough to trigger it and nothing reaches disk until
+ *  they stop — a crash mid-paragraph loses the paragraph. Measured from the
+ *  FIRST edit of the burst, not the last, so the bound is on how stale the file
+ *  can be rather than on how fast the user types. (Direct Files data-safety
+ *  audit, finding 9.) */
+const MAX_SAVE_DELAY_MS = 3_000;
+
 export function scheduleSave() {
   if (!doc.loaded) return;
   if (saveTimer) clearTimeout(saveTimer);
+  else burstStartedAt = Date.now();
+  const postponedBy = Date.now() - (burstStartedAt ?? Date.now());
+  const delay = Math.max(0, Math.min(SAVE_DEBOUNCE_MS, MAX_SAVE_DELAY_MS - postponedBy));
   saveTimer = setTimeout(() => {
     saveTimer = null;
+    burstStartedAt = null;
     const names = [...dirty];
     void (async () => {
       const results = await Promise.all(names.map((n) => enqueueSave(n)));
@@ -419,7 +615,28 @@ export function scheduleSave() {
       // for a lull instead of firing on every 400ms save batch.
       if (results.some(Boolean)) scheduleDataRev();
     })();
-  }, 400);
+  }, delay);
+}
+
+/** An external write landed on a page that still has unsaved edits. Do NOT mark
+ *  it conflicted here.
+ *
+ *  A conflict banner is only usable if "Keep mine" can present the observation
+ *  epoch it was shown, and the backend mints one exactly once: for the disk
+ *  state it just refused to overwrite. A banner raised from the frontend has no
+ *  epoch, so `save_page` refuses the force, the banner stays up, its retry is
+ *  forbidden while the page is conflicted, and the only live action left is
+ *  "Use disk version" — which discards the edit. That is the unresolvable
+ *  dirty-editor tail this whole mechanism exists to prevent. (GH #254
+ *  increment 2, correction-delta re-verification, HIGH blocker.)
+ *
+ *  So run the ordinary, base-revision-guarded save instead. It cannot overwrite
+ *  a diverged file; if the disk really moved, its refusal raises the banner WITH
+ *  authority through the single conflict path in `doSave`, and if it did not,
+ *  the pending edit simply lands. Reading the file to prove divergence first is
+ *  not enough on its own — that read revokes any authority for the path. */
+export async function reconcileExternalChange(name: string): Promise<void> {
+  await enqueueSave(name, { kind: "reobserve" });
 }
 
 /** Save one page immediately, bypassing the debounce — for actions that must
@@ -445,7 +662,7 @@ export async function flushCutSourcePages(sources: readonly ClipboardSourcePage[
     || !sources.every(cutSourceUsable)
   ) return false;
   const results = await Promise.all(
-    sources.map((source) => enqueueSave(source.name, false, source)),
+    sources.map((source) => enqueueSave(source.name, ORDINARY, source)),
   );
   if (results.some(Boolean)) scheduleDataRev();
   return results.every(Boolean);
@@ -499,7 +716,7 @@ export async function flushAll(): Promise<boolean> {
  *  must not clear the conflict unless it did. */
 export async function forceSave(name: string): Promise<boolean> {
   dirty.add(name); // ensure doSave writes even though it's parked as conflicted
-  const ok = await enqueueSave(name, true);
+  const ok = await enqueueSave(name, forceIntent(name));
   if (!ok) pushToast(`Couldn't overwrite “${name}”.`, "error");
   return ok;
 }

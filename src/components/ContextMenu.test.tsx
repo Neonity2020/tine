@@ -3,11 +3,13 @@ import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { ContextMenu, deletePageMenuLabel, pageMenuAvailability } from "./ContextMenu";
 import { initParser } from "../render/parse";
-import { blockProperty, doc, resetStore, setDoc, type Node as StoreNode } from "../store";
+import { blockProperty, doc, markDirty, resetStore, setDoc, type Node as StoreNode } from "../store";
 import {
+  clearConflict,
   closeContextMenu,
   closeExportModal,
   exportModal,
+  markConflict,
   openContextMenu,
   openPageContextMenu,
 } from "../ui";
@@ -340,5 +342,53 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
     const newTabIdx = labels.indexOf("Open in new tab");
     expect(newTabIdx).toBeGreaterThan(zoomIdx);
     dispose();
+  });
+
+  // "The file moves to the graph's .tine-trash folder" reads as fully
+  // recoverable, and for a saved page it is. A page with unsaved edits — dirty,
+  // or parked with an unresolved conflict, which by definition never reached
+  // disk — trashes only its STALE file. The user's actual work is destroyed and
+  // is in no trash. Say so before they answer. (Direct Files data-safety audit,
+  // 2026-08-09, finding 18.)
+  async function confirmTextForDelete(): Promise<string> {
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(false);
+    const dispose = mount(() => <ContextMenu />);
+    openPageContextMenu(10, 10, "P", "page");
+    [...document.querySelectorAll<HTMLElement>(".ctx-item")]
+      .find((el) => el.textContent?.trim() === "Delete page")!
+      .click();
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalled());
+    dispose();
+    return confirm.mock.calls[0][0] as string;
+  }
+
+  it("warns that unsaved edits are not in the trash copy", async () => {
+    load();
+    markDirty("P");
+
+    const text = await confirmTextForDelete();
+
+    expect(text).toContain("unsaved");
+    expect(text).toContain(".tine-trash");
+    clearConflict("P");
+  });
+
+  it("warns for a conflicted page, whose edits provably never reached disk", async () => {
+    load();
+    markConflict("P");
+
+    const text = await confirmTextForDelete();
+
+    expect(text).toContain("unsaved");
+    clearConflict("P");
+  });
+
+  it("keeps the plain wording for a page with nothing unsaved", async () => {
+    load();
+
+    const text = await confirmTextForDelete();
+
+    expect(text).not.toContain("unsaved");
+    expect(text).toContain(".tine-trash");
   });
 });

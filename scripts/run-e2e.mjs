@@ -3,12 +3,11 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildInputState, normalizedBuildInputState } from "./build-e2e-inputs.mjs";
-import { windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
+import { freeLoopbackPort, windowsWebviewProfileSnapshot } from "./e2e-capabilities.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const contractsPath = path.join(root, "tests/ui-regressions/e2e-contracts.json");
@@ -16,7 +15,9 @@ const suiteName = process.argv[2] ?? "linux-smoke";
 const only = process.argv.find((arg) => arg.startsWith("--scenario="))?.slice("--scenario=".length);
 const app = path.resolve(process.env.TINE_APP || path.join(root, process.platform === "win32" ? "target/release/tine.exe" : "target/release/tine"));
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
-const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || 180_000);
+const longFocusedWindows = suiteName === "windows-smoke"
+  && ["windows-managed-storage", "windows-direct-large-open"].includes(only);
+const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (longFocusedWindows ? 15 * 60_000 : 180_000));
 const suiteStartedAt = new Date().toISOString();
 function gitOutput(args) {
   const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
@@ -145,6 +146,8 @@ const suites = {
     ["pdf-logseq", "scripts/e2e-pdf-logseq.mjs", { E2E_WINDOW_MANAGER: "openbox" }],
     ["print-security", "scripts/e2e-print-security.mjs", {}],
     ["windows-core", "scripts/e2e-windows-smoke.mjs", {}],
+    ["windows-direct-large-open", "scripts/e2e-windows-direct-large-open.mjs", {}],
+    ["windows-managed-storage", "scripts/e2e-windows-managed-storage.mjs", {}],
     ["page-trailing-block", "scripts/e2e-page-trailing-block.mjs", {}],
     ["tab-overflow", "scripts/e2e-tab-overflow.mjs", {}],
   ],
@@ -325,17 +328,6 @@ function failureIsBlocking(status, contractEntry) {
   return contractEntry.contracts.some((contract) => contract.blocking);
 }
 
-async function freePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const port = server.address().port;
-      server.close(() => resolve(port));
-    });
-  });
-}
-
 function xmlEscape(value) {
   return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;");
 }
@@ -391,9 +383,9 @@ async function runScenario([id, script, extraEnv], contractEntry) {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const stdout = fs.openSync(path.join(dir, "stdout.log"), "w");
     const stderr = fs.openSync(path.join(dir, "stderr.log"), "w");
-    const driverPort = await freePort();
-    const nativePort = await freePort();
-    const previewPort = await freePort();
+    const driverPort = await freeLoopbackPort();
+    const nativePort = await freeLoopbackPort(new Set([driverPort]));
+    const previewPort = await freeLoopbackPort(new Set([driverPort, nativePort]));
     const env = {
       ...baseProcessEnv,
       ...extraEnv,

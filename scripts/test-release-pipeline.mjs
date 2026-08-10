@@ -13,8 +13,11 @@ import {
   selectExactCiEvidence,
 } from "./ci-evidence-lib.mjs";
 import {
+  freeLoopbackPort,
+  selectWebdriverWindowWithSelector,
   tauriCapabilities,
   webdriverServerArgs,
+  windowsUserDataFolder,
   windowsWebviewProfileSnapshot,
 } from "./e2e-capabilities.mjs";
 import { candidateProblems, releaseLayout, RELEASE_LANES } from "./release-layout.mjs";
@@ -37,6 +40,14 @@ const preflight = fs.readFileSync(path.join(process.cwd(), "scripts/check-releas
 const e2eRunner = fs.readFileSync(path.join(process.cwd(), "scripts/run-e2e.mjs"), "utf8");
 const receiptHelper = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-receipt.mjs"), "utf8");
 const buildInputs = fs.readFileSync(path.join(process.cwd(), "scripts/build-e2e-inputs.mjs"), "utf8");
+const windowsWebviewDriverInstaller = fs.readFileSync(
+  path.join(process.cwd(), "scripts/install-windows-webview2-driver.ps1"),
+  "utf8"
+);
+const issue295Scenario = fs.readFileSync(
+  path.join(process.cwd(), "scripts/e2e-windows-page-reference-latency.mjs"),
+  "utf8"
+);
 const printSecurity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-print-security.mjs"), "utf8");
 const referenceParity = fs.readFileSync(path.join(process.cwd(), "scripts/e2e-og-parity-references.mjs"), "utf8");
 const windowsScenarios = [
@@ -68,6 +79,22 @@ assert.deepEqual(
   [],
   "tracked paths must remain unique on case-insensitive filesystems"
 );
+assert.match(uiE2eWorkflow, /windows-issue-295:[\s\S]*?inputs\.windows_scenario == 'windows-page-reference-latency'/);
+assert.match(uiE2eWorkflow, /ref: \$\{\{ inputs\.linux_scenario \}\}[\s\S]*?path: candidate/);
+assert.match(uiE2eWorkflow, /a4cc5eca0c08ac3e819dc490e3d48f545c207da742a670bf437a86a6d1b6aa24/);
+assert.match(
+  uiE2eWorkflow,
+  /windows-issue-295:[\s\S]*?Install Tauri WebDriver bridge[\s\S]*?cargo install tauri-driver --locked[\s\S]*?Drive literal page-reference keys/,
+);
+assert.match(uiE2eWorkflow, /node scripts\/e2e-windows-page-reference-latency\.mjs/);
+assert.match(uiE2eWorkflow, /actions\/cache\/restore@v4[\s\S]*?windows-gh295-candidate-\$\{\{ inputs\.linux_scenario \}\}/);
+assert.match(uiE2eWorkflow, /actions\/cache\/save@v4[\s\S]*?candidate\/target\/release\/tine\.exe/);
+assert.match(issue295Scenario, /const TYPED = "\[\[typing refference here lags a lot"/);
+assert.match(issue295Scenario, /await target\.click\(\)/);
+assert.match(issue295Scenario, /await browser\.keys\(\[key\]\)/);
+assert.match(issue295Scenario, /dispatchToSecondPaint/);
+assert.match(issue295Scenario, /quickSwitch/);
+assert.match(issue295Scenario, /directSave/);
 
 function yamlBlock(lines, key, indent) {
   const header = `${" ".repeat(indent)}${key}:`;
@@ -639,6 +666,23 @@ assert.doesNotMatch(
   "the focused Windows workflow hides a 0\/N scenario result behind a green job"
 );
 assert.match(
+  uiE2eWorkflow,
+  /Install Edge WebDriver matching the WebView2 runtime[\s\S]*?\.\/scripts\/install-windows-webview2-driver\.ps1/,
+  "focused Windows UI CI does not select EdgeDriver from the actual WebView2 runtime"
+);
+assert.match(
+  releaseWorkflow,
+  /Install Edge WebDriver matching the WebView2 runtime[\s\S]*?\.\/scripts\/install-windows-webview2-driver\.ps1/,
+  "release Windows UI CI does not select EdgeDriver from the actual WebView2 runtime"
+);
+assert.match(windowsWebviewDriverInstaller, /Microsoft\\EdgeWebView\\Application/);
+assert.match(windowsWebviewDriverInstaller, /msedgewebview2\.exe/);
+assert.doesNotMatch(
+  windowsWebviewDriverInstaller,
+  /Microsoft\\Edge\\Application\\msedge\.exe/,
+  "the WebView2 driver installer must not infer its version from the independently updated desktop browser"
+);
+assert.match(
   releaseWorkflow,
   /name: Upload exact Windows x64 frontend proof[\s\S]*?if: matrix\.lane == 'windows-x64'[\s\S]*?name: release-e2e-frontend-windows-x64[\s\S]*?path: dist/,
   "the release build does not preserve the exact frontend needed to validate the staged Windows executable"
@@ -817,6 +861,21 @@ function assemble(input, output) {
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "tine-release-pipeline-test-"));
 try {
+  const firstFreePort = await freeLoopbackPort();
+  const secondFreePort = await freeLoopbackPort(new Set([firstFreePort]));
+  assert.ok(Number.isInteger(firstFreePort));
+  assert.notEqual(secondFreePort, firstFreePort);
+  let selectedWindow = "capture";
+  const selected = await selectWebdriverWindowWithSelector({
+    async getWindowHandles() { return ["capture", "main"]; },
+    async switchToWindow(handle) { selectedWindow = handle; },
+    async getTitle() { return selectedWindow === "main" ? "Tine" : "Quick Capture"; },
+    async getUrl() { return selectedWindow; },
+    $(selector) {
+      return { isExisting: async () => selector === ".main-app" && selectedWindow === "main" };
+    },
+  }, ".main-app", 100);
+  assert.equal(selected, "main");
   const priorWebviewRoot = process.env.E2E_WEBVIEW_USER_DATA_ROOT;
   process.env.E2E_WEBVIEW_USER_DATA_ROOT = path.join(temporary, "webview2");
   const windowsCapabilities = tauriCapabilities("C:/Tine.exe", "fixture session", "win32");
@@ -826,6 +885,12 @@ try {
   );
   assert.equal(windowsCapabilities.browserName, "webview2");
   assert.equal(windowsCapabilities["ms:edgeOptions"].binary, "C:/Tine.exe");
+  assert.equal(
+    windowsUserDataFolder("explicit session", {
+      E2E_WEBVIEW_USER_DATA_ROOT: path.join(temporary, "explicit-webview2"),
+    }),
+    path.join(temporary, "explicit-webview2", "explicit-session"),
+  );
   const attachedCapabilities = tauriCapabilities(
     "C:/Tine.exe",
     "fixture session",

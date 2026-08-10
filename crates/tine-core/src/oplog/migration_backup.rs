@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::bootstrap_import::{BOOTSTRAP_FRONTIER_SCHEMA_VERSION, BOOTSTRAP_IMPORT_SCHEMA_VERSION};
@@ -25,7 +26,7 @@ use super::import::{
     InactiveBootstrapVerifiedPublication,
 };
 use super::object_store::{
-    control_directory_identity, open_dir_nofollow, sync_dir_required,
+    control_directory_identity, open_dir_nofollow, open_file_nofollow, sync_dir_required,
     BootstrapAggregateHistoryBindingV1,
 };
 use super::{
@@ -57,6 +58,8 @@ const RESTORE_PROOF_MAGIC: &[u8; 8] = b"TINERP1\0";
 const COMMIT_MARKER_MAGIC: &[u8; 8] = b"TINEMC1\0";
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_HEADER_BYTES: usize = 256 * 1024;
+const MAX_RETAINED_EVIDENCE_BYTES: u64 = 1024 * 1024;
+const SOURCE_BACKUP_BINDING_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 thread_local! {
@@ -323,6 +326,7 @@ pub(crate) struct VerifiedSourceBackup {
     total_bytes: u64,
     manifest: BlobDescription,
     restore_proof: BlobDescription,
+    commit_marker: BlobDescription,
     evidence_digest: ContentDigest,
     instrumentation: MigrationBackupInstrumentation,
 }
@@ -339,6 +343,7 @@ impl PartialEq for VerifiedSourceBackup {
             && self.total_bytes == other.total_bytes
             && self.manifest == other.manifest
             && self.restore_proof == other.restore_proof
+            && self.commit_marker == other.commit_marker
             && self.evidence_digest == other.evidence_digest
     }
 }
@@ -390,12 +395,282 @@ impl VerifiedSourceBackup {
         self.restore_proof
     }
 
+    pub(crate) const fn commit_marker(&self) -> BlobDescription {
+        self.commit_marker
+    }
+
     pub(crate) const fn evidence_digest(&self) -> ContentDigest {
         self.evidence_digest
     }
 
     pub(crate) const fn instrumentation(&self) -> &MigrationBackupInstrumentation {
         &self.instrumentation
+    }
+
+    pub(crate) fn retained_binding(&self) -> SourceBackupBindingV1 {
+        SourceBackupBindingV1 {
+            schema_version: SOURCE_BACKUP_BINDING_SCHEMA_VERSION,
+            workspace_id: self.workspace_id,
+            graph_resource: self.graph_resource,
+            backup_root_identity: self.backup_root_identity,
+            publication_id: ContentDigest::from_bytes(self.publication_id),
+            aggregate_digest: ContentDigest::from_bytes(self.aggregate_digest),
+            source_inventory: self.source_inventory,
+            file_count: self.file_count,
+            total_bytes: self.total_bytes,
+            manifest: self.manifest,
+            restore_proof: self.restore_proof,
+            commit_marker: self.commit_marker,
+            evidence_digest: self.evidence_digest,
+        }
+    }
+}
+
+/// Constant-size identity for the already verified migration backup that is
+/// retained as both rollback authority and bootstrap baseline byte storage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceBackupBindingV1 {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    graph_resource: CanonicalGraphResourceId,
+    backup_root_identity: ContentDigest,
+    publication_id: ContentDigest,
+    aggregate_digest: ContentDigest,
+    source_inventory: BlobDescription,
+    file_count: u64,
+    total_bytes: u64,
+    manifest: BlobDescription,
+    restore_proof: BlobDescription,
+    commit_marker: BlobDescription,
+    evidence_digest: ContentDigest,
+}
+
+impl SourceBackupBindingV1 {
+    pub(crate) fn validate(&self) -> Result<(), MigrationBackupError> {
+        if self.schema_version != SOURCE_BACKUP_BINDING_SCHEMA_VERSION
+            || self.file_count > BOOTSTRAP_SOURCE_MAX_FILES
+            || self.total_bytes > BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES
+            || self.restore_proof.byte_length() > MAX_RETAINED_EVIDENCE_BYTES
+            || self.commit_marker.byte_length() > MAX_RETAINED_EVIDENCE_BYTES
+        {
+            return Err(MigrationBackupError::BindingMismatch(
+                "retained source backup binding is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    pub(crate) const fn graph_resource(&self) -> CanonicalGraphResourceId {
+        self.graph_resource
+    }
+
+    pub(crate) const fn backup_root_identity(&self) -> ContentDigest {
+        self.backup_root_identity
+    }
+
+    pub(crate) const fn publication_id(&self) -> ContentDigest {
+        self.publication_id
+    }
+
+    pub(crate) const fn aggregate_digest(&self) -> ContentDigest {
+        self.aggregate_digest
+    }
+
+    pub(crate) const fn source_inventory(&self) -> BlobDescription {
+        self.source_inventory
+    }
+
+    pub(crate) const fn file_count(&self) -> u64 {
+        self.file_count
+    }
+
+    pub(crate) const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    pub(crate) const fn manifest(&self) -> BlobDescription {
+        self.manifest
+    }
+
+    pub(crate) const fn restore_proof(&self) -> BlobDescription {
+        self.restore_proof
+    }
+
+    pub(crate) const fn commit_marker(&self) -> BlobDescription {
+        self.commit_marker
+    }
+
+    pub(crate) const fn evidence_digest(&self) -> ContentDigest {
+        self.evidence_digest
+    }
+
+    pub(crate) fn binding_digest(&self) -> ContentDigest {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tine/source-backup-binding/v1\0");
+        hasher.update(self.schema_version.to_be_bytes());
+        hasher.update(self.workspace_id.as_uuid().as_bytes());
+        for digest in [
+            ContentDigest::from_bytes(*self.graph_resource.as_bytes()),
+            self.backup_root_identity,
+            self.publication_id,
+            self.aggregate_digest,
+            self.evidence_digest,
+        ] {
+            hasher.update(digest.as_bytes());
+        }
+        for description in [
+            self.source_inventory,
+            self.manifest,
+            self.restore_proof,
+            self.commit_marker,
+        ] {
+            hasher.update(description.sha256());
+            hasher.update(description.byte_length().to_be_bytes());
+        }
+        hasher.update(self.file_count.to_be_bytes());
+        hasher.update(self.total_bytes.to_be_bytes());
+        ContentDigest::from_bytes(hasher.finalize().into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test(
+        workspace_id: WorkspaceId,
+        graph_resource: CanonicalGraphResourceId,
+        backup_root_identity: ContentDigest,
+        publication_id: ContentDigest,
+        aggregate_digest: ContentDigest,
+    ) -> Self {
+        let empty = BlobDescription::of(&[]);
+        Self {
+            schema_version: SOURCE_BACKUP_BINDING_SCHEMA_VERSION,
+            workspace_id,
+            graph_resource,
+            backup_root_identity,
+            publication_id,
+            aggregate_digest,
+            source_inventory: empty,
+            file_count: 0,
+            total_bytes: 0,
+            manifest: empty,
+            restore_proof: empty,
+            commit_marker: empty,
+            evidence_digest: ContentDigest::of(b"synthetic source backup evidence"),
+        }
+    }
+}
+
+/// Read-only capability for exact point reads from the committed migration
+/// backup. The compact binding is authenticated once at reopen; callers still
+/// supply and verify the semantic manifest row for every byte read.
+pub(crate) struct SourceBackupPayloadAuthority {
+    payload: Dir,
+}
+
+impl SourceBackupPayloadAuthority {
+    pub(crate) fn reopen(
+        roots: &MigrationBackupRoot,
+        binding: &SourceBackupBindingV1,
+    ) -> Result<Self, MigrationBackupError> {
+        binding.validate()?;
+        roots.freshly_validate_retained_roots()?;
+        if roots.root_identity() != binding.backup_root_identity()
+            || roots.graph_resource() != binding.graph_resource()
+        {
+            return Err(MigrationBackupError::BindingMismatch(
+                "retained source backup root or graph resource changed",
+            ));
+        }
+
+        let root = Dir::open_ambient_dir(roots.canonical_root(), ambient_authority())?;
+        let base = open_dir_nofollow(&root, BACKUP_ROOT_DIRECTORY)
+            .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
+        let workspace = open_dir_nofollow(&base, &binding.workspace_id().to_string())
+            .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
+        let publication = open_dir_nofollow(&workspace, &hex(binding.publication_id().as_bytes()))
+            .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
+
+        require_capability_description(&publication, MANIFEST_FILE, binding.manifest())?;
+        require_capability_description(&publication, RESTORE_PROOF_FILE, binding.restore_proof())?;
+        let marker = read_capability_file(
+            &publication,
+            COMMIT_MARKER_FILE,
+            MAX_RETAINED_EVIDENCE_BYTES,
+        )?;
+        if BlobDescription::of(&marker) != binding.commit_marker()
+            || marker
+                .get(marker.len().saturating_sub(32)..)
+                .is_none_or(|suffix| suffix != binding.evidence_digest().as_bytes())
+        {
+            return Err(MigrationBackupError::CorruptOrConflicting(
+                "retained source backup commit marker changed",
+            ));
+        }
+        let payload = open_dir_nofollow(&publication, PAYLOAD_DIRECTORY)
+            .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))?;
+        Ok(Self { payload })
+    }
+
+    pub(crate) fn read_at(
+        &self,
+        path: &ManagedPath,
+        expected: BlobDescription,
+    ) -> Result<Vec<u8>, MigrationBackupError> {
+        validate_retained_managed_path(path)?;
+        let mut components = path.as_str().split('/').peekable();
+        let mut directory = self.payload.try_clone()?;
+        let mut leaf = None;
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                leaf = Some(component);
+            } else {
+                directory = open_dir_nofollow(&directory, component).map_err(|error| {
+                    MigrationBackupError::Io(io::Error::other(error.to_string()))
+                })?;
+            }
+        }
+        let leaf = leaf.ok_or(MigrationBackupError::CorruptOrConflicting(
+            "retained source backup path is empty",
+        ))?;
+        let mut file = open_file_nofollow(&directory, leaf)?;
+        let metadata = file.metadata()?;
+        if !metadata_is_real_file(&metadata) || metadata.len() != expected.byte_length() {
+            return Err(MigrationBackupError::CorruptOrConflicting(
+                "retained source backup payload has the wrong shape or length",
+            ));
+        }
+        if metadata.len() > BOOTSTRAP_SOURCE_MAX_FILE_BYTES {
+            return Err(MigrationBackupError::ResourceLimit {
+                resource: "retained source backup payload bytes",
+                observed: metadata.len(),
+                limit: BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
+            });
+        }
+        let capacity =
+            usize::try_from(metadata.len()).map_err(|_| MigrationBackupError::ResourceLimit {
+                resource: "retained source backup payload allocation",
+                observed: metadata.len(),
+                limit: BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
+            })?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| MigrationBackupError::ResourceLimit {
+                resource: "retained source backup payload allocation",
+                observed: metadata.len(),
+                limit: BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
+            })?;
+        file.read_to_end(&mut bytes)?;
+        if BlobDescription::of(&bytes) != expected {
+            return Err(MigrationBackupError::CorruptOrConflicting(
+                "retained source backup payload digest changed",
+            ));
+        }
+        Ok(bytes)
     }
 }
 
@@ -537,7 +812,7 @@ pub(crate) fn verify_migration_source_backup(
         manifest,
         restore_proof,
     );
-    publish_small_file_atomic(
+    let commit_marker = publish_small_file_atomic(
         &paths.final_directory,
         COMMIT_MARKER_STAGE_FILE,
         COMMIT_MARKER_FILE,
@@ -593,6 +868,7 @@ pub(crate) fn verify_migration_source_backup(
         total_bytes: summary.total_bytes,
         manifest,
         restore_proof,
+        commit_marker,
         evidence_digest,
         instrumentation,
     })
@@ -2124,6 +2400,85 @@ fn validate_final_root_entries(directory: &Path) -> Result<(), MigrationBackupEr
         return Err(MigrationBackupError::CorruptOrConflicting(
             "committed backup is missing its proof or marker",
         ));
+    }
+    Ok(())
+}
+
+fn require_capability_description(
+    directory: &Dir,
+    name: &str,
+    expected: BlobDescription,
+) -> Result<(), MigrationBackupError> {
+    let mut file = open_file_nofollow(directory, name)?;
+    let metadata = file.metadata()?;
+    if !metadata_is_real_file(&metadata) || metadata.len() != expected.byte_length() {
+        return Err(MigrationBackupError::CorruptOrConflicting(
+            "retained source backup evidence has the wrong shape or length",
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; IO_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    if BlobDescription::from_parts(digest.finalize().into(), metadata.len()) != expected {
+        return Err(MigrationBackupError::CorruptOrConflicting(
+            "retained source backup evidence digest changed",
+        ));
+    }
+    Ok(())
+}
+
+fn read_capability_file(
+    directory: &Dir,
+    name: &str,
+    maximum: u64,
+) -> Result<Vec<u8>, MigrationBackupError> {
+    let mut file = open_file_nofollow(directory, name)?;
+    let metadata = file.metadata()?;
+    if !metadata_is_real_file(&metadata) || metadata.len() > maximum {
+        return Err(MigrationBackupError::CorruptOrConflicting(
+            "retained source backup evidence has the wrong shape or size",
+        ));
+    }
+    let capacity =
+        usize::try_from(metadata.len()).map_err(|_| MigrationBackupError::ResourceLimit {
+            resource: "retained source backup evidence allocation",
+            observed: metadata.len(),
+            limit: maximum,
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| MigrationBackupError::ResourceLimit {
+            resource: "retained source backup evidence allocation",
+            observed: metadata.len(),
+            limit: maximum,
+        })?;
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn validate_retained_managed_path(path: &ManagedPath) -> Result<(), MigrationBackupError> {
+    if path.as_str().len() > BOOTSTRAP_SOURCE_MAX_PATH_BYTES {
+        return Err(MigrationBackupError::ResourceLimit {
+            resource: "managed path bytes",
+            observed: path.as_str().len() as u64,
+            limit: BOOTSTRAP_SOURCE_MAX_PATH_BYTES as u64,
+        });
+    }
+    let depth = path.as_str().split('/').count() as u64;
+    let maximum_depth = BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH.saturating_add(1) as u64;
+    if depth > maximum_depth {
+        return Err(MigrationBackupError::ResourceLimit {
+            resource: "managed path depth",
+            observed: depth,
+            limit: maximum_depth,
+        });
     }
     Ok(())
 }

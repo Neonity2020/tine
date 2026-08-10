@@ -15,6 +15,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const G = "/tmp/txdg-del-g";
@@ -23,14 +26,6 @@ const TD = process.env.TAURI_DRIVER || path.resolve(ROOT, "..", ".toolchain", "c
 const WEBKIT_DRIVER = process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver";
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4444);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4445);
-
-let xvfb;
-async function ensureDisplay() {
-  if (process.env.DISPLAY) return;
-  process.env.DISPLAY = ":98";
-  xvfb = spawn("Xvfb", [":98", "-screen", "0", "1400x1000x24"], { stdio: "ignore" });
-  await sleep(1200);
-}
 
 const BLOCKS = [
   "alpha bravo charlie delta echo",
@@ -476,4 +471,4 @@ console.log(`broken cases: ${broken}/${results.length}`);
 
 await browser.deleteSession();
 td.kill();
-if (xvfb) xvfb.kill();
+stopDisplay();

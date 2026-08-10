@@ -2848,10 +2848,33 @@
       "status": "reported",
       "coverage": {
         "tests": [
-          "src-tauri/src/graph.rs::tests::direct_large_graph_open_manual_benchmark"
+          "src-tauri/src/graph.rs::tests::direct_large_graph_open_manual_benchmark",
+          "scripts/e2e-windows-direct-large-open.mjs"
         ]
       },
-      "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore does not reproduce the Windows report. Debug builds now emit phase and cumulative timings for canonicalization, private/shared storage discovery, asset approval, Direct core open, legacy store discovery, graph binding, backup scheduling, settings/title, and warm-cache scheduling. Keep this reported until a current Windows trace identifies the missing filesystem or platform phase."
+      "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore does not reproduce the Windows report. Debug builds now emit phase and cumulative timings for canonicalization, private/shared storage discovery, asset approval, Direct core open, legacy store discovery, graph binding, backup scheduling, settings/title, and warm-cache scheduling. The focused Windows WebView2 scenario measures the load_graph interval on the same file-count shape and preserves phase diagnostics, but cannot duplicate the reporter's physical disk, antivirus, or 24.6 GB of real payload. Keep this reported until a current Windows trace identifies the missing filesystem or platform phase."
+    },
+    {
+      "id": "REG-WINDOWS-MANAGED-ACTIVATION-292",
+      "title": "Managed storage activation on a large Windows graph either becomes active or leaves Direct Files usable",
+      "family": "managed-storage-activation",
+      "sources": {
+        "issues": [
+          292
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows"
+      ],
+      "layer": "real-app",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-windows-managed-storage.mjs"
+        ]
+      },
+      "notes": "The reporter saw activation fail on Windows 11 with about 13,000 pages, after which pages were unavailable until returning to Direct Files. The focused hosted-Windows WebView2 scenario drives the real Settings activation on a 13,000-page nested Unicode Markdown/Org graph, verifies byte-preserved source files, opens a nested page under managed storage, returns to Direct Files, and reopens the page. Keep this reported until hosted execution either reproduces the failure or records a repeatable pass that sharply narrows the remaining Windows 11 or graph-content evidence gap."
     },
     {
       "id": "REG-CASE-INSENSITIVE-TRACKED-PATHS-280",
@@ -3038,7 +3061,33 @@
           "crates/tine-core/tests/graph.rs"
         ]
       },
-      "notes": "GH #254 increment 1, ordinary save only. An external editor that writes by temp+rename (the common safe pattern, and what Syncthing/Dropbox deliver) leaves the same path on a NEW inode. save_page authorized with PinnedSaveAuthority::LoadedRevision, whose retained-identity check refused before the byte comparison ever ran, returning 'path-pinned page does not match its captured exact owner' - a message isRetryableSaveFailure retries forever, so the page became permanently unsaveable with no user-resolvable path out. Measured pre-fix: 4 of 5 cases fail, and NOTABLY the different-byte case failed with the same unresolvable code, so a genuine external change was equally unrecoverable, not just the same-byte one. A new authority OrdinaryEditorSave proves exact path ownership and nothing about physical identity; the byte comparison then decides. Equal bytes on a new inode re-pin to the current snapshot and proceed; different bytes return the literal 'conflict' the frontend can resolve. LoadedRevision is UNCHANGED and still used by verify_existing_journal_page_projection, which authenticates before an opaque durable append and must not inherit this reorder - the contract verifier rejected a helper-wide change twice on exactly this boundary. KNOWN UNCHANGED and out of scope: an externally DELETED target still refuses through the name-only-creation identity check rather than conflict; verified byte-identical before and after, asserted as-is, and owned by increment 2 (a present-only authority cannot express an absent snapshot). The force-save half of #254 ('Keep mine' overwriting the wrong snapshot) is NOT fixed here."
+      "notes": "GH #254 increment 1, ordinary save only. An external editor that writes by temp+rename (the common safe pattern, and what Syncthing/Dropbox deliver) leaves the same path on a NEW inode. save_page authorized with PinnedSaveAuthority::LoadedRevision, whose retained-identity check refused before the byte comparison ever ran, returning 'path-pinned page does not match its captured exact owner' - a message isRetryableSaveFailure retries forever, so the page became permanently unsaveable with no user-resolvable path out. Measured pre-fix: 4 of 5 cases fail, and NOTABLY the different-byte case failed with the same unresolvable code, so a genuine external change was equally unrecoverable, not just the same-byte one. A new authority OrdinaryEditorSave proves exact path ownership and nothing about physical identity; the byte comparison then decides. Equal bytes on a new inode re-pin to the current snapshot and proceed; different bytes return the literal 'conflict' the frontend can resolve. LoadedRevision is UNCHANGED and still used by verify_existing_journal_page_projection, which authenticates before an opaque durable append and must not inherit this reorder - the contract verifier rejected a helper-wide change twice on exactly this boundary. At increment 1, delete conflicts and the force-save half were deliberately deferred to increment 2; the next record covers both."
+    },
+    {
+      "id": "REG-DIRECT-SAVE-EXACT-CONFLICT-AUTHORITY-GH254",
+      "title": "Keep mine writes only over the exact disk snapshot shown by its conflict",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [
+          254
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs",
+          "src-tauri/src/commands.rs",
+          "src/persistence.test.ts"
+        ]
+      },
+      "notes": "GH #254 increment 2. A conflict now mints one per-Graph, per-editor-episode, exact-path, monotonic-epoch token holding Present { revision, resource_identity } or Absent plus the coherently observed baseline bytes. Force consumes it before every attempt and runs the ordinary save protocol with those bytes and identity substituted as its rechecked baseline; it never delegates by revision alone. Under Martin's state-not-events ruling (2026-08-09) a byte-identical republication of the shown snapshot is a no-op, so force DOES rebind to the live inode in exactly that case and refuses a different-byte winner on a new inode; two tests pin both halves. S1-S9 each have a deterministic site test, including both final-reread arms and post-restore/post-publication observation timing. Stable observations get per-site conflict.* codes; exceptional observation failure gets conflict_retry.*, which cannot reach the keep-mine/use-disk banner and now also RETRACTS an existing one: a force has already spent its token by then, so leaving the banner up left Keep-mine permanently dead beside a destructive Use-disk (adversarial implementation verification, finding 3). Loads, watcher observations, forget_file, successful saves, and the shared Tine-owned graph-text mutation boundary revoke authority, covering rename/delete/trash/merge, managed projection/import/migration, sync-conflict resolution, and PDF-highlight page writes. Hard admission refusals remain tokenless."
     },
     {
       "id": "REG-UNLINKED-REFS-SEE-CODE-GH270",
@@ -3087,6 +3136,290 @@
         ]
       },
       "notes": "Martin, 2026-08-09: a generated graph wrote each report to `pages/c01 Swap Bribery.md` with `title:: Swap Bribery` and linked the index by FILENAME. Since Logseq resolves a page's name as title:: > filename > first block (graph-parser extract.cljc get-page-name), the filename named nothing and all 29 links opened blank pages with no signal. Tine <=0.6.5 used the filename and ignored title::; aa4a4b29 (2026-07-29, shipped in 0.6.90) corrected that, which is why the graph looked fine when built. Backend was never at fault - load_named returned full content for all 30 pages. DELIBERATE DIVERGENCE, approved by Martin: Logseq does NOT distinguish unresolved links (components/block.cljs:548 dims only untitled-page?, i.e. a page that EXISTS under a uuid name); Tine dims them, as Obsidian does. Applied to [[refs]] only, NOT #tags - a tag with no page file is ordinary Logseq usage and dimming those would mark most tags in a normal graph. existing_page_names resolves like load_named (normalized keys + alias table, no PageKind filter, so a link to an existing journal is alive) and costs one memoized page-list read per call; pageExistsBatch coalesces every reference in a tick into one IPC, asks each name once per graph, and treats UNKNOWN AS ALIVE so a page of good links never flashes as dead. Verified on the real 30-page graph: 8/8 refs dimmed before the repair, 0/8 after, all six sampled links clicking through to 24-27 block pages."
+    },
+    {
+      "id": "REG-SAVE-DEBOUNCE-CEILING-20260809",
+      "title": "A fluent typing burst is never written to disk until the typist pauses",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/persistenceDebounceCeiling.test.ts"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 9. scheduleSave cleared and re-armed a 400 ms timer on every markDirty, with no ceiling, so the debounce fired only during a pause in typing. Measured fail-before: 40 keystrokes at 300 ms intervals - 12 seconds of prose at a pace slower than most people type - produced ZERO writes. A crash, power loss or OOM kill during a long passage therefore lost the whole passage, and the loss window grew with how well the writing was going. Fixed by measuring a MAX_SAVE_DELAY_MS ceiling of 3 s from the FIRST dirty mark of a burst rather than the last, so the bound is on file staleness rather than typing speed; the burst clock restarts whenever no save is armed, which every drain path (flushAll, resetSaveState, the timer itself) already guarantees by nulling saveTimer. Coalescing is unchanged: a short burst still costs exactly one write."
+    },
+    {
+      "id": "REG-CONFLICT-RESOLVE-PINNED-FILE-20260809",
+      "title": "\"Use disk version\" on a page pinned to a specific file loads a different file",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [
+          21
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ConflictBar.test.tsx"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 10. Two files can carry one page NAME - the duplicate-day stray of GH #21, or same-titled pages in different folders - and the editor pins such a page to its exact path so saves write back to the file it was loaded from. ConflictBar's \"Use disk version\" resolved by NAME (backend getPage), which reaches the backend's canonical owner of that name, so the button silently re-pointed the tab at a different file: the user discarded their edits to THIS file and got someone else's file loaded in its place. Fixed by resolving through getPageByPath whenever the loaded page carries a path - the same idiom store.ts, RightSidebar and LiveRefGroup already use. An absent pinned file drops the page rather than falling back to the name, since that fallback is the same defect; an unpinned (never-saved) page still resolves by name because it has nothing else."
+    },
+    {
+      "id": "REG-DELETE-PAGE-UNSAVED-WARNING-20260809",
+      "title": "Deleting a page with unsaved edits promises a recoverable trash copy that does not contain them",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ContextMenu.test.tsx"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 18. The delete confirmation said only 'The file moves to the graph's .tine-trash folder', which reads as fully recoverable. The trash receives the FILE, so a dirty page's latest keystrokes - and, provably, EVERY edit on a conflicted page, whose saves are refused by design until the conflict is resolved - are destroyed with nothing to recover from. The prompt now names that outcome when the page is dirty or conflicted, while the user can still answer no; wording is unchanged for a page with nothing unsaved. Deliberately NOT fixed by flushing first: making delete trigger a save is a behavior change with its own risk, and it cannot help the conflicted case at all."
+    },
+    {
+      "id": "REG-CLOSE-FLUSH-GRACE-20260809",
+      "title": "Closing offers to discard work that is still being written",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [
+          161
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/safeClose.test.ts"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 11. The shared close transaction (desktop window-close and Android root Back) bounded flushAll at a flat 4 s and treated expiry as failure, so a flush that had merely not FINISHED was reported in the same words as one that could never succeed - 'unsaved changes that couldn't be saved... close anyway and lose them?' - inviting the user to throw away a write in progress. A slow or network filesystem, a fsync behind a busy disk, or many dirty pages can exceed 4 s with nothing wrong; on the 1,045-file anonymized corpus a save averages ~7 ms, so the bound is already several hundred pages' worth. The close now races the SAME flush promise twice: at the soft bound it says 'still saving' and grants a 26 s grace period, and only a flush that genuinely finished false, threw, or outlasted the grace period reaches a discard prompt - which now distinguishes 'failed' from 'still-saving' in its wording. The pre-existing test asserted that the timeout case behaved identically to failure, i.e. it encoded the defect; it was split rather than grandfathered."
+    },
+    {
+      "id": "REG-CONFLICT-SELF-CLEARS-20260809",
+      "title": "A conflict raised by a transient file removal is never cleared when the file returns",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/App.test.tsx"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 17. Raising a conflict was gated on a per-page divergence proof; clearing one was gated on nothing, because only a user's click (or forgetPage) ever cleared a conflict. handleGraphChange's REMOVED branch calls markConflict with no proof at all, so an external editor writing by temp+rename, or a mid-delivery Syncthing pass, could park a page behind the banner permanently. doSave then refuses that page forever, and both banner buttons destroy something: 'Use disk version' the unsaved edit, 'Keep mine' a file it never needed to overwrite. Fixed by making the proof two-directional in ONE owner, applyDivergenceVerdict, used by both observation sites (legacy watcher and sparse-v2 epoch): a negative proof on a currently-conflicted page clears the conflict and reschedules the edit it was freezing. A third site cannot reintroduce the asymmetry. A file that returns with DIFFERENT content still conflicts."
+    },
+    {
+      "id": "REG-SHADOW-JOURNAL-TEXT-EXTENSIONS-20260809",
+      "title": "The direct shadow-journal rule asked two extensions while its managed twin asked three",
+      "family": "filesystem-safety",
+      "sources": {
+        "issues": [
+          21
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/tests/graph.rs"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 15, landed as a CONSISTENCY fix with an explicit NEGATIVE result. Graph::is_shadow_journal (direct mode) hard-coded canonical candidates '{stem}.md' and '{stem}.org'; its managed twin managed_is_shadow_journal already asked configured_text_variant_paths, i.e. all of LOGSEQ_TEXT_EXTENSIONS = md/markdown/org. The audit predicted that in a '.markdown' graph a title-named leftover would therefore escape the #21 shadow rule and poison the (kind,name) cache. IT DOES NOT: probes at the observation boundary show load_named and journals_desc both still serve the canonical file for both extensions, because later layers mask the misclassification. The necessity gate is therefore NOT satisfied and no user-visible defect is claimed - the divergence between the two classifiers is real and was removed, and the three new tests pin the #21 rule per extension so that a change in whichever layer is currently masking it cannot silently take the guarantee with it."
+    },
+    {
+      "id": "REG-ALL-PAGES-LABEL-LINEAR-20260809",
+      "title": "The All Pages sidebar list scanned the whole page list once per visible row",
+      "family": "performance",
+      "sources": {
+        "issues": [
+          21
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "frontend",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/pages.test.ts"
+        ]
+      },
+      "notes": "Direct Files performance audit 2026-08-09, finding F9. pageListLabel disambiguates a row whose display name collides with another page (same title in different folders, or the same stem as .md and .org) by scanning the whole list twice - once for the name, once for the parent sub-path. The sidebar called it per rendered row, so rendering All Pages cost O(rows x pages): measured 21 ms at 5,000 pages and 39 ms at 20,000, for 300 visible rows. pageListLabels now counts both keys in ONE pass and returns a lookup, memoized in Sidebar alongside the existing filter+sort memo. The label RULE is unchanged and the three original correctness tests still pass verbatim. Necessity: the shape tests COUNT element reads through a Proxy rather than timing anything - a linear implementation reads the array once while building the index and never again, a per-row scan reads it once more per row - and both fail against the pre-fix implementation. A first attempt asserted wall-clock and was replaced after it flaked on a loaded box: 47 ms against a 26 ms ceiling with the fix in place. The index is keyed by value, not object identity, so a caller holding a copy of an entry gets the same label."
+    },
+    {
+      "id": "REG-STARTUP-UNWRITABLE-DATA-HOME-20260809",
+      "title": "Tine crashes at launch with a backtrace when the app-data home is not writable",
+      "family": "availability",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux"
+      ],
+      "layer": "tauri-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/data_home.rs"
+        ]
+      },
+      "notes": "Found while working the 2026-08-09 Direct Files audit backlog; reproduced on the stock deployed release binary, so not a regression from that work. Tauri creates the WebView user-data directory ($XDG_DATA_HOME/page.tine.Tine) inside its OWN setup(), while building the configured windows (tauri::manager::webview calls create_dir_all there), and an IO error at that point is unreachable by the application: it panics with 'Failed to setup app: Permission denied (os error 13)' at tauri-2.11.2/src/app.rs:1417, before Tine's setup hook runs. A user whose ~/.local/share is root-owned - the shape of the box this was found on, drwxr-xr-t root root - therefore got a hard crash with a backtrace and no actionable message, made more confusing by Tine's own desktop-identity step logging the same Permission denied and explicitly treating it as NON-fatal one line earlier. data_home::ensure_usable now probes the directory before anything resolves it (create_dir_all is not the question: it succeeds on an existing directory nobody may write) and, when it is unusable, points XDG_DATA_HOME at the first writable fallback for that launch - ~/.tine-data, then $XDG_RUNTIME_DIR/tine-data, then a uid-namespaced temp dir - so settings, session and the WebView store live somewhere real. XDG_DATA_HOME is the one lever that redirects Tauri's path resolver, WebKitGTK's website-data manager and Tine's own settings together. The frontend toasts once, stickily, naming the directory, because a silent relocation is its own defect. If nothing at all is writable the app prints one actionable sentence and exits 1 rather than panicking. Verified on the built binary: unwritable base -> app stays up, ~/.tine-data/page.tine.Tine populated with tine-settings.json and the WebKit store, nothing written to the read-only base; ordinary writable base -> no relocation diagnostic at all and no probe residue."
+    },
+    {
+      "id": "REG-WATCH-RETRY-UNWATCHED-ROOT-20260809",
+      "title": "A graph whose watch() failed stays blind to external changes while another graph is watched",
+      "family": "external-change-reconciliation",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "tauri-app",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src-tauri/src/watcher.rs"
+        ]
+      },
+      "notes": "Direct Files data-safety audit 2026-08-09, finding 16, landed in its REACHABLE form only. The audit claimed an inotify watch() failure leaves the watcher permanently blind with no poll fallback; that is not what the code does. A failed root is never inserted into `watched` and is retried on the next cycle, and when EVERY root fails `watched` is empty, which takes the else branch and its bounded <=3 s recv_timeout - a working recovery loop. The reachable case is mixed: with two graphs open, the inotify branch blocks on rx.recv() until an event arrives from a root that IS watched, so a root the kernel refused is retried only when some other graph happens to change. inotify limits are per-user (fs.inotify.max_user_watches), so opening a second large graph is exactly how one root fails while the other is healthy, and on a quiet healthy graph the failing one stays invisible indefinitely. inotify_cycle_wait now bounds the wait to UNWATCHED_ROOT_RETRY (3 s, matching the poll branch ceiling) whenever a desired root is unwatched, and never delays a sooner scheduled retry. Coverage gaps stated in the tests themselves: they pin the wait policy, not a real kernel watch() failure (which needs privileges unavailable here) and not the call-site wiring, and they are a specification rather than fail-before evidence because the function is new."
+    },
+    {
+      "id": "REG-REFERENCED-NAMES-DIGEST-GATE-20260809",
+      "title": "Every typing lull shipped the whole reference-name inventory across IPC",
+      "family": "direct-files-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs",
+          "src/pages.inventory.test.ts"
+        ]
+      },
+      "notes": "Direct Files performance audit 2026-08-09, finding F7. The frontend's reference-name resource is keyed on dataRev, which a save bumps ~700 ms after every typing lull, so referenced_page_names ran and its result crossed IPC on every pause in typing: measured 15-23 ms and about 5,000 names at 5,225 files, with the JSON parse landing on the UI thread. The answer almost never changes, because typing inside a block rarely adds or removes a [[link]]. referenced_page_names now takes the digest of the set the caller already holds and omits the payload when it still matches, so the ordinary case is an integer. The digest is a commutative fold with the length mixed in: the memo's order comes from a HashMap, so a sequence-dependent hash would report a change on every rebuild and the gate would save nothing. NOT fixed here: the whole-graph recompute itself still runs once per cache generation, because computing the digest needs the names; making it incremental needs per-name reference counts in cache_upsert/cache_remove and is a separate packet. The frontend test pins the dangerous reading of an omitted payload - treating it as an empty set would erase every reference-only page from autocomplete and the namespace tree - and that the digest is actually presented back."
+    },
+    {
+      "id": "REG-SAVE-PORTABLE-ALIAS-SCAN-ASCII-20260809",
+      "title": "Every save case-folded and NFC-normalised every filename in the target's directory",
+      "family": "direct-files-performance",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/receipt.rs"
+        ]
+      },
+      "notes": "Direct Files performance audit 2026-08-09, finding F6. validate_graph_text_portable_aliases_path_local enumerates each path component's directory looking for case/NFC aliases of the target, and built a PortablePathKey for EVERY entry - a String allocation plus NFD -> default case fold -> NFC per filename. The audit's controlled experiment held graph size constant and varied only layout: 4.87 ms/save with 4,000 pages in one directory versus 0.70 ms with 40 per subdirectory, i.e. 6.9x on layout alone, growing without bound on the one directory that only ever grows (journals/) and running inside the identity-mutation lock. PortablePathKey::graph_text_components_match answers the same question without building either key when both sides are ASCII, where NFD/NFC are the identity and default case folding is exactly ASCII lowercasing. Controlled A/B on this box, same graph and build, 4,000 pages in one directory, 60 saves x 3 runs: 2.54-2.67 ms median before, 1.39-1.41 ms after (~1.8x). The both-sides-ASCII guard is load-bearing rather than redundant: folding can PRODUCE ASCII from non-ASCII (U+212A KELVIN SIGN folds to k, U+FB01 to fi), so a non-ASCII name can legitimately collide with an ASCII one and must still take the full fold. This is an identity boundary whose failure mode is admitting a collision, so the test asserts agreement with the full fold over every ordered pair of a name set that includes NFC/NFD twins, the sharp s, Cyrillic, and both fold-to-ASCII traps. Residual NOT fixed: the directory enumeration is still O(entries); removing that needs the maintained admission index to become the authority for this check, which is a data-safety boundary change and its own packet."
+    },
+    {
+      "id": "REG-CONFLICT-OVERRIDE-NAMES-ITS-OBSERVATION-GH254",
+      "title": "A duplicated \"Keep mine\" spent authority minted for a newer winner nobody was shown",
+      "family": "direct-save-fidelity",
+      "sources": {
+        "issues": [
+          254
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos",
+        "android"
+      ],
+      "layer": "tine-core",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs",
+          "src/persistence.ts"
+        ]
+      },
+      "notes": "GH #254 increment 2, adversarial implementation verification finding 1 (CRITICAL) and the reachable half of finding 2. A force request named its authority only by path plus loaded revision, so consume_conflict_authority could only check SELF-consistency - that the live token is the newest - never that the user had seen it. Reachable data loss with no malicious writer: an external editor or sync client publishes B after the banner showed A; two force requests are in flight under that one banner (the button is not disabled while its request is pending) and the per-page save queue serializes them; the first correctly refuses B and, being a coherent observation, mints fresh authority FOR B; the second, issued before B existed, consumed it and overwrote B. A conflict error now carries the observation epoch it minted at, direct_save_error_message emits it as 'conflict:<n>', the frontend stores it with the banner and echoes it back on force, and consumption requires the presented epoch to equal the live token's. Found while fixing: checking ownership AFTER taking would let one stray duplicate click disarm the banner permanently, so a mis-addressed override is now refused WITHOUT spending the live token - covered by its own test. A force that can name no observation is refused at the command boundary rather than allowed to consume whatever is current. Necessity: all three new core tests fail against the pre-fix check."
     }
   ]
 }

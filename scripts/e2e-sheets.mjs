@@ -9,6 +9,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureDisplay } from "./lib/e2e-display.mjs";
+
+await ensureDisplay();
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const G = "/tmp/sheets-e2e";

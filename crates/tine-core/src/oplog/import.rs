@@ -457,6 +457,34 @@ impl InactiveBootstrapPreparedPublication {
             )?,
         })
     }
+
+    pub(crate) fn open_part_object_pack(
+        &self,
+        ordinal: u32,
+    ) -> Result<(File, u64), BootstrapStreamingImportError> {
+        if ordinal >= self.aggregate.parts().len() as u32 {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "bootstrap part ordinal is outside the sealed aggregate".into(),
+            ));
+        }
+        let path = self
+            .sealed_directory
+            .join(BOOTSTRAP_STREAM_PARTS)
+            .join(format!("{ordinal:08}"))
+            .join(BOOTSTRAP_STREAM_PART_OBJECTS);
+        let file = File::open(path)?;
+        let length = file.metadata()?.len();
+        let maximum = MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART
+            + 4 * u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART);
+        if length > maximum {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "sealed bootstrap part object pack bytes",
+                observed: length,
+                limit: maximum,
+            });
+        }
+        Ok((file, length))
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1046,32 +1074,18 @@ fn publish_inactive_bootstrap_prefix(
         publication.publish_source_blob_page(aggregate.source_blob_root(), &page)?;
         instrumentation.source_blob_pages += 1;
     }
-    let mut chunks = prepared.source_capture.chunks_cursor()?;
-    while let Some(chunk) = chunks.next()? {
-        let mut reader = prepared.source_capture.open_chunk(&chunk)?;
-        let capacity = usize::try_from(chunk.description().byte_length()).map_err(|_| {
-            invalid_bootstrap_orchestration("source chunk byte length cannot be represented")
-        })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        reader.read_to_end(&mut bytes)?;
-        reader.finish()?;
-        publication.publish_source_chunk(
-            SourceBlobChunkDigestV1::from_bytes(*chunk.description().sha256()),
-            &bytes,
-        )?;
-        instrumentation.source_chunks += 1;
-        instrumentation.peak_owned_source_chunks = 1;
-    }
     inactive_bootstrap_orchestration_cut(
         InactiveBootstrapOrchestrationCut::AfterSourcePublication,
     )?;
 
     for (ordinal, descriptor) in aggregate.parts().iter().copied().enumerate() {
-        let mut part = prepared.open_part(ordinal as u32)?;
-        while let Some(bytes) = part.next_object_bytes()? {
-            publication.publish_object_bytes(&bytes)?;
-            instrumentation.objects += 1;
-        }
+        let (mut object_pack, object_pack_length) =
+            prepared.open_part_object_pack(ordinal as u32)?;
+        publication.publish_part_pack(descriptor, &mut object_pack, object_pack_length)?;
+        instrumentation.objects = instrumentation.objects.saturating_add(u64::from(
+            descriptor.evidence().payload_object_root().object_count(),
+        ));
+        let part = prepared.open_part(ordinal as u32)?;
         let spans = part.span_index()?;
         publication.publish_part_artifacts(descriptor, part.manifest_bytes(), &spans)?;
         instrumentation.parts += 1;
@@ -13473,6 +13487,15 @@ mod tests {
         )
         .unwrap();
         assert_verified_orchestration(&multi, &verified, multi_binding);
+        let bootstrap = archive.join("bootstrap-v1");
+        assert!(!bootstrap.join("source-chunks").exists());
+        assert!(!bootstrap.join("objects").exists());
+        assert_eq!(
+            fs::read_dir(bootstrap.join("part-object-packs"))
+                .unwrap()
+                .count(),
+            multi.aggregate().parts().len()
+        );
         assert_eq!(
             verified.instrumentation().cold_records,
             u64::from(verified.part_count())

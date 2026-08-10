@@ -279,13 +279,39 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
             .load_by_path("external/deep/Exact.markdown")
             .unwrap()
             .unwrap();
-        identity_bound.blocks[0].raw = "must not replace a new inode".into();
+        identity_bound.blocks[0].raw = "keep mine over a republished inode".into();
+        std::fs::write(&path, "- shown conflict\n").unwrap();
+        graph
+            .save_page(&identity_bound, identity_bound.rev.as_deref())
+            .unwrap_err();
+
+        // A syncer republishes the SAME bytes by temp+rename: new inode, state
+        // the user was shown unchanged. "Keep mine" must go through. Refusing
+        // would be stricter than an ordinary save, which treats a same-byte
+        // republication as the state it already has (GH #254 increment 2).
         let replacement = root.join("external/deep/.replacement.markdown");
-        std::fs::write(&replacement, "- external winner\n").unwrap();
+        std::fs::write(&replacement, "- shown conflict\n").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
+        graph.force_save_page(&identity_bound).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("keep mine over a republished inode"));
+
+        // A DIFFERENT-byte winner on a new inode is still refused, and the file
+        // is left exactly as that winner wrote it.
+        let mut second = graph
+            .load_by_path("external/deep/Exact.markdown")
+            .unwrap()
+            .unwrap();
+        second.blocks[0].raw = "must not replace a different winner".into();
+        std::fs::write(&path, "- second shown conflict\n").unwrap();
+        graph.save_page(&second, second.rev.as_deref()).unwrap_err();
+        let foreign = root.join("external/deep/.foreign.markdown");
+        std::fs::write(&foreign, "- different winner\n").unwrap();
+        std::fs::rename(&foreign, &path).unwrap();
         let before = std::fs::read(&path).unwrap();
         assert_eq!(
-            graph.force_save_page(&identity_bound).unwrap_err().kind(),
+            graph.force_save_page(&second).unwrap_err().kind(),
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -3219,9 +3245,8 @@ mod page_inventory_survives_a_content_save {
 /// frontend classifies as transient and retries forever, so the page silently
 /// stopped saving. Direct Files data-safety audit, 2026-08-09, finding 2.
 ///
-/// This covers only the ORDINARY save half, which the contract verifier
-/// certified as an independently safe increment. Force-save ("Keep mine") and
-/// the trusted journal projection are deliberately untouched.
+/// Increment 2 adds one-shot exact-snapshot authority to the conflict half;
+/// trusted journal projection remains deliberately separate.
 mod external_atomic_replacement {
     use super::*;
 
@@ -3309,7 +3334,11 @@ mod external_atomic_replacement {
 
         page.blocks[0].raw = "mine".into();
         let error = graph.save_page(&page, base.as_deref()).unwrap_err();
-        assert_eq!(error.to_string(), "conflict", "must be the resolvable code");
+        assert_eq!(
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_present",
+            "must be a resolvable minted-authority code"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("pages/Note.md")).unwrap(),
             "- from another device\n",
@@ -3330,27 +3359,18 @@ mod external_atomic_replacement {
         std::fs::write(root.join("pages/Note.md"), "- edited in place\n").unwrap();
 
         page.blocks[0].raw = "mine".into();
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
         assert_eq!(
-            graph
-                .save_page(&page, base.as_deref())
-                .unwrap_err()
-                .to_string(),
-            "conflict"
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_present"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Necessity guard: an externally DELETED target must still refuse rather
-    /// than silently resurrecting the page.
-    ///
-    /// It refuses, but NOT with the resolvable `conflict` code — it fails
-    /// earlier, in the name-only-creation identity check. Verified to be
-    /// identical before and after this change, so it is pre-existing and out of
-    /// scope here. Closing it properly needs the absent-target override
-    /// authority the contract verifier called blocker A, which belongs to the
-    /// GH #254 project. Asserted as-is so a future change to it is deliberate.
+    /// An external deletion is a resolvable `Absent` conflict. It must not be
+    /// resurrected until the user explicitly chooses Keep mine.
     #[test]
-    fn an_external_delete_still_refuses_without_resurrecting() {
+    fn an_external_delete_mints_absent_authority_without_resurrecting() {
         let root = scratch("deleted");
         let (graph, mut page) = open_with(&root, "- original\n");
         let base = page.rev.clone();
@@ -3358,19 +3378,19 @@ mod external_atomic_replacement {
         std::fs::remove_file(root.join("pages/Note.md")).unwrap();
 
         page.blocks[0].raw = "mine".into();
-        let error = graph
-            .save_page(&page, base.as_deref())
-            .unwrap_err()
-            .to_string();
-        assert_ne!(error, "", "the save must refuse");
+        let error = graph.save_page(&page, base.as_deref()).unwrap_err();
+        assert_eq!(
+            tine_core::model::direct_save_failure_code(&error),
+            "conflict.save_baseline_absent"
+        );
         assert!(
             !root.join("pages/Note.md").exists(),
             "a deleted page must not be silently resurrected"
         );
-        assert_eq!(
-            error, "effective page identity evidence is stale or incomplete for name-only creation",
-            "pre-existing refusal code; see the doc comment before changing this"
-        );
+        graph.force_save_page(&page).unwrap();
+        assert!(std::fs::read_to_string(root.join("pages/Note.md"))
+            .unwrap()
+            .contains("mine"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -3437,5 +3457,94 @@ mod unlinked_references_see_code_blocks {
             "the link is still linked"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Direct Files data-safety audit, finding 15. Two shadow-journal classifiers
+/// disagreed: the managed one asked every Logseq text extension, the direct one
+/// hard-coded `.md`/`.org`, though `.markdown` is first-class
+/// (`LOGSEQ_TEXT_EXTENSIONS`, and OG accepts it case-insensitively).
+///
+/// NOT a regression proof, and deliberately labelled as such: these three pass
+/// with and without the unification. The audit predicted that a `.markdown`
+/// canonical day would let a title-named leftover poison the (kind, name) cache,
+/// and it does not — `load_named` and `journals_desc` both still serve the
+/// canonical file, because later layers happen to mask the misclassification. So
+/// the divergence is real in the code and its predicted consequence is not
+/// reachable today. What these DO pin is the #21 rule itself, at the observation
+/// boundary, for every extension: whichever layer is currently masking it can
+/// move without silently taking the guarantee with it.
+mod shadow_journal_sees_every_text_extension {
+    use super::*;
+
+    fn graph_with_canonical(extension: &str) -> (std::path::PathBuf, Graph) {
+        let root = std::env::temp_dir().join(format!(
+            "tine-ds15-shadow-{}-{extension}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::create_dir_all(root.join("journals")).unwrap();
+        // The canonical day, under a date-stem filename.
+        std::fs::write(
+            root.join(format!("journals/2026_06_26.{extension}")),
+            "- the canonical day\n",
+        )
+        .unwrap();
+        // …and a leftover whose NAME parses as that same day. Nothing on disk
+        // says which is authoritative, so the date-stem file wins by rule and
+        // this one must stay out of the (kind, name) cache.
+        std::fs::write(
+            root.join("pages/leftover.md"),
+            "title:: Jun 26th, 2026\n- the shadow's own text\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        (root, graph)
+    }
+
+    fn day_resolves_to_the_canonical_file(extension: &str) {
+        let (root, graph) = graph_with_canonical(extension);
+        // Reading the leftover by PATH is the ordinary way it gets seen: opening
+        // the stray file, or a watcher event on it. That read reconciles the
+        // parsed document into the (kind, name) cache unless the shadow rule
+        // stops it — which is where the two classifiers disagreed.
+        let leftover = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.rel_path == "pages/leftover.md")
+            .expect("the leftover is discovered");
+        let _ = graph.load_page(&leftover);
+
+        let loaded = graph
+            .load_named("Jun 26th, 2026", tine_core::PageKind::Journal)
+            .expect("load_named succeeds")
+            .expect("the day resolves to something");
+        let text = format!("{loaded:?}");
+        assert!(
+            text.contains("the canonical day"),
+            ".{extension}: the day resolved to the shadow instead of the canonical file"
+        );
+        assert!(
+            !text.contains("the shadow's own text"),
+            ".{extension}: the shadow leaked into the day's content"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_md_canonical_day_shadows_a_title_named_leftover() {
+        day_resolves_to_the_canonical_file("md");
+    }
+
+    #[test]
+    fn a_markdown_canonical_day_shadows_it_too() {
+        day_resolves_to_the_canonical_file("markdown");
+    }
+
+    #[test]
+    fn an_org_canonical_day_shadows_it_too() {
+        day_resolves_to_the_canonical_file("org");
     }
 }

@@ -390,8 +390,13 @@ pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>
 }
 
 #[tauri::command]
-pub(crate) fn referenced_page_names(state: GraphContext<'_>) -> Result<Vec<String>, String> {
-    with_read_graph(&state, |g| Ok(g.referenced_page_names()))
+pub(crate) fn referenced_page_names(
+    known_digest: Option<u64>,
+    state: GraphContext<'_>,
+) -> Result<tine_core::ReferencedPageNames, String> {
+    with_read_graph(&state, |g| {
+        Ok(g.referenced_page_names_versioned(known_digest))
+    })
 }
 
 #[derive(Serialize)]
@@ -813,7 +818,17 @@ fn direct_save_error_message(error: std::io::Error) -> String {
     // the prefix keeps that set open to new named conflicts without this arm
     // silently widening to cover unclassified failures.
     if code.starts_with("conflict.") {
-        return "conflict".to_string();
+        // The observation epoch rides with the banner so "Keep mine" can name
+        // the conflict the user actually saw. Without it a second, already-issued
+        // force request consumes authority minted for a NEWER unseen winner and
+        // overwrites it (GH #254 increment 2, implementation verification,
+        // finding 1). A conflict that somehow carries no epoch stays the bare
+        // literal, and the frontend then has nothing to present, so its force is
+        // refused rather than silently allowed.
+        return match tine_core::model::direct_save_conflict_epoch(&error) {
+            Some(epoch) => format!("conflict:{epoch}"),
+            None => "conflict".to_string(),
+        };
     }
     format!("{code}: {error}")
 }
@@ -868,6 +883,11 @@ pub(crate) async fn save_page(
     page: PageDto,
     base_rev: Option<String>,
     force: Option<bool>,
+    // Which conflict observation a forced save is answering. Required for a
+    // force; a request that cannot name one is refused rather than allowed to
+    // consume whatever authority happens to be current (GH #254 increment 2,
+    // adversarial implementation verification, finding 1).
+    conflict_epoch: Option<u64>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -907,7 +927,17 @@ pub(crate) async fn save_page(
                     // the moment it is needed.
                     let started = Instant::now();
                     let result = if force.unwrap_or(false) {
-                        graph.force_save_page(&page)
+                        match conflict_epoch {
+                            Some(observation_epoch) => graph.force_save_page_at_revision(
+                                &page,
+                                base_rev.as_deref(),
+                                tine_core::ConflictOverride { observation_epoch },
+                            ),
+                            None => Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "conflict override authority is missing or already consumed",
+                            )),
+                        }
                     } else {
                         graph.save_page(&page, base_rev.as_deref())
                     };
@@ -3138,5 +3168,37 @@ mod direct_save_error_tests {
             )),
             "conflict"
         );
+    }
+
+    #[test]
+    fn every_minted_site_and_no_tokenless_site_reaches_the_banner() {
+        for message in [
+            "editor conflict: save baseline present",
+            "editor conflict: save baseline absent",
+            "editor conflict: commit recheck",
+            "editor conflict: replace pre-retirement",
+            "editor conflict: retired mismatch",
+            "editor conflict: publication collision",
+            "editor conflict: create publication collision",
+            "editor conflict: final reread absent",
+            "editor conflict: final reread present",
+            "editor conflict: post-publication validation",
+        ] {
+            assert_eq!(
+                direct_save_error_message(io::Error::new(io::ErrorKind::AlreadyExists, message,)),
+                "conflict",
+                "minted authority at {message} must reach the two-arm banner"
+            );
+        }
+        for message in [
+            "tokenless editor conflict: commit recheck: continued churn",
+            "tokenless editor conflict: replace pre-retirement: transient I/O",
+            "tokenless editor conflict: final reread present: transient I/O",
+        ] {
+            let reported =
+                direct_save_error_message(io::Error::new(io::ErrorKind::WouldBlock, message));
+            assert!(reported.starts_with("conflict_retry."), "{reported}");
+            assert_ne!(reported, "conflict");
+        }
     }
 }

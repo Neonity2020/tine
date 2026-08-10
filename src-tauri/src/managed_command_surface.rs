@@ -50,6 +50,7 @@ use ManagedRouting::{ConfigWrite, LegacyOnly, ManagedRouted, NoGraphSlot, ReadOn
 const SCANNED_SOURCES: &[(&str, &str)] = &[
     ("backup.rs", include_str!("backup.rs")),
     ("commands.rs", include_str!("commands.rs")),
+    ("data_home.rs", include_str!("data_home.rs")),
     ("debug.rs", include_str!("debug.rs")),
     ("graph.rs", include_str!("graph.rs")),
     ("lib.rs", include_str!("lib.rs")),
@@ -107,6 +108,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("edit_asset_external", ReadOnly),
     ("empty_asset_trash", TrashWrite),
     ("enable_managed_sync", LegacyOnly),
+    ("existing_page_names", ReadOnly),
     ("export_query_subtrees", ReadOnly),
     ("forget_known_graph", NoGraphSlot),
     ("get_app_bool", NoGraphSlot),
@@ -212,6 +214,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("store_plugin_registry_cache", NoGraphSlot),
     ("stream_asset_path", LegacyOnly),
     ("sync_conflict_diff", ReadOnly),
+    ("take_data_home_fallback_notice", NoGraphSlot),
     ("take_identifier_migration_notice", NoGraphSlot),
     ("tine_open_devtools", NoGraphSlot),
     ("tine_quit", NoGraphSlot),
