@@ -5227,11 +5227,11 @@ impl Graph {
     /// `logseq/.tine-trash` sits beside `assets`, `publish` and `.tine-sync` in
     /// `graph_text_scope::fixed_excluded`, so nothing under it is ever scanned,
     /// imported or projected: it is outside the oplog's document domain exactly
-    /// the way `assets/` is. Only the *destination* is covered here. Page,
-    /// journal and conflict trashing still passes through
-    /// [`Graph::admit_managed_text_writer`] because its **source** is graph
-    /// text; this capability restores the asset-side trash writes that were
-    /// refused only incidentally.
+    /// the way `assets/` is. Only the *destination* is covered here. Page and
+    /// journal trashing still passes through [`Graph::admit_managed_text_writer`]
+    /// because their sources are graph text. A recognized sync-conflict copy is
+    /// excluded from the document domain too, so its explicit discard path uses
+    /// this point capability just like an asset does.
     fn ensure_trash_write_target(&self, target: &Path) -> io::Result<()> {
         let trash = trash_root(&self.root);
         if target != trash && !target.starts_with(&trash) {
@@ -11677,7 +11677,7 @@ impl Graph {
                     .map_err(crdt_io_error)?
             };
             if known {
-                self.trash_sync_conflict_with_permit(&write, &conflict.path)?;
+                self.trash_sync_conflict(&conflict.path)?;
                 changed = true;
             }
         }
@@ -12901,31 +12901,29 @@ impl Graph {
     /// that the target actually IS a conflict copy so this can never trash a real
     /// page. Recoverable in `logseq/.tine-trash` (ADR 0007).
     pub fn trash_sync_conflict(&self, conflict_rel: &str) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
-        self.trash_sync_conflict_with_permit(&write, conflict_rel)
-    }
-
-    fn trash_sync_conflict_with_permit(
-        &self,
-        write: &ManagedTextWritePermit,
-        conflict_rel: &str,
-    ) -> io::Result<()> {
         let conf = self
-            .resolve_managed_rel(write, conflict_rel)?
+            .resolve_configured_rel_lexical(conflict_rel)
             .ok_or_else(bad_path)?;
         if !path_is_sync_conflict(&conf) {
             return Err(bad_path()); // refuse anything that isn't a conflict copy
         }
-        if !self.managed_exists(write, &conf)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no such conflict file",
-            ));
+        self.ensure_within_graph_root(&conf)?;
+        match fs::symlink_metadata(&conf) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Err(bad_path()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no such conflict file",
+                ))
+            }
+            Err(error) => return Err(error),
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+        self.ensure_trash_write_target(&trash)?;
         let name = conf.file_name().and_then(|s| s.to_str()).unwrap_or("file");
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
-        self.managed_move_to_trash(write, &conf, &dest, &trash)
+        move_to_trash(&conf, &dest, &trash)
     }
 
     /// Raw contents of ONE journal file (by exact filename) — lets the UI show a
@@ -34904,13 +34902,17 @@ mod tests {
     /// `graph_text_scope::fixed_excluded`, so nothing under it is scanned,
     /// imported or projected. Trashing an orphaned asset is an asset-side write
     /// into that tree and must stay available under managed storage; trashing a
-    /// journal file is a graph-text deletion and must not.
+    /// recognized sync-conflict copy is likewise outside graph discovery and can
+    /// be discarded into that tree; trashing a journal file is a graph-text
+    /// deletion and must not.
     #[test]
     fn a_derived_read_only_graph_trashes_assets_but_not_journals() {
         let dir = scratch("derived-read-only-trash");
         fs::create_dir_all(dir.join("assets")).unwrap();
         fs::write(dir.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         fs::write(dir.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
+        let conflict = "Alpha.sync-conflict-20260810-120000-DEVICE.md";
+        fs::write(dir.join("pages").join(conflict), "- conflict evidence\n").unwrap();
 
         let view = Graph::open_derived_read_only(&dir);
 
@@ -34930,6 +34932,11 @@ mod tests {
             .empty_asset_trash()
             .expect("emptying the asset trash is an asset-side write");
         assert_eq!(removed, 1, "the emptied entry must be counted");
+
+        view.trash_sync_conflict(&format!("pages/{conflict}"))
+            .expect("a conflict copy is excluded from the graph-text domain");
+        assert!(!dir.join("pages").join(conflict).exists());
+        assert_eq!(view.asset_trash_stats().conflicts, 1);
 
         // A journal file is graph text. Its deletion belongs to the oplog and
         // stays refused at the single graph-text admission.
@@ -47507,7 +47514,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn handoff_blocks_omitted_journal_migration_and_conflict_trash_entrypoints() {
+    fn handoff_blocks_journal_migration_but_not_auxiliary_conflict_trash() {
         let dir = scratch("handoff-omitted-entrypoints");
         fs::create_dir_all(dir.join("logseq")).unwrap();
         fs::write(
@@ -47543,15 +47550,17 @@ mod tests {
 
         start.wait();
         assert_handoff_blocked(migration.join().unwrap());
-        assert_handoff_blocked(trash.join().unwrap());
+        trash.join().unwrap().unwrap();
         assert!(dir.join("journals").join(title_named).exists());
-        assert!(dir.join("pages").join(conflict).exists());
+        assert!(!dir.join("pages").join(conflict).exists());
+        assert_eq!(
+            trash_stats(&trash_root(&dir)).conflicts,
+            1,
+            "the conflict copy remains recoverable while graph-text authority is retired"
+        );
 
         drop(handoff);
         assert_eq!(graph.migrate_journal_filenames_checked().unwrap(), 1);
-        assert!(graph
-            .trash_sync_conflict(&format!("pages/{conflict}"))
-            .is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 

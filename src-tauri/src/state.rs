@@ -711,6 +711,8 @@ mod tests {
         std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::write(root.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         std::fs::write(root.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
+        let conflict = "Alpha.sync-conflict-20260810-120000-DEVICE.md";
+        std::fs::write(root.join("pages").join(conflict), "- peer copy\n").unwrap();
 
         assert!(slot.is_sparse_v2(), "fixture must be a managed binding");
 
@@ -737,6 +739,13 @@ mod tests {
         slot.with_trash_graph(|graph| graph.trash_asset("orphan.png").map_err(|e| e.to_string()))
             .expect("a managed binding must be able to trash an orphaned asset");
         assert!(!root.join("assets/orphan.png").exists());
+        slot.with_trash_graph(|graph| {
+            graph
+                .trash_sync_conflict(&format!("pages/{conflict}"))
+                .map_err(|error| error.to_string())
+        })
+        .expect("a managed binding must be able to trash excluded conflict evidence");
+        assert!(!root.join("pages").join(conflict).exists());
 
         // Graph text: still the oplog's, through every one of these routes.
         for (route, attempt) in [

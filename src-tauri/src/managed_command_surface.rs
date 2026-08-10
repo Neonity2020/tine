@@ -221,7 +221,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("tine_quit", NoGraphSlot),
     ("trash_asset", TrashWrite),
     ("trash_journal_file", LegacyOnly),
-    ("trash_sync_conflict", LegacyOnly),
+    ("trash_sync_conflict", TrashWrite),
     ("uninstall_plugin", NoGraphSlot),
     ("verify_plugin_registry", NoGraphSlot),
     ("warm_done", NoGraphSlot),
@@ -265,10 +265,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     ),
     (
         "trash_journal_file",
-        "graph-text deletion: oplog transaction",
-    ),
-    (
-        "trash_sync_conflict",
         "graph-text deletion: oplog transaction",
     ),
 ];
@@ -455,11 +451,11 @@ mod tests {
         }
     }
 
-    /// Settings and the orphaned-asset cleanup are the slice M5-A restored; if
+    /// Settings and excluded-source trash cleanup are the slice M5-A restored; if
     /// they ever go back onto the legacy authority the diff above would say so,
     /// but name them here too so the regression reads as a sentence.
     #[test]
-    fn settings_and_asset_trash_are_not_refused_under_managed_storage() {
+    fn settings_and_excluded_source_trash_are_not_refused_under_managed_storage() {
         let scanned = scanned_surface();
         for command in [
             "set_favorites",
@@ -480,7 +476,7 @@ mod tests {
                 "{command} must persist through the configuration capability"
             );
         }
-        for command in ["trash_asset", "empty_asset_trash"] {
+        for command in ["trash_asset", "empty_asset_trash", "trash_sync_conflict"] {
             assert_eq!(
                 scanned.get(command),
                 Some(&TrashWrite),

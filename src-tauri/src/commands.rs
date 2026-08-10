@@ -3324,7 +3324,7 @@ pub(crate) fn resolve_sync_conflict(
 /// trash). Refuses anything that isn't a conflict copy.
 #[tauri::command]
 pub(crate) fn trash_sync_conflict(conflict: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_trash_graph(&state, |g| {
         g.trash_sync_conflict(&conflict).map_err(|e| e.to_string())
     })
 }
