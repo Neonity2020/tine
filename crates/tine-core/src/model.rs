@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -1070,6 +1071,54 @@ pub(crate) enum JournalPageProjectionOutcome<A> {
     CommittedPending(CommittedPendingJournalPageProjection<A>),
 }
 
+/// The only failures possible while crossing the journal append boundary.
+///
+/// Validation failures occur before the append callback has been invoked.
+/// Callback failures are retained as their caller-defined type so the next
+/// layer can make an append-specific decision without recovering an error from
+/// a display string.
+#[derive(Debug)]
+pub(crate) enum JournalPageCommitError<E> {
+    Precommit(io::Error),
+    Append(E),
+}
+
+impl<E> JournalPageCommitError<E> {
+    #[allow(dead_code)] // Available to crate callers that need to inspect a pre-append failure.
+    pub(crate) const fn precommit(&self) -> Option<&io::Error> {
+        match self {
+            Self::Precommit(error) => Some(error),
+            Self::Append(_) => None,
+        }
+    }
+
+    #[allow(dead_code)] // Available to crate callers that need to inspect an append failure.
+    pub(crate) const fn append(&self) -> Option<&E> {
+        match self {
+            Self::Precommit(_) => None,
+            Self::Append(error) => Some(error),
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for JournalPageCommitError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Precommit(error) => error.fmt(formatter),
+            Self::Append(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for JournalPageCommitError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Precommit(error) => Some(error),
+            Self::Append(error) => Some(error),
+        }
+    }
+}
+
 #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 enum JournalPageProjectionRecovery {
     InProcess(JournalPageProjectionPlan),
@@ -1134,10 +1183,10 @@ struct JournalCommittedPageProjection<'a, A> {
 
 #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl<'a> VerifiedJournalPageProjection<'a> {
-    fn append<A>(
+    fn append<A, E>(
         self,
-        append: impl FnOnce() -> io::Result<A>,
-    ) -> io::Result<JournalCommittedPageProjection<'a, A>> {
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalCommittedPageProjection<'a, A>, E> {
         let append_proof = append()?;
         Ok(JournalCommittedPageProjection {
             graph: self.graph,
@@ -20658,55 +20707,66 @@ impl Graph {
     /// exact path lock remain held from validation through the append callback
     /// and graph publication.
     ///
-    /// Validation and append failures are ordinary precommit errors.  Once the
+    /// Validation failures are [`JournalPageCommitError::Precommit`], and an
+    /// append callback failure is [`JournalPageCommitError::Append`]. Once the
     /// callback returns its opaque durable proof, every later failure is returned
     /// as [`JournalPageProjectionOutcome::CommittedPending`] and must be retried
     /// with [`Graph::retry_committed_journal_page_projection`], never redrafted or
     /// appended again.
     #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
-    pub(crate) fn commit_existing_page_with_journal<A>(
+    pub(crate) fn commit_existing_page_with_journal<A, E>(
         &self,
         page: &PageDto,
         base_rev: &str,
         expected_base: &[u8],
         exact_target: &[u8],
-        append: impl FnOnce() -> io::Result<A>,
-    ) -> io::Result<JournalPageProjectionOutcome<A>> {
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
         #[cfg(test)]
         let validation_started = std::time::Instant::now();
         if page.guide {
-            return Err(io::Error::new(
+            return Err(JournalPageCommitError::Precommit(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "bundled Guide pages cannot be journal projected",
-            ));
+            )));
         }
         if page.path.is_empty() {
-            return Err(io::Error::new(
+            return Err(JournalPageCommitError::Precommit(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "journal projection supports only an existing exact page path",
-            ));
+            )));
         }
-        let write = self.admit_managed_text_writer()?;
-        let _identity = self.lock_graph_text_identity_mutation()?;
-        let (path, cache) = self.existing_journal_projection_target(&write, page)?;
+        let write = self
+            .admit_managed_text_writer()
+            .map_err(JournalPageCommitError::Precommit)?;
+        let _identity = self
+            .lock_graph_text_identity_mutation()
+            .map_err(JournalPageCommitError::Precommit)?;
+        let (path, cache) = self
+            .existing_journal_projection_target(&write, page)
+            .map_err(JournalPageCommitError::Precommit)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
-        let verified = self.verify_existing_journal_page_projection(
-            &write,
-            page,
-            base_rev,
-            expected_base,
-            exact_target,
-            path,
-            cache,
-        )?;
+        let verified = self
+            .verify_existing_journal_page_projection(
+                &write,
+                page,
+                base_rev,
+                expected_base,
+                exact_target,
+                path,
+                cache,
+            )
+            .map_err(JournalPageCommitError::Precommit)?;
         #[cfg(test)]
         crate::oplog::trusted_local_commit::note_trusted_local_graph_validation(
             validation_started.elapsed(),
         );
         #[cfg(test)]
         let append_started = std::time::Instant::now();
-        let committed = verified.append(append)?;
+        let committed = verified
+            .append(append)
+            .map_err(JournalPageCommitError::Append)?;
         #[cfg(test)]
         crate::oplog::trusted_local_commit::note_trusted_local_journal_append(
             append_started.elapsed(),
@@ -33242,7 +33302,14 @@ mod tests {
         fn commit<A>(
             &self,
             append: impl FnOnce() -> io::Result<A>,
-        ) -> io::Result<JournalPageProjectionOutcome<A>> {
+        ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<io::Error>> {
+            self.commit_with_error(append)
+        }
+
+        fn commit_with_error<A, E>(
+            &self,
+            append: impl FnOnce() -> Result<A, E>,
+        ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
             self.graph.commit_existing_page_with_journal(
                 &self.page,
                 &self.base_rev,
@@ -33410,7 +33477,7 @@ mod tests {
                 exact_target.as_bytes(),
                 || {
                     calls.set(calls.get() + 1);
-                    Ok("authenticated-layout-proof")
+                    Ok::<_, ()>("authenticated-layout-proof")
                 },
             )
             .unwrap();
@@ -33434,12 +33501,15 @@ mod tests {
                     exact_target.as_bytes(),
                     || {
                         calls.set(calls.get() + 1);
-                        Ok(())
+                        Ok::<(), ()>(())
                     },
                 )
                 .err()
                 .unwrap_or_else(|| panic!("{label} semantic mismatch committed"));
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            let precommit = error
+                .precommit()
+                .unwrap_or_else(|| panic!("{label} semantic mismatch was not precommit"));
+            assert_eq!(precommit.kind(), io::ErrorKind::InvalidData, "{label}");
             assert_eq!(calls.get(), 0, "{label}");
             assert_eq!(regular_file_tree(&fixture.root), before, "{label}");
             fixture.cleanup_root = false;
@@ -33510,12 +33580,15 @@ mod tests {
                 exact_target.as_bytes(),
                 || {
                     calls.set(calls.get() + 1);
-                    Ok(())
+                    Ok::<(), ()>(())
                 },
             )
             .err()
             .expect("Org layout-only difference must remain refused before append");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.precommit().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData)
+        );
         assert_eq!(calls.get(), 0);
         assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
     }
@@ -33535,13 +33608,16 @@ mod tests {
                     fixture.target.as_bytes(),
                     || {
                         calls.set(calls.get() + 1);
-                        Ok(())
+                        Ok::<(), ()>(())
                     },
                 )
                 .err()
                 .unwrap_or_else(|| panic!("{label} precommit conflict produced an outcome"));
+            let precommit = error
+                .precommit()
+                .unwrap_or_else(|| panic!("{label} error was not precommit"));
             assert!(matches!(
-                error.kind(),
+                precommit.kind(),
                 io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidInput
             ));
             assert_eq!(calls.get(), 0);
@@ -33651,7 +33727,12 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn journal_projection_append_error_is_same_precommit_error_and_changes_zero_bytes() {
+    fn journal_projection_append_error_preserves_non_io_type_and_changes_no_graph_bytes_or_cache() {
+        #[derive(Debug, Eq, PartialEq)]
+        enum AppendSentinel {
+            DurableAppendRejected,
+        }
+
         let fixture = JournalProjectionFixture::new(
             "journal-projection-append-error",
             "pages/Append.md",
@@ -33659,21 +33740,23 @@ mod tests {
             "target",
         );
         let before = regular_file_tree(&fixture.root);
+        let cache_before = fixture.graph.cache.read().unwrap().clone();
         let calls = Cell::new(0_usize);
         let error = fixture
-            .commit(|| {
+            .commit_with_error(|| {
                 calls.set(calls.get() + 1);
-                Err::<(), _>(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "durable append failed exactly",
-                ))
+                Err::<(), _>(AppendSentinel::DurableAppendRejected)
             })
             .err()
-            .expect("append error is precommit");
-        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-        assert_eq!(error.to_string(), "durable append failed exactly");
+            .expect("append error must cross the graph boundary");
+        assert_eq!(error.append(), Some(&AppendSentinel::DurableAppendRejected));
+        assert!(matches!(
+            error,
+            JournalPageCommitError::Append(AppendSentinel::DurableAppendRejected)
+        ));
         assert_eq!(calls.get(), 1);
         assert_eq!(regular_file_tree(&fixture.root), before);
+        assert_exact_budget_cache_unchanged(&fixture.graph, &cache_before);
     }
 
     #[cfg(any(unix, windows))]
@@ -34000,7 +34083,7 @@ mod tests {
                 b"- changed\n",
                 || {
                     calls.set(calls.get() + 1);
-                    Ok(())
+                    Ok::<(), ()>(())
                 },
             )
             .is_err());
@@ -34055,7 +34138,7 @@ mod tests {
                     &revision,
                     base.as_bytes(),
                     target.as_bytes(),
-                    || Ok(index),
+                    || Ok::<_, ()>(index),
                 )
                 .unwrap();
             let JournalPageProjectionOutcome::Durable(durable) = outcome else {

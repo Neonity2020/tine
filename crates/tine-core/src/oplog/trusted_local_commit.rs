@@ -18,7 +18,7 @@ use tine_storage::{LocalJournalAppend, LocalJournalSegment};
 
 use crate::model::{
     content_rev, CommittedPendingJournalPageProjection, DurableJournalPageProjection, Format,
-    JournalPageProjectionOutcome, JournalPageProjectionTarget,
+    JournalPageCommitError, JournalPageProjectionOutcome, JournalPageProjectionTarget,
 };
 use crate::{Graph, PageDto, PageKind};
 
@@ -126,6 +126,7 @@ pub(crate) enum TrustedLocalCommitError {
     InvalidPreparedInput(String),
     ManagedRecord(ManagedLocalRecordError),
     PrecommitGraph(io::Error),
+    JournalAppend(ManagedLocalRecordError),
 }
 
 impl fmt::Display for TrustedLocalCommitError {
@@ -134,6 +135,7 @@ impl fmt::Display for TrustedLocalCommitError {
             Self::InvalidPreparedInput(detail) => formatter.write_str(detail),
             Self::ManagedRecord(error) => error.fmt(formatter),
             Self::PrecommitGraph(error) => error.fmt(formatter),
+            Self::JournalAppend(error) => error.fmt(formatter),
         }
     }
 }
@@ -354,18 +356,21 @@ impl TrustedLocalCommitCoordinator {
 
         #[cfg(test)]
         let graph_started = Instant::now();
-        let graph_outcome = graph
-            .commit_existing_page_with_journal(
-                page,
-                base_revision,
-                expected_base,
-                exact_target,
-                || {
-                    append_managed_local_record(journal, &prepared)
-                        .map_err(|error| io::Error::other(error.to_string()))
-                },
-            )
-            .map_err(TrustedLocalCommitError::PrecommitGraph)?;
+        let graph_outcome = match graph.commit_existing_page_with_journal(
+            page,
+            base_revision,
+            expected_base,
+            exact_target,
+            || append_managed_local_record(journal, &prepared),
+        ) {
+            Ok(outcome) => outcome,
+            Err(JournalPageCommitError::Precommit(error)) => {
+                return Err(TrustedLocalCommitError::PrecommitGraph(error));
+            }
+            Err(JournalPageCommitError::Append(error)) => {
+                return Err(TrustedLocalCommitError::JournalAppend(error));
+            }
+        };
         #[cfg(test)]
         note_commit_stage(|timings| timings.graph_total = graph_started.elapsed());
         Ok(finish_committed_graph(engine, prepared, graph_outcome))
@@ -1029,7 +1034,9 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(TrustedLocalCommitError::PrecommitGraph(_))
+            Err(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalRecordError::WrongDurabilityProof
+            ))
         ));
         assert_eq!(wrong_journal.stats().frames_appended, 0);
         assert_eq!(

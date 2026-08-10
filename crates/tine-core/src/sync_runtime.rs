@@ -18297,6 +18297,9 @@ fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorReq
         TrustedLocalCommitError::PrecommitGraph(_) => {
             SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph
         }
+        TrustedLocalCommitError::JournalAppend(_) => {
+            SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph
+        }
     };
     SyncEditorRequestError::ActorRefusedWithCode(code)
 }
@@ -20177,6 +20180,12 @@ mod tests {
             ),
             (
                 TrustedLocalCommitError::PrecommitGraph(std::io::Error::other(nested)),
+                SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
+            ),
+            (
+                TrustedLocalCommitError::JournalAppend(
+                    crate::oplog::ManagedLocalRecordError::WrongDurabilityProof,
+                ),
                 SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
             ),
         ];
