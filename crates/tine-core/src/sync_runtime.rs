@@ -1964,6 +1964,32 @@ pub enum SyncApplicationUnitOutcome {
     Deferred { state: SyncEditorDeferred },
 }
 
+/// One application-owned graph-identity mutation.  Callers name only the
+/// user-visible target; the actor resolves durable page/block identities and
+/// constructs the bounded semantic transaction at its exact frontier.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mutation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationGraphMutationRequest {
+    RenamePage {
+        old: String,
+        new: String,
+        expected_path: Option<String>,
+    },
+    DeletePage {
+        name: String,
+        page_kind: SyncPageKind,
+        expected_path: Option<String>,
+    },
+    MergePages {
+        source_path: String,
+        destination_path: String,
+    },
+    RenameFileToPage {
+        path: String,
+        new_name: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SyncApplicationPdfOpenOutcome {
@@ -3437,6 +3463,25 @@ impl SyncRuntimeHandle {
         validate_application_save_request(&request)?;
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::SaveApplicationPage {
+            request,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
+    /// Perform one page-identity mutation through the same actor and semantic
+    /// transaction authority as managed editor saves.
+    pub fn mutate_application_graph(
+        &self,
+        request: SyncApplicationGraphMutationRequest,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        validate_application_graph_mutation_request(&request)?;
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::MutateApplicationGraph {
             request,
             reply: reply_sender,
         })
@@ -5019,6 +5064,69 @@ fn validate_application_save_request(
     Ok(())
 }
 
+fn validate_application_graph_mutation_request(
+    request: &SyncApplicationGraphMutationRequest,
+) -> Result<(), SyncApplicationPageRequestError> {
+    let (names, paths): (Vec<&str>, Vec<&str>) = match request {
+        SyncApplicationGraphMutationRequest::RenamePage {
+            old,
+            new,
+            expected_path,
+        } => (
+            vec![old.as_str(), new.as_str()],
+            expected_path.as_deref().into_iter().collect(),
+        ),
+        SyncApplicationGraphMutationRequest::DeletePage {
+            name,
+            expected_path,
+            ..
+        } => (
+            vec![name.as_str()],
+            expected_path.as_deref().into_iter().collect(),
+        ),
+        SyncApplicationGraphMutationRequest::MergePages {
+            source_path,
+            destination_path,
+        } => (
+            Vec::new(),
+            vec![source_path.as_str(), destination_path.as_str()],
+        ),
+        SyncApplicationGraphMutationRequest::RenameFileToPage { path, new_name } => {
+            (vec![new_name.as_str()], vec![path.as_str()])
+        }
+    };
+    let text_bytes = names
+        .iter()
+        .chain(paths.iter())
+        .try_fold(0_usize, |total, value| total.checked_add(value.len()))
+        .unwrap_or(usize::MAX);
+    if text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES {
+        return Err(SyncApplicationPageRequestError::RequestTooLarge(
+            SyncEditorRequestSize {
+                text_bytes,
+                ..SyncEditorRequestSize::default()
+            },
+        ));
+    }
+    for name in names {
+        LogicalPageName::parse(name.to_owned()).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidName,
+            )
+        })?;
+    }
+    for path in paths {
+        if path.len() > MAX_LOCAL_MUTATION_PATH_BYTES
+            || ManagedPath::parse(path.to_owned()).is_err()
+        {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_application_page_bounds(
     page: &PageDto,
 ) -> Result<SyncEditorRequestSize, SyncApplicationPageRequestError> {
@@ -6297,6 +6405,10 @@ enum ActorRequest {
         reply:
             mpsc::Sender<Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError>>,
     },
+    MutateApplicationGraph {
+        request: SyncApplicationGraphMutationRequest,
+        reply: mpsc::Sender<Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError>>,
+    },
     WriteApplicationPdfViewState {
         pdf_filename: String,
         page: i64,
@@ -6490,6 +6602,11 @@ fn run_actor_loop(
                 note_application_save_stage(|timings| {
                     timings.actor_total = started.elapsed();
                 });
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::MutateApplicationGraph { request, reply } => {
+                let result = actor.mutate_application_graph(request);
                 let _ = reply.send(result);
                 false
             }
@@ -11054,6 +11171,367 @@ impl RuntimeActor {
             timings.application_outcome = outcome_started.elapsed();
         });
         outcome
+    }
+
+    fn mutate_application_graph(
+        &mut self,
+        request: SyncApplicationGraphMutationRequest,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationUnitOutcome::Deferred { state });
+        }
+        let transaction = match request {
+            SyncApplicationGraphMutationRequest::RenamePage {
+                old,
+                new,
+                expected_path,
+            } => self.plan_application_page_rename(&old, &new, expected_path.as_deref())?,
+            SyncApplicationGraphMutationRequest::DeletePage {
+                name,
+                page_kind,
+                expected_path,
+            } => self.plan_application_page_delete(&name, page_kind, expected_path.as_deref())?,
+            SyncApplicationGraphMutationRequest::MergePages {
+                source_path,
+                destination_path,
+            } => self.plan_application_page_merge(&source_path, &destination_path)?,
+            SyncApplicationGraphMutationRequest::RenameFileToPage { path, new_name } => {
+                self.plan_application_file_rescue(&path, &new_name)?
+            }
+        };
+        let Some(transaction) = transaction else {
+            return Ok(SyncApplicationUnitOutcome::Applied);
+        };
+        self.execute_application_unit_transaction(transaction)
+    }
+
+    fn plan_application_page_rename(
+        &self,
+        old: &str,
+        new: &str,
+        expected_path: Option<&str>,
+    ) -> Result<Option<OperationTransaction>, SyncApplicationPageRequestError> {
+        let old = old.trim();
+        let new = new.trim();
+        if old.is_empty() || crate::refs::same_page(old, new) {
+            return Ok(None);
+        }
+        let old_key = crate::refs::normalize(old);
+        let namespace_prefix = format!("{old_key}/");
+        let old_chars = old.chars().count();
+        let inventory = self.application_inventory_ready()?;
+        let primary = inventory
+            .iter()
+            .find(|entry| entry.kind == PageKind::Page && crate::refs::same_page(&entry.name, old));
+        if let Some(expected) = expected_path {
+            if primary.is_none_or(|entry| entry.rel_path != expected) {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "rename_stale_page_target",
+                ));
+            }
+        }
+
+        let mut selected = inventory
+            .iter()
+            .filter(|entry| entry.kind == PageKind::Page)
+            .filter_map(|entry| {
+                let key = crate::refs::normalize(&entry.name);
+                let primary = key == old_key;
+                (primary || key.starts_with(&namespace_prefix)).then(|| {
+                    let target_name = if primary {
+                        new.to_owned()
+                    } else {
+                        format!(
+                            "{new}{}",
+                            entry.name.chars().skip(old_chars).collect::<String>()
+                        )
+                    };
+                    (entry, target_name)
+                })
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Ok(None);
+        }
+
+        let selected_paths = selected
+            .iter()
+            .map(|(entry, _)| entry.rel_path.as_str())
+            .collect::<HashSet<_>>();
+        let mut target_names = HashSet::new();
+        let mut target_paths = HashSet::new();
+        let mut requests = Vec::with_capacity(selected.len());
+        for (entry, target_name) in selected.drain(..) {
+            let target_key = crate::refs::normalize(&target_name);
+            if !target_names.insert(target_key.clone())
+                || inventory.iter().any(|other| {
+                    !selected_paths.contains(other.rel_path.as_str())
+                        && other.kind == PageKind::Page
+                        && crate::refs::normalize(&other.name) == target_key
+                })
+            {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "rename_target_identity",
+                ));
+            }
+            let format = Format::from_path(Path::new(&entry.rel_path));
+            let target_path = self
+                .graph
+                .new_sparse_page_path_for_format(&target_name, PageKind::Page, format)
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("rename_target_path")
+                })?;
+            if !target_paths.insert(target_path.clone()) {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "rename_target_path",
+                ));
+            }
+            requests.push((
+                LogicalPageName::parse(entry.name.clone()).map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("rename_source_identity")
+                })?,
+                LogicalPageName::parse(target_name).map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("rename_target_identity")
+                })?,
+                target_path,
+            ));
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let store = runtime
+            .engine()
+            .archive_store()
+            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        let mut query = runtime
+            .database()
+            .frontier_reference_query(runtime.engine(), store)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("rename_query"))?;
+        let plan = query
+            .plan_page_renames(&requests)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("rename_plan"))?;
+        Ok(Some(plan.transaction().clone()))
+    }
+
+    fn plan_application_page_delete(
+        &self,
+        name: &str,
+        page_kind: SyncPageKind,
+        expected_path: Option<&str>,
+    ) -> Result<Option<OperationTransaction>, SyncApplicationPageRequestError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let page_id = match editor_name_state(runtime, &self.graph, name.to_owned(), page_kind)
+            .map_err(map_editor_application_error)?
+        {
+            EditorNameState::Exact(page_id) => page_id,
+            EditorNameState::Missing { .. } if expected_path.is_none() => return Ok(None),
+            EditorNameState::Missing { .. } => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "delete_stale_page_target",
+                ))
+            }
+            EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "delete_page_identity",
+                ))
+            }
+        };
+        let current = self.load_application_page_id_ready(page_id)?;
+        if expected_path.is_some_and(|path| current.page.path != path) {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "delete_stale_page_target",
+            ));
+        }
+        OperationTransaction::new(vec![SemanticOperation::DeletePage { page_id }])
+            .map(Some)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("delete_plan"))
+    }
+
+    fn plan_application_page_merge(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+    ) -> Result<Option<OperationTransaction>, SyncApplicationPageRequestError> {
+        if source_path == destination_path {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "merge_same_page",
+            ));
+        }
+        let source = match self.load_application_exact_ready(source_path)? {
+            ApplicationExactLoad::Loaded(current) => current,
+            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "merge_source_identity",
+                ))
+            }
+        };
+        let destination = match self.load_application_exact_ready(destination_path)? {
+            ApplicationExactLoad::Loaded(current) => current,
+            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "merge_destination_identity",
+                ))
+            }
+        };
+        if source.editor.page.page_id == destination.editor.page.page_id {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "merge_same_page",
+            ));
+        }
+        if source.page.format != destination.page.format {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "merge_format_mismatch",
+            ));
+        }
+        if source.page.read_only || destination.page.read_only {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "merge_read_only",
+            ));
+        }
+
+        let mut merged = destination.page.clone();
+        if merged.format == Format::Md {
+            merged.pre_block = merge_markdown_page_properties(
+                destination.page.pre_block.as_deref(),
+                source.page.pre_block.as_deref(),
+            );
+        }
+        let mut appended = source.page.blocks.clone();
+        relabel_application_blocks_for_merge(&mut appended, &mut 0);
+        merged.blocks.extend(appended);
+        let blocks = application_editor_blocks_existing(&merged, &destination)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("merge_block_identity"))?;
+        let request = SyncEditorSaveRequest {
+            target: SyncEditorSaveTarget::Existing {
+                page_id: destination.editor.page.page_id.to_string(),
+                revision: destination.revision.clone(),
+            },
+            preamble: merged.pre_block,
+            blocks,
+        };
+        validate_editor_save_request(&request).map_err(map_editor_application_error)?;
+        let resolved =
+            resolve_editor_block_ids(&request.blocks).map_err(map_editor_application_error)?;
+        let mut operations =
+            build_existing_editor_transaction(&destination.editor, &request, &resolved)
+                .map_err(map_editor_application_error)?
+                .map_or_else(Vec::new, |transaction| transaction.operations);
+        operations.push(SemanticOperation::DeletePage {
+            page_id: source.editor.page.page_id,
+        });
+        finish_editor_transaction(operations).map_err(map_editor_application_error)
+    }
+
+    fn plan_application_file_rescue(
+        &self,
+        path: &str,
+        new_name: &str,
+    ) -> Result<Option<OperationTransaction>, SyncApplicationPageRequestError> {
+        let current = match self.load_application_exact_ready(path)? {
+            ApplicationExactLoad::Loaded(current) => current,
+            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "file_rescue_source_identity",
+                ))
+            }
+        };
+        let new_name = LogicalPageName::parse(new_name.trim().to_owned()).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidName,
+            )
+        })?;
+        let target_path = self
+            .graph
+            .new_sparse_page_path_for_format(new_name.as_str(), PageKind::Page, current.page.format)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("file_rescue_target_path")
+            })?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        if let Some(owner) = runtime
+            .engine()
+            .current_page_for_logical_name(&new_name)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("file_rescue_target"))?
+        {
+            if owner != current.editor.page.page_id {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "file_rescue_target",
+                ));
+            }
+        }
+        match runtime
+            .engine()
+            .current_page_at_path(&target_path)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("file_rescue_target"))?
+        {
+            CurrentPageAtPath::Unowned | CurrentPageAtPath::Released(_) => {}
+            CurrentPageAtPath::ExactOwner(owner)
+                if owner.page_id() == current.editor.page.page_id => {}
+            CurrentPageAtPath::ExactOwner(_)
+            | CurrentPageAtPath::PortableCollision(_)
+            | CurrentPageAtPath::ReleasedPortableCollision(_) => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "file_rescue_target",
+                ))
+            }
+        }
+        if current.editor.page.name == new_name
+            && current.editor.page.path == target_path
+            && current.editor.page.kind == ManagedTextKind::Page
+        {
+            return Ok(None);
+        }
+        let mut operations = vec![SemanticOperation::RenamePagesAndRewriteReferrers {
+            page_changes: vec![crate::oplog::PageRename {
+                page_id: current.editor.page.page_id,
+                new_name,
+                new_path: target_path,
+            }],
+            block_rewrites: Vec::new(),
+            page_preamble_rewrites: Vec::new(),
+        }];
+        if current.editor.page.kind != ManagedTextKind::Page {
+            operations.push(SemanticOperation::SetPageKind {
+                page_id: current.editor.page.page_id,
+                kind: ManagedTextKind::Page,
+            });
+        }
+        finish_editor_transaction(operations).map_err(map_editor_application_error)
+    }
+
+    fn execute_application_unit_transaction(
+        &mut self,
+        transaction: OperationTransaction,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        match self.submit_local_mutation(transaction) {
+            SyncLocalMutationOutcome::Durable { .. } => Ok(SyncApplicationUnitOutcome::Applied),
+            outcome @ SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                batch_id: None, ..
+            }
+            | outcome @ SyncLocalMutationOutcome::Blocked { .. }
+            | outcome @ SyncLocalMutationOutcome::Revoked { .. } => {
+                Ok(SyncApplicationUnitOutcome::Deferred {
+                    state: editor_deferred_from_local(outcome),
+                })
+            }
+            SyncLocalMutationOutcome::RetryableRetainedRecovery {
+                batch_id: Some(batch_id),
+                phase,
+            } => match self.settle_application_publication(&batch_id.to_string(), phase)? {
+                ApplicationPublicationSettlement::Durable => {
+                    Ok(SyncApplicationUnitOutcome::Applied)
+                }
+                ApplicationPublicationSettlement::Deferred(state) => {
+                    Ok(SyncApplicationUnitOutcome::Deferred { state })
+                }
+            },
+        }
     }
 
     fn write_application_pdf_view_state(
@@ -17645,6 +18123,42 @@ fn application_editor_blocks_new(
         .collect())
 }
 
+fn merge_markdown_page_properties(
+    destination: Option<&str>,
+    source: Option<&str>,
+) -> Option<String> {
+    let mut merged = destination.unwrap_or_default().to_owned();
+    let destination_keys = merged
+        .lines()
+        .filter_map(|line| {
+            crate::doc::parse_property_line(line).map(|(key, _)| key.to_ascii_lowercase())
+        })
+        .collect::<HashSet<_>>();
+    let extra = source
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            crate::doc::parse_property_line(line)
+                .is_some_and(|(key, _)| !destination_keys.contains(&key.to_ascii_lowercase()))
+        })
+        .collect::<Vec<_>>();
+    if !extra.is_empty() {
+        if !merged.is_empty() && !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+        merged.push_str(&extra.join("\n"));
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
+fn relabel_application_blocks_for_merge(blocks: &mut [BlockDto], next: &mut usize) {
+    for block in blocks {
+        block.id = format!("merge-source-{}", *next);
+        *next = next.saturating_add(1);
+        relabel_application_blocks_for_merge(&mut block.children, next);
+    }
+}
+
 fn editor_name_state(
     runtime: &PromotedLocalRuntime,
     graph: &Graph,
@@ -21419,6 +21933,147 @@ mod tests {
         assert!(second.created_pages.is_empty());
         assert_eq!(second.skipped_pages.len(), first.created_pages.len());
         assert!(second.copied_assets.is_empty());
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn application_graph_mutations_are_atomic_and_namespace_complete() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-application-graph-mutations");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Area.md",
+            b"related:: [[Area/Child]]\n\n- root sees [[Area]] and [[Area/Child]]\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Area%2FChild.md",
+            b"parent:: [[Area]]\n\n- child sees [[Area/Child]] and [[Area]]\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Referrer.md",
+            b"- both [[Area]] and [[Area/Child]]\n",
+        );
+
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "Area".into(),
+                    new: "Domain".into(),
+                    expected_path: Some("content/nested pages/Area.md".into()),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (domain, _) = load_application_logical(&handle, "Domain", SyncPageKind::Page);
+        let (child, _) = load_application_logical(&handle, "Domain/Child", SyncPageKind::Page);
+        let (referrer, _) = load_application_logical(&handle, "Referrer", SyncPageKind::Page);
+        assert!(domain
+            .pre_block
+            .as_deref()
+            .unwrap()
+            .contains("[[Domain/Child]]"));
+        assert!(domain.blocks[0].raw.contains("[[Domain]]"));
+        assert!(domain.blocks[0].raw.contains("[[Domain/Child]]"));
+        assert!(child.pre_block.as_deref().unwrap().contains("[[Domain]]"));
+        assert!(child.blocks[0].raw.contains("[[Domain/Child]]"));
+        assert!(child.blocks[0].raw.contains("[[Domain]]"));
+        assert!(referrer.blocks[0].raw.contains("[[Domain]]"));
+        assert!(referrer.blocks[0].raw.contains("[[Domain/Child]]"));
+
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Merge Source.md",
+            b"alias:: Source Alias\nsource-only:: retained\n\n- source root\n  - source child\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Merge Destination.md",
+            b"alias:: Destination Alias\n\n- destination root\n",
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::MergePages {
+                    source_path: "content/nested pages/Merge Source.md".into(),
+                    destination_path: "content/nested pages/Merge Destination.md".into(),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (merged, _) =
+            load_application_logical(&handle, "Merge Destination", SyncPageKind::Page);
+        assert!(merged
+            .pre_block
+            .as_deref()
+            .unwrap()
+            .contains("alias:: Destination Alias"));
+        assert!(merged
+            .pre_block
+            .as_deref()
+            .unwrap()
+            .contains("source-only:: retained"));
+        assert_eq!(merged.blocks.len(), 2);
+        assert_eq!(merged.blocks[1].raw, "source root");
+        assert_eq!(merged.blocks[1].children[0].raw, "source child");
+        assert!(matches!(
+            handle
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: "content/nested pages/Merge Source.md".into(),
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Missing { .. }
+        ));
+
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Stray.md",
+            b"- unchanged rescue bytes\n",
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenameFileToPage {
+                    path: "content/nested pages/Stray.md".into(),
+                    new_name: "Rescued Page".into(),
+                },)
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (rescued, _) = load_application_logical(&handle, "Rescued Page", SyncPageKind::Page);
+        assert_eq!(rescued.blocks[0].raw, "unchanged rescue bytes");
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::DeletePage {
+                    name: "Rescued Page".into(),
+                    page_kind: SyncPageKind::Page,
+                    expected_path: Some(rescued.path),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        assert!(matches!(
+            handle
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::Logical {
+                        name: "Rescued Page".into(),
+                        page_kind: SyncPageKind::Page,
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Missing { .. }
+        ));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

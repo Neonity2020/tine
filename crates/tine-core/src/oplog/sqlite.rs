@@ -8521,56 +8521,98 @@ impl FrontierReferenceQuery<'_> {
         new_name: super::LogicalPageName,
         new_path: super::ManagedPath,
     ) -> Result<FrontierRenamePlan, ProjectionError> {
-        let target_page_id = self
-            .engine
-            .resolve_logical_page_name(old_name)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
-            .ok_or_else(|| {
-                ProjectionError::Materialization(
-                    "rename target has no authenticated exact page-name owner".into(),
-                )
-            })?;
-        let results = self.references_to_page_name_inner(
-            old_name,
-            super::MAX_MATERIALIZATION_QUERY_ROWS,
-            true,
-        )?;
-        let mut preamble_facts = BTreeMap::<PageId, Vec<super::PageNameReferenceFactV1>>::new();
+        self.plan_page_renames(&[(old_name.clone(), new_name, new_path)])
+    }
+
+    /// Build one atomic namespace-capable rename transaction. Every raw source
+    /// is rewritten once even when it refers to several renamed namespace
+    /// members, avoiding the lost-update bug of composing independent plans.
+    pub fn plan_page_renames(
+        &mut self,
+        requests: &[(
+            super::LogicalPageName,
+            super::LogicalPageName,
+            super::ManagedPath,
+        )],
+    ) -> Result<FrontierRenamePlan, ProjectionError> {
+        if requests.is_empty() {
+            return Err(ProjectionError::Materialization(
+                "rename request set is empty".into(),
+            ));
+        }
+        let mut page_changes = Vec::with_capacity(requests.len());
+        let mut primary_target_page_id = None;
+        let mut touched = BTreeSet::new();
+        let mut preamble_facts =
+            BTreeMap::<PageId, Vec<(super::PageNameReferenceFactV1, String)>>::new();
         let mut block_facts = BTreeMap::<
             (PageId, DocumentId, super::BlockId),
-            Vec<super::PageNameReferenceFactV1>,
+            Vec<(super::PageNameReferenceFactV1, String)>,
         >::new();
-        let mut touched = BTreeSet::from([target_page_id]);
-        for hit in &results.hits {
-            let ReferenceFactV1::PageName(fact) = &hit.fact else {
-                continue;
-            };
-            if matches!(
-                fact.kind,
-                super::PageReferenceKindV1::AliasDeclaration
-                    | super::PageReferenceKindV1::PropertyKeyPseudoPage
-            ) {
-                continue;
-            }
-            touched.insert(hit.source_page_id);
-            match fact.source {
-                ReferenceSourceLocatorV1::Preamble => {
-                    preamble_facts
-                        .entry(hit.source_page_id)
-                        .or_default()
-                        .push(fact.clone());
+        for (old_name, new_name, new_path) in requests {
+            let target_page_id = self
+                .engine
+                .resolve_logical_page_name(old_name)
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+                .ok_or_else(|| {
+                    ProjectionError::Materialization(
+                        "rename target has no authenticated exact page-name owner".into(),
+                    )
+                })?;
+            touched.insert(target_page_id);
+            primary_target_page_id.get_or_insert(target_page_id);
+            page_changes.push(super::PageRename {
+                page_id: target_page_id,
+                new_name: new_name.clone(),
+                new_path: new_path.clone(),
+            });
+            let results = self.references_to_page_name_inner(
+                old_name,
+                super::MAX_MATERIALIZATION_QUERY_ROWS,
+                true,
+            )?;
+            for hit in &results.hits {
+                let ReferenceFactV1::PageName(fact) = &hit.fact else {
+                    continue;
+                };
+                if matches!(
+                    fact.kind,
+                    super::PageReferenceKindV1::AliasDeclaration
+                        | super::PageReferenceKindV1::PropertyKeyPseudoPage
+                ) {
+                    continue;
                 }
-                ReferenceSourceLocatorV1::Block {
-                    block_id,
-                    home_document_id,
-                } => {
-                    block_facts
-                        .entry((hit.source_page_id, home_document_id, block_id))
-                        .or_default()
-                        .push(fact.clone());
+                touched.insert(hit.source_page_id);
+                let replacement = new_name.as_str().to_owned();
+                match fact.source {
+                    ReferenceSourceLocatorV1::Preamble => {
+                        preamble_facts
+                            .entry(hit.source_page_id)
+                            .or_default()
+                            .push((fact.clone(), replacement));
+                    }
+                    ReferenceSourceLocatorV1::Block {
+                        block_id,
+                        home_document_id,
+                    } => {
+                        block_facts
+                            .entry((hit.source_page_id, home_document_id, block_id))
+                            .or_default()
+                            .push((fact.clone(), replacement));
+                    }
                 }
             }
         }
+        page_changes.sort_unstable_by_key(|change| change.page_id);
+        if !page_changes
+            .windows(2)
+            .all(|pair| pair[0].page_id != pair[1].page_id)
+        {
+            return Err(ProjectionError::Materialization(
+                "rename request set names one page more than once".into(),
+            ));
+        }
+        let target_page_id = primary_target_page_id.expect("non-empty rename request set");
         let mut page_preamble_rewrites = Vec::new();
         let mut block_rewrites = Vec::new();
         for source_page_id in &touched {
@@ -8580,7 +8622,11 @@ impl FrontierReferenceQuery<'_> {
                 .materialize_page(*source_page_id)
                 .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
             if let Some(facts) = preamble_facts.get(source_page_id) {
-                verify_current_page_facts(&posting, facts)?;
+                let evidence = facts
+                    .iter()
+                    .map(|(fact, _)| fact.clone())
+                    .collect::<Vec<_>>();
+                verify_current_page_facts(&posting, &evidence)?;
                 let source = page.preamble.as_deref().ok_or_else(|| {
                     ProjectionError::Materialization(
                         "rename preamble candidate has no current source bytes".into(),
@@ -8588,14 +8634,18 @@ impl FrontierReferenceQuery<'_> {
                 })?;
                 page_preamble_rewrites.push(super::PagePreambleRewrite {
                     page_id: *source_page_id,
-                    new_preamble: Some(rewrite_raw_page_targets(source, facts, new_name.as_str())?),
+                    new_preamble: Some(rewrite_raw_page_targets_with_replacements(source, facts)?),
                 });
             }
             for ((page_id, home_document_id, block_id), facts) in block_facts
                 .iter()
                 .filter(|((page_id, _, _), _)| page_id == source_page_id)
             {
-                verify_current_page_facts(&posting, facts)?;
+                let evidence = facts
+                    .iter()
+                    .map(|(fact, _)| fact.clone())
+                    .collect::<Vec<_>>();
+                verify_current_page_facts(&posting, &evidence)?;
                 let block = page
                     .blocks
                     .iter()
@@ -8612,11 +8662,7 @@ impl FrontierReferenceQuery<'_> {
                         block_id: *block_id,
                         home_document_id: *home_document_id,
                     },
-                    new_content: rewrite_raw_page_targets(
-                        &block.content,
-                        facts,
-                        new_name.as_str(),
-                    )?,
+                    new_content: rewrite_raw_page_targets_with_replacements(&block.content, facts)?,
                 });
                 debug_assert_eq!(*page_id, *source_page_id);
             }
@@ -8627,11 +8673,7 @@ impl FrontierReferenceQuery<'_> {
         page_preamble_rewrites.sort_unstable_by_key(|rewrite| rewrite.page_id);
         let transaction = super::OperationTransaction::new(vec![
             super::SemanticOperation::RenamePagesAndRewriteReferrers {
-                page_changes: vec![super::PageRename {
-                    page_id: target_page_id,
-                    new_name,
-                    new_path,
-                }],
+                page_changes,
                 block_rewrites,
                 page_preamble_rewrites,
             },
@@ -8662,21 +8704,35 @@ fn verify_current_page_facts(
     Ok(())
 }
 
+#[cfg(test)]
 fn rewrite_raw_page_targets(
     source: &str,
     facts: &[super::PageNameReferenceFactV1],
     replacement: &str,
 ) -> Result<String, ProjectionError> {
+    let facts = facts
+        .iter()
+        .cloned()
+        .map(|fact| (fact, replacement.to_owned()))
+        .collect::<Vec<_>>();
+    rewrite_raw_page_targets_with_replacements(source, &facts)
+}
+
+fn rewrite_raw_page_targets_with_replacements(
+    source: &str,
+    facts: &[(super::PageNameReferenceFactV1, String)],
+) -> Result<String, ProjectionError> {
     let mut facts = facts.to_vec();
     facts.sort_unstable_by(|left, right| {
         right
+            .0
             .byte_start
-            .cmp(&left.byte_start)
-            .then_with(|| right.byte_end.cmp(&left.byte_end))
+            .cmp(&left.0.byte_start)
+            .then_with(|| right.0.byte_end.cmp(&left.0.byte_end))
     });
     let mut next_start = source.len();
     let mut rewritten = source.to_owned();
-    for fact in facts {
+    for (fact, replacement) in facts {
         let span_start = usize::try_from(fact.byte_start).map_err(|_| {
             ProjectionError::Materialization("reference source offset is invalid".into())
         })?;
@@ -8710,7 +8766,7 @@ fn rewrite_raw_page_targets(
         let end = start.checked_add(fact.raw_target.len()).ok_or_else(|| {
             ProjectionError::Materialization("reference source offset overflowed".into())
         })?;
-        rewritten.replace_range(start..end, replacement);
+        rewritten.replace_range(start..end, &replacement);
         next_start = span_start;
     }
     Ok(rewritten)

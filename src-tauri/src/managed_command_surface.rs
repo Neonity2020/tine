@@ -104,7 +104,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("debug_info", NoGraphSlot),
     ("debug_log", NoGraphSlot),
     ("default_graph_parent", NoGraphSlot),
-    ("delete_page", LegacyOnly),
+    ("delete_page", ManagedRouted),
     ("detect_media_editor", NoGraphSlot),
     ("edit_asset_external", Filesystem),
     ("empty_asset_trash", TrashWrite),
@@ -149,7 +149,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("load_workspaces", NoGraphSlot),
     ("managed_sync_identity_plan", LegacyOnly),
     ("managed_sync_status", LegacyOnly),
-    ("merge_pages", LegacyOnly),
+    ("merge_pages", ManagedRouted),
     ("open_asset", Filesystem),
     ("open_external", NoGraphSlot),
     ("open_graph_window", NoGraphSlot),
@@ -171,8 +171,8 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("read_plugin_entry", NoGraphSlot),
     ("read_text_file", NoGraphSlot),
     ("referenced_page_names", ManagedRouted),
-    ("rename_file_to_page", LegacyOnly),
-    ("rename_page", LegacyOnly),
+    ("rename_file_to_page", ManagedRouted),
+    ("rename_page", ManagedRouted),
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
     ("resolve_sync_conflict", LegacyOnly),
@@ -235,7 +235,6 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
 ///
 /// Each entry says what the command needs before it can come back.
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
-    ("delete_page", "multi-page mutation: oplog transaction"),
     (
         "enable_managed_sync",
         "legacy-only by construction: it is the migration into managed storage",
@@ -252,9 +251,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
         "managed_sync_status",
         "legacy-only by construction: reports the migration",
     ),
-    ("merge_pages", "multi-page mutation: oplog transaction"),
-    ("rename_file_to_page", "rename: oplog transaction"),
-    ("rename_page", "rename: oplog transaction"),
     (
         "resolve_sync_conflict",
         "rewrites graph text: oplog transaction",

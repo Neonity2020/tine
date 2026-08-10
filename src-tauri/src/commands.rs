@@ -16,12 +16,13 @@ use tine_core::model::{
     BacklinkFilterContext, BacklinkFilterTarget, BlockDto, PageDto, PageEntry, PageKind, RefGroup,
 };
 use tine_core::sync_runtime::{
-    SyncApplicationGuideCopyOutcome, SyncApplicationNavigationOutcome,
-    SyncApplicationNavigationReply, SyncApplicationNavigationRequest,
-    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
-    SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
-    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncApplicationPdfOpenOutcome,
-    SyncApplicationPublishOutcome, SyncApplicationUnitOutcome, SyncRuntimeHandle,
+    SyncApplicationGraphMutationRequest, SyncApplicationGuideCopyOutcome,
+    SyncApplicationNavigationOutcome, SyncApplicationNavigationReply,
+    SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
+    SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
+    SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
+    SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome, SyncApplicationUnitOutcome,
+    SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -275,6 +276,21 @@ fn sparse_application_handle(
         crate::sync_runtime::active_handle(slot).map(Some)
     } else {
         Ok(None)
+    }
+}
+
+fn map_managed_graph_mutation(
+    outcome: Result<
+        SyncApplicationUnitOutcome,
+        tine_core::sync_runtime::SyncApplicationPageRequestError,
+    >,
+) -> Result<(), String> {
+    match outcome.map_err(|error| error.to_string())? {
+        SyncApplicationUnitOutcome::Applied => Ok(()),
+        SyncApplicationUnitOutcome::Deferred { .. } => Err(
+            "Tine-managed storage is updating pages. Try the operation again when it finishes."
+                .into(),
+        ),
     }
 }
 
@@ -1311,11 +1327,23 @@ pub(crate) async fn delete_page(
     expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        graph
-            .delete_page_expected(&name, kind, expected_path.as_deref())
-            .map_err(|e| e.to_string())
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::DeletePage {
+                    name,
+                    page_kind: kind.into(),
+                    expected_path,
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .delete_page_expected(&name, kind, expected_path.as_deref())
+                .map_err(|e| e.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1328,11 +1356,23 @@ pub(crate) async fn rename_page(
     expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        graph
-            .rename_page_expected(&old, &new, expected_path.as_deref())
-            .map_err(|e| e.to_string())
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::RenamePage {
+                    old,
+                    new,
+                    expected_path,
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .rename_page_expected(&old, &new, expected_path.as_deref())
+                .map_err(|e| e.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1364,6 +1404,8 @@ mod graph_wide_command_boundary_tests {
             "write_pdf_view_state",
             "rename_page",
             "delete_page",
+            "merge_pages",
+            "rename_file_to_page",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("command stays async");
@@ -3634,24 +3676,56 @@ mod application_page_authority_tests {
 /// `src` (both graph-root-relative paths). The merged `dst` is written through the
 /// normal round-tripping save path (#21).
 #[tauri::command]
-pub(crate) fn merge_pages(src: String, dst: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.merge_pages(&src, &dst).map_err(|e| e.to_string())
+pub(crate) async fn merge_pages(
+    src: String,
+    dst: String,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::MergePages {
+                    source_path: src,
+                    destination_path: dst,
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .merge_pages(&src, &dst)
+                .map_err(|e| e.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Rescue a duplicate-day stray by moving it to a uniquely-named page
 /// (`pages/<new_name>`), so it stops colliding and becomes normally navigable (#21).
 #[tauri::command]
-pub(crate) fn rename_file_to_page(
+pub(crate) async fn rename_file_to_page(
     path: String,
     new_name: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.rename_file_to_page(&path, &new_name)
-            .map_err(|e| e.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::RenameFileToPage { path, new_name },
+            )),
+            None => slot
+                .legacy_graph()?
+                .rename_file_to_page(&path, &new_name)
+                .map_err(|e| e.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
