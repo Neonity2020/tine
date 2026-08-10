@@ -10003,8 +10003,31 @@ impl RuntimeActor {
                     if let Err(error) = self.collapse_drained_managed_local_overlay() {
                         return Some(SyncRuntimeTick::RecoveryBlocked(error));
                     }
-                    if let Err(error) = self.compact_drained_managed_local_journal() {
-                        return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                    match self.compact_drained_managed_local_journal() {
+                        Ok(true) => {
+                            // The compacted generation is a sparse, already
+                            // quiescent checkpoint. Refresh the disposable
+                            // crash-recovery accelerator here so unsafe reopen
+                            // cost is bounded by the suffix since the latest
+                            // compaction rather than by lifetime history.
+                            // Publication is deliberately best-effort: a
+                            // resume point grants no authority, and refusing
+                            // one must never turn an accepted save into a
+                            // failure.
+                            let authority = self
+                                .authority
+                                .as_ref()
+                                .expect("active actor retains local authority");
+                            let runtime = self
+                                .runtime
+                                .as_mut()
+                                .expect("active actor retains promoted runtime");
+                            let _ = runtime.publish_compaction_resume_point(authority, &self.graph);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return Some(SyncRuntimeTick::RecoveryBlocked(error));
+                        }
                     }
                 }
                 if let Err(error) = self.cleanup_managed_local_generations() {
@@ -32517,7 +32540,7 @@ mod tests {
     ) -> String {
         let engine = &promoted.engine;
         format!(
-            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={} projection_recovery={} projection_rebuild_reason={:?} projection_applied_batches={} projection_bulk_pages_materialized={} projection_ancestry_full_scans={}",
+            "total_ms={:.3} bootstrap_anchor_ms={:.3} enrollment_session_ms={:.3} promotion_state_ms={:.3} mint_ms={:.3} handoff_and_final_proof_ms={:.3} bootstrap_projection_ms={:.3} bootstrap_runtime_authority_ms={:.3} resume_candidate_ms={:.3} reconstructed_bootstrap_resume={} engine_open_ms={:.3} sqlite_open_ms={:.3} tail_construction_ms={:.3} engine_total_ms={:.3} engine_construction_ms={:.3} engine_resume_restore_ms={:.3} engine_bootstrap_part_recovery_ms={:.3} engine_bootstrap_parts={} engine_prepare_replay_ms={:.3} engine_predecessor_restore_ms={:.3} engine_bootstrap_replay_ms={:.3} engine_archived_tail_replay_ms={:.3} engine_finish_replay_ms={:.3} engine_archived_manifests_offered={} engine_archived_manifests_replayed={} projection_recovery={} projection_rebuild_reason={:?} projection_applied_batches={} projection_bulk_pages_materialized={} projection_ancestry_full_scans={}",
             startup_ms(promoted.total),
             startup_ms(promoted.bootstrap_anchor),
             startup_ms(promoted.enrollment_session),
@@ -32536,6 +32559,13 @@ mod tests {
             startup_ms(engine.resume_restore),
             startup_ms(engine.bootstrap_part_recovery),
             engine.bootstrap_parts_examined,
+            startup_ms(promoted.engine_stages.prepare_replay),
+            startup_ms(promoted.engine_stages.predecessor_restore),
+            startup_ms(promoted.engine_stages.bootstrap_part_replay),
+            startup_ms(promoted.engine_stages.archived_tail_replay),
+            startup_ms(promoted.engine_stages.finish_replay),
+            promoted.engine_stages.archived_manifests_offered,
+            promoted.engine_stages.archived_manifests_replayed,
             promoted.projection_recovery,
             promoted.projection_rebuild_reason,
             promoted.projection_applied_batches,
@@ -32888,6 +32918,20 @@ mod tests {
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
         let promoted = take_promoted_runtime_open_instrumentation(workspace_id);
+        let resume = reopened
+            .handle
+            .as_ref()
+            .and_then(|handle| handle.engine_instrumentation().ok())
+            .map(|instrumentation| instrumentation.resume)
+            .expect("reopened runtime reports its resume observation");
+        assert!(
+            resume.adopted,
+            "the compacted journal boundary must publish an adoptable crash-recovery point"
+        );
+        assert!(
+            resume.replayed_generations < 6,
+            "reopen replayed the complete six-generation aged suffix instead of the bounded post-compaction suffix: {resume:?}"
+        );
         assert_eq!(
             promoted.projection_recovery, "opened-existing",
             "a projection already at the accepted frontier was not opened as-is (reason: {})",
