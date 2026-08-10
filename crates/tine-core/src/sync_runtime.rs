@@ -141,6 +141,7 @@ use crate::oplog::sqlite::{
     reset_full_digest_scan_instrumentation, take_full_digest_scan_instrumentation,
     BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
 };
+use crate::oplog::sqlite_materialization::MaterializedTaskCandidateBlockRow;
 #[cfg(test)]
 use crate::oplog::trusted_local_commit::{
     last_commit_stage_timings, TrustedLocalCommitStageTimings,
@@ -396,6 +397,15 @@ struct ManagedApplicationSaveInstrumentation {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ManagedApplicationQueryInstrumentation {
+    sparse_attempts: usize,
+    sparse_completions: usize,
+    sparse_fallbacks: usize,
+    sparse_fallback_reason: Option<ManagedSparseTaskQueryFallback>,
+    sparse_candidate_rows: usize,
+    sparse_ancestor_rows: usize,
+    sparse_parser_rows: usize,
+    sparse_overlay_rows: usize,
+    sparse_dto_constructions: usize,
     full_inventory_passes: usize,
     inventory_pages: usize,
     result_page_hydrations: usize,
@@ -403,6 +413,19 @@ struct ManagedApplicationQueryInstrumentation {
     indexed_candidate_pages: usize,
     overlay_pages: usize,
     block_branches: usize,
+}
+
+/// A sparse result is authoritative only when every input and structural fact
+/// is complete.  These stable categories make test receipts distinguish a
+/// deliberate complete-page fallback from a successful sparse execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedSparseTaskQueryFallback {
+    OverlayIncomplete,
+    OverlayAuthority,
+    CandidateRead,
+    CandidateAuthority,
+    Structure,
+    Runner,
 }
 
 #[cfg(test)]
@@ -3807,6 +3830,42 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn force_managed_task_query_overlay_incomplete(
+        &self,
+        path: &str,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let path =
+            ManagedPath::parse(path).map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ForceManagedTaskQueryOverlayIncomplete {
+            path,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn force_managed_task_query_overlay_invalid_order(
+        &self,
+        path: &str,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let path =
+            ManagedPath::parse(path).map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ForceManagedTaskQueryOverlayInvalidOrder {
+            path,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn tick_provider_for_test(&self) -> Result<SyncRuntimeTick, SyncRuntimeRequestError> {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
@@ -6649,6 +6708,16 @@ enum ActorRequest {
         reply: mpsc::Sender<ManagedTaskQueryOverlaySnapshot>,
     },
     #[cfg(test)]
+    ForceManagedTaskQueryOverlayIncomplete {
+        path: ManagedPath,
+        reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
+    ForceManagedTaskQueryOverlayInvalidOrder {
+        path: ManagedPath,
+        reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
     TickProviderForTest {
         reply: mpsc::Sender<SyncRuntimeTick>,
     },
@@ -6951,6 +7020,18 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
+            ActorRequest::ForceManagedTaskQueryOverlayIncomplete { path, reply } => {
+                actor.force_managed_task_query_overlay_incomplete(&path);
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ForceManagedTaskQueryOverlayInvalidOrder { path, reply } => {
+                actor.force_managed_task_query_overlay_invalid_order(&path);
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
             ActorRequest::TickProviderForTest { reply } => {
                 if !actor.provider_has_work()
                     && actor.provider_accepted_manifest_revalidation_ready
@@ -7051,6 +7132,13 @@ struct LatestTaskQueryOverlayBlock {
     order: String,
     content: String,
     logseq_uuid: Option<LogseqUuid>,
+    // These are captured from the already parsed application DTO at the
+    // serialized save/recovery seam.  Q2 may enumerate marker candidates
+    // without reparsing every hot block just to rediscover task headers.
+    marker: Option<String>,
+    priority: Option<String>,
+    scheduled: Option<String>,
+    deadline: Option<String>,
 }
 
 /// Every locally newest projection frame has one entry.  An incomplete entry
@@ -7194,6 +7282,14 @@ fn latest_task_query_overlay_page_from_application(
                         order: materialized.order.clone(),
                         content: parsed_block.block.raw.clone(),
                         logseq_uuid: materialized.logseq_uuid,
+                        marker: parsed_block
+                            .block
+                            .marker
+                            .as_deref()
+                            .map(str::to_ascii_uppercase),
+                        priority: parsed_block.block.priority.clone(),
+                        scheduled: parsed_block.block.scheduled.clone(),
+                        deadline: parsed_block.block.deadline.clone(),
                     },
                 )
                 .is_some()
@@ -7243,6 +7339,207 @@ fn latest_task_query_overlay_after_recovery(
         path,
         state,
     }
+}
+
+/// One complete sparse input after the actor has proved the page identity and
+/// structural ancestry.  It deliberately contains no page DTO or outline.
+#[derive(Clone, Debug)]
+struct ManagedSparseTaskQueryCandidate {
+    block_id: BlockId,
+    page_id: PageId,
+    parent: Option<BlockId>,
+    order: String,
+    raw: String,
+    identity: String,
+    page: crate::query::ApplicationSparseQueryPage,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedSparseTaskQueryStructure {
+    page_id: PageId,
+    parent: Option<BlockId>,
+    order: String,
+}
+
+/// Joined SQLite page facts are already authenticated by the certified
+/// candidate read.  Cache them per page so a dense task page does one recency
+/// metadata lookup rather than one per candidate block.
+#[derive(Clone, Debug)]
+struct ManagedSparseTaskQueryPageFacts {
+    name: String,
+    path: ManagedPath,
+    kind: ManagedTextKind,
+    sparse_page: crate::query::ApplicationSparseQueryPage,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ManagedSparseTaskQueryMetrics {
+    candidate_rows: usize,
+    ancestor_rows: usize,
+    parser_rows: usize,
+    overlay_rows: usize,
+    dto_constructions: usize,
+}
+
+fn sparse_task_query_identity(block_id: BlockId, logseq_uuid: Option<LogseqUuid>) -> String {
+    logseq_uuid.map_or_else(
+        || format!("{SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX}{block_id}"),
+        |uuid| uuid.to_string(),
+    )
+}
+
+fn sparse_task_query_page_kind(kind: ManagedTextKind) -> PageKind {
+    match kind {
+        ManagedTextKind::Page => PageKind::Page,
+        ManagedTextKind::Journal => PageKind::Journal,
+    }
+}
+
+fn sparse_task_query_page_recency(
+    graph_root: &Path,
+    name: &str,
+    path: &ManagedPath,
+    kind: ManagedTextKind,
+) -> i64 {
+    if kind == ManagedTextKind::Journal {
+        return crate::date::JournalDate::from_title(name)
+            .map(|date| date.to_days() * 86_400)
+            .unwrap_or(i64::MIN);
+    }
+    std::fs::metadata(graph_root.join(path.as_str()))
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(i64::MIN)
+}
+
+impl ManagedSparseTaskQueryPageFacts {
+    fn from_joined_row(
+        row: &MaterializedTaskCandidateBlockRow,
+        graph_root: &Path,
+    ) -> Result<Self, ManagedSparseTaskQueryFallback> {
+        if LogicalPageName::parse(row.page_name.clone()).is_err() {
+            return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
+        }
+        let format = Format::from_path(Path::new(row.page_path.as_str()));
+        Ok(Self {
+            name: row.page_name.clone(),
+            path: row.page_path.clone(),
+            kind: row.page_kind,
+            sparse_page: crate::query::ApplicationSparseQueryPage {
+                name: row.page_name.clone(),
+                path: row.page_path.as_str().to_owned(),
+                kind: sparse_task_query_page_kind(row.page_kind),
+                is_org: format == Format::Org,
+                recency: sparse_task_query_page_recency(
+                    graph_root,
+                    &row.page_name,
+                    &row.page_path,
+                    row.page_kind,
+                ),
+            },
+        })
+    }
+
+    fn matches_joined_row(&self, row: &MaterializedTaskCandidateBlockRow) -> bool {
+        self.name == row.page_name && self.path == row.page_path && self.kind == row.page_kind
+    }
+}
+
+fn managed_sparse_task_query_candidate_from_sqlite(
+    row: MaterializedTaskCandidateBlockRow,
+    page: crate::query::ApplicationSparseQueryPage,
+) -> ManagedSparseTaskQueryCandidate {
+    ManagedSparseTaskQueryCandidate {
+        block_id: row.block_id,
+        page_id: row.page_id,
+        parent: row.parent,
+        order: row.order,
+        raw: row.content,
+        identity: sparse_task_query_identity(row.block_id, row.logseq_uuid),
+        page,
+    }
+}
+
+fn sparse_task_query_order_is_valid(order: &str) -> bool {
+    !order.is_empty() && order.len() <= 512 && !order.chars().any(char::is_control)
+}
+
+fn sparse_task_query_dfs_key(leaf_to_root: Vec<(String, BlockId)>) -> Vec<String> {
+    let mut root_to_leaf = leaf_to_root;
+    root_to_leaf.reverse();
+    root_to_leaf
+        .into_iter()
+        .flat_map(|(order, block_id)| {
+            // `BlockId` derives `Ord` from `Uuid`; its canonical lower-case
+            // hyphenated UUID spelling is fixed-width hexadecimal, so lexical
+            // string order preserves that UUID order.  Keeping the two values
+            // adjacent mirrors projection's `(order, block_id)` sibling key.
+            [order, block_id.to_string()]
+        })
+        .collect()
+}
+
+fn sparse_task_query_dfs_order(
+    candidate: &ManagedSparseTaskQueryCandidate,
+    overlay_structures: &HashMap<BlockId, ManagedSparseTaskQueryStructure>,
+    overlay_page_ids: &HashSet<PageId>,
+    read: &SqliteMaterializedRead<'_>,
+    structure_cache: &mut HashMap<BlockId, ManagedSparseTaskQueryStructure>,
+    ancestor_rows: &mut usize,
+) -> Result<Vec<String>, ManagedSparseTaskQueryFallback> {
+    let mut seen = HashSet::new();
+    let mut block_id = candidate.block_id;
+    let mut structure = ManagedSparseTaskQueryStructure {
+        page_id: candidate.page_id,
+        parent: candidate.parent,
+        order: candidate.order.clone(),
+    };
+    let mut leaf_to_root = Vec::new();
+    loop {
+        if !seen.insert(block_id)
+            || structure.page_id != candidate.page_id
+            || !sparse_task_query_order_is_valid(&structure.order)
+        {
+            return Err(ManagedSparseTaskQueryFallback::Structure);
+        }
+        leaf_to_root.push((structure.order.clone(), block_id));
+        let Some(parent) = structure.parent else {
+            break;
+        };
+        block_id = parent;
+        structure = if let Some(structure) = overlay_structures.get(&parent) {
+            structure.clone()
+        } else {
+            // A page masked by a latest frame must obtain every ancestor from
+            // that exact frame as well.  Falling through to SQLite here would
+            // silently combine two authority epochs.
+            if overlay_page_ids.contains(&candidate.page_id) {
+                return Err(ManagedSparseTaskQueryFallback::Structure);
+            }
+            if let Some(structure) = structure_cache.get(&parent) {
+                structure.clone()
+            } else {
+                *ancestor_rows = ancestor_rows.saturating_add(1);
+                let row = read
+                    .block_structure(parent)
+                    .map_err(|_| ManagedSparseTaskQueryFallback::Structure)?
+                    .ok_or(ManagedSparseTaskQueryFallback::Structure)?;
+                if row.block_id != parent {
+                    return Err(ManagedSparseTaskQueryFallback::Structure);
+                }
+                let structure = ManagedSparseTaskQueryStructure {
+                    page_id: row.page_id,
+                    parent: row.parent,
+                    order: row.order,
+                };
+                structure_cache.insert(parent, structure.clone());
+                structure
+            }
+        };
+    }
+    Ok(sparse_task_query_dfs_key(leaf_to_root))
 }
 
 struct ManagedLocalPublisherAttempt {
@@ -9694,6 +9991,40 @@ impl RuntimeActor {
     }
 
     #[cfg(test)]
+    fn force_managed_task_query_overlay_incomplete(&mut self, path: &ManagedPath) {
+        let managed = self
+            .managed_local
+            .as_mut()
+            .expect("active test actor retains managed-local state");
+        let entry = managed
+            .latest_task_query_overlay
+            .get_mut(path.as_str())
+            .expect("test requests an exact latest overlay path");
+        entry.state = LatestTaskQueryOverlayState::Incomplete;
+    }
+
+    #[cfg(test)]
+    fn force_managed_task_query_overlay_invalid_order(&mut self, path: &ManagedPath) {
+        let managed = self
+            .managed_local
+            .as_mut()
+            .expect("active test actor retains managed-local state");
+        let entry = managed
+            .latest_task_query_overlay
+            .get_mut(path.as_str())
+            .expect("test requests an exact latest overlay path");
+        let LatestTaskQueryOverlayState::Complete(page) = &mut entry.state else {
+            panic!("malformed-order test requires a complete exact overlay")
+        };
+        page.blocks
+            .values_mut()
+            .next()
+            .expect("complete test overlay retains a block")
+            .order
+            .clear();
+    }
+
+    #[cfg(test)]
     fn note_managed_application_query_inventory_pass(&self, pages: usize) {
         let mut current = self.managed_application_query_instrumentation.get();
         current.full_inventory_passes = current.full_inventory_passes.saturating_add(1);
@@ -9762,6 +10093,43 @@ impl RuntimeActor {
     fn note_managed_application_query_block_branch(&self) {
         let mut current = self.managed_application_query_instrumentation.get();
         current.block_branches = current.block_branches.saturating_add(1);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_sparse_task_query_attempt(&self) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.sparse_attempts = current.sparse_attempts.saturating_add(1);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_sparse_task_query_completion(
+        &self,
+        candidate_rows: usize,
+        ancestor_rows: usize,
+        parser_rows: usize,
+        overlay_rows: usize,
+        dto_constructions: usize,
+    ) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.sparse_completions = current.sparse_completions.saturating_add(1);
+        current.sparse_candidate_rows =
+            current.sparse_candidate_rows.saturating_add(candidate_rows);
+        current.sparse_ancestor_rows = current.sparse_ancestor_rows.saturating_add(ancestor_rows);
+        current.sparse_parser_rows = current.sparse_parser_rows.saturating_add(parser_rows);
+        current.sparse_overlay_rows = current.sparse_overlay_rows.saturating_add(overlay_rows);
+        current.sparse_dto_constructions = current
+            .sparse_dto_constructions
+            .saturating_add(dto_constructions);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_sparse_task_query_fallback(&self, reason: ManagedSparseTaskQueryFallback) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.sparse_fallbacks = current.sparse_fallbacks.saturating_add(1);
+        current.sparse_fallback_reason = Some(reason);
         self.managed_application_query_instrumentation.set(current);
     }
 
@@ -11194,6 +11562,259 @@ impl RuntimeActor {
     }
 
     fn application_simple_query_ready(
+        &self,
+        query: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+        let Some(eligibility) = crate::query::sparse_task_query_eligibility(query) else {
+            return self.application_simple_query_pages_ready(query, max_rows, max_bytes);
+        };
+        #[cfg(test)]
+        self.note_managed_sparse_task_query_attempt();
+        match self.application_sparse_task_query_ready(&eligibility, query, max_rows, max_bytes) {
+            Ok((result, metrics)) => {
+                #[cfg(test)]
+                self.note_managed_sparse_task_query_completion(
+                    metrics.candidate_rows,
+                    metrics.ancestor_rows,
+                    metrics.parser_rows,
+                    metrics.overlay_rows,
+                    metrics.dto_constructions,
+                );
+                let _ = metrics;
+                Ok(result)
+            }
+            Err(reason) => {
+                #[cfg(test)]
+                self.note_managed_sparse_task_query_fallback(reason);
+                let _ = reason;
+                self.application_simple_query_pages_ready(query, max_rows, max_bytes)
+            }
+        }
+    }
+
+    /// The bounded managed block reader.  Returning an error means *no* sparse
+    /// result was exposed; the caller runs the established complete page
+    /// evaluator once instead of combining a partial answer.
+    fn application_sparse_task_query_ready(
+        &self,
+        eligibility: &crate::query::SparseTaskQueryEligibility,
+        query: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<
+        (
+            SyncApplicationBoundedRefGroups,
+            ManagedSparseTaskQueryMetrics,
+        ),
+        ManagedSparseTaskQueryFallback,
+    > {
+        let markers = eligibility.markers.iter().collect::<HashSet<_>>();
+        if markers.is_empty() {
+            return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
+        }
+
+        // Copy the tiny pending suffix out of actor-local state.  It has to be
+        // a one-for-one companion to the latest frames: any absent or
+        // incomplete entry is an authority boundary, not an empty overlay.
+        let (overlay_pages, overlay_structures, masked_paths, masked_page_ids) = {
+            let managed = self
+                .managed_local
+                .as_ref()
+                .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
+            if managed.latest_projection_frames.len() != managed.latest_task_query_overlay.len() {
+                return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
+            }
+            let mut pages = Vec::new();
+            let mut structures = HashMap::new();
+            let mut paths = HashSet::new();
+            let mut page_ids = HashSet::new();
+            for (key, frame) in &managed.latest_projection_frames {
+                let entry = managed
+                    .latest_task_query_overlay
+                    .get(key)
+                    .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
+                if entry.sequence != frame.sequence() || entry.path.as_str() != key {
+                    return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
+                }
+                let LatestTaskQueryOverlayState::Complete(page) = &entry.state else {
+                    return Err(ManagedSparseTaskQueryFallback::OverlayIncomplete);
+                };
+                if page.path != entry.path
+                    || LogicalPageName::parse(page.name.clone()).is_err()
+                    || page.format != Format::from_path(Path::new(page.path.as_str()))
+                    || !paths.insert(page.path.clone())
+                    || !page_ids.insert(page.page_id)
+                {
+                    return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
+                }
+                for (block_id, block) in &page.blocks {
+                    if *block_id != block.block_id
+                        || structures
+                            .insert(
+                                *block_id,
+                                ManagedSparseTaskQueryStructure {
+                                    page_id: page.page_id,
+                                    parent: block.parent,
+                                    order: block.order.clone(),
+                                },
+                            )
+                            .is_some()
+                    {
+                        return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
+                    }
+                    if !sparse_task_query_order_is_valid(&block.order) {
+                        return Err(ManagedSparseTaskQueryFallback::Structure);
+                    }
+                }
+                pages.push(page.clone());
+            }
+            (pages, structures, paths, page_ids)
+        };
+
+        let mut metrics = ManagedSparseTaskQueryMetrics::default();
+        let mut candidates = BTreeMap::<BlockId, ManagedSparseTaskQueryCandidate>::new();
+        for page in &overlay_pages {
+            let sparse_page = crate::query::ApplicationSparseQueryPage {
+                name: page.name.clone(),
+                path: page.path.as_str().to_owned(),
+                kind: sparse_task_query_page_kind(page.kind),
+                is_org: page.format == Format::Org,
+                recency: sparse_task_query_page_recency(
+                    &self.graph.root,
+                    &page.name,
+                    &page.path,
+                    page.kind,
+                ),
+            };
+            for block in page.blocks.values() {
+                if !block
+                    .marker
+                    .as_ref()
+                    .is_some_and(|marker| markers.contains(marker))
+                {
+                    continue;
+                }
+                metrics.overlay_rows = metrics.overlay_rows.saturating_add(1);
+                candidates.entry(block.block_id).or_insert_with(|| {
+                    ManagedSparseTaskQueryCandidate {
+                        block_id: block.block_id,
+                        page_id: page.page_id,
+                        parent: block.parent,
+                        order: block.order.clone(),
+                        raw: block.content.clone(),
+                        identity: sparse_task_query_identity(block.block_id, block.logseq_uuid),
+                        page: sparse_page.clone(),
+                    }
+                });
+            }
+        }
+
+        let read = self
+            .application_materialized_read_ready()
+            .map_err(|_| ManagedSparseTaskQueryFallback::CandidateRead)?;
+        let mut page_cache = HashMap::<PageId, ManagedSparseTaskQueryPageFacts>::new();
+        const BATCH: usize = 512;
+        for marker in &eligibility.markers {
+            let mut cursor = None;
+            loop {
+                let rows = read
+                    .task_candidate_blocks_after(marker, cursor, BATCH)
+                    .map_err(|_| ManagedSparseTaskQueryFallback::CandidateRead)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let len = rows.len();
+                for row in rows {
+                    cursor = Some((row.page_id, row.block_id));
+                    // Path *and* page-id masks defend rename/replacement and
+                    // all other hot-frame changes without trusting either
+                    // SQLite coordinate in isolation.
+                    if masked_paths.contains(&row.page_path)
+                        || masked_page_ids.contains(&row.page_id)
+                    {
+                        continue;
+                    }
+                    let page = if let Some(page) = page_cache.get(&row.page_id) {
+                        if !page.matches_joined_row(&row) {
+                            return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
+                        }
+                        page.sparse_page.clone()
+                    } else {
+                        // The v0.3 candidate API joins pages and applies the
+                        // Tine facade's path/kind validation.  A second
+                        // `read.page` query cannot establish an independent
+                        // authority, so retain and cross-check those joined
+                        // facts instead.
+                        let page = ManagedSparseTaskQueryPageFacts::from_joined_row(
+                            &row,
+                            &self.graph.root,
+                        )?;
+                        let sparse_page = page.sparse_page.clone();
+                        page_cache.insert(row.page_id, page);
+                        sparse_page
+                    };
+                    let candidate = managed_sparse_task_query_candidate_from_sqlite(row, page);
+                    candidates.entry(candidate.block_id).or_insert(candidate);
+                }
+                if len < BATCH {
+                    break;
+                }
+            }
+        }
+
+        metrics.candidate_rows = candidates.len();
+        let identities = candidates
+            .iter()
+            .map(|(block_id, candidate)| (*block_id, candidate.identity.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut structure_cache = HashMap::new();
+        let mut dfs_keys = HashSet::new();
+        let mut sparse_candidates = Vec::with_capacity(candidates.len());
+        for candidate in candidates.into_values() {
+            let dfs_order = sparse_task_query_dfs_order(
+                &candidate,
+                &overlay_structures,
+                &masked_page_ids,
+                &read,
+                &mut structure_cache,
+                &mut metrics.ancestor_rows,
+            )?;
+            if !dfs_keys.insert((candidate.page_id, dfs_order.clone())) {
+                return Err(ManagedSparseTaskQueryFallback::Structure);
+            }
+            let parent_identity = candidate
+                .parent
+                .and_then(|parent| identities.get(&parent).cloned());
+            sparse_candidates.push(crate::query::ApplicationSparseQueryCandidate {
+                raw: candidate.raw,
+                identity: candidate.identity,
+                page: candidate.page,
+                parent_identity,
+                dfs_order,
+            });
+        }
+        metrics.parser_rows = sparse_candidates.len();
+        let result = crate::query::run_application_sparse_task_query_bounded(
+            &sparse_candidates,
+            query,
+            max_rows,
+            max_bytes,
+        )
+        .map_err(|_| ManagedSparseTaskQueryFallback::Runner)?;
+        metrics.dto_constructions = result.groups.iter().map(|group| group.blocks.len()).sum();
+        Ok((
+            SyncApplicationBoundedRefGroups {
+                groups: result.groups,
+                total: result.total,
+                exceeded: result.exceeded,
+            },
+            metrics,
+        ))
+    }
+
+    fn application_simple_query_pages_ready(
         &self,
         query: &str,
         max_rows: usize,
@@ -23164,6 +23785,112 @@ mod tests {
             }
         }
 
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let query = "(and (task TODO) (priority A) (scheduled))";
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: query.into(),
+                max_rows: 128,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(managed),
+        } = outcome
+        else {
+            panic!("hot-overlay sparse task query returned the wrong outcome: {outcome:?}")
+        };
+        assert_managed_simple_query_matches_direct(
+            "hot overlay marker priority planning",
+            managed,
+            Graph::open(fixture.graph_root()).run_query_bounded(query, 128, 1024 * 1024),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
+        assert_eq!(counters.sparse_completions, 1, "{counters:?}");
+        assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_rows, 2, "{counters:?}");
+        assert_eq!(counters.sparse_candidate_rows, 2, "{counters:?}");
+        assert_eq!(counters.sparse_ancestor_rows, 0, "{counters:?}");
+        assert_eq!(counters.sparse_parser_rows, 2, "{counters:?}");
+        assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+        assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+        assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
+
+        handle
+            .force_managed_task_query_overlay_invalid_order(&path)
+            .unwrap();
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: query.into(),
+                max_rows: 128,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(fallback),
+        } = outcome
+        else {
+            panic!("malformed-order fallback returned the wrong outcome: {outcome:?}")
+        };
+        assert_managed_simple_query_matches_direct(
+            "malformed hot-overlay order falls back as one complete query",
+            fallback,
+            Graph::open(fixture.graph_root()).run_query_bounded(query, 128, 1024 * 1024),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
+        assert_eq!(counters.sparse_completions, 0, "{counters:?}");
+        assert_eq!(counters.sparse_fallbacks, 1, "{counters:?}");
+        assert_eq!(
+            counters.sparse_fallback_reason,
+            Some(ManagedSparseTaskQueryFallback::Structure),
+            "{counters:?}"
+        );
+        assert_eq!(counters.sparse_candidate_rows, 0, "{counters:?}");
+        assert_eq!(counters.sparse_parser_rows, 0, "{counters:?}");
+
+        handle
+            .force_managed_task_query_overlay_incomplete(&path)
+            .unwrap();
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: query.into(),
+                max_rows: 128,
+                max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(fallback),
+        } = outcome
+        else {
+            panic!("incomplete overlay fallback returned the wrong outcome: {outcome:?}")
+        };
+        assert_managed_simple_query_matches_direct(
+            "incomplete hot overlay falls back as one complete query",
+            fallback,
+            Graph::open(fixture.graph_root()).run_query_bounded(query, 128, 1024 * 1024),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
+        assert_eq!(counters.sparse_completions, 0, "{counters:?}");
+        assert_eq!(counters.sparse_fallbacks, 1, "{counters:?}");
+        assert_eq!(
+            counters.sparse_fallback_reason,
+            Some(ManagedSparseTaskQueryFallback::OverlayIncomplete),
+            "{counters:?}"
+        );
+        assert_eq!(counters.sparse_candidate_rows, 0, "{counters:?}");
+        assert_eq!(counters.sparse_parser_rows, 0, "{counters:?}");
+
         for _ in 0..64 {
             if handle.status().unwrap().managed_local_pending == 0 {
                 break;
@@ -23189,16 +23916,35 @@ mod tests {
             .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("production source has its test boundary");
-        let simple_query = production
+        let simple_query_router = production
             .split_once("    fn application_simple_query_ready(")
             .and_then(|(_, tail)| {
-                tail.split_once("\n    fn application_all_query_pages_ready(")
+                tail.split_once("\n    fn application_sparse_task_query_ready(")
                     .map(|(body, _)| body)
             })
             .expect("simple query retains a narrow boundary");
         assert!(
-            !simple_query.contains("latest_task_query_overlay"),
-            "Q1 must not add a query-time overlay path before Q2"
+            simple_query_router.contains("sparse_task_query_eligibility"),
+            "Q2 must ask the strict sparse eligibility gate before the page evaluator"
+        );
+        assert!(
+            simple_query_router.contains("application_simple_query_pages_ready"),
+            "an ineligible or incomplete sparse attempt must retain the one established fallback"
+        );
+        let sparse_query = production
+            .split_once("    fn application_sparse_task_query_ready(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn application_simple_query_pages_ready(")
+                    .map(|(body, _)| body)
+            })
+            .expect("sparse query retains a complete-or-fallback boundary");
+        assert!(
+            sparse_query.contains("latest_task_query_overlay"),
+            "the sparse path must use the exact actor-local overlay rather than hydrating pages"
+        );
+        assert!(
+            !sparse_query.contains("application_navigation_overlay_ready"),
+            "the sparse path must not reparse the pending overlay at query time"
         );
 
         let editor = production
@@ -23236,6 +23982,212 @@ mod tests {
             })
             .expect("managed-local drain retains a narrow boundary");
         assert!(drain.contains("retire_latest_task_query_overlay"));
+    }
+
+    #[test]
+    fn managed_sparse_task_query_matches_direct_markdown_and_org_without_page_hydration() {
+        const MAX_ROWS: usize = 128;
+        const MAX_BYTES: usize = 1024 * 1024;
+        let fixture = RuntimeHostFixture::safe("sync-runtime-sparse-task-query-differential");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Sparse Markdown.md",
+            b"- TODO [#A] markdown root SCHEDULED: <2026-08-10 Mon>\n  - TODO [#A] markdown child DEADLINE: <2026-08-12 Wed>\n- DONE markdown done\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Sparse Org.org",
+            b"* TODO [#A] org root SCHEDULED: <2026-08-10 Mon>\n** TODO [#A] org child DEADLINE: <2026-08-12 Wed>\n* DONE org done\n",
+        );
+        let direct = Graph::open(fixture.graph_root());
+        for query in [
+            "(task todo)",
+            "(and (task TODO) (priority A))",
+            "(and (task TODO) (scheduled))",
+            "(and (task TODO) (deadline))",
+            "(and (task TODO) (sort-by modified desc))",
+        ] {
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
+            let outcome = handle
+                .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.into(),
+                    max_rows: MAX_ROWS,
+                    max_bytes: MAX_BYTES,
+                })
+                .unwrap();
+            let SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::SimpleQuery(managed),
+            } = outcome
+            else {
+                panic!("sparse task query returned the wrong outcome: {outcome:?}")
+            };
+            assert_managed_simple_query_matches_direct(
+                query,
+                managed.clone(),
+                direct.run_query_bounded(query, MAX_ROWS, MAX_BYTES),
+            );
+            let counters = handle.managed_application_query_instrumentation().unwrap();
+            assert_eq!(counters.sparse_attempts, 1, "{query}: {counters:?}");
+            assert_eq!(counters.sparse_completions, 1, "{query}: {counters:?}");
+            assert_eq!(counters.sparse_fallbacks, 0, "{query}: {counters:?}");
+            assert!(counters.sparse_candidate_rows >= 2, "{query}: {counters:?}");
+            assert_eq!(
+                counters.sparse_parser_rows, counters.sparse_candidate_rows,
+                "only enumerated task candidates may be parsed: {query}: {counters:?}"
+            );
+            assert_eq!(counters.full_inventory_passes, 0, "{query}: {counters:?}");
+            assert_eq!(counters.result_page_hydrations, 0, "{query}: {counters:?}");
+            assert_eq!(
+                counters.metadata_page_hydrations, 0,
+                "{query}: {counters:?}"
+            );
+            let identities = managed
+                .groups
+                .iter()
+                .flat_map(|group| group.blocks.iter())
+                .map(|block| block.id.as_str())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                identities.len(),
+                managed
+                    .groups
+                    .iter()
+                    .map(|group| group.blocks.len())
+                    .sum::<usize>(),
+                "sparse task result identities must be unique: {query}"
+            );
+            assert!(
+                identities
+                    .iter()
+                    .all(|identity| identity.starts_with(SYNC_APPLICATION_INTERNAL_BLOCK_PREFIX)),
+                "fixture has no external UUIDs, so sparse identities must remain opaque: {query}"
+            );
+        }
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_sparse_task_query_one_match_in_twenty_thousand_blocks_is_candidate_bounded() {
+        const MAX_ROWS: usize = 128;
+        const MAX_BYTES: usize = 1024 * 1024;
+        let fixture = RuntimeHostFixture::safe("sync-runtime-sparse-task-query-one-match");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let mut body = String::with_capacity(20_000 * 16);
+        for _ in 0..19_995 {
+            body.push_str("- unrelated non-task text\n");
+        }
+        body.push_str(
+            "- ancestor one\n  - ancestor two\n    - ancestor three\n      - ancestor four\n        - TODO only task\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Sparse One Match.md",
+            body.as_bytes(),
+        );
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: "(task TODO)".into(),
+                max_rows: MAX_ROWS,
+                max_bytes: MAX_BYTES,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(managed),
+        } = outcome
+        else {
+            panic!("one-match sparse query returned the wrong outcome: {outcome:?}")
+        };
+        assert_managed_simple_query_matches_direct(
+            "20k one-match candidate receipt",
+            managed,
+            Graph::open(fixture.graph_root()).run_query_bounded("(task TODO)", MAX_ROWS, MAX_BYTES),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
+        assert_eq!(counters.sparse_completions, 1, "{counters:?}");
+        assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
+        assert_eq!(counters.sparse_candidate_rows, 1, "{counters:?}");
+        assert_eq!(counters.sparse_parser_rows, 1, "{counters:?}");
+        assert_eq!(
+            counters.sparse_ancestor_rows, 4,
+            "only the matching block's four-node ancestry may be read: {counters:?}"
+        );
+        assert_eq!(counters.sparse_overlay_rows, 0, "{counters:?}");
+        assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+        assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+        assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
+        assert_eq!(counters.sparse_dto_constructions, 1, "{counters:?}");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn sparse_task_query_dfs_keys_match_materializer_order_for_equal_parent_orders() {
+        let page_id = PageId::from_uuid(Uuid::from_u128(0x100));
+        let low_parent = BlockId::from_uuid(Uuid::from_u128(0x101));
+        let high_parent = BlockId::from_uuid(Uuid::from_u128(0x102));
+        let low_child = BlockId::from_uuid(Uuid::from_u128(0x103));
+        let high_child = BlockId::from_uuid(Uuid::from_u128(0x104));
+        assert!(low_parent < high_parent);
+        assert!(low_parent.to_string() < high_parent.to_string());
+
+        let page = crate::query::ApplicationSparseQueryPage {
+            name: "Ordering".into(),
+            path: "content/nested pages/Ordering.md".into(),
+            kind: PageKind::Page,
+            is_org: false,
+            recency: 0,
+        };
+        // Projection orders the equal-order roots by BlockId, so the `z`
+        // child of the lower-ID root precedes the `a` child of the higher-ID
+        // root.  An order-only sparse key would reverse these subtrees.
+        let low_root_subtree = crate::query::ApplicationSparseQueryCandidate {
+            raw: "TODO lower-root z-child".into(),
+            identity: "low-child".into(),
+            page: page.clone(),
+            parent_identity: None,
+            dfs_order: sparse_task_query_dfs_key(vec![
+                ("z".into(), low_child),
+                ("same".into(), low_parent),
+            ]),
+        };
+        let high_root_subtree = crate::query::ApplicationSparseQueryCandidate {
+            raw: "TODO higher-root a-child".into(),
+            identity: "high-child".into(),
+            page,
+            parent_identity: None,
+            dfs_order: sparse_task_query_dfs_key(vec![
+                ("a".into(), high_child),
+                ("same".into(), high_parent),
+            ]),
+        };
+        assert!(low_root_subtree.dfs_order < high_root_subtree.dfs_order);
+        let result = crate::query::run_application_sparse_task_query_bounded(
+            &[high_root_subtree, low_root_subtree],
+            "(task TODO)",
+            8,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(result.total, 2);
+        assert_eq!(result.groups[0].blocks[0].raw, "TODO lower-root z-child");
+        assert_eq!(result.groups[0].blocks[1].raw, "TODO higher-root a-child");
     }
 
     #[test]
