@@ -6263,6 +6263,29 @@
         "failBefore": "proven"
       },
       "notes": "OG parity gap: OG binds :editor/follow-link to mod+o and :editor/open-link-in-sidebar to mod+shift+o (frontend/modules/shortcut/config.cljs:214/:217); Tine had no mod+o at all. The 'which link' rule is transcribed from OG's thingatpt.cljs extract-nearest-link-from-text, including its surprising part: OG collects EVERY candidate in the block and picks the one nearest the caret, so a caret anywhere in a block with one link still follows it. URLs are included for follow and deliberately excluded for the sidebar, matching OG's two call sites. Block refs are best-effort: a bare ((uuid)) in raw text carries no page, so a block outside the loaded working set is not found - the same give-up OG's open-link-in-sidebar! does when db/get-page misses. FAIL-BEFORE is an absence (no mod+o binding existed), verified by grep."
+    },
+    {
+      "id": "UI-MANAGED-RUNTIME-EVENT-BRIDGE-001",
+      "title": "Managed-storage runtime status, progress and failure reasons update the app and open Storage & sync panel for the current graph only",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/managedStorageRuntime.test.ts",
+          "src/components/Settings.test.tsx"
+        ],
+        "scenario": "managed-storage.runtime-event-status-and-error-bridge",
+        "failBefore": "reconstructed"
+      },
+      "notes": "Confirmed UI audit H1 at dc82d0c4: watcher.rs emitted sparse-v2-status, sparse-v2-tick and sparse-v2-error, but the frontend subscribed only to sparse-v2-changed. The Settings panel therefore retained its open-time status snapshot and the runtime's explicit failure reason was invisible. A single app-owned typed bridge now updates both surfaces, preserves the native reason text, and accepts an event only when its binding generation matches the currently bound graph. Direct-file managed-sync-error and graph-watch-error listeners remain unchanged."
     }
   ]
 }

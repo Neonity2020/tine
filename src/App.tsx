@@ -129,6 +129,7 @@ import { installBackgroundFlush } from "./backgroundFlush";
 import { installAndroidBackHandler, requestAndroidRootClose } from "./androidBack";
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
+import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -573,6 +574,29 @@ export function App(): JSX.Element {
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.
   onMount(() => void initDebug());
+
+  // The sparse runtime can tick while Settings is closed. Subscribe once at the
+  // app boundary; the shared bridge carries the matching graph generation into
+  // both this feedback and the panel without component-owned duplicate listeners.
+  onMount(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    void managedStorageRuntime.listen().then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    onCleanup(() => {
+      disposed = true;
+      unlisten();
+    });
+  });
+  createEffect(on(
+    () => managedStorageRuntime.snapshot().error,
+    (reason) => {
+      if (reason) pushToast(managedStorageRuntimeErrorMessage(reason), "error");
+    },
+    { defer: true },
+  ));
 
   // AppPlugin is the single Android native Back owner.  A drawer/transient is
   // never represented by synthetic history; route history remains the fallback.

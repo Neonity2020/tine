@@ -211,6 +211,18 @@ export interface SparseV2Tick {
   epoch: number | null;
 }
 
+/** A watcher update scoped to the graph binding that produced it. */
+export interface SparseV2TickEvent {
+  binding_generation: number;
+  tick: SparseV2Tick;
+}
+
+/** A watcher failure scoped to the graph binding that produced it. */
+export interface SparseV2ErrorEvent {
+  binding_generation: number;
+  message: string;
+}
+
 export interface SparseV2RuntimeStatus {
   lifecycle: "active" | "terminal" | "stopped_safe" | "stopped_crashed";
   recovery: "first_promotion" | "resumed_own_unsafe" | "adopted_safe_handoff" | "took_over_crashed_unsafe" | null;
@@ -238,6 +250,12 @@ export type SparseV2Status = SparseV2Availability & {
   cancel_reason: string | null;
   binding_generation: number;
 };
+
+/** A status snapshot scoped to the graph binding that produced it. */
+export interface SparseV2RuntimeStatusEvent {
+  binding_generation: number;
+  runtime: SparseV2RuntimeStatus;
+}
 
 export interface SparseV2CancelResult {
   status: SparseV2Status;

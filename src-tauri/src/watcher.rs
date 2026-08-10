@@ -16,6 +16,28 @@ struct GraphChange {
     removed: bool,
 }
 
+/// Every sparse-runtime watcher event is scoped to the graph binding that
+/// produced it. A window can be rebound to another graph while a watcher cycle
+/// is in flight; the frontend must be able to drop that older cycle instead of
+/// showing its status or failure for the new graph.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct SparseV2RuntimeStatusEvent {
+    binding_generation: u64,
+    runtime: crate::sync_runtime::SparseV2RuntimeStatusDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct SparseV2TickEvent {
+    binding_generation: u64,
+    tick: crate::sync_runtime::SparseV2TickDto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+struct SparseV2ErrorEvent {
+    binding_generation: u64,
+    message: String,
+}
+
 #[derive(Default)]
 struct Pending {
     paths: HashSet<PathBuf>,
@@ -900,6 +922,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         struct WatchedSparse {
             handle: SyncRuntimeHandle,
             root: PathBuf,
+            binding_generation: u64,
             last_error: Option<String>,
             retry: RetrySchedule,
             initial_tick: bool,
@@ -924,7 +947,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 if let Some(handle) = slot.sparse_runtime().cloned() {
                     graphs.remove(&label);
                     match sparse_graphs.get_mut(&label) {
-                        Some(current) if current.root == slot.root_key => {
+                        Some(current)
+                            if current.root == slot.root_key
+                                && current.binding_generation == slot.binding_generation =>
+                        {
                             current.handle = handle;
                         }
                         _ => {
@@ -933,6 +959,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 WatchedSparse {
                                     handle,
                                     root: slot.root_key.clone(),
+                                    binding_generation: slot.binding_generation,
                                     last_error: None,
                                     retry: RetrySchedule::default(),
                                     initial_tick: true,
@@ -1226,7 +1253,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         ) {
                             let message = format!("{tick:?}");
                             if graph.last_error.as_deref() != Some(&message) {
-                                let _ = app.emit_to(label, "sparse-v2-error", &message);
+                                let _ = app.emit_to(
+                                    label,
+                                    "sparse-v2-error",
+                                    SparseV2ErrorEvent {
+                                        binding_generation: graph.binding_generation,
+                                        message: message.clone(),
+                                    },
+                                );
                                 graph.last_error = Some(message);
                             }
                         } else {
@@ -1235,7 +1269,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         let _ = app.emit_to(
                             label,
                             "sparse-v2-tick",
-                            crate::sync_runtime::tick_dto(tick),
+                            SparseV2TickEvent {
+                                binding_generation: graph.binding_generation,
+                                tick: crate::sync_runtime::tick_dto(tick),
+                            },
                         );
                         if changed {
                             let _ = app.emit_to(label, "sparse-v2-changed", ());
@@ -1244,7 +1281,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             let _ = app.emit_to(
                                 label,
                                 "sparse-v2-status",
-                                crate::sync_runtime::runtime_status(status),
+                                SparseV2RuntimeStatusEvent {
+                                    binding_generation: graph.binding_generation,
+                                    runtime: crate::sync_runtime::runtime_status(status),
+                                },
                             );
                         }
                     }
@@ -1252,7 +1292,14 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         graph.retry.failed(Instant::now());
                         let message = error.to_string();
                         if graph.last_error.as_deref() != Some(&message) {
-                            let _ = app.emit_to(label, "sparse-v2-error", &message);
+                            let _ = app.emit_to(
+                                label,
+                                "sparse-v2-error",
+                                SparseV2ErrorEvent {
+                                    binding_generation: graph.binding_generation,
+                                    message: message.clone(),
+                                },
+                            );
                             graph.last_error = Some(message);
                         }
                     }

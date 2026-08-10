@@ -906,6 +906,15 @@ export function mockBackend(): Backend {
     async sparseV2Status() {
       return sparseV2;
     },
+    async onSparseV2Status() {
+      return () => {};
+    },
+    async onSparseV2Tick() {
+      return () => {};
+    },
+    async onSparseV2Error() {
+      return () => {};
+    },
     async onSparseV2ActivationProgress() {
       return () => {};
     },
