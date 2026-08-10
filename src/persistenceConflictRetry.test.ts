@@ -35,6 +35,7 @@ vi.mock("./store", () => ({
   peekPageInstanceGeneration: () => 1,
   retryPendingBlockRefStamps: () => {},
   notifyPageBecameReplaceable: () => {},
+  sweepReplaceable: () => {},
   pageByName: (name: string) => ({ name, kind: "page", path: draftPath }),
   pageInstanceGeneration: () => 1,
   pageToDto: (name: string) => ({

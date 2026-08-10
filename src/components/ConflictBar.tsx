@@ -9,6 +9,7 @@ import {
 } from "../persistence";
 import {
   canForceSave,
+  notifyPageBecameReplaceable,
   editGeneration,
   editorActivationFor,
   forceSave,
@@ -95,6 +96,10 @@ export function ConflictBar(): JSX.Element {
     if (dto) {
       reloadPage(dto);
       clearConflict(name);
+      // The real "Use disk version" transition: `reloadPage` then `clearConflict`
+      // makes the page replaceable and produces no save at all, so nothing else
+      // announces it. (GH #254 increment 3.)
+      notifyPageBecameReplaceable(name);
     } else {
       // The file is gone on disk (deleted/renamed externally). "Use disk version"
       // = accept that: drop the page and its unsaved edits from the store, rather
