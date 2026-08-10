@@ -433,6 +433,7 @@ struct PendingAuthorDocuments {
     generation: u64,
     mutation_token: u64,
     documents: BTreeMap<DocumentId, LoroDoc>,
+    projection_pages: BTreeMap<PageId, ProjectionPageState>,
 }
 
 struct PreparedTransactionParts {
@@ -6441,7 +6442,6 @@ impl ManagedLocalWork {
 /// object envelope from the finalized batch. The decoded view is therefore the
 /// same input the later archive expander publishes, while its CRDT updates and
 /// projection objects directly drive hot replay and graph recovery.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedManagedLocalRecord {
     batch_id: BatchId,
     sequence: u64,
@@ -6449,6 +6449,7 @@ pub struct PreparedManagedLocalRecord {
     record: ManagedLocalRecord,
     post_page: MaterializedPage,
     retained_author_mutation_token: Option<u64>,
+    retained_author_candidate: Option<ValidatedManagedLocalCandidate>,
 }
 
 impl PreparedManagedLocalRecord {
@@ -6726,6 +6727,20 @@ fn decode_managed_local_payload(
         ));
     }
 
+    managed_local_record_from_prepared(payload.sequence, prepared_batch)
+}
+
+/// Construct the typed live record from an already validated prepared batch.
+///
+/// Live authoring owns the exact `PreparedBatch` that produced the canonical
+/// journal bytes, so decoding and canonically re-encoding those same bytes
+/// before the append proves nothing additional. Recovery still enters through
+/// `decode_managed_local_payload` and retains every byte-level canonicality and
+/// binding check above.
+fn managed_local_record_from_prepared(
+    sequence: u64,
+    prepared_batch: PreparedBatch,
+) -> Result<ManagedLocalRecord, ManagedLocalRecordError> {
     let projection_objects = super::projection_manifest::validate_projection_object_set(
         prepared_batch.manifest(),
         prepared_batch.objects(),
@@ -6810,7 +6825,7 @@ fn decode_managed_local_payload(
         ));
     }
     Ok(ManagedLocalRecord {
-        sequence: payload.sequence,
+        sequence,
         prepared_batch,
         projection: ManagedLocalProjection {
             intent: intent.clone(),
@@ -14396,7 +14411,7 @@ impl ShardedHotEngine {
     /// its manifested projection intent and exact annotated existing base.
     pub fn prepare_managed_local_record(
         &self,
-        prepared: &PreparedBatch,
+        prepared: PreparedBatch,
         sequence: u64,
     ) -> Result<PreparedManagedLocalRecord, ManagedLocalRecordError> {
         if sequence != self.local_overlay.next_sequence {
@@ -14424,11 +14439,7 @@ impl ShardedHotEngine {
         };
         let journal_payload = postcard::to_allocvec(&payload)
             .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
-        let record = decode_managed_local_payload(
-            prepared.manifest().author_device_id().as_uuid(),
-            sequence,
-            &journal_payload,
-        )?;
+        let record = managed_local_record_from_prepared(sequence, prepared)?;
         let retained = self.pending_author_managed_local_candidate(&record, false)?;
         let (candidate, retained_author_mutation_token) = match retained {
             Some((candidate, mutation_token)) => (candidate, Some(mutation_token)),
@@ -14439,8 +14450,9 @@ impl ShardedHotEngine {
             sequence,
             journal_payload,
             record,
-            post_page: candidate.page,
+            post_page: candidate.page.clone(),
             retained_author_mutation_token,
+            retained_author_candidate: retained_author_mutation_token.map(|_| candidate),
         })
     }
 
@@ -14449,7 +14461,7 @@ impl ShardedHotEngine {
     pub fn apply_appended_managed_local_record(
         &mut self,
         append: &LocalJournalAppend,
-        prepared: &PreparedManagedLocalRecord,
+        prepared: &mut PreparedManagedLocalRecord,
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
         if append.device_id
             != prepared
@@ -14465,18 +14477,21 @@ impl ShardedHotEngine {
             return Err(ManagedLocalRecordError::WrongDurabilityProof);
         }
         if let Some(expected_mutation_token) = prepared.retained_author_mutation_token {
-            if self.author_mutation_generation() == expected_mutation_token {
-                if let Some((candidate, retained_mutation_token)) =
-                    self.pending_author_managed_local_candidate(&prepared.record, true)?
-                {
-                    if retained_mutation_token == expected_mutation_token {
-                        return self.apply_validated_managed_local_record(
-                            prepared.record.clone(),
-                            prepared.journal_payload(),
-                            candidate,
-                        );
-                    }
-                }
+            if self.author_mutation_generation() == expected_mutation_token
+                && self.consume_prevalidated_pending_author_candidate(
+                    &prepared.record,
+                    expected_mutation_token,
+                )
+            {
+                let candidate = prepared
+                    .retained_author_candidate
+                    .take()
+                    .expect("retained author token owns a validated candidate");
+                return self.apply_validated_managed_local_record(
+                    prepared.record.clone(),
+                    prepared.journal_payload(),
+                    candidate,
+                );
             }
         }
         self.apply_managed_local_record(prepared.record.clone(), prepared.journal_payload())
@@ -14766,23 +14781,28 @@ impl ShardedHotEngine {
             ));
         }
 
-        let documents = if consume {
-            self.pending_author_documents
+        let (documents, retained_projection) = if consume {
+            let mut pending = self
+                .pending_author_documents
                 .borrow_mut()
                 .take()
-                .expect("matching pending author evidence exists")
-                .documents
+                .expect("matching pending author evidence exists");
+            (pending.documents, pending.projection_pages.remove(&page_id))
         } else {
-            self.pending_author_documents
-                .borrow()
+            let pending = self.pending_author_documents.borrow();
+            let pending = pending
                 .as_ref()
-                .expect("matching pending author evidence exists")
-                .documents
-                .iter()
-                .map(|(document_id, document)| {
-                    clone_doc(document, 1).map(|copy| (*document_id, copy))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?
+                .expect("matching pending author evidence exists");
+            (
+                pending
+                    .documents
+                    .iter()
+                    .map(|(document_id, document)| {
+                        clone_doc(document, 1).map(|copy| (*document_id, copy))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?,
+                pending.projection_pages.get(&page_id).cloned(),
+            )
         };
         let expected_batch_heads = manifest
             .dependency_frontier()
@@ -14847,22 +14867,66 @@ impl ShardedHotEngine {
                 },
             ));
         }
-        let page = self.materialize_hot_page_with_overrides(page_id, &documents)?;
-        let candidate = self.validate_managed_local_projection_candidate(
-            record,
-            ValidatedManagedLocalCandidate {
-                page,
-                documents,
-                document_heads,
-                block_claims,
-                update_bytes,
-            },
-        )?;
+        let retained_projection = retained_projection.ok_or_else(|| {
+            ManagedLocalRecordError::CorruptPayload(
+                "retained author evidence has no exact post-projection page".into(),
+            )
+        })?;
+        if retained_projection.page.page_id != page_id
+            || retained_projection.page.path != *record.projection.intent.path()
+            || retained_projection.frontier != *record.projection.intent.post_frontier()
+            || retained_projection.claim_evidence != record.projection.intent.claim_evidence()
+        {
+            return Err(ManagedLocalRecordError::CorruptPayload(
+                "retained author projection differs from its finalized intent".into(),
+            ));
+        }
+        // The finalizer produced the intent target from this exact retained
+        // projection state and the prepared-batch fingerprint binds that
+        // intent to these documents. Re-rendering the same page here would be
+        // a repeated proof of established private state; recovered or foreign
+        // records still take the full validation path.
+        let candidate = ValidatedManagedLocalCandidate {
+            page: retained_projection.page,
+            documents,
+            document_heads,
+            block_claims,
+            update_bytes,
+        };
         let mut work = self.local_overlay.work.get();
         work.retained_author_candidates_used =
             work.retained_author_candidates_used.saturating_add(1);
         self.local_overlay.work.set(work);
         Ok(Some((candidate, current_mutation_token)))
+    }
+
+    /// Consume the retained author documents after the durable append when
+    /// the engine generation is exactly the one already validated while the
+    /// record was prepared. This is deliberately only an ownership transfer:
+    /// any intervening engine transition advances the mutation token and
+    /// forces the ordinary full validation path instead.
+    fn consume_prevalidated_pending_author_candidate(
+        &self,
+        record: &ManagedLocalRecord,
+        expected_mutation_token: u64,
+    ) -> bool {
+        let manifest = record.prepared_batch.manifest();
+        let fingerprint = prepared_manifest_fingerprint(&record.prepared_batch);
+        let matches = self
+            .pending_author_documents
+            .borrow()
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.batch_id == manifest.batch_id()
+                    && pending.manifest_fingerprint == fingerprint
+                    && pending.generation == self.history_generation
+                    && pending.mutation_token == expected_mutation_token
+                    && pending.documents.keys().eq(record.crdt_updates.keys())
+            });
+        if matches {
+            self.pending_author_documents.borrow_mut().take();
+        }
+        matches
     }
 
     fn apply_managed_local_record(
@@ -16311,12 +16375,20 @@ impl ShardedHotEngine {
         )?;
         let prepared = PreparedBatch::new(manifest, objects)?;
         if draft.origin == BatchOrigin::LocalMutation {
+            let projection_pages = draft
+                .pages
+                .iter()
+                .filter_map(|(page_id, draft_page)| {
+                    draft_page.after.clone().map(|state| (*page_id, state))
+                })
+                .collect();
             *self.pending_author_documents.borrow_mut() = Some(PendingAuthorDocuments {
                 batch_id: draft.author.batch_id,
                 manifest_fingerprint: prepared_manifest_fingerprint(&prepared),
                 generation: draft.generation,
                 mutation_token: draft.mutation_token,
                 documents: draft.prospective_documents,
+                projection_pages,
             });
         }
         let _ = draft.semantic_effect;
@@ -16774,6 +16846,7 @@ impl ShardedHotEngine {
                                 (document_id, document)
                             })
                             .collect(),
+                        projection_pages: BTreeMap::new(),
                     });
                 }
                 (BTreeMap::new(), None)

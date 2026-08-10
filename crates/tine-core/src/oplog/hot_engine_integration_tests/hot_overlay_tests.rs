@@ -245,7 +245,7 @@ impl OverlayFixture {
     fn prepare_record(&self, prepared: &PreparedBatch) -> crate::oplog::PreparedManagedLocalRecord {
         self.engine
             .prepare_managed_local_record(
-                prepared,
+                prepared.clone(),
                 self.engine.managed_local_prefix_state().next_sequence,
             )
             .unwrap()
@@ -275,7 +275,7 @@ impl OverlayFixture {
     fn append_and_apply(
         &mut self,
         journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
-        prepared: &crate::oplog::PreparedManagedLocalRecord,
+        prepared: &mut crate::oplog::PreparedManagedLocalRecord,
     ) -> (tine_storage::LocalJournalAppend, MaterializedPage) {
         let append = append_managed_local_record(journal, prepared).unwrap();
         let page = match self
@@ -544,10 +544,10 @@ fn markdown_and_org_record_application_matches_the_exact_accepted_engine_and_sql
         let mut local =
             OverlayFixture::new(&format!("managed-record-local-{extension}"), extension, 8);
         let (_, mut journal) = local.journal("semantic");
-        let prepared = local.prepare_record(&batches[0]);
+        let mut prepared = local.prepare_record(&batches[0]);
         let forbidden_before = forbidden_commit_work();
         let stats_before = journal.stats();
-        let (_, response) = local.append_and_apply(&mut journal, &prepared);
+        let (_, response) = local.append_and_apply(&mut journal, &mut prepared);
         let direct = local
             .engine
             .materialize_current_page_at_path(&local.page_path)
@@ -596,6 +596,8 @@ fn record_reconstructs_exact_prepared_batch_and_projection_material() {
     let prepared = fixture.prepare_record(&batches[0]);
     let decoded = decode_managed_local_record(&frame(&prepared)).unwrap();
 
+    assert_eq!(prepared.record(), &decoded);
+
     assert_eq!(
         decoded.prepared_batch().manifest().encode().unwrap(),
         batches[0].manifest().encode().unwrap()
@@ -641,8 +643,8 @@ fn consecutive_records_replay_into_a_fresh_engine_like_uninterrupted_execution()
     let (_, mut journal) = uninterrupted.journal("chain");
     let mut frames = Vec::new();
     for prepared_batch in &batches {
-        let prepared = uninterrupted.prepare_record(prepared_batch);
-        uninterrupted.append_and_apply(&mut journal, &prepared);
+        let mut prepared = uninterrupted.prepare_record(prepared_batch);
+        uninterrupted.append_and_apply(&mut journal, &mut prepared);
         frames.push(frame(&prepared));
     }
     let live = uninterrupted
@@ -807,7 +809,7 @@ fn corrupt_binding_order_and_stale_base_are_refused_before_visible_change() {
 fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
     let (_, batches) = finalized_edit_chain("managed-record-append-source", "md", 8, 1);
     let mut fixture = OverlayFixture::new("managed-record-append-local", "md", 8);
-    let prepared = fixture.prepare_record(&batches[0]);
+    let mut prepared = fixture.prepare_record(&batches[0]);
     let wrong_root = fixture._dir.path().join("journal-wrong-device");
     std::fs::create_dir_all(&wrong_root).unwrap();
     let wrong_dir = Dir::open_ambient_dir(wrong_root, ambient_authority()).unwrap();
@@ -835,7 +837,7 @@ fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
     assert_eq!(
         fixture
             .engine
-            .apply_appended_managed_local_record(&wrong_receipt, &prepared),
+            .apply_appended_managed_local_record(&wrong_receipt, &mut prepared),
         Err(ManagedLocalRecordError::WrongDurabilityProof)
     );
     assert_eq!(
@@ -844,7 +846,7 @@ fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
     );
     fixture
         .engine
-        .apply_appended_managed_local_record(&append, &prepared)
+        .apply_appended_managed_local_record(&append, &mut prepared)
         .unwrap();
 }
 
@@ -856,7 +858,7 @@ fn intervening_engine_mutation_refuses_retained_managed_candidate_before_visibil
         .prepare_bootstrap_transaction(fixture.local_author(1_120_000), &fixture.content_edit(9))
         .unwrap();
     let prepared_batch = fixture.finalize_edit(1_120_010, 1);
-    let prepared = fixture.prepare_record(&prepared_batch);
+    let mut prepared = fixture.prepare_record(&prepared_batch);
     let (_, mut journal) = fixture.journal("retained-stale");
     let append = append_managed_local_record(&mut journal, &prepared).unwrap();
 
@@ -877,7 +879,7 @@ fn intervening_engine_mutation_refuses_retained_managed_candidate_before_visibil
     assert!(matches!(
         fixture
             .engine
-            .apply_appended_managed_local_record(&append, &prepared),
+            .apply_appended_managed_local_record(&append, &mut prepared),
         Err(ManagedLocalRecordError::StaleBase)
     ));
     assert_eq!(
@@ -895,11 +897,11 @@ fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
     let (_, batches) = finalized_edit_chain("managed-record-torn-source", "org", 8, 2);
     let mut live = OverlayFixture::new("managed-record-torn-live", "org", 8);
     let (journal_root, mut journal) = live.journal("torn");
-    let first = live.prepare_record(&batches[0]);
-    live.append_and_apply(&mut journal, &first);
+    let mut first = live.prepare_record(&batches[0]);
+    live.append_and_apply(&mut journal, &mut first);
     let expected_prefix = live.engine.materialize_page(live.page_id).unwrap();
-    let second = live.prepare_record(&batches[1]);
-    let (second_append, _) = live.append_and_apply(&mut journal, &second);
+    let mut second = live.prepare_record(&batches[1]);
+    let (second_append, _) = live.append_and_apply(&mut journal, &mut second);
     let committed = journal.committed_bytes();
     drop(journal);
 
@@ -945,10 +947,10 @@ fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
 fn accepted_catchup_collapses_prefix_without_semantic_change_and_sequence_stays_monotonic() {
     let mut fixture = OverlayFixture::new("managed-record-collapse", "md", 12);
     let prepared_batch = fixture.finalize_edit(1_110_000, 1);
-    let prepared = fixture.prepare_record(&prepared_batch);
+    let mut prepared = fixture.prepare_record(&prepared_batch);
     let (_, mut journal) = fixture.journal("collapse");
     let before_frontier = fixture.engine.accepted_frontier_root().unwrap();
-    fixture.append_and_apply(&mut journal, &prepared);
+    fixture.append_and_apply(&mut journal, &mut prepared);
     assert!(matches!(
         fixture
             .engine

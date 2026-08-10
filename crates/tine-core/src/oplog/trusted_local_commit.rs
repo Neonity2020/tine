@@ -317,7 +317,7 @@ impl TrustedLocalCommitCoordinator {
         let prepared_started = Instant::now();
         let batch = prepared.into_trusted_batch();
         let sequence = engine.managed_local_prefix_state().next_sequence;
-        let prepared = match engine.prepare_managed_local_record(&batch, sequence) {
+        let prepared = match engine.prepare_managed_local_record(batch, sequence) {
             Ok(prepared) => prepared,
             Err(ManagedLocalRecordError::Unsupported(reason)) => {
                 return Ok(TrustedLocalCommitOutcome::Declined {
@@ -517,6 +517,16 @@ fn prepared_page_mismatch(
     None
 }
 
+fn materialized_page_semantics_equal(left: &MaterializedPage, right: &MaterializedPage) -> bool {
+    left.page_id == right.page_id
+        && left.home_document_id == right.home_document_id
+        && left.name == right.name
+        && left.path == right.path
+        && left.kind == right.kind
+        && left.preamble == right.preamble
+        && left.blocks == right.blocks
+}
+
 fn finish_committed_graph(
     engine: &mut ShardedHotEngine,
     prepared: PreparedManagedLocalRecord,
@@ -533,7 +543,7 @@ fn finish_committed_graph(
 
 fn finish_committed_state(
     engine: &mut ShardedHotEngine,
-    prepared: PreparedManagedLocalRecord,
+    mut prepared: PreparedManagedLocalRecord,
     graph: CommittedGraphState,
 ) -> TrustedLocalCommitOutcome {
     let append = match &graph {
@@ -543,13 +553,16 @@ fn finish_committed_state(
     #[cfg(test)]
     let overlay_started = Instant::now();
     let applied = before_overlay_hook()
-        .and_then(|()| engine.apply_appended_managed_local_record(append, &prepared));
+        .and_then(|()| engine.apply_appended_managed_local_record(append, &mut prepared));
     #[cfg(test)]
     note_commit_stage(|timings| timings.hot_overlay_apply = overlay_started.elapsed());
     let post_page = match applied {
         Ok(ManagedLocalApplyOutcome::Applied { batch_id, page }) => {
             debug_assert_eq!(batch_id, prepared.batch_id());
-            debug_assert_eq!(&page, prepared.post_page());
+            debug_assert!(materialized_page_semantics_equal(
+                &page,
+                prepared.post_page()
+            ));
             page
         }
         Err(last_error) => {
@@ -848,12 +861,13 @@ mod tests {
                 fast.graph.read_projection_input(&fast.page_path).unwrap(),
                 Some(committed.exact_target().to_vec())
             );
-            assert_eq!(
-                fast.engine
+            assert_page_semantics(
+                &fast
+                    .engine
                     .materialize_current_page_at_path(&fast.page_path)
                     .unwrap()
                     .unwrap(),
-                *committed.post_page()
+                committed.post_page(),
             );
             assert!(forbidden_commit_work().since(forbidden_before).is_none());
             assert_eq!(
@@ -936,7 +950,7 @@ mod tests {
         );
         let managed = fixture.engine.managed_local_work().since(managed_before);
         assert_eq!(managed.accepted_base_documents_loaded, 0);
-        assert_eq!(managed.retained_author_candidates_used, 24);
+        assert_eq!(managed.retained_author_candidates_used, 12);
     }
 
     #[test]
@@ -1384,7 +1398,7 @@ mod tests {
             assert_eq!(managed.commits_applied, edits);
             assert_eq!(managed.documents_imported, edits);
             assert_eq!(managed.accepted_base_documents_loaded, 0);
-            assert_eq!(managed.retained_author_candidates_used, edits * 2);
+            assert_eq!(managed.retained_author_candidates_used, edits);
             let total_p50 = p50(totals);
             eprintln!(
                 "trusted-local bounded probe: pages={pages} samples={} total_p50_ms={:.6} prepared_p50_ms={:.6} graph_p50_ms={:.6} graph_validation_p50_ms={:.6} append_p50_ms={:.6} graph_publication_p50_ms={:.6} graph_cache_p50_ms={:.6} overlay_p50_ms={:.6} response_p50_ms={:.6} managed_work={managed:?} graph_work={:?}",
