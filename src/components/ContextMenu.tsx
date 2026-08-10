@@ -835,7 +835,7 @@ function PageMenu(props: {
         // Deleted a day IN the journals feed (in place, no navigation) → the feed
         // loader's withToday didn't re-run, so restore today's empty placeholder
         // here if it was the one deleted (#17). No-op for an older day.
-        if (kind === "journal") restoreTodayJournalInFeed();
+        if (kind === "journal") void restoreTodayJournalInFeed();
         pushToast(`Deleted “${name}”`, "success");
       })
       .catch(() => pushToast("Delete failed", "error"));

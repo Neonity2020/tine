@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SparseV2Status } from "./types";
+import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -887,8 +887,8 @@ export function mockBackend(): Backend {
       }
       return files.map((f) => ({ ...f, bytes: new TextEncoder().encode(f.text).length }));
     },
-    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<string> {
-      return "mock-rev"; // no-op in mock
+    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
+      return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
     },
     async managedSyncStatus() {
       return managedSync;
@@ -1267,7 +1267,7 @@ export function mockBackend(): Backend {
     async setPreferredWorkflow(): Promise<void> {
       // no-op in the browser mock
     },
-    // These seven reach `refresh_graph` in the real backend, which installs a
+    // These settings reach `refresh_graph` in the real backend, which installs a
     // FRESH Graph with an empty editor-activation registry. Not a no-op even
     // here: a mock that silently omits a contract lets every test that uses it
     // prove the wrong thing. (GH #254 increment 3, round 15.)
@@ -1762,7 +1762,7 @@ export function mockBackend(): Backend {
       return [];
     },
     async restoreBackup(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async loadSession(): Promise<string | null> {
       return mockSession;

@@ -1,11 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const backendMock = vi.hoisted(() => ({ getPage: vi.fn() }));
+const backendMock = vi.hoisted(() => ({
+  getPage: vi.fn(),
+  getPageByPath: vi.fn(),
+  activateEditor: vi.fn(),
+  activateAbsentEditor: vi.fn(),
+  retireEditorActivation: vi.fn(),
+}));
 vi.mock("../backend", () => ({ backend: () => backendMock }));
 
 import { loadSingle, pageByName, resetStore } from "../store";
 import type { PageDto, PageKind, RefGroup } from "../types";
 import { bumpGraphEpoch, setGraphMeta } from "../ui";
+import { notifyGraphRebound } from "../modeHooks";
 import {
   hydrateVisibleQueryPages,
   queryHydrationCircuitStatus,
@@ -27,6 +34,10 @@ function page(name: string, kind: PageKind): PageDto {
 beforeEach(() => {
   resetStore();
   backendMock.getPage.mockReset();
+  backendMock.getPageByPath.mockReset();
+  backendMock.activateEditor.mockReset();
+  backendMock.activateAbsentEditor.mockReset();
+  backendMock.retireEditorActivation.mockReset();
   backendMock.getPage.mockImplementation(async (name: string, kind: PageKind) => ({
     name,
     kind,
@@ -34,6 +45,17 @@ beforeEach(() => {
     pre_block: null,
     blocks: [],
   }));
+  backendMock.activateEditor.mockImplementation(async (path: string) => ({
+    activation: 1,
+    target: path,
+    prospective: false,
+  }));
+  backendMock.activateAbsentEditor.mockImplementation(async (name: string, kind: PageKind) => ({
+    activation: 1,
+    target: `${kind === "journal" ? "journals" : "pages"}/${name}.md`,
+    prospective: true,
+  }));
+  backendMock.retireEditorActivation.mockResolvedValue(true);
   setGraphMeta({ root: "/graph" } as any);
 });
 
@@ -115,6 +137,26 @@ describe("query sheet hydration identity", () => {
     expect(requestedNames).not.toContain("Old5");
     expect(pageByName("Fresh")?.kind).toBe("page");
     expect(pageByName("Old0")).toBeUndefined();
+  });
+
+  it("does not install a DTO read before a same-root graph rebound", async () => {
+    let resolve!: (dto: PageDto) => void;
+    backendMock.getPage.mockReturnValueOnce(new Promise<PageDto>((done) => {
+      resolve = done;
+    }));
+    const visible = group("Rebound", "page", "rebound-block");
+    const hydration = hydrateVisibleQueryPages(
+      [{ id: "rebound-block", page: "Rebound" }],
+      [visible],
+    );
+
+    await vi.waitFor(() => expect(backendMock.getPage).toHaveBeenCalledWith("Rebound", "page"));
+    notifyGraphRebound();
+    resolve(page("Rebound", "page"));
+    await hydration;
+
+    expect(pageByName("Rebound")).toBeUndefined();
+    expect(backendMock.activateEditor).not.toHaveBeenCalled();
   });
 
   it("bounds physical IPC concurrency across repeated graph switches", async () => {

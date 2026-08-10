@@ -14,19 +14,21 @@ import {
   prepareCrossPageSources,
 } from "./store";
 import { journalTitle } from "./journal";
+import { graphBinding } from "./persistence";
 import { carryKeepsContext, carryHeaderText, pushToast } from "./ui";
 import { openJournals } from "./router";
 import type { PageDto } from "./types";
 
 async function ensureLoaded(name: string, kind: "journal" | "page"): Promise<boolean> {
   if (pageByName(name)) return true;
+  const binding = graphBinding();
   const dto = await backend().getPage(name, kind);
   if (dto) {
     // A refusal here used to be invisible: this returned `true` unconditionally
     // after calling `ensurePageLoaded`, so carry went on to move blocks into
     // whichever editor happened to be loaded under that name — the wrong file.
     // Carry must stop instead. (GH #254 increment 3.)
-    if (ensurePageLoaded(dto)) return false;
+    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding })) return false;
     return true;
   }
   return false;
@@ -37,12 +39,13 @@ async function ensureLoaded(name: string, kind: "journal" | "page"): Promise<boo
 async function ensureToday(): Promise<string | null> {
   const t = journalTitle(new Date());
   if (!pageByName(t)) {
+    const binding = graphBinding();
     const dto = await backend().getPage(t, "journal");
     const page: PageDto =
       dto ?? { name: t, kind: "journal", title: t, pre_block: null, blocks: [{ id: `new-${t}`, raw: "", collapsed: false, children: [] }] };
     // Previously returned the title unconditionally, so a refused today made
     // carry proceed against an editor it had not loaded. Null means stop.
-    if (ensurePageLoaded(page)) return null;
+    if (await ensurePageLoaded(page, { expectedGraphBinding: binding })) return null;
   }
   return t;
 }

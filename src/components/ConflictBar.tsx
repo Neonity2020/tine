@@ -113,7 +113,14 @@ export function ConflictBar(): JSX.Element {
       return;
     }
     if (dto) {
-      reloadPage(dto);
+      const refusal = await reloadPage(dto);
+      if (refusal) {
+        // Presentation already consumed the shown authority. A failed/stale
+        // replacement must not clear the banner or leave it dead.
+        dropObservation(name);
+        void reobserve(name);
+        return;
+      }
       clearConflict(name);
       // The real "Use disk version" transition: `reloadPage` then `clearConflict`
       // makes the page replaceable and produces no save at all, so nothing else

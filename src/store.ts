@@ -8,7 +8,7 @@
 
 import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal, createMemo, createRoot } from "solid-js";
-import type { BlockDto, Format, PageDto, PageKind, RefGroup } from "./types";
+import type { ActivationIntent, BlockDto, EditorActivationHandle, Format, PageDto, PageKind, RefGroup } from "./types";
 import type { ClipboardBlock, ClipboardPayloadData, ClipboardPayloadSlot, ClipboardSourcePage } from "./clipboard";
 import {
   CLIPBOARD_PAYLOAD_MAX_BLOCKS,
@@ -377,6 +377,29 @@ export function setProspectiveTarget(pageName: string, target: string): void {
   prospectiveTargets.set(pageName, target);
 }
 
+function recordEditorActivation(pageName: string, handle: EditorActivationHandle): void {
+  setEditorActivation(pageName, handle.activation);
+  // Keep the exact target beside a pathless editor after first creation too.
+  // The save response is the first authoritative place the frontend learns the
+  // resolved path, and `pageToDto` must keep pinning later saves to it.
+  prospectiveTargets.set(pageName, handle.target);
+}
+
+async function retireExactEditorActivation(
+  pageName: string,
+  target: string | undefined,
+  activation: number,
+): Promise<void> {
+  clearEditorActivation(pageName, activation);
+  if (!target) return;
+  await backend().retireEditorActivation(target, activation).catch(() => {});
+}
+
+async function retireMintedActivation(handle: EditorActivationHandle | null): Promise<void> {
+  if (!handle) return;
+  await backend().retireEditorActivation(handle.target, handle.activation).catch(() => {});
+}
+
 /** Drop every activation — graph reset and teardown. */
 export function clearAllEditorActivations(): void {
   editorActivations.clear();
@@ -406,16 +429,10 @@ onGraphRebound(clearAllEditorActivations);
 export function retireEditorFor(pageName: string, path?: string): void {
   const activation = editorActivations.get(pageName);
   if (activation === undefined) return;
-  clearEditorActivation(pageName, activation);
-  const target = path ?? doc.pages.find((p) => p.name === pageName)?.path;
-  if (!target) return;
-  void backend()
-    .retireEditorActivation(target, activation)
-    .catch(() => {
-      // Best effort: the core's own compare-and-retire is the authority, and a
-      // lost retirement cannot promote anyone — it only leaves a token that no
-      // frontend DTO will ever present.
-    });
+  const target = path
+    ?? doc.pages.find((p) => p.name === pageName)?.path
+    ?? prospectiveTargets.get(pageName);
+  void retireExactEditorActivation(pageName, target, activation);
 }
 
 function toFeedPage(dto: PageDto, byId: Record<string, Node>): FeedPage {
@@ -452,7 +469,7 @@ function purgePageNodes(s: DocState, pageName: string) {
 /** Merge a page into the working set, replacing any prior copy of that page.
  *  Other loaded pages (and their nodes) are left untouched — so a page open in
  *  the sidebar survives navigating the main view elsewhere. */
-function upsertPage(dto: PageDto) {
+function upsertPage(dto: PageDto): boolean {
   // A real page with this name exists again → lift any delete tombstone so edits
   // to the freshly-(re)created page save normally.
   untombstone(dto.name);
@@ -467,20 +484,17 @@ function upsertPage(dto: PageDto) {
   // external change (content differs) still reloads + invalidates (data-safety #42).
   if (existing && pageContentMatches(dto, existing)) {
     setBaseRev(dto.name, dto.rev ?? null);
-    return;
+    return false;
   }
   // Replacing an already-loaded copy means the page's content changed under us
   // (a conflict-resolution / watcher reload). Any undo entry predating this reload
   // is stale — replaying it would clobber the just-loaded (external) version, so
   // drop those entries. (A first load has no prior entries → no-op.)
   const replacing = !!existing;
-  // A genuine replacement is a NEW editor instance, so the outgoing one must give
-  // up its identity — captured from the page being replaced, before it is gone.
-  // Leaving it live means the incoming editor inherits, under same-path Reuse, a
-  // token minted for an editor that was shown a different conflict: exactly the
-  // cross-instance authority this increment exists to prevent.
-  // (GH #254 increment 3.)
-  if (replacing) retireEditorFor(dto.name, existing?.path);
+  // Activation retirement is deliberately NOT done here. Editable DTOs enter
+  // through the two-phase installer below, which records B before compare-
+  // retiring exact A. Retiring by name from this mutation primitive can race a
+  // concurrent installer and destroy the activation it just installed.
   // Record the load baseline (the on-disk rev) so saves conflict against it.
   setBaseRev(dto.name, dto.rev ?? null);
   setDoc(
@@ -495,6 +509,7 @@ function upsertPage(dto: PageDto) {
   activatePageInstance(dto.name);
   invalidateAllMatrixDimensions();
   if (replacing) invalidateUndoForPage(dto.name);
+  return true;
 }
 
 /** Whether a reload DTO carries the SAME content (page-property pre-block + every
@@ -513,31 +528,139 @@ function pageContentMatches(dto: PageDto, page: FeedPage): boolean {
   return dto.blocks.length === page.roots.length && dto.blocks.every((b, i) => eq(b, page.roots[i]));
 }
 
-/** Load a page into the working set if it isn't already there (used by
- *  satellite surfaces — sidebar / query results / embeds — so they render the
- *  same live, editable nodes as the main view). Idempotent: never clobbers an
- *  already-loaded page's in-progress edits. */
-export function ensurePageLoaded(dto: PageDto): InstanceRefusal | null {
-  const existing = doc.pages.find((p) => p.name === dto.name);
-  if (existing && (existing.path ?? "") === (dto.path ?? "")) return null;
-  // A path-pinned route may intentionally load a duplicate-day stray with the
-  // same logical title as the canonical journal. Replace the name slot with the
-  // exact requested file instead of silently keeping (and then editing/saving)
-  // the canonical file. Full simultaneous duplicate identity is tracked by the
-  // file-identity ADR; this closes the wrong-target write immediately.
-  //
-  // But never over unsaved work (GH #304, reproduced). Replacing an incumbent
-  // that holds an edit purges its nodes while the DIRTY MARK SURVIVES and starts
-  // describing the replacement's content, and any live banner survives describing
-  // a file the editor no longer holds. Nothing is written to make a replacement
-  // possible: the request is refused and the surface that asked says why, so the
-  // user can resolve the incumbent and ask again.
-  if (existing && !mayReplaceInstance(dto.name)) {
+type CapturedEditorInstance = {
+  generation: number;
+  path?: string;
+  kind: PageKind;
+  activation?: number;
+  activationTarget?: string;
+};
+
+function captureEditorInstance(name: string): CapturedEditorInstance | null {
+  const page = pageByName(name);
+  const generation = pageInstanceGeneration(name);
+  if (!page || generation === null) return null;
+  return {
+    generation,
+    path: page.path,
+    kind: page.kind,
+    activation: editorActivationFor(name),
+    activationTarget: page.path || prospectiveTargets.get(name),
+  };
+}
+
+function isExactCapturedInstance(name: string, captured: CapturedEditorInstance | null): boolean {
+  const current = pageByName(name);
+  if (!captured) return !current && peekPageInstanceGeneration(name) === undefined;
+  return !!current
+    && current.kind === captured.kind
+    && current.path === captured.path
+    && peekPageInstanceGeneration(name) === captured.generation
+    && editorActivationFor(name) === captured.activation
+    && (current.path || prospectiveTargets.get(name)) === captured.activationTarget;
+}
+
+export type EditorInstallOptions = {
+  /** Binding captured before the read that produced the DTO. */
+  expectedGraphBinding?: number;
+  /** Explicit user-authorised discard; identity and binding still re-check. */
+  bypassReplacementGate?: boolean;
+  /** Surface/component ownership spanning the activation await. */
+  isRequestLive?: () => boolean;
+};
+
+/** Load a page into the editable working set through the activation boundary.
+ *
+ * Replacement is a two-phase protocol: capture exact A under the synchronous
+ * full gate; await B's activation; re-check both the gate and exact A; install B
+ * and record it; then compare-retire A. A failed/stale activation never installs
+ * an editable DTO. Same-instance same-content hydration stays idempotent. */
+export async function ensurePageLoaded(
+  dto: PageDto,
+  options: EditorInstallOptions = {},
+): Promise<InstanceRefusal | null> {
+  const binding = options.expectedGraphBinding ?? graphBinding();
+  if (binding !== graphBinding() || options.isRequestLive?.() === false) {
+    return { reason: "stale-instance", page: dto.name };
+  }
+
+  const captured = captureEditorInstance(dto.name);
+  const incumbent = pageByName(dto.name);
+  const samePath = !!incumbent && (incumbent.path ?? "") === (dto.path ?? "");
+  const sameInstanceHydration = !!incumbent && samePath && pageContentMatches(dto, incumbent);
+  const replacing = !!captured && !sameInstanceHydration;
+
+  // Phase 1: the complete synchronous gate, before activation. A same-instance
+  // hydration does not replace anything, so a dirty editor may safely acquire
+  // the identity it already owns.
+  if (replacing && !options.bypassReplacementGate && !mayReplaceInstance(dto.name)) {
     return { reason: "unsaved-changes", page: dto.name };
   }
+
+  // Already active exact-instance hydration is the idempotent fast path.
+  if (sameInstanceHydration && editorActivationFor(dto.name) !== undefined) return null;
+
+  let handle: EditorActivationHandle | null = null;
+  const editable = !dto.read_only && !dto.guide;
+  if (editable) {
+    try {
+      if (dto.path) {
+        // Reuse is only valid when this exact frontend instance already owns the
+        // activation, and that case returned through the fast path above.  With
+        // no local activation, mint a replacement even for a first installation:
+        // a best-effort retirement from an older destroyed editor may have failed,
+        // and inheriting that stale core record would cross editor episodes.
+        const intent: ActivationIntent = "replace";
+        handle = await backend().activateEditor(dto.path, intent);
+      } else {
+        handle = await backend().activateAbsentEditor(dto.name, dto.kind);
+      }
+    } catch {
+      return { reason: "activation-failed", page: dto.name };
+    }
+  }
+
+  // Phase 3: both graph ownership and exact incumbent identity must survive the
+  // await. Then re-evaluate the full gate in the same synchronous turn as the
+  // install. A raced B is compare-retired; A/current remains untouched.
+  if (
+    binding !== graphBinding()
+    || options.isRequestLive?.() === false
+    || !isExactCapturedInstance(dto.name, captured)
+  ) {
+    await retireMintedActivation(handle);
+    return { reason: "stale-instance", page: pageByName(dto.name)?.name ?? dto.name };
+  }
+  if (replacing && !options.bypassReplacementGate && !mayReplaceInstance(dto.name)) {
+    await retireMintedActivation(handle);
+    return { reason: "unsaved-changes", page: dto.name };
+  }
+
+  if (sameInstanceHydration) {
+    if (handle) recordEditorActivation(dto.name, handle);
+    return null;
+  }
+
+  // Phase 4: publish B's instance first, then its identity, then retire exact A.
+  // `clearEditorActivation` is compare-based, so retiring A cannot clear B.
   upsertPage(dto);
+  if (handle) recordEditorActivation(dto.name, handle);
+  if (captured?.activation !== undefined) {
+    await retireExactEditorActivation(
+      dto.name,
+      captured.activationTarget,
+      captured.activation,
+    );
+  }
   evictIfNeeded();
   return null;
+}
+
+/** Install the isolated quick-capture scratch DTO without touching core.
+ * It is the sole C9 exception: local-only, never graph-persisted, and therefore
+ * deliberately has no editor activation. */
+export function installCaptureScratchPage(dto: PageDto): void {
+  upsertPage(dto);
 }
 
 /** Load a page selected by the main graph router. `ensurePageLoaded` also serves
@@ -545,8 +668,11 @@ export function ensurePageLoaded(dto: PageDto): InstanceRefusal | null {
  * scratch editor can never write the graph. A successfully resolved main route,
  * however, is sufficient to arm ordinary persistence even when an invalidated
  * Journals reload has not landed yet. */
-export function loadRoutedPage(dto: PageDto): InstanceRefusal | null {
-  const refusal = ensurePageLoaded(dto);
+export async function loadRoutedPage(
+  dto: PageDto,
+  expectedGraphBinding = graphBinding(),
+): Promise<InstanceRefusal | null> {
+  const refusal = await ensurePageLoaded(dto, { expectedGraphBinding });
   if (refusal) {
     // A refused route must not leave the surface silently blank — that is a trap,
     // not a safeguard. The route currently marks itself loaded after this call and
@@ -554,11 +680,13 @@ export function loadRoutedPage(dto: PageDto): InstanceRefusal | null {
     // save lifecycle, so nothing would retry on its own. Say what is holding the
     // file and what resolves it, so the user can act and ask again.
     // (GH #254 increment 3.)
-    pushToast(
-      `“${refusal.page}” has unsaved changes, so the other file with that name can't be shown yet. ` +
-        `Save or resolve it, then open the file again.`,
-      "error",
-    );
+    const message = refusal.reason === "unsaved-changes"
+      ? `“${refusal.page}” has unsaved changes, so the other file with that name can't be shown yet. ` +
+        `Save or resolve it, then open the file again.`
+      : refusal.reason === "activation-failed"
+        ? `“${refusal.page}” could not be activated for editing. Open it again to retry.`
+        : `The request for “${refusal.page}” became stale. Open it again to retry.`;
+    pushToast(message, "error");
     return refusal;
   }
   setDoc("loaded", true);
@@ -717,8 +845,8 @@ function pinnedPages(): Set<string> {
 /** Replace a page in the working set from a fresh DTO (e.g. resolving a conflict
  *  with the disk version, or a watcher reload). Updates the main view and any
  *  satellite that shows it, since they share `byId`. */
-export function reloadPage(dto: PageDto) {
-  upsertPage(dto);
+export async function reloadPage(dto: PageDto): Promise<InstanceRefusal | null> {
+  return ensurePageLoaded(dto, { bypassReplacementGate: true });
 }
 
 /** Apply a watcher-driven disk reload only if it is STILL safe at this instant.
@@ -737,14 +865,35 @@ export function reloadPage(dto: PageDto) {
  *  deliberate clobber — "use disk version" is an explicit user decision.
  *
  *  Returns false when the reload was declined. */
-export function reloadPageIfStillSafe(name: string, dto: PageDto): boolean {
+export async function reloadPageIfStillSafe(
+  name: string,
+  dto: PageDto,
+  expectedGraphBinding = graphBinding(),
+): Promise<boolean> {
   // The full gate, not `reloadDisposition` alone: component-local uncommitted
   // input (the title-rename draft, IME composition) is invisible to every store
   // predicate, and this path deliberately replaces the working instance.
   if (!mayReplaceInstance(name)) return false;
   if (reloadDisposition(name) !== "reload") return false;
-  upsertPage(dto);
-  return true;
+  return (await ensurePageLoaded(dto, { expectedGraphBinding })) === null;
+}
+
+const pendingHlsRefreshes = new Map<string, () => void>();
+
+function retryHlsRefreshWhenReplaceable(name: string, binding: number): void {
+  if (pendingHlsRefreshes.has(name)) return;
+  const stop = onPageBecameReplaceable(name, () => {
+    stop();
+    pendingHlsRefreshes.delete(name);
+    if (binding !== graphBinding()) return;
+    void reloadHlsIfLoaded(name);
+  });
+  pendingHlsRefreshes.set(name, stop);
+}
+
+function clearPendingHlsRefreshes(): void {
+  for (const stop of pendingHlsRefreshes.values()) stop();
+  pendingHlsRefreshes.clear();
 }
 
 /** After a PDF highlight write changed an `hls__` page on disk, refresh its
@@ -752,19 +901,27 @@ export function reloadPageIfStillSafe(name: string, dto: PageDto): boolean {
  *  track disk — otherwise a later editor save would conflict against the highlight
  *  write. Skips a page with unsaved edits / an open conflict: the caller flushes
  *  those FIRST so they're on disk and merged in, rather than clobbered here. */
-export async function reloadHlsIfLoaded(name: string): Promise<void> {
-  if (!pageByName(name)) return;
+export async function reloadHlsIfLoaded(name: string): Promise<boolean> {
+  if (!pageByName(name)) return false;
   // The FULL gate, and re-evaluated after the await. The old dirty-or-conflicted
   // check missed uncommitted input the store cannot see — an IME composition on
   // the notes page was reproduced being destroyed here while the store was clean
   // — and checking only before the await let the page become dirty during it,
   // since `reloadPage` is a deliberate clobber. Declining is safe: the next
   // highlight write re-drives this. (GH #254 increment 3.)
-  if (!mayReplaceInstance(name)) return;
+  const binding = graphBinding();
+  if (!mayReplaceInstance(name)) {
+    retryHlsRefreshWhenReplaceable(name, binding);
+    return false;
+  }
   const dto = await backend().getPage(name, "page");
-  if (!dto) return;
-  if (!mayReplaceInstance(name)) return;
-  reloadPage(dto);
+  if (!dto || binding !== graphBinding()) return false;
+  const refusal = await ensurePageLoaded(dto, { expectedGraphBinding: binding });
+  if (refusal) {
+    if (refusal.reason === "unsaved-changes") retryHlsRefreshWhenReplaceable(name, binding);
+    return false;
+  }
+  return true;
 }
 function evictIfNeeded() {
   if (doc.pages.length <= WORKING_SET_CAP) return;
@@ -806,6 +963,7 @@ export function resetStore() {
   // storm of per-page retirements against a graph that is going away.
   clearAllEditorActivations();
   clearAllEditorLeases();
+  clearPendingHlsRefreshes();
   clearPendingBlockRefStamps();
   // Cancel pending/in-flight saves and clear all save guard state (timers, graph
   // token, dirty/baseline/tombstone) so nothing from the old graph can be written
@@ -837,12 +995,8 @@ export function resetStore() {
 /** Install `dto` unless the loaded page holds unsaved work. Reports whether it
  *  actually installed, so publication can follow installation rather than assume
  *  it. (GH #254 increment 3.) */
-function upsertUnlessDirty(dto: PageDto): boolean {
-  // The full gate, not the three store predicates alone: uncommitted input can
-  // live outside the store entirely (IME composition, the title-rename draft).
-  if (pageByName(dto.name) && !mayReplaceInstance(dto.name)) return false;
-  upsertPage(dto);
-  return true;
+async function upsertUnlessDirty(dto: PageDto, expectedGraphBinding: number): Promise<boolean> {
+  return (await ensurePageLoaded(dto, { expectedGraphBinding })) === null;
 }
 
 export type ReloadDisposition = "reload" | "conflict" | "skip";
@@ -989,22 +1143,31 @@ export function mayReplaceInstance(name: string): boolean {
 
 /** Why a replacement was refused, for the surface that asked for it. */
 export type InstanceRefusal = {
-  reason: "unsaved-changes";
+  reason: "unsaved-changes" | "stale-instance" | "activation-failed";
   /** The page holding the unsaved work — what the surface tells the user. */
   page: string;
 };
 
 /** Load a single page and make it the main view. */
 export function loadSingle(dto: PageDto, opts: { endEdit?: boolean } = {}) {
-  upsertUnlessDirty(dto);
+  // Legacy synchronous store seeding used by isolated/test surfaces. Production
+  // routed editors use `loadRoutedPage`, and feed editors use `loadFeed`; both go
+  // through activation before publication. A page seeded here still acquires its
+  // activation at the save boundary before any write.
+  if (pageByName(dto.name) && !mayReplaceInstance(dto.name)) return false;
+  upsertPage(dto);
   setDoc("feed", [dto.name]);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
+  return true;
 }
 
 /** Load the journals feed as the main view. */
-export function loadFeed(dtos: PageDto[], opts: { endEdit?: boolean } = {}) {
+export async function loadFeed(
+  dtos: PageDto[],
+  opts: { endEdit?: boolean; expectedGraphBinding?: number } = {},
+) {
   // Publication FOLLOWS installation. When the DTO is declined the name used to
   // be published into the feed anyway, so the feed rendered a dirty path-pinned
   // stray as though it were the requested canonical journal — no refusal, no
@@ -1016,19 +1179,29 @@ export function loadFeed(dtos: PageDto[], opts: { endEdit?: boolean } = {}) {
   // path-pinned stray already occupying the name made the declined canonical DTO
   // publish anyway, so the feed rendered the stray as though it were the
   // requested journal.
-  const installed = dtos.filter((d) => upsertUnlessDirty(d));
-  setDoc("feed", installed.map((d) => d.name));
+  const binding = opts.expectedGraphBinding ?? graphBinding();
+  const installed: string[] = [];
+  for (const dto of dtos) {
+    if (await upsertUnlessDirty(dto, binding)) installed.push(dto.name);
+  }
+  if (binding !== graphBinding()) return;
+  setDoc("feed", installed);
   setDoc("loaded", true);
   if (opts.endEdit !== false) endEdit("page-navigation");
   evictIfNeeded();
 }
 
 /** Append more pages to the journals feed (infinite scroll). */
-export function appendFeed(dtos: PageDto[]) {
+export async function appendFeed(
+  dtos: PageDto[],
+  expectedGraphBinding = graphBinding(),
+) {
+  const binding = expectedGraphBinding;
   for (const d of dtos) {
     if (doc.feed.includes(d.name)) continue;
     // Publication follows installation — see `loadFeed`.
-    if (!upsertUnlessDirty(d)) continue;
+    if (!(await upsertUnlessDirty(d, binding))) continue;
+    if (binding !== graphBinding()) return;
     setDoc("feed", [...doc.feed, d.name]);
   }
   evictIfNeeded();
@@ -1055,11 +1228,14 @@ export function emptyPage(name: string, kind: "journal" | "page"): PageDto {
  *  (e.g. it was an OLDER day that got deleted). The placeholder is empty and
  *  writable — `upsertPage` lifts the delete tombstone, so the first keystroke saves
  *  a fresh file, exactly like reopening the journal. */
-export function restoreTodayJournalInFeed() {
+export async function restoreTodayJournalInFeed(): Promise<boolean> {
   const title = journalTitle(new Date());
-  if (doc.feed.includes(title)) return;
-  upsertUnlessDirty(emptyPage(title, "journal"));
+  if (doc.feed.includes(title)) return true;
+  const binding = graphBinding();
+  if (!(await upsertUnlessDirty(emptyPage(title, "journal"), binding))) return false;
+  if (binding !== graphBinding()) return false;
   setDoc("feed", [title, ...doc.feed]);
+  return true;
 }
 
 function toDto(id: string): BlockDto {
@@ -2421,6 +2597,7 @@ export async function captureToPage(title: string, markdown: string): Promise<bo
 async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNode[]): Promise<boolean> {
   if (!nodes.length) return false;
   if (!pageByName(name)) {
+    const binding = graphBinding();
     const dto: PageDto =
       (await backend().getPage(name, kind)) ??
       { name, kind, title: name, pre_block: null, blocks: [], rev: null };
@@ -2428,7 +2605,7 @@ async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNo
     // slot: that would append the capture into whichever editor is loaded under
     // this name, which on a refusal is a DIFFERENT file. Returning false keeps
     // the capture text where the caller can retry it. (GH #254 increment 3.)
-    if (ensurePageLoaded(dto)) return false;
+    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding })) return false;
   }
   const page = pageByName(name);
   if (!page || !pageWritable(name)) return false;
@@ -3261,7 +3438,7 @@ export async function persistBlockRefTarget(
       retainStamp({ uuid, page, kind, path, epoch });
       return;
     }
-    if (dto && ensurePageLoaded(dto)) {
+    if (dto && await ensurePageLoaded(dto, { expectedGraphBinding: epoch })) {
       // RETAIN the request. The user-visible mutation has already happened —
       // autocomplete committed `((uuid))`, or the sidebar item is already open —
       // and this stamp is what makes those survive a restart. Skipping it leaves

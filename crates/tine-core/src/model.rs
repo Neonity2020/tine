@@ -2112,8 +2112,8 @@ pub enum ActivationIntent {
     /// burn the incumbent's authority.
     Reuse,
     /// The working instance is genuinely being replaced (`reloadPage`,
-    /// `reloadPageIfStillSafe`, PDF-notes refresh). Mints a new activation and
-    /// retires the one it replaced.
+    /// `reloadPageIfStillSafe`, PDF-notes refresh). Mints a new activation; the
+    /// frontend retires the exact incumbent only after installing the replacement.
     Replace,
 }
 
@@ -2145,7 +2145,11 @@ struct ActivationRecord {
 #[derive(Default)]
 struct EditorActivationState {
     next: u64,
-    live: std::collections::HashMap<PathBuf, ActivationRecord>,
+    // Replacement activation is two-phase across an async frontend boundary:
+    // B must become live before A can be retired. Keep every exact activation
+    // for the path during that interval; the last record is the prospective
+    // current instance returned by idempotent Reuse.
+    live: std::collections::HashMap<PathBuf, Vec<ActivationRecord>>,
 }
 
 /// The outcome of activating an editor.
@@ -15483,6 +15487,7 @@ impl Graph {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty name"));
         }
         if old.is_empty() || crate::refs::same_page(old, new) {
+            self.finish_successful_rename_editor_lifecycle();
             return Ok(()); // nothing to do (case-only rename is intentionally a no-op)
         }
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
@@ -15808,6 +15813,7 @@ impl Graph {
             }
         }
         if edits.is_empty() {
+            self.finish_successful_rename_editor_lifecycle();
             return Ok(()); // page doesn't exist / nothing references it
         }
 
@@ -16030,7 +16036,20 @@ impl Graph {
         for edit in &edits {
             self.record_managed_projection(&write, &edit.dst);
         }
+        self.finish_successful_rename_editor_lifecycle();
         Ok(())
+    }
+
+    /// An ordinary rename resets the frontend's entire working set because the
+    /// transaction can rewrite references in every open page.  The Graph itself
+    /// remains bound, so its activation registry would otherwise outlive those
+    /// destroyed editor instances and a later `Reuse` could inherit a dead
+    /// editor's authority.  Burn the whole graph-wide editor generation only
+    /// after a successful rename; an error leaves the still-mounted editors and
+    /// their conflict banners intact.
+    fn finish_successful_rename_editor_lifecycle(&self) {
+        self.editor_activations.lock().unwrap().live.clear();
+        self.revoke_all_conflict_authority();
     }
 
     /// Delete a page/journal file. Rather than unlinking, the file is moved to a
@@ -20570,10 +20589,12 @@ impl Graph {
     /// on every DTO hand-out would mint for non-editors; minting here means an
     /// activation exists exactly when a live editor does.
     ///
-    /// `Reuse` on a path that already has a live activation returns it unchanged
-    /// and does not burn it — plain re-hydration is idempotent. `Replace` mints a
-    /// new activation and retires the incumbent, which is what `reloadPage`,
-    /// `reloadPageIfStillSafe` and the PDF-notes refresh genuinely do.
+    /// `Reuse` on a path that already has a live activation returns the newest
+    /// one unchanged and does not burn it — plain re-hydration is idempotent.
+    /// `Replace` mints a
+    /// new activation while leaving the incumbent live until the frontend
+    /// completes its compare-and-retire swap, which is what `reloadPage`,
+    /// `reloadPageIfStillSafe` and the PDF-notes refresh genuinely require.
     ///
     /// An **absent** page (no file at `rel` yet) activates against a prospective
     /// target resolved now and returned to the caller. Holding it reserves nothing
@@ -20594,7 +20615,7 @@ impl Graph {
         let prospective = self.entry_for_path(&abs).is_none();
         let mut state = self.editor_activations.lock().unwrap();
         if intent == ActivationIntent::Reuse {
-            if let Some(record) = state.live.get(&abs) {
+            if let Some(record) = state.live.get(&abs).and_then(|records| records.last()) {
                 return Ok(EditorActivationHandle {
                     activation: record.activation,
                     target: rel.to_owned(),
@@ -20604,13 +20625,10 @@ impl Graph {
         }
         state.next += 1;
         let activation = EditorActivation(state.next);
-        state.live.insert(
-            abs,
-            ActivationRecord {
-                activation,
-                prospective,
-            },
-        );
+        state.live.entry(abs).or_default().push(ActivationRecord {
+            activation,
+            prospective,
+        });
         Ok(EditorActivationHandle {
             activation,
             target: rel.to_owned(),
@@ -20642,13 +20660,10 @@ impl Graph {
         let mut state = self.editor_activations.lock().unwrap();
         state.next += 1;
         let activation = EditorActivation(state.next);
-        state.live.insert(
-            abs,
-            ActivationRecord {
-                activation,
-                prospective: true,
-            },
-        );
+        state.live.entry(abs).or_default().push(ActivationRecord {
+            activation,
+            prospective: true,
+        });
         Ok(EditorActivationHandle {
             activation,
             target: rel,
@@ -20720,13 +20735,52 @@ impl Graph {
             return false;
         };
         let mut state = self.editor_activations.lock().unwrap();
-        match state.live.get(&abs) {
-            Some(record) if record.activation == activation => {
-                state.live.remove(&abs);
+        let retired = state.live.get_mut(&abs).and_then(|records| {
+            let index = records
+                .iter()
+                .position(|record| record.activation == activation)?;
+            records.remove(index);
+            Some(records.is_empty())
+        });
+        match retired {
+            Some(empty) => {
+                if empty {
+                    state.live.remove(&abs);
+                }
                 true
             }
             _ => false,
         }
+    }
+
+    /// Finish the absent-to-present transition after a successful first save and
+    /// return the activation at its exact resolved target.
+    ///
+    /// The save target can move after absent activation (for example when an
+    /// alternate extension appears), so the frontend cannot safely infer the
+    /// path from the request it sent. Returning the core's live record lets the
+    /// exact issuing editor adopt that result without minting on ordinary
+    /// re-saves. Managed storage never calls this legacy-graph operation.
+    pub fn finish_saved_editor_activation(
+        &self,
+        activation: EditorActivation,
+    ) -> Option<EditorActivationHandle> {
+        let (path, prospective) = {
+            let mut state = self.editor_activations.lock().unwrap();
+            let (path, record) = state.live.iter_mut().find_map(|(path, records)| {
+                records
+                    .iter_mut()
+                    .find(|record| record.activation == activation && record.prospective)
+                    .map(|record| (path, record))
+            })?;
+            record.prospective = false;
+            (path.clone(), record.prospective)
+        };
+        Some(EditorActivationHandle {
+            activation,
+            target: self.rel_path(&path),
+            prospective,
+        })
     }
 
     /// Is `activation` the live editor for `abs` right now?
@@ -20735,7 +20789,7 @@ impl Graph {
         state
             .live
             .get(abs)
-            .is_some_and(|record| record.activation == activation)
+            .is_some_and(|records| records.iter().any(|record| record.activation == activation))
     }
 
     /// Is this save the FIRST one from an editor that had no file when it opened?
@@ -20756,8 +20810,11 @@ impl Graph {
     fn prospective_activation_target(&self, page: &PageDto) -> Option<PathBuf> {
         let activation = EditorActivation::from_u64(page.activation?);
         let state = self.editor_activations.lock().unwrap();
-        state.live.iter().find_map(|(path, record)| {
-            (record.activation == activation && record.prospective).then(|| path.clone())
+        state.live.iter().find_map(|(path, records)| {
+            records
+                .iter()
+                .any(|record| record.activation == activation && record.prospective)
+                .then(|| path.clone())
         })
     }
 
@@ -20778,14 +20835,20 @@ impl Graph {
         activation: EditorActivation,
     ) -> bool {
         let mut state = self.editor_activations.lock().unwrap();
-        match state.live.get(from) {
-            Some(record) if record.activation == activation => {
-                let record = state.live.remove(from).expect("checked above");
-                state.live.insert(to.to_path_buf(), record);
-                true
-            }
-            _ => false,
+        let Some((record, empty)) = state.live.get_mut(from).and_then(|records| {
+            let index = records
+                .iter()
+                .position(|record| record.activation == activation)?;
+            let record = records.remove(index);
+            Some((record, records.is_empty()))
+        }) else {
+            return false;
+        };
+        if empty {
+            state.live.remove(from);
         }
+        state.live.entry(to.to_path_buf()).or_default().push(record);
+        true
     }
 
     fn revoke_conflict_authority(&self, path: &Path) {
@@ -20996,12 +21059,16 @@ impl Graph {
                 (ConflictSnapshot::Absent, None) => true,
                 _ => false,
             },
-            PinnedSaveAuthority::OrdinaryEditorSave(loaded_revision) => match loaded {
+            PinnedSaveAuthority::OrdinaryEditorSave {
+                loaded_revision,
+                prospective_editor,
+            } => match loaded {
                 Some(loaded) => loaded.entry.path == path,
                 // A pinned editor that loaded an existing file may observe its
-                // deletion and mint Absent authority. A never-loaded pinned DTO
-                // still has no creation authority of its own.
-                None => loaded_revision.is_some(),
+                // deletion and mint Absent authority. A core-minted prospective
+                // activation is the separate proof that a never-loaded pinned
+                // editor may create its exact target.
+                None => prospective_editor || loaded_revision.is_some(),
             },
             PinnedSaveAuthority::LoadedRevision(loaded_rev) => {
                 let Some(loaded) = loaded else {
@@ -21607,11 +21674,15 @@ impl Graph {
             || self.save_is_from_prospective_editor(page, &path))
         .then_some((page.kind, page.name.as_str()));
         let validation = self.validate_graph_text_target(&write, &path, requested_identity)?;
+        let prospective_editor = self.save_is_from_prospective_editor(page, &path);
         self.require_pinned_save_owner(
             page,
             &path,
             validation.target.as_ref(),
-            PinnedSaveAuthority::OrdinaryEditorSave(base_rev),
+            PinnedSaveAuthority::OrdinaryEditorSave {
+                loaded_revision: base_rev,
+                prospective_editor,
+            },
         )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
@@ -24547,6 +24618,7 @@ pub(crate) fn generated_document_page_dto(
 ) -> io::Result<PageDto> {
     assign_virtual_doc_runtime_ids(&mut document.roots, identity_namespace, name)?;
     Ok(PageDto {
+        activation: None,
         name: name.to_owned(),
         kind: PageKind::Page,
         title: name.to_owned(),
@@ -27257,7 +27329,10 @@ enum PinnedSaveAuthority<'a> {
     /// model (`specs/notes/2026-08-07-trust-model-and-threat-model-decision.md`)
     /// a byte-forging adversary is out of scope. Equal bytes therefore mean the
     /// same state regardless of which inode carries them.
-    OrdinaryEditorSave(Option<&'a str>),
+    OrdinaryEditorSave {
+        loaded_revision: Option<&'a str>,
+        prospective_editor: bool,
+    },
     /// The user was shown the conflict and chose to keep their own edits.
     ///
     /// A stale revision and a stale identity ARE the conflict being resolved —
@@ -52734,7 +52809,61 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Reuse is idempotent; replace mints a new identity and retires the old one.
+    #[test]
+    fn gh254_successful_first_save_finishes_the_exact_activation_without_churn() {
+        let root = scratch("gh254-inc3-first-save-activation");
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let prospective = graph
+            .activate_absent_editor("First save", PageKind::Page)
+            .unwrap();
+        let mut page = PageDto {
+            activation: Some(prospective.activation.as_u64()),
+            name: "First save".into(),
+            kind: PageKind::Page,
+            title: "First save".into(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                raw: "created".into(),
+                ..Default::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: prospective.target.clone(),
+            guide: false,
+        };
+
+        let revision = graph.save_page(&page, None).unwrap();
+        let finished = graph
+            .finish_saved_editor_activation(prospective.activation)
+            .expect("the successful first save must resolve its issuing activation");
+        assert_eq!(finished.activation, prospective.activation);
+        assert_eq!(finished.target, prospective.target);
+        assert!(!finished.prospective);
+        assert!(graph
+            .finish_saved_editor_activation(prospective.activation)
+            .is_none());
+
+        page.rev = Some(revision);
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        let reused = graph
+            .activate_editor(&finished.target, ActivationIntent::Reuse)
+            .unwrap();
+        assert_eq!(reused.activation, prospective.activation);
+        assert!(
+            !reused.prospective,
+            "an ordinary re-save must not churn or re-prospect the activation"
+        );
+        assert!(graph
+            .finish_saved_editor_activation(EditorActivation::from_u64(
+                prospective.activation.as_u64() + 1,
+            ))
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Reuse is idempotent; replace mints a second identity for a two-phase swap.
     ///
     /// Both halves are load-bearing. Without idempotence, ordinary re-hydration of
     /// an open page would burn the live editor's identity. Without replacement,
@@ -52761,10 +52890,15 @@ mod tests {
             "a genuine content replacement is a new editor instance"
         );
         assert!(
-            !graph.retire_editor_activation("pages/Note.md", first.activation),
-            "compare-and-retire must refuse to retire an activation that is no \
-             longer live — a late retirement of the OLD editor must not destroy \
-             the NEW one"
+            graph.retire_editor_activation("pages/Note.md", first.activation),
+            "A must remain live until the frontend installs B"
+        );
+        let reused_after_retiring_a = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Reuse)
+            .unwrap();
+        assert_eq!(
+            reused_after_retiring_a.activation, replaced.activation,
+            "compare-retiring A must not destroy the concurrently live B"
         );
         assert!(graph.retire_editor_activation("pages/Note.md", replaced.activation));
         let _ = fs::remove_dir_all(root);
@@ -52820,6 +52954,57 @@ mod tests {
         graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         graph.rename_page("Note", "Renamed").unwrap();
         assert!(graph.force_save_page(&page).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Rename resets the frontend's whole working set: reference rewrites can
+    /// make every mounted page stale, not only the page whose file moved.  The
+    /// backend Graph remains the same object, so it must explicitly burn every
+    /// activation after success rather than relying on Graph destruction.
+    #[test]
+    fn gh254_successful_rename_burns_all_editor_activations_but_failure_does_not() {
+        let root = scratch("gh254-inc3-rename-activation-lifecycle");
+        let note_path = root.join("pages/Note.md");
+        let other_path = root.join("pages/Other.md");
+        fs::write(&note_path, "- [[Other]]\n").unwrap();
+        fs::write(&other_path, "- other\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+
+        let note = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Replace)
+            .unwrap();
+        let other = graph
+            .activate_editor("pages/Other.md", ActivationIntent::Replace)
+            .unwrap();
+
+        assert!(graph.rename_page("Note", "").is_err());
+        assert!(graph.retire_editor_activation("pages/Note.md", note.activation));
+        assert!(graph.retire_editor_activation("pages/Other.md", other.activation));
+
+        let note = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Replace)
+            .unwrap();
+        let other = graph
+            .activate_editor("pages/Other.md", ActivationIntent::Replace)
+            .unwrap();
+        graph.rename_page("Note", "Renamed").unwrap();
+
+        assert!(
+            !graph.retire_editor_activation("pages/Note.md", note.activation),
+            "the moved page's destroyed editor must be retired"
+        );
+        assert!(
+            !graph.retire_editor_activation("pages/Other.md", other.activation),
+            "a reference-rewritten satellite editor must be retired too"
+        );
+        let reopened = graph
+            .activate_editor("pages/Other.md", ActivationIntent::Reuse)
+            .unwrap();
+        assert_ne!(
+            reopened.activation, other.activation,
+            "Reuse after the reset must mint for the new editor instance"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

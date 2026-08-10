@@ -260,7 +260,7 @@ describe("deferred block-ref stamp — enumerated interleavings (GH #254 increme
 
       let release: (() => void) | undefined;
       let landSave: (rev: unknown) => void = () => {};
-      store.loadRoutedPage(page("Target", INCUMBENT, "incumbent"));
+      await store.loadRoutedPage(page("Target", INCUMBENT, "incumbent"));
       if (c.incumbent === "dirty") persistence.markDirty("Target");
       if (c.incumbent === "conflicted") {
         // Conflicted is NOT dirty. `doSave` clears the dirty mark before it
@@ -394,7 +394,7 @@ describe("deferred block-ref stamp — enumerated interleavings (GH #254 increme
         // The real "Use disk version" route: adopt the disk bytes, which clears
         // the dirty mark, THEN drop the banner. Clearing the banner alone left
         // the page dirty and therefore still refusing.
-        store.reloadPage(page("Target", INCUMBENT, "disk winner"));
+        await store.reloadPage(page("Target", INCUMBENT, "disk winner"));
         ui.clearConflict("Target");
         store.sweepReplaceable();
       }

@@ -1796,6 +1796,7 @@ mod tests {
 
     fn new_page(name: &str) -> PageDto {
         PageDto {
+            activation: None,
             name: name.to_owned(),
             kind: PageKind::Page,
             title: name.to_owned(),

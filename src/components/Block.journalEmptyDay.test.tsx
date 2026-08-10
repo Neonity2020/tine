@@ -32,8 +32,8 @@ function journal(name: string, blocks: BlockDto[]): PageDto {
 }
 
 describe("journal feed empty-day editing", () => {
-  it("keeps the day's only empty root when Backspace sees the next feed block on another day", () => {
-    loadFeed([
+  it("keeps the day's only empty root when Backspace sees the next feed block on another day", async () => {
+    await loadFeed([
       journal("Today", [blk("today-empty", "")]),
       journal("Yesterday", [blk("yesterday-empty", "")]),
     ]);

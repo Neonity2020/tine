@@ -31,6 +31,7 @@ import { Block, SurfaceContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { endEditForSurface } from "../editorController";
+import { graphBinding } from "../persistence";
 
 function surfaceKey(item: SidebarItem): string {
   return `sidebar:${sidebarItemKey(item)}`;
@@ -219,6 +220,7 @@ function useEnsurePage(
   createEffect(() => {
     if (!enabled()) return;
     const epoch = graphEpoch();
+    const binding = graphBinding();
     const n = name();
     const k = kind();
     const p = path();
@@ -244,12 +246,22 @@ function useEnsurePage(
       const retryWhenFreed = (pageName: string) => {
         stopRetry?.();
         stopRetry = onPageBecameReplaceable(pageName, () => {
+          if (!active || epoch !== graphEpoch() || binding !== graphBinding()) {
+            stopRetry?.();
+            stopRetry = null;
+            return;
+          }
           if (retryInFlight) return;
           retryInFlight = true;
           void (p ? backend().getPageByPath(p) : backend().getPage(n, k))
-            .then((fresh) => {
-              if (!active || epoch !== graphEpoch() || !fresh) return;
-              if (!ensurePageLoaded(fresh)) {
+            .then(async (fresh) => {
+              if (!active || epoch !== graphEpoch() || binding !== graphBinding() || !fresh) return;
+              if (!(await ensurePageLoaded(fresh, {
+                expectedGraphBinding: binding,
+                isRequestLive: () => active
+                  && epoch === graphEpoch()
+                  && binding === graphBinding(),
+              }))) {
                 stopRetry?.();
                 stopRetry = null;
               }
@@ -262,10 +274,10 @@ function useEnsurePage(
       };
       const request = p ? backend().getPageByPath(p) : backend().getPage(n, k);
       void request
-        .then((dto) => {
+        .then(async (dto) => {
           // Drop a load that resolved after a graph switch — otherwise it would
           // insert an old-graph page into the new graph's working set.
-          if (!active || epoch !== graphEpoch()) return;
+          if (!active || epoch !== graphEpoch() || binding !== graphBinding()) return;
           if (dto) {
             // Alias-map warmup usually canonicalizes before the item is created.
             // A restored/early mixed-case item can race it; adopt the backend's
@@ -276,22 +288,35 @@ function useEnsurePage(
             // re-expanding happening to retrigger it is not a contract. Say what
             // is holding the file, so the user can resolve it and re-open.
             // (GH #254 increment 3.)
-            const refusal = ensurePageLoaded(dto);
+            const refusal = await ensurePageLoaded(dto, {
+              expectedGraphBinding: binding,
+              isRequestLive: () => active
+                && epoch === graphEpoch()
+                && binding === graphBinding(),
+            });
             if (refusal) {
               // Say why, AND resume automatically. Relying on the user collapsing
               // and re-expanding happened to work but was never a contract; the
               // item otherwise sits on an empty loading body observing nothing.
               // (GH #254 increment 3, acceptance row E2.)
-              pushToast(
-                `“${refusal.page}” has unsaved changes, so the other file with that name ` +
-                  `can't be shown in the sidebar yet. It will appear once that is resolved.`,
-                "error",
-              );
+              if (refusal.reason === "unsaved-changes") {
+                pushToast(
+                  `“${refusal.page}” has unsaved changes, so the other file with that name ` +
+                    `can't be shown in the sidebar yet. It will appear once that is resolved.`,
+                  "error",
+                );
+              } else if (refusal.reason === "activation-failed") {
+                pushToast(
+                  `“${refusal.page}” could not be activated for editing in the sidebar. ` +
+                    `Close and reopen it to retry.`,
+                  "error",
+                );
+              }
               // DURABLE, not one-shot: the retry can itself be refused again —
               // a lease taken during its awaited read is enough — and a listener
               // that unsubscribed before that read would strand the item on an
               // empty body. It stops only when the load actually succeeds.
-              retryWhenFreed(refusal.page);
+              if (refusal.reason === "unsaved-changes") retryWhenFreed(refusal.page);
             }
           }
         })

@@ -40,11 +40,11 @@ describe("replacing a loaded instance (GH #304)", () => {
     clearAllEditorLeases();
   });
 
-  it("refuses a same-name different-path load while the incumbent is dirty", () => {
-    expect(ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
+  it("refuses a same-name different-path load while the incumbent is dirty", async () => {
+    expect(await ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
     markDirty("Note");
 
-    const refusal = ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"));
+    const refusal = await ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"));
 
     expect(refusal).toEqual({ reason: "unsaved-changes", page: "Note" });
     const live = doc.pages.find((p) => p.name === "Note");
@@ -54,25 +54,25 @@ describe("replacing a loaded instance (GH #304)", () => {
     expect(doc.byId[live!.roots[0]]?.raw).toBe("incumbent");
   });
 
-  it("refuses while a component holds uncommitted input no store predicate can see", () => {
-    expect(ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
+  it("refuses while a component holds uncommitted input no store predicate can see", async () => {
+    expect(await ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
     // Not dirty, not conflicted, not saving — this is the page-title rename and
     // the IME-composition shape, where the text lives outside the store entirely.
     const release = takeEditorLease("Note");
     expect(mayReplaceInstance("Note")).toBe(false);
 
-    const refusal = ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"));
+    const refusal = await ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"));
     expect(refusal).toEqual({ reason: "unsaved-changes", page: "Note" });
 
     // And it must not wedge: releasing the lease lets the request through.
     release();
     expect(hasEditorLease("Note")).toBe(false);
-    expect(ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"))).toBeNull();
+    expect(await ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"))).toBeNull();
     expect(doc.pages.find((p) => p.name === "Note")?.path).toBe("pages/other/Note.md");
   });
 
-  it("keeps leases per component, so one surface cannot clear another's", () => {
-    ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"));
+  it("keeps leases per component, so one surface cannot clear another's", async () => {
+    await ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"));
     const a = takeEditorLease("Note");
     const b = takeEditorLease("Note");
 
@@ -87,22 +87,22 @@ describe("replacing a loaded instance (GH #304)", () => {
 
   it("retires the identity it replaces, and the one it evicts", async () => {
     const { setEditorActivation, editorActivationFor } = await import("./store");
-    ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"));
+    await ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"));
     setEditorActivation("Note", 17);
     const retire = vi.spyOn(backend(), "retireEditorActivation").mockResolvedValue(true);
 
     // A genuine replacement is a NEW editor. Leaving the old identity live means
     // the incoming editor inherits, under same-path Reuse, a token minted for an
     // editor that was shown a different conflict.
-    ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"));
+    await ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"));
 
     expect(retire).toHaveBeenCalledWith("pages/Note.md", 17);
-    expect(editorActivationFor("Note")).toBeUndefined();
+    expect(editorActivationFor("Note")).not.toBe(17);
   });
 
   it("stamps a deferred block ref once the page actually becomes replaceable", async () => {
     const { persistBlockRefTarget, takeEditorLease } = await import("./store");
-    ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
+    await ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
     const release = takeEditorLease("Target");
     const read = vi
       .spyOn(backend(), "getPageByPath")
@@ -123,7 +123,7 @@ describe("replacing a loaded instance (GH #304)", () => {
 
   it("drops a deferred stamp whose graph went away", async () => {
     const { persistBlockRefTarget, takeEditorLease } = await import("./store");
-    ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
+    await ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
     const releaseB = takeEditorLease("Target");
     vi.spyOn(backend(), "getPageByPath").mockResolvedValue(
       page("Target", "pages/other/Target.md", "requested"),
@@ -146,7 +146,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const { markDirty, flushPage } = await import("./persistence");
     const { loadRoutedPage } = await import("./store");
     // `flushPage` returns early unless the store is armed for persistence.
-    loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
+    await loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
     markDirty("Target");
     const read = vi
       .spyOn(backend(), "getPageByPath")
@@ -167,7 +167,7 @@ describe("replacing a loaded instance (GH #304)", () => {
 
   it("re-drives a deferred stamp when the incumbent is forgotten entirely", async () => {
     const { persistBlockRefTarget, forgetPage } = await import("./store");
-    ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
+    await ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
     // Dirty, which is what `forgetSaveState` clears — a lease is held by a
     // component and would legitimately survive the page being forgotten.
     markDirty("Target");
@@ -192,7 +192,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const { persistBlockRefTarget, deletePage, takeEditorLease, doc: liveDoc } = await import(
       "./store"
     );
-    ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
+    await ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
     const release = takeEditorLease("Target");
 
     let releaseRead: (dto: unknown) => void = () => {};
@@ -228,7 +228,7 @@ describe("replacing a loaded instance (GH #304)", () => {
   it("still resolves the surviving file when its same-named sibling is deleted", async () => {
     const { persistBlockRefTarget, deletePage, loadRoutedPage } = await import("./store");
     const { markConflict } = await import("./ui");
-    loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
+    await loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
     // CONFLICTED, not merely dirty. `deletePage` flushes a dirty page first, and
     // that save frees the incumbent — so the retry would fire before the delete,
     // install the survivor, and then be removed by `forgetPage`'s name-keyed
@@ -263,7 +263,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const { persistBlockRefTarget, deletePage, takeEditorLease, doc: liveDoc } = await import(
       "./store"
     );
-    ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
+    await ensurePageLoaded(page("Target", "pages/Target.md", "incumbent"));
     const release = takeEditorLease("Target");
 
     const read = vi
@@ -313,7 +313,7 @@ describe("replacing a loaded instance (GH #304)", () => {
 
   it("does not carry a deleted file's path into the next graph", async () => {
     const { persistBlockRefTarget, deletePage, resetStore, doc: liveDoc } = await import("./store");
-    ensurePageLoaded(page("Target", "pages/old/Target.md", "old"));
+    await ensurePageLoaded(page("Target", "pages/old/Target.md", "old"));
     vi.spyOn(backend(), "deletePage").mockResolvedValue(undefined as never);
     vi.spyOn(backend(), "savePage").mockResolvedValue("rev-2");
     await deletePage("Target", "page", "pages/old/Target.md");
@@ -347,7 +347,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     // not a reason to refuse.
     const { persistBlockRefTarget, deletePage, loadRoutedPage } = await import("./store");
     const { markConflict } = await import("./ui");
-    loadRoutedPage(page("Target", "pages/stray/Target.md", "incumbent"));
+    await loadRoutedPage(page("Target", "pages/stray/Target.md", "incumbent"));
     markDirty("Target");
     markConflict("Target"); // conflicted, so the delete does not flush it first
 
@@ -408,11 +408,11 @@ describe("replacing a loaded instance (GH #304)", () => {
     const { toasts, setToasts } = await import("./ui");
     setToasts([]);
 
-    expect(loadRoutedPage(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
+    expect(await loadRoutedPage(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
     markDirty("Note");
     expect(toasts()).toHaveLength(0);
 
-    const refusal = loadRoutedPage(page("Note", "pages/other/Note.md", "requested"));
+    const refusal = await loadRoutedPage(page("Note", "pages/other/Note.md", "requested"));
 
     expect(refusal).toEqual({ reason: "unsaved-changes", page: "Note" });
     const said = toasts().map((t) => t.message);
@@ -428,7 +428,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     // other refusing state it announced NOTHING when it ended, so a request
     // whose read landed mid-drag waited for a coincidental later sweep.
     const { persistBlockRefTarget, setBlockMoving, loadRoutedPage } = await import("./store");
-    loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
+    await loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
     setBlockMoving(true, "Target");
 
     const read = vi
@@ -477,7 +477,7 @@ describe("replacing a loaded instance (GH #304)", () => {
     const { markDirty, flushPage, isDirty } = await import("./persistence");
     const { changeJournalTitleFormat, setGraphMeta } = await import("./ui");
 
-    loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
+    await loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
     markDirty("Target");
     setGraphMeta({ root: "/g", journal_page_title_format: "MMM do, yyyy" } as never);
     vi.spyOn(backend(), "setJournalTitleFormat").mockResolvedValue(undefined);
@@ -524,8 +524,8 @@ describe("replacing a loaded instance (GH #304)", () => {
   });
 
   it("announces a rebind for every command that reopens the graph", async () => {
-    // Six of the seven `refresh_graph` producers never announced; the seventh
-    // only did because it was the one under review. Announced at the command
+    // Most `refresh_graph` producers once failed to announce; the one initially
+    // covered only did because it was under review. Announced at the command
     // boundary now, so a caller cannot forget.
     const { graphBinding } = await import("./persistence");
     const before = graphBinding();
@@ -536,6 +536,10 @@ describe("replacing a loaded instance (GH #304)", () => {
     const afterFormat = graphBinding();
     await backend().setLogicalOutdenting(true);
     expect(graphBinding(), "setLogicalOutdenting reopens the graph").not.toBe(afterFormat);
+
+    const afterOutdenting = graphBinding();
+    await backend().restoreBackup("2026-08-10_12-00-00");
+    expect(graphBinding(), "restoreBackup reopens the graph").not.toBe(afterOutdenting);
   });
 
   it("abandons a save whose activation was minted by the previous binding", async () => {
@@ -544,11 +548,14 @@ describe("replacing a loaded instance (GH #304)", () => {
     // it and sending it to savePage writes under an identity the new core never
     // issued. The window has to be guarded by the BINDING — the save epoch
     // deliberately does not move on a reopen, which is what made this reachable.
-    const { loadRoutedPage, editorActivationFor } = await import("./store");
+    const { loadRoutedPage, editorActivationFor, clearAllEditorActivations } = await import("./store");
     const { markDirty, flushPage } = await import("./persistence");
     const { notifyGraphRebound } = await import("./modeHooks");
 
-    loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
+    await loadRoutedPage(page("Target", "pages/Target.md", "incumbent"));
+    // A history-restored editor intentionally carries no activation; its first
+    // save acquires one through this guarded path.
+    clearAllEditorActivations();
     markDirty("Target");
 
     let handOver: (h: unknown) => void = () => {};
@@ -574,9 +581,9 @@ describe("replacing a loaded instance (GH #304)", () => {
     expect(saved, "nor written under").not.toHaveBeenCalled();
   });
 
-  it("allows the replacement when the incumbent is clean", () => {
-    expect(ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
-    expect(ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"))).toBeNull();
+  it("allows the replacement when the incumbent is clean", async () => {
+    expect(await ensurePageLoaded(page("Note", "pages/Note.md", "incumbent"))).toBeNull();
+    expect(await ensurePageLoaded(page("Note", "pages/other/Note.md", "replacement"))).toBeNull();
     expect(doc.pages.find((p) => p.name === "Note")?.path).toBe("pages/other/Note.md");
   });
 });

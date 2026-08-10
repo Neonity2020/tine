@@ -631,12 +631,17 @@ async function ensureEditorActivation(name: string): Promise<void> {
   const instanceAtStart = peekPageInstanceGeneration(name);
   try {
     const handle = page.path
-      ? await backend().activateEditor(page.path, "reuse")
+      // No local activation means there is nothing this exact instance may
+      // legitimately reuse. Minting replaces any stale core record left by a
+      // failed best-effort retirement instead of inheriting another editor's
+      // conflict authority.
+      ? await backend().activateEditor(page.path, "replace")
       : await backend().activateAbsentEditor(name, page.kind);
     // Re-check across the await. A graph switch or a re-install makes this a
     // DIFFERENT editor, and recording the handle then would hand one editor's
     // identity to another — reproduced writing a replacement graph's page.
     if (
+      handle &&
       editorActivationFor(name) === undefined &&
       graphBindingRev === token &&
       (pageByName(name)?.path ?? "") === pathAtStart &&
@@ -649,6 +654,13 @@ async function ensureEditorActivation(name: string): Promise<void> {
       // a save builds its snapshot disturbs cut retirement, which is
       // authority-bound to the exact loaded instance. (GH #254 increment 3.)
       if (handle.prospective && handle.target) setProspectiveTarget(name, handle.target);
+    } else if (handle) {
+      // The core minted this identity, but the exact editor that requested it
+      // disappeared while IPC was in flight. Leaving it live lets a later Reuse
+      // hand an unowned activation to another editor of the same path.
+      await backend()
+        .retireEditorActivation(handle.target, handle.activation)
+        .catch(() => {});
     }
   } catch {
     // Non-fatal, as above.
@@ -733,6 +745,8 @@ async function doSave(
   // invalidating this save, so the two questions need their own counters here
   // too. (GH #254 increment 3, round 15.)
   const bindingAtStart = graphBindingRev;
+  const activationInstanceAtStart = peekPageInstanceGeneration(name);
+  const activationPathAtStart = pageByName(name)?.path ?? "";
   // Acquire this editor's identity before the DTO is built, so `pageToDto` can
   // stamp it. Keyed through the STORE's registry, never by path alone: a copied
   // DTO does not travel this path, never acquires an identity, and is refused on
@@ -743,7 +757,12 @@ async function doSave(
   // serializes the replacement graph's bytes and writes them anyway (reproduced,
   // with `activation: undefined`, which is exactly why an identity check alone
   // could not catch it). (GH #254 increment 3.)
-  if (graphToken !== token || graphBindingRev !== bindingAtStart) return false;
+  if (
+    graphToken !== token
+    || graphBindingRev !== bindingAtStart
+    || peekPageInstanceGeneration(name) !== activationInstanceAtStart
+    || (pageByName(name)?.path ?? "") !== activationPathAtStart
+  ) return false;
   const dto = measureIssue248("frontend.pageToDtoMs", () => pageToDto(name));
   if (!dto) {
     // Two very different reasons, and they must not share an outcome (audit
@@ -769,9 +788,11 @@ async function doSave(
   }
   dirty.delete(name);
   const baseline = baseRev.get(name) ?? null;
+  const issuingInstance = peekPageInstanceGeneration(name);
+  const issuingActivation = dto.activation;
   try {
     const observation = intent.kind === "force" ? intent.observation : null;
-    const rev = await measureIssue248Async("frontend.savePageAwaitMs", () =>
+    const saved = await measureIssue248Async("frontend.savePageAwaitMs", () =>
       backend().savePage(
         dto,
         baseline,
@@ -780,10 +801,35 @@ async function doSave(
         observation?.kind === "managed" ? observation.observation : null,
       )
     );
+    const rev = typeof saved === "string" ? saved : saved.revision;
     // A reload/rename/delete/rebind while savePage was in flight invalidates the
     // retirement proof even if those bytes landed. Never let that stale success
     // authorize identity reuse or update the replacement instance's baseline.
-    if (expectedCutSource && !cutSourceUsable(expectedCutSource)) return false;
+    const cutStillUsable = !expectedCutSource || cutSourceUsable(expectedCutSource);
+    const exactIssuerStillLive = cutStillUsable
+      && graphBindingRev === bindingAtStart
+      && peekPageInstanceGeneration(name) === issuingInstance
+      && editorActivationFor(name) === issuingActivation;
+    if (typeof saved !== "string" && saved.activation) {
+      if (exactIssuerStillLive) {
+        // A first-create response may resolve/retarget the activation. It belongs
+        // only to the exact page instance and graph binding that issued this save;
+        // a late success must never bless a replacement editor.
+        setEditorActivation(name, saved.activation.activation);
+        setProspectiveTarget(name, saved.activation.target);
+      } else {
+        // The save landed, but its editor disappeared while it was in flight.
+        // Retire the returned exact handle so the successful response cannot
+        // leave unowned override authority behind.
+        await backend()
+          .retireEditorActivation(saved.activation.target, saved.activation.activation)
+          .catch(() => {});
+      }
+    }
+    // The durable save may have completed, but its caller no longer owns the
+    // current frontend instance. Do not update that replacement's baseline,
+    // clear its conflict, or release move barriers on its behalf.
+    if (!exactIssuerStillLive) return false;
     if (token === graphToken) {
       baseRev.set(name, rev);
       if (baseline === null) bumpPageInventoryRev();

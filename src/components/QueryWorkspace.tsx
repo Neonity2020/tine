@@ -27,6 +27,7 @@ import type {
   QueryExplainNode,
   QueryHit,
   RefGroup,
+  SavePageResult,
 } from "../types";
 import { QueryBuilder } from "./QueryBuilder";
 import { SearchResultRow, buildSearchExcerpt } from "./SearchResultRow";
@@ -49,7 +50,7 @@ export interface MaterializeQueryInput {
 
 export interface MaterializeQueryDependencies {
   getPage(name: string, kind: "page"): Promise<PageDto | null>;
-  savePage(page: PageDto, baseRev: null, force: false): Promise<string>;
+  savePage(page: PageDto, baseRev: null, force: false): Promise<SavePageResult>;
   /** Rust-authoritative friendly-search validation; required before every nonblank friendly save. */
   runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane: string, explain: boolean): Promise<QueryExecution>;
 }
@@ -134,7 +135,8 @@ export async function materializeQueryWorkspace(
         children: [],
       }],
     };
-    const rev = await deps.savePage(page, null, false);
+    const saved = await deps.savePage(page, null, false);
+    const rev = typeof saved === "string" ? saved : saved.revision;
     bumpPageInventoryRev();
     return { ok: true, name, page, rev };
   } catch (error) {

@@ -85,6 +85,8 @@ const UNSCANNED_SOURCES: &[(&str, &str)] = &[
 /// Sorted by name. Keep it that way; the tests compare sorted sets and the
 /// diff is the point.
 const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
+    ("activate_absent_editor", ManagedRouted),
+    ("activate_editor", ManagedRouted),
     ("activate_sparse_v2", NoGraphSlot),
     ("app_platform", NoGraphSlot),
     ("apply_spellcheck", NoGraphSlot),
@@ -161,6 +163,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("page_print_html", ManagedRouted),
     ("prepare_tine_quit", NoGraphSlot),
     ("prepare_sparse_v2_share", NoGraphSlot),
+    ("present_conflict_override", LegacyOnly),
     ("preview_block", ManagedRouted),
     ("publish_html", ManagedRouted),
     ("query_facets", ManagedRouted),
@@ -179,6 +182,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("resolve_blocks", ManagedRouted),
     ("resolve_sync_conflict", ManagedRouted),
     ("restore_backup", LegacyOnly),
+    ("retire_editor_activation", LegacyOnly),
     ("run_advanced_query", ManagedRouted),
     ("run_graph_search", ManagedRouted),
     ("run_query", ManagedRouted),
@@ -254,8 +258,16 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
         "legacy-only by construction: reports the migration",
     ),
     (
+        "present_conflict_override",
+        "managed conflicts use actor-issued observations, not Direct Files editor activations",
+    ),
+    (
         "restore_backup",
         "legacy zip backups have no managed analogue",
+    ),
+    (
+        "retire_editor_activation",
+        "managed editors receive no Direct Files activation to retire",
     ),
     (
         "set_backup_keep",

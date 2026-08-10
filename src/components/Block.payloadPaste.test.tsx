@@ -54,11 +54,11 @@ describe("private block payload paste necessity", () => {
     const host = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const preserved = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     seedHost(host);
-    ensurePageLoaded({
+    await ensurePageLoaded({
       name: "Source", kind: "page", title: "Source", pre_block: null, format: "md",
       blocks: [{ id: preserved, raw: `identity\nid:: ${preserved}`, collapsed: false, children: [] }],
     });
-    ensurePageLoaded({
+    await ensurePageLoaded({
       name: "References", kind: "page", title: "References", pre_block: null, format: "md",
       blocks: [{ id: "referrer", raw: `See ((${preserved}))`, collapsed: false, children: [] }],
     });

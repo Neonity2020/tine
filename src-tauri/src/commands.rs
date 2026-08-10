@@ -380,6 +380,16 @@ pub(crate) struct ManagedConflictObservation {
     revision: String,
 }
 
+/// Save transport result. Direct Files includes the activation at its resolved
+/// target when an absent editor successfully becomes present. Managed storage
+/// preserves its existing revision semantics and returns no activation.
+#[derive(Serialize)]
+pub(crate) struct SavePageResult {
+    revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation: Option<tine_core::EditorActivationHandle>,
+}
+
 fn sparse_save_request(
     page: PageDto,
     base_rev: Option<String>,
@@ -987,7 +997,7 @@ pub(crate) async fn save_page(
     // ignores this; managed Keep mine cannot proceed without both path and rev.
     managed_conflict_observation: Option<ManagedConflictObservation>,
     state: GraphContext<'_>,
-) -> Result<String, String> {
+) -> Result<SavePageResult, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let benchmark_started = std::env::var_os("TINE_ISSUE248_BENCH").map(|_| Instant::now());
@@ -1019,10 +1029,18 @@ pub(crate) async fn save_page(
                     // when the OS coalesces Tine's own file event; otherwise that
                     // derivative queue can remain pending until unrelated I/O.
                     crate::state::poke_watcher(&state);
-                    result
+                    result.map(|revision| SavePageResult {
+                        revision,
+                        activation: None,
+                    })
                 }
                 None => {
                     let graph = slot.legacy_graph()?;
+                    let first_save_activation = base_rev
+                        .is_none()
+                        .then_some(page.activation)
+                        .flatten()
+                        .map(tine_core::EditorActivation::from_u64);
                     // Always timed, not just under the issue-248 benchmark env
                     // var. A save that takes minutes is the thing users report,
                     // and a measurement that only exists when someone thought to
@@ -1053,7 +1071,15 @@ pub(crate) async fn save_page(
                         );
                     }
                     report_direct_save_diagnostics(&graph, elapsed, result.as_ref().err());
-                    result.map_err(direct_save_error_message)
+                    result.map_err(direct_save_error_message).map(|revision| {
+                        let activation = first_save_activation.and_then(|activation| {
+                            graph.finish_saved_editor_activation(activation)
+                        });
+                        SavePageResult {
+                            revision,
+                            activation,
+                        }
+                    })
                 }
             }
         };
@@ -3581,14 +3607,19 @@ pub(crate) async fn activate_editor(
     path: String,
     intent: tine_core::ActivationIntent,
     state: GraphContext<'_>,
-) -> Result<tine_core::EditorActivationHandle, String> {
+) -> Result<Option<tine_core::EditorActivationHandle>, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.legacy_graph()?
-            .activate_editor(&path, intent)
-            .map_err(|error| error.to_string())
+        match sparse_application_handle(&slot)? {
+            Some(_) => Ok(None),
+            None => slot
+                .legacy_graph()?
+                .activate_editor(&path, intent)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -3601,14 +3632,19 @@ pub(crate) async fn activate_absent_editor(
     name: String,
     kind: PageKind,
     state: GraphContext<'_>,
-) -> Result<tine_core::EditorActivationHandle, String> {
+) -> Result<Option<tine_core::EditorActivationHandle>, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
-        slot.legacy_graph()?
-            .activate_absent_editor(&name, kind)
-            .map_err(|error| error.to_string())
+        match sparse_application_handle(&slot)? {
+            Some(_) => Ok(None),
+            None => slot
+                .legacy_graph()?
+                .activate_absent_editor(&name, kind)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4006,6 +4042,32 @@ mod application_page_authority_tests {
         assert!(mapped.contains(&20260729));
         assert!(!mapped.contains(&20260728));
         assert!(!mapped.contains(&20260727));
+    }
+
+    #[test]
+    fn save_response_keeps_managed_compatibility_and_serializes_direct_activation() {
+        let managed = serde_json::to_value(SavePageResult {
+            revision: "managed-revision".into(),
+            activation: None,
+        })
+        .unwrap();
+        assert_eq!(
+            managed,
+            serde_json::json!({ "revision": "managed-revision" })
+        );
+
+        let direct = serde_json::to_value(SavePageResult {
+            revision: "direct-revision".into(),
+            activation: Some(tine_core::EditorActivationHandle {
+                activation: tine_core::EditorActivation::from_u64(41),
+                target: "pages/New.md".into(),
+                prospective: false,
+            }),
+        })
+        .unwrap();
+        assert_eq!(direct["activation"]["activation"], 41);
+        assert_eq!(direct["activation"]["target"], "pages/New.md");
+        assert_eq!(direct["activation"]["prospective"], false);
     }
 
     #[test]

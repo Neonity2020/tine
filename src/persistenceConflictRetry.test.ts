@@ -41,6 +41,7 @@ vi.mock("./store", () => ({
   pageToDto: (name: string) => ({
     name, kind: "page", title: name, pre_block: null, blocks: [],
     format: "markdown", path: draftPath, guide: false, read_only: false,
+    activation: 1,
   }),
 }));
 

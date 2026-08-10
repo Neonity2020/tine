@@ -93,7 +93,7 @@ import {
   reloadPageIfStillSafe,
   restoreTodayJournalInFeed,
 } from "./store";
-import { applyDivergenceVerdict, isSaving, reconcileExternalChange } from "./persistence";
+import { applyDivergenceVerdict, graphBinding, isSaving, reconcileExternalChange } from "./persistence";
 import type { QuickCaptureAck, QuickCaptureRequest } from "./quickCaptureAck";
 import { backend, isTauri, type GraphChange } from "./backend";
 import { parserFailed } from "./render/parse";
@@ -191,10 +191,12 @@ function journalsFeedOwner(
   routes: Array<{ paneId: string; route: ReturnType<PaneRouter["route"]> }>
 ): JournalsFeedOwner | null {
   const epoch = graphEpoch();
+  const binding = graphBinding();
   const owners = routes.filter((p) => p.route.kind === "journals");
   if (!owners.length) return null;
   return {
     graphEpoch: epoch,
+    graphBinding: binding,
     isLive: () =>
       graphEpoch() === epoch && owners.some((p) =>
         layoutPaneIds().includes(p.paneId) && sameRoute(paneRouter(p.paneId).route(), p.route)
@@ -210,6 +212,7 @@ function requestJournalFeedWatcherRestart(
 }
 
 export async function handleGraphChange(c: GraphChange) {
+  const binding = graphBinding();
   // The backend watcher has already landed this transaction in its graph cache.
   // Invalidate every derived visible-entity view even when the changed page is
   // outside the bounded frontend working set (#166); loaded pages are refreshed
@@ -238,7 +241,7 @@ export async function handleGraphChange(c: GraphChange) {
       }
     }
     if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
-      restoreTodayJournalInFeed();
+      await restoreTodayJournalInFeed();
       requestJournalFeedWatcherRestart(routes);
     }
     return;
@@ -258,6 +261,7 @@ export async function handleGraphChange(c: GraphChange) {
     // conflict here blocks every subsequent save of the very edit it warns about.
     if (!isSaving(c.name)) {
       const current = await backend().getPage(c.name, c.kind);
+      if (binding !== graphBinding()) return;
       await applyDivergenceVerdict(c.name, { exists: !!current, rev: current?.rev ?? null });
     }
     if (c.kind === "journal") requestJournalFeedWatcherRestart(routes);
@@ -265,7 +269,7 @@ export async function handleGraphChange(c: GraphChange) {
   }
   if (routes.some((p) => p.route.kind === "page" && p.route.name === c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name));
+    if (dto) await reloadPageIfStillSafe(c.name, toLoadablePage(dto, c.name), binding);
     // A page surface may have the same journal loaded while another live pane
     // shows Journals.  Reloading that DTO is not feed reconciliation: always
     // give the live feed owner its authoritative null-cursor restart too.
@@ -275,7 +279,7 @@ export async function handleGraphChange(c: GraphChange) {
   if (c.kind === "journal" && routes.some((p) => p.route.kind === "journals")) {
     if (pageByName(c.name)) {
       const dto = await backend().getPage(c.name, c.kind);
-      if (dto) reloadPageIfStillSafe(c.name, dto);
+      if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
       requestJournalFeedWatcherRestart(routes);
       return;
     }
@@ -287,11 +291,12 @@ export async function handleGraphChange(c: GraphChange) {
   }
   if (pageByName(c.name) && !doc.feed.includes(c.name)) {
     const dto = await backend().getPage(c.name, c.kind);
-    if (dto) reloadPageIfStillSafe(c.name, dto);
+    if (dto) await reloadPageIfStillSafe(c.name, dto, binding);
   }
 }
 
 export async function handleSparseV2Changed() {
+  const binding = graphBinding();
   // Managed reconciliation reports one admitted aggregate epoch rather than
   // legacy per-file changes. Refresh only live surfaces and invalidate the
   // bounded inventory; unloaded pages remain demand-loaded from SQLite.
@@ -312,6 +317,7 @@ export async function handleSparseV2Changed() {
     // it with an aggregate epoch can only produce a verdict on staler evidence.
     if (disposition === "conflict" && isSaving(route.name)) continue;
     const dto = await backend().getPage(route.name, route.pageKind);
+    if (binding !== graphBinding()) return;
     if (disposition === "conflict") {
       // The page has an unsaved edit. Prove this page actually diverged before
       // blocking its saves — the epoch alone says only that SOMETHING was
@@ -320,7 +326,7 @@ export async function handleSparseV2Changed() {
       await applyDivergenceVerdict(route.name, { exists: !!dto, rev: dto?.rev ?? null });
       continue;
     }
-    if (dto) reloadPageIfStillSafe(route.name, toLoadablePage(dto, route.name));
+    if (dto) await reloadPageIfStillSafe(route.name, toLoadablePage(dto, route.name), binding);
   }
   requestJournalFeedWatcherRestart(routes);
 }

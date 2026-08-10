@@ -106,8 +106,8 @@ afterEach(() => {
 });
 
 describe("history parity", () => {
-  it("page-only undo/redo removes only A's newest interleaved raw/structural entries", () => {
-    store.loadFeed([
+  it("page-only undo/redo removes only A's newest interleaved raw/structural entries", async () => {
+    await store.loadFeed([
       page("A", [block("a", "alpha")]),
       page("B", [block("b", "beta")]),
     ]);
@@ -144,8 +144,8 @@ describe("history parity", () => {
     }
   });
 
-  it("defaults to global selection and the mode toggle switches to route-page selection", () => {
-    store.loadFeed([
+  it("defaults to global selection and the mode toggle switches to route-page selection", async () => {
+    await store.loadFeed([
       page("A", [block("a", "alpha")]),
       page("B", [block("b", "beta")]),
     ]);
@@ -174,8 +174,8 @@ describe("history parity", () => {
     expect(toasts().at(-1)?.message).toBe("Undo/redo mode: Page only");
   });
 
-  it("captures raw-entry route/sidebar/editor context and restores a clamped selection request", () => {
-    store.loadFeed([
+  it("captures raw-entry route/sidebar/editor context and restores a clamped selection request", async () => {
+    await store.loadFeed([
       page("A", [block("a", "abc")]),
       page("B", [block("b", "beta")]),
     ]);
@@ -234,8 +234,8 @@ describe("history parity", () => {
     });
   });
 
-  it("keeps data replay and stack order intact when saved route/block context is missing", () => {
-    store.loadFeed([page("B", [block("b", "before")])]);
+  it("keeps data replay and stack order intact when saved route/block context is missing", async () => {
+    await store.loadFeed([page("B", [block("b", "before")])]);
     const before = dtoBytes("B");
     setRoute("Deleted page");
     editTarget("deleted-block", { start: 7, end: 12 }, "gone-owner", "gone-surface");

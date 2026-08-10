@@ -2,6 +2,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { backend } from "../backend";
+import { graphBinding } from "../persistence";
+import { notifyGraphRebound } from "../modeHooks";
 import { initParser } from "../render/parse";
 import {
   doc,
@@ -68,9 +70,10 @@ function tick(): Promise<void> {
 }
 
 async function flushMicrotasks() {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
+  // Editable DTO installation now includes an activation IPC boundary before
+  // feed publication. Drain the resulting promise chain, not just the original
+  // read + resource continuation.
+  for (let i = 0; i < 12; i++) await Promise.resolve();
 }
 
 function localDay() {
@@ -193,7 +196,7 @@ describe("Journals feed generation lifecycle", () => {
     const mounted = mount(() => <PageView />);
     try {
       await flushMicrotasks();
-      const owner = { graphEpoch: graphEpoch(), isLive: () => true };
+      const owner = { graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true };
       const duplicate = reloadJournalsFeedFromStart(owner);
       await flushMicrotasks();
       expect(api).toHaveBeenCalledTimes(1);
@@ -202,11 +205,32 @@ describe("Journals feed generation lifecycle", () => {
       expect(doc.feed).toContain("single-flight");
 
       const beforeInactive = api.mock.calls.length;
-      await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => false });
+      await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => false });
       expect(api).toHaveBeenCalledTimes(beforeInactive);
     } finally {
       mounted.dispose();
     }
+  });
+
+  it("does not publish a feed response read before a same-root graph rebound", async () => {
+    let resolveFeed!: (value: JournalFeedPage) => void;
+    vi.spyOn(backend(), "journalFeedPage").mockReturnValueOnce(new Promise((resolve) => {
+      resolveFeed = resolve;
+    }));
+    const owner = {
+      graphEpoch: graphEpoch(),
+      graphBinding: graphBinding(),
+      isLive: () => true,
+    };
+    const loading = reloadJournalsFeedFromStart(owner);
+    await vi.waitFor(() => expect(backend().journalFeedPage).toHaveBeenCalledWith(3, null));
+
+    notifyGraphRebound();
+    resolveFeed(feedResponse([journalDto("old-binding-feed")]));
+    await loading;
+
+    expect(doc.feed).not.toContain("old-binding-feed");
+    expect(pageByName("old-binding-feed")).toBeUndefined();
   });
 
   it("arms one local-calendar timer and cleans it up when the Journals surface disposes", async () => {
@@ -342,7 +366,7 @@ describe("Journals feed generation lifecycle", () => {
     });
     startEditing("sidebar", 0);
     const call = vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([journalDto("fresh")]));
-    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => true });
+    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
     expect(call).toHaveBeenCalledTimes(1);
     expect(doc.feed).toContain("fresh");
   });
@@ -356,7 +380,7 @@ describe("Journals feed generation lifecycle", () => {
     const before = pageByName(today);
     setRaw("feed", "unsaved changed");
     const call = vi.spyOn(backend(), "journalFeedPage").mockResolvedValue(feedResponse([journalDto("would-clobber")]));
-    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => true });
+    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
     expect(call).not.toHaveBeenCalled();
     expect(pageByName(today)).toBe(before);
     expect(doc.feed).toEqual([today]);
@@ -365,9 +389,9 @@ describe("Journals feed generation lifecycle", () => {
   it("rejects a false owner before generation acquisition so its live request still lands", async () => {
     let resolveLive!: (value: JournalFeedPage) => void;
     const api = vi.spyOn(backend(), "journalFeedPage").mockImplementation(() => new Promise((resolve) => { resolveLive = resolve; }));
-    const live = reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => true });
+    const live = reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
     await flushMicrotasks();
-    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => false });
+    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => false });
     expect(api).toHaveBeenCalledTimes(1);
     resolveLive(feedResponse([journalDto("live-response")]));
     await live;
@@ -412,7 +436,7 @@ describe("Journals feed generation lifecycle", () => {
       await flushMicrotasks();
     }
     try {
-      await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => true });
+      await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
       await flushMicrotasks();
       expect(api).not.toHaveBeenCalled();
       expect(pageByName(today)).toBe(oldPage);
@@ -450,7 +474,7 @@ describe("Journals feed generation lifecycle", () => {
     const api = vi.spyOn(backend(), "journalFeedPage")
       .mockRejectedValueOnce(new Error("temporary backend error"))
       .mockResolvedValueOnce(feedResponse([journalDto("retried", "fresh content")]));
-    const owner = { graphEpoch: graphEpoch(), isLive: () => true };
+    const owner = { graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true };
     await reloadJournalsFeedFromStart(owner);
     expect(doc.feed).toEqual([today]);
     await reloadJournalsFeedFromStart(owner);
@@ -462,7 +486,7 @@ describe("Journals feed generation lifecycle", () => {
     const api = vi.spyOn(backend(), "journalFeedPage")
       .mockResolvedValueOnce(feedResponse([journalDto("wrong-day")], { as_of_day: 19990101 }))
       .mockResolvedValueOnce(feedResponse([journalDto("matched-day")]));
-    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => true });
+    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
     expect(api).toHaveBeenCalledTimes(2);
     expect(doc.feed).toContain("matched-day");
   });
@@ -503,17 +527,17 @@ describe("Journals feed generation lifecycle", () => {
     // completed generation first, as a real Journals route would, so this test
     // isolates append ownership instead of inheriting another test's retry.
     api.mockResolvedValueOnce(feedResponse([journalDto("baseline")]));
-    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => true });
+    await reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
     api.mockReset()
       .mockResolvedValueOnce(feedResponse([journalDto("initial")], { next_before_day: 20300714, done: false }))
       .mockImplementationOnce(() => new Promise((resolve) => { resolveAppend = resolve; }))
       .mockImplementationOnce(() => new Promise((resolve) => { resolveRestart = resolve; }));
     const mounted = mount(() => <PageView />);
     try {
-      await tick(); await tick();
+      await flushMicrotasks();
       const append = extendFeedForScroll();
       await flushMicrotasks();
-      const restart = reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), isLive: () => true });
+      const restart = reloadJournalsFeedFromStart({ graphEpoch: graphEpoch(), graphBinding: graphBinding(), isLive: () => true });
       await flushMicrotasks();
       resolveAppend(feedResponse([journalDto("stale-append")], { next_before_day: null, done: true }));
       await append;
@@ -645,8 +669,7 @@ describe("zoomed block view", () => {
 
     const { root, dispose } = mount(() => <PageView />);
     try {
-      await tick();
-      await tick();
+      await flushMicrotasks();
       expect(root.querySelector(".zoomed-page")).not.toBeNull();
       expect(root.querySelector(`[data-block-id="${transient}"]`)).not.toBeNull();
       expect(root.textContent).toContain("Fresh zoom target");
@@ -684,8 +707,8 @@ describe("zoomed block view", () => {
 
     const { root, dispose } = mount(() => <PageView />);
     try {
-      await tick();
-      await tick();
+      await flushMicrotasks();
+      await flushMicrotasks();
       expect(root.querySelector(`[data-block-id="${child}"]`)).not.toBeNull();
       expect(doc.byId[parent].collapsed).toBe(true);
     } finally {
@@ -719,7 +742,7 @@ describe("zoomed block view", () => {
     focusBlock(parent);
     const { root, dispose } = mount(() => <PageView />);
     try {
-      await tick();
+      await flushMicrotasks();
       await tick();
       startEditing(parent, 0);
       await tick();
@@ -988,8 +1011,9 @@ describe("page actions entry point", () => {
 
     const { root, dispose } = mount(() => <><PageView /><PageView /></>);
     try {
-      await tick();
-      await tick();
+      await vi.waitFor(() => {
+        expect(root.querySelectorAll("[data-page-actions-trigger]")).toHaveLength(2);
+      });
       const triggers = [...root.querySelectorAll<HTMLButtonElement>("[data-page-actions-trigger]")];
       expect(triggers).toHaveLength(2);
       expect(triggers.map((trigger) => trigger.getAttribute("aria-expanded"))).toEqual(["false", "false"]);
@@ -1075,17 +1099,16 @@ describe("page actions entry point", () => {
     mainPaneRouter.openPage(dto.name, "page", { inPlace: true });
     const { root, dispose } = mount(() => <PageView />);
     try {
-      await tick();
-      await tick();
+      await flushMicrotasks();
       expect(root.querySelector("[data-page-actions-trigger]")).not.toBeNull();
 
       setDoc("pages", 0, "kind", "journal");
       mainPaneRouter.openPage(dto.name, "journal", { inPlace: true });
-      await tick();
+      await flushMicrotasks();
       expect(root.querySelector("[data-page-actions-trigger]")).not.toBeNull();
 
       setDoc("pages", 0, "guide", true);
-      await tick();
+      await flushMicrotasks();
       expect(root.querySelector("[data-page-actions-trigger]")).toBeNull();
     } finally {
       dispose();
@@ -1242,6 +1265,38 @@ describe("page route loading", () => {
       await flushMicrotasks();
 
       expect(pageByName(stale.name)).toBeUndefined();
+      expect(doc.loaded).toBe(false);
+    } finally {
+      dispose();
+    }
+  });
+
+  it("does not install a routed DTO read before a same-root graph rebound", async () => {
+    const stale: PageDto = {
+      name: "Rebound page",
+      kind: "page",
+      title: "Rebound page",
+      pre_block: null,
+      path: "pages/Rebound page.md",
+      rev: "rebound-rev",
+      blocks: [{ id: "rebound-page-block", raw: "old graph", collapsed: false, children: [] }],
+    };
+    let resolveStale!: (value: PageDto) => void;
+    vi.spyOn(backend(), "getPage").mockReturnValueOnce(new Promise((resolve) => {
+      resolveStale = resolve;
+    }));
+    const activate = vi.spyOn(backend(), "activateEditor");
+    mainPaneRouter.openPage(stale.name, stale.kind, { inPlace: true });
+
+    const { dispose } = mount(() => <PageView />);
+    try {
+      await vi.waitFor(() => expect(backend().getPage).toHaveBeenCalledWith(stale.name, stale.kind));
+      notifyGraphRebound();
+      resolveStale(stale);
+      await flushMicrotasks();
+
+      expect(pageByName(stale.name)).toBeUndefined();
+      expect(activate).not.toHaveBeenCalled();
       expect(doc.loaded).toBe(false);
     } finally {
       dispose();
@@ -1445,7 +1500,7 @@ describe("page properties", () => {
 
     const { root, dispose } = mount(() => <PageView />);
     try {
-      await tick();
+      await flushMicrotasks();
       const rows = [...root.querySelectorAll<HTMLElement>(".prop-row")];
       const row = (key: string) => rows.find((candidate) => candidate.querySelector(".prop-key")?.textContent === key)!;
       expect([...row("tags").querySelectorAll(".page-ref")].map((link) => link.textContent)).toEqual(["books", "Knowledge work"]);

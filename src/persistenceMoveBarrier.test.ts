@@ -36,6 +36,7 @@ vi.mock("./store", () => ({
     path: `pages/${name}.md`,
     guide: false,
     read_only: false,
+    activation: 1,
   }),
 }));
 

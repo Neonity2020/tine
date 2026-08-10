@@ -10,6 +10,7 @@ import type {
   BacklinkFilterTarget,
   AssetInfo,
   EditorActivationHandle,
+  SavePageResult,
   PageKind,
   GraphMeta,
   GuideCopyResult,
@@ -266,7 +267,7 @@ export interface Backend {
     force?: boolean,
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
-  ): Promise<string>;
+  ): Promise<SavePageResult>;
   managedSyncStatus(): Promise<ManagedSyncStatus | null>;
   managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
   enableManagedSync(): Promise<ManagedSyncEnableResult>;
@@ -390,10 +391,10 @@ export interface Backend {
    *  mixed-purpose reads above: an activation exists exactly when a live editor
    *  does, so a read for export/preview/hydration cannot inherit an editor's
    *  override authority. (GH #254 increment 3.) */
-  activateEditor(path: string, intent: ActivationIntent): Promise<EditorActivationHandle>;
+  activateEditor(path: string, intent: ActivationIntent): Promise<EditorActivationHandle | null>;
   /** Activate an editor for a page with no file yet, returning the prospective
    *  target it is live for. Reserves nothing on disk. */
-  activateAbsentEditor(name: string, kind: PageKind): Promise<EditorActivationHandle>;
+  activateAbsentEditor(name: string, kind: PageKind): Promise<EditorActivationHandle | null>;
   /** Compare-and-retire: retires only if `activation` is still the live one, and
    *  reports whether it was. A retirement racing a newer activation must not
    *  revoke the newer editor. */
@@ -650,6 +651,7 @@ const REBINDING_COMMANDS = new Set([
   "set_doc_mode_enter_for_new_block",
   "set_logical_outdenting",
   "set_guide_announced",
+  "restore_backup",
 ]);
 
 class TauriBackend implements Backend {
@@ -807,7 +809,7 @@ class TauriBackend implements Backend {
     managedConflictObservation: { path: string; revision: string } | null = null,
   ) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
-      this.call<string>("save_page", {
+      this.call<SavePageResult>("save_page", {
         page,
         baseRev,
         force,
@@ -1080,10 +1082,10 @@ class TauriBackend implements Backend {
     return this.call<PageDto | null>("get_page_by_path", { path });
   }
   activateEditor(path: string, intent: ActivationIntent) {
-    return this.call<EditorActivationHandle>("activate_editor", { path, intent });
+    return this.call<EditorActivationHandle | null>("activate_editor", { path, intent });
   }
   activateAbsentEditor(name: string, kind: PageKind) {
-    return this.call<EditorActivationHandle>("activate_absent_editor", { name, kind });
+    return this.call<EditorActivationHandle | null>("activate_absent_editor", { name, kind });
   }
   retireEditorActivation(path: string, activation: number) {
     return this.call<boolean>("retire_editor_activation", { path, activation });
