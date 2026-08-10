@@ -9,7 +9,8 @@ use super::*;
 use crate::fast_commit::forbidden_commit_work;
 use crate::oplog::{
     append_managed_local_record, decode_managed_local_record, ApplicationRuntimeRoot,
-    ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind, ManagedLocalRecordError,
+    ManagedLocalAppendError, ManagedLocalAppendProof, ManagedLocalApplyOutcome,
+    ManagedLocalJournalPayloadKind, ManagedLocalJournalProtocol, ManagedLocalRecordError,
     MaterializedPage, ProjectionClaim, RebuildSource, SqliteFrontier,
 };
 
@@ -276,7 +277,7 @@ impl OverlayFixture {
         &mut self,
         journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
         prepared: &mut crate::oplog::PreparedManagedLocalRecord,
-    ) -> (tine_storage::LocalJournalAppend, MaterializedPage) {
+    ) -> (ManagedLocalAppendProof, MaterializedPage) {
         let append = append_managed_local_record(journal, prepared).unwrap();
         let page = match self
             .engine
@@ -806,7 +807,7 @@ fn corrupt_binding_order_and_stale_base_are_refused_before_visible_change() {
 }
 
 #[test]
-fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
+fn append_refuses_wrong_device_before_writing_and_proof_binds_legacy_one_barrier() {
     let (_, batches) = finalized_edit_chain("managed-record-append-source", "md", 8, 1);
     let mut fixture = OverlayFixture::new("managed-record-append-local", "md", 8);
     let mut prepared = fixture.prepare_record(&batches[0]);
@@ -818,26 +819,31 @@ fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
         .0;
     assert_eq!(
         append_managed_local_record(&mut wrong, &prepared),
-        Err(ManagedLocalRecordError::WrongDurabilityProof)
+        Err(ManagedLocalAppendError::DefinitelyNotAppended(
+            ManagedLocalRecordError::WrongDurabilityProof
+        ))
     );
     assert_eq!(wrong.next_sequence(), 0);
     assert_eq!(wrong.stats().frames_appended, 0);
 
     let (_, mut correct) = fixture.journal("correct-device");
     let append = append_managed_local_record(&mut correct, &prepared).unwrap();
-    assert_eq!(append.device_id, uuid(DEVICE));
-    assert_eq!(append.sequence, 0);
+    assert_eq!(append.protocol(), ManagedLocalJournalProtocol::LegacyV1);
+    assert_eq!(append.receipt().device_id, uuid(DEVICE));
+    assert_eq!(append.receipt().sequence, 0);
     assert_eq!(
-        append.payload_digest,
+        append.receipt().payload_digest,
         ContentDigest::of(prepared.journal_payload())
     );
-    assert_eq!(append.data_durability_syncs, 1);
-    let mut wrong_receipt = append;
-    wrong_receipt.data_durability_syncs = 0;
+    assert_eq!(
+        append.receipt().data_durability_syncs,
+        append.protocol().expected_successful_append_data_syncs()
+    );
+    let wrong_proof = append.with_data_durability_syncs_for_test(0);
     assert_eq!(
         fixture
             .engine
-            .apply_appended_managed_local_record(&wrong_receipt, &mut prepared),
+            .apply_appended_managed_local_record(&wrong_proof, &mut prepared),
         Err(ManagedLocalRecordError::WrongDurabilityProof)
     );
     assert_eq!(
@@ -848,6 +854,27 @@ fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
         .engine
         .apply_appended_managed_local_record(&append, &mut prepared)
         .unwrap();
+}
+
+#[test]
+fn managed_local_append_proof_uses_the_protocol_exact_sync_count() {
+    assert_eq!(
+        ManagedLocalJournalProtocol::LegacyV1.expected_successful_append_data_syncs(),
+        1
+    );
+    assert_eq!(
+        ManagedLocalJournalProtocol::V2.expected_successful_append_data_syncs(),
+        2
+    );
+    let source = include_str!("../hot_engine.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    assert!(source.contains("expected_successful_append_data_syncs"));
+    assert!(!source.contains("data_durability_syncs != 1 | 2"));
+    assert!(source.contains("fn legacy_v1_managed_local_append_proof"));
+    assert!(!source.contains("ManagedLocalAppendProof::new"));
+    assert!(!source.contains("pub(crate) const fn new("));
 }
 
 #[test]
@@ -910,7 +937,7 @@ fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
         .write(true)
         .open(&segment_path)
         .unwrap();
-    file.set_len(committed - second_append.frame_bytes / 2)
+    file.set_len(committed - second_append.receipt().frame_bytes / 2)
         .unwrap();
     file.sync_data().unwrap();
     drop(file);

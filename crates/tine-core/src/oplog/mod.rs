@@ -126,10 +126,13 @@ pub use batch::{
     MAX_OBJECT_BYTES, OBJECT_ENVELOPE_SCHEMA_VERSION, OPERATION_SCHEMA_VERSION,
     OPLOG_PROTOCOL_VERSION,
 };
-pub(crate) use hot_engine::ProjectionTombstoneAuthorization;
+pub(crate) use hot_engine::{
+    append_managed_local_record, ManagedLocalAppendError, ManagedLocalAppendProof,
+    ProjectionTombstoneAuthorization,
+};
 pub use hot_engine::{
-    append_managed_local_record, decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence,
-    AuthorBatch, AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation,
+    decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
+    AuthorTransactionDraft, BatchDisposition, BlockContentRewrite, BlockLocation,
     CapabilityCapturedProjectionInput, CapabilityCapturedProjectionState, CurrentPageAtPath,
     EngineError, EngineInstrumentation, EngineStatus, FatalEvidenceHandle, ImmutableHomeClaim,
     ImmutableHomeConflict, ImmutableHomeEvidence, LogseqIdentityMutation, LogseqIdentityTrigger,
@@ -142,6 +145,8 @@ pub use hot_engine::{
     ProjectionRequirementState, ProjectionWriteAuthorization, SemanticOperation, ShardedHotEngine,
     StageOutcome, WorkspaceStatus,
 };
+#[cfg(test)]
+pub(crate) use hot_engine::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
 pub use identity::{
     BatchId, BlockId, CanonicalArchiveResourceId, CanonicalGraphResourceId, CrdtPeerId, DeviceId,
     DocumentId, ImportId, LogseqUuid, PageId, ProjectionEndpointId, ProjectionReceiptStoreId,
@@ -156,6 +161,7 @@ pub use import::{
     MAX_IMPORT_DEPTH, MAX_IMPORT_FILES, MAX_IMPORT_LOCATOR_COMPONENTS, MAX_IMPORT_PARSED_NODES,
     MAX_IMPORT_RAW_BYTES,
 };
+pub(crate) use local_journal_v2_anchor::ManagedLocalJournalProtocol;
 pub use object_store::{BatchInspection, ObjectStore, ObjectStoreStats, StoreError};
 pub use page_name_index::{
     ExactLogicalPageNameBlobV1, ExactLogicalPageNameDigest, ExactLogicalPageNameRefV1,

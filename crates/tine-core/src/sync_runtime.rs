@@ -152,14 +152,16 @@ use crate::oplog::{
     decode_managed_local_record, BatchId, BatchOrigin, BlockId, BlockLocation,
     CanonicalGraphResourceId, ContentDigest, CurrentPageAtPath, DeviceId, DocumentId,
     FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin, LogseqUuid,
-    ManagedLocalJournalPayloadKind, ManagedPath, ManagedTextKind, MaterializedBlock,
-    MaterializedBlockRow, MaterializedEntityId, MaterializedPage, MaterializedPageRow,
-    MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
-    OperationBatch, OperationObject, OperationTransaction, PageId, ProjectionEndpointId,
-    ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
-    SessionId, SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
-    MAX_MATERIALIZATION_QUERY_ROWS,
+    ManagedLocalAppendError, ManagedLocalJournalPayloadKind, ManagedPath, ManagedTextKind,
+    MaterializedBlock, MaterializedBlockRow, MaterializedEntityId, MaterializedPage,
+    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
+    MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction, PageId,
+    ProjectionEndpointId, ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1,
+    SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
+    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
+#[cfg(test)]
+use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
 use uuid::Uuid;
 
 const ACTOR_CHANNEL_CAPACITY: usize = 64;
@@ -2178,6 +2180,8 @@ pub enum SyncEditorRefusalCode {
     TrustedLocalCommitInvalidPreparedInput,
     TrustedLocalCommitManagedRecord,
     TrustedLocalCommitPrecommitGraph,
+    TrustedLocalCommitAppendRefused,
+    TrustedLocalAppendOutcomeUnknown,
     FallbackReadmission,
     PostCommitCurrentPageLookup,
     TrustedOutcomeDeclined,
@@ -2213,6 +2217,8 @@ impl SyncEditorRefusalCode {
             }
             Self::TrustedLocalCommitManagedRecord => "trusted_local.commit.managed_record",
             Self::TrustedLocalCommitPrecommitGraph => "trusted_local.commit.precommit_graph",
+            Self::TrustedLocalCommitAppendRefused => "trusted_local.commit.append_refused",
+            Self::TrustedLocalAppendOutcomeUnknown => "trusted_local.append_outcome_unknown",
             Self::FallbackReadmission => "fallback.readmission",
             Self::PostCommitCurrentPageLookup => "post_commit.current_page_lookup",
             Self::TrustedOutcomeDeclined => "trusted_outcome.declined",
@@ -3810,6 +3816,22 @@ impl SyncRuntimeHandle {
                 reply: reply_sender,
             },
         )?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn install_managed_local_append_fault(
+        &self,
+        fault: ManagedLocalAppendFault,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::InstallManagedLocalAppendFault {
+            fault,
+            reply: reply_sender,
+        })?;
         reply_receiver
             .recv()
             .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
@@ -6555,6 +6577,11 @@ enum ActorRequest {
         reply: mpsc::Sender<SyncRuntimeTick>,
     },
     #[cfg(test)]
+    InstallManagedLocalAppendFault {
+        fault: ManagedLocalAppendFault,
+        reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
     InstallRepeatedOperationalFault {
         point: OperationalFaultPoint,
         failures: u8,
@@ -6742,7 +6769,9 @@ fn run_actor_loop(
                 observations,
                 reply,
             } => {
-                actor.advance_local_mutation_once();
+                if actor.terminal.is_none() {
+                    actor.advance_local_mutation_once();
+                }
                 let result = actor.observe(observations);
                 let _ = reply.send(result);
                 false
@@ -6786,7 +6815,8 @@ fn run_actor_loop(
                 false
             }
             ActorRequest::Status { reply } => {
-                actor.advance_local_mutation_once();
+                // Status is observational. In particular, it must not cause
+                // retained work to advance after the actor becomes terminal.
                 let _ = reply.send(actor.snapshot());
                 false
             }
@@ -6853,6 +6883,14 @@ fn run_actor_loop(
                 }
                 let result = actor.tick_provider();
                 let _ = reply.send(result);
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::InstallManagedLocalAppendFault { fault, reply } => {
+                // Install the test-only one-shot at the adapter's actual
+                // actor-thread call site, not on the test caller thread.
+                inject_managed_local_append_fault_for_test(fault);
+                let _ = reply.send(());
                 false
             }
             #[cfg(test)]
@@ -6995,12 +7033,14 @@ enum TrustedLocalRuntimeAttempt {
     Declined,
     Reconciliation(Vec<ManagedPath>),
     Committed(TrustedLocalCommitOutcome),
+    CommitRefused(TrustedLocalCommitError),
 }
 
 enum EditorCoordinatorExecution {
     Trusted(TrustedLocalCommitOutcome),
     Reconciliation(Vec<ManagedPath>),
     Declined,
+    CommitRefused(TrustedLocalCommitError),
 }
 
 fn prepare_trusted_local_runtime_commit(
@@ -7034,15 +7074,17 @@ fn prepare_trusted_local_runtime_commit(
             SyncEditorRefusalCode::TrustedLocalEngineAuthority,
         )
     })?;
-    let outcome = TrustedLocalCommitCoordinator::commit(
+    let outcome = match TrustedLocalCommitCoordinator::commit(
         graph,
         journal,
         engine,
         target_page,
         base_revision,
         prepared,
-    )
-    .map_err(trusted_local_commit_refusal)?;
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => return Ok(TrustedLocalRuntimeAttempt::CommitRefused(error)),
+    };
     Ok(match outcome {
         TrustedLocalCommitOutcome::Declined { .. } => TrustedLocalRuntimeAttempt::Declined,
         committed => TrustedLocalRuntimeAttempt::Committed(committed),
@@ -13123,9 +13165,34 @@ impl RuntimeActor {
                     EditorCoordinatorExecution::Reconciliation(paths)
                 }
                 TrustedLocalRuntimeAttempt::Declined => EditorCoordinatorExecution::Declined,
+                TrustedLocalRuntimeAttempt::CommitRefused(error) => {
+                    EditorCoordinatorExecution::CommitRefused(error)
+                }
             }
         };
         let state = match execution {
+            EditorCoordinatorExecution::CommitRefused(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalAppendError::DefinitelyNotAppended(_),
+            )) => {
+                return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                    SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
+                ));
+            }
+            EditorCoordinatorExecution::CommitRefused(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalAppendError::AppendOutcomeUnknown(_),
+            )) => {
+                // The commit boundary's authority/session/journal borrows all
+                // ended with `execution` above.  Do not attempt any recovery
+                // or additional actor work in this process: reopen resolves
+                // whether legacy-v1 retained zero or one complete frame.
+                self.latch_terminal("managed-local append outcome is unknown".into());
+                return Err(SyncEditorRequestError::ActorRefusedWithCode(
+                    SyncEditorRefusalCode::TrustedLocalAppendOutcomeUnknown,
+                ));
+            }
+            EditorCoordinatorExecution::CommitRefused(error) => {
+                return Err(trusted_local_commit_refusal(error));
+            }
             EditorCoordinatorExecution::Trusted(outcome) => {
                 return self.finish_trusted_local_editor_outcome(outcome, affected_page_ids)
             }
@@ -14112,6 +14179,9 @@ impl RuntimeActor {
     }
 
     fn tick_inner(&mut self) -> SyncRuntimeTick {
+        if let Some(detail) = &self.terminal {
+            return SyncRuntimeTick::Terminal(detail.clone());
+        }
         if let Some(outcome) = self.advance_local_mutation_once() {
             return SyncRuntimeTick::LocalMutation(outcome);
         }
@@ -17150,12 +17220,10 @@ impl RuntimeActor {
     }
 
     fn clean_shutdown(&mut self) -> Result<SyncShutdownOutcome, SyncRuntimeRequestError> {
+        if self.terminal.is_some() {
+            return Ok(SyncShutdownOutcome::Terminal(self.snapshot()));
+        }
         if self.local_mutation.is_some() {
-            if self.terminal.is_some() {
-                return Err(SyncRuntimeRequestError::ActorRefused(
-                    "clean shutdown refused by a revoked local mutation".into(),
-                ));
-            }
             let outcome = self.advance_local_mutation_once();
             if self.local_mutation.is_some() {
                 let detail = match outcome {
@@ -17208,10 +17276,6 @@ impl RuntimeActor {
                 }),
             ));
         }
-        if self.terminal.is_some() {
-            return Ok(SyncShutdownOutcome::Terminal(self.snapshot()));
-        }
-
         self.drain_shared_provider_for_shutdown()?;
         if self.shared_phase == Some(SyncSharedPhase::Active)
             && self.provider_accepted_manifest_revalidation_ready
@@ -17473,6 +17537,9 @@ impl RuntimeActor {
     fn prepare_shared(
         &mut self,
     ) -> Result<SyncSharedEnrollmentDescriptor, SyncRuntimeRequestError> {
+        if let Some(detail) = &self.terminal {
+            return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
+        }
         self.clean_shutdown()?;
         let (accepted_generation, accepted_frontier_root, frontier_tips) = {
             let engine = self
@@ -17547,6 +17614,9 @@ impl RuntimeActor {
         &mut self,
         descriptor: SharedEnrollmentDescriptorV1,
     ) -> Result<SharedJoinStep, SyncRuntimeRequestError> {
+        if let Some(detail) = &self.terminal {
+            return Err(SyncRuntimeRequestError::ActorRefused(detail.clone()));
+        }
         let store = self.retained_archive_store()?;
         if self.pending_join.is_none() {
             let expected = inspect_shared_provider_descriptor(&self.provider_root)
@@ -18071,8 +18141,8 @@ impl RuntimeActor {
     }
 
     fn latch_terminal(&mut self, detail: String) {
-        self.refresh_watcher();
         self.terminal = Some(detail);
+        self.refresh_watcher();
         self.feed.take();
         self.authority.take();
         self.runtime.take();
@@ -18297,9 +18367,12 @@ fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorReq
         TrustedLocalCommitError::PrecommitGraph(_) => {
             SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph
         }
-        TrustedLocalCommitError::JournalAppend(_) => {
-            SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph
-        }
+        TrustedLocalCommitError::JournalAppend(ManagedLocalAppendError::DefinitelyNotAppended(
+            _,
+        )) => SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
+        TrustedLocalCommitError::JournalAppend(ManagedLocalAppendError::AppendOutcomeUnknown(
+            _,
+        )) => SyncEditorRefusalCode::TrustedLocalAppendOutcomeUnknown,
     };
     SyncEditorRequestError::ActorRefusedWithCode(code)
 }
@@ -20184,9 +20257,11 @@ mod tests {
             ),
             (
                 TrustedLocalCommitError::JournalAppend(
-                    crate::oplog::ManagedLocalRecordError::WrongDurabilityProof,
+                    ManagedLocalAppendError::DefinitelyNotAppended(
+                        crate::oplog::ManagedLocalRecordError::WrongDurabilityProof,
+                    ),
                 ),
-                SyncEditorRefusalCode::TrustedLocalCommitPrecommitGraph,
+                SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
             ),
         ];
         for (error, code) in commit_errors {
@@ -24966,6 +25041,245 @@ mod tests {
         let restored = load_application_exact(&reopened, path);
         assert_parser_dto_semantics(&saved, &restored.0);
         assert_eq!(saved_revision, restored.1);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_append_unknown_before_write_latches_terminal_without_publishing_or_retrying() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-append-unknown-before");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Unknown Before.md";
+        let before = b"- before append uncertainty\n";
+        admit_external_page(&handle, &fixture, path, before);
+        let (mut page, revision) = load_application_exact(&handle, path);
+        page.blocks[0].raw = "must remain a dirty draft".into();
+
+        handle
+            .install_managed_local_append_fault(ManagedLocalAppendFault::BeforePhysicalAppend)
+            .unwrap();
+        let refusal = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page: page.clone(),
+        });
+        let detail = refusal.unwrap_err().to_string();
+        assert!(detail.contains("trusted_local.append_outcome_unknown"));
+        assert!(!detail.contains(&page.path));
+        assert!(!detail.contains("must remain a dirty draft"));
+        assert_eq!(
+            handle.status().unwrap().lifecycle,
+            SyncRuntimeLifecycle::Terminal
+        );
+        assert_eq!(managed_local_journal_frames(&request).len(), 0);
+        assert_eq!(fs::read(fixture.graph_root().join(path)).unwrap(), before);
+
+        // The actor is terminal before the caller gets this reply. No second
+        // save can append or publish, and all terminal work stays fenced.
+        assert!(matches!(
+            handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision: page.rev.clone().unwrap(),
+                },
+                page: page.clone(),
+            }),
+            Ok(SyncApplicationPageSaveOutcome::Deferred {
+                state: SyncEditorDeferred::Revoked { .. }
+            })
+        ));
+        assert!(matches!(
+            handle.write_application_pdf_view_state("assets/unknown-before.pdf".into(), 1, 1.0),
+            Ok(SyncApplicationUnitOutcome::Deferred {
+                state: SyncEditorDeferred::Revoked { .. }
+            })
+        ));
+        assert!(matches!(
+            handle.save_editor_page(SyncEditorSaveRequest {
+                target: SyncEditorSaveTarget::New {
+                    name: "Terminal Editor Save".into(),
+                    page_kind: SyncPageKind::Page,
+                    revision: String::new(),
+                    format: None,
+                },
+                preamble: None,
+                blocks: Vec::new(),
+            }),
+            Ok(SyncEditorSaveOutcome::Deferred {
+                state: SyncEditorDeferred::Revoked { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::TrashJournalFile {
+                    name: "Terminal Graph Mutation".into(),
+                }
+            ),
+            Ok(SyncApplicationUnitOutcome::Deferred {
+                state: SyncEditorDeferred::Revoked { .. }
+            })
+        ));
+        assert!(matches!(
+            handle.publish_application_html(),
+            Ok(SyncApplicationPublishOutcome::Deferred {
+                state: SyncEditorDeferred::Revoked { .. }
+            })
+        ));
+        assert!(matches!(
+            handle.copy_application_guide("Terminal Guide".into()),
+            Ok(SyncApplicationGuideCopyOutcome::Deferred {
+                state: SyncEditorDeferred::Revoked { .. }
+            })
+        ));
+        assert!(matches!(
+            handle.observe_watcher(vec![SyncWatcherObservation::RescanRequired]),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
+        ));
+        assert!(matches!(
+            handle.observe_provider_paths(vec!["manifests/terminal.manifest".into()], false),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
+        ));
+        let terminal_transaction = OperationTransaction::new(vec![SemanticOperation::CreatePage {
+            page_id: PageId::from_uuid(Uuid::from_u128(0x7a11)),
+            home_document_id: DocumentId::from_uuid(Uuid::from_u128(0x7a12)),
+            name: LogicalPageName::parse("Terminal Local Mutation").unwrap(),
+            path: ManagedPath::parse("pages/Terminal Local Mutation.md").unwrap(),
+            kind: ManagedTextKind::Page,
+        }])
+        .unwrap();
+        assert!(matches!(
+            handle.submit_local_mutation(terminal_transaction),
+            Ok(SyncLocalMutationOutcome::Revoked { .. })
+        ));
+        assert!(matches!(
+            handle.prepare_shared(),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
+        ));
+        let join_source = make_shared_fixture("sync-runtime-terminal-join-source", 0x7a13);
+        let descriptor = activate_and_prepare_shared(&join_source);
+        assert!(matches!(
+            handle.join_shared(descriptor),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
+        ));
+        assert!(matches!(
+            handle.tick().unwrap(),
+            SyncRuntimeTick::Terminal(_)
+        ));
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Terminal(_)
+        ));
+        assert_eq!(managed_local_journal_frames(&request).len(), 0);
+
+        drop(handle);
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        drive_initial_feed(&reopened);
+        assert_eq!(managed_local_journal_frames(&fixture.request()).len(), 0);
+        let restored = load_application_exact(&reopened, path);
+        assert_eq!(restored.0.blocks[0].raw, "before append uncertainty");
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn actor_status_dispatch_is_snapshot_only_after_terminal() {
+        let source = include_str!("sync_runtime.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the runtime source has its test boundary");
+        let status = production
+            .split_once("ActorRequest::Status { reply } => {")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n            #[cfg(test)]\n            ActorRequest::EngineInstrumentation",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("actor status dispatch has a narrow source boundary");
+        assert!(status.contains("actor.snapshot()"));
+        assert!(!status.contains("advance_local_mutation_once"));
+        assert!(!status.contains("actor.tick"));
+    }
+
+    #[test]
+    fn managed_append_unknown_after_write_reopens_exactly_once_without_duplicate_append() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-append-unknown-after");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Unknown After.md";
+        let before = b"- before physical append\n";
+        admit_external_page(&handle, &fixture, path, before);
+        let (mut page, revision) = load_application_exact(&handle, path);
+        page.blocks[0].raw = "replay exactly this append".into();
+
+        handle
+            .install_managed_local_append_fault(ManagedLocalAppendFault::AfterPhysicalAppend)
+            .unwrap();
+        let refusal = handle.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: page.path.clone(),
+                revision,
+            },
+            page: page.clone(),
+        });
+        assert!(refusal
+            .unwrap_err()
+            .to_string()
+            .contains("trusted_local.append_outcome_unknown"));
+        assert_eq!(
+            handle.status().unwrap().lifecycle,
+            SyncRuntimeLifecycle::Terminal
+        );
+        assert_eq!(managed_local_journal_frames(&request).len(), 1);
+        assert_eq!(fs::read(fixture.graph_root().join(path)).unwrap(), before);
+
+        assert!(matches!(
+            handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision: page.rev.clone().unwrap(),
+                },
+                page,
+            }),
+            Ok(SyncApplicationPageSaveOutcome::Deferred {
+                state: SyncEditorDeferred::Revoked { .. }
+            })
+        ));
+        assert_eq!(managed_local_journal_frames(&request).len(), 1);
+        drop(handle);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&reopened);
+        let (mut restored, restored_revision) = load_application_exact(&reopened, path);
+        assert_eq!(restored.blocks[0].raw, "replay exactly this append");
+        assert_eq!(managed_local_journal_frames(&request).len(), 1);
+
+        restored.blocks[0].raw = "save once after replay".into();
+        let later = reopened
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: restored.path.clone(),
+                    revision: restored_revision,
+                },
+                page: restored,
+            })
+            .unwrap();
+        assert!(matches!(
+            later,
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        assert_eq!(managed_local_journal_frames(&request).len(), 2);
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

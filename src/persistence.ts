@@ -38,6 +38,11 @@ const saveChain = new Map<string, Promise<boolean>>();
 const transientFailures = new Map<string, number>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+// An append outcome the managed runtime cannot prove is resolved only by
+// reopening and replaying the physical journal. This latch belongs to this
+// graph/process state, not to a page: continuing automatic saves could make a
+// draft look retryable when the actor has already terminally fenced mutation.
+let reopenRequired = false;
 // When the current run of edits first went dirty, so the debounce below can be
 // coalescing without being indefinitely postponable. Null whenever no save is
 // armed — every drain path (`flushAll`, `resetSaveState`, the timer itself)
@@ -288,6 +293,7 @@ export function resetSaveState() {
     dataRevTimer = null;
   }
   graphToken++;
+  reopenRequired = false;
   dirty.clear();
   baseRev.clear();
   conflictObservation.clear();
@@ -320,6 +326,20 @@ function clearTransientRetry(name: string) {
   retryTimers.delete(name);
 }
 
+function latchReopenRequired(): boolean {
+  if (reopenRequired) return false;
+  reopenRequired = true;
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  burstStartedAt = null;
+  for (const timer of retryTimers.values()) clearTimeout(timer);
+  retryTimers.clear();
+  transientFailures.clear();
+  return true;
+}
+
 /** Save failures the backend reports with a bounded code that a retry cannot
  *  change: the graph has two files whose names collide on case-insensitive
  *  filesystems, two paths pointing at one physical file, a symlink where a page
@@ -327,7 +347,7 @@ function clearTransientRetry(name: string) {
  *  the whole pre-save check — on a large graph the expensive part — to arrive at
  *  the same answer, three times, per dirty page. Report it once instead. */
 export function isRetryableSaveFailure(error: unknown): boolean {
-  const message = String(error);
+  const code = saveFailureCode(error);
   return ![
     "precheck.symlink",
     "precheck.portable_collision",
@@ -340,7 +360,33 @@ export function isRetryableSaveFailure(error: unknown): boolean {
     // Managed storage refused the save because the page moved underneath it.
     // Permanent until the page is reloaded — retrying just hides it.
     "managed.conflict",
-  ].some((code) => message.includes(code));
+    // The process cannot know whether this record was written. Reopen selects
+    // the complete physical prefix; a same-process retry could duplicate it.
+    "trusted_local.append_outcome_unknown",
+  ].some((nonRetryable) => code === nonRetryable);
+}
+
+export type SaveFailureDisposition = "append_outcome_unknown" | "ordinary";
+
+/** Classify bounded backend failures before any generic retry policy. */
+export function saveFailureDisposition(error: unknown): SaveFailureDisposition {
+  return saveFailureCode(error) === "trusted_local.append_outcome_unknown"
+    ? "append_outcome_unknown"
+    : "ordinary";
+}
+
+/** Extract a bounded save-failure code from either backend contract.
+ *
+ * Direct saves prefix a bounded code. The managed actor instead returns its
+ * bounded reason code in a terminal envelope, for example
+ * `sync actor refused application page intent at committing the semantic page
+ * transaction (reason code: trusted_local.append_outcome_unknown)`. Both forms
+ * are parsed structurally so page text or ordinary error prose cannot change
+ * the retry/latch disposition.
+ */
+function saveFailureCode(error: unknown): string {
+  const message = String(error).replace(/^Error: /, "");
+  return directSaveFailureCode(message) || actorReasonCode(message);
 }
 
 /** The bounded failure code the Direct backend prefixes to a save error.
@@ -355,8 +401,7 @@ export function isRetryableSaveFailure(error: unknown): boolean {
  *  Returns `""` when there is no code separator or the prefix is not code-shaped
  *  — including the banner-class `conflict` / `conflict:<n>` shape, which is
  *  matched by `conflictObservationEpoch` before this is consulted. */
-function directSaveFailureCode(error: unknown): string {
-  const message = String(error).replace(/^Error: /, "");
+function directSaveFailureCode(message: string): string {
   const separator = message.indexOf(": ");
   if (separator <= 0) return ""; // no code at all — never a family
   const code = message.slice(0, separator);
@@ -366,6 +411,12 @@ function directSaveFailureCode(error: unknown): string {
   // read as one: without it, `Error("conflict_authority.spent while reporting
   // …")` was accepted whole and routed into the authority handler.
   return /^[a-z][a-z_]*(\.[a-z][a-z_]*)*$/.test(code) ? code : "";
+}
+
+/** Extract the managed actor's complete terminal reason-code envelope only. */
+function actorReasonCode(message: string): string {
+  const match = /^sync actor refused application page intent(?: at [^(]+)? \(reason code: ([a-z][a-z_]*(?:\.[a-z][a-z_]*)*)\)$/.exec(message);
+  return match?.[1] ?? "";
 }
 
 /** The observation epoch a banner-class conflict was raised at.
@@ -382,6 +433,7 @@ function conflictObservationEpoch(error: unknown): number | null {
 }
 
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
+  if (reopenRequired) return;
   if (!isRetryableSaveFailure(error)) {
     transientFailures.delete(name);
     pushToast(`Couldn't save “${name}”. (${String(error)})`, "error");
@@ -405,7 +457,7 @@ function scheduleTransientRetry(name: string, token: number, error: unknown) {
   if (prior) clearTimeout(prior);
   const timer = setTimeout(() => {
     retryTimers.delete(name);
-    if (token === graphToken && dirty.has(name) && !isConflicted(name)) {
+    if (token === graphToken && !reopenRequired && dirty.has(name) && !isConflicted(name)) {
       void enqueueSave(name);
     }
   }, failures === 1 ? 100 : 300);
@@ -562,6 +614,18 @@ async function doSave(
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
     return true;
   } catch (e) {
+    if (saveFailureDisposition(e) === "append_outcome_unknown") {
+      if (token === graphToken) {
+        dirty.add(name); // the draft remains local until reopen resolves the frame
+        if (latchReopenRequired()) {
+          pushToast(
+            "Managed storage could not establish the append outcome. Reopen Tine before saving again.",
+            "error"
+          );
+        }
+      }
+      return false;
+    }
     // The backend says "conflict" and nothing else for a real base-revision
     // conflict. Match it exactly: a substring test used to catch every other
     // backend `AlreadyExists` too -- a portable-filename collision, a
@@ -579,7 +643,7 @@ async function doSave(
         conflictObservation.set(name, { kind: "direct", epoch: null });
       }
       markConflict(name);
-    } else if (directSaveFailureCode(e) === "managed.conflict") {
+    } else if (saveFailureCode(e) === "managed.conflict") {
       // The refusal itself carries no overwrite authority. Observe the exact
       // pinned managed page through the actor, but do not load it into the
       // store: the retained draft stays intact until the user explicitly
@@ -606,7 +670,7 @@ async function doSave(
       // reflects this newly observed (or now unobservable) managed owner.
       if (isConflicted(name)) clearConflict(name);
       markConflict(name);
-    } else if (directSaveFailureCode(e).startsWith("conflict_authority.")) {
+    } else if (saveFailureCode(e).startsWith("conflict_authority.")) {
       // The force named an observation the disk has since moved past — a later
       // external write, or a read, revoked it before the click reached the
       // backend. The refusal is right: that authority was for a state the user
@@ -626,7 +690,7 @@ async function doSave(
         dirty.add(name); // the edit is still unwritten
         void reconcileExternalChange(name);
       }
-    } else if (directSaveFailureCode(e).startsWith("conflict_retry.")) {
+    } else if (saveFailureCode(e).startsWith("conflict_retry.")) {
       // The backend could not coherently observe the winner, so it minted no
       // authority — and a force that reached here has already CONSUMED the
       // token its banner was standing on. Leaving that banner up is the
@@ -667,7 +731,7 @@ const SAVE_DEBOUNCE_MS = 400;
 const MAX_SAVE_DELAY_MS = 3_000;
 
 export function scheduleSave() {
-  if (!doc.loaded) return;
+  if (!doc.loaded || reopenRequired) return;
   if (saveTimer) clearTimeout(saveTimer);
   else burstStartedAt = Date.now();
   const postponedBy = Date.now() - (burstStartedAt ?? Date.now());

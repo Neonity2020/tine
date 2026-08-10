@@ -14,7 +14,7 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
-use tine_storage::{LocalJournalAppend, LocalJournalSegment};
+use tine_storage::LocalJournalSegment;
 
 use crate::model::{
     content_rev, CommittedPendingJournalPageProjection, DurableJournalPageProjection, Format,
@@ -24,9 +24,10 @@ use crate::{Graph, PageDto, PageKind};
 
 use super::operational_coordinator::PreparedLocalMutation;
 use super::{
-    append_managed_local_record, BatchId, ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind,
-    ManagedLocalRecord, ManagedLocalRecordError, ManagedTextKind, MaterializedPage,
-    PreparedManagedLocalRecord, ShardedHotEngine,
+    append_managed_local_record, BatchId, ManagedLocalAppendError, ManagedLocalAppendProof,
+    ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind, ManagedLocalRecord,
+    ManagedLocalRecordError, ManagedTextKind, MaterializedPage, PreparedManagedLocalRecord,
+    ShardedHotEngine,
 };
 
 pub(crate) struct TrustedLocalCommitCoordinator;
@@ -126,7 +127,7 @@ pub(crate) enum TrustedLocalCommitError {
     InvalidPreparedInput(String),
     ManagedRecord(ManagedLocalRecordError),
     PrecommitGraph(io::Error),
-    JournalAppend(ManagedLocalRecordError),
+    JournalAppend(ManagedLocalAppendError),
 }
 
 impl fmt::Display for TrustedLocalCommitError {
@@ -154,7 +155,7 @@ pub(crate) enum TrustedLocalCommitOutcome {
 /// observe, but cannot construct, committed evidence.
 pub(crate) struct TrustedLocalCommitted {
     prepared: PreparedManagedLocalRecord,
-    graph: DurableJournalPageProjection<LocalJournalAppend>,
+    graph: DurableJournalPageProjection<ManagedLocalAppendProof>,
     post_page: MaterializedPage,
 }
 
@@ -171,7 +172,7 @@ impl TrustedLocalCommitted {
         self.prepared.record()
     }
 
-    pub(crate) fn append(&self) -> &LocalJournalAppend {
+    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
         self.graph.append_proof()
     }
 
@@ -200,7 +201,7 @@ impl TrustedLocalCommitted {
 /// retry without accepting an append callback or a semantic transaction.
 pub(crate) struct TrustedLocalCommittedPendingProjection {
     prepared: PreparedManagedLocalRecord,
-    graph: CommittedPendingJournalPageProjection<LocalJournalAppend>,
+    graph: CommittedPendingJournalPageProjection<ManagedLocalAppendProof>,
     post_page: MaterializedPage,
 }
 
@@ -213,7 +214,7 @@ impl TrustedLocalCommittedPendingProjection {
         self.prepared.sequence()
     }
 
-    pub(crate) fn append(&self) -> &LocalJournalAppend {
+    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
         self.graph.append_proof()
     }
 
@@ -239,8 +240,8 @@ impl TrustedLocalCommittedPendingProjection {
 }
 
 enum CommittedGraphState {
-    Durable(DurableJournalPageProjection<LocalJournalAppend>),
-    Pending(CommittedPendingJournalPageProjection<LocalJournalAppend>),
+    Durable(DurableJournalPageProjection<ManagedLocalAppendProof>),
+    Pending(CommittedPendingJournalPageProjection<ManagedLocalAppendProof>),
 }
 
 /// The append crossed the commit boundary but hot application could not be
@@ -261,7 +262,7 @@ impl TrustedLocalCommittedRecovery {
         self.prepared.sequence()
     }
 
-    pub(crate) fn append(&self) -> &LocalJournalAppend {
+    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
         match &self.graph {
             CommittedGraphState::Durable(graph) => graph.append_proof(),
             CommittedGraphState::Pending(graph) => graph.append_proof(),
@@ -535,7 +536,7 @@ fn materialized_page_semantics_equal(left: &MaterializedPage, right: &Materializ
 fn finish_committed_graph(
     engine: &mut ShardedHotEngine,
     prepared: PreparedManagedLocalRecord,
-    graph: JournalPageProjectionOutcome<LocalJournalAppend>,
+    graph: JournalPageProjectionOutcome<ManagedLocalAppendProof>,
 ) -> TrustedLocalCommitOutcome {
     let graph = match graph {
         JournalPageProjectionOutcome::Durable(graph) => CommittedGraphState::Durable(graph),
@@ -1035,7 +1036,9 @@ mod tests {
         assert!(matches!(
             result,
             Err(TrustedLocalCommitError::JournalAppend(
-                ManagedLocalRecordError::WrongDurabilityProof
+                ManagedLocalAppendError::DefinitelyNotAppended(
+                    ManagedLocalRecordError::WrongDurabilityProof
+                )
             ))
         ));
         assert_eq!(wrong_journal.stats().frames_appended, 0);
@@ -1049,6 +1052,24 @@ mod tests {
         assert_eq!(
             append.engine.managed_local_prefix_state().records_applied,
             0
+        );
+        let (_, mut right_journal) = append.journal("right-device");
+        let later_prepared = prepared_edit(&mut append, 1_220_040, 1);
+        assert!(matches!(
+            TrustedLocalCommitCoordinator::commit(
+                &append.graph,
+                &mut right_journal,
+                &mut append.engine,
+                &page,
+                &base_revision,
+                later_prepared,
+            ),
+            Ok(TrustedLocalCommitOutcome::Committed(_))
+        ));
+        assert_eq!(right_journal.stats().frames_appended, 1);
+        assert_eq!(
+            append.engine.managed_local_prefix_state().records_applied,
+            1
         );
     }
 

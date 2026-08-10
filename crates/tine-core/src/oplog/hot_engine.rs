@@ -70,13 +70,14 @@ use super::{
     BatchOrigin, BlobDescription, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId,
     ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
-    ManagedPath, ManagedTextKind, ManifestObjectRef, ManifestProjectionPrecondition,
-    ManifestProjectionTarget, ManifestedProjectionIntent, MembershipClaim, MembershipDelta,
-    ObjectKind, ObjectStore, OperationBatch, OperationObject, PageDelta, PageId, PageState,
-    PortablePathKeyDigest, PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant,
-    ProjectionCompletedReceipt, ProjectionCompletion, ProjectionEndpointId, ProjectionIntent,
-    ProjectionReceiptStore, ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget,
-    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
+    ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind, ManifestObjectRef,
+    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
+    MembershipClaim, MembershipDelta, ObjectKind, ObjectStore, OperationBatch, OperationObject,
+    PageDelta, PageId, PageState, PortablePathKeyDigest, PreparedBatch, ProjectionClaimEvidence,
+    ProjectionClaimParticipant, ProjectionCompletedReceipt, ProjectionCompletion,
+    ProjectionEndpointId, ProjectionIntent, ProjectionReceiptStore, ProjectionWork,
+    ProjectionWorkIndex, ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError,
+    SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -6617,15 +6618,110 @@ pub struct ManagedLocalPrefixState {
     pub commitment: ContentDigest,
 }
 
+/// Protocol-bound evidence that one managed-local record became durable.
+///
+/// This is crate-owned evidence: only managed-journal adapters may construct
+/// it. Keeping the physical protocol in the proof lets the v2 rollover
+/// adapter produce the same evidence without teaching the coordinator a
+/// numeric sync count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedLocalAppendProof {
+    protocol: ManagedLocalJournalProtocol,
+    receipt: LocalJournalAppend,
+}
+
+impl ManagedLocalAppendProof {
+    pub(crate) const fn protocol(&self) -> ManagedLocalJournalProtocol {
+        self.protocol
+    }
+
+    pub(crate) const fn receipt(&self) -> &LocalJournalAppend {
+        &self.receipt
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_data_durability_syncs_for_test(mut self, syncs: u64) -> Self {
+        self.receipt.data_durability_syncs = syncs;
+        self
+    }
+}
+
+/// Construct proof only for a receipt returned by the active legacy-v1 append
+/// adapter. A future v2 adapter must introduce its own narrowly scoped
+/// constructor when it owns a v2 receipt; the coordinator must never mint one.
+fn legacy_v1_managed_local_append_proof(receipt: LocalJournalAppend) -> ManagedLocalAppendProof {
+    ManagedLocalAppendProof {
+        protocol: ManagedLocalJournalProtocol::LegacyV1,
+        receipt,
+    }
+}
+
+/// Whether a managed-local append is proven not to have started or may have
+/// crossed the physical journal boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedLocalAppendError {
+    DefinitelyNotAppended(ManagedLocalRecordError),
+    AppendOutcomeUnknown(LocalJournalError),
+}
+
+impl fmt::Display for ManagedLocalAppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DefinitelyNotAppended(_) => {
+                formatter.write_str("managed-local append was refused before storage")
+            }
+            Self::AppendOutcomeUnknown(_) => {
+                formatter.write_str("managed-local append outcome is unknown")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManagedLocalAppendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DefinitelyNotAppended(error) => Some(error),
+            Self::AppendOutcomeUnknown(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedLocalAppendFault {
+    BeforePhysicalAppend,
+    AfterPhysicalAppend,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MANAGED_LOCAL_APPEND_FAULT: std::cell::Cell<Option<ManagedLocalAppendFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_managed_local_append_fault_for_test(fault: ManagedLocalAppendFault) {
+    // This must run on the owning runtime actor thread. The test handle sends
+    // an actor request before the next save, so parallel runtime tests never
+    // share a fault and the adapter consumes it exactly once.
+    MANAGED_LOCAL_APPEND_FAULT.set(Some(fault));
+}
+
+#[cfg(test)]
+fn take_managed_local_append_fault_for_test() -> Option<ManagedLocalAppendFault> {
+    MANAGED_LOCAL_APPEND_FAULT.take()
+}
+
 /// Append one prepared record to its device-owned segment.
 ///
 /// Binding and sequence are checked before the durable write begins. The
-/// returned storage receipt names the actual segment device and sequence,
-/// payload digest, and its single data-durability barrier.
-pub fn append_managed_local_record(
+/// returned proof names the active protocol and its receipt. Any error after
+/// the physical append call begins is conservatively uncertain: legacy-v1 does
+/// not expose the exact write cut to this caller.
+pub(crate) fn append_managed_local_record(
     segment: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
     prepared: &PreparedManagedLocalRecord,
-) -> Result<LocalJournalAppend, ManagedLocalRecordError> {
+) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
     let author_device = prepared
         .record
         .prepared_batch
@@ -6633,11 +6729,28 @@ pub fn append_managed_local_record(
         .author_device_id()
         .as_uuid();
     if segment.device_id() != author_device || segment.next_sequence() != prepared.sequence {
-        return Err(ManagedLocalRecordError::WrongDurabilityProof);
+        return Err(ManagedLocalAppendError::DefinitelyNotAppended(
+            ManagedLocalRecordError::WrongDurabilityProof,
+        ));
     }
-    segment
+    #[cfg(test)]
+    let test_fault = take_managed_local_append_fault_for_test();
+    #[cfg(test)]
+    if test_fault == Some(ManagedLocalAppendFault::BeforePhysicalAppend) {
+        return Err(ManagedLocalAppendError::AppendOutcomeUnknown(
+            LocalJournalError::Io("injected unknown outcome before physical append".into()),
+        ));
+    }
+    let receipt = segment
         .append(prepared.payload_kind(), prepared.journal_payload())
-        .map_err(ManagedLocalRecordError::from)
+        .map_err(ManagedLocalAppendError::AppendOutcomeUnknown)?;
+    #[cfg(test)]
+    if test_fault == Some(ManagedLocalAppendFault::AfterPhysicalAppend) {
+        return Err(ManagedLocalAppendError::AppendOutcomeUnknown(
+            LocalJournalError::Io("injected unknown outcome after physical append".into()),
+        ));
+    }
+    Ok(legacy_v1_managed_local_append_proof(receipt))
 }
 
 /// Decode and authenticate the complete canonical record represented by one
@@ -14473,22 +14586,24 @@ impl ShardedHotEngine {
     }
 
     /// Advance visible state only after the append receipt proves this exact
-    /// record crossed the owning segment's one data-durability barrier.
-    pub fn apply_appended_managed_local_record(
+    /// record crossed the exact data-durability barrier for its protocol.
+    pub(crate) fn apply_appended_managed_local_record(
         &mut self,
-        append: &LocalJournalAppend,
+        append: &ManagedLocalAppendProof,
         prepared: &mut PreparedManagedLocalRecord,
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
-        if append.device_id
+        let receipt = append.receipt();
+        if receipt.device_id
             != prepared
                 .record
                 .prepared_batch
                 .manifest()
                 .author_device_id()
                 .as_uuid()
-            || append.sequence != prepared.sequence
-            || append.payload_digest != ContentDigest::of(prepared.journal_payload())
-            || append.data_durability_syncs != 1
+            || receipt.sequence != prepared.sequence
+            || receipt.payload_digest != ContentDigest::of(prepared.journal_payload())
+            || receipt.data_durability_syncs
+                != append.protocol().expected_successful_append_data_syncs()
         {
             return Err(ManagedLocalRecordError::WrongDurabilityProof);
         }
