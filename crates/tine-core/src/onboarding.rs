@@ -84,6 +84,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Project/Roadmap",
         markdown: include_str!("templates/roadmap.md"),
     },
+    GuideTemplate {
+        title: "Workflows/Structure repeated information",
+        markdown: include_str!("templates/structure-repeated-information.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -334,6 +338,9 @@ mod tests {
         assert!(dir.join("pages/Tine Guide.md").is_file());
         assert!(dir.join("pages/Feature showcase.md").is_file());
         assert!(dir.join("pages/Project___Roadmap.md").is_file());
+        assert!(dir
+            .join("pages/Workflows___Structure repeated information.md")
+            .is_file());
 
         // Every page loads by its (namespace-decoded) title, and every page parses.
         let graph = Graph::open(&dir);
@@ -417,6 +424,61 @@ mod tests {
         assert!(plugins.markdown.contains("not Logseq or Obsidian plugins"));
     }
 
+    #[test]
+    fn structure_workflow_is_registered_linked_copyable_and_executable() {
+        let title = "Workflows/Structure repeated information";
+        let workflow = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("structure workflow is registered");
+        assert!(workflow
+            .markdown
+            .contains("- # Structure repeated information"));
+        assert!(workflow
+            .markdown
+            .contains("tine.fields:: status=enum:planned,active,done;owner=text;estimate=number"));
+        assert!(workflow
+            .markdown
+            .contains("{{query (property owner Avery)}}"));
+        assert!(workflow
+            .markdown
+            .contains("What you should see: a reusable selection of matching tracker blocks"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Workflows/Structure repeated information]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("structure workflow is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Workflows/Structure repeated information"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-structure-workflow-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Workflows/Structure repeated information"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("structure workflow was copied");
+        assert!(copied_markdown.contains("{{query (property owner Avery)}}"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Sheets]]"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Formulas]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[derive(serde::Deserialize)]
     struct DeliberateGuideStub {
         title: String,
@@ -437,7 +499,14 @@ mod tests {
             for block in blocks {
                 // `DocBlock::projection` is the canonical lsdoc-backed reference
                 // extraction used by the graph's index and backlink paths.
-                targets.extend(block.projection().refs_page.iter().cloned());
+                let projection = block.projection();
+                targets.extend(
+                    projection
+                        .refs_page
+                        .iter()
+                        .filter(|target| !projection.block_refs.contains(target))
+                        .cloned(),
+                );
                 collect(&block.children, targets);
             }
         }
@@ -483,7 +552,7 @@ mod tests {
     fn guide_link_validator_rejects_accidental_targets_and_ignores_inline_code() {
         let templates = [GuideTemplate {
             title: "Test source",
-            markdown: "- [[Martin]] #demo [[Accidental target]] `[[literal brackets]]`",
+            markdown: "- [[Martin]] #demo [[Accidental target]] `[[literal brackets]]` ((00000000-0000-4000-8000-00000000feed))",
         }];
 
         assert_eq!(
