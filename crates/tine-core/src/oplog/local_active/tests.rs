@@ -10068,6 +10068,54 @@ mod terminal_construction {
 
         // One candidate transaction and one durability barrier on both paths.
         for built in [&terminal, &replay] {
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_hits,
+                built.bootstrap.terminal_accepted_frontier_session_hits
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_misses,
+                built.bootstrap.terminal_accepted_frontier_session_misses
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_evictions,
+                built.bootstrap.terminal_accepted_frontier_session_evictions
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_oversize,
+                built.bootstrap.terminal_accepted_frontier_session_oversize
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_peak_resident_bytes,
+                built
+                    .bootstrap
+                    .terminal_accepted_frontier_session_peak_resident_bytes
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_hits,
+                built.bootstrap.terminal_external_exact_session_hits
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_misses,
+                built.bootstrap.terminal_external_exact_session_misses
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_evictions,
+                built.bootstrap.terminal_external_exact_session_evictions
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_oversize,
+                built.bootstrap.terminal_external_exact_session_oversize
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_peak_resident_bytes,
+                built
+                    .bootstrap
+                    .terminal_external_exact_session_peak_resident_bytes
+            );
+            assert!(
+                built.rebuild.exact_document_loads >= built.observation.pages.len(),
+                "terminal materialization did not report its exact document loads"
+            );
             assert_eq!(built.rebuild.physical_candidate_transactions, 1);
             assert_eq!(built.rebuild.physical_candidate_durability_barriers, 1);
             assert_eq!(built.rebuild.physical_ordinary_transactions, 0);

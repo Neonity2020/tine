@@ -4800,6 +4800,24 @@ impl SqliteFrontier {
         }
         if let Some(materializer) = materializer.as_ref() {
             let (accepted_frontier, external_exact) = materializer.lookup_session_stats();
+            debug_assert_eq!(
+                instrumentation.exact_document_loads,
+                materializer.exact_document_loads()
+            );
+            instrumentation.record_materialization(EventMaterializationInstrumentation {
+                accepted_frontier_session_hits: accepted_frontier.hits,
+                accepted_frontier_session_misses: accepted_frontier.misses,
+                accepted_frontier_session_evictions: accepted_frontier.evictions,
+                accepted_frontier_session_oversize: accepted_frontier.oversize,
+                accepted_frontier_session_peak_resident_bytes: accepted_frontier
+                    .peak_resident_bytes,
+                external_exact_session_hits: external_exact.hits,
+                external_exact_session_misses: external_exact.misses,
+                external_exact_session_evictions: external_exact.evictions,
+                external_exact_session_oversize: external_exact.oversize,
+                external_exact_session_peak_resident_bytes: external_exact.peak_resident_bytes,
+                ..EventMaterializationInstrumentation::default()
+            });
             bootstrap.record_terminal_lookup_session(
                 seen_pages.len(),
                 accepted_frontier,

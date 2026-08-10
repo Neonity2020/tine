@@ -38359,7 +38359,11 @@ mod tests {
     /// any scale.
     #[test]
     fn managed_projection_rebuild_resolves_documents_through_lookup_sessions() {
-        let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 60);
+        // Cross more than two 64-page terminal materialization windows. One
+        // window can legitimately report one root miss and one later hit while
+        // still batching all of its document loads; reuse is observable only
+        // when the same retained session serves another bounded window.
+        let fixture = ActivationFixture::scaled("managed-rebuild-lookup-sessions", 0xa0ec, 130);
         let workspace_id = fixture.request.identities.workspace_id;
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
