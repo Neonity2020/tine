@@ -18,6 +18,7 @@ icon:: 🧭
   - [[Features/Managed sync]] — understand the separate **Testing only** opt-in that can add operation-backed sync while keeping your Markdown/Org graph in place.
   - [[Features/Tips & shortcuts]] — learn Ctrl+K, slash commands, tabs, sidebars, focus mode, and daily shortcuts.
   - [[Reference/Files, external edits, and backups]] — learn what Tine writes where, and where snapshots, conflict copies, and the trash live.
+  - [[Reference/Troubleshooting and recovery]] — follow numbered recovery steps for conflict banners, deleted pages, snapshots, sync copies, duplicate days, and bad starts.
 - ## Feature showcase
   - [[Feature showcase]] — inspect one live example of each supported Logseq rendering feature.
 - ## Create one yourself

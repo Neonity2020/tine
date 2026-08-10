@@ -58,3 +58,16 @@ Added one canonical workflow page, registered it in the shared manifest, linked 
 - `docs/FEATURES.md:222-227` — “config is a few harmless `tine.*` properties… Logseq renders the same file as an ordinary nested outline”. The view-property coexistence claim, linked to [[Features/Sheets]].
 - `docs/FEATURES.md:506-509` — “A filesystem watcher… reconciles changes synced in from other devices”. The “changes appear automatically” claim; banner behavior cross-cited from `src/components/ConflictBar.tsx:45-56`.
 - `crates/tine-core/src/templates/managed-sync.md:4` — “Your normal mode is **Direct files**… **Testing only.**” The single managed-sync pointer wording.
+
+## Phase C — candidates: J09 recovery actions (Reference/Troubleshooting and recovery)
+
+### Behavioral claim sources
+
+- `src/components/ConflictBar.tsx:6-10,45-56` — “A save is refused (not clobbered) when the file changed on disk under us… skipped by every future save batch until resolved”, buttons “Use disk version” / “Keep mine (overwrite)”. The banner scenario and outcomes.
+- `src/components/ContextMenu.tsx:939-947` — delete confirm: “The file moves to the graph's .tine-trash folder.”; `docs/FEATURES.md:547` — “page delete moves to a recoverable **trash**”. The trash-restore scenario; the file-manager restore path is the only restore surface (no in-app trash browser exists — verified by reading `AssetsTab` at `src/components/Settings.tsx:3330-3480`, which lists asset trash only).
+- `src/components/Settings.tsx:2553-2574` — restore confirm “Your current state is snapshotted first, so this is reversible.” and `Settings.tsx:2589-2596` — snapshots happen “each time it opens… outside the graph”. The snapshot-restore scenario (snapshot scope: `journals/` and `pages/` per the same confirm).
+- `src/components/Settings.tsx:2867-2900` — “Syncthing and Dropbox leave a `*.sync-conflict-*` copy… Review & merge shows a block-by-block diff… Discard copy trashes it (recoverable)”; fallback “The page this shadows no longer exists — discard the copy, or restore it in Logseq.” The merge scenario and the shadowless-copy case.
+- `docs/FEATURES.md:520-522` — duplicate days “keeps **both**… **Open** / **Merge** / **Rename** / **Trash**”; `src/components/Settings.tsx:2799-2810` — “usually left over from changing the date format… Open reaches a file directly (it's editable and saves back to itself); Merge folds a stray into the canonical day; Rename turns it into a normal page; Trash removes the redundant one (recoverable).” The duplicate-day scenario.
+- `README.md:218-231` — “run it with debug logging on… `TINE_DEBUG=1 tine` or `tine --debug`… defaults to `/tmp/tine-debug.log` (override with `TINE_DEBUG_LOG=/path`)… The log records no note content — only startup diagnostics.” The startup-recovery scenario.
+- `README.md:210-213` — “On the rare GPU/compositor combo where WebKitGTK's DMABUF renderer aborts (the window fails to appear, or you see `EGL_BAD_PARAMETER`…), set `TINE_GPU=0` to fall back to software rendering”. The window-never-appears step.
+- `docs/FEATURES.md:629-635` — “runs Tine's parser (lsdoc) against Logseq's own parser… Every divergence snippet is **anonymized**… and **re-verified to still reproduce the divergence**… nothing is uploaded.” The diagnostics/report scenario.
