@@ -14,8 +14,6 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
-use tine_storage::LocalJournalSegment;
-
 use crate::model::{
     content_rev, CommittedPendingJournalPageProjection, DurableJournalPageProjection, Format,
     JournalPageCommitError, JournalPageProjectionOutcome, JournalPageProjectionTarget,
@@ -25,7 +23,7 @@ use crate::{Graph, PageDto, PageKind};
 use super::operational_coordinator::PreparedLocalMutation;
 use super::{
     append_managed_local_record, BatchId, ManagedLocalAppendError, ManagedLocalAppendProof,
-    ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind, ManagedLocalRecord,
+    ManagedLocalApplyOutcome, ManagedLocalJournalAppend, ManagedLocalRecord,
     ManagedLocalRecordError, ManagedTextKind, MaterializedPage, PreparedManagedLocalRecord,
     ShardedHotEngine,
 };
@@ -283,9 +281,9 @@ impl TrustedLocalCommittedRecovery {
 }
 
 impl TrustedLocalCommitCoordinator {
-    pub(crate) fn commit(
+    pub(crate) fn commit<J: ManagedLocalJournalAppend>(
         graph: &Graph,
-        journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+        journal: &mut J,
         engine: &mut ShardedHotEngine,
         page: &PageDto,
         base_revision: &str,
@@ -774,7 +772,7 @@ mod tests {
 
     fn commit_edit(
         fixture: &mut OverlayFixture,
-        journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+        journal: &mut impl ManagedLocalJournalAppend,
         seed: u128,
         generation: usize,
     ) -> TrustedLocalCommitOutcome {

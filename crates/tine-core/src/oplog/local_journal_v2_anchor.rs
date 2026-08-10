@@ -783,6 +783,48 @@ mod tests {
     }
 
     #[test]
+    fn every_legacy_suffix_through_fifty_one_bytes_refuses_without_changing_bytes() {
+        let directory = TemporaryCapabilityDirectory::new("legacy-v1-suffixes");
+        let device_id = Uuid::from_u128(0x1250);
+        let name = "legacy-v1-suffixes.journal";
+        {
+            let (mut segment, _) = LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open(
+                &directory.dir,
+                name,
+                device_id,
+            )
+            .unwrap();
+            segment
+                .append(
+                    ManagedLocalJournalPayloadKind::RecordV1,
+                    b"complete legacy frame",
+                )
+                .unwrap();
+        }
+        let complete = fs::read(directory.root.join(name)).unwrap();
+        for suffix_bytes in 1..=51 {
+            let mut bytes = complete.clone();
+            bytes.extend(vec![0xa5; suffix_bytes]);
+            fs::write(directory.root.join(name), &bytes).unwrap();
+            assert!(
+                LockedLocalJournalV1Segment::<ManagedLocalJournalPayloadKind>::inspect(
+                    &directory.dir,
+                    name,
+                    device_id,
+                    0,
+                )
+                .is_err(),
+                "legacy suffix length {suffix_bytes} unexpectedly became appendable"
+            );
+            assert_eq!(
+                fs::read(directory.root.join(name)).unwrap(),
+                bytes,
+                "legacy suffix length {suffix_bytes} was modified while refusing"
+            );
+        }
+    }
+
+    #[test]
     fn managed_local_journal_wraps_a_reopened_v2_segment() {
         let directory = TemporaryCapabilityDirectory::new("v2");
         let device_id = Uuid::from_u128(0x3400);

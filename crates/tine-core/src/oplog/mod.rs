@@ -128,7 +128,7 @@ pub use batch::{
 };
 pub(crate) use hot_engine::{
     append_managed_local_record, ManagedLocalAppendError, ManagedLocalAppendProof,
-    ProjectionTombstoneAuthorization,
+    ManagedLocalJournalAppend, ProjectionTombstoneAuthorization,
 };
 pub use hot_engine::{
     decode_managed_local_record, AcceptedBatch, AcceptedBatchEvidence, AuthorBatch,
@@ -161,7 +161,11 @@ pub use import::{
     MAX_IMPORT_DEPTH, MAX_IMPORT_FILES, MAX_IMPORT_LOCATOR_COMPONENTS, MAX_IMPORT_PARSED_NODES,
     MAX_IMPORT_RAW_BYTES,
 };
-pub(crate) use local_journal_v2_anchor::ManagedLocalJournalProtocol;
+pub(crate) use local_journal_v2_anchor::{
+    classify_managed_local_anchor, managed_local_v2_anchor_name,
+    parse_managed_local_v2_anchor_name, ManagedLocalAnchorEncoding, ManagedLocalGenerationAnchorV2,
+    ManagedLocalJournal, ManagedLocalJournalProtocol, MANAGED_LOCAL_ANCHOR_V2_BYTES,
+};
 pub use object_store::{BatchInspection, ObjectStore, ObjectStoreStats, StoreError};
 pub use page_name_index::{
     ExactLogicalPageNameBlobV1, ExactLogicalPageNameDigest, ExactLogicalPageNameRefV1,

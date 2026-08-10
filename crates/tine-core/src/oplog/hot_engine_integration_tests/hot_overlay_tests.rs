@@ -3,15 +3,17 @@ use std::time::Instant;
 use std::{collections::BTreeMap, fs};
 
 use cap_std::{ambient_authority, fs::Dir};
-use tine_storage::{LocalJournalFrame, LocalJournalSegment};
+use tine_storage::{
+    LocalJournalFrame, LocalJournalSegment, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
+};
 
 use super::*;
 use crate::fast_commit::forbidden_commit_work;
 use crate::oplog::{
     append_managed_local_record, decode_managed_local_record, ApplicationRuntimeRoot,
     ManagedLocalAppendError, ManagedLocalAppendProof, ManagedLocalApplyOutcome,
-    ManagedLocalJournalPayloadKind, ManagedLocalJournalProtocol, ManagedLocalRecordError,
-    MaterializedPage, ProjectionClaim, RebuildSource, SqliteFrontier,
+    ManagedLocalJournal, ManagedLocalJournalPayloadKind, ManagedLocalJournalProtocol,
+    ManagedLocalRecordError, MaterializedPage, ProjectionClaim, RebuildSource, SqliteFrontier,
 };
 
 const ENDPOINT: u128 = 980_000;
@@ -857,6 +859,40 @@ fn append_refuses_wrong_device_before_writing_and_proof_binds_legacy_one_barrier
 }
 
 #[test]
+fn fresh_schema2_append_proof_requires_two_syncs_and_applies_once() {
+    let (_, batches) = finalized_edit_chain("managed-record-append-v2-source", "md", 8, 1);
+    let mut fixture = OverlayFixture::new("managed-record-append-v2-local", "md", 8);
+    let mut prepared = fixture.prepare_record(&batches[0]);
+    let root = fixture._dir.path().join("journal-v2");
+    std::fs::create_dir_all(&root).unwrap();
+    let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+    let selection =
+        LocalJournalSegmentV2Selection::random("managed-local-v2.journal", uuid(DEVICE), 0)
+            .unwrap();
+    LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(&directory, &selection)
+        .unwrap();
+    let (segment, recovery) = LocalJournalSegmentV2::open_selected(&directory, &selection).unwrap();
+    assert_eq!(recovery.frames_recovered, 0);
+    let mut journal = ManagedLocalJournal::from_open_v2(segment);
+
+    let append = append_managed_local_record(&mut journal, &prepared).unwrap();
+    assert_eq!(append.protocol(), ManagedLocalJournalProtocol::V2);
+    assert_eq!(append.receipt().data_durability_syncs, 2);
+    assert_eq!(
+        append.receipt().data_durability_syncs,
+        append.protocol().expected_successful_append_data_syncs()
+    );
+    fixture
+        .engine
+        .apply_appended_managed_local_record(&append, &mut prepared)
+        .unwrap();
+    assert_eq!(
+        fixture.engine.managed_local_prefix_state().records_applied,
+        1
+    );
+}
+
+#[test]
 fn managed_local_append_proof_uses_the_protocol_exact_sync_count() {
     assert_eq!(
         ManagedLocalJournalProtocol::LegacyV1.expected_successful_append_data_syncs(),
@@ -872,7 +908,7 @@ fn managed_local_append_proof_uses_the_protocol_exact_sync_count() {
         .unwrap();
     assert!(source.contains("expected_successful_append_data_syncs"));
     assert!(!source.contains("data_durability_syncs != 1 | 2"));
-    assert!(source.contains("fn legacy_v1_managed_local_append_proof"));
+    assert!(source.contains("fn managed_local_append_proof"));
     assert!(!source.contains("ManagedLocalAppendProof::new"));
     assert!(!source.contains("pub(crate) const fn new("));
 }

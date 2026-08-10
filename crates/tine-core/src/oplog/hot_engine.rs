@@ -13,7 +13,10 @@ use loro::{
     UpdateOptions, ValueOrContainer, VersionVector,
 };
 use serde::{Deserialize, Serialize};
-use tine_storage::{LocalJournalAppend, LocalJournalError, LocalJournalFrame, LocalJournalSegment};
+use tine_storage::{
+    LocalJournalAppend, LocalJournalAppendError, LocalJournalError, LocalJournalFrame,
+    LocalJournalSegment,
+};
 use uuid::Uuid;
 
 use super::authenticated_patricia::{
@@ -70,14 +73,14 @@ use super::{
     BatchOrigin, BlobDescription, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId,
     ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
-    ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind, ManifestObjectRef,
-    ManifestProjectionPrecondition, ManifestProjectionTarget, ManifestedProjectionIntent,
-    MembershipClaim, MembershipDelta, ObjectKind, ObjectStore, OperationBatch, OperationObject,
-    PageDelta, PageId, PageState, PortablePathKeyDigest, PreparedBatch, ProjectionClaimEvidence,
-    ProjectionClaimParticipant, ProjectionCompletedReceipt, ProjectionCompletion,
-    ProjectionEndpointId, ProjectionIntent, ProjectionReceiptStore, ProjectionWork,
-    ProjectionWorkIndex, ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError,
-    SessionId, ValidatedBatch, WorkspaceId,
+    ManagedLocalJournal, ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind,
+    ManifestObjectRef, ManifestProjectionPrecondition, ManifestProjectionTarget,
+    ManifestedProjectionIntent, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
+    OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
+    PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
+    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionReceiptStore,
+    ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget, SemanticEffect,
+    SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -6646,14 +6649,11 @@ impl ManagedLocalAppendProof {
     }
 }
 
-/// Construct proof only for a receipt returned by the active legacy-v1 append
-/// adapter. A future v2 adapter must introduce its own narrowly scoped
-/// constructor when it owns a v2 receipt; the coordinator must never mint one.
-fn legacy_v1_managed_local_append_proof(receipt: LocalJournalAppend) -> ManagedLocalAppendProof {
-    ManagedLocalAppendProof {
-        protocol: ManagedLocalJournalProtocol::LegacyV1,
-        receipt,
-    }
+fn managed_local_append_proof(
+    protocol: ManagedLocalJournalProtocol,
+    receipt: LocalJournalAppend,
+) -> ManagedLocalAppendProof {
+    ManagedLocalAppendProof { protocol, receipt }
 }
 
 /// Whether a managed-local append is proven not to have started or may have
@@ -6661,13 +6661,14 @@ fn legacy_v1_managed_local_append_proof(receipt: LocalJournalAppend) -> ManagedL
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedLocalAppendError {
     DefinitelyNotAppended(ManagedLocalRecordError),
+    DefinitelyNotAppendedStorage(LocalJournalError),
     AppendOutcomeUnknown(LocalJournalError),
 }
 
 impl fmt::Display for ManagedLocalAppendError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DefinitelyNotAppended(_) => {
+            Self::DefinitelyNotAppended(_) | Self::DefinitelyNotAppendedStorage(_) => {
                 formatter.write_str("managed-local append was refused before storage")
             }
             Self::AppendOutcomeUnknown(_) => {
@@ -6681,7 +6682,93 @@ impl std::error::Error for ManagedLocalAppendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::DefinitelyNotAppended(error) => Some(error),
-            Self::AppendOutcomeUnknown(error) => Some(error),
+            Self::DefinitelyNotAppendedStorage(error) | Self::AppendOutcomeUnknown(error) => {
+                Some(error)
+            }
+        }
+    }
+}
+
+/// The only physical journal shapes that may reach the managed-local append
+/// adapter. Production owns the enum form; the legacy implementation remains
+/// available only to focused lower-level fixtures that establish its retained
+/// recovery behaviour.
+pub(crate) trait ManagedLocalJournalAppend {
+    fn managed_local_device_id(&self) -> Uuid;
+    fn managed_local_next_sequence(&self) -> u64;
+    fn append_managed_local_payload(
+        &mut self,
+        payload_kind: ManagedLocalJournalPayloadKind,
+        payload: &[u8],
+    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError>;
+}
+
+impl ManagedLocalJournalAppend for LocalJournalSegment<ManagedLocalJournalPayloadKind> {
+    fn managed_local_device_id(&self) -> Uuid {
+        self.device_id()
+    }
+
+    fn managed_local_next_sequence(&self) -> u64 {
+        self.next_sequence()
+    }
+
+    fn append_managed_local_payload(
+        &mut self,
+        payload_kind: ManagedLocalJournalPayloadKind,
+        payload: &[u8],
+    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
+        let receipt = self
+            .append(payload_kind, payload)
+            .map_err(ManagedLocalAppendError::AppendOutcomeUnknown)?;
+        Ok(managed_local_append_proof(
+            ManagedLocalJournalProtocol::LegacyV1,
+            receipt,
+        ))
+    }
+}
+
+impl ManagedLocalJournalAppend for ManagedLocalJournal<ManagedLocalJournalPayloadKind> {
+    fn managed_local_device_id(&self) -> Uuid {
+        self.device_id()
+    }
+
+    fn managed_local_next_sequence(&self) -> u64 {
+        self.next_sequence()
+    }
+
+    fn append_managed_local_payload(
+        &mut self,
+        payload_kind: ManagedLocalJournalPayloadKind,
+        payload: &[u8],
+    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
+        match self {
+            // The inspector deliberately has no mutating append API. A
+            // legacy journal reaching this boundary is a runtime bug; saves
+            // must be deferred until the rollover actor swaps in v2.
+            ManagedLocalJournal::LegacyV1(_) => {
+                Err(ManagedLocalAppendError::DefinitelyNotAppended(
+                    ManagedLocalRecordError::Unsupported(
+                        "managed-local legacy journal is pending schema-2 rollover".into(),
+                    ),
+                ))
+            }
+            ManagedLocalJournal::V2(segment) => {
+                let receipt =
+                    segment
+                        .append(payload_kind, payload)
+                        .map_err(|error| match error {
+                            LocalJournalAppendError::DefinitelyNotAppended(error) => {
+                                ManagedLocalAppendError::DefinitelyNotAppendedStorage(error)
+                            }
+                            LocalJournalAppendError::AppendOutcomeUnknown(error) => {
+                                ManagedLocalAppendError::AppendOutcomeUnknown(error)
+                            }
+                        })?;
+                Ok(managed_local_append_proof(
+                    ManagedLocalJournalProtocol::V2,
+                    receipt,
+                ))
+            }
         }
     }
 }
@@ -6718,8 +6805,8 @@ fn take_managed_local_append_fault_for_test() -> Option<ManagedLocalAppendFault>
 /// returned proof names the active protocol and its receipt. Any error after
 /// the physical append call begins is conservatively uncertain: legacy-v1 does
 /// not expose the exact write cut to this caller.
-pub(crate) fn append_managed_local_record(
-    segment: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+pub(crate) fn append_managed_local_record<J: ManagedLocalJournalAppend>(
+    segment: &mut J,
     prepared: &PreparedManagedLocalRecord,
 ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
     let author_device = prepared
@@ -6728,7 +6815,9 @@ pub(crate) fn append_managed_local_record(
         .manifest()
         .author_device_id()
         .as_uuid();
-    if segment.device_id() != author_device || segment.next_sequence() != prepared.sequence {
+    if segment.managed_local_device_id() != author_device
+        || segment.managed_local_next_sequence() != prepared.sequence
+    {
         return Err(ManagedLocalAppendError::DefinitelyNotAppended(
             ManagedLocalRecordError::WrongDurabilityProof,
         ));
@@ -6742,15 +6831,14 @@ pub(crate) fn append_managed_local_record(
         ));
     }
     let receipt = segment
-        .append(prepared.payload_kind(), prepared.journal_payload())
-        .map_err(ManagedLocalAppendError::AppendOutcomeUnknown)?;
+        .append_managed_local_payload(prepared.payload_kind(), prepared.journal_payload())?;
     #[cfg(test)]
     if test_fault == Some(ManagedLocalAppendFault::AfterPhysicalAppend) {
         return Err(ManagedLocalAppendError::AppendOutcomeUnknown(
             LocalJournalError::Io("injected unknown outcome after physical append".into()),
         ));
     }
-    Ok(legacy_v1_managed_local_append_proof(receipt))
+    Ok(receipt)
 }
 
 /// Decode and authenticate the complete canonical record represented by one

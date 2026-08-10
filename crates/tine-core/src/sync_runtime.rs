@@ -32,9 +32,11 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use tine_storage::LocalJournalSegment;
 use tine_storage::{
-    publish_immutable_exact, read_optional_regular, sync_dir_required, LocalJournalFrame,
-    LocalJournalSegment,
+    publish_immutable_exact, read_optional_regular, DurableDirectoryPublication, LocalJournalFrame,
+    LocalJournalSegmentV2, LockedLocalJournalV1Segment,
 };
 
 #[cfg(test)]
@@ -149,16 +151,18 @@ use crate::oplog::trusted_local_commit::{
 };
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
-    decode_managed_local_record, BatchId, BatchOrigin, BlockId, BlockLocation,
+    classify_managed_local_anchor, decode_managed_local_record, managed_local_v2_anchor_name,
+    parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlockId, BlockLocation,
     CanonicalGraphResourceId, ContentDigest, CurrentPageAtPath, DeviceId, DocumentId,
     FrontierReferenceHit, LineageDigest, LogicalPageName, LogseqIdentityOrigin, LogseqUuid,
-    ManagedLocalAppendError, ManagedLocalJournalPayloadKind, ManagedPath, ManagedTextKind,
-    MaterializedBlock, MaterializedBlockRow, MaterializedEntityId, MaterializedPage,
-    MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow,
-    MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction, PageId,
-    ProjectionEndpointId, ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1,
-    SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
-    MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    ManagedLocalAnchorEncoding, ManagedLocalAppendError, ManagedLocalGenerationAnchorV2,
+    ManagedLocalJournal, ManagedLocalJournalPayloadKind, ManagedLocalJournalProtocol, ManagedPath,
+    ManagedTextKind, MaterializedBlock, MaterializedBlockRow, MaterializedEntityId,
+    MaterializedPage, MaterializedPageRow, MaterializedPropertyRow, MaterializedSearchHit,
+    MaterializedTagRow, MaterializedTaskRow, OperationBatch, OperationObject, OperationTransaction,
+    PageId, ProjectionEndpointId, ReferenceCatalogPolicyV1, ReferenceFactV1,
+    ReferenceSourceLocatorV1, SemanticOperation, SessionId, SqliteMaterializedRead, WorkspaceId,
+    MANAGED_LOCAL_ANCHOR_V2_BYTES, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
 };
 #[cfg(test)]
 use crate::oplog::{inject_managed_local_append_fault_for_test, ManagedLocalAppendFault};
@@ -179,17 +183,14 @@ const MANAGED_LOCAL_GENERATION_ANCHOR_BYTES: u64 = 8192;
 const MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD: u64 = 64;
 #[cfg(test)]
 const MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD: u64 = 4;
-const MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD: u64 = 8 * 1024 * 1024;
-const MANAGED_LOCAL_RETAINED_GENERATIONS: usize = 2;
-
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedLocalCompactionFaultPoint {
     AfterCheckpointPublication,
-    AfterSegmentCreation,
-    AfterAnchorPublication,
+    AfterV2Prepare,
+    BeforeAnchorPublication,
+    AfterAnchorBeforeVerification,
     AfterInMemorySwitch,
-    AfterCleanupRemoval,
 }
 
 #[cfg(test)]
@@ -6949,8 +6950,7 @@ enum PendingManagedLocalCommit {
 
 struct ManagedLocalRuntimeState {
     directory: Dir,
-    journal: LocalJournalSegment<ManagedLocalJournalPayloadKind>,
-    generation: Option<u64>,
+    journal: ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
     frames: VecDeque<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     latest_projection_frames: BTreeMap<String, LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
     checkpoint: ManagedLocalDrainCheckpoint,
@@ -6958,7 +6958,6 @@ struct ManagedLocalRuntimeState {
     continuation: Option<ManagedLocalDrainContinuation>,
     pending_commit: Option<PendingManagedLocalCommit>,
     authorship_complete: BTreeSet<BatchId>,
-    cleanup_pending: bool,
     last_failure: Option<String>,
 }
 
@@ -6971,8 +6970,10 @@ impl ManagedLocalRuntimeState {
         if self.pending_commit.is_some() {
             return Some("committed_foreground_recovery".into());
         }
-        if self.cleanup_pending && self.frames.is_empty() {
-            return Some("compaction_cleanup".into());
+        if self.journal.protocol() == ManagedLocalJournalProtocol::LegacyV1
+            && self.frames.is_empty()
+        {
+            return Some("schema2_rollover".into());
         }
         self.continuation
             .as_ref()
@@ -7047,7 +7048,7 @@ fn prepare_trusted_local_runtime_commit(
     session: &mut crate::oplog::local_active::PromotedRuntimeSession<'_>,
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
-    journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+    journal: &mut ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
     target_page: &PageDto,
     transaction: &OperationTransaction,
 ) -> Result<TrustedLocalRuntimeAttempt, SyncEditorRequestError> {
@@ -7875,6 +7876,7 @@ struct ManagedLocalGenerationAnchor {
 }
 
 impl ManagedLocalGenerationAnchor {
+    #[cfg(test)]
     fn new(
         generation: u64,
         checkpoint: ManagedLocalDrainCheckpoint,
@@ -7891,6 +7893,7 @@ impl ManagedLocalGenerationAnchor {
         }
     }
 
+    #[cfg(test)]
     fn encode(&self) -> Result<Vec<u8>, String> {
         postcard::to_allocvec(self).map_err(|error| error.to_string())
     }
@@ -7971,6 +7974,166 @@ fn managed_local_checkpoint_sequence(name: &str) -> Option<u64> {
     (format!("{sequence:020}") == digits).then_some(sequence)
 }
 
+/// Schema-1 and schema-2 anchors share one authority-generation namespace.
+///
+/// A newer schema-1 generation must therefore outrank an older schema-2
+/// selector during the rolling protocol migration.  A same-generation pair
+/// has no unambiguous authority order and must fail closed rather than letting
+/// the implementation detail of either branch choose a winner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedLocalAuthorityGeneration {
+    LegacyV1(u64),
+    SchemaV2(u64),
+}
+
+impl ManagedLocalAuthorityGeneration {
+    const fn generation(self) -> u64 {
+        match self {
+            Self::LegacyV1(generation) | Self::SchemaV2(generation) => generation,
+        }
+    }
+}
+
+fn select_managed_local_authority_generation(
+    names: &[String],
+    device_id: Uuid,
+) -> Result<Option<ManagedLocalAuthorityGeneration>, String> {
+    let schema1 = names
+        .iter()
+        .filter_map(|name| managed_local_generation_from_name(name, device_id, ".anchor"))
+        .collect::<BTreeSet<_>>();
+    let schema2 = names
+        .iter()
+        .filter_map(|name| parse_managed_local_v2_anchor_name(name, device_id))
+        .collect::<BTreeSet<_>>();
+
+    if let Some(generation) = schema1.intersection(&schema2).next() {
+        return Err(format!(
+            "managed-local schema-1/schema-2 authority generation {generation} is ambiguous"
+        ));
+    }
+
+    Ok(match (schema1.last().copied(), schema2.last().copied()) {
+        (Some(schema1), Some(schema2)) if schema1 > schema2 => {
+            Some(ManagedLocalAuthorityGeneration::LegacyV1(schema1))
+        }
+        (Some(_), Some(schema2)) => Some(ManagedLocalAuthorityGeneration::SchemaV2(schema2)),
+        (Some(schema1), None) => Some(ManagedLocalAuthorityGeneration::LegacyV1(schema1)),
+        (None, Some(schema2)) => Some(ManagedLocalAuthorityGeneration::SchemaV2(schema2)),
+        (None, None) => None,
+    })
+}
+
+fn next_managed_local_authority_generation(
+    names: &[String],
+    device_id: Uuid,
+) -> Result<u64, String> {
+    match select_managed_local_authority_generation(names, device_id)? {
+        Some(authority) => authority
+            .generation()
+            .checked_add(1)
+            .ok_or_else(|| "managed-local authority generation overflow".to_owned()),
+        None => Ok(1),
+    }
+}
+
+fn open_exact_managed_local_v2_successor(
+    directory: &Dir,
+    binding: &EnrollmentBindingV1,
+    selector_generation: u64,
+    expected: &ManagedLocalGenerationAnchorV2,
+) -> Result<ManagedLocalJournal<ManagedLocalJournalPayloadKind>, String> {
+    let anchor_name =
+        managed_local_v2_anchor_name(expected.checkpoint().device_id(), selector_generation);
+    let bytes = read_optional_regular(
+        directory,
+        &anchor_name,
+        MANAGED_LOCAL_ANCHOR_V2_BYTES as u64,
+        None,
+    )
+    .map_err(|error| format!("cannot resolve managed-local successor {anchor_name}: {error}"))?
+    .ok_or_else(|| format!("managed-local successor {anchor_name} is absent"))?;
+    if classify_managed_local_anchor(&bytes) != ManagedLocalAnchorEncoding::SchemaV2 {
+        return Err(format!(
+            "managed-local successor {anchor_name} is not schema 2"
+        ));
+    }
+    let resolved = ManagedLocalGenerationAnchorV2::decode(
+        &bytes,
+        selector_generation,
+        binding.workspace_id(),
+        binding.lineage_digest(),
+        expected.checkpoint().device_id(),
+    )
+    .map_err(|error| format!("managed-local successor {anchor_name} is corrupt: {error}"))?;
+    if &resolved != expected {
+        return Err(format!(
+            "managed-local successor {anchor_name} is mismatched"
+        ));
+    }
+    let (journal, recovery) = LocalJournalSegmentV2::open_selected(directory, resolved.selection())
+        .map_err(|error| {
+            format!(
+                "cannot open managed-local successor tuple {}: {error}",
+                resolved.selection().segment_name()
+            )
+        })?;
+    if recovery.frames_recovered != 0 || recovery.discarded_tail_bytes != 0 {
+        return Err("managed-local successor is not the exact empty rollover tuple".into());
+    }
+    Ok(ManagedLocalJournal::from_open_v2(journal))
+}
+
+fn prepare_fresh_managed_local_v2_journal(
+    directory: &Dir,
+    checkpoint: ManagedLocalDrainCheckpoint,
+    selector_generation: u64,
+) -> Result<
+    (
+        ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
+        ManagedLocalGenerationAnchorV2,
+    ),
+    String,
+> {
+    // This retained object is deliberately obtained before the segment,
+    // frontier, or authority name exists. On Windows that makes unsupported
+    // write-through publication a refusal-before-mutation rather than a
+    // best-effort recovery problem.
+    let publication = DurableDirectoryPublication::open(directory).map_err(|error| {
+        format!("managed-local schema-2 durable publication is unavailable: {error}")
+    })?;
+    let anchor =
+        ManagedLocalGenerationAnchorV2::new(selector_generation, checkpoint, None, Uuid::new_v4())
+            .map_err(|error| {
+                format!("cannot construct fresh managed-local schema-2 anchor: {error}")
+            })?;
+    let anchor_name = managed_local_v2_anchor_name(
+        anchor.checkpoint().device_id(),
+        anchor.selector_generation(),
+    );
+    let anchor_bytes = anchor
+        .encode()
+        .map_err(|error| format!("cannot encode fresh managed-local schema-2 anchor: {error}"))?;
+    LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(directory, anchor.selection())
+        .map_err(|error| format!("cannot prepare fresh managed-local schema-2 segment: {error}"))?;
+    let (journal, recovery) = LocalJournalSegmentV2::open_selected(directory, anchor.selection())
+        .map_err(|error| {
+        format!("cannot open fresh managed-local schema-2 segment: {error}")
+    })?;
+    if recovery.frames_recovered != 0
+        || recovery.discarded_tail_bytes != 0
+        || journal.next_sequence() != anchor.checkpoint().next_sequence()
+    {
+        return Err("fresh managed-local schema-2 tuple is not empty".into());
+    }
+    publication
+        .publish_new_exact(&anchor_name, &anchor_bytes)
+        .map_err(|error| {
+            format!("cannot publish fresh managed-local schema-2 anchor {anchor_name}: {error}")
+        })?;
+    Ok((ManagedLocalJournal::from_open_v2(journal), anchor))
+}
+
 fn open_managed_local_runtime(
     application_runtime_root: &Path,
     binding: &EnrollmentBindingV1,
@@ -7991,49 +8154,141 @@ fn open_managed_local_runtime(
     let directory = open_dir_nofollow(&namespace, &workspace_name).map_err(display)?;
     let device_id = binding.device_id().as_uuid();
     let names = managed_local_directory_names(&directory)?;
-    let mut generations = names
-        .iter()
-        .filter_map(|name| managed_local_generation_from_name(name, device_id, ".anchor"))
-        .collect::<Vec<_>>();
-    generations.sort_unstable();
-    generations.dedup();
-    let (generation, generation_anchor, journal) = if let Some(generation) = generations.last() {
-        let anchor_name = managed_local_generation_anchor_filename(device_id, *generation);
-        let anchor_bytes = read_optional_regular(
-            &directory,
-            &anchor_name,
-            MANAGED_LOCAL_GENERATION_ANCHOR_BYTES,
-            None,
-        )
-        .map_err(|error| {
-            format!("cannot read authoritative managed-local generation {anchor_name}: {error}")
-        })?
-        .ok_or_else(|| {
-            format!("authoritative managed-local generation {anchor_name} disappeared")
-        })?;
-        let anchor = ManagedLocalGenerationAnchor::decode(&anchor_bytes, *generation, binding)
-            .map_err(|error| {
-                format!("authoritative managed-local generation {anchor_name} is corrupt: {error}")
-            })?;
-        let segment_name = managed_local_generation_segment_filename(device_id, *generation);
-        let (journal, _) = LocalJournalSegment::open_from_sequence(
-            &directory,
-            &segment_name,
-            device_id,
-            *generation,
-        )
-        .map_err(|error| {
-            format!(
+    let (journal, mut checkpoint, mut checkpoint_batch_id) =
+        match select_managed_local_authority_generation(&names, device_id)? {
+            Some(ManagedLocalAuthorityGeneration::SchemaV2(selector_generation)) => {
+                let anchor_name = managed_local_v2_anchor_name(device_id, selector_generation);
+                let anchor_bytes = read_optional_regular(
+                    &directory,
+                    &anchor_name,
+                    MANAGED_LOCAL_ANCHOR_V2_BYTES as u64,
+                    None,
+                )
+                .map_err(|error| {
+                    format!(
+                        "cannot read authoritative managed-local selector {anchor_name}: {error}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!("authoritative managed-local selector {anchor_name} disappeared")
+                })?;
+                if classify_managed_local_anchor(&anchor_bytes)
+                    != ManagedLocalAnchorEncoding::SchemaV2
+                {
+                    return Err(format!(
+                "authoritative managed-local selector {anchor_name} is corrupt: not schema 2"
+            ));
+                }
+                let anchor = ManagedLocalGenerationAnchorV2::decode(
+                    &anchor_bytes,
+                    selector_generation,
+                    binding.workspace_id(),
+                    binding.lineage_digest(),
+                    device_id,
+                )
+                .map_err(|error| {
+                    format!(
+                        "authoritative managed-local selector {anchor_name} is corrupt: {error}"
+                    )
+                })?;
+                let (journal, _) =
+                    LocalJournalSegmentV2::open_selected(&directory, anchor.selection()).map_err(
+                        |error| {
+                            format!(
+                    "cannot open authoritative managed-local selector tuple {}: {error}",
+                    anchor.selection().segment_name()
+                )
+                        },
+                    )?;
+                (
+                    ManagedLocalJournal::from_open_v2(journal),
+                    anchor.checkpoint().clone(),
+                    anchor.accepted_batch_id(),
+                )
+            }
+            Some(ManagedLocalAuthorityGeneration::LegacyV1(generation)) => {
+                let anchor_name = managed_local_generation_anchor_filename(device_id, generation);
+                let anchor_bytes = read_optional_regular(
+                    &directory,
+                    &anchor_name,
+                    MANAGED_LOCAL_GENERATION_ANCHOR_BYTES,
+                    None,
+                )
+                .map_err(|error| {
+                    format!(
+                        "cannot read authoritative managed-local generation {anchor_name}: {error}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!("authoritative managed-local generation {anchor_name} disappeared")
+                })?;
+                let anchor =
+                    ManagedLocalGenerationAnchor::decode(&anchor_bytes, generation, binding)
+                        .map_err(|error| {
+                            format!(
+                        "authoritative managed-local generation {anchor_name} is corrupt: {error}"
+                    )
+                        })?;
+                let segment_name = managed_local_generation_segment_filename(device_id, generation);
+                let journal = LockedLocalJournalV1Segment::inspect(
+                    &directory,
+                    &segment_name,
+                    device_id,
+                    generation,
+                )
+                .map_err(|error| {
+                    format!(
                 "cannot open authoritative managed-local generation segment {segment_name}: {error}"
             )
-        })?;
-        (Some(*generation), Some(anchor), journal)
-    } else {
-        let segment_name = format!("device-{}.segment", device_id.simple());
-        let (journal, _) = LocalJournalSegment::open(&directory, &segment_name, device_id)
-            .map_err(|error| format!("cannot open enrolled managed-local journal: {error}"))?;
-        (None, None, journal)
-    };
+                })?;
+                (
+                    ManagedLocalJournal::from_locked_v1(journal),
+                    anchor.checkpoint,
+                    Some(anchor.accepted_batch_id),
+                )
+            }
+            None => {
+                let segment_name = format!("device-{}.segment", device_id.simple());
+                if names.iter().any(|name| name == &segment_name) {
+                    let journal = LockedLocalJournalV1Segment::inspect(
+                        &directory,
+                        &segment_name,
+                        device_id,
+                        0,
+                    )
+                    .map_err(|error| {
+                        format!("cannot inspect enrolled managed-local journal: {error}")
+                    })?;
+                    (
+                        ManagedLocalJournal::from_locked_v1(journal),
+                        ManagedLocalDrainCheckpoint::initial(
+                            device_id,
+                            binding.workspace_id(),
+                            binding.lineage_digest(),
+                        ),
+                        None,
+                    )
+                } else {
+                    let checkpoint = ManagedLocalDrainCheckpoint::initial(
+                        device_id,
+                        binding.workspace_id(),
+                        binding.lineage_digest(),
+                    );
+                    let selector_generation =
+                        next_managed_local_authority_generation(&names, device_id)?;
+                    let (journal, anchor) = prepare_fresh_managed_local_v2_journal(
+                        &directory,
+                        checkpoint.clone(),
+                        selector_generation,
+                    )?;
+                    (
+                        journal,
+                        anchor.checkpoint().clone(),
+                        anchor.accepted_batch_id(),
+                    )
+                }
+            }
+        };
     let mut recovered_frames = Vec::new();
     journal
         .replay(|frame| recovered_frames.push(frame))
@@ -8046,20 +8301,7 @@ fn open_managed_local_runtime(
         return Err("managed-local journal sequence/count binding is inconsistent".into());
     }
 
-    let mut checkpoint = generation_anchor.as_ref().map_or_else(
-        || {
-            ManagedLocalDrainCheckpoint::initial(
-                device_id,
-                binding.workspace_id(),
-                binding.lineage_digest(),
-            )
-        },
-        |anchor| anchor.checkpoint.clone(),
-    );
-    let mut checkpoint_batch_id = generation_anchor
-        .as_ref()
-        .map(|anchor| anchor.accepted_batch_id);
-    if generation.is_none() {
+    if journal.protocol() == ManagedLocalJournalProtocol::LegacyV1 && journal.base_sequence() == 0 {
         let mut missing_checkpoint = false;
         let checkpoint_probe_end = journal
             .next_sequence()
@@ -8096,7 +8338,7 @@ fn open_managed_local_runtime(
             }
             checkpoint = decoded;
         }
-    } else {
+    } else if journal.protocol() == ManagedLocalJournalProtocol::LegacyV1 {
         let mut checkpoint_sequences = names
             .iter()
             .filter_map(|name| managed_local_checkpoint_sequence(name))
@@ -8146,7 +8388,6 @@ fn open_managed_local_runtime(
         return Ok(ManagedLocalRuntimeState {
             directory,
             journal,
-            generation,
             frames: VecDeque::new(),
             latest_projection_frames: BTreeMap::new(),
             checkpoint,
@@ -8154,7 +8395,6 @@ fn open_managed_local_runtime(
             continuation: None,
             pending_commit: None,
             authorship_complete: BTreeSet::new(),
-            cleanup_pending: generation.is_some(),
             last_failure: None,
         });
     }
@@ -8192,7 +8432,7 @@ fn open_managed_local_runtime(
                 })?,
             )
             .map_err(|error| format!("cannot seed checkpointed managed-local prefix: {error}"))?;
-    } else if generation.is_some() {
+    } else if journal.base_sequence() != 0 {
         engine
             .seed_compacted_managed_local_prefix(
                 checkpoint.next_sequence(),
@@ -8271,7 +8511,6 @@ fn open_managed_local_runtime(
     Ok(ManagedLocalRuntimeState {
         directory,
         journal,
-        generation,
         frames,
         latest_projection_frames,
         checkpoint,
@@ -8279,7 +8518,6 @@ fn open_managed_local_runtime(
         continuation: None,
         pending_commit: None,
         authorship_complete: BTreeSet::new(),
-        cleanup_pending: generation.is_some(),
         last_failure: None,
     })
 }
@@ -12890,6 +13128,37 @@ impl RuntimeActor {
                 phase,
             });
         }
+        if self.managed_local.as_ref().is_some_and(|managed| {
+            managed.journal.protocol() == ManagedLocalJournalProtocol::LegacyV1
+        }) {
+            // Legacy v1 is retained solely as a locked inspector. Let the
+            // derivative lane drain and roll it forward, but never let a save
+            // reopen or append to that old physical segment.
+            return match self.tick_managed_local_derivative() {
+                Some(SyncRuntimeTick::Terminal(_)) => {
+                    EditorTurnReadiness::Deferred(SyncEditorDeferred::Revoked {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::ProjectionDrain,
+                    })
+                }
+                Some(SyncRuntimeTick::RecoveryBlocked(_))
+                | Some(SyncRuntimeTick::Blocked(_))
+                | Some(SyncRuntimeTick::Failed(_)) => {
+                    EditorTurnReadiness::Deferred(SyncEditorDeferred::BlockedRecovery {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::ProjectionDrain,
+                        retained_publication: true,
+                    })
+                }
+                Some(_) | None => {
+                    EditorTurnReadiness::Deferred(SyncEditorDeferred::BlockedRecovery {
+                        batch_id: None,
+                        phase: SyncLocalMutationPhase::ProjectionDrain,
+                        retained_publication: true,
+                    })
+                }
+            };
+        }
         if self
             .managed_local
             .as_ref()
@@ -13173,6 +13442,9 @@ impl RuntimeActor {
         let state = match execution {
             EditorCoordinatorExecution::CommitRefused(TrustedLocalCommitError::JournalAppend(
                 ManagedLocalAppendError::DefinitelyNotAppended(_),
+            ))
+            | EditorCoordinatorExecution::CommitRefused(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalAppendError::DefinitelyNotAppendedStorage(_),
             )) => {
                 return Err(SyncEditorRequestError::ActorRefusedWithCode(
                     SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
@@ -13638,15 +13910,11 @@ impl RuntimeActor {
             .as_ref()
             .is_some_and(|managed| managed.frames.is_empty())
         {
-            let compacted = match self.compact_drained_managed_local_journal() {
-                Ok(compacted) => compacted,
+            let rolled_over = match self.rollover_drained_legacy_managed_local_journal() {
+                Ok(rolled_over) => rolled_over,
                 Err(error) => return Some(SyncRuntimeTick::RecoveryBlocked(error)),
             };
-            let cleaned = match self.cleanup_managed_local_generations() {
-                Ok(cleaned) => cleaned,
-                Err(error) => return Some(SyncRuntimeTick::RecoveryBlocked(error)),
-            };
-            if compacted || cleaned {
+            if rolled_over {
                 return Some(SyncRuntimeTick::Recovering);
             }
         }
@@ -13824,13 +14092,12 @@ impl RuntimeActor {
                 }
                 managed.continuation = None;
                 managed.authorship_complete.remove(&completion.batch_id);
-                managed.cleanup_pending = true;
                 managed.last_failure = None;
                 if managed.frames.is_empty() {
                     if let Err(error) = self.collapse_drained_managed_local_overlay() {
                         return Some(SyncRuntimeTick::RecoveryBlocked(error));
                     }
-                    match self.compact_drained_managed_local_journal() {
+                    match self.rollover_drained_legacy_managed_local_journal() {
                         Ok(true) => {
                             // The compacted generation is a sparse, already
                             // quiescent checkpoint. Refresh the disposable
@@ -13856,9 +14123,6 @@ impl RuntimeActor {
                             return Some(SyncRuntimeTick::RecoveryBlocked(error));
                         }
                     }
-                }
-                if let Err(error) = self.cleanup_managed_local_generations() {
-                    return Some(SyncRuntimeTick::RecoveryBlocked(error));
                 }
                 Some(SyncRuntimeTick::Recovering)
             }
@@ -13932,119 +14196,157 @@ impl RuntimeActor {
             .map_err(|error| format!("managed-local collapse failed: {error}"))
     }
 
-    fn compact_drained_managed_local_journal(&mut self) -> Result<bool, String> {
-        let (base_sequence, next_sequence, committed_bytes, checkpoint, accepted_batch_id) = {
+    fn rollover_drained_legacy_managed_local_journal(&mut self) -> Result<bool, String> {
+        let (directory, device_id, legacy_generation, next_sequence, checkpoint, accepted_batch_id) = {
             let managed = self
                 .managed_local
                 .as_ref()
-                .ok_or_else(|| "managed-local compaction has no runtime state".to_owned())?;
-            if !managed.frames.is_empty() || managed.pending_commit.is_some() {
+                .ok_or_else(|| "managed-local rollover has no runtime state".to_owned())?;
+            if managed.journal.protocol() == ManagedLocalJournalProtocol::V2
+                || !managed.frames.is_empty()
+                || managed.pending_commit.is_some()
+            {
                 return Ok(false);
             }
+            if managed.checkpoint.next_sequence() != managed.journal.next_sequence() {
+                return Err("managed-local rollover checkpoint is not current".into());
+            }
             (
+                managed.directory.try_clone().map_err(display)?,
+                managed.journal.device_id(),
                 managed.journal.base_sequence(),
                 managed.journal.next_sequence(),
-                managed.journal.committed_bytes(),
                 managed.checkpoint.clone(),
                 managed.checkpoint_batch_id,
             )
         };
-        let retained_frames = next_sequence
-            .checked_sub(base_sequence)
-            .ok_or_else(|| "managed-local compaction sequence moved behind its base".to_owned())?;
-        if retained_frames < MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
-            && committed_bytes < MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD
-        {
-            return Ok(false);
+        if (next_sequence == 0) != accepted_batch_id.is_none() {
+            return Err("managed-local rollover checkpoint/batch binding is invalid".into());
         }
-        if checkpoint.next_sequence() != next_sequence {
-            return Err("managed-local compaction checkpoint is behind the journal".into());
-        }
-        let accepted_batch_id = accepted_batch_id.ok_or_else(|| {
-            "managed-local compaction checkpoint has no accepted batch evidence".to_owned()
-        })?;
 
         {
             let authority = self
                 .authority
                 .as_mut()
-                .ok_or_else(|| "managed-local compaction has no active authority".to_owned())?;
+                .ok_or_else(|| "managed-local rollover has no active authority".to_owned())?;
             let runtime = self
                 .runtime
                 .as_mut()
-                .ok_or_else(|| "managed-local compaction has no active runtime".to_owned())?;
+                .ok_or_else(|| "managed-local rollover has no active runtime".to_owned())?;
             let mut session = runtime
                 .admit_promoted_mutation(authority, &self.graph)
-                .map_err(|error| format!("managed-local compaction was refused: {error}"))?;
+                .map_err(|error| format!("managed-local rollover was refused: {error}"))?;
             let engine = session.engine().map_err(|error| {
-                format!("managed-local compaction lost engine authority: {error}")
+                format!("managed-local rollover lost engine authority: {error}")
             })?;
             let prefix = engine.managed_local_prefix_state();
             if prefix.next_sequence != next_sequence || prefix.records_applied != 0 {
                 return Err(
-                    "managed-local compaction requires an exactly collapsed hot overlay".into(),
+                    "managed-local rollover requires an exactly collapsed hot overlay".into(),
                 );
             }
-            if !engine
-                .accepted_batch_is_active(accepted_batch_id)
-                .map_err(display)?
-            {
-                return Err(
-                    "managed-local compaction accepted-history evidence is not active".into(),
-                );
+            if let Some(batch_id) = accepted_batch_id {
+                if !engine.accepted_batch_is_active(batch_id).map_err(display)? {
+                    return Err(
+                        "managed-local rollover accepted-history evidence is not active".into(),
+                    );
+                }
             }
         }
 
-        let device_id = checkpoint.device_id();
-        let generation = next_sequence;
-        let segment_name = managed_local_generation_segment_filename(device_id, generation);
-        let anchor_name = managed_local_generation_anchor_filename(device_id, generation);
-        let anchor =
-            ManagedLocalGenerationAnchor::new(generation, checkpoint.clone(), accepted_batch_id);
-        let encoded_anchor = anchor
-            .encode()
-            .map_err(|error| format!("cannot encode managed-local generation anchor: {error}"))?;
-        let new_journal = {
-            let managed = self
-                .managed_local
-                .as_ref()
-                .expect("managed-local runtime remains installed");
-            let (journal, recovery) = LocalJournalSegment::open_from_sequence(
-                &managed.directory,
-                &segment_name,
-                device_id,
-                generation,
-            )
-            .map_err(|error| {
-                format!("cannot create managed-local generation segment {segment_name}: {error}")
-            })?;
-            if recovery.frames_recovered != 0
-                || recovery.discarded_tail_bytes != 0
-                || journal.next_sequence() != generation
-            {
+        let names = managed_local_directory_names(&directory)?;
+        match select_managed_local_authority_generation(&names, device_id)? {
+            Some(ManagedLocalAuthorityGeneration::LegacyV1(generation))
+                if generation == legacy_generation => {}
+            Some(authority) => {
                 return Err(format!(
-                    "incomplete managed-local generation segment {segment_name} is not empty"
+                    "managed-local rollover observed newer global authority generation {}; reopen before migrating legacy generation {legacy_generation}",
+                    authority.generation()
                 ));
             }
-            if managed_local_compaction_cut!(device_id, AfterSegmentCreation) {
-                return Err(
-                    "injected crash after managed-local generation segment creation".into(),
-                );
+            None if legacy_generation == 0 => {}
+            None => {
+                return Err(format!(
+                    "managed-local rollover lost authoritative schema-1 generation {legacy_generation}"
+                ));
             }
-            publish_immutable_exact(&managed.directory, &anchor_name, &encoded_anchor).map_err(
-                |error| {
-                    format!("cannot publish managed-local generation anchor {anchor_name}: {error}")
-                },
-            )?;
-            journal
-        };
-
-        if managed_local_compaction_cut!(device_id, AfterAnchorPublication) {
-            self.latch_terminal(
-                "injected crash after managed-local generation anchor publication".into(),
-            );
-            return Err("injected managed-local crash cut requires reopen".into());
         }
+        let selector_generation = legacy_generation
+            .checked_add(1)
+            .ok_or_else(|| "managed-local rollover selector generation overflow".to_owned())?;
+        // Probe before any caller-owned v2 artifact is created. The retained
+        // publication is also the sole anchor publisher below.
+        let publication = DurableDirectoryPublication::open(&directory).map_err(|error| {
+            format!("managed-local rollover durable publication is unavailable: {error}")
+        })?;
+        let anchor = ManagedLocalGenerationAnchorV2::new(
+            selector_generation,
+            checkpoint,
+            accepted_batch_id,
+            Uuid::new_v4(),
+        )
+        .map_err(|error| format!("cannot construct managed-local rollover anchor: {error}"))?;
+        let anchor_name = managed_local_v2_anchor_name(device_id, selector_generation);
+        let anchor_bytes = anchor
+            .encode()
+            .map_err(|error| format!("cannot encode managed-local rollover anchor: {error}"))?;
+        LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(
+            &directory,
+            anchor.selection(),
+        )
+        .map_err(|error| format!("cannot prepare managed-local rollover tuple: {error}"))?;
+        if managed_local_compaction_cut!(device_id, AfterV2Prepare) {
+            return Err("injected crash after managed-local v2 tuple preparation".into());
+        }
+        let (prepared, recovery) =
+            LocalJournalSegmentV2::open_selected(&directory, anchor.selection())
+                .map_err(|error| format!("cannot open managed-local rollover tuple: {error}"))?;
+        if recovery.frames_recovered != 0
+            || recovery.discarded_tail_bytes != 0
+            || prepared.next_sequence() != next_sequence
+        {
+            return Err("managed-local rollover tuple is not empty at the checkpoint".into());
+        }
+        if managed_local_compaction_cut!(device_id, BeforeAnchorPublication) {
+            return Err("injected crash before managed-local schema-2 anchor publication".into());
+        }
+
+        let new_journal = match publication.publish_new_exact(&anchor_name, &anchor_bytes) {
+            Ok(()) if !managed_local_compaction_cut!(device_id, AfterAnchorBeforeVerification) => {
+                ManagedLocalJournal::from_open_v2(prepared)
+            }
+            Ok(()) => {
+                drop(prepared);
+                open_exact_managed_local_v2_successor(
+                    &directory,
+                    &self.binding,
+                    selector_generation,
+                    &anchor,
+                )
+                .map_err(|error| {
+                    self.latch_terminal(format!(
+                        "managed-local rollover successor resolution failed after anchor publication: {error}"
+                    ));
+                    error
+                })?
+            }
+            Err(publication_error) => {
+                drop(prepared);
+                open_exact_managed_local_v2_successor(
+                    &directory,
+                    &self.binding,
+                    selector_generation,
+                    &anchor,
+                )
+                .map_err(|resolution_error| {
+                    let detail = format!(
+                        "managed-local rollover anchor publication failed ({publication_error}) and exact successor resolution failed: {resolution_error}"
+                    );
+                    self.latch_terminal(detail.clone());
+                    detail
+                })?
+            }
+        };
 
         let managed = self
             .managed_local
@@ -14052,101 +14354,10 @@ impl RuntimeActor {
             .expect("managed-local runtime remains installed");
         let old_journal = std::mem::replace(&mut managed.journal, new_journal);
         drop(old_journal);
-        managed.generation = Some(generation);
-        managed.cleanup_pending = true;
         if managed_local_compaction_cut!(device_id, AfterInMemorySwitch) {
-            return Err("injected crash after managed-local in-memory generation switch".into());
+            return Err("injected crash after managed-local in-memory protocol switch".into());
         }
         Ok(true)
-    }
-
-    fn cleanup_managed_local_generations(&mut self) -> Result<bool, String> {
-        let managed = self
-            .managed_local
-            .as_mut()
-            .ok_or_else(|| "managed-local cleanup has no runtime state".to_owned())?;
-        if !managed.cleanup_pending {
-            return Ok(false);
-        }
-        let names = managed_local_directory_names(&managed.directory)?;
-        let device_id = managed.journal.device_id();
-        let mut generations = names
-            .iter()
-            .filter_map(|name| managed_local_generation_from_name(name, device_id, ".anchor"))
-            .collect::<Vec<_>>();
-        generations.sort_unstable();
-        generations.dedup();
-        let retained = generations
-            .iter()
-            .rev()
-            .take(MANAGED_LOCAL_RETAINED_GENERATIONS)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let obsolete = generations
-            .iter()
-            .copied()
-            .filter(|generation| !retained.contains(generation))
-            .collect::<Vec<_>>();
-        let mut changed = false;
-        for generation in &obsolete {
-            let anchor_name = managed_local_generation_anchor_filename(device_id, *generation);
-            managed
-                .directory
-                .remove_file(&anchor_name)
-                .map_err(|error| {
-                    format!("cannot retire managed-local generation anchor {anchor_name}: {error}")
-                })?;
-            if managed_local_compaction_cut!(device_id, AfterCleanupRemoval) {
-                return Err("injected crash during managed-local generation cleanup".into());
-            }
-            sync_dir_required(&managed.directory).map_err(|error| {
-                format!("cannot make managed-local anchor retirement durable: {error}")
-            })?;
-            changed = true;
-        }
-
-        let retained_segments = retained
-            .iter()
-            .map(|generation| managed_local_generation_segment_filename(device_id, *generation))
-            .collect::<BTreeSet<_>>();
-        let legacy_segment = format!("device-{}.segment", device_id.simple());
-        for name in &names {
-            let is_own_generation_segment =
-                managed_local_generation_from_name(name, device_id, ".segment").is_some();
-            let remove = (managed.generation.is_some() && name == &legacy_segment)
-                || (is_own_generation_segment && !retained_segments.contains(name));
-            if remove {
-                managed.directory.remove_file(name).map_err(|error| {
-                    format!("cannot retire managed-local segment {name}: {error}")
-                })?;
-                if managed_local_compaction_cut!(device_id, AfterCleanupRemoval) {
-                    return Err("injected crash during managed-local segment cleanup".into());
-                }
-                changed = true;
-            }
-        }
-        if managed.generation.is_some() {
-            let retained_checkpoint =
-                managed_local_checkpoint_filename(managed.checkpoint.next_sequence());
-            for name in &names {
-                if managed_local_checkpoint_sequence(name).is_some() && name != &retained_checkpoint
-                {
-                    managed.directory.remove_file(name).map_err(|error| {
-                        format!("cannot retire managed-local checkpoint {name}: {error}")
-                    })?;
-                    if managed_local_compaction_cut!(device_id, AfterCleanupRemoval) {
-                        return Err("injected crash during managed-local checkpoint cleanup".into());
-                    }
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            sync_dir_required(&managed.directory)
-                .map_err(|error| format!("cannot make managed-local cleanup durable: {error}"))?;
-        }
-        managed.cleanup_pending = false;
-        Ok(changed)
     }
 
     fn tick(&mut self) -> SyncRuntimeTick {
@@ -18369,7 +18580,10 @@ fn trusted_local_commit_refusal(error: TrustedLocalCommitError) -> SyncEditorReq
         }
         TrustedLocalCommitError::JournalAppend(ManagedLocalAppendError::DefinitelyNotAppended(
             _,
-        )) => SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
+        ))
+        | TrustedLocalCommitError::JournalAppend(
+            ManagedLocalAppendError::DefinitelyNotAppendedStorage(_),
+        ) => SyncEditorRefusalCode::TrustedLocalCommitAppendRefused,
         TrustedLocalCommitError::JournalAppend(ManagedLocalAppendError::AppendOutcomeUnknown(
             _,
         )) => SyncEditorRefusalCode::TrustedLocalAppendOutcomeUnknown,
@@ -21255,41 +21469,88 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
-        let segment_names = names
+        let legacy_segment_names = names
             .iter()
             .filter(|name| name.starts_with("device-") && name.ends_with(".segment"))
             .cloned()
             .collect::<Vec<_>>();
-        let device = managed_local_test_device_id(&segment_names);
-        let generation = names
+        let v2_segment_names = names
             .iter()
-            .filter_map(|name| managed_local_generation_from_name(name, device, ".anchor"))
-            .max();
-        let segment_name = generation.map_or_else(
-            || format!("device-{}.segment", device.simple()),
-            |generation| managed_local_generation_segment_filename(device, generation),
-        );
+            .filter(|name| name.starts_with("device-") && name.ends_with(".journal-v2"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let device = managed_local_test_device_id(if v2_segment_names.is_empty() {
+            &legacy_segment_names
+        } else {
+            &v2_segment_names
+        });
         let snapshot_directory = std::env::temp_dir().join(format!(
             "tine-managed-local-journal-snapshot-{}",
             Uuid::new_v4()
         ));
         fs::create_dir_all(&snapshot_directory).unwrap();
-        fs::copy(
-            workspace_directory.join(&segment_name),
-            snapshot_directory.join(&segment_name),
-        )
-        .unwrap();
         let directory = Dir::open_ambient_dir(&snapshot_directory, ambient_authority()).unwrap();
-        let (journal, _) = LocalJournalSegment::open_from_sequence(
-            &directory,
-            &segment_name,
-            device,
-            generation.unwrap_or(0),
-        )
-        .unwrap();
         let mut frames = Vec::new();
-        journal.replay(|frame| frames.push(frame)).unwrap();
-        drop(journal);
+        if let Some(segment_name) = v2_segment_names.iter().max() {
+            let (selector_generation, segment_id) =
+                crate::oplog::local_journal_v2_anchor::parse_managed_local_v2_segment_name(
+                    segment_name,
+                    device,
+                )
+                .expect("schema-2 segment name is canonical");
+            assert!(selector_generation > 0);
+            fs::copy(
+                workspace_directory.join(segment_name),
+                snapshot_directory.join(segment_name),
+            )
+            .unwrap();
+            let frontier_name = format!(
+                "{}{}",
+                segment_name,
+                tine_storage::formats::LOCAL_JOURNAL_FRONTIER_SUFFIX
+            );
+            fs::copy(
+                workspace_directory.join(&frontier_name),
+                snapshot_directory.join(&frontier_name),
+            )
+            .unwrap();
+            let selection = tine_storage::LocalJournalSegmentV2Selection::new(
+                segment_name,
+                segment_id,
+                device,
+                0,
+            )
+            .unwrap();
+            let (journal, _) =
+                LocalJournalSegmentV2::open_selected(&directory, &selection).unwrap();
+            journal.replay(|frame| frames.push(frame)).unwrap();
+            drop(journal);
+        } else {
+            let generation = names
+                .iter()
+                .filter_map(|name| managed_local_generation_from_name(name, device, ".anchor"))
+                .max();
+            let segment_name = generation.map_or_else(
+                || format!("device-{}.segment", device.simple()),
+                |generation| managed_local_generation_segment_filename(device, generation),
+            );
+            fs::copy(
+                workspace_directory.join(&segment_name),
+                snapshot_directory.join(&segment_name),
+            )
+            .unwrap();
+            let directory =
+                Dir::open_ambient_dir(&snapshot_directory, ambient_authority()).unwrap();
+            let (journal, _) = LocalJournalSegment::open_from_sequence(
+                &directory,
+                &segment_name,
+                device,
+                generation.unwrap_or(0),
+            )
+            .unwrap();
+            journal.replay(|frame| frames.push(frame)).unwrap();
+            drop(journal);
+        }
         drop(directory);
         fs::remove_dir_all(snapshot_directory).unwrap();
         frames
@@ -21314,8 +21575,15 @@ mod tests {
             .find_map(|segment_name| {
                 segment_name
                     .strip_prefix("device-")
-                    .and_then(|name| name.strip_suffix(".segment"))
-                    .and_then(|name| name.split("-generation-").next())
+                    .and_then(|name| {
+                        name.strip_suffix(".segment")
+                            .or_else(|| name.strip_suffix(".journal-v2"))
+                    })
+                    .and_then(|name| {
+                        name.split("-generation-")
+                            .next()
+                            .and_then(|name| name.split("-selector-").next())
+                    })
                     .and_then(|device| Uuid::parse_str(device).ok())
             })
             .expect("managed-local segment has a canonical device UUID")
@@ -21328,6 +21596,125 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    fn install_empty_legacy_managed_local_journal(request: &SyncRuntimeOpenRequest) -> Uuid {
+        let fresh = active_handle(SyncRuntimeHandle::open(request.clone()));
+        assert!(matches!(
+            fresh.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        let directory_path = managed_local_workspace_directory(request);
+        let names = managed_local_file_names(request);
+        let segment_names = names
+            .iter()
+            .filter(|name| name.ends_with(".journal-v2"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let device_id = managed_local_test_device_id(&segment_names);
+        let anchor_name = names
+            .iter()
+            .filter(|name| name.ends_with(".anchor-v2"))
+            .max()
+            .expect("fresh managed state has one schema-2 anchor");
+        // Deliberately leave the former segment/frontier pair in place. It is
+        // now unanchored residue and must neither authorize nor block legacy
+        // rollover's random retry tuple.
+        fs::remove_file(directory_path.join(anchor_name)).unwrap();
+        let directory = Dir::open_ambient_dir(&directory_path, ambient_authority()).unwrap();
+        let legacy_name = format!("device-{}.segment", device_id.simple());
+        let (legacy, recovery) = LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open(
+            &directory,
+            &legacy_name,
+            device_id,
+        )
+        .unwrap();
+        assert_eq!(recovery.frames_recovered, 0);
+        drop(legacy);
+        device_id
+    }
+
+    /// Build an actual schema-1 compacted authority from one admitted managed
+    /// edit, while deliberately retaining the old schema-2 tuple as
+    /// unanchored residue.  This is the migration shape a pre-v2 installation
+    /// presents on its first v2-capable reopen.
+    fn install_drained_schema1_generation(
+        request: &SyncRuntimeOpenRequest,
+        fixture: &RuntimeHostFixture,
+    ) -> (Uuid, ManagedLocalDrainCheckpoint, BatchId, String) {
+        let path = "content/nested pages/Schema 1 Migration Seed.md";
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        admit_external_page(&handle, fixture, path, b"- before schema-1 migration\n");
+        let (page, revision) = load_application_exact(&handle, path);
+        let (_page, _revision) =
+            save_application_block_text(&handle, page, revision, "schema-1 retained edit");
+        drain_managed_local(&handle);
+        let frames = managed_local_journal_frames(request);
+        assert_eq!(
+            frames.len(),
+            1,
+            "seed must retain one physical journal frame"
+        );
+        let accepted_batch_id = decode_managed_local_record(&frames[0])
+            .unwrap()
+            .prepared_batch()
+            .manifest()
+            .batch_id();
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let directory_path = managed_local_workspace_directory(request);
+        let names = managed_local_file_names(request);
+        let segment_names = names
+            .iter()
+            .filter(|name| name.ends_with(".journal-v2"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let device_id = managed_local_test_device_id(&segment_names);
+        let checkpoint_name = managed_local_checkpoint_filename(1);
+        let checkpoint: ManagedLocalDrainCheckpoint =
+            postcard::from_bytes(&fs::read(directory_path.join(&checkpoint_name)).unwrap())
+                .unwrap();
+        assert_eq!(checkpoint.next_sequence(), 1);
+        let generation = checkpoint.next_sequence();
+
+        let v2_anchors = names
+            .iter()
+            .filter(|name| name.ends_with(".anchor-v2"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            v2_anchors.len(),
+            1,
+            "seed must have one v2 authority anchor"
+        );
+        fs::remove_file(directory_path.join(v2_anchors[0])).unwrap();
+
+        let directory = Dir::open_ambient_dir(&directory_path, ambient_authority()).unwrap();
+        let segment_name = managed_local_generation_segment_filename(device_id, generation);
+        let (legacy, recovery) =
+            LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open_from_sequence(
+                &directory,
+                &segment_name,
+                device_id,
+                generation,
+            )
+            .unwrap();
+        assert_eq!(recovery.frames_recovered, 0);
+        assert_eq!(legacy.next_sequence(), generation);
+        drop(legacy);
+        let anchor =
+            ManagedLocalGenerationAnchor::new(generation, checkpoint.clone(), accepted_batch_id);
+        fs::write(
+            directory_path.join(managed_local_generation_anchor_filename(
+                device_id, generation,
+            )),
+            anchor.encode().unwrap(),
+        )
+        .unwrap();
+        (device_id, checkpoint, accepted_batch_id, path.into())
     }
 
     fn drain_managed_local(handle: &SyncRuntimeHandle) {
@@ -25348,263 +25735,138 @@ mod tests {
     }
 
     #[test]
-    fn managed_local_generations_bound_history_and_reopen_pending_suffix_at_next_sequence() {
-        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-generations-bounded");
+    fn fresh_managed_local_state_selects_v2_before_its_first_save_and_never_cleans_authority() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-fresh-v2");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        let initial_names = managed_local_file_names(&request);
+        assert_eq!(
+            initial_names
+                .iter()
+                .filter(|name| name.ends_with(".anchor-v2"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            initial_names
+                .iter()
+                .filter(|name| name.ends_with(".journal-v2"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            initial_names
+                .iter()
+                .filter(|name| name.ends_with(tine_storage::formats::LOCAL_JOURNAL_FRONTIER_SUFFIX))
+                .count(),
+            1
+        );
+        assert!(
+            !initial_names.iter().any(|name| name.ends_with(".segment")),
+            "fresh managed state must never create a legacy v1 segment"
+        );
+        drive_initial_feed(&handle);
+        let path = "content/nested pages/Fresh v2 café 日.md";
+        admit_external_page(&handle, &fixture, path, b"- fresh v2\n");
+        let (page, revision) = load_application_exact(&handle, path);
+        let (_page, _revision) =
+            save_application_block_text(&handle, page, revision, "first schema-2 append");
+        assert_eq!(managed_local_journal_frames(&request).len(), 1);
+        drain_managed_local(&handle);
+        assert_eq!(managed_local_journal_frames(&request).len(), 1);
+        let drained_names = managed_local_file_names(&request);
+        for name in &initial_names {
+            assert!(
+                drained_names.contains(name),
+                "activation/rollover must not delete existing authority {name}"
+            );
+        }
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn schema2_drained_history_remains_authoritative_until_retirement_is_implemented() {
+        let fixture = RuntimeHostFixture::safe("managed-local-v2-no-retirement");
         let request = fixture.request();
         let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
         drive_initial_feed(&handle);
-        let path = "content/nested pages/Generations café 日.md";
-        admit_external_page(&handle, &fixture, path, b"- generation zero\n");
+        let path = "diary/日記/Schema 2 history.org";
+        admit_external_page(&handle, &fixture, path, b"* before retained history\n");
         let (mut page, mut revision) = load_application_exact(&handle, path);
-
-        let edits = MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize * 4;
-        for index in 1..=edits {
-            (page, revision) = save_application_block_text(
-                &handle,
-                page,
-                revision,
-                &format!("generation edit {index} — café 日"),
-            );
-            if index % MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize == 0 {
-                drain_managed_local(&handle);
-            }
-        }
-        let compacted = load_application_exact(&handle, path);
-        assert_eq!(handle.status().unwrap().managed_local_pending, 0);
-        assert_eq!(
-            handle.status().unwrap().managed_local_next_sequence,
-            edits as u64
-        );
-
-        let names = managed_local_file_names(&request);
-        let anchors = names
-            .iter()
-            .filter(|name| name.ends_with(".anchor"))
-            .count();
-        let segments = names
-            .iter()
-            .filter(|name| name.ends_with(".segment"))
-            .count();
-        let checkpoints = names
-            .iter()
-            .filter(|name| managed_local_checkpoint_sequence(name).is_some())
-            .count();
-        assert!(anchors <= MANAGED_LOCAL_RETAINED_GENERATIONS);
-        assert!(segments <= MANAGED_LOCAL_RETAINED_GENERATIONS);
-        assert_eq!(checkpoints, 1);
-        assert!(names.len() <= MANAGED_LOCAL_RETAINED_GENERATIONS * 2 + 1);
-        let current_segment = names
-            .iter()
-            .filter(|name| name.ends_with(".segment"))
-            .max()
-            .unwrap();
-        assert_eq!(
-            fs::metadata(managed_local_workspace_directory(&request).join(current_segment))
-                .unwrap()
-                .len(),
-            0
-        );
-        let retained_bytes = fs::read_dir(managed_local_workspace_directory(&request))
-            .unwrap()
-            .map(|entry| entry.unwrap().metadata().unwrap().len())
-            .sum::<u64>();
-        let retained_bound = 2
-            * (MANAGED_LOCAL_COMPACTION_BYTE_THRESHOLD
-                + tine_storage::formats::MAX_LOCAL_JOURNAL_FRAME_BYTES as u64)
-            + 64 * 1024;
-        assert!(retained_bytes < retained_bound);
-
-        for suffix in 1..=5 {
-            (page, revision) = save_application_block_text(
-                &handle,
-                page,
-                revision,
-                &format!("pending suffix {suffix} — org/Markdown exact"),
-            );
-        }
-        let suffix_expected = load_application_exact(&handle, path);
-        let suffix_graph_bytes = fs::read(fixture.graph_root().join(path)).unwrap();
-        drop(handle);
-        let suffix_frames = managed_local_journal_frames(&request);
-        assert_eq!(suffix_frames.len(), 5);
-        assert_eq!(suffix_frames[0].sequence(), edits as u64);
-        assert_eq!(suffix_frames[4].sequence(), edits as u64 + 4);
-
-        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
-        let reopened_status = reopened.status().unwrap();
-        assert_eq!(reopened_status.managed_local_pending, 5);
-        assert_eq!(
-            reopened_status.managed_local_next_sequence,
-            edits as u64 + 5
-        );
-        drain_managed_local(&reopened);
-        drive_initial_feed(&reopened);
-        let restored = load_application_exact(&reopened, path);
-        assert_parser_dto_semantics(&suffix_expected.0, &restored.0);
-        assert_eq!(suffix_expected.1, restored.1);
-        assert_eq!(
-            fs::read(fixture.graph_root().join(path)).unwrap(),
-            suffix_graph_bytes
-        );
-        assert_ne!(compacted.1, suffix_expected.1);
-
-        let (_next, _next_revision) = save_application_block_text(
-            &reopened,
-            restored.0,
-            restored.1,
-            "first append after compacted reopen",
-        );
-        assert_eq!(
-            reopened.status().unwrap().managed_local_next_sequence,
-            edits as u64 + 6
-        );
-        drain_managed_local(&reopened);
-        assert!(matches!(
-            reopened.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn managed_local_compacted_and_uncompacted_references_match_semantically_and_exactly() {
-        let compacted_fixture = RuntimeHostFixture::safe("managed-local-compacted-reference");
-        let reference_fixture = RuntimeHostFixture::safe("managed-local-uncompacted-reference");
-        let compacted_request = compacted_fixture.request();
-        let compacted = active_handle(SyncRuntimeHandle::open(compacted_request.clone()));
-        let reference = active_handle(SyncRuntimeHandle::open(reference_fixture.request()));
-        drive_initial_feed(&compacted);
-        drive_initial_feed(&reference);
-        let path = "diary/日記/Compaction reference.org";
-        let initial = b"#+title: Compaction reference\n\n* before compaction\n";
-        admit_external_page(&compacted, &compacted_fixture, path, initial);
-        admit_external_page(&reference, &reference_fixture, path, initial);
-        let (mut compacted_page, mut compacted_revision) = load_application_exact(&compacted, path);
-        let (mut reference_page, mut reference_revision) = load_application_exact(&reference, path);
         for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
-            let content = format!("reference edit {index} — café 日");
-            (compacted_page, compacted_revision) = save_application_block_text(
-                &compacted,
-                compacted_page,
-                compacted_revision,
-                &content,
-            );
-            (reference_page, reference_revision) = save_application_block_text(
-                &reference,
-                reference_page,
-                reference_revision,
-                &content,
+            (page, revision) = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("retained schema-2 edit {index}"),
             );
         }
-        drain_managed_local(&compacted);
-        assert_eq!(compacted.status().unwrap().managed_local_pending, 0);
+        drain_managed_local(&handle);
         assert_eq!(
-            reference.status().unwrap().managed_local_pending,
+            managed_local_journal_frames(&request).len(),
             MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize
         );
-        let compacted_result = load_application_exact(&compacted, path);
-        let reference_result = load_application_exact(&reference, path);
-        assert_parser_dto_semantics(&reference_result.0, &compacted_result.0);
-        assert_eq!(
-            fs::read(compacted_fixture.graph_root().join(path)).unwrap(),
-            fs::read(reference_fixture.graph_root().join(path)).unwrap()
-        );
         assert!(matches!(
-            compacted.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-        assert!(managed_local_journal_frames(&compacted_request).is_empty());
-        drain_managed_local(&reference);
-        assert!(matches!(
-            reference.clean_shutdown().unwrap(),
+            handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
     }
 
     #[test]
-    fn managed_local_generation_crash_cuts_reopen_without_loss_or_sequence_reset() {
+    fn legacy_rollover_crash_cuts_reopen_to_exactly_one_schema2_authority() {
         use ManagedLocalCompactionFaultPoint as Cut;
 
         for (ordinal, cut) in [
-            Cut::AfterCheckpointPublication,
-            Cut::AfterSegmentCreation,
-            Cut::AfterAnchorPublication,
+            Cut::AfterV2Prepare,
+            Cut::BeforeAnchorPublication,
+            Cut::AfterAnchorBeforeVerification,
             Cut::AfterInMemorySwitch,
-            Cut::AfterCleanupRemoval,
         ]
         .into_iter()
         .enumerate()
         {
-            let label = format!("sync-runtime-managed-local-compaction-cut-{ordinal}");
+            let label = format!("sync-runtime-managed-local-rollover-cut-{ordinal}");
             let fixture = RuntimeHostFixture::safe(&label);
             let request = fixture.request();
+            let device_id = install_empty_legacy_managed_local_journal(&request);
             let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
-            drive_initial_feed(&handle);
-            let paths = (0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD)
-                .map(|index| format!("content/nested pages/Crash Cut {index}.org"))
-                .collect::<Vec<_>>();
-            for path in &paths {
-                admit_external_page(&handle, &fixture, path, b"* before crash cut\n");
-            }
-            for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
-                let path = &paths[index as usize];
-                let (page, revision) = load_application_exact(&handle, &path);
-                save_application_block_text(
-                    &handle,
-                    page,
-                    revision,
-                    &format!("crash cut {ordinal} edit {index}"),
-                );
-            }
-            let last_path = paths.last().unwrap();
-            let expected = load_application_exact(&handle, &last_path);
-            let segment_names = managed_local_file_names(&request)
-                .into_iter()
-                .filter(|name| name.ends_with(".segment"))
-                .collect::<Vec<_>>();
-            let device_id = managed_local_test_device_id(&segment_names);
             fail_managed_local_compaction_once_at(device_id, cut);
-            let mut observed_cut = false;
-            for _ in 0..4096 {
-                let tick = handle.tick().unwrap();
-                if matches!(
-                    tick,
-                    SyncRuntimeTick::RecoveryBlocked(ref detail)
-                        if detail.contains("injected")
-                ) {
-                    observed_cut = true;
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(tick, SyncRuntimeTick::Terminal(_)),
+                "rollover cut {cut:?} unexpectedly made legacy authority terminal"
+            );
+            drop(handle);
+
+            let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+            for _ in 0..64 {
+                let retry = reopened.tick().unwrap();
+                assert!(
+                    !matches!(retry, SyncRuntimeTick::Terminal(_)),
+                    "rollover cut {cut:?} did not resolve on reopen"
+                );
+                if managed_local_file_names(&request)
+                    .iter()
+                    .filter(|name| name.ends_with(".anchor-v2"))
+                    .count()
+                    == 1
+                {
                     break;
                 }
             }
-            assert!(observed_cut, "crash cut {cut:?} was not reached");
-            drop(handle);
-
-            let opened = SyncRuntimeHandle::open(request.clone());
+            let names = managed_local_file_names(&request);
             assert_eq!(
-                opened.status,
-                SyncRuntimeOpenStatus::Active,
-                "crash cut {cut:?} did not reopen"
+                names
+                    .iter()
+                    .filter(|name| name.ends_with(".anchor-v2"))
+                    .count(),
+                1,
+                "rollover cut {cut:?} retained more than one active schema-2 selector"
             );
-            let reopened = opened.handle.expect("active crash-cut reopen has a handle");
-            drive_initial_feed(&reopened);
-            drain_managed_local(&reopened);
-            let restored = load_application_exact(&reopened, &last_path);
-            assert_parser_dto_semantics(&expected.0, &restored.0);
-            assert_eq!(expected.1, restored.1);
-            assert_eq!(
-                reopened.status().unwrap().managed_local_next_sequence,
-                MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
-            );
-            let (_next, _) = save_application_block_text(
-                &reopened,
-                restored.0,
-                restored.1,
-                "append after crash cut",
-            );
-            assert_eq!(
-                reopened.status().unwrap().managed_local_next_sequence,
-                MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD + 1
-            );
-            drain_managed_local(&reopened);
+            assert_eq!(reopened.status().unwrap().managed_local_next_sequence, 0);
             assert!(matches!(
                 reopened.clean_shutdown().unwrap(),
                 SyncShutdownOutcome::Safe(_)
@@ -25613,23 +25875,104 @@ mod tests {
     }
 
     #[test]
-    fn managed_local_incomplete_generation_is_ignored_but_corrupt_authority_fails_closed() {
-        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-generation-authority");
+    fn schema1_rollover_uses_next_global_generation_and_reopen_selects_schema2_successor() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-schema1-to-schema2-generation");
+        let request = fixture.request();
+        let (device_id, checkpoint, _accepted_batch_id, path) =
+            install_drained_schema1_generation(&request, &fixture);
+        let schema1_generation = checkpoint.next_sequence();
+        let schema2_generation = schema1_generation.checked_add(1).unwrap();
+
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        let expected_anchor = managed_local_v2_anchor_name(device_id, schema2_generation);
+        for _ in 0..64 {
+            let tick = handle.tick().unwrap();
+            assert!(
+                !matches!(
+                    tick,
+                    SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Terminal(_)
+                ),
+                "schema-1 authority must migrate rather than block after startup: {tick:?}"
+            );
+            if managed_local_file_names(&request).contains(&expected_anchor) {
+                break;
+            }
+        }
+        assert!(
+            managed_local_file_names(&request).contains(&expected_anchor),
+            "rollover must publish schema-2 selector {schema2_generation} after active schema-1 generation {schema1_generation}"
+        );
+        assert_eq!(
+            handle.status().unwrap().managed_local_next_sequence,
+            schema1_generation
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+        assert!(
+            !matches!(reopened.tick().unwrap(), SyncRuntimeTick::RecoveryBlocked(_) | SyncRuntimeTick::Terminal(_)),
+            "reopen must select the schema-2 successor instead of attempting a second legacy rollover"
+        );
+        let (page, revision) = load_application_exact(&reopened, &path);
+        let (_page, _revision) = save_application_block_text(
+            &reopened,
+            page,
+            revision,
+            "append through schema-2 successor",
+        );
+        assert_eq!(
+            reopened.status().unwrap().managed_local_next_sequence,
+            schema2_generation
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn same_generation_schema1_and_schema2_authorities_are_refused() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-schema-generation-ambiguity");
+        let request = fixture.request();
+        let (device_id, checkpoint, accepted_batch_id, _path) =
+            install_drained_schema1_generation(&request, &fixture);
+        let generation = checkpoint.next_sequence();
+        let directory_path = managed_local_workspace_directory(&request);
+        let directory = Dir::open_ambient_dir(&directory_path, ambient_authority()).unwrap();
+        let schema2 = ManagedLocalGenerationAnchorV2::new(
+            generation,
+            checkpoint,
+            Some(accepted_batch_id),
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(
+            &directory,
+            schema2.selection(),
+        )
+        .unwrap();
+        fs::write(
+            directory_path.join(managed_local_v2_anchor_name(device_id, generation)),
+            schema2.encode().unwrap(),
+        )
+        .unwrap();
+
+        let refused = SyncRuntimeHandle::open(request);
+        assert!(matches!(
+            refused.status,
+            SyncRuntimeOpenStatus::OpenRefused { ref detail }
+                if detail.contains("schema-1/schema-2") && detail.contains("ambiguous")
+        ));
+    }
+
+    #[test]
+    fn unanchored_schema2_pairs_are_ignored_but_a_corrupt_highest_selector_fails_closed() {
+        let fixture = RuntimeHostFixture::safe("sync-runtime-managed-local-v2-authority");
         let request = fixture.request();
         let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
-        drive_initial_feed(&handle);
-        let path = "content/nested pages/Generation Authority.md";
-        admit_external_page(&handle, &fixture, path, b"- authority zero\n");
-        let (mut page, mut revision) = load_application_exact(&handle, path);
-        for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
-            (page, revision) = save_application_block_text(
-                &handle,
-                page,
-                revision,
-                &format!("authority edit {index}"),
-            );
-        }
-        drain_managed_local(&handle);
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -25638,39 +25981,37 @@ mod tests {
         let names = managed_local_file_names(&request);
         let segment_names = names
             .iter()
-            .filter(|name| name.ends_with(".segment"))
+            .filter(|name| name.ends_with(".journal-v2"))
             .cloned()
             .collect::<Vec<_>>();
         let device_id = managed_local_test_device_id(&segment_names);
-        let incomplete_generation = MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD + 10_000;
         let directory_path = managed_local_workspace_directory(&request);
         let directory = Dir::open_ambient_dir(&directory_path, ambient_authority()).unwrap();
-        let incomplete_name =
-            managed_local_generation_segment_filename(device_id, incomplete_generation);
-        let (incomplete, _) =
-            LocalJournalSegment::<ManagedLocalJournalPayloadKind>::open_from_sequence(
-                &directory,
-                &incomplete_name,
+        let unanchored_segment_id = Uuid::new_v4();
+        let unanchored = tine_storage::LocalJournalSegmentV2Selection::new(
+            crate::oplog::local_journal_v2_anchor::managed_local_v2_segment_name(
                 device_id,
-                incomplete_generation,
-            )
+                999,
+                unanchored_segment_id,
+            ),
+            unanchored_segment_id,
+            device_id,
+            0,
+        )
+        .unwrap();
+        LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(&directory, &unanchored)
             .unwrap();
-        drop(incomplete);
 
         let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
-        assert_eq!(
-            reopened.status().unwrap().managed_local_next_sequence,
-            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
-        );
-        drop(reopened);
+        assert_eq!(reopened.status().unwrap().managed_local_next_sequence, 0);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
 
-        let anchor_name = names
-            .iter()
-            .filter(|name| name.ends_with(".anchor"))
-            .max()
-            .unwrap();
+        let anchor_name = managed_local_v2_anchor_name(device_id, 1000);
         fs::write(
-            directory_path.join(anchor_name),
+            directory_path.join(&anchor_name),
             b"corrupt authoritative anchor",
         )
         .unwrap();
@@ -25678,7 +26019,7 @@ mod tests {
         assert!(matches!(
             refused.status,
             SyncRuntimeOpenStatus::OpenRefused { ref detail }
-                if detail.contains("authoritative managed-local generation")
+                if detail.contains("authoritative managed-local selector")
                     && detail.contains("corrupt")
         ));
     }
