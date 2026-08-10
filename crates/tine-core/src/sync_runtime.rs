@@ -352,6 +352,23 @@ struct ManagedApplicationSaveInstrumentation {
     managed_local_next_sequence: u64,
 }
 
+/// Actor-local, test-only accounting for the managed application query paths.
+///
+/// This deliberately counts semantic read operations rather than SQLite calls:
+/// a full inventory pass is the one navigation-page traversal, and an exact
+/// page load is a successfully materialized page DTO. It is kept off the
+/// release actor so evidence collection cannot alter application behavior.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ManagedApplicationQueryInstrumentation {
+    full_inventory_passes: usize,
+    inventory_pages: usize,
+    exact_page_loads: usize,
+    indexed_candidate_pages: usize,
+    overlay_pages: usize,
+    block_branches: usize,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ManagedApplicationSaveStageTimings {
@@ -3680,6 +3697,34 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn reset_managed_application_query_instrumentation(
+        &self,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ResetManagedApplicationQueryInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn managed_application_query_instrumentation(
+        &self,
+    ) -> Result<ManagedApplicationQueryInstrumentation, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ManagedApplicationQueryInstrumentation {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn tick_provider_for_test(&self) -> Result<SyncRuntimeTick, SyncRuntimeRequestError> {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
@@ -6496,6 +6541,12 @@ enum ActorRequest {
         reply: mpsc::Sender<ManagedApplicationSaveInstrumentation>,
     },
     #[cfg(test)]
+    ResetManagedApplicationQueryInstrumentation { reply: mpsc::Sender<()> },
+    #[cfg(test)]
+    ManagedApplicationQueryInstrumentation {
+        reply: mpsc::Sender<ManagedApplicationQueryInstrumentation>,
+    },
+    #[cfg(test)]
     TickProviderForTest {
         reply: mpsc::Sender<SyncRuntimeTick>,
     },
@@ -6771,6 +6822,17 @@ fn run_actor_loop(
                         .as_ref()
                         .map_or(0, |managed| managed.journal.next_sequence()),
                 });
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ResetManagedApplicationQueryInstrumentation { reply } => {
+                actor.reset_managed_application_query_instrumentation();
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ManagedApplicationQueryInstrumentation { reply } => {
+                let _ = reply.send(actor.managed_application_query_instrumentation());
                 false
             }
             #[cfg(test)]
@@ -7677,6 +7739,9 @@ struct RuntimeActor {
     local_mutation: Option<PendingLocalMutation>,
     managed_local: Option<ManagedLocalRuntimeState>,
     prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
+    #[cfg(test)]
+    managed_application_query_instrumentation:
+        std::cell::Cell<ManagedApplicationQueryInstrumentation>,
     startup_recovery_diagnostics: Option<SyncRuntimeRecoveryDiagnostics>,
     recovery: SyncRuntimeRecovery,
     last_watcher: SyncWatcherStatus,
@@ -8506,6 +8571,10 @@ impl RuntimeActor {
             local_mutation: None,
             managed_local: Some(managed_local),
             prepared_application_reply: None,
+            #[cfg(test)]
+            managed_application_query_instrumentation: std::cell::Cell::new(
+                ManagedApplicationQueryInstrumentation::default(),
+            ),
             startup_recovery_diagnostics,
             recovery,
             last_watcher,
@@ -8590,6 +8659,51 @@ impl RuntimeActor {
 
     fn take_startup_recovery_diagnostics(&mut self) -> Option<SyncRuntimeRecoveryDiagnostics> {
         self.startup_recovery_diagnostics.take()
+    }
+
+    #[cfg(test)]
+    fn reset_managed_application_query_instrumentation(&self) {
+        self.managed_application_query_instrumentation
+            .set(ManagedApplicationQueryInstrumentation::default());
+    }
+
+    #[cfg(test)]
+    fn managed_application_query_instrumentation(&self) -> ManagedApplicationQueryInstrumentation {
+        self.managed_application_query_instrumentation.get()
+    }
+
+    #[cfg(test)]
+    fn note_managed_application_query_inventory_pass(&self, pages: usize) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.full_inventory_passes = current.full_inventory_passes.saturating_add(1);
+        current.inventory_pages = current.inventory_pages.saturating_add(pages);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_application_query_exact_page_load(&self) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.exact_page_loads = current.exact_page_loads.saturating_add(1);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_application_simple_query_scope(
+        &self,
+        indexed_candidate_pages: usize,
+        overlay_pages: usize,
+    ) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.indexed_candidate_pages = indexed_candidate_pages;
+        current.overlay_pages = overlay_pages;
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    #[cfg(test)]
+    fn note_managed_application_query_block_branch(&self) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.block_branches = current.block_branches.saturating_add(1);
+        self.managed_application_query_instrumentation.set(current);
     }
 
     fn observe(
@@ -10169,6 +10283,8 @@ impl RuntimeActor {
                 )
             });
         if needs_inventory {
+            #[cfg(test)]
+            let mut inventory_pages = 0_usize;
             let mut cursor: Option<(ManagedPath, PageId)> = None;
             loop {
                 let rows = read
@@ -10182,6 +10298,10 @@ impl RuntimeActor {
                 }
                 let len = rows.len();
                 for row in rows {
+                    #[cfg(test)]
+                    {
+                        inventory_pages = inventory_pages.saturating_add(1);
+                    }
                     cursor = Some((row.path.clone(), row.page_id));
                     if masked_page_ids.contains(&row.page_id) {
                         continue;
@@ -10203,8 +10323,16 @@ impl RuntimeActor {
                     break;
                 }
             }
+            #[cfg(test)]
+            self.note_managed_application_query_inventory_pass(inventory_pages);
         }
         drop(read);
+
+        #[cfg(test)]
+        self.note_managed_application_simple_query_scope(
+            candidate_page_ids.len(),
+            overlay.values().filter(|current| current.is_some()).count(),
+        );
 
         let mut sources = Vec::new();
         for (path, current) in overlay {
@@ -10336,6 +10464,8 @@ impl RuntimeActor {
             .into_iter()
             .map(|(entry, _)| entry)
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.note_managed_application_query_inventory_pass(entries.len());
         if cancelled() {
             return Ok(plan.execute_application_with_explain(
                 entries,
@@ -10352,6 +10482,10 @@ impl RuntimeActor {
             .branches
             .iter()
             .any(|branch| branch.target == crate::query_plan::QueryTarget::Blocks);
+        #[cfg(test)]
+        if needs_blocks {
+            self.note_managed_application_query_block_branch();
+        }
         let mut pages = Vec::new();
         if needs_blocks {
             for entry in &entries {
@@ -10847,6 +10981,8 @@ impl RuntimeActor {
         if current.editor.page.path != *path {
             return Err(SyncApplicationPageRequestError::ActorRefused);
         }
+        #[cfg(test)]
+        self.note_managed_application_query_exact_page_load();
         Ok(ApplicationExactLoad::Loaded(current))
     }
 
@@ -10858,14 +10994,17 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        load_preferred_source_authenticated_application_page(
+        let current = load_preferred_source_authenticated_application_page(
             runtime,
             &self.graph,
             page_id,
             self.exact_projection_read_available(),
         )
         .map_err(map_editor_application_error)?
-        .ok_or(SyncApplicationPageRequestError::ActorRefused)
+        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+        #[cfg(test)]
+        self.note_managed_application_query_exact_page_load();
+        Ok(current)
     }
 
     fn save_application_page(
@@ -29642,6 +29781,40 @@ mod tests {
             fixture
         }
 
+        /// A parser-owned query fixture whose task-candidate density is
+        /// controlled independently of graph scale. Every page has one block
+        /// containing the regex/search sentinel; only the first
+        /// `task_candidate_pages` have a TODO marker.
+        fn scaled_query_candidate_density(
+            label: &str,
+            seed: u128,
+            total_pages: usize,
+            task_candidate_pages: usize,
+        ) -> Self {
+            assert!(total_pages > 0);
+            assert!(task_candidate_pages <= total_pages);
+            let fixture = Self::empty(label, seed);
+            for page in 0..total_pages {
+                let directory = fixture
+                    .graph_root
+                    .join(format!("notes/query-density/{}/deep", page % 16));
+                fs::create_dir_all(&directory).unwrap();
+                let marker = if page < task_candidate_pages {
+                    "TODO"
+                } else {
+                    "DONE"
+                };
+                fs::write(
+                    directory.join(format!("Query-Density-{page}.md")),
+                    format!(
+                        "title:: Query density {page}\n\n- {marker} query-density-page {page}\n"
+                    ),
+                )
+                .unwrap();
+            }
+            fixture
+        }
+
         fn copied_graph(label: &str, seed: u128, source: &Path) -> Self {
             assert!(source.is_dir(), "graph-copy source must be a directory");
             let fixture = Self::nested_unicode(label, seed);
@@ -39608,42 +39781,83 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "manual performance receipt: managed simple queries and graph search"]
-    fn managed_simple_query_1000_page_manual_gate() {
+    fn managed_query_gate_scales() -> Vec<usize> {
+        let raw =
+            std::env::var("TINE_MANAGED_QUERY_GATE_PAGES").unwrap_or_else(|_| "1000,10000".into());
+        let scales = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value.parse::<usize>().unwrap_or_else(|error| {
+                    panic!("TINE_MANAGED_QUERY_GATE_PAGES contains {value:?}: {error}")
+                })
+            })
+            .collect::<BTreeSet<_>>();
         assert!(
-            !cfg!(debug_assertions),
-            "run with cargo test -p tine-core --release managed_simple_query_1000_page_manual_gate -- --ignored --nocapture"
+            !scales.is_empty() && scales.iter().all(|pages| *pages >= 100),
+            "TINE_MANAGED_QUERY_GATE_PAGES must contain one or more scales of at least 100 pages"
         );
-        let total_pages = std::env::var("TINE_MANAGED_QUERY_GATE_PAGES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|pages| *pages >= 100)
-            .unwrap_or(1_000);
-        let samples = std::env::var("TINE_MANAGED_QUERY_GATE_SAMPLES")
+        scales.into_iter().collect()
+    }
+
+    fn managed_query_gate_samples() -> usize {
+        std::env::var("TINE_MANAGED_QUERY_GATE_SAMPLES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|samples| *samples >= 2)
-            .unwrap_or(3);
-        let fixture = ActivationFixture::scaled_mixed_with_journals(
-            "managed-simple-query-gate",
-            0xa1f0,
-            total_pages.saturating_sub(3),
-            4,
+            .unwrap_or(5)
+    }
+
+    fn assert_managed_simple_query_matches_direct(
+        label: &str,
+        mut managed: SyncApplicationBoundedRefGroups,
+        direct: crate::model::BoundedRefGroups,
+    ) {
+        assert_eq!(managed.exceeded, direct.exceeded, "{label}");
+        assert_eq!(managed.total, direct.total, "{label}");
+        let mut direct_groups = (*direct.groups).clone();
+        canonicalize_query_groups_for_mode_differential(&mut managed.groups);
+        canonicalize_query_groups_for_mode_differential(&mut direct_groups);
+        assert_eq!(
+            serde_json::to_value(managed.groups).unwrap(),
+            serde_json::to_value(direct_groups).unwrap(),
+            "managed query diverged from parser-owned Direct Files semantics: {label}"
         );
+    }
+
+    fn max_query_gate_counter(
+        samples: &[ManagedApplicationQueryInstrumentation],
+        value: impl Fn(&ManagedApplicationQueryInstrumentation) -> usize,
+    ) -> usize {
+        samples.iter().map(value).max().unwrap_or(0)
+    }
+
+    fn managed_query_search_manual_receipt(
+        fixture: &ActivationFixture,
+        label: &str,
+        samples: usize,
+        expected_task_candidate_pages: Option<usize>,
+    ) {
+        const MAX_ROWS: usize = 20_000;
+        const MAX_BYTES: usize = 32 * 1024 * 1024;
         let indexed = "(task TODO)";
-        let broad = format!(
-            "(content-regex \"task {}-\")",
-            total_pages.saturating_sub(4)
-        );
+        let regex_all = "(content-regex \".*\")";
+        let graph_search_source = "query-density-page";
 
         let direct = Graph::open(&fixture.graph_root);
-        let direct_indexed = direct.run_query_bounded(indexed, 20_000, 32 * 1024 * 1024);
-        let direct_broad = direct.run_query_bounded(&broad, 20_000, 32 * 1024 * 1024);
-        let direct_graph_search = direct.run_graph_search("task", 20, 20, false);
+        let total_pages = direct.list_pages().len();
+        assert!(total_pages > 0, "{label} fixture has no pages");
+        let direct_indexed = direct.run_query_bounded(indexed, MAX_ROWS, MAX_BYTES);
+        let direct_regex_all = direct.run_query_bounded(regex_all, MAX_ROWS, MAX_BYTES);
+        let direct_graph_search = direct.run_graph_search(graph_search_source, 0, MAX_ROWS, false);
 
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        assert_eq!(
+            activated.status,
+            SyncLocalActivationStatus::Active,
+            "{label}"
+        );
         let activation_handle = activated.handle.expect("activation retains its actor");
         drive_initial_feed(&activation_handle);
         assert!(matches!(
@@ -39653,15 +39867,18 @@ mod tests {
         drop(activation_handle);
 
         let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
-        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active, "{label}");
         let handle = opened.handle.expect("managed reopen retains its actor");
-        let run = |query: &str| {
+        let run_simple = |query: &str| {
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
             let started = Instant::now();
             let outcome = handle
                 .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
                     query: query.into(),
-                    max_rows: 20_000,
-                    max_bytes: 32 * 1024 * 1024,
+                    max_rows: MAX_ROWS,
+                    max_bytes: MAX_BYTES,
                 })
                 .unwrap();
             let elapsed = started.elapsed();
@@ -39671,25 +39888,22 @@ mod tests {
             else {
                 panic!("managed query returned the wrong outcome: {outcome:?}")
             };
-            (elapsed, result)
+            (
+                elapsed,
+                result,
+                handle.managed_application_query_instrumentation().unwrap(),
+            )
         };
-
-        let mut indexed_samples = Vec::with_capacity(samples);
-        let mut broad_samples = Vec::with_capacity(samples);
-        let mut graph_search_samples = Vec::with_capacity(samples);
-        for _ in 0..samples {
-            let (elapsed, result) = run(indexed);
-            assert_eq!(result.total, direct_indexed.total);
-            indexed_samples.push(elapsed);
-            let (elapsed, result) = run(&broad);
-            assert_eq!(result.total, direct_broad.total);
-            broad_samples.push(elapsed);
+        let run_graph_search = || {
+            handle
+                .reset_managed_application_query_instrumentation()
+                .unwrap();
             let started = Instant::now();
             let outcome = handle
                 .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
-                    source: "task".into(),
-                    page_limit: 20,
-                    block_limit: 20,
+                    source: graph_search_source.into(),
+                    page_limit: 0,
+                    block_limit: MAX_ROWS,
                     lane: Some("performance-receipt".into()),
                     explain: false,
                     scope: None,
@@ -39697,45 +39911,190 @@ mod tests {
                 .unwrap();
             let elapsed = started.elapsed();
             let SyncApplicationNavigationOutcome::Loaded {
-                reply: SyncApplicationNavigationReply::GraphSearch(mut result),
+                reply: SyncApplicationNavigationReply::GraphSearch(result),
             } = outcome
             else {
                 panic!("managed graph search returned the wrong outcome: {outcome:?}")
             };
+            (
+                elapsed,
+                result,
+                handle.managed_application_query_instrumentation().unwrap(),
+            )
+        };
+
+        let mut indexed_samples = Vec::with_capacity(samples);
+        let mut regex_all_samples = Vec::with_capacity(samples);
+        let mut graph_search_samples = Vec::with_capacity(samples);
+        let mut indexed_counters = Vec::with_capacity(samples);
+        let mut regex_all_counters = Vec::with_capacity(samples);
+        let mut graph_search_counters = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let (elapsed, result, counters) = run_simple(indexed);
+            assert_managed_simple_query_matches_direct(
+                &format!("{label} indexed sample={sample}"),
+                result,
+                direct_indexed.clone(),
+            );
+            assert_eq!(
+                counters.full_inventory_passes, 0,
+                "indexed task query performed a full inventory scan: {counters:?}"
+            );
+            assert_eq!(
+                counters.inventory_pages, 0,
+                "indexed task query visited inventory rows: {counters:?}"
+            );
+            if let Some(expected) = expected_task_candidate_pages {
+                assert_eq!(
+                    counters.indexed_candidate_pages, expected,
+                    "task candidate density drifted: {counters:?}"
+                );
+            }
+            assert!(
+                counters.exact_page_loads
+                    <= counters
+                        .indexed_candidate_pages
+                        .saturating_add(counters.overlay_pages),
+                "indexed task query exact-loads more pages than its distinct unmasked candidates plus overlay: {counters:?}"
+            );
+            indexed_samples.push(elapsed);
+            indexed_counters.push(counters);
+
+            let (elapsed, result, counters) = run_simple(regex_all);
+            assert_managed_simple_query_matches_direct(
+                &format!("{label} Regex-All sample={sample}"),
+                result,
+                direct_regex_all.clone(),
+            );
+            assert_eq!(
+                counters.full_inventory_passes, 1,
+                "Regex-All must make exactly one inventory pass: {counters:?}"
+            );
+            assert_eq!(
+                counters.inventory_pages, total_pages,
+                "Regex-All inventory did not cover each page exactly once: {counters:?}"
+            );
+            assert!(
+                counters.exact_page_loads <= total_pages,
+                "Regex-All exact-loaded a page more than once: {counters:?}"
+            );
+            regex_all_samples.push(elapsed);
+            regex_all_counters.push(counters);
+
+            let (elapsed, mut result, counters) = run_graph_search();
             let mut expected = direct_graph_search.clone();
             canonicalize_graph_search_for_mode_differential(&mut result);
             canonicalize_graph_search_for_mode_differential(&mut expected);
             assert_eq!(
                 serde_json::to_value(result).unwrap(),
-                serde_json::to_value(expected).unwrap()
+                serde_json::to_value(expected).unwrap(),
+                "managed graph search diverged from parser-owned Direct Files semantics: {label} sample={sample}"
+            );
+            assert_eq!(
+                counters.block_branches, 1,
+                "the graph-search receipt must exercise its block branch: {counters:?}"
+            );
+            assert_eq!(
+                counters.full_inventory_passes, 1,
+                "graph search must make exactly one inventory pass: {counters:?}"
+            );
+            assert_eq!(
+                counters.inventory_pages, total_pages,
+                "graph-search inventory did not cover each page exactly once: {counters:?}"
+            );
+            assert!(
+                counters.exact_page_loads <= total_pages,
+                "graph search exact-loaded a page more than once: {counters:?}"
             );
             graph_search_samples.push(elapsed);
+            graph_search_counters.push(counters);
         }
+
+        let indexed_p50 = startup_median(&indexed_samples);
         let indexed_p95 = startup_p95(&indexed_samples);
-        let broad_p95 = startup_p95(&broad_samples);
+        let regex_all_p50 = startup_median(&regex_all_samples);
+        let regex_all_p95 = startup_p95(&regex_all_samples);
+        let graph_search_p50 = startup_median(&graph_search_samples);
         let graph_search_p95 = startup_p95(&graph_search_samples);
         eprintln!(
-            "managed_simple_query pages={total_pages} samples={samples} indexed_p95_ms={:.3} broad_p95_ms={:.3} graph_search_p95_ms={:.3}",
+            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_candidates_max={} indexed_overlay_max={} indexed_exact_loads_max={} regex_all_inventory_passes_max={} regex_all_exact_loads_max={} graph_search_inventory_passes_max={} graph_search_exact_loads_max={}",
+            startup_ms(indexed_p50),
             startup_ms(indexed_p95),
-            startup_ms(broad_p95),
+            startup_ms(regex_all_p50),
+            startup_ms(regex_all_p95),
+            startup_ms(graph_search_p50),
             startup_ms(graph_search_p95),
+            max_query_gate_counter(&indexed_counters, |counters| counters.indexed_candidate_pages),
+            max_query_gate_counter(&indexed_counters, |counters| counters.overlay_pages),
+            max_query_gate_counter(&indexed_counters, |counters| counters.exact_page_loads),
+            max_query_gate_counter(&regex_all_counters, |counters| counters.full_inventory_passes),
+            max_query_gate_counter(&regex_all_counters, |counters| counters.exact_page_loads),
+            max_query_gate_counter(&graph_search_counters, |counters| counters.full_inventory_passes),
+            max_query_gate_counter(&graph_search_counters, |counters| counters.exact_page_loads),
         );
+
+        // These are emergency tripwires retained from the predecessor receipt,
+        // not calibrated architectural budgets. The exact-current p50/p95
+        // output above is what a release measurement will use to set budgets.
         assert!(
             indexed_p95 < Duration::from_secs(1),
-            "indexed 1,000-page simple query exceeded one second"
+            "indexed query emergency tripwire exceeded one second at {label}: {indexed_p95:?}"
         );
         assert!(
-            broad_p95 < Duration::from_secs(2),
-            "all-page 1,000-page simple query exceeded two seconds"
+            regex_all_p95 < Duration::from_secs(2),
+            "Regex-All emergency tripwire exceeded two seconds at {label}: {regex_all_p95:?}"
         );
         assert!(
             graph_search_p95 < Duration::from_secs(2),
-            "1,000-page graph search exceeded two seconds"
+            "graph-search emergency tripwire exceeded two seconds at {label}: {graph_search_p95:?}"
         );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    #[ignore = "manual release performance receipt: managed task query densities plus Regex-All and graph search at 1k/10k and optional copied corpus"]
+    fn managed_query_search_manual_gate() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run with cargo test -p tine-core --release managed_query_search_manual_gate -- --ignored --nocapture"
+        );
+        let samples = managed_query_gate_samples();
+        for (scale, total_pages) in managed_query_gate_scales().into_iter().enumerate() {
+            for (density, candidate_pages) in [
+                ("0.1pct", (total_pages.saturating_add(999) / 1_000).max(1)),
+                ("10pct", (total_pages.saturating_add(9) / 10).max(1)),
+                ("100pct", total_pages),
+            ] {
+                let fixture = ActivationFixture::scaled_query_candidate_density(
+                    "managed-query-search-gate",
+                    0xa1f0 + (scale as u128) * 16 + candidate_pages as u128,
+                    total_pages,
+                    candidate_pages,
+                );
+                managed_query_search_manual_receipt(
+                    &fixture,
+                    &format!("synthetic-{total_pages}-{density}"),
+                    samples,
+                    Some(candidate_pages),
+                );
+            }
+        }
+
+        if let Some(source) = std::env::var_os("TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY") {
+            let source = fs::canonicalize(PathBuf::from(source))
+                .expect("TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY must name a readable copy");
+            assert!(source.is_dir(), "real-copy source must be a directory");
+            assert!(
+                !source.starts_with("/home/koutecky/research/brain"),
+                "the live graph is forbidden; supply a copied corpus"
+            );
+            let fixture =
+                ActivationFixture::copied_graph("managed-query-search-real-copy", 0xa2f0, &source);
+            managed_query_search_manual_receipt(&fixture, "explicit-real-copy", samples, None);
+        }
     }
 
     #[test]
