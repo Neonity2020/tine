@@ -1137,13 +1137,37 @@ pub(crate) async fn get_unlinked_refs(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        bounded_groups_or_error(graph.unlinked_refs_bounded(
-            &name,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::UnlinkedReferences {
+                    name,
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::UnlinkedReferences(result) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                _ => Err("managed unlinked references returned the wrong reply kind".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.unlinked_refs_bounded(
+                &name,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1315,6 +1339,7 @@ mod managed_actor_command_boundary_tests {
             "block_referrers",
             "get_backlinks",
             "get_backlink_filter_context",
+            "get_unlinked_refs",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1355,6 +1380,7 @@ mod managed_actor_command_boundary_tests {
             "block_referrers",
             "get_backlinks",
             "get_backlink_filter_context",
+            "get_unlinked_refs",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");

@@ -44,7 +44,7 @@ use crate::fast_commit::{
 use crate::model::{
     sync_conflict_base, AcceptedExternalDocumentIdentity, BacklinkFilterContext,
     BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
-    RefGroup, ReferenceKind,
+    RefGroup, ReferenceBlockEvidence, ReferenceKind,
 };
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
@@ -1845,6 +1845,11 @@ pub enum SyncApplicationNavigationRequest {
         max_rows: usize,
         max_bytes: usize,
     },
+    UnlinkedReferences {
+        name: String,
+        max_rows: usize,
+        max_bytes: usize,
+    },
     BacklinkFilterContext {
         name: String,
         targets: Vec<BacklinkFilterTarget>,
@@ -1876,6 +1881,7 @@ pub enum SyncApplicationNavigationReply {
     BlockReferenceCounts(HashMap<String, usize>),
     BlockReferrers(SyncApplicationBoundedRefGroups),
     Backlinks(SyncApplicationBoundedRefGroups),
+    UnlinkedReferences(SyncApplicationBoundedRefGroups),
     BacklinkFilterContext(BacklinkFilterContext),
 }
 
@@ -4467,8 +4473,14 @@ fn validate_application_navigation_request(
             name,
             max_rows,
             max_bytes,
+        }
+        | SyncApplicationNavigationRequest::UnlinkedReferences {
+            name,
+            max_rows,
+            max_bytes,
         } => {
-            if *max_rows == 0
+            if name.len() > MAX_MATERIALIZATION_QUERY_BYTES
+                || *max_rows == 0
                 || *max_rows > MAX_SYNC_APPLICATION_RESULT_ROWS
                 || *max_bytes == 0
                 || *max_bytes > MAX_SYNC_APPLICATION_RESULT_BYTES
@@ -6324,6 +6336,31 @@ enum ApplicationExactLoad {
 }
 
 type ApplicationNavigationOverlay = BTreeMap<ManagedPath, Option<(PageId, PageDto)>>;
+type ApplicationReferenceSource = (
+    String,
+    Option<i64>,
+    PageDto,
+    Vec<(BlockDto, ReferenceBlockEvidence)>,
+);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationUnlinkedCandidateStrategy {
+    Indexed,
+    FullExactFallback,
+}
+
+fn application_unlinked_candidate_strategy(
+    normalized_names: &[String],
+) -> ApplicationUnlinkedCandidateStrategy {
+    if normalized_names
+        .iter()
+        .all(|name| name.chars().any(char::is_alphanumeric))
+    {
+        ApplicationUnlinkedCandidateStrategy::Indexed
+    } else {
+        ApplicationUnlinkedCandidateStrategy::FullExactFallback
+    }
+}
 
 #[derive(Default)]
 struct ApplicationPageReferenceCandidates {
@@ -6357,6 +6394,72 @@ fn application_parser_indices_for_block_ids(
         return Err(SyncApplicationPageRequestError::ActorRefused);
     }
     Ok(allowed)
+}
+
+fn bound_application_reference_sources(
+    mut sources: Vec<ApplicationReferenceSource>,
+    max_rows: usize,
+    max_bytes: usize,
+    lower_bound_exceeded: bool,
+) -> SyncApplicationBoundedRefGroups {
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut rows = 0_usize;
+    let mut bytes = 0_usize;
+    let mut total = 0_usize;
+    let mut exceeded = false;
+    let mut grouped: Vec<(Option<i64>, RefGroup)> = Vec::new();
+    let mut by_name = HashMap::<String, usize>::new();
+    for (_, date_key, page, matches) in sources {
+        let key = crate::refs::page_key(&page.name);
+        let index = *by_name.entry(key).or_insert_with(|| {
+            let index = grouped.len();
+            grouped.push((
+                date_key,
+                RefGroup {
+                    page: page.name.clone(),
+                    kind: page.kind,
+                    blocks: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            ));
+            index
+        });
+        if let (Some(previous), Some(current)) = (grouped[index].0, date_key) {
+            grouped[index].0 = Some(previous.max(current));
+        } else if grouped[index].0.is_none() {
+            grouped[index].0 = date_key;
+        }
+        for (block, evidence) in matches {
+            total = total.saturating_add(1);
+            let estimated = crate::model::block_dto_estimated_bytes(&block)
+                .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence))
+                .saturating_add(page.name.len())
+                .saturating_add(256);
+            if !exceeded && rows < max_rows && bytes.saturating_add(estimated) <= max_bytes {
+                rows += 1;
+                bytes = bytes.saturating_add(estimated);
+                grouped[index].1.blocks.push(block);
+                grouped[index].1.evidence.push(evidence);
+            } else {
+                exceeded = true;
+            }
+        }
+    }
+    grouped.retain(|(_, group)| !group.blocks.is_empty());
+    grouped.sort_by(|a, b| {
+        b.0.unwrap_or(i64::MIN)
+            .cmp(&a.0.unwrap_or(i64::MIN))
+            .then_with(|| a.1.page.cmp(&b.1.page))
+    });
+    if lower_bound_exceeded {
+        total = total.max(max_rows.saturating_add(1));
+        exceeded = true;
+    }
+    SyncApplicationBoundedRefGroups {
+        groups: grouped.into_iter().map(|(_, group)| group).collect(),
+        total,
+        exceeded,
+    }
 }
 
 fn find_application_blocks<'a>(
@@ -8262,6 +8365,13 @@ impl RuntimeActor {
             } => SyncApplicationNavigationReply::Backlinks(
                 self.application_backlinks_ready(&name, max_rows, max_bytes)?,
             ),
+            SyncApplicationNavigationRequest::UnlinkedReferences {
+                name,
+                max_rows,
+                max_bytes,
+            } => SyncApplicationNavigationReply::UnlinkedReferences(
+                self.application_unlinked_references_ready(&name, max_rows, max_bytes)?,
+            ),
             SyncApplicationNavigationRequest::BacklinkFilterContext { name, targets } => {
                 SyncApplicationNavigationReply::BacklinkFilterContext(
                     self.application_backlink_filter_context_ready(&name, &targets)?,
@@ -8847,65 +8957,171 @@ impl RuntimeActor {
                 matches,
             ));
         }
-        sources.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(bound_application_reference_sources(
+            sources,
+            max_rows,
+            max_bytes,
+            candidate_exceeded,
+        ))
+    }
 
-        let mut rows = 0_usize;
-        let mut bytes = 0_usize;
-        let mut total = 0_usize;
-        let mut exceeded = false;
-        let mut grouped: Vec<(Option<i64>, RefGroup)> = Vec::new();
-        let mut by_name = HashMap::<String, usize>::new();
-        for (_, date_key, page, matches) in sources {
-            let key = crate::refs::page_key(&page.name);
-            let index = *by_name.entry(key).or_insert_with(|| {
-                let index = grouped.len();
-                grouped.push((
-                    date_key,
-                    RefGroup {
-                        page: page.name.clone(),
-                        kind: page.kind,
-                        blocks: Vec::new(),
-                        evidence: Vec::new(),
-                    },
-                ));
-                index
-            });
-            if let (Some(previous), Some(current)) = (grouped[index].0, date_key) {
-                grouped[index].0 = Some(previous.max(current));
-            } else if grouped[index].0.is_none() {
-                grouped[index].0 = date_key;
+    fn application_unlinked_references_ready(
+        &self,
+        target: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+        let (canonical, names_norm, self_page) =
+            self.application_equivalent_page_names_ready(target)?;
+        let excluded = crate::refs::page_key(&self_page);
+        let mut sources = Vec::<ApplicationReferenceSource>::new();
+
+        if application_unlinked_candidate_strategy(&names_norm)
+            == ApplicationUnlinkedCandidateStrategy::FullExactFallback
+        {
+            // unicode61 deliberately has no candidate for a tokenless literal.
+            // Preserve correctness through exact application pages, never the
+            // broad Direct-Files parsed cache. This exceptional path remains
+            // explicit so C3 performance receipts can measure it separately.
+            for (entry, _) in self.application_navigation_pages_ready()? {
+                if crate::refs::page_key(&entry.name) == excluded {
+                    continue;
+                }
+                let current = match self.load_application_exact_ready(&entry.rel_path)? {
+                    ApplicationExactLoad::Loaded(current) => current,
+                    ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                        return Err(SyncApplicationPageRequestError::ActorRefused)
+                    }
+                };
+                let matches = crate::query::application_page_reference_matches(
+                    &current.page,
+                    &canonical,
+                    &names_norm,
+                    ReferenceKind::Plain,
+                    None,
+                    true,
+                    &self.graph.config,
+                );
+                if !matches.is_empty() {
+                    sources.push((entry.rel_path, entry.date_key, current.page, matches));
+                }
             }
-            for (block, evidence) in matches {
-                total = total.saturating_add(1);
-                let estimated = crate::model::block_dto_estimated_bytes(&block)
-                    .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence))
-                    .saturating_add(page.name.len())
-                    .saturating_add(256);
-                if !exceeded && rows < max_rows && bytes.saturating_add(estimated) <= max_bytes {
-                    rows += 1;
-                    bytes = bytes.saturating_add(estimated);
-                    grouped[index].1.blocks.push(block);
-                    grouped[index].1.evidence.push(evidence);
-                } else {
-                    exceeded = true;
+            return Ok(bound_application_reference_sources(
+                sources, max_rows, max_bytes, false,
+            ));
+        }
+
+        let overlay = self.application_navigation_overlay_ready()?;
+        let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        const BATCH: usize = 256;
+        let mut candidate_pages = BTreeSet::<PageId>::new();
+        let mut page_headers = HashMap::<PageId, (ManagedPath, String)>::new();
+        for normalized in &names_norm {
+            let mut cursor = None;
+            loop {
+                let rows = read
+                    .plain_text_candidate_pages_after(normalized, cursor, BATCH)
+                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let len = rows.len();
+                for row in rows {
+                    cursor = Some(row.page_id);
+                    let (path, page_name) = if let Some(header) = page_headers.get(&row.page_id) {
+                        header.clone()
+                    } else {
+                        let page = read
+                            .page(row.page_id)
+                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+                            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                        let header = (page.path, page.name);
+                        page_headers.insert(row.page_id, header.clone());
+                        header
+                    };
+                    if !masked_paths.contains(&path)
+                        && crate::refs::page_key(&page_name) != excluded
+                    {
+                        candidate_pages.insert(row.page_id);
+                    }
+                }
+                if len < BATCH {
+                    break;
                 }
             }
         }
-        grouped.retain(|(_, group)| !group.blocks.is_empty());
-        grouped.sort_by(|a, b| {
-            b.0.unwrap_or(i64::MIN)
-                .cmp(&a.0.unwrap_or(i64::MIN))
-                .then_with(|| a.1.page.cmp(&b.1.page))
-        });
-        if candidate_exceeded {
-            total = total.max(max_rows.saturating_add(1));
-            exceeded = true;
+        drop(read);
+
+        for (path, current) in overlay {
+            let Some((_, page)) = current else {
+                continue;
+            };
+            if crate::refs::page_key(&page.name) == excluded {
+                continue;
+            }
+            let matches = crate::query::application_page_reference_matches(
+                &page,
+                &canonical,
+                &names_norm,
+                ReferenceKind::Plain,
+                None,
+                true,
+                &self.graph.config,
+            );
+            if matches.is_empty() {
+                continue;
+            }
+            let entry = self
+                .graph
+                .projected_inventory_entry(&path, &page.name, model_sync_page_kind(page.kind))
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
         }
-        Ok(SyncApplicationBoundedRefGroups {
-            groups: grouped.into_iter().map(|(_, group)| group).collect(),
-            total,
-            exceeded,
-        })
+        for page_id in candidate_pages {
+            let current = self.load_application_page_id_ready(page_id)?;
+            if crate::refs::page_key(&current.page.name) == excluded {
+                continue;
+            }
+            let matches = crate::query::application_page_reference_matches(
+                &current.page,
+                &canonical,
+                &names_norm,
+                ReferenceKind::Plain,
+                None,
+                true,
+                &self.graph.config,
+            );
+            if matches.is_empty() {
+                continue;
+            }
+            let entry = self
+                .graph
+                .projected_inventory_entry(
+                    &current.editor.page.path,
+                    &current.page.name,
+                    current.editor.page.kind,
+                )
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            sources.push((
+                current.editor.page.path.as_str().to_owned(),
+                entry.date_key,
+                current.page,
+                matches,
+            ));
+        }
+        Ok(bound_application_reference_sources(
+            sources, max_rows, max_bytes, false,
+        ))
     }
 
     fn application_backlink_filter_context_ready(
@@ -18617,6 +18833,14 @@ mod tests {
         let database_path = request.database_path.clone();
         let handle = active_handle(SyncRuntimeHandle::open(request));
         drive_initial_feed(&handle);
+        assert_eq!(
+            application_unlinked_candidate_strategy(&["ordinary ω".into(), "compass".into()]),
+            ApplicationUnlinkedCandidateStrategy::Indexed
+        );
+        assert_eq!(
+            application_unlinked_candidate_strategy(&["++".into()]),
+            ApplicationUnlinkedCandidateStrategy::FullExactFallback
+        );
         let genuine = "7f46e275-4f95-4f58-a485-bb8e16726c42";
         let dangling = "efac0a70-56a0-49bb-aed7-9095dfa4f1e2";
         admit_external_page(
@@ -18632,14 +18856,15 @@ mod tests {
             &handle,
             &fixture,
             "diary/日記/2026_07_30.org",
-            format!("* TODO journal root [[Compass]] (({genuine}))\n** journal child\n").as_bytes(),
+            format!("* TODO journal root Ordinary Ω [[Compass]] (({genuine}))\n** journal child\n")
+                .as_bytes(),
         );
         admit_external_page(
             &handle,
             &fixture,
             "content/nested pages/Ref source.md",
             format!(
-                "related:: [[Compass]]\n\n- first [[Compass]] (({genuine})) and (({genuine})) plus (({dangling}))\n  - nested [[Compass]] {{{{embed (({genuine}))}}}}\n"
+                "related:: [[Compass]]\nnote:: Ordinary Ω\n\n- first Ordinary Ω [[Compass]] (({genuine})) and (({genuine})) plus (({dangling}))\n  - nested Cafe\u{301} and ++ [[Compass]] {{{{embed (({genuine}))}}}}\n"
             )
             .as_bytes(),
         );
@@ -18889,6 +19114,50 @@ mod tests {
             assert_eq!(actual.facets, expected.facets);
             assert_eq!(actual.truncated, expected.truncated);
         }
+        for target in ["Ordinary Ω", "Café", "++"] {
+            let SyncApplicationNavigationReply::UnlinkedReferences(managed_unlinked) =
+                navigation(SyncApplicationNavigationRequest::UnlinkedReferences {
+                    name: target.into(),
+                    max_rows: 20_000,
+                    max_bytes: 32 * 1024 * 1024,
+                })
+            else {
+                panic!("wrong unlinked-reference reply for {target:?}")
+            };
+            let direct_unlinked = graph.unlinked_refs(target);
+            assert!(!managed_unlinked.exceeded);
+            assert_eq!(
+                managed_unlinked.groups.len(),
+                direct_unlinked.len(),
+                "managed/direct unlinked group count differs for {target:?}"
+            );
+            for (actual, expected) in managed_unlinked.groups.iter().zip(direct_unlinked.iter()) {
+                assert_eq!(actual.page, expected.page);
+                assert_eq!(actual.kind, expected.kind);
+                assert_eq!(actual.blocks.len(), expected.blocks.len());
+                for ((actual_block, actual_evidence), (expected_block, expected_evidence)) in actual
+                    .blocks
+                    .iter()
+                    .zip(&actual.evidence)
+                    .zip(expected.blocks.iter().zip(&expected.evidence))
+                {
+                    assert_eq!(actual_block.raw, expected_block.raw);
+                    assert_eq!(actual_block.breadcrumb, expected_block.breadcrumb);
+                    assert_eq!(actual_evidence.occurrences, expected_evidence.occurrences);
+                    assert_eq!(actual_evidence.total, expected_evidence.total);
+                    assert_eq!(actual_evidence.truncated, expected_evidence.truncated);
+                }
+            }
+        }
+        let oversized_reference_name = "x".repeat(MAX_MATERIALIZATION_QUERY_BYTES + 1);
+        assert!(matches!(
+            handle.application_navigation(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: oversized_reference_name,
+                max_rows: 1,
+                max_bytes: 1024,
+            }),
+            Err(SyncApplicationPageRequestError::RequestTooLarge(_))
+        ));
         for path in [
             "content/nested pages/Ordinary Ω.md",
             "diary/日記/2026_07_30.org",
@@ -18978,7 +19247,7 @@ mod tests {
             &fixture,
             "content/nested pages/Navigation.md",
             format!(
-                "icon:: old\nalias:: Old Alias\n\n- mentions [[Old Phantom]] (({old_reference}))\n  id:: {identity}\n"
+                "icon:: old\nalias:: Old Alias\n\n- mentions Old Plain [[Old Phantom]] (({old_reference}))\n  id:: {identity}\n"
             )
             .as_bytes(),
         );
@@ -18986,7 +19255,7 @@ mod tests {
             load_application_exact(&handle, "content/nested pages/Navigation.md");
         page.pre_block = Some("icon:: new\nalias:: New Alias".into());
         page.blocks[0].raw =
-            format!("- mentions [[New Phantom]] (({new_reference}))\n  id:: {identity}");
+            format!("- mentions New Plain [[New Phantom]] (({new_reference}))\n  id:: {identity}");
         let saved = handle
             .save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::Existing {
@@ -19045,6 +19314,26 @@ mod tests {
         assert!(new_backlinks.groups[0].blocks[0]
             .raw
             .contains("New Phantom"));
+        let SyncApplicationNavigationReply::UnlinkedReferences(old_unlinked) =
+            loaded(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: "Old Plain".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong old-unlinked reply")
+        };
+        assert!(old_unlinked.groups.is_empty());
+        let SyncApplicationNavigationReply::UnlinkedReferences(new_unlinked) =
+            loaded(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: "New Plain".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong new-unlinked reply")
+        };
+        assert_eq!(new_unlinked.total, 1);
         let SyncApplicationNavigationReply::ResolveBlocks(resolved) =
             loaded(SyncApplicationNavigationRequest::ResolveBlocks {
                 uuids: vec![identity.into()],
@@ -19084,7 +19373,8 @@ mod tests {
         assert_eq!(icons.get("New Alias").map(String::as_str), Some("new"));
 
         let mut created_block = BlockDto::default();
-        created_block.raw = format!("- links [[Created Phantom]] (({new_reference}))");
+        created_block.raw =
+            format!("- links Created Plain [[Created Phantom]] (({new_reference}))");
         let created = handle
             .save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::New {
@@ -19128,6 +19418,17 @@ mod tests {
         };
         assert_eq!(created_backlinks.total, 1);
         assert_eq!(created_backlinks.groups[0].page, "Created Navigation");
+        let SyncApplicationNavigationReply::UnlinkedReferences(created_unlinked) =
+            loaded(SyncApplicationNavigationRequest::UnlinkedReferences {
+                name: "Created Plain".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong created-unlinked reply")
+        };
+        assert_eq!(created_unlinked.total, 1);
+        assert_eq!(created_unlinked.groups[0].page, "Created Navigation");
         let SyncApplicationNavigationReply::BlockReferenceCounts(counts) =
             loaded(SyncApplicationNavigationRequest::BlockReferenceCounts)
         else {

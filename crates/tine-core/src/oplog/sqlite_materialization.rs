@@ -15,6 +15,7 @@ use std::fmt;
 use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tine_storage::sqlite as storage;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
@@ -1566,6 +1567,7 @@ pub(crate) fn lower_validated_change(
 }
 
 fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, MaterializationError> {
+    let normalized_searchable_text = normalized_searchable_text(&page.searchable_text)?;
     Ok(storage::PhysicalPage {
         page_id: page.page_id.as_uuid().into_bytes(),
         home_document_id: page.home_document_id.as_uuid().into_bytes(),
@@ -1575,6 +1577,7 @@ fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, Mat
         text_kind: text_kind_to_sql(page.kind),
         preamble: page.preamble.clone(),
         searchable_text: page.searchable_text.clone(),
+        normalized_searchable_text,
         references: page.references.iter().map(lower_reference).collect(),
         properties: page.properties.iter().map(lower_property).collect(),
         tags: page.tags.clone(),
@@ -1589,6 +1592,7 @@ fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, Mat
 fn lower_block(
     block: &MaterializedBlockInput,
 ) -> Result<storage::PhysicalBlock, MaterializationError> {
+    let normalized_searchable_text = normalized_searchable_text(&block.searchable_text)?;
     Ok(storage::PhysicalBlock {
         block_id: block.block_id.as_uuid().into_bytes(),
         home_document_id: block.home_document_id.as_uuid().into_bytes(),
@@ -1596,6 +1600,7 @@ fn lower_block(
         order: block.order.clone(),
         content: block.content.clone(),
         searchable_text: block.searchable_text.clone(),
+        normalized_searchable_text,
         heading_level: block.heading_level,
         collapsed: block.collapsed,
         logseq_uuid: block.logseq_uuid.map(|id| id.as_uuid().into_bytes()),
@@ -1610,6 +1615,18 @@ fn lower_block(
             deadline: task.deadline.clone(),
         }),
     })
+}
+
+fn normalized_searchable_text(value: &str) -> Result<String, MaterializationError> {
+    let normalized = value.to_lowercase().nfc().collect::<String>();
+    if normalized.len() > MAX_MATERIALIZATION_FIELD_BYTES {
+        return Err(MaterializationError::ResourceLimit {
+            resource: "normalized searchable text bytes",
+            found: normalized.len(),
+            maximum: MAX_MATERIALIZATION_FIELD_BYTES,
+        });
+    }
+    Ok(normalized)
 }
 
 fn lower_reference(reference: &MaterializedReference) -> storage::PhysicalReference {
@@ -1951,6 +1968,11 @@ pub struct MaterializedPageReferrerCandidateRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedPlainTextCandidatePageRow {
+    pub page_id: PageId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPropertyRow {
     pub owner: MaterializedEntityId,
     pub page_id: PageId,
@@ -2282,6 +2304,23 @@ impl<'a> SqliteMaterializedRead<'a> {
             .collect()
     }
 
+    pub fn plain_text_candidate_pages_after(
+        &self,
+        normalized_phrase: &str,
+        after: Option<PageId>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPlainTextCandidatePageRow>, MaterializationError> {
+        self.inner
+            .plain_text_candidate_pages_after(
+                normalized_phrase,
+                after.map(|page| page.as_uuid().into_bytes()),
+                limit,
+            )?
+            .into_iter()
+            .map(plain_text_candidate_page_row_from_storage)
+            .collect()
+    }
+
     pub fn properties(
         &self,
         owner: MaterializedEntityId,
@@ -2481,6 +2520,14 @@ fn page_referrer_candidate_row_from_storage(
     Ok(MaterializedPageReferrerCandidateRow {
         source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
         source: entity_from_storage(row.source),
+    })
+}
+
+fn plain_text_candidate_page_row_from_storage(
+    row: storage::PhysicalPlainTextCandidatePageRow,
+) -> Result<MaterializedPlainTextCandidatePageRow, MaterializationError> {
+    Ok(MaterializedPlainTextCandidatePageRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
     })
 }
 
