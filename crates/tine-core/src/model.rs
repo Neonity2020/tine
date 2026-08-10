@@ -31460,6 +31460,21 @@ pub fn direct_save_conflict_epoch(error: &io::Error) -> Option<u64> {
 pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
     let message = error.to_string();
     let has = |needle: &str| message.contains(needle);
+    // Anchored, not `contains`. Every raw error below can carry a graph-relative
+    // PATH, and a page name is the user's to choose — so a `contains` test lets a
+    // file named after one of these sentences give an unrelated failure that
+    // family's provenance. The three authority messages are always the WHOLE
+    // error (`consume_conflict_authority` and the command boundary construct
+    // them directly and nothing wraps them), so anchoring costs nothing and
+    // makes the code mean what it says.
+    //
+    // The arms that predate this still use `contains`, and the same weakness
+    // reaches them: a page named `editor conflict: save baseline present.md`
+    // can put a banner-class code on an unrelated failure. Anchoring those too
+    // would reclassify legitimately WRAPPED errors (several are composed as
+    // `{primary}; …`) and needs its own packet with its own verification; it is
+    // recorded rather than done here.
+    let starts = |needle: &str| message.starts_with(needle);
     if has("is a symlink or reparse point") {
         "precheck.symlink"
     } else if has("changed during retained identity capture") || has("changed during capture") {
@@ -31498,16 +31513,16 @@ pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
         "conflict_retry.final_reread_present"
     } else if has("tokenless editor conflict: post-publication validation") {
         "conflict_retry.replace_post_publication"
-    } else if has("conflict override authority is newer") {
+    } else if starts("conflict override authority is newer") {
         // A "Keep mine" that named an observation the disk has since moved past.
         // Its own family, NOT `conflict.*`: the frontend must not read it as a
         // fresh banner (there is no new authority in it) and must not read it as
         // a transient failure either -- the banner it answers is now dead, so the
         // only safe response is to observe again and re-raise a live one.
         "conflict_authority.superseded"
-    } else if has("conflict override authority belongs to a different editor episode") {
+    } else if starts("conflict override authority belongs to a different editor episode") {
         "conflict_authority.other_episode"
-    } else if has("conflict override authority is missing or already consumed") {
+    } else if starts("conflict override authority is missing or already consumed") {
         "conflict_authority.spent"
     } else if has("editor conflict: save baseline present") {
         "conflict.save_baseline_present"
@@ -41144,6 +41159,20 @@ mod tests {
                 Error::new(
                     ErrorKind::PermissionDenied,
                     "conflict override authority is missing or already consumed",
+                ),
+            ),
+            // A page name is the user's to choose, and raw errors carry paths.
+            // An unrelated failure that merely MENTIONS an authority sentence --
+            // because a file is named after it -- must not inherit that family:
+            // the frontend answers `conflict_authority.*` by re-observing, so a
+            // permanent failure wearing that code would feed its own retry.
+            // (GH #254 increment 2, fifth correction-delta re-verification.)
+            (
+                "unknown",
+                Error::new(
+                    ErrorKind::Other,
+                    "exact-identity restore failed for pages/\
+                     conflict override authority is missing or already consumed.md",
                 ),
             ),
             // `require_pinned_save_owner`, LoadedRevision arm: the file moved

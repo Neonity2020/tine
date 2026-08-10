@@ -338,7 +338,13 @@ export function isRetryableSaveFailure(error: unknown): boolean {
 function directSaveFailureCode(error: unknown): string {
   const message = String(error).replace(/^Error: /, "");
   const separator = message.indexOf(": ");
-  return separator > 0 ? message.slice(0, separator) : message;
+  if (separator <= 0) return ""; // no code at all — never a family
+  const code = message.slice(0, separator);
+  // A bounded code is `family.condition`, lower-case and underscored. Requiring
+  // the SHAPE means an error that merely opens with code-like prose cannot be
+  // read as one: without it, `Error("conflict_authority.spent while reporting
+  // …")` was accepted whole and routed into the authority handler.
+  return /^[a-z][a-z_]*\.[a-z][a-z_]*$/.test(code) ? code : "";
 }
 
 /** The observation epoch a banner-class conflict was raised at.

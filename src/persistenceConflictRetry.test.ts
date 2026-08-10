@@ -89,6 +89,21 @@ describe("a failure is classified by its code, not by the page's name", () => {
       expect(calls.length).toBe(1);
     });
   }
+
+  // Fifth re-verification, LOW. An error with no bounded prefix used to be
+  // returned whole, so prose that merely OPENS with a code-shaped token was
+  // accepted as that family.
+  it("does not read a family out of unprefixed prose", async () => {
+    markDirty("Notes");
+    nextResult = () => Promise.reject(new Error(
+      "conflict_authority.spent while reporting an unrelated raw failure"
+    ));
+
+    expect(await forceSave("Notes")).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(calls.length).toBe(1);
+  });
 });
 
 describe("a tokenless force does not strand the page behind a spent banner", () => {

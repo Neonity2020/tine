@@ -46,32 +46,58 @@ function isFunctionLike(node: ts.Node): boolean {
  *  itself, an alias on the import, and a plain `const x = markConflict`. Matching
  *  only the literal identifier would let `import { markConflict as raise }` walk
  *  straight past the rule this file exists to hold. */
-function localNamesForMarkConflict(sf: ts.SourceFile): Set<string> {
+function localNamesForMarkConflict(sf: ts.SourceFile): {
+  names: Set<string>;
+  namespaces: Set<string>;
+} {
   const names = new Set(["markConflict"]);
+  const namespaces = new Set<string>();
   const visit = (node: ts.Node) => {
-    if (ts.isImportDeclaration(node) && node.importClause?.namedBindings
-      && ts.isNamedImports(node.importClause.namedBindings)) {
-      for (const element of node.importClause.namedBindings.elements) {
-        if ((element.propertyName ?? element.name).text === "markConflict") {
-          names.add(element.name.text);
+    if (ts.isImportDeclaration(node) && node.importClause?.namedBindings) {
+      const bindings = node.importClause.namedBindings;
+      if (ts.isNamedImports(bindings)) {
+        for (const element of bindings.elements) {
+          if ((element.propertyName ?? element.name).text === "markConflict") {
+            names.add(element.name.text);
+          }
         }
+      } else if (ts.isNamespaceImport(bindings)) {
+        // `import * as ui` — any `ui.markConflict(...)` is the same call.
+        namespaces.add(bindings.name.text);
       }
     }
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)
-      && node.initializer && ts.isIdentifier(node.initializer)
-      && names.has(node.initializer.text)) {
-      names.add(node.name.text);
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      // `const raise = markConflict`, and chains of it.
+      if (ts.isIdentifier(node.name) && ts.isIdentifier(node.initializer)
+        && names.has(node.initializer.text)) {
+        names.add(node.name.text);
+      }
+      // `const { markConflict: raise } = ui` off a namespace import.
+      if (ts.isObjectBindingPattern(node.name) && ts.isIdentifier(node.initializer)
+        && namespaces.has(node.initializer.text)) {
+        for (const element of node.name.elements) {
+          if (((element.propertyName ?? element.name) as ts.Node).getText(sf) === "markConflict"
+            && ts.isIdentifier(element.name)) {
+            names.add(element.name.text);
+          }
+        }
+      }
     }
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  return names;
+  return { names, namespaces };
 }
 
 export function bannerRaiseViolations(file: string, source: string): string[] {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true,
     file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
-  const raisers = localNamesForMarkConflict(sf);
+  const { names: raisers, namespaces } = localNamesForMarkConflict(sf);
+  const isRaiser = (callee: ts.Expression): boolean =>
+    (ts.isIdentifier(callee) && raisers.has(callee.text))
+    // `ui.markConflict(...)` through a namespace import.
+    || (ts.isPropertyAccessExpression(callee) && callee.name.text === "markConflict"
+      && ts.isIdentifier(callee.expression) && namespaces.has(callee.expression.text));
   const violations: string[] = [];
   const allowedFn = file === ALLOWED_CALLER.file ? ALLOWED_CALLER.fn : null;
   const visit = (node: ts.Node, enclosing: string | null) => {
@@ -86,8 +112,7 @@ export function bannerRaiseViolations(file: string, source: string): string[] {
       : isFunctionLike(node)
         ? null
         : enclosing;
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
-      && raisers.has(node.expression.text)
+    if (ts.isCallExpression(node) && isRaiser(node.expression)
       && !(allowedFn !== null && scope === allowedFn)) {
       const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
       violations.push(`${file}:${line + 1}: markConflict outside the save-result path`);
@@ -117,6 +142,36 @@ describe("only a backend save refusal may raise a conflict banner", () => {
     expect(bannerRaiseViolations("src/App.tsx",
       "import { markConflict as raiseConflict } from \"./ui\";\n"
       + "raiseConflict(name);\n"))
+      .toEqual(["src/App.tsx:2: markConflict outside the save-result path"]);
+  });
+
+  it("recognises a namespace import and a destructured alias off it", () => {
+    expect(bannerRaiseViolations("src/App.tsx",
+      "import * as ui from \"./ui\";\n"
+      + "ui.markConflict(name);\n"
+      + "const { markConflict: raise } = ui;\n"
+      + "raise(name);\n"))
+      .toEqual([
+        "src/App.tsx:2: markConflict outside the save-result path",
+        "src/App.tsx:4: markConflict outside the save-result path",
+      ]);
+  });
+
+  // The stated limit, pinned so nobody reads more into this guard than it
+  // delivers. It is a single-file syntactic scan: a module that re-exports
+  // markConflict UNDER ANOTHER NAME hides it, because connecting the two needs
+  // the module graph. A re-export under the same name is still caught, since the
+  // local name is what this file sees. The production scan is green and there is
+  // no second caller today; this is the known hole, not a claim of completeness.
+  it("cannot see a re-export that renames markConflict", () => {
+    expect(bannerRaiseViolations("src/App.tsx",
+      "import { raiseConflict } from \"./reexports\";\n"
+      + "raiseConflict(name);\n"))
+      .toEqual([]);
+    // …while the same chain keeping the name is caught.
+    expect(bannerRaiseViolations("src/App.tsx",
+      "import { markConflict } from \"./reexports\";\n"
+      + "markConflict(name);\n"))
       .toEqual(["src/App.tsx:2: markConflict outside the save-result path"]);
   });
 
