@@ -1874,6 +1874,13 @@ pub enum SyncApplicationNavigationRequest {
         max_rows: usize,
         max_bytes: usize,
     },
+    ExportQuerySubtrees {
+        specs: Vec<crate::query::QueryExportSpec>,
+        max_queries: usize,
+        max_roots: usize,
+        max_nodes: usize,
+        max_bytes: usize,
+    },
     GraphSearch {
         source: String,
         page_limit: usize,
@@ -1930,6 +1937,7 @@ pub enum SyncApplicationNavigationReply {
     },
     SimpleQuery(SyncApplicationBoundedRefGroups),
     AdvancedQuery(SyncApplicationBoundedAdvancedResult),
+    ExportQuerySubtrees(crate::query::QueryExportBatch),
     GraphSearch(crate::query_plan::QueryExecution),
     BlockSearch(Vec<RefGroup>),
 }
@@ -4535,6 +4543,40 @@ fn validate_application_navigation_request(
         }
         return Ok(());
     }
+    if let SyncApplicationNavigationRequest::ExportQuerySubtrees {
+        specs,
+        max_queries,
+        max_roots,
+        max_nodes,
+        max_bytes,
+    } = request
+    {
+        let text_bytes = specs
+            .iter()
+            .map(|spec| spec.key.len().saturating_add(spec.query.len()))
+            .try_fold(0_usize, usize::checked_add)
+            .unwrap_or(usize::MAX);
+        if specs.len() > MAX_SYNC_APPLICATION_RESULT_ROWS
+            || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+            || *max_queries == 0
+            || *max_queries > MAX_SYNC_APPLICATION_RESULT_ROWS
+            || *max_roots == 0
+            || *max_roots > MAX_SYNC_APPLICATION_RESULT_ROWS
+            || *max_nodes == 0
+            || *max_nodes > MAX_SYNC_APPLICATION_PAGE_BLOCKS
+            || *max_bytes == 0
+            || *max_bytes > MAX_SYNC_APPLICATION_RESULT_BYTES
+        {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: specs.len().max(*max_nodes),
+                    text_bytes: text_bytes.max(*max_bytes),
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        return Ok(());
+    }
     if let SyncApplicationNavigationRequest::AdvancedQuery {
         query,
         current_page,
@@ -4715,7 +4757,8 @@ fn validate_application_navigation_request(
         SyncApplicationNavigationRequest::PropertyFacets { .. } => unreachable!(),
         SyncApplicationNavigationRequest::GraphSearch { .. }
         | SyncApplicationNavigationRequest::BlockSearch { .. }
-        | SyncApplicationNavigationRequest::AdvancedQuery { .. } => unreachable!(),
+        | SyncApplicationNavigationRequest::AdvancedQuery { .. }
+        | SyncApplicationNavigationRequest::ExportQuerySubtrees { .. } => unreachable!(),
     };
     if names.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(
@@ -8657,6 +8700,21 @@ impl RuntimeActor {
                     max_bytes,
                 )?,
             ),
+            SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                specs,
+                max_queries,
+                max_roots,
+                max_nodes,
+                max_bytes,
+            } => SyncApplicationNavigationReply::ExportQuerySubtrees(
+                self.application_export_query_subtrees_ready(
+                    &specs,
+                    max_queries,
+                    max_roots,
+                    max_nodes,
+                    max_bytes,
+                )?,
+            ),
             SyncApplicationNavigationRequest::GraphSearch {
                 source,
                 page_limit,
@@ -9858,6 +9916,25 @@ impl RuntimeActor {
             total,
             exceeded,
         })
+    }
+
+    fn application_export_query_subtrees_ready(
+        &self,
+        specs: &[crate::query::QueryExportSpec],
+        max_queries: usize,
+        max_roots: usize,
+        max_nodes: usize,
+        max_bytes: usize,
+    ) -> Result<crate::query::QueryExportBatch, SyncApplicationPageRequestError> {
+        let pages = self.application_all_query_pages_ready()?;
+        Ok(crate::query::export_application_query_subtrees(
+            &pages,
+            specs,
+            max_queries,
+            max_roots,
+            max_nodes,
+            max_bytes,
+        ))
     }
 
     fn application_graph_search_ready(
@@ -19635,6 +19712,12 @@ mod tests {
         canonicalize_query_groups_for_mode_differential(&mut result.groups);
     }
 
+    fn canonicalize_query_export_for_mode_differential(batch: &mut crate::query::QueryExportBatch) {
+        for result in &mut batch.results {
+            canonicalize_query_groups_for_mode_differential(&mut result.groups);
+        }
+    }
+
     fn assert_parser_dto_semantics(expected: &PageDto, actual: &PageDto) {
         let mut expected = expected.clone();
         let mut actual = actual.clone();
@@ -20090,6 +20173,43 @@ mod tests {
         };
         assert!(bounded_advanced.exceeded);
         assert!(bounded_advanced.total > bounded_advanced.result.groups.len());
+        let export_specs = vec![
+            crate::query::QueryExportSpec {
+                key: "simple".into(),
+                query: "(task TODO)".into(),
+                advanced: false,
+            },
+            crate::query::QueryExportSpec {
+                key: "advanced".into(),
+                query: "[:find (pull ?b [*]) :where (task ?b \"TODO\")]".into(),
+                advanced: true,
+            },
+            crate::query::QueryExportSpec {
+                key: "omitted".into(),
+                query: "ordinary".into(),
+                advanced: false,
+            },
+        ];
+        let SyncApplicationNavigationReply::ExportQuerySubtrees(mut managed_export) =
+            navigation(SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                specs: export_specs.clone(),
+                max_queries: 2,
+                max_roots: 3,
+                max_nodes: 3,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong query-export reply")
+        };
+        let mut direct_export =
+            crate::query::export_query_subtrees(&graph, &export_specs, 2, 3, 3, 32 * 1024 * 1024);
+        canonicalize_query_export_for_mode_differential(&mut managed_export);
+        canonicalize_query_export_for_mode_differential(&mut direct_export);
+        assert_eq!(
+            serde_json::to_value(managed_export).unwrap(),
+            serde_json::to_value(direct_export).unwrap(),
+            "managed query export must share Direct Files selection, hydration and cumulative budgets"
+        );
         let requested = vec![
             genuine.to_owned(),
             genuine.to_owned(),
@@ -20649,6 +20769,25 @@ mod tests {
             .groups
             .iter()
             .any(|group| group.page == "Navigation"));
+        let SyncApplicationNavigationReply::ExportQuerySubtrees(done_export) =
+            loaded(SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                specs: vec![crate::query::QueryExportSpec {
+                    key: "done".into(),
+                    query: "(task DONE)".into(),
+                    advanced: false,
+                }],
+                max_queries: 8,
+                max_roots: 8,
+                max_nodes: 32,
+                max_bytes: 1024 * 1024,
+            })
+        else {
+            panic!("wrong immediate query-export reply")
+        };
+        assert!(done_export.results[0]
+            .groups
+            .iter()
+            .any(|group| group.page == "Navigation"));
 
         let mut created_block = BlockDto::default();
         created_block.raw = format!(
@@ -20790,6 +20929,25 @@ mod tests {
             panic!("wrong created task-query reply")
         };
         assert!(todo_query
+            .groups
+            .iter()
+            .any(|group| group.page == "Created Navigation"));
+        let SyncApplicationNavigationReply::ExportQuerySubtrees(todo_export) =
+            loaded(SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                specs: vec![crate::query::QueryExportSpec {
+                    key: "todo".into(),
+                    query: "(task TODO)".into(),
+                    advanced: false,
+                }],
+                max_queries: 8,
+                max_roots: 8,
+                max_nodes: 32,
+                max_bytes: 1024 * 1024,
+            })
+        else {
+            panic!("wrong created query-export reply")
+        };
+        assert!(todo_export.results[0]
             .groups
             .iter()
             .any(|group| group.page == "Created Navigation"));

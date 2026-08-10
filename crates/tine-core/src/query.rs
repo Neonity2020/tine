@@ -13,6 +13,7 @@ use crate::model::{
 };
 use crate::refs;
 use crate::search_query::Matcher;
+use std::collections::{HashMap, HashSet};
 
 /// Query source crosses several boundaries (live macros, native IPC, static
 /// publication, and export). Keep one shared ceiling so no caller can make the
@@ -3411,7 +3412,7 @@ fn block_to_bounded_dto(
 /// One query macro requested by Copy / Export. Query evaluation and subtree
 /// hydration stay in the same native operation so a shallow result never causes
 /// the WebView to fetch and retain its complete source page.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QueryExportSpec {
     pub key: String,
     pub query: String,
@@ -3452,59 +3453,119 @@ struct SelectedExportQuery {
     roots: Vec<SelectedExportRoot>,
 }
 
-/// Evaluate and hydrate several Copy / Export query macros under one cumulative
-/// root, node, and byte budget. Only the selected block subtrees are cloned into
-/// DTOs; complete PageDto values never cross IPC or accumulate in the WebView.
-///
-/// `max_roots` is deliberately global, not per macro. This keeps a selection
-/// containing many distinct query blocks from multiplying the same advertised
-/// export limit. Each relevant source document is scanned at most once and only
-/// references to the requested roots are retained while the graph snapshot is
-/// borrowed.
-pub fn export_query_subtrees(
-    graph: &Graph,
+struct ExportHydrationPage<'a> {
+    kind: PageKind,
+    name: &'a str,
+    roots: &'a [DocBlock],
+}
+
+fn hydrate_selected_export_queries(
+    selected: Vec<SelectedExportQuery>,
+    pages: &[ExportHydrationPage<'_>],
+    max_nodes: usize,
+    max_bytes: usize,
+) -> Vec<QueryExportResult> {
+    let mut wanted_by_page: HashMap<(PageKind, String), HashSet<String>> = HashMap::new();
+    for query in &selected {
+        for root in &query.roots {
+            wanted_by_page
+                .entry((root.kind, root.page.clone()))
+                .or_default()
+                .insert(root.id.clone());
+        }
+    }
+
+    let total_wanted = wanted_by_page.values().map(HashSet::len).sum::<usize>();
+    let mut found: HashMap<(PageKind, String, String), &DocBlock> = HashMap::new();
+    for page in pages {
+        if found.len() == total_wanted {
+            break;
+        }
+        let page_key = (page.kind, page.name.to_owned());
+        let Some(wanted) = wanted_by_page.get(&page_key) else {
+            continue;
+        };
+        let mut stack: Vec<&DocBlock> = page.roots.iter().rev().collect();
+        while let Some(block) = stack.pop() {
+            let property_id = block.property("id");
+            let matched = if wanted.contains(block.uuid.as_str()) {
+                Some(block.uuid.as_str())
+            } else {
+                property_id.as_deref().filter(|id| wanted.contains(*id))
+            };
+            if let Some(id) = matched {
+                found.insert((page.kind, page.name.to_owned(), id.to_string()), block);
+                if found.len() == total_wanted {
+                    break;
+                }
+            }
+            for child in block.children.iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+
+    let mut remaining_nodes = max_nodes.max(1);
+    let mut remaining_bytes = max_bytes.max(1);
+    selected
+        .into_iter()
+        .map(|query| {
+            let mut groups: Vec<RefGroup> = Vec::new();
+            let mut shown = 0usize;
+            let mut omitted_nodes = 0usize;
+            for root in query.roots {
+                let Some(block) = found.get(&(root.kind, root.page.clone(), root.id.clone()))
+                else {
+                    omitted_nodes = omitted_nodes.saturating_add(1);
+                    continue;
+                };
+                let total_nodes = subtree_node_count(block);
+                let before_nodes = remaining_nodes;
+                let dto = block_to_bounded_dto(block, &mut remaining_nodes, &mut remaining_bytes);
+                let emitted = before_nodes.saturating_sub(remaining_nodes);
+                omitted_nodes = omitted_nodes.saturating_add(total_nodes.saturating_sub(emitted));
+                let Some(dto) = dto else {
+                    continue;
+                };
+                shown += 1;
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.kind == root.kind && group.page == root.page)
+                {
+                    group.blocks.push(dto);
+                } else {
+                    groups.push(RefGroup {
+                        page: root.page,
+                        kind: root.kind,
+                        blocks: vec![dto],
+                        evidence: Vec::new(),
+                    });
+                }
+            }
+            QueryExportResult {
+                key: query.key,
+                groups,
+                shown,
+                total: query.total,
+                omitted_nodes,
+            }
+        })
+        .collect()
+}
+
+fn select_export_queries(
     specs: &[QueryExportSpec],
     max_queries: usize,
     max_roots: usize,
-    max_nodes: usize,
-    max_bytes: usize,
-) -> QueryExportBatch {
+    mut evaluate: impl FnMut(&QueryExportSpec) -> BoundedGroups,
+) -> (usize, Vec<SelectedExportQuery>) {
     let query_limit = max_queries.max(1);
     let mut remaining_roots = max_roots.max(1);
     let mut selected = Vec::new();
-
-    // Evaluate one query at a time and retain only at most `max_roots` identities
-    // across the whole session. Cached shallow results may be larger, but they are
-    // dropped before the next query and never become complete page trees.
     for spec in specs.iter().take(query_limit) {
-        const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
-        const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
-        let bounded = if spec.advanced {
-            let (result, exceeded, total) = run_advanced_query_bounded(
-                graph,
-                &spec.query,
-                None,
-                QUERY_EXPORT_CONSTRUCTION_ROWS,
-                QUERY_EXPORT_CONSTRUCTION_BYTES,
-            );
-            BoundedGroups {
-                groups: result.groups,
-                total,
-                exceeded,
-            }
-        } else {
-            run_query_bounded(
-                graph,
-                &spec.query,
-                QUERY_EXPORT_CONSTRUCTION_ROWS,
-                QUERY_EXPORT_CONSTRUCTION_BYTES,
-            )
-        };
+        let bounded = evaluate(spec);
         let total = bounded.total;
         let mut roots = Vec::new();
-        // Do not emit a wrongly ordered prefix of a globally-sorted query. A
-        // query over the construction ceiling is disclosed as entirely omitted;
-        // ordinary bounded queries still retain the existing first-N export.
         for group in if bounded.exceeded {
             &[]
         } else {
@@ -3531,108 +3592,125 @@ pub fn export_query_subtrees(
             roots,
         });
     }
+    (query_limit, selected)
+}
+
+/// Evaluate and hydrate several Copy / Export query macros under one cumulative
+/// root, node, and byte budget. Only the selected block subtrees are cloned into
+/// DTOs; complete PageDto values never cross IPC or accumulate in the WebView.
+///
+/// `max_roots` is deliberately global, not per macro. This keeps a selection
+/// containing many distinct query blocks from multiplying the same advertised
+/// export limit. Each relevant source document is scanned at most once and only
+/// references to the requested roots are retained while the graph snapshot is
+/// borrowed.
+pub fn export_query_subtrees(
+    graph: &Graph,
+    specs: &[QueryExportSpec],
+    max_queries: usize,
+    max_roots: usize,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> QueryExportBatch {
+    let (query_limit, selected) = select_export_queries(specs, max_queries, max_roots, |spec| {
+        const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
+        const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
+        if spec.advanced {
+            let (result, exceeded, total) = run_advanced_query_bounded(
+                graph,
+                &spec.query,
+                None,
+                QUERY_EXPORT_CONSTRUCTION_ROWS,
+                QUERY_EXPORT_CONSTRUCTION_BYTES,
+            );
+            BoundedGroups {
+                groups: result.groups,
+                total,
+                exceeded,
+            }
+        } else {
+            run_query_bounded(
+                graph,
+                &spec.query,
+                QUERY_EXPORT_CONSTRUCTION_ROWS,
+                QUERY_EXPORT_CONSTRUCTION_BYTES,
+            )
+        }
+    });
 
     let results = graph.with_pages(|pages| {
-        use std::collections::{HashMap, HashSet};
-
-        let mut wanted_by_page: HashMap<(PageKind, String), HashSet<String>> = HashMap::new();
-        for query in &selected {
-            for root in &query.roots {
-                wanted_by_page
-                    .entry((root.kind, root.page.clone()))
-                    .or_default()
-                    .insert(root.id.clone());
-            }
-        }
-
-        // Borrow at most `max_roots` matching blocks. Walking with an explicit
-        // stack avoids both recursive call growth and variadic child spreading on
-        // a page with hundreds of thousands of direct children.
-        let total_wanted = wanted_by_page.values().map(HashSet::len).sum::<usize>();
-        let mut found: HashMap<(PageKind, String, String), &DocBlock> = HashMap::new();
-        for (entry, doc) in pages {
-            if found.len() == total_wanted {
-                break;
-            }
-            let page_key = (entry.kind, entry.name.clone());
-            let Some(wanted) = wanted_by_page.get(&page_key) else {
-                continue;
-            };
-            let mut stack: Vec<&DocBlock> = doc.roots.iter().rev().collect();
-            while let Some(block) = stack.pop() {
-                let property_id = block.property("id");
-                let matched = if wanted.contains(block.uuid.as_str()) {
-                    Some(block.uuid.as_str())
-                } else {
-                    property_id.as_deref().filter(|id| wanted.contains(*id))
-                };
-                if let Some(id) = matched {
-                    found.insert((entry.kind, entry.name.clone(), id.to_string()), block);
-                    if found.len() == total_wanted {
-                        break;
-                    }
-                }
-                for child in block.children.iter().rev() {
-                    stack.push(child);
-                }
-            }
-        }
-
-        let mut remaining_nodes = max_nodes.max(1);
-        let mut remaining_bytes = max_bytes.max(1);
-        selected
-            .into_iter()
-            .map(|query| {
-                let mut groups: Vec<RefGroup> = Vec::new();
-                let mut shown = 0usize;
-                let mut omitted_nodes = 0usize;
-                for root in query.roots {
-                    let Some(block) = found.get(&(root.kind, root.page.clone(), root.id.clone()))
-                    else {
-                        // The graph changed between query evaluation and the
-                        // borrowed hydration snapshot. Count the missing result as
-                        // omitted instead of falling back to an unbounded page load.
-                        omitted_nodes = omitted_nodes.saturating_add(1);
-                        continue;
-                    };
-                    let total_nodes = subtree_node_count(block);
-                    let before_nodes = remaining_nodes;
-                    let dto =
-                        block_to_bounded_dto(block, &mut remaining_nodes, &mut remaining_bytes);
-                    let emitted = before_nodes.saturating_sub(remaining_nodes);
-                    omitted_nodes =
-                        omitted_nodes.saturating_add(total_nodes.saturating_sub(emitted));
-                    let Some(dto) = dto else {
-                        continue;
-                    };
-                    shown += 1;
-                    if let Some(group) = groups
-                        .iter_mut()
-                        .find(|group| group.kind == root.kind && group.page == root.page)
-                    {
-                        group.blocks.push(dto);
-                    } else {
-                        groups.push(RefGroup {
-                            page: root.page,
-                            kind: root.kind,
-                            blocks: vec![dto],
-                            evidence: Vec::new(),
-                        });
-                    }
-                }
-                QueryExportResult {
-                    key: query.key,
-                    groups,
-                    shown,
-                    total: query.total,
-                    omitted_nodes,
-                }
+        let pages = pages
+            .iter()
+            .map(|(entry, doc)| ExportHydrationPage {
+                kind: entry.kind,
+                name: &entry.name,
+                roots: &doc.roots,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        hydrate_selected_export_queries(selected, &pages, max_nodes, max_bytes)
     });
 
     QueryExportBatch {
         results,
+        omitted_queries: specs.len().saturating_sub(query_limit),
+    }
+}
+
+pub(crate) fn export_application_query_subtrees(
+    pages: &[ApplicationQueryPage],
+    specs: &[QueryExportSpec],
+    max_queries: usize,
+    max_roots: usize,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> QueryExportBatch {
+    let (query_limit, selected) = select_export_queries(specs, max_queries, max_roots, |spec| {
+        const QUERY_EXPORT_CONSTRUCTION_ROWS: usize = 20_000;
+        const QUERY_EXPORT_CONSTRUCTION_BYTES: usize = 32 * 1024 * 1024;
+        if spec.advanced {
+            let (result, exceeded, total) = run_application_advanced_query_pages_bounded(
+                pages,
+                &spec.query,
+                None,
+                QUERY_EXPORT_CONSTRUCTION_ROWS,
+                QUERY_EXPORT_CONSTRUCTION_BYTES,
+            );
+            BoundedGroups {
+                groups: result.groups,
+                total,
+                exceeded,
+            }
+        } else {
+            run_application_query_pages_bounded(
+                pages,
+                &spec.query,
+                QUERY_EXPORT_CONSTRUCTION_ROWS,
+                QUERY_EXPORT_CONSTRUCTION_BYTES,
+            )
+        }
+    });
+    let documents = pages
+        .iter()
+        .map(|source| {
+            let roots = source
+                .page
+                .blocks
+                .iter()
+                .map(|block| application_query_doc_block(block, source.page.format == Format::Org))
+                .collect::<Vec<_>>();
+            (source.page.kind, source.page.name.as_str(), roots)
+        })
+        .collect::<Vec<_>>();
+    let hydration_pages = documents
+        .iter()
+        .map(|(kind, name, roots)| ExportHydrationPage {
+            kind: *kind,
+            name,
+            roots,
+        })
+        .collect::<Vec<_>>();
+    QueryExportBatch {
+        results: hydrate_selected_export_queries(selected, &hydration_pages, max_nodes, max_bytes),
         omitted_queries: specs.len().saturating_sub(query_limit),
     }
 }

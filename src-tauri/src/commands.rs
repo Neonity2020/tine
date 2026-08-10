@@ -1334,6 +1334,7 @@ mod graph_wide_command_boundary_tests {
             "query_facets",
             "run_query",
             "run_advanced_query",
+            "export_query_subtrees",
             "run_graph_search",
             "search",
             "rename_page",
@@ -1380,6 +1381,7 @@ mod managed_actor_command_boundary_tests {
             "query_facets",
             "run_query",
             "run_advanced_query",
+            "export_query_subtrees",
             "run_graph_search",
             "search",
         ] {
@@ -1427,6 +1429,7 @@ mod managed_actor_command_boundary_tests {
             "query_facets",
             "run_query",
             "run_advanced_query",
+            "export_query_subtrees",
             "run_graph_search",
             "search",
         ] {
@@ -1514,7 +1517,7 @@ pub(crate) async fn run_query(
 /// construction budget. Unlike `get_page`, this returns only selected subtrees;
 /// unrelated page content is never cloned across IPC or retained by the WebView.
 #[tauri::command]
-pub(crate) fn export_query_subtrees(
+pub(crate) async fn export_query_subtrees(
     specs: Vec<tine_core::query::QueryExportSpec>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query::QueryExportBatch, String> {
@@ -1534,15 +1537,36 @@ pub(crate) fn export_query_subtrees(
             QUERY_EXPORT_MAX_QUERIES,
         ));
     }
-    with_read_graph(&state, |graph| {
-        let batch = tine_core::query::export_query_subtrees(
-            graph,
-            &specs,
-            QUERY_EXPORT_MAX_QUERIES,
-            QUERY_EXPORT_MAX_ROOTS,
-            QUERY_EXPORT_MAX_NODES,
-            QUERY_EXPORT_MAX_BYTES,
-        );
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let batch = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                    specs,
+                    max_queries: QUERY_EXPORT_MAX_QUERIES,
+                    max_roots: QUERY_EXPORT_MAX_ROOTS,
+                    max_nodes: QUERY_EXPORT_MAX_NODES,
+                    max_bytes: QUERY_EXPORT_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::ExportQuerySubtrees(batch) => batch,
+                _ => return Err("managed navigation returned the wrong reply".into()),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                tine_core::query::export_query_subtrees(
+                    &graph,
+                    &specs,
+                    QUERY_EXPORT_MAX_QUERIES,
+                    QUERY_EXPORT_MAX_ROOTS,
+                    QUERY_EXPORT_MAX_NODES,
+                    QUERY_EXPORT_MAX_BYTES,
+                )
+            }
+        };
         let bytes = batch
             .results
             .iter()
@@ -1567,6 +1591,8 @@ pub(crate) fn export_query_subtrees(
         }
         Ok(batch)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
