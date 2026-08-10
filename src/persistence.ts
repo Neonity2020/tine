@@ -352,6 +352,13 @@ export function tombstoneCovers(name: string, path?: string): boolean {
   return deleted === path;
 }
 
+/** Publish a tombstone directly for lifecycle tests and already-proven callers. */
+export function tombstone(name: string, path?: string): void {
+  deletedPages.add(name);
+  if (path) deletedPagePaths.set(name, path);
+  else deletedPagePaths.delete(name);
+}
+
 /** Atomically retire one quiescent page from persistence.
  *
  * Delete calls this synchronously after its awaited drain and exact-instance
