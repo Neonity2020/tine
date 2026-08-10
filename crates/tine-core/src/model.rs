@@ -35650,11 +35650,15 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    fn arm_present_conflict_for_force(graph: &Graph, page: &PageDto, path: &Path) {
+    fn arm_present_conflict_for_force(
+        graph: &Graph,
+        page: &PageDto,
+        path: &Path,
+    ) -> ConflictOverride {
         let bytes = fs::read_to_string(path).unwrap();
         let resource_identity =
             canonical_projection_file_resource_id(&fs::File::open(path).unwrap()).unwrap();
-        graph.mint_conflict_authority(
+        let observation_epoch = graph.mint_conflict_authority(
             path,
             &ConflictEditorEpisode {
                 // The conflict is minted FOR this editor, so it must name it —
@@ -35669,6 +35673,7 @@ mod tests {
             },
             Some(bytes),
         );
+        ConflictOverride { observation_epoch }
     }
 
     /// The read-only view exists so managed storage can answer whole-graph
@@ -39399,8 +39404,10 @@ mod tests {
             assert!(err.to_string().contains("page-header property"));
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
-            arm_present_conflict_for_force(&g, &dto, &path);
-            let err = g.force_save_page(&dto).unwrap_err();
+            let shown = arm_present_conflict_for_force(&g, &dto, &path);
+            let err = g
+                .force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+                .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
             let _ = fs::remove_dir_all(&dir);
@@ -39477,8 +39484,9 @@ mod tests {
                 }];
 
                 let err = if forced {
-                    arm_present_conflict_for_force(&g, &dto, &path);
-                    g.force_save_page(&dto).unwrap_err()
+                    let shown = arm_present_conflict_for_force(&g, &dto, &path);
+                    g.force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+                        .unwrap_err()
                 } else {
                     g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
                 };
@@ -39744,8 +39752,9 @@ mod tests {
         as_editor(&g, &mut dto);
         for forced in [false, true] {
             let err = if forced {
-                arm_present_conflict_for_force(&g, &dto, &path);
-                g.force_save_page(&dto).unwrap_err()
+                let shown = arm_present_conflict_for_force(&g, &dto, &path);
+                g.force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+                    .unwrap_err()
             } else {
                 g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
             };
@@ -51722,9 +51731,21 @@ mod tests {
 
         assert_handoff_blocked(graph.create_markdown_page_if_absent("create", "- no\n"));
         assert_handoff_blocked(graph.save_page(&page, None));
-        assert_handoff_blocked(graph.force_save_page(&page));
+        assert_handoff_blocked(graph.force_save_page_at_revision(
+            &page,
+            None,
+            ConflictOverride {
+                observation_epoch: 0,
+            },
+        ));
         assert_handoff_blocked(graph.save_page(&journal, None));
-        assert_handoff_blocked(graph.force_save_page(&journal));
+        assert_handoff_blocked(graph.force_save_page_at_revision(
+            &journal,
+            None,
+            ConflictOverride {
+                observation_epoch: 0,
+            },
+        ));
         assert_handoff_blocked(graph.rename_page_expected("old", "new", None));
         assert_handoff_blocked(graph.delete_page_expected("page", PageKind::Page, None));
         assert_handoff_blocked(graph.delete_page_expected(
