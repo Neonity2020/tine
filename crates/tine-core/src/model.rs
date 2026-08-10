@@ -6907,6 +6907,10 @@ impl Graph {
         let mut path_bytes = 0_u64;
 
         for (component_index, requested_component) in components.iter().enumerate() {
+            // Hoisted out of the entry loop: for a non-ASCII component the fast
+            // path never fires, and refolding the same component once per
+            // directory entry is slower than the code this replaced.
+            let requested_probe = PortablePathKey::graph_text_component_probe(requested_component);
             let is_filename = component_index + 1 == components.len();
             let mut next = Vec::new();
 
@@ -6941,7 +6945,11 @@ impl Graph {
                     if path_bytes > limits.path_bytes {
                         return Err(managed_text_inventory_limit_error("aggregate path bytes"));
                     }
-                    if !PortablePathKey::graph_text_components_match(name, requested_component) {
+                    if !PortablePathKey::graph_text_component_matches(
+                        name,
+                        requested_component,
+                        requested_probe.as_ref(),
+                    ) {
                         continue;
                     }
                     let relative = if prefix.relative.is_empty() {

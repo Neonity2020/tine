@@ -301,10 +301,39 @@ impl PortablePathKey {
     /// `fi`), so a non-ASCII name can legitimately match an ASCII one and must
     /// still go through the full fold.
     pub(crate) fn graph_text_components_match(a: &str, b: &str) -> bool {
-        if a.is_ascii() && b.is_ascii() {
-            return a.eq_ignore_ascii_case(b);
+        Self::graph_text_component_matches(a, b, Self::graph_text_component_probe(b).as_ref())
+    }
+
+    /// The fold of the ONE component a directory scan compares every entry
+    /// against, computed once. `None` means "ASCII", which is the case the fast
+    /// path serves without a key at all.
+    ///
+    /// This exists because the scan is a loop: folding the unchanged requested
+    /// component per entry measured 1.79-1.88x SLOWER than the pre-fast-path
+    /// code whenever that component is non-ASCII — which for a graph written in
+    /// a language with diacritics is the ordinary case, not the exotic one.
+    /// (F6 verification, medium follow-up.)
+    pub(crate) fn graph_text_component_probe(component: &str) -> Option<PortablePathKey> {
+        (!component.is_ascii()).then(|| Self::from_graph_text_path(component))
+    }
+
+    /// Does `name` share `component`'s portable identity, given the `probe`
+    /// `graph_text_component_probe(component)` returned?
+    pub(crate) fn graph_text_component_matches(
+        name: &str,
+        component: &str,
+        probe: Option<&PortablePathKey>,
+    ) -> bool {
+        // `probe` is None exactly when `component` is ASCII, so this is the
+        // both-sides-ASCII case and needs no key on either side.
+        if probe.is_none() && name.is_ascii() {
+            return name.eq_ignore_ascii_case(component);
         }
-        Self::from_graph_text_path(a) == Self::from_graph_text_path(b)
+        let name_key = Self::from_graph_text_path(name);
+        match probe {
+            Some(key) => name_key == *key,
+            None => name_key == Self::from_graph_text_path(component),
+        }
     }
 
     fn from_components(path: &str) -> Self {
@@ -2019,6 +2048,46 @@ mod tests {
     /// with building both keys on every input, including the ones that make the
     /// both-sides-ASCII guard load-bearing: folding can produce ASCII from
     /// non-ASCII. (Direct Files performance audit 2026-08-09, finding F6.)
+    /// The probe form is what the scan actually calls, so it has to agree with
+    /// the two-argument form on every input — including the asymmetric cases,
+    /// since the probe is built from ONE side.
+    #[test]
+    fn the_probe_form_agrees_with_the_full_fold_in_both_directions() {
+        let names = [
+            "Journals",
+            "journals",
+            "Ärger.md",
+            "A\u{0308}rger.md",
+            "ärger.md",
+            "\u{212A}elvin.md",
+            "kelvin.md",
+            "\u{FB01}le.md",
+            "file.md",
+            "Стр.md",
+            "стр.md",
+            "Stra\u{00DF}e.md",
+            "strasse.md",
+            "",
+        ];
+        for component in names {
+            let probe = PortablePathKey::graph_text_component_probe(component);
+            assert_eq!(
+                probe.is_none(),
+                component.is_ascii(),
+                "the probe must be absent exactly for an ASCII component: {component:?}"
+            );
+            for name in names {
+                let folded = PortablePathKey::from_graph_text_path(name)
+                    == PortablePathKey::from_graph_text_path(component);
+                assert_eq!(
+                    PortablePathKey::graph_text_component_matches(name, component, probe.as_ref()),
+                    folded,
+                    "{name:?} vs {component:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_ascii_component_fast_path_agrees_with_the_full_fold() {
         let names = [
