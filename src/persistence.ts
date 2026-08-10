@@ -285,6 +285,17 @@ export function isTombstoned(name: string): boolean {
   return deletedPages.has(name);
 }
 
+/** Which FILE a tombstone was raised for, when the delete named one. */
+const deletedPagePaths = new Map<string, string>();
+
+/** Refuse only the exact deleted file when the tombstone named a path. */
+export function isTombstonedFile(name: string, path?: string): boolean {
+  if (!deletedPages.has(name)) return false;
+  const deleted = deletedPagePaths.get(name);
+  if (!deleted || !path) return true;
+  return deleted === path;
+}
+
 /** Atomically retire one quiescent page from persistence.
  *
  * Delete calls this synchronously after its awaited drain and exact-instance
@@ -293,7 +304,11 @@ export function isTombstoned(name: string): boolean {
  * turn that publishes the marker. A caller may explicitly allow an already
  * captured conflict-resolution delete; ordinary deletes still reject a conflict
  * raised during their awaited drain. */
-export function tombstoneIfQuiescent(name: string, allowConflicted = false): boolean {
+export function tombstoneIfQuiescent(
+  name: string,
+  allowConflicted = false,
+  path?: string,
+): boolean {
   if (
     dirty.has(name)
     || saveChain.has(name)
@@ -303,11 +318,14 @@ export function tombstoneIfQuiescent(name: string, allowConflicted = false): boo
     return false;
   }
   deletedPages.add(name);
+  if (path) deletedPagePaths.set(name, path);
+  else deletedPagePaths.delete(name);
   return true;
 }
 /** Lift a delete tombstone (page re-created, or the delete failed). */
 export function untombstone(name: string) {
   deletedPages.delete(name);
+  deletedPagePaths.delete(name);
 }
 /** Drop a page's dirty + baseline state — its content is leaving the working set. */
 export function forgetSaveState(name: string) {
@@ -333,6 +351,7 @@ export function resetSaveState() {
   baseRev.clear();
   conflictObservation.clear();
   deletedPages.clear();
+  deletedPagePaths.clear();
   heldSources.clear();
   heldByDest.clear();
   transientFailures.clear();
