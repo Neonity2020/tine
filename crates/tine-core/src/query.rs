@@ -13,7 +13,7 @@ use crate::model::{
 };
 use crate::refs;
 use crate::search_query::Matcher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Query source crosses several boundaries (live macros, native IPC, static
 /// publication, and export). Keep one shared ceiling so no caller can make the
@@ -1780,6 +1780,291 @@ pub(crate) enum SimpleQueryCandidatePlan {
     All,
 }
 
+/// Exact marker streams a managed sparse task-query reader may enumerate.
+///
+/// This is deliberately narrower than [`SimpleQueryCandidatePlan`]: the latter
+/// only needs a complete page source, while this plan promises that every
+/// selected row is a parser-owned task candidate.  The sparse runner still
+/// parses and evaluates the complete query against each returned raw block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SparseTaskQueryEligibility {
+    pub(crate) markers: Vec<String>,
+}
+
+/// The existing simple parser intentionally accepts a recoverable prefix for
+/// Direct Files.  A sparse reader cannot safely decide that an incomplete
+/// source has a complete marker stream, so it additionally requires one full,
+/// balanced expression.  This is a syntax guard over the shared tokenizer and
+/// parser, not a second query dialect.
+fn sparse_query_source_is_complete(query_src: &str) -> bool {
+    if !query_source_within_limit(query_src) || !query_nesting_within_limit(query_src) {
+        return false;
+    }
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in query_src.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+        }
+    }
+    if in_string {
+        return false;
+    }
+
+    let tokens = tokenize(query_src);
+    let mut depth = 0usize;
+    for token in &tokens {
+        match token {
+            Tok::LParen => depth = depth.saturating_add(1),
+            Tok::RParen => match depth.checked_sub(1) {
+                Some(next) => depth = next,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return false;
+    }
+    let mut position = 0;
+    parse_expr(&tokens, &mut position, JournalDate::today(), 0).is_some()
+        && position == tokens.len()
+}
+
+/// The shared parser deliberately supplies recoverable defaults for malformed
+/// presentation directives so Direct Files can keep evaluating the rest of a
+/// query.  Sparse selection cannot turn those defaults into an authority to
+/// enumerate a narrowed candidate stream.  Validate only the source shapes
+/// whose parsed forms the sparse path accepts; the parser itself remains the
+/// sole evaluator and Direct Files keeps its existing recovery behavior.
+fn sparse_task_directive_shapes_are_strict(query_src: &str) -> bool {
+    fn name(token: &Tok) -> Option<&str> {
+        match token {
+            Tok::Word(value) | Tok::Str(value) | Tok::PageRef(value) | Tok::Tag(value) => {
+                Some(value)
+            }
+            Tok::LParen | Tok::RParen => None,
+        }
+    }
+
+    fn nonempty_name(token: &Tok) -> bool {
+        name(token).is_some_and(|value| !value.trim().is_empty())
+    }
+
+    fn flat_args<'a>(tokens: &'a [Tok], position: &mut usize) -> Option<&'a [Tok]> {
+        let start = *position;
+        while !matches!(tokens.get(*position), Some(Tok::RParen)) {
+            if matches!(tokens.get(*position), Some(Tok::LParen) | None) {
+                return None;
+            }
+            *position += 1;
+        }
+        let args = &tokens[start..*position];
+        *position += 1; // closing parenthesis
+        Some(args)
+    }
+
+    fn between(args: &[Tok], today: JournalDate) -> bool {
+        let [Tok::Word(field), lo, hi] = args else {
+            return false;
+        };
+        matches!(
+            field.to_ascii_lowercase().as_str(),
+            "scheduled" | "deadline"
+        ) && name(lo)
+            .and_then(|value| resolve_date_token(value, today))
+            .is_some()
+            && name(hi)
+                .and_then(|value| resolve_date_token(value, today))
+                .is_some()
+    }
+
+    fn sample(args: &[Tok]) -> bool {
+        matches!(args, [argument] if name(argument).is_some_and(|value| value.parse::<usize>().is_ok()))
+    }
+
+    fn sort_by(args: &[Tok]) -> bool {
+        match args {
+            [field] => nonempty_name(field),
+            [field, Tok::Word(direction) | Tok::Str(direction)] => {
+                nonempty_name(field)
+                    && matches!(direction.to_ascii_lowercase().as_str(), "asc" | "desc")
+            }
+            _ => false,
+        }
+    }
+
+    fn aggregate(args: &[Tok]) -> bool {
+        match args {
+            [kind] if name(kind).is_some_and(|value| value.eq_ignore_ascii_case("count")) => true,
+            [kind, field]
+                if name(kind).is_some_and(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "sum" | "avg" | "average"
+                    )
+                }) =>
+            {
+                nonempty_name(field)
+            }
+            _ => false,
+        }
+    }
+
+    fn group_by(args: &[Tok]) -> bool {
+        // `page` is the built-in grouping key; any nonempty name is an exact
+        // property key, matching the existing `(group-by page|<prop>)` grammar.
+        matches!(args, [field] if nonempty_name(field))
+    }
+
+    fn expression(tokens: &[Tok], position: &mut usize, today: JournalDate) -> bool {
+        match tokens.get(*position) {
+            Some(Tok::LParen) => {
+                *position += 1;
+                let Some(Tok::Word(head)) = tokens.get(*position) else {
+                    return false;
+                };
+                *position += 1;
+                match head.to_ascii_lowercase().as_str() {
+                    "between" => {
+                        flat_args(tokens, position).is_some_and(|args| between(args, today))
+                    }
+                    "sample" => flat_args(tokens, position).is_some_and(sample),
+                    "sort-by" => flat_args(tokens, position).is_some_and(sort_by),
+                    "aggregate" => flat_args(tokens, position).is_some_and(aggregate),
+                    "group-by" => flat_args(tokens, position).is_some_and(group_by),
+                    _ => {
+                        while !matches!(tokens.get(*position), Some(Tok::RParen)) {
+                            if !expression(tokens, position, today) {
+                                return false;
+                            }
+                        }
+                        *position += 1;
+                        true
+                    }
+                }
+            }
+            Some(Tok::RParen) | None => false,
+            Some(_) => {
+                *position += 1;
+                true
+            }
+        }
+    }
+
+    let tokens = tokenize(query_src);
+    let mut position = 0;
+    expression(&tokens, &mut position, JournalDate::today()) && position == tokens.len()
+}
+
+/// Conservative eligibility/extraction for the block-level managed task path.
+///
+/// Keep this beside the broader page candidate planner so marker
+/// canonicalization and malformed-query handling stay shared.  The accepted
+/// filter grammar is intentionally small: positive task leaves combined by
+/// `and`, optionally one priority leaf and scheduled/deadline presence or
+/// range leaves.  Presentation directives remain neutral filters and are
+/// handed to the existing finalizer below.
+pub(crate) fn sparse_task_query_eligibility(query_src: &str) -> Option<SparseTaskQueryEligibility> {
+    if !sparse_query_source_is_complete(query_src)
+        || !sparse_task_directive_shapes_are_strict(query_src)
+    {
+        return None;
+    }
+    // Reuse the established candidate-plan parser and its marker
+    // canonicalization.  In particular, do not grow another token parser here.
+    let SimpleQueryCandidatePlan::Indexed(sources) = simple_query_candidate_plan(query_src) else {
+        return None;
+    };
+    let planned_markers = sources
+        .iter()
+        .filter_map(|source| match source {
+            SimpleQueryCandidateSource::Task(marker) => Some(marker.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if planned_markers.is_empty()
+        || sources
+            .iter()
+            .any(|source| !matches!(source, SimpleQueryCandidateSource::Task(_)))
+    {
+        return None;
+    }
+
+    let pred = Pred::parse(query_src, JournalDate::today())?;
+    let mut task_marker_sets = Vec::<BTreeSet<String>>::new();
+    let mut saw_priority = false;
+
+    fn accepted_shape(
+        pred: &Pred,
+        task_marker_sets: &mut Vec<BTreeSet<String>>,
+        saw_priority: &mut bool,
+    ) -> bool {
+        match pred {
+            Pred::Task(markers) => {
+                let markers = markers
+                    .iter()
+                    .map(|marker| marker.to_ascii_uppercase())
+                    .collect::<BTreeSet<_>>();
+                if markers.is_empty() {
+                    return false;
+                }
+                task_marker_sets.push(markers);
+                true
+            }
+            Pred::Priority(_) => {
+                if *saw_priority {
+                    return false;
+                }
+                *saw_priority = true;
+                true
+            }
+            Pred::Scheduled
+            | Pred::Deadline
+            | Pred::Between(BetweenField::Scheduled | BetweenField::Deadline, _, _)
+            | Pred::Sample(_)
+            | Pred::SortBy(..)
+            | Pred::Aggregate(_)
+            | Pred::GroupBy(_) => true,
+            Pred::And(children) if !children.is_empty() => children
+                .iter()
+                .all(|child| accepted_shape(child, task_marker_sets, saw_priority)),
+            // OR, NOT, page/ref/property/tag/journal/content/search/regex and
+            // any future predicate are not safely enumerable by a marker index.
+            _ => false,
+        }
+    }
+
+    if !accepted_shape(&pred, &mut task_marker_sets, &mut saw_priority) {
+        return None;
+    }
+    let markers = task_marker_sets
+        .into_iter()
+        .reduce(|intersection, markers| {
+            intersection
+                .intersection(&markers)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })?;
+    // Multiple positive task leaves with no common marker are a contradictory
+    // shape.  Refuse the sparse path instead of making marker enumeration a
+    // second interpretation of the query.
+    if markers.is_empty() || !markers.is_subset(&planned_markers) {
+        return None;
+    }
+    Some(SparseTaskQueryEligibility {
+        markers: markers.into_iter().collect(),
+    })
+}
+
 /// Conservative page-level candidate plan for indexed managed simple-query
 /// families. A returned union is complete: every matching block must live on a
 /// page selected by at least one source. AND may choose one complete child; OR
@@ -1959,6 +2244,191 @@ fn run_application_pred_pages_bounded(
     }
 
     finish_query_groups(groups, recency_by_page, &opts, budget)
+}
+
+/// Storage-independent shallow block supplied by the managed sparse reader.
+///
+/// `identity` is the caller's already-authoritative result identity (external
+/// UUID or its managed internal fallback); it is never inferred from raw text.
+/// `dfs_order` is the complete root-to-leaf structural key supplied by the
+/// caller.  Equal keys retain the caller's input order.
+#[derive(Clone, Debug)]
+pub(crate) struct ApplicationSparseQueryCandidate {
+    pub(crate) raw: String,
+    pub(crate) identity: String,
+    pub(crate) page: ApplicationSparseQueryPage,
+    pub(crate) parent_identity: Option<String>,
+    pub(crate) dfs_order: Vec<String>,
+}
+
+/// Parser mode and page facts needed to evaluate one sparse candidate without
+/// constructing a page DTO or hydrating its outline.
+#[derive(Clone, Debug)]
+pub(crate) struct ApplicationSparseQueryPage {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) kind: PageKind,
+    pub(crate) is_org: bool,
+    pub(crate) recency: i64,
+}
+
+/// A sparse runner failure means the caller must run the established complete
+/// evaluator; it must never combine a partial sparse result with fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApplicationSparseQueryError {
+    Ineligible,
+    MissingIdentity,
+    DuplicateIdentity,
+}
+
+fn application_sparse_query_doc_block(candidate: &ApplicationSparseQueryCandidate) -> DocBlock {
+    DocBlock {
+        raw: candidate.raw.clone(),
+        children: Vec::new(),
+        uuid: candidate.identity.clone(),
+        is_org: candidate.page.is_org,
+        proj: std::sync::OnceLock::new(),
+    }
+}
+
+/// Run a marker-narrowed sparse task candidate set with the ordinary simple
+/// query parser, evaluator, DTO constructor, result budget and finalizer.
+///
+/// The managed reader must provide every marker candidate and a complete DFS
+/// key/parent relation.  We evaluate all candidates before admitting any DTO so
+/// immediate-parent suppression is based on the full matched-ID set, even when
+/// a result budget or sample later truncates the display.
+pub(crate) fn run_application_sparse_task_query_bounded(
+    candidates: &[ApplicationSparseQueryCandidate],
+    query_src: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<BoundedGroups, ApplicationSparseQueryError> {
+    if sparse_task_query_eligibility(query_src).is_none() {
+        return Err(ApplicationSparseQueryError::Ineligible);
+    }
+    let pred = Pred::parse(query_src, JournalDate::today())
+        .ok_or(ApplicationSparseQueryError::Ineligible)?;
+    let mut opts = QueryOpts::default();
+    pred.collect_opts(&mut opts);
+
+    let mut ordered = candidates.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.dfs_order.cmp(&right.dfs_order));
+
+    let mut identities = HashSet::with_capacity(ordered.len());
+    for candidate in &ordered {
+        if candidate.identity.is_empty() {
+            return Err(ApplicationSparseQueryError::MissingIdentity);
+        }
+        if !identities.insert(candidate.identity.as_str()) {
+            return Err(ApplicationSparseQueryError::DuplicateIdentity);
+        }
+    }
+
+    struct EvaluatedCandidate<'a> {
+        candidate: &'a ApplicationSparseQueryCandidate,
+        block: DocBlock,
+        matched: bool,
+    }
+
+    let mut evaluated = Vec::with_capacity(ordered.len());
+    for candidate in ordered {
+        let block = application_sparse_query_doc_block(candidate);
+        let empty_props = Vec::new();
+        let empty_tags = Vec::new();
+        let ctx = EvalCtx {
+            journal: (candidate.page.kind == PageKind::Journal)
+                .then(|| journal_ordinal(&candidate.page.name))
+                .flatten(),
+            is_journal: candidate.page.kind == PageKind::Journal,
+            page_name: &candidate.page.name,
+            page_props: &empty_props,
+            page_tags: &empty_tags,
+        };
+        let matched = pred.eval_with_path_refs(&block, &PathRefCounts::new(), &ctx);
+        evaluated.push(EvaluatedCandidate {
+            candidate,
+            block,
+            matched,
+        });
+    }
+    let matched_ids = evaluated
+        .iter()
+        .filter(|candidate| candidate.matched)
+        .map(|candidate| candidate.candidate.identity.as_str())
+        .collect::<HashSet<_>>();
+
+    struct SparseGroup {
+        page: String,
+        kind: PageKind,
+        recency: i64,
+        blocks: Vec<BlockDto>,
+    }
+
+    let mut budget = ConstructionBudget::new(max_rows, max_bytes);
+    let sample_admission_cap = opts.sample.filter(|_| opts.sort.is_none());
+    let want_recency = matches!(&opts.sort, Some((field, _)) if is_recency_field(field));
+    let mut groups = Vec::<SparseGroup>::new();
+    let mut group_indexes = HashMap::<(String, String, PageKind), usize>::new();
+    for candidate in &evaluated {
+        if !candidate.matched
+            || candidate
+                .candidate
+                .parent_identity
+                .as_deref()
+                .is_some_and(|parent| matched_ids.contains(parent))
+        {
+            continue;
+        }
+        if sample_admission_cap.is_some_and(|cap| budget.rows >= cap) {
+            continue;
+        }
+        if budget.closed() {
+            budget.deny_match();
+            continue;
+        }
+        if !budget.admit_estimated(
+            &candidate.candidate.page.name,
+            shallow_dto_estimated_bytes(&candidate.block, &[]),
+        ) {
+            continue;
+        }
+
+        let page = &candidate.candidate.page;
+        let key = (page.name.clone(), page.path.clone(), page.kind);
+        let index = match group_indexes.get(&key) {
+            Some(index) => *index,
+            None => {
+                let index = groups.len();
+                group_indexes.insert(key, index);
+                groups.push(SparseGroup {
+                    page: page.name.clone(),
+                    kind: page.kind,
+                    recency: page.recency,
+                    blocks: Vec::new(),
+                });
+                index
+            }
+        };
+        groups[index].blocks.push(result_dto(&candidate.block));
+    }
+
+    let mut recency_by_page = HashMap::new();
+    let groups = groups
+        .into_iter()
+        .map(|group| {
+            if want_recency {
+                recency_by_page.insert(group.page.clone(), group.recency);
+            }
+            RefGroup {
+                page: group.page,
+                kind: group.kind,
+                blocks: group.blocks,
+                evidence: Vec::new(),
+            }
+        })
+        .collect();
+    Ok(finish_query_groups(groups, recency_by_page, &opts, budget))
 }
 
 // --- Scoped-invalidation support (#52) --------------------------------------
@@ -5292,6 +5762,185 @@ mod tests {
     }
 
     #[test]
+    fn sparse_task_query_eligibility_is_conservative_and_canonical() {
+        struct Case {
+            query: &'static str,
+            markers: Option<&'static [&'static str]>,
+        }
+
+        let cases = [
+            Case {
+                query: "(task ToDo)",
+                markers: Some(&["TODO"]),
+            },
+            Case {
+                query: "(todo doing Now)",
+                markers: Some(&["DOING", "NOW"]),
+            },
+            Case {
+                query: "(and (task TODO DOING) (task todo) (priority A B) (scheduled) (between deadline 2026-06-01 2026-06-30))",
+                markers: Some(&["TODO"]),
+            },
+            Case {
+                query: "(and (group-by page) (aggregate count) (sample 2) (sort-by priority desc) (task todo) (deadline))",
+                markers: Some(&["TODO"]),
+            },
+            // Boolean negation/disjunction and task-free positive filters cannot
+            // be reduced to a complete positive marker stream.
+            Case {
+                query: "(or (task TODO) (task DOING))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (not (deadline)))",
+                markers: None,
+            },
+            Case {
+                query: "(priority A)",
+                markers: None,
+            },
+            Case {
+                query: "(scheduled)",
+                markers: None,
+            },
+            Case {
+                query: "(between deadline 2026-06-01 2026-06-30)",
+                markers: None,
+            },
+            // Every other predicate family remains on the existing full path.
+            Case {
+                query: "(and (task TODO) (page-ref Projects))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (tag Projects))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (page Home))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (property status active))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (page-property status active))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (page-tags research))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (namespace Work))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (journal))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) \"ship\")",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (search ship))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (content-regex \"ship.*\"))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (between any 2026-06-01 2026-06-30))",
+                markers: None,
+            },
+            // Contradictory marker leaves and repeated priority leaves are refused
+            // rather than reinterpreted as a storage filter.
+            Case {
+                query: "(and (task TODO) (task DONE))",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) (priority A) (priority B))",
+                markers: None,
+            },
+            Case {
+                query: ")",
+                markers: None,
+            },
+            Case {
+                query: "(task TODO",
+                markers: None,
+            },
+            Case {
+                query: "(task TODO) trailing",
+                markers: None,
+            },
+            Case {
+                query: "(and (task TODO) \"unterminated)",
+                markers: None,
+            },
+            Case {
+                query: "(unknown TODO)",
+                markers: None,
+            },
+            Case {
+                query: "[:find (pull ?b [*]) :where [(= ?b ?b)]]",
+                markers: None,
+            },
+        ];
+
+        for case in cases {
+            let actual = sparse_task_query_eligibility(case.query).map(|plan| plan.markers);
+            let expected = case.markers.map(|markers| {
+                markers
+                    .iter()
+                    .map(|marker| (*marker).to_owned())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(actual, expected, "eligibility mismatch for {}", case.query);
+        }
+    }
+
+    #[test]
+    fn sparse_task_query_eligibility_refuses_permissive_directive_defaults() {
+        // `Pred::parse` intentionally keeps these recoverable for Direct Files.
+        // The sparse reader must not treat its fallback values as explicit
+        // selector instructions.
+        for query in [
+            "(and (task TODO) (between scheduled))",
+            "(and (task TODO) (between scheduled today))",
+            "(and (task TODO) (between scheduled not-a-date tomorrow))",
+            "(and (task TODO) (sample))",
+            "(and (task TODO) (sample not-a-number))",
+            "(and (task TODO) (sort-by))",
+            "(and (task TODO) (sort-by priority sideways))",
+            "(and (task TODO) (aggregate))",
+            "(and (task TODO) (aggregate median))",
+            "(and (task TODO) (aggregate sum))",
+            "(and (task TODO) (group-by))",
+            "(and (task TODO) (group-by #))",
+        ] {
+            assert!(
+                sparse_task_query_eligibility(query).is_none(),
+                "permissive directive fallback was eligible: {query}"
+            );
+        }
+
+        for query in [
+            "(and (task TODO) (between scheduled today tomorrow))",
+            "(and (task TODO) (sample 0) (sort-by custom-prop) (aggregate avg score) (group-by status))",
+        ] {
+            assert!(
+                sparse_task_query_eligibility(query).is_some(),
+                "valid directive shape became ineligible: {query}"
+            );
+        }
+    }
+
+    #[test]
     fn autocomplete_property_facets_follow_og_visibility_sources_and_budget() {
         use std::fs;
 
@@ -6705,6 +7354,214 @@ mod tests {
         assert!(result.is_empty());
         assert!(checks.get() < 40, "cancellation checks: {}", checks.get());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn sparse_test_block(id: &str, raw: &str, children: Vec<BlockDto>) -> BlockDto {
+        BlockDto {
+            id: id.into(),
+            raw: raw.into(),
+            children,
+            ..BlockDto::default()
+        }
+    }
+
+    fn sparse_test_page(
+        name: &str,
+        path: &str,
+        kind: PageKind,
+        format: Format,
+        recency: i64,
+        blocks: Vec<BlockDto>,
+    ) -> ApplicationQueryPage {
+        ApplicationQueryPage {
+            page: PageDto {
+                name: name.into(),
+                kind,
+                title: name.into(),
+                pre_block: None,
+                blocks,
+                rev: None,
+                format,
+                read_only: false,
+                path: path.into(),
+                activation: None,
+                guide: false,
+            },
+            recency,
+        }
+    }
+
+    fn sparse_test_candidate(
+        id: &str,
+        raw: &str,
+        page: &ApplicationQueryPage,
+        parent_identity: Option<&str>,
+        dfs_order: &[&str],
+    ) -> ApplicationSparseQueryCandidate {
+        ApplicationSparseQueryCandidate {
+            raw: raw.into(),
+            identity: id.into(),
+            page: ApplicationSparseQueryPage {
+                name: page.page.name.clone(),
+                path: page.page.path.clone(),
+                kind: page.page.kind,
+                is_org: page.page.format == Format::Org,
+                recency: page.recency,
+            },
+            parent_identity: parent_identity.map(str::to_owned),
+            dfs_order: dfs_order.iter().map(|part| (*part).to_owned()).collect(),
+        }
+    }
+
+    fn sparse_result_value(result: BoundedGroups) -> serde_json::Value {
+        serde_json::json!({
+            "groups": result.groups,
+            "total": result.total,
+            "exceeded": result.exceeded,
+        })
+    }
+
+    #[test]
+    fn sparse_task_query_runner_matches_existing_page_evaluator() {
+        let markdown = sparse_test_page(
+            "Work",
+            "pages/Work.md",
+            PageKind::Page,
+            Format::Md,
+            10,
+            vec![
+                sparse_test_block(
+                    "md-parent",
+                    "TODO [#A] parent\nSCHEDULED: <2026-06-16 Tue>",
+                    vec![sparse_test_block(
+                        "md-child",
+                        "TODO [#A] child\nSCHEDULED: <2026-06-16 Tue>",
+                        Vec::new(),
+                    )],
+                ),
+                sparse_test_block(
+                    "md-deadline",
+                    "TODO [#B] deadline\nDEADLINE: <2026-06-19 Fri>",
+                    Vec::new(),
+                ),
+            ],
+        );
+        let org = sparse_test_page(
+            "Org Tasks",
+            "pages/Org Tasks.org",
+            PageKind::Page,
+            Format::Org,
+            20,
+            vec![sparse_test_block(
+                "org-deadline",
+                "TODO [#A] org deadline\nDEADLINE: <2026-06-18 Thu>",
+                Vec::new(),
+            )],
+        );
+        let pages = vec![markdown, org];
+        // Deliberately not input-DFS order: the sparse core must use the
+        // structural keys supplied by its caller before it admits result DTOs.
+        let candidates = vec![
+            sparse_test_candidate(
+                "org-deadline",
+                "TODO [#A] org deadline\nDEADLINE: <2026-06-18 Thu>",
+                &pages[1],
+                None,
+                &["c"],
+            ),
+            sparse_test_candidate(
+                "md-child",
+                "TODO [#A] child\nSCHEDULED: <2026-06-16 Tue>",
+                &pages[0],
+                Some("md-parent"),
+                &["a", "a"],
+            ),
+            sparse_test_candidate(
+                "md-deadline",
+                "TODO [#B] deadline\nDEADLINE: <2026-06-19 Fri>",
+                &pages[0],
+                None,
+                &["b"],
+            ),
+            sparse_test_candidate(
+                "md-parent",
+                "TODO [#A] parent\nSCHEDULED: <2026-06-16 Tue>",
+                &pages[0],
+                None,
+                &["a"],
+            ),
+        ];
+
+        for (query, max_rows, max_bytes) in [
+            (
+                "(and (task todo) (priority A) (scheduled))",
+                usize::MAX,
+                usize::MAX,
+            ),
+            (
+                "(and (task TODO) (between deadline 2026-06-15 2026-06-20) (sort-by priority asc))",
+                usize::MAX,
+                usize::MAX,
+            ),
+            (
+                "(and (task TODO) (sort-by priority desc) (sample 2) (aggregate count) (group-by page))",
+                usize::MAX,
+                usize::MAX,
+            ),
+            ("(and (task TODO) (sample 1))", usize::MAX, usize::MAX),
+            ("(task TODO)", 1, usize::MAX),
+            ("(task TODO)", usize::MAX, 1),
+        ] {
+            let page_result =
+                run_application_query_pages_bounded(&pages, query, max_rows, max_bytes);
+            let sparse_result = run_application_sparse_task_query_bounded(
+                &candidates,
+                query,
+                max_rows,
+                max_bytes,
+            )
+            .expect("eligible fixture query");
+            assert_eq!(
+                sparse_result_value(sparse_result),
+                sparse_result_value(page_result),
+                "sparse result drifted for {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_task_query_runner_refuses_noncanonical_identities() {
+        let page = sparse_test_page(
+            "Work",
+            "pages/Work.md",
+            PageKind::Page,
+            Format::Md,
+            0,
+            Vec::new(),
+        );
+        let duplicate = vec![
+            sparse_test_candidate("same", "TODO one", &page, None, &["a"]),
+            sparse_test_candidate("same", "TODO two", &page, None, &["b"]),
+        ];
+        assert!(matches!(
+            run_application_sparse_task_query_bounded(
+                &duplicate,
+                "(task TODO)",
+                usize::MAX,
+                usize::MAX,
+            ),
+            Err(ApplicationSparseQueryError::DuplicateIdentity)
+        ));
+        let missing = vec![sparse_test_candidate("", "TODO one", &page, None, &["a"])];
+        assert!(matches!(
+            run_application_sparse_task_query_bounded(
+                &missing,
+                "(task TODO)",
+                usize::MAX,
+                usize::MAX,
+            ),
+            Err(ApplicationSparseQueryError::MissingIdentity)
+        ));
     }
 
     #[test]
