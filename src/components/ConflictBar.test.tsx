@@ -268,6 +268,50 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     mounted.dispose();
   });
 
+  it("keeps a compositionstart-absent IME transaction and restores an answerable conflict", async () => {
+    const { dispose, savePage } = await mountWithObservedDirectConflict();
+    const blockId = pageByName(sharedName)!.roots[0];
+    dispose();
+    startEditing(blockId, 0);
+    const mounted = mountConflictWith(() => <Block id={blockId} />);
+    const textarea = mounted.root.querySelector<HTMLTextAreaElement>("textarea.block-editor")!;
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(
+      page(strayPath, "the authorised disk winner"),
+    );
+    vi.spyOn(backend(), "activateEditor").mockResolvedValue({
+      activation: 9005,
+      target: strayPath,
+      prospective: false,
+    });
+    let releasePresentation!: (value: "authorised") => void;
+    const presentation = new Promise<"authorised">((resolve) => {
+      releasePresentation = resolve;
+    });
+    const present = vi.spyOn(backend(), "presentConflictOverride").mockReturnValue(presentation);
+    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+
+    mounted.root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+    await vi.waitFor(() => expect(present).toHaveBeenCalledTimes(1));
+    textarea.value = "post-click fallback composing text";
+    const composing = new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertCompositionText",
+      data: "字",
+    });
+    Object.defineProperty(composing, "isComposing", { value: true });
+    textarea.dispatchEvent(composing);
+    expect(doc.byId[blockId].raw).toBe("the retained local draft");
+    releasePresentation("authorised");
+
+    await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
+    expect(textarea.isConnected).toBe(true);
+    expect(textarea.value).toBe("post-click fallback composing text");
+    expect(doc.byId[blockId].raw).toBe("the retained local draft");
+    expect(conflicts()).toContain(sharedName);
+    expect(shownObservationFor(sharedName)).toBe(42);
+    mounted.dispose();
+  });
+
   it("installs managed current bytes without Direct presentation or activation", async () => {
     loadSingle(page(strayPath, "the managed baseline"));
     setRaw(pageByName(sharedName)!.roots[0], "the retained managed draft");

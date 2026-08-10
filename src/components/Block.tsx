@@ -2366,7 +2366,7 @@ export function Editor(props: { id: string }): JSX.Element {
     releaseCompositionLease = null;
   };
   onCleanup(dropCompositionLease);
-  const onCompositionStart = () => {
+  const beginComposition = () => {
     if (!compositionActive) {
       const pageName = doc.byId[props.id]?.page;
       if (pageName) releaseCompositionLease = takeEditorLease(pageName);
@@ -2375,8 +2375,16 @@ export function Editor(props: { id: string }): JSX.Element {
     compositionEndValue = null;
     clearTimeout(acTimer);
   };
+  const onCompositionStart = () => beginComposition();
   const onInput = (e: InputEvent) => {
-    if (compositionActive || e.isComposing) return;
+    // Some supported IMEs omit compositionstart but mark their composing input.
+    // Enter the same transaction before returning DOM-local so an awaited page
+    // replacement cannot treat that not-yet-committed text as pre-click state.
+    if (e.isComposing) {
+      if (!compositionActive) beginComposition();
+      return;
+    }
+    if (compositionActive) return;
     // Chromium-family engines can emit one ordinary input after compositionend.
     // Its DOM value has already committed above; suppress only that duplicate,
     // never a subsequent real edit with different text.
@@ -2434,7 +2442,6 @@ export function Editor(props: { id: string }): JSX.Element {
     commit(ref.value);
     autosize();
     refreshAutocompleteAfterInput();
-    dropCompositionLease();
   };
   const onCompositionEnd = () => {
     compositionActive = false;
@@ -2443,6 +2450,7 @@ export function Editor(props: { id: string }): JSX.Element {
     commit(ref.value);
     autosize();
     refreshAutocompleteAfterInput();
+    dropCompositionLease();
   };
 
   // Move the block up/down among siblings, keeping edit mode + caret (the DOM
