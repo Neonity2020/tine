@@ -67,14 +67,21 @@ export function ConflictBar(): JSX.Element {
         activation,
         shown,
       );
-      if (outcome !== "authorised") {
-        // Neither refusal may leave a dead banner. `superseded` means a newer
-        // observation is live, so re-observing surfaces it for the user to answer;
-        // `withdrawn` means the authority is gone with no successor, which is the
-        // state that would otherwise sit dead forever.
+      if (outcome === "superseded") {
+        // A newer observation is live, so re-observing surfaces it for the user
+        // to answer instead of installing bytes from underneath that winner.
         dropObservation(name);
         void reobserve(name);
         return;
+      }
+      if (outcome === "withdrawn") {
+        // The shown authority disappeared with no successor. The discard can
+        // still complete when the pinned file has returned to this editor's
+        // loaded baseline: forget the dead observation, then use the same
+        // read/final-identity-check/install path as an authorised discard. In
+        // particular, do not re-observe here — that is a real guarded save and
+        // would write the retained draft over the baseline the user chose.
+        dropObservation(name);
       }
     }
     let dto;

@@ -3,7 +3,8 @@ import { render } from "solid-js/web";
 import { ConflictBar } from "./ConflictBar";
 import { markConflict, conflicts, clearConflict } from "../ui";
 import { backend } from "../backend";
-import { loadSingle, resetStore, pageByName, doc } from "../store";
+import { loadSingle, resetStore, pageByName, doc, setRaw } from "../store";
+import { flushPage, isDirty } from "../persistence";
 import type { PageDto } from "../types";
 
 afterEach(() => {
@@ -45,6 +46,74 @@ describe("resolving a conflict on a page pinned to a specific file", () => {
     const dispose = render(() => <ConflictBar />, root);
     return { root, dispose };
   }
+
+  async function mountWithObservedDirectConflict() {
+    loadSingle(page(strayPath, "the loaded disk baseline"));
+    const loaded = pageByName(sharedName);
+    expect(loaded).toBeDefined();
+    setRaw(loaded!.roots[0], "the retained local draft");
+
+    // Exercise the real conflict path so the banner has both pieces of Direct
+    // authority that ConflictBar presents: an editor activation and the shown
+    // observation minted by the refused guarded save.
+    const savePage = vi.spyOn(backend(), "savePage")
+      .mockRejectedValueOnce(new Error("conflict:41"));
+    expect(await flushPage(sharedName)).toBe(false);
+    expect(conflicts()).toEqual([sharedName]);
+    expect(isDirty(sharedName)).toBe(false);
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <ConflictBar />, root);
+    return { root, dispose, savePage };
+  }
+
+  it("adopts the pinned baseline without writing when the shown authority was withdrawn", async () => {
+    const { root, dispose, savePage } = await mountWithObservedDirectConflict();
+    const diskBaseline = page(strayPath, "the loaded disk baseline");
+    const present = vi.spyOn(backend(), "presentConflictOverride")
+      .mockResolvedValue("withdrawn");
+    const getPageByPath = vi.spyOn(backend(), "getPageByPath")
+      .mockResolvedValue(diskBaseline);
+    const getPage = vi.spyOn(backend(), "getPage");
+    // This is what the defective re-observing route would write. Leaving it
+    // available makes the regression prove that no post-click save is issued,
+    // rather than passing because an unexpected write happened to throw.
+    savePage.mockResolvedValue("rev-of-retained-draft");
+    const saveCallsBeforeClick = savePage.mock.calls.length;
+
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+
+    await vi.waitFor(() => expect(conflicts()).toEqual([]));
+    expect(present).toHaveBeenCalledWith(strayPath, diskBaseline.rev, expect.any(Number), 41);
+    expect(getPageByPath).toHaveBeenCalledWith(strayPath);
+    expect(getPage).not.toHaveBeenCalled();
+    expect(savePage).toHaveBeenCalledTimes(saveCallsBeforeClick);
+    expect(isDirty(sharedName)).toBe(false);
+    const live = pageByName(sharedName);
+    expect(live?.path).toBe(strayPath);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the loaded disk baseline");
+    dispose();
+  });
+
+  it("re-observes a superseded conflict instead of installing disk bytes", async () => {
+    const { root, dispose, savePage } = await mountWithObservedDirectConflict();
+    const present = vi.spyOn(backend(), "presentConflictOverride")
+      .mockResolvedValue("superseded");
+    const getPageByPath = vi.spyOn(backend(), "getPageByPath")
+      .mockResolvedValue(page(strayPath, "newer disk bytes must not be installed"));
+    savePage.mockRejectedValueOnce(new Error("conflict:42"));
+
+    root.querySelectorAll<HTMLButtonElement>(".conflict-btn")[0].click();
+
+    await vi.waitFor(() => expect(savePage).toHaveBeenCalledTimes(2));
+    expect(present).toHaveBeenCalledWith(strayPath, expect.any(String), expect.any(Number), 41);
+    expect(getPageByPath).not.toHaveBeenCalled();
+    const live = pageByName(sharedName);
+    expect(live ? doc.byId[live.roots[0]]?.raw : undefined).toBe("the retained local draft");
+    expect(conflicts()).toContain(sharedName);
+    dispose();
+  });
 
   it("refuses to install disk bytes read against a graph that has been reopened", async () => {
     // Acceptance row D2 requires the click to capture the graph binding and
