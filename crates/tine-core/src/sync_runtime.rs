@@ -42,8 +42,9 @@ use crate::fast_commit::{
     forbidden_commit_work, graph_wide_commit_work, ForbiddenCommitWork, GraphWideCommitWork,
 };
 use crate::model::{
-    sync_conflict_base, AcceptedExternalDocumentIdentity, BlockDto, BlockPreview, Format, Graph,
-    PageDto, PageEntry, PageKind, RefGroup,
+    sync_conflict_base, AcceptedExternalDocumentIdentity, BacklinkFilterContext,
+    BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
+    RefGroup, ReferenceKind,
 };
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
@@ -1839,6 +1840,15 @@ pub enum SyncApplicationNavigationRequest {
         max_rows: usize,
         max_bytes: usize,
     },
+    Backlinks {
+        name: String,
+        max_rows: usize,
+        max_bytes: usize,
+    },
+    BacklinkFilterContext {
+        name: String,
+        targets: Vec<BacklinkFilterTarget>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1865,6 +1875,8 @@ pub enum SyncApplicationNavigationReply {
     PreviewBlock(Option<BlockPreview>),
     BlockReferenceCounts(HashMap<String, usize>),
     BlockReferrers(SyncApplicationBoundedRefGroups),
+    Backlinks(SyncApplicationBoundedRefGroups),
+    BacklinkFilterContext(BacklinkFilterContext),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4373,6 +4385,30 @@ fn validate_application_load_request(
 fn validate_application_navigation_request(
     request: &SyncApplicationNavigationRequest,
 ) -> Result<(), SyncApplicationPageRequestError> {
+    if let SyncApplicationNavigationRequest::BacklinkFilterContext { name, targets } = request {
+        let text_bytes = name
+            .len()
+            .checked_add(
+                targets
+                    .iter()
+                    .map(|target| target.page.len().saturating_add(target.block_id.len()))
+                    .try_fold(0_usize, usize::checked_add)
+                    .unwrap_or(usize::MAX),
+            )
+            .unwrap_or(usize::MAX);
+        if targets.len() > MAX_SYNC_APPLICATION_RESULT_ROWS
+            || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+        {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: targets.len(),
+                    text_bytes,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        return Ok(());
+    }
     let (names, query, limit) = match request {
         SyncApplicationNavigationRequest::ReferencedPageNames
         | SyncApplicationNavigationRequest::PageAliases => (&[][..], None, None),
@@ -4427,6 +4463,27 @@ fn validate_application_navigation_request(
             }
             (&[][..], Some(uuid.as_str()), None)
         }
+        SyncApplicationNavigationRequest::Backlinks {
+            name,
+            max_rows,
+            max_bytes,
+        } => {
+            if *max_rows == 0
+                || *max_rows > MAX_SYNC_APPLICATION_RESULT_ROWS
+                || *max_bytes == 0
+                || *max_bytes > MAX_SYNC_APPLICATION_RESULT_BYTES
+            {
+                return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                    SyncEditorRequestSize {
+                        blocks: *max_rows,
+                        text_bytes: *max_bytes,
+                        ..SyncEditorRequestSize::default()
+                    },
+                ));
+            }
+            (&[][..], Some(name.as_str()), None)
+        }
+        SyncApplicationNavigationRequest::BacklinkFilterContext { .. } => unreachable!(),
     };
     if names.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(
@@ -6267,6 +6324,40 @@ enum ApplicationExactLoad {
 }
 
 type ApplicationNavigationOverlay = BTreeMap<ManagedPath, Option<(PageId, PageDto)>>;
+
+#[derive(Default)]
+struct ApplicationPageReferenceCandidates {
+    preamble: bool,
+    blocks: HashSet<BlockId>,
+}
+
+fn application_parser_indices_for_block_ids(
+    current: &ApplicationCurrentPage,
+    block_ids: &HashSet<BlockId>,
+) -> Result<HashSet<usize>, SyncApplicationPageRequestError> {
+    if current.editor.dto.blocks.len() != flatten_application_blocks(&current.page.blocks).len() {
+        return Err(SyncApplicationPageRequestError::ActorRefused);
+    }
+    let allowed = current
+        .editor
+        .dto
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| match &block.key {
+            SyncEditorBlockKey::Existing(id) => parse_editor_block_id(id).map(|id| (index, id)),
+            SyncEditorBlockKey::Temporary(_) => Err(SyncEditorRequestError::ActorRefused),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+        .into_iter()
+        .filter_map(|(index, block_id)| block_ids.contains(&block_id).then_some(index))
+        .collect::<HashSet<_>>();
+    if allowed.len() != block_ids.len() {
+        return Err(SyncApplicationPageRequestError::ActorRefused);
+    }
+    Ok(allowed)
+}
 
 fn find_application_blocks<'a>(
     blocks: &'a [BlockDto],
@@ -8164,6 +8255,18 @@ impl RuntimeActor {
             } => SyncApplicationNavigationReply::BlockReferrers(
                 self.application_block_referrers_ready(&uuid, max_rows, max_bytes)?,
             ),
+            SyncApplicationNavigationRequest::Backlinks {
+                name,
+                max_rows,
+                max_bytes,
+            } => SyncApplicationNavigationReply::Backlinks(
+                self.application_backlinks_ready(&name, max_rows, max_bytes)?,
+            ),
+            SyncApplicationNavigationRequest::BacklinkFilterContext { name, targets } => {
+                SyncApplicationNavigationReply::BacklinkFilterContext(
+                    self.application_backlink_filter_context_ready(&name, &targets)?,
+                )
+            }
         };
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
     }
@@ -8494,30 +8597,7 @@ impl RuntimeActor {
         }
         for (page_id, block_ids) in candidates {
             let current = self.load_application_page_id_ready(page_id)?;
-            if current.editor.blocks.len() != flatten_application_blocks(&current.page.blocks).len()
-            {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
-            }
-            let allowed = current
-                .editor
-                .dto
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(index, block)| match &block.key {
-                    SyncEditorBlockKey::Existing(id) => {
-                        parse_editor_block_id(id).map(|id| (index, id))
-                    }
-                    SyncEditorBlockKey::Temporary(_) => Err(SyncEditorRequestError::ActorRefused),
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
-                .into_iter()
-                .filter_map(|(index, block_id)| block_ids.contains(&block_id).then_some(index))
-                .collect::<HashSet<_>>();
-            if allowed.len() != block_ids.len() {
-                return Err(SyncApplicationPageRequestError::ActorRefused);
-            }
+            let allowed = application_parser_indices_for_block_ids(&current, &block_ids)?;
             let blocks = application_page_block_referrers(&current.page, target, Some(&allowed));
             if blocks.is_empty() {
                 continue;
@@ -8592,6 +8672,314 @@ impl RuntimeActor {
             total,
             exceeded,
         })
+    }
+
+    fn application_equivalent_page_names_ready(
+        &self,
+        target: &str,
+    ) -> Result<(String, Vec<String>, String), SyncApplicationPageRequestError> {
+        let mut real_pages = crate::query::RealPageNames::new();
+        for (page, _) in self.application_navigation_pages_ready()? {
+            let key = crate::refs::page_key(&page.name);
+            match real_pages.get_mut(&key) {
+                Some((winner_path, winner_name)) if page.path < *winner_path => {
+                    *winner_path = page.path;
+                    *winner_name = page.name;
+                }
+                Some(_) => {}
+                None => {
+                    real_pages.insert(key, (page.path, page.name));
+                }
+            }
+        }
+        let aliases = self
+            .application_navigation_aliases_ready()?
+            .into_iter()
+            .map(|(alias, owner, _)| (alias, owner))
+            .collect::<Vec<_>>();
+        Ok(crate::query::equivalent_page_names(
+            &real_pages,
+            &aliases,
+            target,
+        ))
+    }
+
+    fn application_backlinks_ready(
+        &self,
+        target: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+        let (canonical, names_norm, self_page) =
+            self.application_equivalent_page_names_ready(target)?;
+        let excluded = crate::refs::page_key(&self_page);
+        let overlay = self.application_navigation_overlay_ready()?;
+        let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+
+        const BATCH: usize = 256;
+        let mut candidates = HashMap::<PageId, ApplicationPageReferenceCandidates>::new();
+        let mut page_headers = HashMap::<PageId, (ManagedPath, String)>::new();
+        let mut candidate_count = 0_usize;
+        let mut candidate_exceeded = false;
+        'names: for normalized in &names_norm {
+            let mut cursor: Option<(PageId, MaterializedEntityId)> = None;
+            loop {
+                let rows = read
+                    .page_referrer_candidates_after(normalized, cursor, BATCH)
+                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let len = rows.len();
+                for row in rows {
+                    cursor = Some((row.source_page_id, row.source));
+                    let (path, page_name) =
+                        if let Some(header) = page_headers.get(&row.source_page_id) {
+                            header.clone()
+                        } else {
+                            let page = read
+                                .page(row.source_page_id)
+                                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+                                .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                            let header = (page.path, page.name);
+                            page_headers.insert(row.source_page_id, header.clone());
+                            header
+                        };
+                    if masked_paths.contains(&path) || crate::refs::page_key(&page_name) == excluded
+                    {
+                        continue;
+                    }
+                    let entry = candidates.entry(row.source_page_id).or_default();
+                    let inserted = match row.source {
+                        MaterializedEntityId::Page(page_id) => {
+                            if page_id != row.source_page_id {
+                                return Err(SyncApplicationPageRequestError::ActorRefused);
+                            }
+                            let inserted = !entry.preamble;
+                            entry.preamble = true;
+                            inserted
+                        }
+                        MaterializedEntityId::Block(block_id) => entry.blocks.insert(block_id),
+                    };
+                    if inserted {
+                        candidate_count = candidate_count
+                            .checked_add(1)
+                            .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                        if candidate_count > max_rows {
+                            candidate_exceeded = true;
+                            break 'names;
+                        }
+                    }
+                }
+                if len < BATCH {
+                    break;
+                }
+            }
+        }
+        drop(read);
+
+        let mut sources = Vec::new();
+        for (path, current) in overlay {
+            let Some((_, page)) = current else {
+                continue;
+            };
+            if crate::refs::page_key(&page.name) == excluded {
+                continue;
+            }
+            let matches = crate::query::application_page_reference_matches(
+                &page,
+                &canonical,
+                &names_norm,
+                ReferenceKind::Explicit,
+                None,
+                true,
+                &self.graph.config,
+            );
+            if matches.is_empty() {
+                continue;
+            }
+            let entry = self
+                .graph
+                .projected_inventory_entry(&path, &page.name, model_sync_page_kind(page.kind))
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            sources.push((path.as_str().to_owned(), entry.date_key, page, matches));
+        }
+        for (page_id, candidate) in candidates {
+            let current = self.load_application_page_id_ready(page_id)?;
+            if crate::refs::page_key(&current.page.name) == excluded {
+                continue;
+            }
+            let allowed = application_parser_indices_for_block_ids(&current, &candidate.blocks)?;
+            let matches = crate::query::application_page_reference_matches(
+                &current.page,
+                &canonical,
+                &names_norm,
+                ReferenceKind::Explicit,
+                Some(&allowed),
+                candidate.preamble,
+                &self.graph.config,
+            );
+            if matches.is_empty() {
+                continue;
+            }
+            let entry = self
+                .graph
+                .projected_inventory_entry(
+                    &current.editor.page.path,
+                    &current.page.name,
+                    current.editor.page.kind,
+                )
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            sources.push((
+                current.editor.page.path.as_str().to_owned(),
+                entry.date_key,
+                current.page,
+                matches,
+            ));
+        }
+        sources.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut rows = 0_usize;
+        let mut bytes = 0_usize;
+        let mut total = 0_usize;
+        let mut exceeded = false;
+        let mut grouped: Vec<(Option<i64>, RefGroup)> = Vec::new();
+        let mut by_name = HashMap::<String, usize>::new();
+        for (_, date_key, page, matches) in sources {
+            let key = crate::refs::page_key(&page.name);
+            let index = *by_name.entry(key).or_insert_with(|| {
+                let index = grouped.len();
+                grouped.push((
+                    date_key,
+                    RefGroup {
+                        page: page.name.clone(),
+                        kind: page.kind,
+                        blocks: Vec::new(),
+                        evidence: Vec::new(),
+                    },
+                ));
+                index
+            });
+            if let (Some(previous), Some(current)) = (grouped[index].0, date_key) {
+                grouped[index].0 = Some(previous.max(current));
+            } else if grouped[index].0.is_none() {
+                grouped[index].0 = date_key;
+            }
+            for (block, evidence) in matches {
+                total = total.saturating_add(1);
+                let estimated = crate::model::block_dto_estimated_bytes(&block)
+                    .saturating_add(crate::query::reference_evidence_estimated_bytes(&evidence))
+                    .saturating_add(page.name.len())
+                    .saturating_add(256);
+                if !exceeded && rows < max_rows && bytes.saturating_add(estimated) <= max_bytes {
+                    rows += 1;
+                    bytes = bytes.saturating_add(estimated);
+                    grouped[index].1.blocks.push(block);
+                    grouped[index].1.evidence.push(evidence);
+                } else {
+                    exceeded = true;
+                }
+            }
+        }
+        grouped.retain(|(_, group)| !group.blocks.is_empty());
+        grouped.sort_by(|a, b| {
+            b.0.unwrap_or(i64::MIN)
+                .cmp(&a.0.unwrap_or(i64::MIN))
+                .then_with(|| a.1.page.cmp(&b.1.page))
+        });
+        if candidate_exceeded {
+            total = total.max(max_rows.saturating_add(1));
+            exceeded = true;
+        }
+        Ok(SyncApplicationBoundedRefGroups {
+            groups: grouped.into_iter().map(|(_, group)| group).collect(),
+            total,
+            exceeded,
+        })
+    }
+
+    fn application_backlink_filter_context_ready(
+        &self,
+        target: &str,
+        targets: &[BacklinkFilterTarget],
+    ) -> Result<BacklinkFilterContext, SyncApplicationPageRequestError> {
+        let (_, names_norm, _) = self.application_equivalent_page_names_ready(target)?;
+        let excluded_refs = names_norm.into_iter().collect::<HashSet<_>>();
+        let mut requested = HashMap::<(PageKind, String), HashSet<String>>::new();
+        for item in targets {
+            requested
+                .entry((item.kind, crate::refs::page_key(&item.page)))
+                .or_default()
+                .insert(item.block_id.clone());
+        }
+        let requested_unique = requested.values().map(HashSet::len).sum::<usize>();
+        let mut context = BacklinkFilterContext::default();
+        let mut bytes = 0_usize;
+        let pages = self.application_navigation_pages_ready()?;
+        for (entry, _) in pages {
+            let key = (entry.kind, crate::refs::page_key(&entry.name));
+            let Some(ids) = requested.get(&key) else {
+                continue;
+            };
+            let current = match self.load_application_exact_ready(&entry.rel_path)? {
+                ApplicationExactLoad::Loaded(current) => current,
+                ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                    context.truncated = true;
+                    continue;
+                }
+            };
+            let mut roots = Vec::new();
+            if let Some(block) = crate::query::application_page_property_dto(&current.page) {
+                if ids.contains(&block.id) {
+                    roots.push(block);
+                }
+            }
+            fn collect(blocks: &[BlockDto], ids: &HashSet<String>, out: &mut Vec<BlockDto>) {
+                for block in blocks {
+                    if ids.contains(&block.id) {
+                        out.push(block.clone());
+                    }
+                    collect(&block.children, ids, out);
+                }
+            }
+            collect(&current.page.blocks, ids, &mut roots);
+            for block in roots {
+                if bytes >= crate::query::BACKLINK_FILTER_MAX_BYTES {
+                    context.truncated = true;
+                    break;
+                }
+                let result = crate::query::application_backlink_filter_entry(
+                    &current.page.name,
+                    current.page.kind,
+                    &block,
+                    current.page.format == Format::Org,
+                    &excluded_refs,
+                    crate::query::BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
+                );
+                let estimated = crate::query::backlink_filter_entry_estimated_bytes(&result);
+                if bytes.saturating_add(estimated) > crate::query::BACKLINK_FILTER_MAX_BYTES {
+                    context.truncated = true;
+                    break;
+                }
+                bytes = bytes.saturating_add(estimated);
+                context.truncated |= result.truncated;
+                context.entries.push(result);
+            }
+        }
+        if context.entries.len() < requested_unique {
+            context.truncated = true;
+        }
+        Ok(context)
     }
 
     fn application_navigation_pages_ready(
@@ -18244,14 +18632,14 @@ mod tests {
             &handle,
             &fixture,
             "diary/日記/2026_07_30.org",
-            format!("* TODO journal root (({genuine}))\n** journal child\n").as_bytes(),
+            format!("* TODO journal root [[Compass]] (({genuine}))\n** journal child\n").as_bytes(),
         );
         admit_external_page(
             &handle,
             &fixture,
             "content/nested pages/Ref source.md",
             format!(
-                "- first (({genuine})) and (({genuine})) plus (({dangling}))\n  - nested {{{{embed (({genuine}))}}}}\n"
+                "related:: [[Compass]]\n\n- first [[Compass]] (({genuine})) and (({genuine})) plus (({dangling}))\n  - nested [[Compass]] {{{{embed (({genuine}))}}}}\n"
             )
             .as_bytes(),
         );
@@ -18431,6 +18819,76 @@ mod tests {
                 assert_eq!(actual.breadcrumb, expected.breadcrumb);
             }
         }
+        let SyncApplicationNavigationReply::Backlinks(managed_backlinks) =
+            navigation(SyncApplicationNavigationRequest::Backlinks {
+                name: "Ordinary Ω".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong backlinks reply")
+        };
+        assert!(!managed_backlinks.exceeded);
+        let direct_backlinks = graph.backlinks("Ordinary Ω");
+        assert_eq!(managed_backlinks.groups.len(), direct_backlinks.len());
+        for (actual, expected) in managed_backlinks.groups.iter().zip(direct_backlinks.iter()) {
+            assert_eq!(actual.page, expected.page);
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.blocks.len(), expected.blocks.len());
+            assert_eq!(actual.evidence.len(), expected.evidence.len());
+            for ((actual_block, actual_evidence), (expected_block, expected_evidence)) in actual
+                .blocks
+                .iter()
+                .zip(&actual.evidence)
+                .zip(expected.blocks.iter().zip(&expected.evidence))
+            {
+                assert_eq!(actual_block.raw, expected_block.raw);
+                assert_eq!(actual_block.breadcrumb, expected_block.breadcrumb);
+                assert_eq!(actual_evidence.occurrences, expected_evidence.occurrences);
+                assert_eq!(actual_evidence.total, expected_evidence.total);
+                assert_eq!(actual_evidence.truncated, expected_evidence.truncated);
+            }
+        }
+        let managed_targets = managed_backlinks
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group.blocks.iter().map(|block| BacklinkFilterTarget {
+                    page: group.page.clone(),
+                    kind: group.kind,
+                    block_id: block.id.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let direct_targets = direct_backlinks
+            .iter()
+            .flat_map(|group| {
+                group.blocks.iter().map(|block| BacklinkFilterTarget {
+                    page: group.page.clone(),
+                    kind: group.kind,
+                    block_id: block.id.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let SyncApplicationNavigationReply::BacklinkFilterContext(managed_filter) =
+            navigation(SyncApplicationNavigationRequest::BacklinkFilterContext {
+                name: "Ordinary Ω".into(),
+                targets: managed_targets,
+            })
+        else {
+            panic!("wrong backlink-filter reply")
+        };
+        let direct_filter =
+            crate::query::backlink_filter_context(&graph, "Ordinary Ω", &direct_targets);
+        assert_eq!(managed_filter.truncated, direct_filter.truncated);
+        assert_eq!(managed_filter.entries.len(), direct_filter.entries.len());
+        for (actual, expected) in managed_filter.entries.iter().zip(&direct_filter.entries) {
+            assert_eq!(actual.page, expected.page);
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(actual.facets, expected.facets);
+            assert_eq!(actual.truncated, expected.truncated);
+        }
         for path in [
             "content/nested pages/Ordinary Ω.md",
             "diary/日記/2026_07_30.org",
@@ -18564,6 +19022,29 @@ mod tests {
         };
         assert!(names.iter().any(|name| name == "New Phantom"));
         assert!(!names.iter().any(|name| name == "Old Phantom"));
+        let SyncApplicationNavigationReply::Backlinks(old_backlinks) =
+            loaded(SyncApplicationNavigationRequest::Backlinks {
+                name: "Old Phantom".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong old-backlinks reply")
+        };
+        assert!(old_backlinks.groups.is_empty());
+        let SyncApplicationNavigationReply::Backlinks(new_backlinks) =
+            loaded(SyncApplicationNavigationRequest::Backlinks {
+                name: "New Phantom".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong new-backlinks reply")
+        };
+        assert_eq!(new_backlinks.total, 1);
+        assert!(new_backlinks.groups[0].blocks[0]
+            .raw
+            .contains("New Phantom"));
         let SyncApplicationNavigationReply::ResolveBlocks(resolved) =
             loaded(SyncApplicationNavigationRequest::ResolveBlocks {
                 uuids: vec![identity.into()],
@@ -18636,6 +19117,17 @@ mod tests {
             panic!("wrong referenced-name reply")
         };
         assert!(names.iter().any(|name| name == "Created Phantom"));
+        let SyncApplicationNavigationReply::Backlinks(created_backlinks) =
+            loaded(SyncApplicationNavigationRequest::Backlinks {
+                name: "Created Phantom".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong created-backlinks reply")
+        };
+        assert_eq!(created_backlinks.total, 1);
+        assert_eq!(created_backlinks.groups[0].page, "Created Navigation");
         let SyncApplicationNavigationReply::BlockReferenceCounts(counts) =
             loaded(SyncApplicationNavigationRequest::BlockReferenceCounts)
         else {

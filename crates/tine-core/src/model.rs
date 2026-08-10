@@ -650,7 +650,7 @@ pub struct RefGroup {
 /// co-reference facets came from the cached lsdoc projection. This is fetched
 /// only when the Linked References filter opens; ordinary backlink DTOs remain
 /// shallow so their lazy-loading and bridge cost do not change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BacklinkFilterTarget {
     pub page: String,
     pub kind: PageKind,

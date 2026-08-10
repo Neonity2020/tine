@@ -1945,6 +1945,12 @@ pub struct MaterializedBlockReferrerCandidateRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedPageReferrerCandidateRow {
+    pub source_page_id: PageId,
+    pub source: MaterializedEntityId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPropertyRow {
     pub owner: MaterializedEntityId,
     pub page_id: PageId,
@@ -2259,6 +2265,23 @@ impl<'a> SqliteMaterializedRead<'a> {
             .collect()
     }
 
+    pub fn page_referrer_candidates_after(
+        &self,
+        normalized_name: &str,
+        after: Option<(PageId, MaterializedEntityId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPageReferrerCandidateRow>, MaterializationError> {
+        self.inner
+            .page_referrer_candidates_after(
+                normalized_name,
+                after.map(|(page, source)| (page.as_uuid().into_bytes(), lower_entity(source))),
+                limit,
+            )?
+            .into_iter()
+            .map(page_referrer_candidate_row_from_storage)
+            .collect()
+    }
+
     pub fn properties(
         &self,
         owner: MaterializedEntityId,
@@ -2449,6 +2472,15 @@ fn block_referrer_candidate_row_from_storage(
     Ok(MaterializedBlockReferrerCandidateRow {
         source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
         source_block_id: BlockId::from_uuid(Uuid::from_bytes(row.source_block_id)),
+    })
+}
+
+fn page_referrer_candidate_row_from_storage(
+    row: storage::PhysicalPageReferrerCandidateRow,
+) -> Result<MaterializedPageReferrerCandidateRow, MaterializationError> {
+    Ok(MaterializedPageReferrerCandidateRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        source: entity_from_storage(row.source),
     })
 }
 

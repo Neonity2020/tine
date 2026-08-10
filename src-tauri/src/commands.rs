@@ -1060,13 +1060,37 @@ pub(crate) async fn get_backlinks(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        bounded_groups_or_error(graph.backlinks_bounded(
-            &name,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::Backlinks {
+                    name,
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::Backlinks(result) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                _ => Err("managed backlinks returned the wrong reply kind".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.backlinks_bounded(
+                &name,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1084,11 +1108,25 @@ pub(crate) async fn get_backlink_filter_context(
             targets.len()
         ));
     }
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        Ok(tine_core::query::backlink_filter_context(
-            &graph, &name, &targets,
-        ))
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BacklinkFilterContext { name, targets },
+            )? {
+                SyncApplicationNavigationReply::BacklinkFilterContext(context) => Ok(context),
+                _ => Err("managed backlink filter context returned the wrong reply kind".into()),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                Ok(tine_core::query::backlink_filter_context(
+                    &graph, &name, &targets,
+                ))
+            }
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1237,6 +1275,7 @@ mod graph_wide_command_boundary_tests {
             "get_unlinked_refs",
             "block_ref_counts",
             "block_referrers",
+            "get_backlink_filter_context",
             "rename_page",
             "delete_page",
         ] {
@@ -1274,6 +1313,8 @@ mod managed_actor_command_boundary_tests {
             "preview_block",
             "block_ref_counts",
             "block_referrers",
+            "get_backlinks",
+            "get_backlink_filter_context",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1312,6 +1353,8 @@ mod managed_actor_command_boundary_tests {
             "preview_block",
             "block_ref_counts",
             "block_referrers",
+            "get_backlinks",
+            "get_backlink_filter_context",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");

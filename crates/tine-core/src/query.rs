@@ -7,8 +7,9 @@ use crate::date::JournalDate;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::model::{
     block_to_shallow_dto, BacklinkFilterContext, BacklinkFilterEntry, BacklinkFilterTarget,
-    BlockDto, BlockPreview, Format, Graph, PageEntry, PageKind, RefGroup, ReferenceBlockEvidence,
-    ReferenceDiagnosticTrace, ReferenceDiagnostics, ReferenceKind, TemplateDto,
+    BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind, RefGroup,
+    ReferenceBlockEvidence, ReferenceDiagnosticTrace, ReferenceDiagnostics, ReferenceKind,
+    TemplateDto,
 };
 use crate::refs;
 use crate::search_query::Matcher;
@@ -297,7 +298,7 @@ fn shallow_dto_estimated_bytes(block: &DocBlock, ancestors: &[&DocBlock]) -> usi
         .saturating_add(128)
 }
 
-fn reference_evidence_estimated_bytes(evidence: &ReferenceBlockEvidence) -> usize {
+pub(crate) fn reference_evidence_estimated_bytes(evidence: &ReferenceBlockEvidence) -> usize {
     evidence.block_id.len()
         + evidence
             .occurrences
@@ -587,7 +588,7 @@ pub(crate) fn real_page_names(graph: &Graph) -> RealPageNames {
 /// alias-connected component, and the real page to exclude as self. The
 /// normalized component is shared by backlinks, unlinked references, and their
 /// scoped-invalidation predicates so those paths cannot drift.
-fn equivalent_page_names(
+pub(crate) fn equivalent_page_names(
     real_pages: &RealPageNames,
     aliases: &[(String, String)],
     target: &str,
@@ -686,16 +687,21 @@ fn property_projection(raw: &str, is_org: bool) -> DocBlock {
 
 fn page_property_block(entry: &PageEntry, pre: &str) -> Option<DocBlock> {
     let is_org = Format::from_path(&entry.path) == Format::Org;
+    page_property_block_parts(&entry.name, entry.kind, is_org, pre)
+}
+
+fn page_property_block_parts(
+    name: &str,
+    kind: PageKind,
+    is_org: bool,
+    pre: &str,
+) -> Option<DocBlock> {
     let raw = page_property_raw(pre, is_org);
     if raw.is_empty() {
         return None;
     }
     let mut block = property_projection(&raw, is_org);
-    block.uuid = format!(
-        "page-property:{:?}:{}",
-        entry.kind,
-        refs::page_key(&entry.name)
-    );
+    block.uuid = format!("page-property:{:?}:{}", kind, refs::page_key(name));
     Some(block)
 }
 
@@ -760,6 +766,110 @@ fn block_reference_evidence(
         total: result.total,
         truncated: result.truncated,
     })
+}
+
+/// Exact parser-owned reference matches from one application-gateway page.
+/// SQLite callers may restrict ordinary blocks by flattened parser index, but
+/// the evidence and frontend identities always come from `PageDto`.
+pub(crate) fn application_page_reference_matches(
+    page: &PageDto,
+    canonical: &str,
+    names_norm: &[String],
+    kind: ReferenceKind,
+    allowed_indices: Option<&std::collections::HashSet<usize>>,
+    allow_preamble: bool,
+    config: &crate::config::Config,
+) -> Vec<(BlockDto, ReferenceBlockEvidence)> {
+    let is_org = page.format == Format::Org;
+    let mut matches = Vec::new();
+    if allow_preamble {
+        if let Some(block) = page
+            .pre_block
+            .as_deref()
+            .and_then(|pre| page_property_block_parts(&page.name, page.kind, is_org, pre))
+        {
+            if let Some(hit) = block_reference_evidence(&block, canonical, names_norm, kind, config)
+            {
+                let mut dto = block_to_shallow_dto(&block);
+                dto.page_property = true;
+                matches.push((dto, hit));
+            }
+        }
+    }
+
+    fn visit(
+        blocks: &[BlockDto],
+        is_org: bool,
+        canonical: &str,
+        names_norm: &[String],
+        kind: ReferenceKind,
+        allowed_indices: Option<&std::collections::HashSet<usize>>,
+        config: &crate::config::Config,
+        index: &mut usize,
+        ancestors: &mut Vec<String>,
+        output: &mut Vec<(BlockDto, ReferenceBlockEvidence)>,
+    ) {
+        for block in blocks {
+            let current = *index;
+            *index = index.saturating_add(1);
+            let projected = DocBlock {
+                raw: block.raw.clone(),
+                children: Vec::new(),
+                uuid: block.id.clone(),
+                is_org,
+                proj: std::sync::OnceLock::new(),
+            };
+            if allowed_indices.is_none_or(|allowed| allowed.contains(&current)) {
+                if let Some(hit) =
+                    block_reference_evidence(&projected, canonical, names_norm, kind, config)
+                {
+                    let mut dto = block_to_shallow_dto(&projected);
+                    dto.breadcrumb = ancestors.clone();
+                    output.push((dto, hit));
+                }
+            }
+            ancestors.push(crumb_line(&projected));
+            visit(
+                &block.children,
+                is_org,
+                canonical,
+                names_norm,
+                kind,
+                allowed_indices,
+                config,
+                index,
+                ancestors,
+                output,
+            );
+            ancestors.pop();
+        }
+    }
+
+    let mut index = 0;
+    visit(
+        &page.blocks,
+        is_org,
+        canonical,
+        names_norm,
+        kind,
+        allowed_indices,
+        config,
+        &mut index,
+        &mut Vec::new(),
+        &mut matches,
+    );
+    matches
+}
+
+pub(crate) fn application_page_property_dto(page: &PageDto) -> Option<BlockDto> {
+    let mut dto = block_to_shallow_dto(&page_property_block_parts(
+        &page.name,
+        page.kind,
+        page.format == Format::Org,
+        page.pre_block.as_deref()?,
+    )?);
+    dto.page_property = true;
+    Some(dto)
 }
 
 fn block_has_reference(
@@ -953,7 +1063,7 @@ pub fn backlinks_bounded(
     )
 }
 
-const BACKLINK_FILTER_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const BACKLINK_FILTER_MAX_BYTES: usize = 16 * 1024 * 1024;
 const BACKLINK_FILTER_MAX_TEXT_BYTES: usize = 64 * 1024;
 const BACKLINK_FILTER_MAX_FACETS: usize = 256;
 
@@ -1066,6 +1176,107 @@ fn backlink_filter_entry(
     }
 }
 
+pub(crate) fn backlink_filter_entry_estimated_bytes(entry: &BacklinkFilterEntry) -> usize {
+    entry.text.len()
+        + entry.facets.iter().map(String::len).sum::<usize>()
+        + entry.page.len()
+        + entry.block_id.len()
+        + 128
+}
+
+/// Filter metadata for one application-gateway root. This mirrors
+/// `backlink_filter_entry` while retaining managed frontend block identity.
+pub(crate) fn application_backlink_filter_entry(
+    page: &str,
+    kind: PageKind,
+    block: &BlockDto,
+    is_org: bool,
+    excluded_refs: &std::collections::HashSet<String>,
+    remaining_bytes: usize,
+) -> BacklinkFilterEntry {
+    let max_text = BACKLINK_FILTER_MAX_TEXT_BYTES.min(remaining_bytes);
+    let mut text = String::new();
+    let mut facets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut facets_truncated = false;
+    let mut add_facet = |name: &str| {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let key = refs::normalize(name);
+        if excluded_refs.contains(&key) || !seen.insert(key) {
+            return;
+        }
+        if facets.len() >= BACKLINK_FILTER_MAX_FACETS {
+            facets_truncated = true;
+        } else {
+            facets.push(name.to_string());
+        }
+    };
+
+    fn visit(
+        block: &BlockDto,
+        is_org: bool,
+        text: &mut String,
+        max_text: usize,
+        add_facet: &mut impl FnMut(&str),
+        truncated: &mut bool,
+    ) {
+        let projected = DocBlock {
+            raw: block.raw.clone(),
+            children: Vec::new(),
+            uuid: block.id.clone(),
+            is_org,
+            proj: std::sync::OnceLock::new(),
+        };
+        *truncated |= append_bounded_text(text, projected.visible_text(), max_text);
+        let projection = projected.projection();
+        for name in &projection.refs_page {
+            add_facet(name);
+        }
+        if let Some(marker) = projection.marker.as_deref() {
+            add_facet(marker);
+        }
+        for (key, value) in &projection.properties {
+            if !(key.eq_ignore_ascii_case("tags")
+                || key.eq_ignore_ascii_case("alias")
+                || key.eq_ignore_ascii_case("aliases"))
+            {
+                continue;
+            }
+            let quoted = value.trim();
+            if quoted.len() >= 2 && quoted.starts_with('"') && quoted.ends_with('"') {
+                continue;
+            }
+            for value in value.split([',', '，']) {
+                add_facet(&strip_ref(value.trim()));
+            }
+        }
+        for child in &block.children {
+            visit(child, is_org, text, max_text, add_facet, truncated);
+        }
+    }
+
+    let mut text_truncated = false;
+    visit(
+        block,
+        is_org,
+        &mut text,
+        max_text,
+        &mut add_facet,
+        &mut text_truncated,
+    );
+    BacklinkFilterEntry {
+        page: page.to_string(),
+        kind,
+        block_id: block.id.clone(),
+        text,
+        facets,
+        truncated: text_truncated || facets_truncated,
+    }
+}
+
 /// Build search/facet metadata only for the shallow backlink roots already in
 /// one rendered panel. This deliberately does not rerun backlink selection and
 /// cannot turn into a graph-sized arbitrary export: the request is ID-scoped,
@@ -1110,11 +1321,7 @@ pub fn backlink_filter_context(
                             &excluded_refs,
                             BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
                         );
-                        let estimated = entry.text.len()
-                            + entry.facets.iter().map(String::len).sum::<usize>()
-                            + entry.page.len()
-                            + entry.block_id.len()
-                            + 128;
+                        let estimated = backlink_filter_entry_estimated_bytes(&entry);
                         if bytes.saturating_add(estimated) > BACKLINK_FILTER_MAX_BYTES {
                             context.truncated = true;
                         } else {
@@ -1150,11 +1357,7 @@ pub fn backlink_filter_context(
                     &excluded_refs,
                     BACKLINK_FILTER_MAX_BYTES.saturating_sub(bytes),
                 );
-                let estimated = entry.text.len()
-                    + entry.facets.iter().map(String::len).sum::<usize>()
-                    + entry.page.len()
-                    + entry.block_id.len()
-                    + 128;
+                let estimated = backlink_filter_entry_estimated_bytes(&entry);
                 if bytes.saturating_add(estimated) > BACKLINK_FILTER_MAX_BYTES {
                     context.truncated = true;
                     break;
