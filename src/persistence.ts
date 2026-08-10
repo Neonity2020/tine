@@ -318,6 +318,10 @@ export function tombstoneIfQuiescent(
     return false;
   }
   deletedPages.add(name);
+  // Always REPLACE the recorded file, never merge with an older tombstone's: a
+  // pathless delete means "every file with this name", and inheriting a stale
+  // path from a previous tombstone would silently narrow it to one file — the
+  // wrong one, letting the others be resurrected. (GH #254 increment 3.)
   if (path) deletedPagePaths.set(name, path);
   else deletedPagePaths.delete(name);
   return true;
