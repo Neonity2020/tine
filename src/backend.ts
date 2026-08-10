@@ -244,13 +244,13 @@ export interface Backend {
   graphSourceFiles(includeJournals: boolean): Promise<GraphSourceFile[]>;
   /** Save a page. `baseRev` is the revision the editor loaded. Direct Files
    *  binds `force` to `conflictEpoch`; managed storage binds it to the exact
-   *  `managedConflictRevision` observed after refusal. */
+   *  managed path and revision observed after refusal. */
   savePage(
     page: PageDto,
     baseRev: string | null,
     force?: boolean,
     conflictEpoch?: number | null,
-    managedConflictRevision?: string | null,
+    managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<string>;
   managedSyncStatus(): Promise<ManagedSyncStatus | null>;
   managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
@@ -735,7 +735,7 @@ class TauriBackend implements Backend {
     baseRev: string | null,
     force = false,
     conflictEpoch: number | null = null,
-    managedConflictRevision: string | null = null,
+    managedConflictObservation: { path: string; revision: string } | null = null,
   ) {
     return measureIssue248Async("frontend.ipcSaveRoundTripMs", () =>
       this.call<string>("save_page", {
@@ -743,7 +743,7 @@ class TauriBackend implements Backend {
         baseRev,
         force,
         conflictEpoch,
-        managedConflictRevision,
+        managedConflictObservation,
       })
     );
   }
