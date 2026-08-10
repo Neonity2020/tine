@@ -16527,6 +16527,27 @@ impl Graph {
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let lock = self.page_lock(&page_path);
         let _guard = lock.lock().unwrap();
+        self.write_pdf_view_state_sidecar(pdf_filename, page, scale)
+    }
+
+    /// Managed-storage sidecar update. The application actor serializes this
+    /// with every other managed PDF operation, so it needs no graph-text writer
+    /// permit and cannot create or modify an HLS page.
+    pub(crate) fn write_pdf_view_state_asset_only(
+        &self,
+        pdf_filename: &str,
+        page: i64,
+        scale: f64,
+    ) -> io::Result<()> {
+        self.write_pdf_view_state_sidecar(pdf_filename, page, scale)
+    }
+
+    fn write_pdf_view_state_sidecar(
+        &self,
+        pdf_filename: &str,
+        page: i64,
+        scale: f64,
+    ) -> io::Result<()> {
         fs::create_dir_all(self.assets_path())?;
         let sidecar_path = self.pdf_sidecar_for_update(pdf_filename)?;
         self.ensure_asset_write_target(&sidecar_path)?;

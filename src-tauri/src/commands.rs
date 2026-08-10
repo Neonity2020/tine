@@ -20,7 +20,7 @@ use tine_core::sync_runtime::{
     SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
     SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
     SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
-    SyncRuntimeHandle,
+    SyncApplicationUnitOutcome, SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -1339,6 +1339,7 @@ mod graph_wide_command_boundary_tests {
             "page_print_html",
             "run_graph_search",
             "search",
+            "write_pdf_view_state",
             "rename_page",
             "delete_page",
         ] {
@@ -1389,6 +1390,7 @@ mod managed_actor_command_boundary_tests {
             "page_print_html",
             "run_graph_search",
             "search",
+            "write_pdf_view_state",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1440,6 +1442,7 @@ mod managed_actor_command_boundary_tests {
             "page_print_html",
             "run_graph_search",
             "search",
+            "write_pdf_view_state",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");
@@ -3651,16 +3654,35 @@ pub(crate) fn write_highlights(
 }
 
 #[tauri::command]
-pub(crate) fn write_pdf_view_state(
+pub(crate) async fn write_pdf_view_state(
     pdf: String,
     page: i64,
     scale: f64,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.write_pdf_view_state(&pdf, page, scale)
-            .map_err(|e| e.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .write_application_pdf_view_state(pdf, page, scale)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationUnitOutcome::Applied => Ok(()),
+                SyncApplicationUnitOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating PDF state. Try again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .write_pdf_view_state(&pdf, page, scale)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

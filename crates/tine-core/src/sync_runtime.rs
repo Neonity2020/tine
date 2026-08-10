@@ -1956,6 +1956,13 @@ pub enum SyncApplicationNavigationOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationUnitOutcome {
+    Applied,
+    Deferred { state: SyncEditorDeferred },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SyncApplicationPageSelector {
     Logical {
@@ -3404,6 +3411,43 @@ impl SyncRuntimeHandle {
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::SaveApplicationPage {
             request,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
+    /// Persist the asset-side PDF view state in the same ordered application
+    /// actor used by managed page operations. This operation never writes graph
+    /// text; actor ordering keeps it serialized with later managed highlight
+    /// transactions.
+    pub fn write_application_pdf_view_state(
+        &self,
+        pdf_filename: String,
+        page: i64,
+        scale: f64,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        if pdf_filename.is_empty() {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidName,
+            ));
+        }
+        if pdf_filename.len() > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    text_bytes: pdf_filename.len(),
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::WriteApplicationPdfViewState {
+            pdf_filename,
+            page,
+            scale,
             reply: reply_sender,
         })
         .map_err(map_application_actor_error)?;
@@ -6102,6 +6146,12 @@ enum ActorRequest {
         reply:
             mpsc::Sender<Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError>>,
     },
+    WriteApplicationPdfViewState {
+        pdf_filename: String,
+        page: i64,
+        scale: f64,
+        reply: mpsc::Sender<Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError>>,
+    },
     LoadEditorPage {
         request: SyncEditorLoadRequest,
         reply: mpsc::Sender<Result<SyncEditorLoadOutcome, SyncEditorRequestError>>,
@@ -6269,6 +6319,16 @@ fn run_actor_loop(
                 note_application_save_stage(|timings| {
                     timings.actor_total = started.elapsed();
                 });
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::WriteApplicationPdfViewState {
+                pdf_filename,
+                page,
+                scale,
+                reply,
+            } => {
+                let result = actor.write_application_pdf_view_state(&pdf_filename, page, scale);
                 let _ = reply.send(result);
                 false
             }
@@ -10782,6 +10842,21 @@ impl RuntimeActor {
             timings.application_outcome = outcome_started.elapsed();
         });
         outcome
+    }
+
+    fn write_application_pdf_view_state(
+        &mut self,
+        pdf_filename: &str,
+        page: i64,
+        scale: f64,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationUnitOutcome::Deferred { state });
+        }
+        self.graph
+            .write_pdf_view_state_asset_only(pdf_filename, page, scale)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_view_state"))?;
+        Ok(SyncApplicationUnitOutcome::Applied)
     }
 
     fn settle_application_publication(
@@ -20023,6 +20098,23 @@ mod tests {
             serde_json::to_value(graph.orphan_assets()).unwrap(),
             "managed orphan discovery must share Direct Files raw-reference and filesystem semantics"
         );
+        assert_eq!(
+            handle
+                .write_application_pdf_view_state("paper.pdf".into(), 7, 1.75)
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let pdf_state = crate::pdf::parse_pdf_state(
+            &fs::read_to_string(
+                fixture
+                    .graph_root()
+                    .join("assets")
+                    .join(format!("{}.edn", crate::pdf::asset_key("paper.pdf"))),
+            )
+            .unwrap(),
+        );
+        assert_eq!(pdf_state.page, Some(7));
+        assert_eq!(pdf_state.scale, Some(1.75));
         for autocomplete in [false, true] {
             let hidden_properties = if autocomplete {
                 vec!["custom".to_owned()]

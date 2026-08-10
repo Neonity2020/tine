@@ -226,7 +226,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("verify_plugin_registry", NoGraphSlot),
     ("warm_done", NoGraphSlot),
     ("write_highlights", LegacyOnly),
-    ("write_pdf_view_state", LegacyOnly),
+    ("write_pdf_view_state", ManagedRouted),
 ];
 
 /// Every command that a managed binding refuses outright, with the reason it
@@ -289,10 +289,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     ),
     (
         "write_highlights",
-        "asset-domain sidecar, still on the legacy authority",
-    ),
-    (
-        "write_pdf_view_state",
         "asset-domain sidecar, still on the legacy authority",
     ),
 ];
