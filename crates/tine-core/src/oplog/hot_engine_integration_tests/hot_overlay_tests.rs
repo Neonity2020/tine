@@ -873,7 +873,7 @@ fn fresh_schema2_append_proof_requires_two_syncs_and_applies_once() {
         .unwrap();
     let (segment, recovery) = LocalJournalSegmentV2::open_selected(&directory, &selection).unwrap();
     assert_eq!(recovery.frames_recovered, 0);
-    let mut journal = ManagedLocalJournal::from_open_v2(segment);
+    let mut journal = ManagedLocalJournal::from_open_v2(1, segment);
 
     let append = append_managed_local_record(&mut journal, &prepared).unwrap();
     assert_eq!(append.protocol(), ManagedLocalJournalProtocol::V2);

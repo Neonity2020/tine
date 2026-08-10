@@ -8081,7 +8081,10 @@ fn open_exact_managed_local_v2_successor(
     if recovery.frames_recovered != 0 || recovery.discarded_tail_bytes != 0 {
         return Err("managed-local successor is not the exact empty rollover tuple".into());
     }
-    Ok(ManagedLocalJournal::from_open_v2(journal))
+    Ok(ManagedLocalJournal::from_open_v2(
+        selector_generation,
+        journal,
+    ))
 }
 
 fn prepare_fresh_managed_local_v2_journal(
@@ -8131,7 +8134,10 @@ fn prepare_fresh_managed_local_v2_journal(
         .map_err(|error| {
             format!("cannot publish fresh managed-local schema-2 anchor {anchor_name}: {error}")
         })?;
-    Ok((ManagedLocalJournal::from_open_v2(journal), anchor))
+    Ok((
+        ManagedLocalJournal::from_open_v2(selector_generation, journal),
+        anchor,
+    ))
 }
 
 fn open_managed_local_runtime(
@@ -8201,7 +8207,7 @@ fn open_managed_local_runtime(
                         },
                     )?;
                 (
-                    ManagedLocalJournal::from_open_v2(journal),
+                    ManagedLocalJournal::from_open_v2(selector_generation, journal),
                     anchor.checkpoint().clone(),
                     anchor.accepted_batch_id(),
                 )
@@ -8338,7 +8344,11 @@ fn open_managed_local_runtime(
             }
             checkpoint = decoded;
         }
-    } else if journal.protocol() == ManagedLocalJournalProtocol::LegacyV1 {
+    } else {
+        // A schema-2 anchor binds its compacted base.  Later drained frames
+        // retain their immutable checkpoints beside that tuple just like a
+        // non-initial schema-1 generation, so reopen must consume them before
+        // deciding which physical suffix remains pending.
         let mut checkpoint_sequences = names
             .iter()
             .filter_map(|name| managed_local_checkpoint_sequence(name))
@@ -13910,11 +13920,11 @@ impl RuntimeActor {
             .as_ref()
             .is_some_and(|managed| managed.frames.is_empty())
         {
-            let rolled_over = match self.rollover_drained_legacy_managed_local_journal() {
-                Ok(rolled_over) => rolled_over,
+            let compacted = match self.compact_drained_managed_local_journal() {
+                Ok(compacted) => compacted,
                 Err(error) => return Some(SyncRuntimeTick::RecoveryBlocked(error)),
             };
-            if rolled_over {
+            if compacted {
                 return Some(SyncRuntimeTick::Recovering);
             }
         }
@@ -14097,7 +14107,7 @@ impl RuntimeActor {
                     if let Err(error) = self.collapse_drained_managed_local_overlay() {
                         return Some(SyncRuntimeTick::RecoveryBlocked(error));
                     }
-                    match self.rollover_drained_legacy_managed_local_journal() {
+                    match self.compact_drained_managed_local_journal() {
                         Ok(true) => {
                             // The compacted generation is a sparse, already
                             // quiescent checkpoint. Refresh the disposable
@@ -14196,157 +14206,141 @@ impl RuntimeActor {
             .map_err(|error| format!("managed-local collapse failed: {error}"))
     }
 
-    fn rollover_drained_legacy_managed_local_journal(&mut self) -> Result<bool, String> {
-        let (directory, device_id, legacy_generation, next_sequence, checkpoint, accepted_batch_id) = {
+    fn compact_drained_managed_local_journal(&mut self) -> Result<bool, String> {
+        let (
+            directory,
+            device_id,
+            protocol,
+            opened_generation,
+            next_sequence,
+            suffix_frames,
+            checkpoint,
+            accepted_batch_id,
+        ) = {
             let managed = self
                 .managed_local
                 .as_ref()
-                .ok_or_else(|| "managed-local rollover has no runtime state".to_owned())?;
-            if managed.journal.protocol() == ManagedLocalJournalProtocol::V2
-                || !managed.frames.is_empty()
-                || managed.pending_commit.is_some()
-            {
+                .ok_or_else(|| "managed-local compaction has no runtime state".to_owned())?;
+            if !managed.frames.is_empty() || managed.pending_commit.is_some() {
                 return Ok(false);
             }
             if managed.checkpoint.next_sequence() != managed.journal.next_sequence() {
-                return Err("managed-local rollover checkpoint is not current".into());
+                return Err("managed-local compaction checkpoint is not current".into());
+            }
+            let protocol = managed.journal.protocol();
+            let opened_generation = match protocol {
+                ManagedLocalJournalProtocol::LegacyV1 => managed.journal.base_sequence(),
+                ManagedLocalJournalProtocol::V2 => {
+                    managed.journal.v2_selector_generation().ok_or_else(|| {
+                        "managed-local schema-2 journal is missing its selector binding".to_owned()
+                    })?
+                }
+            };
+            let suffix_frames = managed
+                .journal
+                .next_sequence()
+                .checked_sub(managed.journal.base_sequence())
+                .ok_or_else(|| "managed-local journal sequence is before its base".to_owned())?;
+            if protocol == ManagedLocalJournalProtocol::V2
+                && suffix_frames < MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+            {
+                return Ok(false);
             }
             (
                 managed.directory.try_clone().map_err(display)?,
                 managed.journal.device_id(),
-                managed.journal.base_sequence(),
+                protocol,
+                opened_generation,
                 managed.journal.next_sequence(),
+                suffix_frames,
                 managed.checkpoint.clone(),
                 managed.checkpoint_batch_id,
             )
         };
         if (next_sequence == 0) != accepted_batch_id.is_none() {
-            return Err("managed-local rollover checkpoint/batch binding is invalid".into());
+            return Err("managed-local compaction checkpoint/batch binding is invalid".into());
         }
 
         {
             let authority = self
                 .authority
                 .as_mut()
-                .ok_or_else(|| "managed-local rollover has no active authority".to_owned())?;
+                .ok_or_else(|| "managed-local compaction has no active authority".to_owned())?;
             let runtime = self
                 .runtime
                 .as_mut()
-                .ok_or_else(|| "managed-local rollover has no active runtime".to_owned())?;
+                .ok_or_else(|| "managed-local compaction has no active runtime".to_owned())?;
             let mut session = runtime
                 .admit_promoted_mutation(authority, &self.graph)
-                .map_err(|error| format!("managed-local rollover was refused: {error}"))?;
+                .map_err(|error| format!("managed-local compaction was refused: {error}"))?;
             let engine = session.engine().map_err(|error| {
-                format!("managed-local rollover lost engine authority: {error}")
+                format!("managed-local compaction lost engine authority: {error}")
             })?;
             let prefix = engine.managed_local_prefix_state();
             if prefix.next_sequence != next_sequence || prefix.records_applied != 0 {
                 return Err(
-                    "managed-local rollover requires an exactly collapsed hot overlay".into(),
+                    "managed-local compaction requires an exactly collapsed hot overlay".into(),
                 );
             }
             if let Some(batch_id) = accepted_batch_id {
                 if !engine.accepted_batch_is_active(batch_id).map_err(display)? {
                     return Err(
-                        "managed-local rollover accepted-history evidence is not active".into(),
+                        "managed-local compaction accepted-history evidence is not active".into(),
                     );
                 }
             }
         }
 
         let names = managed_local_directory_names(&directory)?;
-        match select_managed_local_authority_generation(&names, device_id)? {
-            Some(ManagedLocalAuthorityGeneration::LegacyV1(generation))
-                if generation == legacy_generation => {}
-            Some(authority) => {
+        let authority = select_managed_local_authority_generation(&names, device_id)?;
+        match (protocol, authority) {
+            (
+                ManagedLocalJournalProtocol::LegacyV1,
+                Some(ManagedLocalAuthorityGeneration::LegacyV1(generation)),
+            ) if generation == opened_generation => {}
+            (ManagedLocalJournalProtocol::LegacyV1, None) if opened_generation == 0 => {}
+            (
+                ManagedLocalJournalProtocol::V2,
+                Some(ManagedLocalAuthorityGeneration::SchemaV2(generation)),
+            ) if generation == opened_generation => {}
+            (_, Some(authority)) => {
                 return Err(format!(
-                    "managed-local rollover observed newer global authority generation {}; reopen before migrating legacy generation {legacy_generation}",
+                    "managed-local compaction observed global authority generation {}; reopen before replacing opened generation {opened_generation}",
                     authority.generation()
                 ));
             }
-            None if legacy_generation == 0 => {}
-            None => {
+            (ManagedLocalJournalProtocol::LegacyV1, None) => {
                 return Err(format!(
-                    "managed-local rollover lost authoritative schema-1 generation {legacy_generation}"
+                    "managed-local compaction lost authoritative schema-1 generation {opened_generation}"
+                ));
+            }
+            (ManagedLocalJournalProtocol::V2, None) => {
+                return Err(format!(
+                    "managed-local compaction lost authoritative schema-2 generation {opened_generation}"
                 ));
             }
         }
-        let selector_generation = legacy_generation
+        let selector_generation = next_managed_local_authority_generation(&names, device_id)?;
+        let expected_generation = opened_generation
             .checked_add(1)
-            .ok_or_else(|| "managed-local rollover selector generation overflow".to_owned())?;
-        // Probe before any caller-owned v2 artifact is created. The retained
-        // publication is also the sole anchor publisher below.
-        let publication = DurableDirectoryPublication::open(&directory).map_err(|error| {
-            format!("managed-local rollover durable publication is unavailable: {error}")
-        })?;
-        let anchor = ManagedLocalGenerationAnchorV2::new(
+            .ok_or_else(|| "managed-local compaction selector generation overflow".to_owned())?;
+        if selector_generation != expected_generation {
+            return Err(format!(
+                "managed-local compaction successor generation {selector_generation} is not global successor {expected_generation}"
+            ));
+        }
+        debug_assert!(
+            protocol == ManagedLocalJournalProtocol::LegacyV1
+                || suffix_frames >= MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+        );
+        let new_journal = self.prepare_publish_and_open_managed_local_v2_successor(
+            &directory,
+            device_id,
             selector_generation,
             checkpoint,
             accepted_batch_id,
-            Uuid::new_v4(),
-        )
-        .map_err(|error| format!("cannot construct managed-local rollover anchor: {error}"))?;
-        let anchor_name = managed_local_v2_anchor_name(device_id, selector_generation);
-        let anchor_bytes = anchor
-            .encode()
-            .map_err(|error| format!("cannot encode managed-local rollover anchor: {error}"))?;
-        LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(
-            &directory,
-            anchor.selection(),
-        )
-        .map_err(|error| format!("cannot prepare managed-local rollover tuple: {error}"))?;
-        if managed_local_compaction_cut!(device_id, AfterV2Prepare) {
-            return Err("injected crash after managed-local v2 tuple preparation".into());
-        }
-        let (prepared, recovery) =
-            LocalJournalSegmentV2::open_selected(&directory, anchor.selection())
-                .map_err(|error| format!("cannot open managed-local rollover tuple: {error}"))?;
-        if recovery.frames_recovered != 0
-            || recovery.discarded_tail_bytes != 0
-            || prepared.next_sequence() != next_sequence
-        {
-            return Err("managed-local rollover tuple is not empty at the checkpoint".into());
-        }
-        if managed_local_compaction_cut!(device_id, BeforeAnchorPublication) {
-            return Err("injected crash before managed-local schema-2 anchor publication".into());
-        }
-
-        let new_journal = match publication.publish_new_exact(&anchor_name, &anchor_bytes) {
-            Ok(()) if !managed_local_compaction_cut!(device_id, AfterAnchorBeforeVerification) => {
-                ManagedLocalJournal::from_open_v2(prepared)
-            }
-            Ok(()) => {
-                drop(prepared);
-                open_exact_managed_local_v2_successor(
-                    &directory,
-                    &self.binding,
-                    selector_generation,
-                    &anchor,
-                )
-                .map_err(|error| {
-                    self.latch_terminal(format!(
-                        "managed-local rollover successor resolution failed after anchor publication: {error}"
-                    ));
-                    error
-                })?
-            }
-            Err(publication_error) => {
-                drop(prepared);
-                open_exact_managed_local_v2_successor(
-                    &directory,
-                    &self.binding,
-                    selector_generation,
-                    &anchor,
-                )
-                .map_err(|resolution_error| {
-                    let detail = format!(
-                        "managed-local rollover anchor publication failed ({publication_error}) and exact successor resolution failed: {resolution_error}"
-                    );
-                    self.latch_terminal(detail.clone());
-                    detail
-                })?
-            }
-        };
+            next_sequence,
+        )?;
 
         let managed = self
             .managed_local
@@ -14358,6 +14352,93 @@ impl RuntimeActor {
             return Err("injected crash after managed-local in-memory protocol switch".into());
         }
         Ok(true)
+    }
+
+    fn prepare_publish_and_open_managed_local_v2_successor(
+        &mut self,
+        directory: &Dir,
+        device_id: Uuid,
+        selector_generation: u64,
+        checkpoint: ManagedLocalDrainCheckpoint,
+        accepted_batch_id: Option<BatchId>,
+        next_sequence: u64,
+    ) -> Result<ManagedLocalJournal<ManagedLocalJournalPayloadKind>, String> {
+        // Probe before any caller-owned v2 artifact is created. The retained
+        // publication is also the sole anchor publisher below.
+        let publication = DurableDirectoryPublication::open(directory).map_err(|error| {
+            format!("managed-local successor durable publication is unavailable: {error}")
+        })?;
+        let anchor = ManagedLocalGenerationAnchorV2::new(
+            selector_generation,
+            checkpoint,
+            accepted_batch_id,
+            Uuid::new_v4(),
+        )
+        .map_err(|error| format!("cannot construct managed-local successor anchor: {error}"))?;
+        let anchor_name = managed_local_v2_anchor_name(device_id, selector_generation);
+        let anchor_bytes = anchor
+            .encode()
+            .map_err(|error| format!("cannot encode managed-local successor anchor: {error}"))?;
+        LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(
+            directory,
+            anchor.selection(),
+        )
+        .map_err(|error| format!("cannot prepare managed-local successor tuple: {error}"))?;
+        if managed_local_compaction_cut!(device_id, AfterV2Prepare) {
+            return Err("injected crash after managed-local v2 tuple preparation".into());
+        }
+        let (prepared, recovery) =
+            LocalJournalSegmentV2::open_selected(directory, anchor.selection())
+                .map_err(|error| format!("cannot open managed-local successor tuple: {error}"))?;
+        if recovery.frames_recovered != 0
+            || recovery.discarded_tail_bytes != 0
+            || prepared.next_sequence() != next_sequence
+        {
+            return Err("managed-local successor tuple is not empty at the checkpoint".into());
+        }
+        if managed_local_compaction_cut!(device_id, BeforeAnchorPublication) {
+            return Err("injected crash before managed-local schema-2 anchor publication".into());
+        }
+
+        match publication.publish_new_exact(&anchor_name, &anchor_bytes) {
+            Ok(()) if !managed_local_compaction_cut!(device_id, AfterAnchorBeforeVerification) => {
+                Ok(ManagedLocalJournal::from_open_v2(
+                    selector_generation,
+                    prepared,
+                ))
+            }
+            Ok(()) => {
+                drop(prepared);
+                open_exact_managed_local_v2_successor(
+                    directory,
+                    &self.binding,
+                    selector_generation,
+                    &anchor,
+                )
+                .map_err(|error| {
+                    self.latch_terminal(format!(
+                        "managed-local successor resolution failed after anchor publication: {error}"
+                    ));
+                    error
+                })
+            }
+            Err(publication_error) => {
+                drop(prepared);
+                open_exact_managed_local_v2_successor(
+                    directory,
+                    &self.binding,
+                    selector_generation,
+                    &anchor,
+                )
+                .map_err(|resolution_error| {
+                    let detail = format!(
+                        "managed-local successor anchor publication failed ({publication_error}) and exact successor resolution failed: {resolution_error}"
+                    );
+                    self.latch_terminal(detail.clone());
+                    detail
+                })
+            }
+        }
     }
 
     fn tick(&mut self) -> SyncRuntimeTick {
@@ -25359,7 +25440,14 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
-        assert!(managed_local_journal_frames(&request).is_empty());
+        assert!(
+            managed_local_file_names(&request)
+                .iter()
+                .filter(|name| name.ends_with(".anchor-v2"))
+                .count()
+                > 1,
+            "accepted/drained saves crossing the threshold must advance schema-2 authority"
+        );
         let reopened = active_handle(SyncRuntimeHandle::open(request));
         drive_initial_feed(&reopened);
         let cold_markdown = load_application_exact(&reopened, markdown_path);
@@ -25788,14 +25876,31 @@ mod tests {
     }
 
     #[test]
-    fn schema2_drained_history_remains_authoritative_until_retirement_is_implemented() {
-        let fixture = RuntimeHostFixture::safe("managed-local-v2-no-retirement");
+    fn schema2_drained_history_crossing_threshold_compacts_to_one_higher_successor() {
+        let fixture = RuntimeHostFixture::safe("managed-local-v2-compaction-successor");
         let request = fixture.request();
         let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
         drive_initial_feed(&handle);
         let path = "diary/日記/Schema 2 history.org";
         admit_external_page(&handle, &fixture, path, b"* before retained history\n");
         let (mut page, mut revision) = load_application_exact(&handle, path);
+        let initial_names = managed_local_file_names(&request);
+        let initial_anchor = initial_names
+            .iter()
+            .find(|name| name.ends_with(".anchor-v2"))
+            .expect("fresh managed state has one schema-2 selector")
+            .clone();
+        let device_id = managed_local_test_device_id(
+            &initial_names
+                .iter()
+                .filter(|name| name.ends_with(".journal-v2"))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let initial_generation = parse_managed_local_v2_anchor_name(&initial_anchor, device_id)
+            .expect("fresh schema-2 selector is canonical");
+        let expected_successor =
+            managed_local_v2_anchor_name(device_id, initial_generation.checked_add(1).unwrap());
         for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
             (page, revision) = save_application_block_text(
                 &handle,
@@ -25805,14 +25910,217 @@ mod tests {
             );
         }
         drain_managed_local(&handle);
+        let compacted = handle.status().unwrap();
+        assert_eq!(compacted.managed_local_pending, 0);
         assert_eq!(
-            managed_local_journal_frames(&request).len(),
-            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize
+            compacted.managed_local_next_sequence,
+            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+        );
+        assert_eq!(
+            compacted.managed_local_checkpointed_sequence,
+            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+        );
+        let compacted_names = managed_local_file_names(&request);
+        assert_eq!(
+            compacted_names
+                .iter()
+                .filter(|name| name.ends_with(".anchor-v2"))
+                .count(),
+            2,
+            "R1 retains the old complete authority and adds one successor"
+        );
+        assert!(compacted_names.contains(&initial_anchor));
+        assert!(compacted_names.contains(&expected_successor));
+        for name in &initial_names {
+            assert!(
+                compacted_names.contains(name),
+                "R1 must retain the complete old tuple {name}"
+            );
+        }
+        let expected = load_application_exact(&handle, path);
+        assert_parser_dto_semantics(&page, &expected.0);
+        assert_eq!(revision, expected.1);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(request));
+        let reopened_status = reopened.status().unwrap();
+        assert_eq!(reopened_status.managed_local_pending, 0);
+        assert_eq!(
+            reopened_status.managed_local_next_sequence,
+            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+        );
+        let restored = load_application_exact(&reopened, path);
+        assert_parser_dto_semantics(&expected.0, &restored.0);
+        assert_eq!(expected.1, restored.1);
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn drained_schema2_history_below_threshold_does_not_compact() {
+        let fixture = RuntimeHostFixture::safe("managed-local-v2-compaction-below-threshold");
+        let request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+        drive_initial_feed(&handle);
+        let path = "diary/日記/Schema 2 short history.org";
+        admit_external_page(&handle, &fixture, path, b"* before short history\n");
+        let (mut page, mut revision) = load_application_exact(&handle, path);
+        let initial_names = managed_local_file_names(&request);
+        for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD - 1 {
+            (page, revision) = save_application_block_text(
+                &handle,
+                page,
+                revision,
+                &format!("short schema-2 edit {index}"),
+            );
+        }
+        drain_managed_local(&handle);
+        let drained_names = managed_local_file_names(&request);
+        assert_eq!(
+            drained_names
+                .iter()
+                .filter(|name| name.ends_with(".anchor-v2"))
+                .count(),
+            1,
+            "a drained suffix below the frame threshold must remain in its current tuple"
+        );
+        for name in &initial_names {
+            assert!(drained_names.contains(name));
+        }
+        assert_eq!(
+            handle.status().unwrap().managed_local_next_sequence,
+            MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD - 1
         );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn schema2_compaction_crash_cuts_reopen_on_the_exact_successor_without_duplicate_append() {
+        use ManagedLocalCompactionFaultPoint as Cut;
+
+        for (ordinal, cut) in [
+            Cut::AfterV2Prepare,
+            Cut::AfterAnchorBeforeVerification,
+            Cut::AfterInMemorySwitch,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture =
+                RuntimeHostFixture::safe(&format!("managed-local-v2-compaction-cut-{ordinal}"));
+            let request = fixture.request();
+            let handle = active_handle(SyncRuntimeHandle::open(request.clone()));
+            drive_initial_feed(&handle);
+            let path = "content/nested pages/Schema 2 compaction cut.md";
+            admit_external_page(&handle, &fixture, path, b"- before compaction cut\n");
+            let (mut page, mut revision) = load_application_exact(&handle, path);
+            let initial_names = managed_local_file_names(&request);
+            let device_id = managed_local_test_device_id(
+                &initial_names
+                    .iter()
+                    .filter(|name| name.ends_with(".journal-v2"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            let initial_generation = initial_names
+                .iter()
+                .find_map(|name| parse_managed_local_v2_anchor_name(name, device_id))
+                .expect("fresh managed state has a canonical schema-2 selector");
+            let expected_successor =
+                managed_local_v2_anchor_name(device_id, initial_generation.checked_add(1).unwrap());
+            let manifests_before = fixture.manifest_count();
+            let applied_before = fixture.applied_batch_count();
+            for index in 0..MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD {
+                (page, revision) = save_application_block_text(
+                    &handle,
+                    page,
+                    revision,
+                    &format!("cut edit {index}"),
+                );
+            }
+            fail_managed_local_compaction_once_at(device_id, cut);
+            let mut cut_observed = false;
+            for _ in 0..4_096 {
+                let tick = handle.tick().unwrap();
+                if matches!(tick, SyncRuntimeTick::RecoveryBlocked(_)) {
+                    cut_observed = true;
+                    break;
+                }
+                if cut == Cut::AfterAnchorBeforeVerification
+                    && managed_local_file_names(&request).contains(&expected_successor)
+                    && handle.status().unwrap().managed_local_pending == 0
+                {
+                    // The existing after-anchor seam forces exact resolution
+                    // in-process instead of returning an ambiguous outcome.
+                    // Drop immediately after that resolution, so reopen still
+                    // proves the selected successor is exact and append-free.
+                    cut_observed = true;
+                    break;
+                }
+                assert!(
+                    !matches!(tick, SyncRuntimeTick::Terminal(_)),
+                    "schema-2 compaction cut {cut:?} unexpectedly became terminal: {tick:?}"
+                );
+            }
+            assert!(
+                cut_observed,
+                "schema-2 compaction cut {cut:?} was not reached"
+            );
+            assert_eq!(handle.status().unwrap().managed_local_pending, 0);
+            drop(handle);
+
+            let reopened = active_handle(SyncRuntimeHandle::open(request.clone()));
+            for _ in 0..16 {
+                if managed_local_file_names(&request).contains(&expected_successor) {
+                    break;
+                }
+                let tick = reopened.tick().unwrap();
+                assert!(
+                    !matches!(
+                        tick,
+                        SyncRuntimeTick::Terminal(_) | SyncRuntimeTick::RecoveryBlocked(_)
+                    ),
+                    "schema-2 compaction cut {cut:?} did not resolve on reopen: {tick:?}"
+                );
+            }
+            let names = managed_local_file_names(&request);
+            assert!(names.contains(&expected_successor));
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.ends_with(".anchor-v2"))
+                    .count(),
+                2,
+                "schema-2 compaction cut {cut:?} must resolve one exact successor"
+            );
+            assert_eq!(
+                reopened.status().unwrap().managed_local_next_sequence,
+                MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD
+            );
+            assert_eq!(
+                fixture.manifest_count(),
+                manifests_before + MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize
+            );
+            assert_eq!(
+                fixture.applied_batch_count(),
+                applied_before + MANAGED_LOCAL_COMPACTION_FRAME_THRESHOLD as usize
+            );
+            let restored = load_application_exact(&reopened, path);
+            assert_parser_dto_semantics(&page, &restored.0);
+            assert_eq!(revision, restored.1);
+            assert!(matches!(
+                reopened.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+        }
     }
 
     #[test]
@@ -41510,8 +41818,12 @@ mod tests {
                     SyncShutdownOutcome::Safe(_)
                 ));
                 assert!(
-                    managed_local_journal_frames(&request).is_empty(),
-                    "drain plus test-threshold compaction leaves no active physical suffix"
+                    managed_local_file_names(&request)
+                        .iter()
+                        .filter(|name| name.ends_with(".anchor-v2"))
+                        .count()
+                        > 1,
+                    "drain plus test-threshold compaction advances schema-2 authority"
                 );
 
                 let reopened = active_handle(SyncRuntimeHandle::open(request));

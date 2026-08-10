@@ -6752,7 +6752,7 @@ impl ManagedLocalJournalAppend for ManagedLocalJournal<ManagedLocalJournalPayloa
                     ),
                 ))
             }
-            ManagedLocalJournal::V2(segment) => {
+            ManagedLocalJournal::V2 { segment, .. } => {
                 let receipt =
                     segment
                         .append(payload_kind, payload)

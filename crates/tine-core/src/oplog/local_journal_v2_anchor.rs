@@ -35,7 +35,10 @@ impl ManagedLocalJournalProtocol {
 /// form that established its physical authority.
 pub(crate) enum ManagedLocalJournal<K> {
     LegacyV1(LockedLocalJournalV1Segment<K>),
-    V2(LocalJournalSegmentV2<K>),
+    V2 {
+        selector_generation: u64,
+        segment: LocalJournalSegmentV2<K>,
+    },
 }
 
 impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
@@ -43,42 +46,63 @@ impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
         Self::LegacyV1(segment)
     }
 
-    pub(crate) fn from_open_v2(segment: LocalJournalSegmentV2<K>) -> Self {
-        Self::V2(segment)
+    pub(crate) fn from_open_v2(
+        selector_generation: u64,
+        segment: LocalJournalSegmentV2<K>,
+    ) -> Self {
+        Self::V2 {
+            selector_generation,
+            segment,
+        }
     }
 
     pub(crate) const fn protocol(&self) -> ManagedLocalJournalProtocol {
         match self {
             Self::LegacyV1(_) => ManagedLocalJournalProtocol::LegacyV1,
-            Self::V2(_) => ManagedLocalJournalProtocol::V2,
+            Self::V2 { .. } => ManagedLocalJournalProtocol::V2,
         }
     }
 
     pub(crate) fn device_id(&self) -> Uuid {
         match self {
             Self::LegacyV1(segment) => segment.device_id(),
-            Self::V2(segment) => segment.selection().device_id(),
+            Self::V2 { segment, .. } => segment.selection().device_id(),
         }
     }
 
     pub(crate) fn base_sequence(&self) -> u64 {
         match self {
             Self::LegacyV1(segment) => segment.base_sequence(),
-            Self::V2(segment) => segment.selection().base_sequence(),
+            Self::V2 { segment, .. } => segment.selection().base_sequence(),
         }
     }
 
     pub(crate) fn next_sequence(&self) -> u64 {
         match self {
             Self::LegacyV1(segment) => segment.next_sequence(),
-            Self::V2(segment) => segment.next_sequence(),
+            Self::V2 { segment, .. } => segment.next_sequence(),
         }
     }
 
     pub(crate) fn committed_bytes(&self) -> u64 {
         match self {
             Self::LegacyV1(segment) => segment.committed_bytes(),
-            Self::V2(segment) => segment.committed_bytes(),
+            Self::V2 { segment, .. } => segment.committed_bytes(),
+        }
+    }
+
+    /// The selector generation that authenticated this open schema-2 tuple.
+    ///
+    /// Callers use this only to bind an already-open journal back to the
+    /// authority generation re-enumerated immediately before successor
+    /// publication.
+    pub(crate) const fn v2_selector_generation(&self) -> Option<u64> {
+        match self {
+            Self::LegacyV1(_) => None,
+            Self::V2 {
+                selector_generation,
+                ..
+            } => Some(*selector_generation),
         }
     }
 
@@ -92,7 +116,7 @@ impl<K: LocalJournalPayloadKind> ManagedLocalJournal<K> {
     ) -> Result<u64, LocalJournalError> {
         match self {
             Self::LegacyV1(segment) => segment.replay(visit),
-            Self::V2(segment) => segment.replay(visit),
+            Self::V2 { segment, .. } => segment.replay(visit),
         }
     }
 }
@@ -861,9 +885,10 @@ mod tests {
         let (segment, recovery) =
             LocalJournalSegmentV2::open_selected(&directory.dir, &selection).unwrap();
         assert_eq!(recovery.frames_recovered, 1);
-        let journal = ManagedLocalJournal::from_open_v2(segment);
+        let journal = ManagedLocalJournal::from_open_v2(7, segment);
 
         assert_eq!(journal.protocol(), ManagedLocalJournalProtocol::V2);
+        assert_eq!(journal.v2_selector_generation(), Some(7));
         assert_eq!(journal.device_id(), device_id);
         assert_eq!(journal.base_sequence(), base_sequence);
         assert_eq!(journal.next_sequence(), base_sequence + 1);
