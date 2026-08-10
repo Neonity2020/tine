@@ -1333,6 +1333,7 @@ mod graph_wide_command_boundary_tests {
             "list_templates",
             "query_facets",
             "run_query",
+            "run_advanced_query",
             "run_graph_search",
             "search",
             "rename_page",
@@ -1378,6 +1379,7 @@ mod managed_actor_command_boundary_tests {
             "list_templates",
             "query_facets",
             "run_query",
+            "run_advanced_query",
             "run_graph_search",
             "search",
         ] {
@@ -1424,6 +1426,7 @@ mod managed_actor_command_boundary_tests {
             "list_templates",
             "query_facets",
             "run_query",
+            "run_advanced_query",
             "run_graph_search",
             "search",
         ] {
@@ -1623,26 +1626,55 @@ pub(crate) async fn run_graph_search(
 }
 
 #[tauri::command]
-pub(crate) fn run_advanced_query(
+pub(crate) async fn run_advanced_query(
     query: String,
     current_page: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query::AdvancedResult, String> {
     validate_query_source(&query)?;
-    with_read_graph(&state, |g| {
-        let (result, exceeded, total) = g.run_advanced_query_bounded_cached(
-            &query,
-            current_page.as_deref(),
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        );
-        if exceeded {
-            return Err(format!(
-                "result-too-large: {total} advanced-query matches; narrow the query"
-            ));
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let bounded = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::AdvancedQuery {
+                    query: query.clone(),
+                    current_page: current_page.clone(),
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::AdvancedQuery(result) => result,
+                _ => return Err("managed navigation returned the wrong reply".into()),
+            },
+            None => {
+                let (result, exceeded, total) =
+                    slot.legacy_graph()?.run_advanced_query_bounded_cached(
+                        &query,
+                        current_page.as_deref(),
+                        RESULT_BRIDGE_MAX_ROWS,
+                        RESULT_BRIDGE_MAX_BYTES,
+                    );
+                tine_core::sync_runtime::SyncApplicationBoundedAdvancedResult {
+                    result,
+                    total,
+                    exceeded,
+                }
+            }
+        };
+        if bounded.exceeded {
+            Err(format!(
+                "result-too-large: {} advanced-query matches; narrow the query",
+                bounded.total
+            ))
+        } else {
+            Ok(bounded.result)
         }
-        Ok(result)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

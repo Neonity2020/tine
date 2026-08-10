@@ -1882,6 +1882,16 @@ pub(crate) fn run_application_query_pages_bounded(
     };
     let mut opts = QueryOpts::default();
     pred.collect_opts(&mut opts);
+    run_application_pred_pages_bounded(pages, &pred, &opts, max_rows, max_bytes)
+}
+
+fn run_application_pred_pages_bounded(
+    pages: &[ApplicationQueryPage],
+    pred: &Pred,
+    opts: &QueryOpts,
+    max_rows: usize,
+    max_bytes: usize,
+) -> BoundedGroups {
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
     let sample_admission_cap = opts.sample.filter(|_| opts.sort.is_none());
     let want_recency = matches!(&opts.sort, Some((field, _)) if is_recency_field(field));
@@ -2129,7 +2139,7 @@ pub(crate) fn page_affects_advanced_query(
 /// Result of an advanced (datalog) query: matched groups + which clause heads
 /// ran vs were ignored, so the UI shows "ran X; ignored Y" rather than a blunt
 /// "unsupported". `supported` is false only when nothing in the subset matched.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdvancedResult {
     pub groups: Vec<RefGroup>,
     pub ran: Vec<String>,
@@ -2190,6 +2200,47 @@ pub fn run_advanced_query_bounded(
     let mut opts = QueryOpts::default();
     pred.collect_opts(&mut opts);
     let bounded = run_pred_bounded(graph, &pred, &opts, max_rows, max_bytes);
+    (
+        AdvancedResult {
+            groups: bounded.groups,
+            ran,
+            ignored,
+            supported: true,
+        },
+        bounded.exceeded,
+        bounded.total,
+    )
+}
+
+pub(crate) fn run_application_advanced_query_pages_bounded(
+    pages: &[ApplicationQueryPage],
+    query_src: &str,
+    current_page: Option<&str>,
+    max_rows: usize,
+    max_bytes: usize,
+) -> (AdvancedResult, bool, usize) {
+    if !query_source_within_limit(query_src) {
+        return (rejected_advanced_query("query-too-large"), false, 0);
+    }
+    if !query_nesting_within_limit(query_src) {
+        return (rejected_advanced_query("query-nesting-too-deep"), false, 0);
+    }
+    let (pred, ran, ignored) = advanced_pred(query_src, current_page, JournalDate::today());
+    let Some(pred) = pred else {
+        return (
+            AdvancedResult {
+                groups: Vec::new(),
+                ran,
+                ignored,
+                supported: false,
+            },
+            false,
+            0,
+        );
+    };
+    let mut opts = QueryOpts::default();
+    pred.collect_opts(&mut opts);
+    let bounded = run_application_pred_pages_bounded(pages, &pred, &opts, max_rows, max_bytes);
     (
         AdvancedResult {
             groups: bounded.groups,

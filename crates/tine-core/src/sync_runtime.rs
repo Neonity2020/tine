@@ -1868,6 +1868,12 @@ pub enum SyncApplicationNavigationRequest {
         max_rows: usize,
         max_bytes: usize,
     },
+    AdvancedQuery {
+        query: String,
+        current_page: Option<String>,
+        max_rows: usize,
+        max_bytes: usize,
+    },
     GraphSearch {
         source: String,
         page_limit: usize,
@@ -1886,6 +1892,13 @@ pub enum SyncApplicationNavigationRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyncApplicationBoundedRefGroups {
     pub groups: Vec<RefGroup>,
+    pub total: usize,
+    pub exceeded: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncApplicationBoundedAdvancedResult {
+    pub result: crate::query::AdvancedResult,
     pub total: usize,
     pub exceeded: bool,
 }
@@ -1916,6 +1929,7 @@ pub enum SyncApplicationNavigationReply {
         exceeded: bool,
     },
     SimpleQuery(SyncApplicationBoundedRefGroups),
+    AdvancedQuery(SyncApplicationBoundedAdvancedResult),
     GraphSearch(crate::query_plan::QueryExecution),
     BlockSearch(Vec<RefGroup>),
 }
@@ -4521,6 +4535,34 @@ fn validate_application_navigation_request(
         }
         return Ok(());
     }
+    if let SyncApplicationNavigationRequest::AdvancedQuery {
+        query,
+        current_page,
+        max_rows,
+        max_bytes,
+    } = request
+    {
+        let text_bytes = query
+            .len()
+            .saturating_add(current_page.as_ref().map_or(0, String::len));
+        if !crate::query::query_source_within_limit(query)
+            || !crate::query::query_nesting_within_limit(query)
+            || *max_rows == 0
+            || *max_rows > MAX_SYNC_APPLICATION_RESULT_ROWS
+            || *max_bytes == 0
+            || *max_bytes > MAX_SYNC_APPLICATION_RESULT_BYTES
+            || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+        {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: *max_rows,
+                    text_bytes: text_bytes.max(*max_bytes),
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        return Ok(());
+    }
     if let SyncApplicationNavigationRequest::GraphSearch {
         source,
         page_limit,
@@ -4672,7 +4714,8 @@ fn validate_application_navigation_request(
         SyncApplicationNavigationRequest::BacklinkFilterContext { .. } => unreachable!(),
         SyncApplicationNavigationRequest::PropertyFacets { .. } => unreachable!(),
         SyncApplicationNavigationRequest::GraphSearch { .. }
-        | SyncApplicationNavigationRequest::BlockSearch { .. } => unreachable!(),
+        | SyncApplicationNavigationRequest::BlockSearch { .. }
+        | SyncApplicationNavigationRequest::AdvancedQuery { .. } => unreachable!(),
     };
     if names.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(
@@ -8601,6 +8644,19 @@ impl RuntimeActor {
             } => SyncApplicationNavigationReply::SimpleQuery(
                 self.application_simple_query_ready(&query, max_rows, max_bytes)?,
             ),
+            SyncApplicationNavigationRequest::AdvancedQuery {
+                query,
+                current_page,
+                max_rows,
+                max_bytes,
+            } => SyncApplicationNavigationReply::AdvancedQuery(
+                self.application_advanced_query_ready(
+                    &query,
+                    current_page.as_deref(),
+                    max_rows,
+                    max_bytes,
+                )?,
+            ),
             SyncApplicationNavigationRequest::GraphSearch {
                 source,
                 page_limit,
@@ -9759,6 +9815,48 @@ impl RuntimeActor {
             groups: result.groups,
             total: result.total,
             exceeded: result.exceeded,
+        })
+    }
+
+    fn application_all_query_pages_ready(
+        &self,
+    ) -> Result<Vec<crate::query::ApplicationQueryPage>, SyncApplicationPageRequestError> {
+        let entries = self.application_navigation_pages_ready()?;
+        let mut pages = Vec::with_capacity(entries.len());
+        for (entry, _) in entries {
+            let current = match self.load_application_exact_ready(&entry.rel_path)? {
+                ApplicationExactLoad::Loaded(current) => current,
+                ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                    return Err(SyncApplicationPageRequestError::ActorRefused)
+                }
+            };
+            pages.push(crate::query::ApplicationQueryPage {
+                recency: application_query_page_recency(&self.graph.root, &current.page),
+                page: current.page,
+            });
+        }
+        Ok(pages)
+    }
+
+    fn application_advanced_query_ready(
+        &self,
+        query: &str,
+        current_page: Option<&str>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<SyncApplicationBoundedAdvancedResult, SyncApplicationPageRequestError> {
+        let pages = self.application_all_query_pages_ready()?;
+        let (result, exceeded, total) = crate::query::run_application_advanced_query_pages_bounded(
+            &pages,
+            query,
+            current_page,
+            max_rows,
+            max_bytes,
+        );
+        Ok(SyncApplicationBoundedAdvancedResult {
+            result,
+            total,
+            exceeded,
         })
     }
 
@@ -19533,6 +19631,10 @@ mod tests {
         }
     }
 
+    fn canonicalize_advanced_for_mode_differential(result: &mut crate::query::AdvancedResult) {
+        canonicalize_query_groups_for_mode_differential(&mut result.groups);
+    }
+
     fn assert_parser_dto_semantics(expected: &PageDto, actual: &PageDto) {
         let mut expected = expected.clone();
         let mut actual = actual.clone();
@@ -19942,6 +20044,52 @@ mod tests {
                 "managed all-page query must share Direct Files semantics: {scan_query}"
             );
         }
+        for (advanced_query, current_page) in [
+            ("[:find (pull ?b [*]) :where (task ?b \"TODO\")]", None),
+            (
+                "[:find (pull ?b [*]) :where (page-ref ?b \"Compass\")]",
+                Some("Ordinary Ω"),
+            ),
+            ("[:find (pull ?b [*]) :where (custom-rule ?b \"x\")]", None),
+        ] {
+            let SyncApplicationNavigationReply::AdvancedQuery(mut managed) =
+                navigation(SyncApplicationNavigationRequest::AdvancedQuery {
+                    query: advanced_query.into(),
+                    current_page: current_page.map(str::to_owned),
+                    max_rows: 20_000,
+                    max_bytes: 32 * 1024 * 1024,
+                })
+            else {
+                panic!("wrong advanced-query reply")
+            };
+            let (mut direct, exceeded, total) = graph.run_advanced_query_bounded_cached(
+                advanced_query,
+                current_page,
+                20_000,
+                32 * 1024 * 1024,
+            );
+            assert_eq!(managed.exceeded, exceeded, "{advanced_query}");
+            assert_eq!(managed.total, total, "{advanced_query}");
+            canonicalize_advanced_for_mode_differential(&mut managed.result);
+            canonicalize_advanced_for_mode_differential(&mut direct);
+            assert_eq!(
+                serde_json::to_value(managed.result).unwrap(),
+                serde_json::to_value(direct).unwrap(),
+                "managed advanced query must share Direct Files semantics: {advanced_query}"
+            );
+        }
+        let SyncApplicationNavigationReply::AdvancedQuery(bounded_advanced) =
+            navigation(SyncApplicationNavigationRequest::AdvancedQuery {
+                query: "[:find (pull ?b [*]) :where (task ?b \"TODO\")]".into(),
+                current_page: None,
+                max_rows: 1,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong bounded advanced-query reply")
+        };
+        assert!(bounded_advanced.exceeded);
+        assert!(bounded_advanced.total > bounded_advanced.result.groups.len());
         let requested = vec![
             genuine.to_owned(),
             genuine.to_owned(),
@@ -20486,6 +20634,21 @@ mod tests {
             };
             assert!(has_new, "search missed immediately saved block text");
         }
+        let SyncApplicationNavigationReply::AdvancedQuery(done_query) =
+            loaded(SyncApplicationNavigationRequest::AdvancedQuery {
+                query: "[:find (pull ?b [*]) :where (task ?b \"DONE\")]".into(),
+                current_page: None,
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong immediate advanced-query reply")
+        };
+        assert!(done_query
+            .result
+            .groups
+            .iter()
+            .any(|group| group.page == "Navigation"));
 
         let mut created_block = BlockDto::default();
         created_block.raw = format!(
@@ -20657,6 +20820,21 @@ mod tests {
             };
             assert!(has_created, "search missed immediately created block text");
         }
+        let SyncApplicationNavigationReply::AdvancedQuery(todo_query) =
+            loaded(SyncApplicationNavigationRequest::AdvancedQuery {
+                query: "[:find (pull ?b [*]) :where (task ?b \"TODO\")]".into(),
+                current_page: None,
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong created advanced-query reply")
+        };
+        assert!(todo_query
+            .result
+            .groups
+            .iter()
+            .any(|group| group.page == "Created Navigation"));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
