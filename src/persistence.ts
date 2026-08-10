@@ -296,6 +296,15 @@ export function isTombstonedFile(name: string, path?: string): boolean {
   return deleted === path;
 }
 
+/** Does a tombstone provably cover this file? Unknown path proceeds when the
+ * tombstone names another exact file, allowing the read to decide. */
+export function tombstoneCovers(name: string, path?: string): boolean {
+  if (!deletedPages.has(name)) return false;
+  const deleted = deletedPagePaths.get(name);
+  if (!deleted) return true;
+  return deleted === path;
+}
+
 /** Atomically retire one quiescent page from persistence.
  *
  * Delete calls this synchronously after its awaited drain and exact-instance
