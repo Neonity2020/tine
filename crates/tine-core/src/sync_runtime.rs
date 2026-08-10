@@ -43875,7 +43875,7 @@ mod tests {
         label: &str,
         samples: usize,
         expected_total_pages: Option<usize>,
-        expected_task_candidate_pages: Option<usize>,
+        expected_task_result_rows: Option<usize>,
     ) {
         const MAX_ROWS: usize = 20_000;
         const MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -43894,14 +43894,14 @@ mod tests {
                 total_pages, expected_total_pages,
                 "synthetic query fixture did not activate at its configured scale: {label}"
             );
-            let expected_task_candidate_pages = expected_task_candidate_pages
+            let expected_task_result_rows = expected_task_result_rows
                 .expect("synthetic query fixture must declare its task density");
             assert!(
                 direct_indexed.total > 0,
                 "synthetic indexed Direct query must be nonempty: {label}"
             );
             assert_eq!(
-                direct_indexed.total, expected_task_candidate_pages,
+                direct_indexed.total, expected_task_result_rows,
                 "synthetic indexed Direct total drifted: {label}"
             );
             assert_eq!(
@@ -44002,10 +44002,28 @@ mod tests {
         let mut graph_search_counters = Vec::with_capacity(samples);
         for sample in 0..samples {
             let (elapsed, result, counters) = run_simple(indexed);
+            let bounded_result_rows = result
+                .groups
+                .iter()
+                .map(|group| group.blocks.len())
+                .sum::<usize>();
+            let bounded_result_total = result.total;
             assert_managed_simple_query_matches_direct(
                 &format!("{label} indexed sample={sample}"),
                 result,
                 direct_indexed.clone(),
+            );
+            assert_eq!(
+                counters.sparse_attempts, 1,
+                "indexed task query must make exactly one sparse attempt: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_completions, 1,
+                "indexed task query must complete exactly one sparse attempt: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_fallbacks, 0,
+                "indexed task query must not fall back to the page evaluator: {counters:?}"
             );
             assert_eq!(
                 counters.full_inventory_passes, 0,
@@ -44015,19 +44033,48 @@ mod tests {
                 counters.inventory_pages, 0,
                 "indexed task query visited inventory rows: {counters:?}"
             );
-            if let Some(expected) = expected_task_candidate_pages {
+            assert_eq!(
+                counters.result_page_hydrations, 0,
+                "indexed task query must not hydrate result pages: {counters:?}"
+            );
+            assert_eq!(
+                counters.metadata_page_hydrations, 0,
+                "indexed task query must not hydrate metadata pages: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_parser_rows, counters.sparse_candidate_rows,
+                "indexed task query must parse each deduplicated sparse candidate exactly once: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_rows, 0,
+                "the settled indexed-query receipt must have no overlay candidates: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_dto_constructions, bounded_result_rows,
+                "indexed task query must construct DTOs only for its bounded result rows: {counters:?}"
+            );
+            assert!(
+                bounded_result_rows <= bounded_result_total,
+                "indexed task query emitted more bounded rows than its total: rows={bounded_result_rows} total={bounded_result_total}"
+            );
+            if let Some(expected) = expected_task_result_rows {
                 assert_eq!(
-                    counters.indexed_candidate_pages, expected,
-                    "task candidate density drifted: {counters:?}"
+                    counters.sparse_candidate_rows, expected,
+                    "synthetic task candidate density drifted: {counters:?}"
+                );
+                assert_eq!(
+                    counters.sparse_parser_rows, expected,
+                    "synthetic task parser rows drifted: {counters:?}"
+                );
+                assert_eq!(
+                    counters.sparse_ancestor_rows, 0,
+                    "synthetic root task candidates must not read ancestors: {counters:?}"
+                );
+                assert_eq!(
+                    counters.sparse_dto_constructions, expected,
+                    "synthetic task DTO count drifted: {counters:?}"
                 );
             }
-            assert_eq!(
-                counters.result_page_hydrations,
-                counters
-                    .indexed_candidate_pages
-                    .saturating_add(counters.overlay_pages),
-                "indexed task query must hydrate each distinct unmasked candidate and overlay page as a query result exactly once: {counters:?}"
-            );
             indexed_samples.push(elapsed);
             indexed_counters.push(counters);
 
@@ -44088,16 +44135,24 @@ mod tests {
         let graph_search_p50 = startup_median(&graph_search_samples);
         let graph_search_p95 = startup_p95(&graph_search_samples);
         eprintln!(
-            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_candidates_max={} indexed_overlay_max={} indexed_result_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
+            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_sparse_attempts_max={} indexed_sparse_completions_max={} indexed_sparse_fallbacks_max={} indexed_sparse_candidates_max={} indexed_sparse_ancestors_max={} indexed_sparse_parser_rows_max={} indexed_sparse_overlay_rows_max={} indexed_sparse_dtos_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
             startup_ms(indexed_p50),
             startup_ms(indexed_p95),
             startup_ms(regex_all_p50),
             startup_ms(regex_all_p95),
             startup_ms(graph_search_p50),
             startup_ms(graph_search_p95),
-            max_query_gate_counter(&indexed_counters, |counters| counters.indexed_candidate_pages),
-            max_query_gate_counter(&indexed_counters, |counters| counters.overlay_pages),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_attempts),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_completions),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_fallbacks),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_candidate_rows),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_ancestor_rows),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_parser_rows),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_overlay_rows),
+            max_query_gate_counter(&indexed_counters, |counters| counters.sparse_dto_constructions),
+            max_query_gate_counter(&indexed_counters, |counters| counters.full_inventory_passes),
             max_query_gate_counter(&indexed_counters, |counters| counters.result_page_hydrations),
+            max_query_gate_counter(&indexed_counters, |counters| counters.metadata_page_hydrations),
             max_query_gate_counter(&regex_all_counters, |counters| counters.full_inventory_passes),
             max_query_gate_counter(&regex_all_counters, |counters| counters.result_page_hydrations),
             max_query_gate_counter(&graph_search_counters, |counters| counters.full_inventory_passes),
