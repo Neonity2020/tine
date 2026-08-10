@@ -2644,6 +2644,172 @@ const INTERNAL_PROPS: &[&str] = &[
     "template-including-parent",
 ];
 
+#[derive(Clone, Copy)]
+pub(crate) enum PropertyFacetMode {
+    QueryBuilder,
+    Autocomplete,
+}
+
+pub(crate) struct PropertyFacetAccumulator {
+    mode: PropertyFacetMode,
+    hidden: std::collections::HashSet<String>,
+    max_items: usize,
+    max_bytes: usize,
+    items: usize,
+    bytes: usize,
+    exceeded: bool,
+    map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl PropertyFacetAccumulator {
+    pub(crate) fn query_builder(max_values: usize, max_bytes: usize) -> Self {
+        Self::new(PropertyFacetMode::QueryBuilder, &[], max_values, max_bytes)
+    }
+
+    pub(crate) fn autocomplete(
+        extra_hidden: &[String],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Self {
+        Self::new(
+            PropertyFacetMode::Autocomplete,
+            extra_hidden,
+            max_items,
+            max_bytes,
+        )
+    }
+
+    fn new(
+        mode: PropertyFacetMode,
+        extra_hidden: &[String],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Self {
+        let hidden = match mode {
+            PropertyFacetMode::QueryBuilder => INTERNAL_PROPS
+                .iter()
+                .map(|key| property_key_norm(key))
+                .collect(),
+            PropertyFacetMode::Autocomplete => OG_AUTOCOMPLETE_HIDDEN_PROPS
+                .iter()
+                .map(|key| property_key_norm(key))
+                .chain(
+                    extra_hidden
+                        .iter()
+                        .map(|key| property_key_norm(key.trim_start_matches(':'))),
+                )
+                .collect(),
+        };
+        Self {
+            mode,
+            hidden,
+            max_items,
+            max_bytes,
+            items: 0,
+            bytes: 0,
+            exceeded: false,
+            map: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn offer(&mut self, source_key: &str, source_value: &str) {
+        let key = property_key_norm(source_key);
+        if key.is_empty() || self.hidden.contains(&key) {
+            return;
+        }
+        let key_missing = !self.map.contains_key(&key);
+        match self.mode {
+            PropertyFacetMode::QueryBuilder => {
+                let value = source_value;
+                if value.trim().is_empty()
+                    || self
+                        .map
+                        .get(&key)
+                        .is_some_and(|values| values.contains(value))
+                {
+                    return;
+                }
+                let key_bytes = if key_missing { key.len() + 64 } else { 0 };
+                let next_bytes = self
+                    .bytes
+                    .saturating_add(key_bytes)
+                    .saturating_add(value.len())
+                    .saturating_add(64);
+                if self.items >= self.max_items || next_bytes > self.max_bytes {
+                    self.exceeded = true;
+                    return;
+                }
+                self.items += 1;
+                self.bytes = next_bytes;
+                self.map.entry(key).or_default().insert(value.to_string());
+            }
+            PropertyFacetMode::Autocomplete => {
+                if key_missing {
+                    let key_bytes = key.len().saturating_add(64);
+                    if self.items >= self.max_items
+                        || self.bytes.saturating_add(key_bytes) > self.max_bytes
+                    {
+                        self.exceeded = true;
+                        return;
+                    }
+                    self.items += 1;
+                    self.bytes = self.bytes.saturating_add(key_bytes);
+                    self.map
+                        .insert(key.clone(), std::collections::BTreeSet::new());
+                }
+                let value = source_value.trim();
+                if value.is_empty()
+                    || self
+                        .map
+                        .get(&key)
+                        .is_some_and(|values| values.contains(value))
+                {
+                    return;
+                }
+                let value_bytes = value.len().saturating_add(64);
+                if self.items >= self.max_items
+                    || self.bytes.saturating_add(value_bytes) > self.max_bytes
+                {
+                    self.exceeded = true;
+                    return;
+                }
+                self.items += 1;
+                self.bytes = self.bytes.saturating_add(value_bytes);
+                self.map.entry(key).or_default().insert(value.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> (Vec<(String, Vec<String>)>, bool) {
+        (
+            self.map
+                .into_iter()
+                .map(|(key, values)| (key, values.into_iter().collect()))
+                .collect(),
+            self.exceeded,
+        )
+    }
+}
+
+pub(crate) fn application_page_property_pairs(
+    page: &PageDto,
+    include_page_properties: bool,
+) -> Vec<(String, String)> {
+    fn visit(blocks: &[BlockDto], output: &mut Vec<(String, String)>) {
+        for block in blocks {
+            output.extend(block.properties.iter().cloned());
+            visit(&block.children, output);
+        }
+    }
+
+    let mut output = Vec::new();
+    if include_page_properties {
+        output.extend(page_facets(page.pre_block.as_deref()).0);
+    }
+    visit(&page.blocks, &mut output);
+    output
+}
+
 /// Distinct property keys (each with its sorted distinct values) used across the
 /// graph. Drives the query builder's property-filter pickers.
 pub fn property_facets(graph: &Graph) -> Vec<(String, Vec<String>)> {
@@ -2655,50 +2821,17 @@ pub fn property_facets_bounded(
     max_values: usize,
     max_bytes: usize,
 ) -> (Vec<(String, Vec<String>)>, bool) {
-    use std::collections::BTreeMap;
-    use std::collections::BTreeSet;
-    let mut values = 0usize;
-    let mut bytes = 0usize;
-    let mut exceeded = false;
-    let facets = graph.with_pages(|pages| {
-        let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut accumulator = PropertyFacetAccumulator::query_builder(max_values, max_bytes);
+    graph.with_pages(|pages| {
         for (_entry, doc) in pages {
             walk(&doc.roots, &mut |b| {
                 for (k, v) in b.properties() {
-                    let k = property_key_norm(&k);
-                    if INTERNAL_PROPS.iter().any(|p| property_key_norm(p) == k) {
-                        continue;
-                    }
-                    if v.trim().is_empty() {
-                        continue;
-                    }
-                    if map.get(&k).is_some_and(|set| set.contains(&v)) {
-                        continue;
-                    }
-                    let key_bytes = if map.contains_key(&k) {
-                        0
-                    } else {
-                        k.len() + 64
-                    };
-                    let next_bytes = bytes
-                        .saturating_add(key_bytes)
-                        .saturating_add(v.len())
-                        .saturating_add(64);
-                    if values >= max_values || next_bytes > max_bytes {
-                        exceeded = true;
-                    } else {
-                        values += 1;
-                        bytes = next_bytes;
-                        map.entry(k).or_default().insert(v);
-                    }
+                    accumulator.offer(&k, &v);
                 }
             });
         }
-        map.into_iter()
-            .map(|(k, vs)| (k, vs.into_iter().collect()))
-            .collect()
     });
-    (facets, exceeded)
+    accumulator.finish()
 }
 
 /// OG-visible property names and their distinct values for editor completion.
@@ -2744,72 +2877,24 @@ pub fn autocomplete_property_facets_bounded(
     max_items: usize,
     max_bytes: usize,
 ) -> (Vec<(String, Vec<String>)>, bool) {
-    use std::collections::{BTreeMap, BTreeSet, HashSet};
-
-    let hidden: HashSet<String> = OG_AUTOCOMPLETE_HIDDEN_PROPS
-        .iter()
-        .map(|key| property_key_norm(key))
-        .chain(
-            graph
-                .config
-                .block_hidden_properties
-                .iter()
-                .map(|key| property_key_norm(key.trim_start_matches(':'))),
-        )
-        .collect();
-    let mut items = 0usize;
-    let mut bytes = 0usize;
-    let mut exceeded = false;
-
-    let facets = graph.with_pages(|pages| {
-        let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut offer = |source_key: String, source_value: String| {
-            let key = property_key_norm(&source_key);
-            if key.is_empty() || hidden.contains(&key) {
-                return;
-            }
-
-            if !map.contains_key(&key) {
-                let key_bytes = key.len().saturating_add(64);
-                if items >= max_items || bytes.saturating_add(key_bytes) > max_bytes {
-                    exceeded = true;
-                    return;
-                }
-                items += 1;
-                bytes = bytes.saturating_add(key_bytes);
-                map.insert(key.clone(), BTreeSet::new());
-            }
-
-            let value = source_value.trim();
-            if value.is_empty() || map.get(&key).is_some_and(|values| values.contains(value)) {
-                return;
-            }
-            let value_bytes = value.len().saturating_add(64);
-            if items >= max_items || bytes.saturating_add(value_bytes) > max_bytes {
-                exceeded = true;
-                return;
-            }
-            items += 1;
-            bytes = bytes.saturating_add(value_bytes);
-            map.entry(key).or_default().insert(value.to_string());
-        };
-
+    let mut accumulator = PropertyFacetAccumulator::autocomplete(
+        &graph.config.block_hidden_properties,
+        max_items,
+        max_bytes,
+    );
+    graph.with_pages(|pages| {
         for (_entry, doc) in pages {
             for (key, value) in page_facets(doc.pre_block.as_deref()).0 {
-                offer(key, value);
+                accumulator.offer(&key, &value);
             }
             walk(&doc.roots, &mut |block| {
                 for (key, value) in block.properties() {
-                    offer(key, value);
+                    accumulator.offer(&key, &value);
                 }
             });
         }
-
-        map.into_iter()
-            .map(|(key, values)| (key, values.into_iter().collect()))
-            .collect()
     });
-    (facets, exceeded)
+    accumulator.finish()
 }
 
 #[cfg(test)]

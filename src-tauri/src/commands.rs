@@ -1301,6 +1301,7 @@ mod graph_wide_command_boundary_tests {
             "block_referrers",
             "get_backlink_filter_context",
             "list_templates",
+            "query_facets",
             "rename_page",
             "delete_page",
         ] {
@@ -1342,6 +1343,7 @@ mod managed_actor_command_boundary_tests {
             "get_backlink_filter_context",
             "get_unlinked_refs",
             "list_templates",
+            "query_facets",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1384,6 +1386,7 @@ mod managed_actor_command_boundary_tests {
             "get_backlink_filter_context",
             "get_unlinked_refs",
             "list_templates",
+            "query_facets",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");
@@ -1553,33 +1556,70 @@ pub(crate) fn run_advanced_query(
 }
 
 #[tauri::command]
-pub(crate) fn query_facets(
+pub(crate) async fn query_facets(
     state: GraphContext<'_>,
     autocomplete: Option<bool>,
 ) -> Result<Vec<(String, Vec<String>)>, String> {
-    with_read_graph(&state, |g| {
-        if autocomplete.unwrap_or(false) {
-            // The editor's OG policy intentionally differs from query-builder
-            // facets; use a separately bounded collector without changing the
-            // default command behavior.
-            return Ok(tine_core::query::autocomplete_property_facets_bounded(
-                g,
-                AUTOCOMPLETE_FACET_MAX_ITEMS,
-                AUTOCOMPLETE_FACET_MAX_BYTES,
-            )
-            .0);
-        }
-        let (facets, exceeded) = tine_core::query::property_facets_bounded(
-            g,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        );
-        if exceeded {
-            Err("result-too-large: property facets exceed the construction budget".into())
-        } else {
-            Ok(facets)
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let autocomplete = autocomplete.unwrap_or(false);
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let meta = slot.graph_meta();
+                let (max_items, max_bytes) = if autocomplete {
+                    (AUTOCOMPLETE_FACET_MAX_ITEMS, AUTOCOMPLETE_FACET_MAX_BYTES)
+                } else {
+                    (RESULT_BRIDGE_MAX_ROWS, RESULT_BRIDGE_MAX_BYTES)
+                };
+                match sparse_navigation(
+                    handle,
+                    SyncApplicationNavigationRequest::PropertyFacets {
+                        autocomplete,
+                        hidden_properties: meta.block_hidden_properties,
+                        max_items,
+                        max_bytes,
+                    },
+                )? {
+                    SyncApplicationNavigationReply::PropertyFacets { facets, exceeded } => {
+                        if exceeded && !autocomplete {
+                            Err(
+                                "result-too-large: property facets exceed the construction budget"
+                                    .into(),
+                            )
+                        } else {
+                            Ok(facets)
+                        }
+                    }
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => {
+                let graph = slot.legacy_graph()?;
+                if autocomplete {
+                    return Ok(tine_core::query::autocomplete_property_facets_bounded(
+                        &graph,
+                        AUTOCOMPLETE_FACET_MAX_ITEMS,
+                        AUTOCOMPLETE_FACET_MAX_BYTES,
+                    )
+                    .0);
+                }
+                let (facets, exceeded) = tine_core::query::property_facets_bounded(
+                    &graph,
+                    RESULT_BRIDGE_MAX_ROWS,
+                    RESULT_BRIDGE_MAX_BYTES,
+                );
+                if exceeded {
+                    Err("result-too-large: property facets exceed the construction budget".into())
+                } else {
+                    Ok(facets)
+                }
+            }
         }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

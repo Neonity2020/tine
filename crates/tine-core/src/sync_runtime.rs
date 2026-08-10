@@ -1855,6 +1855,12 @@ pub enum SyncApplicationNavigationRequest {
         targets: Vec<BacklinkFilterTarget>,
     },
     ListTemplates,
+    PropertyFacets {
+        autocomplete: bool,
+        hidden_properties: Vec<String>,
+        max_items: usize,
+        max_bytes: usize,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1885,6 +1891,10 @@ pub enum SyncApplicationNavigationReply {
     UnlinkedReferences(SyncApplicationBoundedRefGroups),
     BacklinkFilterContext(BacklinkFilterContext),
     Templates(Vec<TemplateDto>),
+    PropertyFacets {
+        facets: Vec<(String, Vec<String>)>,
+        exceeded: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4417,6 +4427,35 @@ fn validate_application_navigation_request(
         }
         return Ok(());
     }
+    if let SyncApplicationNavigationRequest::PropertyFacets {
+        hidden_properties,
+        max_items,
+        max_bytes,
+        ..
+    } = request
+    {
+        let text_bytes = hidden_properties
+            .iter()
+            .map(String::len)
+            .try_fold(0_usize, usize::checked_add)
+            .unwrap_or(usize::MAX);
+        if hidden_properties.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS
+            || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+            || *max_items == 0
+            || *max_items > MAX_SYNC_APPLICATION_RESULT_ROWS
+            || *max_bytes == 0
+            || *max_bytes > MAX_SYNC_APPLICATION_RESULT_BYTES
+        {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: hidden_properties.len().max(*max_items),
+                    text_bytes: text_bytes.max(*max_bytes),
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        return Ok(());
+    }
     let (names, query, limit) = match request {
         SyncApplicationNavigationRequest::ReferencedPageNames
         | SyncApplicationNavigationRequest::PageAliases
@@ -4499,6 +4538,7 @@ fn validate_application_navigation_request(
             (&[][..], Some(name.as_str()), None)
         }
         SyncApplicationNavigationRequest::BacklinkFilterContext { .. } => unreachable!(),
+        SyncApplicationNavigationRequest::PropertyFacets { .. } => unreachable!(),
     };
     if names.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(
@@ -8384,6 +8424,20 @@ impl RuntimeActor {
             SyncApplicationNavigationRequest::ListTemplates => {
                 SyncApplicationNavigationReply::Templates(self.application_templates_ready()?)
             }
+            SyncApplicationNavigationRequest::PropertyFacets {
+                autocomplete,
+                hidden_properties,
+                max_items,
+                max_bytes,
+            } => {
+                let (facets, exceeded) = self.application_property_facets_ready(
+                    autocomplete,
+                    &hidden_properties,
+                    max_items,
+                    max_bytes,
+                )?;
+                SyncApplicationNavigationReply::PropertyFacets { facets, exceeded }
+            }
         };
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
     }
@@ -9207,6 +9261,90 @@ impl RuntimeActor {
             .into_iter()
             .flat_map(|(_, templates)| templates)
             .collect())
+    }
+
+    fn application_property_facets_ready(
+        &self,
+        autocomplete: bool,
+        hidden_properties: &[String],
+        max_items: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<(String, Vec<String>)>, bool), SyncApplicationPageRequestError> {
+        let overlay = self.application_navigation_overlay_ready()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+
+        // Resolve only the small committed suffix to page IDs once. This masks
+        // stale rows (including deletions) without a page lookup per property or
+        // per base page while streaming the graph-wide facet facts.
+        let mut masked_page_ids = HashSet::new();
+        for path in overlay.keys() {
+            let rows = read
+                .pages_by_path(path, 2)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if rows.len() > 1 {
+                return Err(SyncApplicationPageRequestError::ActorRefused);
+            }
+            masked_page_ids.extend(rows.into_iter().map(|page| page.page_id));
+        }
+
+        let mut accumulator = if autocomplete {
+            crate::query::PropertyFacetAccumulator::autocomplete(
+                hidden_properties,
+                max_items,
+                max_bytes,
+            )
+        } else {
+            crate::query::PropertyFacetAccumulator::query_builder(max_items, max_bytes)
+        };
+        const INITIAL_BATCH: usize = 512;
+        let mut batch = INITIAL_BATCH;
+        let mut cursor = None;
+        loop {
+            let rows = loop {
+                match read.property_facet_rows_after(!autocomplete, cursor.clone(), batch) {
+                    Ok(rows) => break rows,
+                    Err(
+                        crate::oplog::sqlite_materialization::MaterializationError::ResourceLimit {
+                            ..
+                        },
+                    ) if batch > 1 => batch = (batch / 2).max(1),
+                    Err(_) => return Err(SyncApplicationPageRequestError::ActorRefused),
+                }
+            };
+            if rows.is_empty() {
+                break;
+            }
+            let len = rows.len();
+            for row in rows {
+                cursor = Some((row.owner, row.source_name.clone(), row.ordinal));
+                if !masked_page_ids.contains(&row.page_id) {
+                    accumulator.offer(&row.normalized_name, &row.value);
+                }
+            }
+            if len < batch {
+                break;
+            }
+        }
+        drop(read);
+
+        for (_, current) in overlay {
+            let Some((_, page)) = current else {
+                continue;
+            };
+            for (key, value) in crate::query::application_page_property_pairs(&page, autocomplete) {
+                accumulator.offer(&key, &value);
+            }
+        }
+        Ok(accumulator.finish())
     }
 
     fn application_backlink_filter_context_ready(
@@ -19064,6 +19202,42 @@ mod tests {
             serde_json::to_value(graph.templates()).unwrap(),
             "managed template discovery must share Direct Files parser semantics"
         );
+        for autocomplete in [false, true] {
+            let hidden_properties = if autocomplete {
+                vec!["custom".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let SyncApplicationNavigationReply::PropertyFacets {
+                facets: managed_facets,
+                exceeded,
+            } = navigation(SyncApplicationNavigationRequest::PropertyFacets {
+                autocomplete,
+                hidden_properties: hidden_properties.clone(),
+                max_items: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+            else {
+                panic!("wrong property-facet reply")
+            };
+            assert!(!exceeded);
+            let mut direct_graph = Graph::open(fixture.graph_root());
+            direct_graph.config.block_hidden_properties = hidden_properties;
+            let direct_facets = if autocomplete {
+                crate::query::autocomplete_property_facets_bounded(
+                    &direct_graph,
+                    20_000,
+                    32 * 1024 * 1024,
+                )
+                .0
+            } else {
+                crate::query::property_facets_bounded(&direct_graph, 20_000, 32 * 1024 * 1024).0
+            };
+            assert_eq!(
+                managed_facets, direct_facets,
+                "managed property facets must share Direct Files policy"
+            );
+        }
         let requested = vec![
             genuine.to_owned(),
             genuine.to_owned(),
@@ -19354,15 +19528,15 @@ mod tests {
             &fixture,
             "content/nested pages/Navigation.md",
             format!(
-                "icon:: old\nalias:: Old Alias\n\n- mentions Old Plain [[Old Phantom]] (({old_reference}))\n  template:: Old template\n  id:: {identity}\n"
+                "icon:: old\nalias:: Old Alias\npageFacet:: old-page\n\n- mentions Old Plain [[Old Phantom]] (({old_reference}))\n  template:: Old template\n  oldFacet:: old-value\n  id:: {identity}\n"
             )
             .as_bytes(),
         );
         let (mut page, revision) =
             load_application_exact(&handle, "content/nested pages/Navigation.md");
-        page.pre_block = Some("icon:: new\nalias:: New Alias".into());
+        page.pre_block = Some("icon:: new\nalias:: New Alias\npageFacet:: new-page".into());
         page.blocks[0].raw = format!(
-            "- mentions New Plain [[New Phantom]] (({new_reference}))\n  Template:: New template\n  id:: {identity}"
+            "- mentions New Plain [[New Phantom]] (({new_reference}))\n  Template:: New template\n  new_prop:: new-value\n  id:: {identity}"
         );
         let saved = handle
             .save_application_page(SyncApplicationPageSaveRequest {
@@ -19490,10 +19664,45 @@ mod tests {
         assert!(!templates
             .iter()
             .any(|template| template.name == "Old template"));
+        let SyncApplicationNavigationReply::PropertyFacets {
+            facets: query_facets,
+            exceeded: false,
+        } = loaded(SyncApplicationNavigationRequest::PropertyFacets {
+            autocomplete: false,
+            hidden_properties: Vec::new(),
+            max_items: 20_000,
+            max_bytes: 32 * 1024 * 1024,
+        })
+        else {
+            panic!("wrong query-facet reply")
+        };
+        assert!(query_facets
+            .iter()
+            .any(|(key, values)| key == "new-prop" && values == &["new-value"]));
+        assert!(!query_facets.iter().any(|(key, _)| key == "oldfacet"));
+        assert!(!query_facets.iter().any(|(key, _)| key == "pagefacet"));
+        let SyncApplicationNavigationReply::PropertyFacets {
+            facets: autocomplete_facets,
+            exceeded: false,
+        } = loaded(SyncApplicationNavigationRequest::PropertyFacets {
+            autocomplete: true,
+            hidden_properties: Vec::new(),
+            max_items: 20_000,
+            max_bytes: 32 * 1024 * 1024,
+        })
+        else {
+            panic!("wrong autocomplete-facet reply")
+        };
+        assert!(autocomplete_facets
+            .iter()
+            .any(|(key, values)| key == "pagefacet" && values == &["new-page"]));
+        assert!(!autocomplete_facets
+            .iter()
+            .any(|(_, values)| values.iter().any(|value| value == "old-page")));
 
         let mut created_block = BlockDto::default();
         created_block.raw = format!(
-            "- links Created Plain [[Created Phantom]] (({new_reference}))\n  template:: Created template"
+            "- links Created Plain [[Created Phantom]] (({new_reference}))\n  template:: Created template\n  created_prop:: created-value"
         );
         let created = handle
             .save_application_page(SyncApplicationPageSaveRequest {
@@ -19504,7 +19713,7 @@ mod tests {
                 page: new_application_page(
                     "Created Navigation",
                     SyncPageKind::Page,
-                    Some("alias:: Created Alias"),
+                    Some("alias:: Created Alias\ncreatedPage:: created-page"),
                     vec![created_block],
                 ),
             })
@@ -19566,6 +19775,36 @@ mod tests {
         assert!(templates
             .iter()
             .any(|template| template.name == "Created template"));
+        let SyncApplicationNavigationReply::PropertyFacets {
+            facets: query_facets,
+            exceeded: false,
+        } = loaded(SyncApplicationNavigationRequest::PropertyFacets {
+            autocomplete: false,
+            hidden_properties: Vec::new(),
+            max_items: 20_000,
+            max_bytes: 32 * 1024 * 1024,
+        })
+        else {
+            panic!("wrong created query-facet reply")
+        };
+        assert!(query_facets
+            .iter()
+            .any(|(key, values)| { key == "created-prop" && values == &["created-value"] }));
+        let SyncApplicationNavigationReply::PropertyFacets {
+            facets: autocomplete_facets,
+            exceeded: false,
+        } = loaded(SyncApplicationNavigationRequest::PropertyFacets {
+            autocomplete: true,
+            hidden_properties: Vec::new(),
+            max_items: 20_000,
+            max_bytes: 32 * 1024 * 1024,
+        })
+        else {
+            panic!("wrong created autocomplete-facet reply")
+        };
+        assert!(autocomplete_facets
+            .iter()
+            .any(|(key, values)| { key == "createdpage" && values == &["created-page"] }));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

@@ -1980,6 +1980,16 @@ pub struct MaterializedBlockPropertyCandidateRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedPropertyFacetRow {
+    pub owner: MaterializedEntityId,
+    pub page_id: PageId,
+    pub source_name: String,
+    pub normalized_name: String,
+    pub value: String,
+    pub ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPropertyRow {
     pub owner: MaterializedEntityId,
     pub page_id: PageId,
@@ -2347,6 +2357,23 @@ impl<'a> SqliteMaterializedRead<'a> {
             .collect()
     }
 
+    pub fn property_facet_rows_after(
+        &self,
+        block_owners_only: bool,
+        after: Option<(MaterializedEntityId, String, u32)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPropertyFacetRow>, MaterializationError> {
+        self.inner
+            .property_facet_rows_after(
+                block_owners_only,
+                after.map(|(owner, name, ordinal)| (lower_entity(owner), name, ordinal)),
+                limit,
+            )?
+            .into_iter()
+            .map(property_facet_row_from_storage)
+            .collect()
+    }
+
     pub fn properties(
         &self,
         owner: MaterializedEntityId,
@@ -2563,6 +2590,19 @@ fn block_property_candidate_row_from_storage(
     Ok(MaterializedBlockPropertyCandidateRow {
         page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
         block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+    })
+}
+
+fn property_facet_row_from_storage(
+    row: storage::PhysicalPropertyFacetRow,
+) -> Result<MaterializedPropertyFacetRow, MaterializationError> {
+    Ok(MaterializedPropertyFacetRow {
+        owner: entity_from_storage(row.owner),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        source_name: row.source_name,
+        normalized_name: row.normalized_name,
+        value: row.value,
+        ordinal: row.ordinal,
     })
 }
 
