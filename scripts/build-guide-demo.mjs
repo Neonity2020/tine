@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { filesUnder, validateGuideDemoLinks } from "./guide-demo-validator.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const checkedIn = path.join(root, "website/demo");
@@ -19,41 +20,8 @@ const built = spawnSync(
 );
 if (built.status !== 0) process.exit(built.status ?? 1);
 
-function filesUnder(dir, prefix = "") {
-  const files = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-    const relative = path.join(prefix, entry.name);
-    if (entry.isDirectory()) files.push(...filesUnder(path.join(dir, entry.name), relative));
-    else files.push(relative);
-  }
-  return files;
-}
-
-function validateLinks(dir) {
-  const failures = [];
-  for (const relative of filesUnder(dir).filter((file) => file.endsWith(".html"))) {
-    const html = fs.readFileSync(path.join(dir, relative), "utf8");
-    for (const match of html.matchAll(/<[^>]+?(?:href|src)="([^"]+)"[^>]*>/g)) {
-      const tag = match[0];
-      const target = match[1];
-      if (/^(?:[a-z]+:|#|\/\/)/i.test(target)) continue;
-      const withoutFragment = target.split("#", 1)[0].split("?", 1)[0];
-      if (!withoutFragment) continue;
-      const resolved = path.resolve(path.dirname(path.join(dir, relative)), decodeURIComponent(withoutFragment));
-      // Deliberate empty-page refs are useful in the editable graph (click to
-      // create) but have no generated static page. Other links and every asset
-      // must resolve inside the generated site.
-      if (/class="[^"]*\b(?:ref|tag)\b/.test(tag) && !fs.existsSync(resolved)) continue;
-      if (!resolved.startsWith(path.resolve(dir) + path.sep) || !fs.existsSync(resolved)) {
-        failures.push(`${relative}: missing local target ${target}`);
-      }
-    }
-  }
-  if (failures.length) throw new Error(`Guide/demo link validation failed:\n${failures.join("\n")}`);
-}
-
 try {
-  validateLinks(output);
+  validateGuideDemoLinks(output);
   if (check) {
     const expected = filesUnder(checkedIn);
     const actual = filesUnder(output);

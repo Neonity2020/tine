@@ -302,6 +302,7 @@ pub fn create_demo_graph(root: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::config::{Config, FileNameFormat};
+    use std::collections::HashSet;
 
     /// The bullet on Project/Roadmap that Welcome both references and embeds.
     const TARGET_ID: &str = "7a1c0f5e-0000-4000-8000-000000000001";
@@ -416,53 +417,79 @@ mod tests {
         assert!(plugins.markdown.contains("not Logseq or Obsidian plugins"));
     }
 
-    /// Bare `[[…]]` link targets in a markdown body (labelled links, embeds, and
-    /// queries all wrap a `[[…]]`, so one scan covers them). Non-nested; a nested
-    /// `[[a [[b]] c]]` yields harmless fragments that never match a demo title.
-    fn extract_page_links(markdown: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut rest = markdown;
-        while let Some(i) = rest.find("[[") {
-            let after = &rest[i + 2..];
-            let Some(j) = after.find("]]") else { break };
-            out.push(after[..j].trim().to_string());
-            rest = &after[j + 2..];
+    #[derive(serde::Deserialize)]
+    struct DeliberateGuideStub {
+        title: String,
+    }
+
+    fn deliberate_guide_stub_keys() -> HashSet<String> {
+        serde_json::from_str::<Vec<DeliberateGuideStub>>(include_str!(
+            "../../../docs/guide-deliberate-stubs.json"
+        ))
+        .expect("guide deliberate-stub allowlist is valid JSON")
+        .into_iter()
+        .map(|stub| crate::refs::page_key(&stub.title))
+        .collect()
+    }
+
+    fn guide_reference_targets(markdown: &str) -> Vec<String> {
+        fn collect(blocks: &[crate::doc::DocBlock], targets: &mut Vec<String>) {
+            for block in blocks {
+                // `DocBlock::projection` is the canonical lsdoc-backed reference
+                // extraction used by the graph's index and backlink paths.
+                targets.extend(block.projection().refs_page.iter().cloned());
+                collect(&block.children, targets);
+            }
         }
-        out
+
+        let document = crate::doc::parse(markdown);
+        let mut targets = Vec::new();
+        collect(&document.roots, &mut targets);
+        targets
+    }
+
+    fn guide_template_link_errors(templates: &[GuideTemplate]) -> Vec<String> {
+        let registered: HashSet<String> = templates
+            .iter()
+            .map(|template| crate::refs::page_key(template.title))
+            .collect();
+        let deliberate_stubs = deliberate_guide_stub_keys();
+        let mut errors = Vec::new();
+        for template in templates {
+            for target in guide_reference_targets(template.markdown) {
+                let key = crate::refs::page_key(&target);
+                if !registered.contains(&key) && !deliberate_stubs.contains(&key) {
+                    errors.push(format!(
+                        "{}: unregistered Guide target {target}",
+                        template.title
+                    ));
+                }
+            }
+        }
+        errors
     }
 
     #[test]
     fn guide_link_set_is_closed_over_demo_pages() {
-        // Every guide page that another guide page links to must itself be a
-        // bundled guide page — otherwise the link dangles in the in-app guide AND
-        // in the copied-into-graph copy (the bug that shipped when Welcome/Roadmap
-        // were in the onboarding list but not GUIDE_TEMPLATES). We flag ONLY targets that are
-        // real demo pages (in the manifest); links to stub pages like [[Martin]] are a
-        // deliberate Logseq affordance (click-to-create) and stay out of the guide.
-        use std::collections::HashSet;
-        let guide: HashSet<String> = GUIDE_TEMPLATES
-            .iter()
-            .map(|t| crate::refs::page_key(t.title))
-            .collect();
-        let demo: HashSet<String> = GUIDE_TEMPLATES
-            .iter()
-            .map(|t| crate::refs::page_key(t.title))
-            .collect();
-        for t in GUIDE_TEMPLATES {
-            for target in extract_page_links(t.markdown) {
-                let key = crate::refs::page_key(&target);
-                if demo.contains(&key) {
-                    assert!(
-                        guide.contains(&key),
-                        "guide page {:?} links to demo page {:?}, which is not in \
-                         GUIDE_TEMPLATES — the link dangles in the in-app guide and \
-                         in copy-into-graph. Add it to GUIDE_TEMPLATES.",
-                        t.title,
-                        target
-                    );
-                }
-            }
-        }
+        let errors = guide_template_link_errors(GUIDE_TEMPLATES);
+        assert!(
+            errors.is_empty(),
+            "Guide links must target a registered page or deliberate stub:\n{}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
+    fn guide_link_validator_rejects_accidental_targets_and_ignores_inline_code() {
+        let templates = [GuideTemplate {
+            title: "Test source",
+            markdown: "- [[Martin]] #demo [[Accidental target]] `[[literal brackets]]`",
+        }];
+
+        assert_eq!(
+            guide_template_link_errors(&templates),
+            vec!["Test source: unregistered Guide target Accidental target"]
+        );
     }
 
     #[test]
