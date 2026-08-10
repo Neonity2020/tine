@@ -5,6 +5,7 @@ icon:: 🧭
 	- Each page is read-only here. Use **Copy the guide into your graph** on any Guide page when you want an editable, interlinked sandbox under `tine-guide/`.
 - ## Start
   - [[Welcome to Tine]] — tour the basics hands-on: bullets, tasks, rich text, links, and live block references.
+  - [[Start/Bring an existing graph]] — point Tine at your existing Logseq graph and learn what it reads and writes.
   - [[Project/Roadmap]] — try a few example tasks for your first steps.
 - ## Workflows
   - [[Workflows/Structure repeated information]] — turn a small repeated outline into a table or board, then find and reuse its blocks before reaching for query syntax.

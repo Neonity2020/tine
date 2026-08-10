@@ -92,6 +92,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Reference/Files, external edits, and backups",
         markdown: include_str!("templates/files-external-edits-backups.md"),
     },
+    GuideTemplate {
+        title: "Start/Bring an existing graph",
+        markdown: include_str!("templates/bring-existing-graph.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -598,6 +602,55 @@ mod tests {
         assert!(copied_markdown.contains("logseq/.tine-trash"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Sheets]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bring_existing_graph_page_is_registered_linked_and_copyable() {
+        let title = "Start/Bring an existing graph";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("bring-an-existing-graph page is registered");
+        assert!(page.markdown.contains("- # Bring an existing graph"));
+        assert!(page.markdown.contains("Open an existing graph"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page
+            .markdown
+            .contains("[[Reference/Files, external edits, and backups]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index.markdown.contains("[[Start/Bring an existing graph]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("bring-an-existing-graph is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Start/Bring an existing graph"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-bring-existing-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Start/Bring an existing graph"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("bring-an-existing-graph was copied");
+        assert!(copied_markdown.contains("Open an existing graph"));
+        assert!(
+            copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
+        );
+        assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

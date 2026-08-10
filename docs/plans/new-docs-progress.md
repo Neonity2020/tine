@@ -45,3 +45,16 @@ Added one canonical workflow page, registered it in the shared manifest, linked 
 - `docs/FEATURES.md:520-522` — “Duplicate journal days lets you **Open** / **Merge** / **Rename** / **Trash** each”; `docs/FEATURES.md:523-531` — “`*.sync-conflict-*` (or `(conflicted copy)`)… out of your page list… **Review & merge** shows a **block-by-block diff**… per-block **keep-current / keep-copy / keep-both**… **Discard copy** trashes it… never auto-merged”. The conflict-copy claims.
 - `crates/tine-core/src/templates/managed-sync.md:4,7` — “**Testing only.** Tine-managed storage is experimental. Your normal mode is **Direct files**” and “Do not enable it merely because you already synchronize your graph folders.” The single managed-sync pointer.
 - `src/components/Settings.tsx:2103-2112` — Settings → Graph → “Export graph to HTML”; `docs/FEATURES.md:656` — “One-click **static HTML export** (`public:: true` pages)”; `docs/FEATURES.md:668` — “right-click a page title → **Export to PDF…**”; `docs/FEATURES.md:679` — “**Copy/export as** Markdown… with a *Rendered* mode”. The export claims.
+
+## Phase C — candidates: J02 open-an-existing-graph path (Start/Bring an existing graph)
+
+### Behavioral claim sources
+
+- `src/components/Welcome.tsx:67-69` — “Open an existing graph / Point Tine at a Logseq graph folder you already have.” The Welcome-screen step.
+- `src/components/Sidebar.tsx:353-356,441-464` — “Tine lists its known graphs here alongside open/create actions”, with menu items “Open graph…” and “New graph…”. The later switching steps. NOTE: `docs/FEATURES.md:552` still says “(No saved recent-graphs list yet — you pick the folder each time.)” — stale relative to the known-graphs menu; the template claim follows current code. Recorded, not repaired (outside the allowed files).
+- `src/components/Settings.tsx:2093-2097` — “Open another graph…” on the Graph tab; `README.md:199-200,208-209` — `TINE_GRAPH=/path/to/your/graph` and “Run one app at a time on a given graph.” The command-line and one-app-at-a-time claims.
+- `docs/FEATURES.md:516-519` — “reads `:journal/file-name-format` and `:journal/page-title-format` and recognizes/creates journal files in your format”. The journal-honoring claim (`Settings.tsx:154-161` lists the shipped formats).
+- `docs/FEATURES.md:511-512,532-538,543-545` — “skip byte-identical rewrites”, recursive folder scan, Org “byte-for-byte … read-only”. Cross-cited evidence shared with the Files page.
+- `docs/FEATURES.md:222-227` — “config is a few harmless `tine.*` properties… Logseq renders the same file as an ordinary nested outline”. The view-property coexistence claim, linked to [[Features/Sheets]].
+- `docs/FEATURES.md:506-509` — “A filesystem watcher… reconciles changes synced in from other devices”. The “changes appear automatically” claim; banner behavior cross-cited from `src/components/ConflictBar.tsx:45-56`.
+- `crates/tine-core/src/templates/managed-sync.md:4` — “Your normal mode is **Direct files**… **Testing only.**” The single managed-sync pointer wording.
