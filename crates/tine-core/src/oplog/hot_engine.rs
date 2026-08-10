@@ -11924,6 +11924,27 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
     }
 
+    pub(crate) fn reference_source_posting_index_at(
+        &self,
+        root: &ReferenceCatalogRootV2,
+    ) -> Result<super::reference_catalog::ReferenceCatalogPostingDigestIndex, EngineError> {
+        self.ensure_not_blocked()?;
+        self.reference_catalog
+            .posting_digest_index_at_root(root)
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+    }
+
+    pub(crate) fn reference_source_posting_from_index(
+        &self,
+        index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
+        page_id: PageId,
+    ) -> Result<Option<super::ReferenceSourcePostingV2>, EngineError> {
+        self.ensure_not_blocked()?;
+        self.reference_catalog
+            .posting_from_digest_index(index, page_id)
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+    }
+
     pub(crate) fn reference_candidates_at(
         &self,
         root: &ReferenceCatalogRootV2,

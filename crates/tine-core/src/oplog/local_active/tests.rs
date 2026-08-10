@@ -743,18 +743,26 @@ fn local_active_shape_fixtures(label: &str) -> [Fixture; 4] {
     for ordinal in 0..4096 {
         multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
     }
+    let zero = Fixture::new(&format!("{label}-zero"), None, Vec::new());
+    let one = Fixture::new(
+        &format!("{label}-one"),
+        None,
+        vec![("pages/one.md".into(), b"- one\n".to_vec())],
+    );
+    // Production's page/manifest cap grew beyond this deliberately compact
+    // fixture. Keep the semantic matrix genuinely multipart through the
+    // existing one-shot test hook rather than manufacturing thousands more
+    // source files and slowing every lifecycle test that uses it.
+    force_next_bootstrap_part_operation_limit(4_096);
+    let multipart = Fixture::new(
+        &format!("{label}-multipart-4096"),
+        None,
+        vec![("pages/multipart.md".into(), multipart_bytes)],
+    );
     [
-        Fixture::new(&format!("{label}-zero"), None, Vec::new()),
-        Fixture::new(
-            &format!("{label}-one"),
-            None,
-            vec![("pages/one.md".into(), b"- one\n".to_vec())],
-        ),
-        Fixture::new(
-            &format!("{label}-multipart-4096"),
-            None,
-            vec![("pages/multipart.md".into(), multipart_bytes)],
-        ),
+        zero,
+        one,
+        multipart,
         rich_fixture(&format!("{label}-rich-nested-unicode")),
     ]
 }
@@ -10084,6 +10092,7 @@ mod terminal_construction {
         for ordinal in 0..3_000 {
             blocks.push_str(&format!("- split {ordinal:04} [[Target {ordinal:04}]]\n"));
         }
+        force_next_bootstrap_part_operation_limit(2_048);
         let mut fixture = Fixture::new(
             "terminal-huge-page-split",
             None,

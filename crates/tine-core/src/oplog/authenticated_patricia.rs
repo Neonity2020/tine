@@ -427,6 +427,17 @@ impl PatriciaIndexStore {
             .map_err(map_storage_error)
     }
 
+    pub(crate) fn construction_visit_all(
+        &self,
+        construction: &PatriciaIndexConstruction,
+        root: PatriciaIndexRoot,
+        visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), StoreError> {
+        self.storage
+            .construction_visit_all(construction, root, visit)
+            .map_err(map_storage_error)
+    }
+
     pub(crate) fn construction_insert_many(
         &self,
         construction: &mut PatriciaIndexConstruction,

@@ -1677,6 +1677,33 @@ fn collect_reference_source_rows(
     else {
         return Ok(false);
     };
+    append_reference_source_rows(posting, stamp, page_id, rows)?;
+    Ok(true)
+}
+
+fn collect_indexed_reference_source_rows(
+    engine: &ShardedHotEngine,
+    index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
+    stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
+    page_id: PageId,
+    rows: &mut ReferenceCatalogSourceRows,
+) -> Result<bool, ProjectionError> {
+    let Some(posting) = engine
+        .reference_source_posting_from_index(index, page_id)
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    append_reference_source_rows(posting, stamp, page_id, rows)?;
+    Ok(true)
+}
+
+fn append_reference_source_rows(
+    posting: super::ReferenceSourcePostingV2,
+    stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
+    page_id: PageId,
+    rows: &mut ReferenceCatalogSourceRows,
+) -> Result<(), ProjectionError> {
     rows.coverage
         .push(super::sqlite_materialization::SourceCoverageFacet {
             source_page_id: page_id,
@@ -1747,7 +1774,7 @@ fn collect_reference_source_rows(
             }
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn authenticated_reference_materialization(
@@ -1969,6 +1996,11 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     /// Catalog rows the terminal row seed authenticated through the paged
     /// current-path cursor.
     pub(crate) terminal_catalog_rows_authenticated: usize,
+    /// Complete Patricia facts-tree traversals used to seed terminal reference
+    /// rows. A nonempty terminal catalog is consumed by exactly one traversal,
+    /// never one root-to-leaf lookup per page.
+    pub(crate) terminal_reference_index_traversals: usize,
+    pub(crate) terminal_reference_index_entries: usize,
     /// Catalog-document shape proofs derived while seeding the terminal rows.
     ///
     /// Each one costs a read linear in the catalog's page entries, so this must
@@ -2065,6 +2097,11 @@ impl BootstrapSqliteRebuildInstrumentation {
             assert_ne!(
                 self.terminal_catalog_document_validations, 0,
                 "a nonempty terminal catalog must be authenticated"
+            );
+            assert_eq!(self.terminal_reference_index_traversals, 1);
+            assert_eq!(
+                self.terminal_reference_index_entries, self.terminal_catalog_rows_authenticated,
+                "the one reference-catalog traversal must cover every terminal page"
             );
         }
         // The one graph-lifetime decoded-segment session is measured, not
@@ -4417,6 +4454,8 @@ impl SqliteFrontier {
             || bootstrap.intermediate_page_materializations != 0
             || bootstrap.bootstrap_part_reads != 0
             || bootstrap.terminal_materializations != 1
+            || bootstrap.terminal_reference_index_traversals != 1
+            || bootstrap.terminal_reference_index_entries != bootstrap.terminal_pages_materialized
         {
             return Err(ProjectionError::Rebuild(
                 "terminal candidate structural accounting invariant failed".into(),
@@ -4487,6 +4526,17 @@ impl SqliteFrontier {
                 catalog_root.extractor_digest(),
                 catalog_root.policy_digest(),
             )?;
+        let reference_index = engine
+            .reference_source_posting_index_at(&catalog_root)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        bootstrap.terminal_reference_index_traversals = 1;
+        bootstrap.terminal_reference_index_entries = reference_index.len();
+        if reference_index.len() as u64 != binding.catalog_rows() {
+            return Err(ProjectionError::Rebuild(
+                "terminal reference catalog does not cover the complete current-path catalog"
+                    .into(),
+            ));
+        }
         let materializer = (binding.catalog_rows() != 0)
             .then(|| {
                 engine
@@ -4545,7 +4595,7 @@ impl SqliteFrontier {
                         )
                     })?,
                     engine,
-                    &catalog_root,
+                    &reference_index,
                     extractor_stamp,
                     &chunk_rows,
                     instrumentation,
@@ -4609,7 +4659,7 @@ impl SqliteFrontier {
         &mut self,
         materializer: &super::hot_engine::BootstrapBulkMaterializer<'_>,
         engine: &ShardedHotEngine,
-        catalog_root: &super::ReferenceCatalogRootV2,
+        reference_index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
         extractor_stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
         rows: &[super::hot_engine::CurrentPathCatalogRow],
         instrumentation: &mut RebuildInstrumentation,
@@ -4641,9 +4691,9 @@ impl SqliteFrontier {
             }
             chunk.pages.push(materialized_page_input(page));
             let reference_started = std::time::Instant::now();
-            let posted = collect_reference_source_rows(
+            let posted = collect_indexed_reference_source_rows(
                 engine,
-                catalog_root,
+                reference_index,
                 extractor_stamp,
                 row.page_id(),
                 &mut reference_rows,
