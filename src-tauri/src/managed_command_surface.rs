@@ -225,7 +225,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("uninstall_plugin", NoGraphSlot),
     ("verify_plugin_registry", NoGraphSlot),
     ("warm_done", NoGraphSlot),
-    ("write_highlights", LegacyOnly),
+    ("write_highlights", ManagedRouted),
     ("write_pdf_view_state", ManagedRouted),
 ];
 
@@ -282,10 +282,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "trash_sync_conflict",
         "graph-text deletion: oplog transaction",
-    ),
-    (
-        "write_highlights",
-        "asset-domain sidecar, still on the legacy authority",
     ),
 ];
 

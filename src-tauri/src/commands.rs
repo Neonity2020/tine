@@ -3663,17 +3663,36 @@ pub(crate) async fn open_pdf(
 }
 
 #[tauri::command]
-pub(crate) fn write_highlights(
+pub(crate) async fn write_highlights(
     pdf: String,
     label: String,
     highlights: Vec<tine_core::pdf::Highlight>,
     base_ids: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.write_highlights(&pdf, &label, &highlights, &base_ids)
-            .map_err(|e| e.to_string())
+    let (app, window_label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &window_label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .write_application_pdf_highlights(pdf, label, highlights, base_ids)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationUnitOutcome::Applied => Ok(()),
+                SyncApplicationUnitOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating PDF notes. Try again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .write_highlights(&pdf, &label, &highlights, &base_ids)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

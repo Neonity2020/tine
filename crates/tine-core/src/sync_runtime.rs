@@ -3495,6 +3495,55 @@ impl SyncRuntimeHandle {
             .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
     }
 
+    pub fn write_application_pdf_highlights(
+        &self,
+        pdf_filename: String,
+        label: String,
+        highlights: Vec<crate::pdf::Highlight>,
+        base_ids: Vec<String>,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        let mut text_bytes = pdf_filename.len().saturating_add(label.len());
+        for highlight in &highlights {
+            text_bytes = text_bytes
+                .saturating_add(highlight.id.len())
+                .saturating_add(highlight.color.len())
+                .saturating_add(highlight.text.as_ref().map_or(0, String::len));
+        }
+        text_bytes = base_ids
+            .iter()
+            .fold(text_bytes, |total, id| total.saturating_add(id.len()));
+        if pdf_filename.is_empty() {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidName,
+            ));
+        }
+        if highlights.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS
+            || base_ids.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS
+            || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES
+        {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: highlights.len().saturating_add(base_ids.len()),
+                    text_bytes,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::WriteApplicationPdfHighlights {
+            pdf_filename,
+            label,
+            highlights,
+            base_ids,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
     /// A public request may be too large to retain verbatim, but that never
     /// makes its observation disposable. The actor's one-owner queue already
     /// gives this marker an epoch, status visibility, and a full graph scan
@@ -6196,6 +6245,13 @@ enum ActorRequest {
         label: String,
         reply: mpsc::Sender<Result<SyncApplicationPdfOpenOutcome, SyncApplicationPageRequestError>>,
     },
+    WriteApplicationPdfHighlights {
+        pdf_filename: String,
+        label: String,
+        highlights: Vec<crate::pdf::Highlight>,
+        base_ids: Vec<String>,
+        reply: mpsc::Sender<Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError>>,
+    },
     LoadEditorPage {
         request: SyncEditorLoadRequest,
         reply: mpsc::Sender<Result<SyncEditorLoadOutcome, SyncEditorRequestError>>,
@@ -6382,6 +6438,22 @@ fn run_actor_loop(
                 reply,
             } => {
                 let result = actor.open_application_pdf(&pdf_filename, &label);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::WriteApplicationPdfHighlights {
+                pdf_filename,
+                label,
+                highlights,
+                base_ids,
+                reply,
+            } => {
+                let result = actor.write_application_pdf_highlights(
+                    &pdf_filename,
+                    &label,
+                    &highlights,
+                    &base_ids,
+                );
                 let _ = reply.send(result);
                 false
             }
@@ -10999,6 +11071,164 @@ impl RuntimeActor {
             SyncApplicationPageSaveOutcome::Conflict { .. } => Err(
                 SyncApplicationPageRequestError::ActorRefusedAt("pdf_hls_page_commit"),
             ),
+        }
+    }
+
+    fn write_application_pdf_highlights(
+        &mut self,
+        pdf_filename: &str,
+        label: &str,
+        highlights: &[crate::pdf::Highlight],
+        base_ids: &[String],
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationUnitOutcome::Deferred { state });
+        }
+        let key = crate::pdf::asset_key(pdf_filename);
+        let name = crate::pdf::hls_page_name(&key);
+        let current_state = {
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+            editor_name_state(runtime, &self.graph, name.clone(), SyncPageKind::Page)
+                .map_err(map_editor_application_error)?
+        };
+        let mut current = match current_state {
+            EditorNameState::Exact(page_id) => Some(self.load_application_page_id_ready(page_id)?),
+            EditorNameState::Missing { .. } => None,
+            EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "pdf_hls_page_identity",
+                ))
+            }
+        };
+        if current.is_none() && self.graph.pdf_legacy_key_is_unambiguous(pdf_filename) {
+            let legacy_name =
+                crate::pdf::hls_page_name(&crate::pdf::legacy_asset_key(pdf_filename));
+            let legacy_state = {
+                let runtime = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+                editor_name_state(runtime, &self.graph, legacy_name, SyncPageKind::Page)
+                    .map_err(map_editor_application_error)?
+            };
+            current = match legacy_state {
+                EditorNameState::Exact(page_id) => {
+                    Some(self.load_application_page_id_ready(page_id)?)
+                }
+                EditorNameState::Missing { .. } => None,
+                EditorNameState::Ambiguous | EditorNameState::PathOccupied => {
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "pdf_legacy_hls_page_identity",
+                    ))
+                }
+            };
+        }
+        if current.as_ref().is_some_and(|loaded| loaded.page.read_only) {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "pdf_hls_page_read_only",
+            ));
+        }
+        let format = current.as_ref().map_or_else(
+            || self.graph.preferred_format(),
+            |loaded| loaded.page.format,
+        );
+        let existing = current
+            .as_ref()
+            .map(|loaded| crate::model::page_dto_document(&loaded.page))
+            .transpose()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("pdf_hls_page_parse"))?;
+        let sidecar = self
+            .graph
+            .commit_managed_highlight_sidecar(pdf_filename, highlights, base_ids)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("pdf_highlight_sidecar")
+            })?;
+        let document = crate::pdf::merge_hls_page_for_format(
+            existing.as_ref(),
+            pdf_filename,
+            label,
+            sidecar.merged(),
+            format,
+        );
+        let built = match current.as_ref() {
+            Some(loaded) => {
+                crate::model::existing_document_page_dto(&loaded.page, document).map(|page| {
+                    (
+                        SyncApplicationPageSaveTarget::Existing {
+                            path: loaded.page.path.clone(),
+                            revision: loaded.revision.clone(),
+                        },
+                        page,
+                    )
+                })
+            }
+            None => crate::model::generated_document_page_dto(
+                &name,
+                format,
+                document,
+                "managed-pdf-highlights-v1",
+            )
+            .map(|page| {
+                (
+                    SyncApplicationPageSaveTarget::New {
+                        name: name.clone(),
+                        page_kind: SyncPageKind::Page,
+                    },
+                    page,
+                )
+            }),
+        };
+        let (target, page) = match built {
+            Ok(built) => built,
+            Err(_) => {
+                self.graph
+                    .rollback_highlight_sidecar_commit(&sidecar)
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "pdf_highlight_pair_rollback",
+                        )
+                    })?;
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "pdf_hls_page_build",
+                ));
+            }
+        };
+        let outcome = self.save_application_page(SyncApplicationPageSaveRequest { target, page });
+        match outcome {
+            Ok(SyncApplicationPageSaveOutcome::Saved { .. })
+            | Ok(SyncApplicationPageSaveOutcome::Unchanged { .. }) => {
+                self.graph
+                    .finish_highlight_sidecar_commit(&sidecar)
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "pdf_highlight_sidecar_cleanup",
+                        )
+                    })?;
+                Ok(SyncApplicationUnitOutcome::Applied)
+            }
+            Ok(SyncApplicationPageSaveOutcome::Deferred { state }) => {
+                Ok(SyncApplicationUnitOutcome::Deferred { state })
+            }
+            Ok(SyncApplicationPageSaveOutcome::Conflict { .. }) => {
+                self.graph
+                    .rollback_highlight_sidecar_commit(&sidecar)
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "pdf_highlight_pair_rollback",
+                        )
+                    })?;
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "pdf_hls_page_commit",
+                ))
+            }
+            // An actor error can occur after a durable publication while the
+            // accepted page is being reconstructed for the reply. In that
+            // ambiguous case retain the sidecar: rolling it back could create
+            // the opposite half-pair. A retry is idempotent and 3-way merges it.
+            Err(error) => Err(error),
         }
     }
 
@@ -20769,6 +20999,87 @@ mod tests {
                 .unwrap(),
             SyncApplicationPdfOpenOutcome::Ready { .. }
         ));
+        let mut highlight = crate::pdf::Highlight {
+            id: "7bf1788a-0ab1-41f2-8941-27f4ca530dc7".into(),
+            page: 2,
+            position: crate::pdf::Position {
+                page: 2,
+                bounding: crate::pdf::Rect {
+                    top: 10.0,
+                    left: 20.0,
+                    width: 30.0,
+                    height: 12.0,
+                    source_width: None,
+                    source_height: None,
+                },
+                rects: Vec::new(),
+            },
+            color: "yellow".into(),
+            text: Some("managed highlight".into()),
+            image: None,
+        };
+        assert_eq!(
+            handle
+                .write_application_pdf_highlights(
+                    "paper.pdf".into(),
+                    "Paper label".into(),
+                    vec![highlight.clone()],
+                    Vec::new(),
+                )
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let sidecar_path = fixture
+            .graph_root()
+            .join("assets")
+            .join(format!("{}.edn", crate::pdf::asset_key("paper.pdf")));
+        let persisted = crate::pdf::parse_pdf_state(&fs::read_to_string(&sidecar_path).unwrap());
+        assert_eq!(persisted.highlights, vec![highlight.clone()]);
+        let (mut annotated_hls, annotated_revision) =
+            load_application_logical(&handle, &hls_name, SyncPageKind::Page);
+        assert_eq!(annotated_hls.blocks.len(), 1);
+        annotated_hls.blocks[0].children.push(BlockDto {
+            id: "managed-pdf-note-request".into(),
+            raw: "user note child".into(),
+            collapsed: false,
+            children: Vec::new(),
+            breadcrumb: Vec::new(),
+            page_property: false,
+            marker: None,
+            priority: None,
+            heading_level: None,
+            scheduled: None,
+            deadline: None,
+            tags: Vec::new(),
+            properties: Vec::new(),
+        });
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: annotated_hls.path.clone(),
+                        revision: annotated_revision,
+                    },
+                    page: annotated_hls,
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        highlight.color = "red".into();
+        assert_eq!(
+            handle
+                .write_application_pdf_highlights(
+                    "paper.pdf".into(),
+                    "Paper label".into(),
+                    vec![highlight.clone()],
+                    vec![highlight.id.clone()],
+                )
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (annotated_hls, _) = load_application_logical(&handle, &hls_name, SyncPageKind::Page);
+        assert_eq!(annotated_hls.blocks[0].children[0].raw, "user note child");
+        assert!(annotated_hls.blocks[0].raw.contains("hl-color:: red"));
         admit_external_page(
             &handle,
             &fixture,
@@ -20792,6 +21103,46 @@ mod tests {
                 .unwrap(),
             SyncApplicationPageLoadOutcome::Missing { .. }
         ));
+        let legacy_highlight = crate::pdf::Highlight {
+            id: "d43ba175-e968-4de8-9cf0-c4cf05ee4b6f".into(),
+            page: 1,
+            position: crate::pdf::Position {
+                page: 1,
+                bounding: crate::pdf::Rect {
+                    top: 1.0,
+                    left: 2.0,
+                    width: 3.0,
+                    height: 4.0,
+                    source_width: None,
+                    source_height: None,
+                },
+                rects: Vec::new(),
+            },
+            color: "blue".into(),
+            text: Some("legacy-key highlight".into()),
+            image: None,
+        };
+        assert_eq!(
+            handle
+                .write_application_pdf_highlights(
+                    "My Paper.pdf".into(),
+                    "My Paper".into(),
+                    vec![legacy_highlight],
+                    Vec::new(),
+                )
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let legacy_name = crate::pdf::hls_page_name(&crate::pdf::legacy_asset_key("My Paper.pdf"));
+        let (legacy_hls, _) = load_application_logical(&handle, &legacy_name, SyncPageKind::Page);
+        assert!(legacy_hls
+            .blocks
+            .iter()
+            .any(|block| block.raw == "legacy annotation notes"));
+        assert!(legacy_hls
+            .blocks
+            .iter()
+            .any(|block| block.raw.contains("legacy-key highlight")));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

@@ -912,6 +912,29 @@ pub struct PageDto {
     pub guide: bool,
 }
 
+/// Exact asset-side result of one PDF-highlight merge. The annotation page is
+/// a separate authority boundary: Direct Files commits it through the guarded
+/// file writer, while managed storage commits it through the semantic actor.
+/// Keeping the sidecar receipt typed lets either caller compensate a rejected
+/// page transaction without re-reading or guessing which bytes it published.
+pub(crate) struct PdfHighlightSidecarCommit {
+    legacy_key: String,
+    edn_path: PathBuf,
+    legacy_edn: Option<PathBuf>,
+    merged: Vec<crate::pdf::Highlight>,
+    primary_baseline: Option<String>,
+    legacy_baseline: Option<String>,
+    committed: String,
+    area_source_key: String,
+    deleted_areas: Vec<crate::pdf::Highlight>,
+}
+
+impl PdfHighlightSidecarCommit {
+    pub(crate) fn merged(&self) -> &[crate::pdf::Highlight] {
+        &self.merged
+    }
+}
+
 /// What enabling managed sync would change in the plain-text projection.
 ///
 /// The migration is deliberately inspectable before it writes: every block needs
@@ -16655,6 +16678,181 @@ impl Graph {
         Ok(false)
     }
 
+    /// Merge and publish only the asset-side PDF highlight sidecar. The caller
+    /// must either commit the paired HLS page and call `finish_...`, or reject
+    /// the page transaction and call `rollback_...`. Actor serialization is the
+    /// managed-mode lock; Direct Files still holds its existing HLS page lock.
+    fn commit_highlight_sidecar_asset_only(
+        &self,
+        pdf_filename: &str,
+        highlights: &[crate::pdf::Highlight],
+        base_ids: &[String],
+        legacy_active: bool,
+    ) -> io::Result<PdfHighlightSidecarCommit> {
+        let key = crate::pdf::asset_key(pdf_filename);
+        let legacy_key = crate::pdf::legacy_asset_key(pdf_filename);
+        let legacy_edn = (legacy_active && legacy_key != key)
+            .then(|| self.assets_path().join(format!("{legacy_key}.edn")));
+        fs::create_dir_all(self.assets_path())?;
+        let edn_path = self.assets_path().join(format!("{key}.edn"));
+        self.ensure_asset_write_target(&edn_path)?;
+        let base: std::collections::HashSet<&str> = base_ids.iter().map(String::as_str).collect();
+        for _attempt in 0..4 {
+            let primary_baseline = read_optional_text(&edn_path)?;
+            let legacy_baseline = if primary_baseline.is_none() {
+                match &legacy_edn {
+                    Some(path) => read_optional_text(path)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let existing_edn = primary_baseline.as_ref().or(legacy_baseline.as_ref());
+            if let Some(raw) = existing_edn {
+                validate_highlight_edn(raw)?;
+            }
+            let disk_highlights = existing_edn
+                .map(|raw| crate::pdf::parse_highlights(raw))
+                .unwrap_or_default();
+            let have: std::collections::HashSet<&str> = highlights
+                .iter()
+                .map(|highlight| highlight.id.as_str())
+                .collect();
+            let mut merged = highlights.to_vec();
+            for highlight in &disk_highlights {
+                if !have.contains(highlight.id.as_str()) && !base.contains(highlight.id.as_str()) {
+                    merged.push(highlight.clone());
+                }
+            }
+            let merged_ids: std::collections::HashSet<&str> = merged
+                .iter()
+                .map(|highlight| highlight.id.as_str())
+                .collect();
+            let deleted_areas = disk_highlights
+                .into_iter()
+                .filter(|highlight| {
+                    highlight.image.is_some() && !merged_ids.contains(highlight.id.as_str())
+                })
+                .collect();
+            let area_source_key = if primary_baseline.is_none() && legacy_baseline.is_some() {
+                legacy_key.clone()
+            } else {
+                key.clone()
+            };
+            let committed =
+                crate::pdf::write_highlights(&merged, existing_edn.map_or("", String::as_str));
+            let primary_now = read_optional_text(&edn_path)?;
+            let legacy_now = if primary_now.is_none() && primary_baseline.is_none() {
+                match &legacy_edn {
+                    Some(path) => read_optional_text(path)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if primary_now != primary_baseline
+                || (primary_baseline.is_none() && legacy_now != legacy_baseline)
+            {
+                continue;
+            }
+            let publish = if primary_baseline.is_none() {
+                atomic_write_new(&edn_path, committed.as_bytes())
+            } else {
+                atomic_write(&edn_path, committed.as_bytes())
+            };
+            match publish {
+                Ok(()) => {
+                    return Ok(PdfHighlightSidecarCommit {
+                        legacy_key,
+                        edn_path,
+                        legacy_edn,
+                        merged,
+                        primary_baseline,
+                        legacy_baseline,
+                        committed,
+                        area_source_key,
+                        deleted_areas,
+                    })
+                }
+                Err(error)
+                    if primary_baseline.is_none()
+                        && error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "highlight sidecar changed repeatedly during update",
+        ))
+    }
+
+    pub(crate) fn commit_managed_highlight_sidecar(
+        &self,
+        pdf_filename: &str,
+        highlights: &[crate::pdf::Highlight],
+        base_ids: &[String],
+    ) -> io::Result<PdfHighlightSidecarCommit> {
+        self.commit_highlight_sidecar_asset_only(
+            pdf_filename,
+            highlights,
+            base_ids,
+            self.pdf_legacy_key_is_unambiguous(pdf_filename),
+        )
+    }
+
+    pub(crate) fn rollback_highlight_sidecar_commit(
+        &self,
+        receipt: &PdfHighlightSidecarCommit,
+    ) -> io::Result<()> {
+        self.rollback_highlight_sidecar(
+            &receipt.edn_path,
+            receipt.primary_baseline.as_deref(),
+            &receipt.committed,
+        )
+    }
+
+    pub(crate) fn finish_highlight_sidecar_commit(
+        &self,
+        receipt: &PdfHighlightSidecarCommit,
+    ) -> io::Result<()> {
+        let source_sidecar_guard = (receipt.area_source_key == receipt.legacy_key)
+            .then(|| receipt.legacy_edn.as_deref())
+            .flatten()
+            .zip(receipt.legacy_baseline.as_deref());
+        self.trash_deleted_pdf_area_images(
+            &receipt.area_source_key,
+            &receipt.edn_path,
+            &receipt.committed,
+            source_sidecar_guard,
+            &receipt.deleted_areas,
+        );
+        if let (Some(path), Some(baseline)) = (&receipt.legacy_edn, &receipt.legacy_baseline) {
+            if read_optional_text(path)?.as_ref() == Some(baseline) {
+                let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+                self.ensure_trash_write_target(&trash)?;
+                fs::create_dir_all(&trash)?;
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("legacy.edn");
+                let destination = trash.join(format!("{}__legacy__{name}", trash_stamp()));
+                if move_file_noreplace(path, &destination).is_ok()
+                    && read_optional_text(&destination)?.as_ref() != Some(baseline)
+                {
+                    let _ = move_file_noreplace(&destination, path);
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "legacy highlight sidecar changed during migration cleanup",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Persist highlights: write `assets/<key>.edn` and the `hls__<key>` page.
     /// `base_ids` are the highlight ids the editor LOADED (its baseline) — used for
     /// a 3-way merge so a highlight the user deleted is honored while one added
@@ -16674,8 +16872,6 @@ impl Graph {
         let legacy_key = crate::pdf::legacy_asset_key(pdf_filename);
         let legacy_active =
             legacy_key != key && !self.retained_asset_key_in_use_by_pdf(&write, &legacy_key)?;
-        let legacy_edn =
-            legacy_active.then(|| self.assets_path().join(format!("{legacy_key}.edn")));
         let legacy_page = if legacy_active {
             self.existing_hls_page_path(&write, &legacy_key)?
         } else {
@@ -16688,15 +16884,6 @@ impl Graph {
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let lock = self.page_lock(&page_path);
         let _guard = lock.lock().unwrap();
-        fs::create_dir_all(self.assets_path())?;
-        let edn_path = self.assets_path().join(format!("{key}.edn"));
-        self.ensure_asset_write_target(&edn_path)?;
-        // 3-way merge against the on-disk set: keep our current highlights, plus
-        // any disk highlight that is an EXTERNAL addition (id not in our baseline
-        // and not already present). A highlight we deliberately deleted (in the
-        // baseline, absent from current) is NOT resurrected. Prefer the new-key
-        // file; fall back to the legacy-key file (migrating it forward).
-        let base: std::collections::HashSet<&str> = base_ids.iter().map(|s| s.as_str()).collect();
         // Read every artifact that will participate before committing either one.
         // If the notes page (or its legacy source) is unreadable, abort while the
         // sidecar is still untouched rather than leaving a half-updated pair.
@@ -16725,101 +16912,12 @@ impl Graph {
                 "org highlight page is read-only (does not round-trip)",
             ));
         }
-        // Merge and publish the sidecar with the same external-writer guard as
-        // config updates. If Logseq/Syncthing changes either the primary or the
-        // legacy fallback after our read, retry against those new bytes instead
-        // of replacing them with a stale full-file serialization.
-        let mut committed_sidecar = None;
-        for _attempt in 0..4 {
-            let primary_baseline = read_optional_text(&edn_path)?;
-            let legacy_baseline = if primary_baseline.is_none() {
-                match &legacy_edn {
-                    Some(path) => read_optional_text(path)?,
-                    None => None,
-                }
-            } else {
-                None
-            };
-            let existing_edn = primary_baseline.as_ref().or(legacy_baseline.as_ref());
-            if let Some(raw) = existing_edn {
-                validate_highlight_edn(raw)?;
-            }
-            let disk_highlights = existing_edn
-                .map(|raw| crate::pdf::parse_highlights(raw))
-                .unwrap_or_default();
-            let have: std::collections::HashSet<&str> =
-                highlights.iter().map(|h| h.id.as_str()).collect();
-            let mut merged = highlights.to_vec();
-            for h in &disk_highlights {
-                if !have.contains(h.id.as_str()) && !base.contains(h.id.as_str()) {
-                    merged.push(h.clone());
-                }
-            }
-            let merged_ids: std::collections::HashSet<&str> =
-                merged.iter().map(|h| h.id.as_str()).collect();
-            let deleted_areas: Vec<crate::pdf::Highlight> = disk_highlights
-                .into_iter()
-                .filter(|h| h.image.is_some() && !merged_ids.contains(h.id.as_str()))
-                .collect();
-            let area_source_key = if primary_baseline.is_none() && legacy_baseline.is_some() {
-                legacy_key.as_str()
-            } else {
-                key.as_str()
-            };
-            let next =
-                crate::pdf::write_highlights(&merged, existing_edn.map_or("", String::as_str));
-            let primary_now = read_optional_text(&edn_path)?;
-            let legacy_now = if primary_now.is_none() && primary_baseline.is_none() {
-                match &legacy_edn {
-                    Some(path) => read_optional_text(path)?,
-                    None => None,
-                }
-            } else {
-                None
-            };
-            if primary_now != primary_baseline
-                || (primary_baseline.is_none() && legacy_now != legacy_baseline)
-            {
-                continue;
-            }
-            let publish = if primary_baseline.is_none() {
-                atomic_write_new(&edn_path, next.as_bytes())
-            } else {
-                atomic_write(&edn_path, next.as_bytes())
-            };
-            match publish {
-                Ok(()) => {}
-                Err(error)
-                    if primary_baseline.is_none()
-                        && error.kind() == io::ErrorKind::AlreadyExists =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-            committed_sidecar = Some((
-                merged,
-                primary_baseline,
-                legacy_baseline,
-                next,
-                area_source_key.to_string(),
-                deleted_areas,
-            ));
-            break;
-        }
-        let (
-            merged,
-            committed_primary_edn_baseline,
-            committed_legacy_edn_baseline,
-            committed_edn,
-            area_source_key,
-            deleted_areas,
-        ) = committed_sidecar.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "highlight sidecar changed repeatedly during update",
-            )
-        })?;
+        let sidecar = self.commit_highlight_sidecar_asset_only(
+            pdf_filename,
+            highlights,
+            base_ids,
+            legacy_active,
+        )?;
 
         // Upsert into the existing hls page, preserving note children by id.
         // (`page_path` + its lock were taken at the top of this fn.) Prefer the
@@ -16835,7 +16933,7 @@ impl Graph {
             existing.as_ref(),
             pdf_filename,
             label,
-            &merged,
+            sidecar.merged(),
             Format::from_path(&page_path),
         );
         // Preserve the notes page's CRLF (shared with write_page), then go through
@@ -16858,11 +16956,7 @@ impl Graph {
         ) {
             Ok(rev) => rev,
             Err(page_error) => {
-                if let Err(rollback_error) = self.rollback_highlight_sidecar(
-                    &edn_path,
-                    committed_primary_edn_baseline.as_deref(),
-                    &committed_edn,
-                ) {
+                if let Err(rollback_error) = self.rollback_highlight_sidecar_commit(&sidecar) {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!(
@@ -16888,41 +16982,13 @@ impl Graph {
         // Drop the self-write marker now the write is published + cached (see
         // write_page / drop_self_write_marker).
         self.drop_self_write_marker(&page_path, &page_rev);
-        let source_sidecar_guard = (area_source_key == legacy_key)
-            .then(|| legacy_edn.as_deref())
-            .flatten()
-            .zip(committed_legacy_edn_baseline.as_deref());
-        self.trash_deleted_pdf_area_images(
-            &area_source_key,
-            &edn_path,
-            &committed_edn,
-            source_sidecar_guard,
-            &deleted_areas,
-        );
+        self.finish_highlight_sidecar_commit(&sidecar)?;
         // Migrate-on-write cleanup is compare-and-recover: only retire a legacy
         // artifact if it still equals the exact bytes we merged. A concurrent
         // legacy update stays at its original path. Unchanged files are moved to
         // recoverable trash rather than hard-deleted.
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
         self.managed_create_dir_all(&write, &trash)?;
-        if let (Some(path), Some(baseline)) = (&legacy_edn, &committed_legacy_edn_baseline) {
-            if read_optional_text(path)?.as_ref() == Some(baseline) {
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("legacy.edn");
-                let dest = trash.join(format!("{}__legacy__{name}", trash_stamp()));
-                if move_file_noreplace(path, &dest).is_ok()
-                    && read_optional_text(&dest)?.as_ref() != Some(baseline)
-                {
-                    let _ = move_file_noreplace(&dest, path);
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "legacy highlight sidecar changed during migration cleanup",
-                    ));
-                }
-            }
-        }
         if let (Some(path), Some(baseline)) = (&legacy_page, &legacy_page_baseline) {
             if self.managed_read_optional_text(&write, path)?.as_ref() == Some(baseline) {
                 let name = path
@@ -23834,6 +23900,32 @@ pub(crate) fn generated_document_page_dto(
         path: String::new(),
         guide: false,
     })
+}
+
+pub(crate) fn page_dto_document(page: &PageDto) -> io::Result<Document> {
+    Ok(Document {
+        pre_block: page.pre_block.clone(),
+        roots: dto_blocks_to_doc_checked(&page.blocks, page.format == Format::Org)?,
+    })
+}
+
+pub(crate) fn existing_document_page_dto(
+    base: &PageDto,
+    mut document: Document,
+) -> io::Result<PageDto> {
+    assign_virtual_doc_runtime_ids(
+        &mut document.roots,
+        "managed-document-update-v1",
+        if base.path.is_empty() {
+            &base.name
+        } else {
+            &base.path
+        },
+    )?;
+    let mut page = base.clone();
+    page.pre_block = document.pre_block;
+    page.blocks = doc_blocks_to_dto_checked(&document.roots)?;
+    Ok(page)
 }
 
 /// Whether a page should load read-only: an org file whose on-disk bytes don't
