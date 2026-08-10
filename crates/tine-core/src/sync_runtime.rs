@@ -355,15 +355,19 @@ struct ManagedApplicationSaveInstrumentation {
 /// Actor-local, test-only accounting for the managed application query paths.
 ///
 /// This deliberately counts semantic read operations rather than SQLite calls:
-/// a full inventory pass is the one navigation-page traversal, and an exact
-/// page load is a successfully materialized page DTO. It is kept off the
-/// release actor so evidence collection cannot alter application behavior.
+/// a full inventory pass is the one navigation-page traversal. Page DTO
+/// hydrations are separated into result hydrations (the pages a query actually
+/// evaluates) and metadata/context hydrations (for example, a pending local
+/// overlay needed to collect aliases or reference names before graph search).
+/// It is kept off the release actor so evidence collection cannot alter
+/// application behavior.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ManagedApplicationQueryInstrumentation {
     full_inventory_passes: usize,
     inventory_pages: usize,
-    exact_page_loads: usize,
+    result_page_hydrations: usize,
+    metadata_page_hydrations: usize,
     indexed_candidate_pages: usize,
     overlay_pages: usize,
     block_branches: usize,
@@ -8681,18 +8685,34 @@ impl RuntimeActor {
     }
 
     #[cfg(test)]
-    fn note_managed_application_query_exact_page_load(&self) {
+    fn note_managed_application_query_result_page_hydration(&self) {
         let mut current = self.managed_application_query_instrumentation.get();
-        current.exact_page_loads = current.exact_page_loads.saturating_add(1);
+        current.result_page_hydrations = current.result_page_hydrations.saturating_add(1);
         self.managed_application_query_instrumentation.set(current);
     }
 
-    fn finish_managed_application_query_page_hydration(
+    #[cfg(test)]
+    fn note_managed_application_query_metadata_page_hydration(&self) {
+        let mut current = self.managed_application_query_instrumentation.get();
+        current.metadata_page_hydrations = current.metadata_page_hydrations.saturating_add(1);
+        self.managed_application_query_instrumentation.set(current);
+    }
+
+    fn finish_managed_application_query_result_page_hydration(
         &self,
         current: ApplicationCurrentPage,
     ) -> ApplicationCurrentPage {
         #[cfg(test)]
-        self.note_managed_application_query_exact_page_load();
+        self.note_managed_application_query_result_page_hydration();
+        current
+    }
+
+    fn finish_managed_application_query_metadata_page_hydration(
+        &self,
+        current: ApplicationCurrentPage,
+    ) -> ApplicationCurrentPage {
+        #[cfg(test)]
+        self.note_managed_application_query_metadata_page_hydration();
         current
     }
 
@@ -8702,7 +8722,7 @@ impl RuntimeActor {
     ) -> ApplicationExactLoad {
         match current {
             ApplicationExactLoad::Loaded(current) => ApplicationExactLoad::Loaded(
-                self.finish_managed_application_query_page_hydration(current),
+                self.finish_managed_application_query_result_page_hydration(current),
             ),
             ApplicationExactLoad::Missing => ApplicationExactLoad::Missing,
             ApplicationExactLoad::Ambiguous => ApplicationExactLoad::Ambiguous,
@@ -10984,7 +11004,13 @@ impl RuntimeActor {
         path: &ManagedPath,
     ) -> Result<ApplicationExactLoad, SyncApplicationPageRequestError> {
         self.load_hot_application_exact_untracked_ready(path)
-            .map(|current| self.finish_managed_application_query_exact_load(current))
+            .map(|current| match current {
+                ApplicationExactLoad::Loaded(current) => ApplicationExactLoad::Loaded(
+                    self.finish_managed_application_query_metadata_page_hydration(current),
+                ),
+                ApplicationExactLoad::Missing => ApplicationExactLoad::Missing,
+                ApplicationExactLoad::Ambiguous => ApplicationExactLoad::Ambiguous,
+            })
     }
 
     fn load_hot_application_exact_untracked_ready(
@@ -11023,7 +11049,7 @@ impl RuntimeActor {
         page_id: PageId,
     ) -> Result<ApplicationCurrentPage, SyncApplicationPageRequestError> {
         self.load_application_page_id_untracked_ready(page_id)
-            .map(|current| self.finish_managed_application_query_page_hydration(current))
+            .map(|current| self.finish_managed_application_query_result_page_hydration(current))
     }
 
     fn load_application_page_id_untracked_ready(
@@ -29877,6 +29903,24 @@ mod tests {
     fn copy_provider_tree(from: &Path, to: &Path) {
         let mut pending = vec![(from.to_path_buf(), to.to_path_buf())];
         while let Some((source, destination)) = pending.pop() {
+            let source_type = fs::symlink_metadata(&source)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "graph-copy source metadata unavailable at {}: {error}",
+                        source.display()
+                    )
+                })
+                .file_type();
+            assert!(
+                !source_type.is_symlink(),
+                "refusing to copy graph root symlink: {}",
+                source.display()
+            );
+            assert!(
+                source_type.is_dir(),
+                "refusing to copy non-directory graph source: {}",
+                source.display()
+            );
             fs::create_dir_all(&destination).unwrap();
             let mut entries = fs::read_dir(source)
                 .unwrap()
@@ -29936,6 +29980,100 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&outside).unwrap(),
             "target must remain outside the copied graph\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_provider_tree_rejects_root_symlink_without_opening_target() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ActivationFixture::empty("copy-provider-tree-root-symlink", 0xa2f2);
+        let real_source = fixture.root.join("real-copy-source");
+        let source_alias = fixture.root.join("copy-source-alias");
+        let destination = fixture.root.join("copy-destination");
+        fs::create_dir_all(&real_source).unwrap();
+        fs::write(real_source.join("must-not-be-copied.md"), "root target\n").unwrap();
+        symlink(&real_source, &source_alias).unwrap();
+
+        let refusal = std::panic::catch_unwind(|| copy_provider_tree(&source_alias, &destination))
+            .expect_err("graph copy accepted a root symlink");
+        let refusal = refusal
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| refusal.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string graph-copy refusal");
+        assert!(
+            refusal.contains("refusing to copy graph root symlink"),
+            "graph copy reached the wrong failure instead of rejecting its root symlink before opening it: {refusal}"
+        );
+        assert!(
+            !destination.exists(),
+            "graph copy created a destination after accepting the root symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(real_source.join("must-not-be-copied.md")).unwrap(),
+            "root target\n"
+        );
+    }
+
+    fn validate_real_graph_copy_source(source: PathBuf, variable: &str) -> PathBuf {
+        let source_type = fs::symlink_metadata(&source)
+            .unwrap_or_else(|error| panic!("{variable} metadata must be readable: {error}"))
+            .file_type();
+        assert!(
+            !source_type.is_symlink(),
+            "{variable} must name a real graph directory, not a symlink"
+        );
+        assert!(source_type.is_dir(), "{variable} must name a directory");
+        // Canonicalization is intentionally after the no-follow root check: it
+        // is used only to enforce the private-graph boundary, never to turn a
+        // symlink alias into an accepted copy root.
+        let canonical = fs::canonicalize(&source)
+            .unwrap_or_else(|error| panic!("{variable} must name a readable graph copy: {error}"));
+        assert!(
+            !canonical.starts_with("/home/koutecky/research/brain"),
+            "the live graph is forbidden; supply a copied corpus"
+        );
+        source
+    }
+
+    fn real_graph_copy_source_from_env(variable: &str) -> PathBuf {
+        let source = PathBuf::from(
+            std::env::var(variable)
+                .unwrap_or_else(|_| panic!("set {variable} to a backed-up graph copy")),
+        );
+        validate_real_graph_copy_source(source, variable)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_graph_copy_gate_rejects_root_symlink_before_canonicalization() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = ActivationFixture::empty("real-graph-copy-root-symlink", 0xa2f4);
+        let real_source = fixture.root.join("real-copy-source");
+        let source_alias = fixture.root.join("copy-source-alias");
+        fs::create_dir_all(&real_source).unwrap();
+        fs::write(real_source.join("must-not-be-opened.md"), "root target\n").unwrap();
+        symlink(&real_source, &source_alias).unwrap();
+
+        let refusal = std::panic::catch_unwind(|| {
+            validate_real_graph_copy_source(source_alias.clone(), "TINE_TEST_COPY")
+        })
+        .expect_err("manual real-copy gate accepted a root symlink");
+        let refusal = refusal
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| refusal.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string real-copy refusal");
+        assert!(
+            refusal.contains("must name a real graph directory, not a symlink"),
+            "manual real-copy gate reached canonicalization or another failure before rejecting the root symlink: {refusal}"
+        );
+        assert_eq!(
+            fs::read_to_string(real_source.join("must-not-be-opened.md")).unwrap(),
+            "root target\n"
         );
     }
 
@@ -40074,11 +40212,11 @@ mod tests {
                 );
             }
             assert_eq!(
-                counters.exact_page_loads,
+                counters.result_page_hydrations,
                 counters
                     .indexed_candidate_pages
                     .saturating_add(counters.overlay_pages),
-                "indexed task query must hydrate each distinct unmasked candidate and overlay page exactly once: {counters:?}"
+                "indexed task query must hydrate each distinct unmasked candidate and overlay page as a query result exactly once: {counters:?}"
             );
             indexed_samples.push(elapsed);
             indexed_counters.push(counters);
@@ -40098,8 +40236,8 @@ mod tests {
                 "Regex-All inventory did not cover each page exactly once: {counters:?}"
             );
             assert_eq!(
-                counters.exact_page_loads, total_pages,
-                "Regex-All must hydrate every inventoried page exactly once: {counters:?}"
+                counters.result_page_hydrations, total_pages,
+                "Regex-All must hydrate every inventoried page as a query result exactly once: {counters:?}"
             );
             regex_all_samples.push(elapsed);
             regex_all_counters.push(counters);
@@ -40126,8 +40264,8 @@ mod tests {
                 "graph-search inventory did not cover each page exactly once: {counters:?}"
             );
             assert_eq!(
-                counters.exact_page_loads, total_pages,
-                "graph block search must hydrate every inventoried page exactly once: {counters:?}"
+                counters.result_page_hydrations, total_pages,
+                "graph block search must hydrate every inventoried page as a query result exactly once: {counters:?}"
             );
             graph_search_samples.push(elapsed);
             graph_search_counters.push(counters);
@@ -40140,7 +40278,7 @@ mod tests {
         let graph_search_p50 = startup_median(&graph_search_samples);
         let graph_search_p95 = startup_p95(&graph_search_samples);
         eprintln!(
-            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_candidates_max={} indexed_overlay_max={} indexed_exact_loads_max={} regex_all_inventory_passes_max={} regex_all_exact_loads_max={} graph_search_inventory_passes_max={} graph_search_exact_loads_max={}",
+            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_candidates_max={} indexed_overlay_max={} indexed_result_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
             startup_ms(indexed_p50),
             startup_ms(indexed_p95),
             startup_ms(regex_all_p50),
@@ -40149,11 +40287,11 @@ mod tests {
             startup_ms(graph_search_p95),
             max_query_gate_counter(&indexed_counters, |counters| counters.indexed_candidate_pages),
             max_query_gate_counter(&indexed_counters, |counters| counters.overlay_pages),
-            max_query_gate_counter(&indexed_counters, |counters| counters.exact_page_loads),
+            max_query_gate_counter(&indexed_counters, |counters| counters.result_page_hydrations),
             max_query_gate_counter(&regex_all_counters, |counters| counters.full_inventory_passes),
-            max_query_gate_counter(&regex_all_counters, |counters| counters.exact_page_loads),
+            max_query_gate_counter(&regex_all_counters, |counters| counters.result_page_hydrations),
             max_query_gate_counter(&graph_search_counters, |counters| counters.full_inventory_passes),
-            max_query_gate_counter(&graph_search_counters, |counters| counters.exact_page_loads),
+            max_query_gate_counter(&graph_search_counters, |counters| counters.result_page_hydrations),
         );
 
         // These are emergency tripwires retained from the predecessor receipt,
@@ -40171,6 +40309,103 @@ mod tests {
             graph_search_p95 < Duration::from_secs(2),
             "graph-search emergency tripwire exceeded two seconds at {label}: {graph_search_p95:?}"
         );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_graph_search_accounts_for_pending_overlay_metadata_separately() {
+        const TOTAL_PAGES: usize = 16;
+        const MAX_ROWS: usize = 20_000;
+        let fixture = ActivationFixture::scaled_query_candidate_density(
+            "managed-query-search-overlay-accounting",
+            0xa2f3,
+            TOTAL_PAGES,
+            4,
+        );
+        let direct = Graph::open(&fixture.graph_root);
+        let mut expected = direct.run_graph_search("query-density-page", 0, MAX_ROWS, false);
+        let overlay_path = direct
+            .list_pages()
+            .into_iter()
+            .next()
+            .expect("overlay fixture must contain pages")
+            .rel_path;
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("managed reopen retains its actor");
+        let (page, revision) = load_application_exact(&handle, &overlay_path);
+        let original_raw = page.blocks[0].raw.clone();
+        let _ = save_application_block_text(&handle, page, revision, &original_raw);
+        assert_eq!(
+            handle.status().unwrap().managed_local_pending,
+            1,
+            "the query must run with a real, undrained local overlay"
+        );
+
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
+                source: "query-density-page".into(),
+                page_limit: 0,
+                block_limit: MAX_ROWS,
+                lane: Some("overlay-accounting".into()),
+                explain: false,
+                scope: None,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::GraphSearch(mut actual),
+        } = outcome
+        else {
+            panic!("managed graph search returned the wrong outcome: {outcome:?}")
+        };
+        canonicalize_graph_search_for_mode_differential(&mut actual);
+        canonicalize_graph_search_for_mode_differential(&mut expected);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "the active-overlay graph search must retain Direct Files semantics"
+        );
+
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(
+            counters.full_inventory_passes, 1,
+            "graph search must keep its one full inventory pass: {counters:?}"
+        );
+        assert_eq!(
+            counters.inventory_pages, TOTAL_PAGES,
+            "graph search must inventory each fixture page once: {counters:?}"
+        );
+        assert_eq!(
+            counters.block_branches, 1,
+            "the receipt must execute graph search's block branch: {counters:?}"
+        );
+        assert_eq!(
+            counters.result_page_hydrations, TOTAL_PAGES,
+            "every graph-search result page must be hydrated exactly once, independent of metadata work: {counters:?}"
+        );
+        assert!(
+            counters.metadata_page_hydrations > 0,
+            "the active overlay must make metadata/context hydration observable instead of hiding it in result work: {counters:?}"
+        );
+
+        drain_managed_local(&handle);
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -40207,14 +40442,8 @@ mod tests {
             }
         }
 
-        if let Some(source) = std::env::var_os("TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY") {
-            let source = fs::canonicalize(PathBuf::from(source))
-                .expect("TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY must name a readable copy");
-            assert!(source.is_dir(), "real-copy source must be a directory");
-            assert!(
-                !source.starts_with("/home/koutecky/research/brain"),
-                "the live graph is forbidden; supply a copied corpus"
-            );
+        if std::env::var_os("TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY").is_some() {
+            let source = real_graph_copy_source_from_env("TINE_MANAGED_QUERY_GATE_REAL_GRAPH_COPY");
             let fixture =
                 ActivationFixture::copied_graph("managed-query-search-real-copy", 0xa2f0, &source);
             managed_query_search_manual_receipt(
@@ -40234,16 +40463,7 @@ mod tests {
             !cfg!(debug_assertions),
             "this gate is release-only; run with TINE_MANAGED_READ_REAL_GRAPH_COPY=<copy> cargo test -p tine-core --release managed_application_read_real_graph_copy_manual_gate -- --ignored --nocapture"
         );
-        let source_root = PathBuf::from(
-            std::env::var("TINE_MANAGED_READ_REAL_GRAPH_COPY")
-                .expect("set TINE_MANAGED_READ_REAL_GRAPH_COPY to a backed-up graph copy"),
-        );
-        let source_root = fs::canonicalize(source_root).unwrap();
-        assert_ne!(
-            source_root,
-            PathBuf::from("/home/koutecky/research/brain"),
-            "the live graph is forbidden; supply a copy"
-        );
+        let source_root = real_graph_copy_source_from_env("TINE_MANAGED_READ_REAL_GRAPH_COPY");
         let fixture = ActivationFixture::copied_graph(
             "managed-application-read-real-copy",
             0xa140,
