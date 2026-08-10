@@ -44,7 +44,7 @@ use crate::fast_commit::{
 use crate::model::{
     sync_conflict_base, AcceptedExternalDocumentIdentity, BacklinkFilterContext,
     BacklinkFilterTarget, BlockDto, BlockPreview, Format, Graph, PageDto, PageEntry, PageKind,
-    RefGroup, ReferenceBlockEvidence, ReferenceKind,
+    RefGroup, ReferenceBlockEvidence, ReferenceKind, TemplateDto,
 };
 use crate::oplog::discovery::{
     discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
@@ -1854,6 +1854,7 @@ pub enum SyncApplicationNavigationRequest {
         name: String,
         targets: Vec<BacklinkFilterTarget>,
     },
+    ListTemplates,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1883,6 +1884,7 @@ pub enum SyncApplicationNavigationReply {
     Backlinks(SyncApplicationBoundedRefGroups),
     UnlinkedReferences(SyncApplicationBoundedRefGroups),
     BacklinkFilterContext(BacklinkFilterContext),
+    Templates(Vec<TemplateDto>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4417,7 +4419,8 @@ fn validate_application_navigation_request(
     }
     let (names, query, limit) = match request {
         SyncApplicationNavigationRequest::ReferencedPageNames
-        | SyncApplicationNavigationRequest::PageAliases => (&[][..], None, None),
+        | SyncApplicationNavigationRequest::PageAliases
+        | SyncApplicationNavigationRequest::ListTemplates => (&[][..], None, None),
         SyncApplicationNavigationRequest::PageIcons { names }
         | SyncApplicationNavigationRequest::ExistingPageNames { names } => {
             (names.as_slice(), None, None)
@@ -8167,6 +8170,7 @@ impl RuntimeActor {
                 ))
             }
             SyncRuntimeQueryRequest::PropertiesNamed { name, value, limit } => {
+                let name = crate::doc::property_key_norm(&name);
                 Ok(SyncRuntimeQueryReply::Properties(
                     read.properties_named(&name, value.as_deref(), limit)
                         .map_err(materialized_query_error)?
@@ -8376,6 +8380,9 @@ impl RuntimeActor {
                 SyncApplicationNavigationReply::BacklinkFilterContext(
                     self.application_backlink_filter_context_ready(&name, &targets)?,
                 )
+            }
+            SyncApplicationNavigationRequest::ListTemplates => {
+                SyncApplicationNavigationReply::Templates(self.application_templates_ready()?)
             }
         };
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
@@ -9122,6 +9129,84 @@ impl RuntimeActor {
         Ok(bound_application_reference_sources(
             sources, max_rows, max_bytes, false,
         ))
+    }
+
+    fn application_templates_ready(
+        &self,
+    ) -> Result<Vec<TemplateDto>, SyncApplicationPageRequestError> {
+        let overlay = self.application_navigation_overlay_ready()?;
+        let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+
+        const BATCH: usize = 256;
+        let mut candidates = BTreeMap::<PageId, HashSet<BlockId>>::new();
+        let mut page_paths = HashMap::<PageId, ManagedPath>::new();
+        let mut cursor = None;
+        loop {
+            let rows = read
+                .block_property_candidates_after("template", cursor, BATCH)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if rows.is_empty() {
+                break;
+            }
+            let len = rows.len();
+            for row in rows {
+                cursor = Some((row.page_id, row.block_id));
+                let path = if let Some(path) = page_paths.get(&row.page_id) {
+                    path.clone()
+                } else {
+                    let page = read
+                        .page(row.page_id)
+                        .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
+                        .ok_or(SyncApplicationPageRequestError::ActorRefused)?;
+                    page_paths.insert(row.page_id, page.path.clone());
+                    page.path
+                };
+                if !masked_paths.contains(&path) {
+                    candidates
+                        .entry(row.page_id)
+                        .or_default()
+                        .insert(row.block_id);
+                }
+            }
+            if len < BATCH {
+                break;
+            }
+        }
+        drop(read);
+
+        let mut sources = Vec::<(String, Vec<TemplateDto>)>::new();
+        for (path, current) in overlay {
+            let Some((_, page)) = current else {
+                continue;
+            };
+            let templates = crate::query::application_page_templates(&page, None);
+            if !templates.is_empty() {
+                sources.push((path.as_str().to_owned(), templates));
+            }
+        }
+        for (page_id, block_ids) in candidates {
+            let current = self.load_application_page_id_ready(page_id)?;
+            let allowed = application_parser_indices_for_block_ids(&current, &block_ids)?;
+            let templates = crate::query::application_page_templates(&current.page, Some(&allowed));
+            if !templates.is_empty() {
+                sources.push((current.editor.page.path.as_str().to_owned(), templates));
+            }
+        }
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(sources
+            .into_iter()
+            .flat_map(|(_, templates)| templates)
+            .collect())
     }
 
     fn application_backlink_filter_context_ready(
@@ -18868,6 +18953,18 @@ mod tests {
             )
             .as_bytes(),
         );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Templates.md",
+            b"- include parent\n  Template:: Parent template\n  id:: 11111111-1111-4111-8111-111111111111\n  - nested child\n- children only\n  template:: Child template\n  template_including_parent:: false\n  - inserted child\n",
+        );
+        admit_external_page(
+            &handle,
+            &fixture,
+            "content/nested pages/Org Templates.org",
+            b"* org template\n:PROPERTIES:\n:Template: Org template\n:END:\n** org child\n",
+        );
         let inventory = match handle.application_page_inventory().unwrap() {
             SyncApplicationPageInventoryOutcome::Loaded { pages } => pages,
             other => panic!("application inventory was not ready: {other:?}"),
@@ -18956,6 +19053,16 @@ mod tests {
                 .map(|page| (&page.name, &page.rel_path))
                 .collect::<Vec<_>>(),
             "managed navigation must share Direct Files quick-switch semantics"
+        );
+        let SyncApplicationNavigationReply::Templates(managed_templates) =
+            navigation(SyncApplicationNavigationRequest::ListTemplates)
+        else {
+            panic!("wrong template reply")
+        };
+        assert_eq!(
+            serde_json::to_value(&managed_templates).unwrap(),
+            serde_json::to_value(graph.templates()).unwrap(),
+            "managed template discovery must share Direct Files parser semantics"
         );
         let requested = vec![
             genuine.to_owned(),
@@ -19247,15 +19354,16 @@ mod tests {
             &fixture,
             "content/nested pages/Navigation.md",
             format!(
-                "icon:: old\nalias:: Old Alias\n\n- mentions Old Plain [[Old Phantom]] (({old_reference}))\n  id:: {identity}\n"
+                "icon:: old\nalias:: Old Alias\n\n- mentions Old Plain [[Old Phantom]] (({old_reference}))\n  template:: Old template\n  id:: {identity}\n"
             )
             .as_bytes(),
         );
         let (mut page, revision) =
             load_application_exact(&handle, "content/nested pages/Navigation.md");
         page.pre_block = Some("icon:: new\nalias:: New Alias".into());
-        page.blocks[0].raw =
-            format!("- mentions New Plain [[New Phantom]] (({new_reference}))\n  id:: {identity}");
+        page.blocks[0].raw = format!(
+            "- mentions New Plain [[New Phantom]] (({new_reference}))\n  Template:: New template\n  id:: {identity}"
+        );
         let saved = handle
             .save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::Existing {
@@ -19371,10 +19479,22 @@ mod tests {
         };
         assert_eq!(icons.get("Navigation").map(String::as_str), Some("new"));
         assert_eq!(icons.get("New Alias").map(String::as_str), Some("new"));
+        let SyncApplicationNavigationReply::Templates(templates) =
+            loaded(SyncApplicationNavigationRequest::ListTemplates)
+        else {
+            panic!("wrong template reply")
+        };
+        assert!(templates
+            .iter()
+            .any(|template| template.name == "New template"));
+        assert!(!templates
+            .iter()
+            .any(|template| template.name == "Old template"));
 
         let mut created_block = BlockDto::default();
-        created_block.raw =
-            format!("- links Created Plain [[Created Phantom]] (({new_reference}))");
+        created_block.raw = format!(
+            "- links Created Plain [[Created Phantom]] (({new_reference}))\n  template:: Created template"
+        );
         let created = handle
             .save_application_page(SyncApplicationPageSaveRequest {
                 target: SyncApplicationPageSaveTarget::New {
@@ -19435,6 +19555,17 @@ mod tests {
             panic!("wrong block-reference-count reply")
         };
         assert_eq!(counts.get(new_reference), Some(&2));
+        let SyncApplicationNavigationReply::Templates(templates) =
+            loaded(SyncApplicationNavigationRequest::ListTemplates)
+        else {
+            panic!("wrong template reply")
+        };
+        assert!(templates
+            .iter()
+            .any(|template| template.name == "New template"));
+        assert!(templates
+            .iter()
+            .any(|template| template.name == "Created template"));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

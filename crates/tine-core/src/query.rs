@@ -2513,6 +2513,96 @@ pub fn templates(graph: &Graph) -> Vec<TemplateDto> {
     })
 }
 
+/// Extract templates from one exact application page. `allowed_indices` uses
+/// parser pre-order indices and is a candidate filter only; properties are
+/// always verified from the current parser DTO before a template is exposed.
+pub(crate) fn application_page_templates(
+    page: &PageDto,
+    allowed_indices: Option<&std::collections::HashSet<usize>>,
+) -> Vec<TemplateDto> {
+    fn property(block: &BlockDto, wanted: &str) -> Option<String> {
+        block
+            .properties
+            .iter()
+            .find(|(name, _)| property_key_norm(name) == wanted)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn template_dto_from_application(block: &BlockDto, strip_template: bool) -> BlockDto {
+        let raw = block
+            .raw
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                let drop = trimmed.starts_with("id::")
+                    || (strip_template
+                        && (trimmed.starts_with("template::")
+                            || trimmed.starts_with("template-including-parent::")));
+                !drop
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        BlockDto {
+            id: String::new(),
+            raw,
+            collapsed: false,
+            children: block
+                .children
+                .iter()
+                .map(|child| template_dto_from_application(child, false))
+                .collect(),
+            breadcrumb: Vec::new(),
+            ..BlockDto::default()
+        }
+    }
+
+    fn visit(
+        blocks: &[BlockDto],
+        page: &PageDto,
+        allowed_indices: Option<&std::collections::HashSet<usize>>,
+        next_index: &mut usize,
+        out: &mut Vec<TemplateDto>,
+    ) {
+        for block in blocks {
+            let index = *next_index;
+            *next_index = next_index.saturating_add(1);
+            if allowed_indices.is_none_or(|allowed| allowed.contains(&index)) {
+                if let Some(name) = property(block, "template").filter(|name| !name.is_empty()) {
+                    let include_parent =
+                        property(block, "template-including-parent").as_deref() != Some("false");
+                    let blocks = if include_parent {
+                        vec![template_dto_from_application(block, true)]
+                    } else {
+                        block
+                            .children
+                            .iter()
+                            .map(|child| template_dto_from_application(child, false))
+                            .collect()
+                    };
+                    out.push(TemplateDto {
+                        name,
+                        blocks,
+                        page: page.name.clone(),
+                        kind: page.kind,
+                    });
+                }
+            }
+            visit(&block.children, page, allowed_indices, next_index, out);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut next_index = 0;
+    visit(
+        &page.blocks,
+        page,
+        allowed_indices,
+        &mut next_index,
+        &mut out,
+    );
+    out
+}
+
 /// Convert a template block subtree to a DTO, dropping `id::` (so inserted
 /// copies get fresh ids) and, at the root, the `template*` properties.
 fn template_dto(b: &DocBlock, strip_template: bool) -> BlockDto {

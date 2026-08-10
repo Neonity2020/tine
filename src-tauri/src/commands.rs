@@ -1300,6 +1300,7 @@ mod graph_wide_command_boundary_tests {
             "block_ref_counts",
             "block_referrers",
             "get_backlink_filter_context",
+            "list_templates",
             "rename_page",
             "delete_page",
         ] {
@@ -1340,6 +1341,7 @@ mod managed_actor_command_boundary_tests {
             "get_backlinks",
             "get_backlink_filter_context",
             "get_unlinked_refs",
+            "list_templates",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1381,6 +1383,7 @@ mod managed_actor_command_boundary_tests {
             "get_backlinks",
             "get_backlink_filter_context",
             "get_unlinked_refs",
+            "list_templates",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");
@@ -1953,10 +1956,25 @@ mod capture_quick_switch_tests {
 }
 
 #[tauri::command]
-pub(crate) fn list_templates(
+pub(crate) async fn list_templates(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::TemplateDto>, String> {
-    with_read_graph(&state, |g| Ok(g.templates()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                match sparse_navigation(handle, SyncApplicationNavigationRequest::ListTemplates)? {
+                    SyncApplicationNavigationReply::Templates(templates) => Ok(templates),
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => Ok(slot.legacy_graph()?.templates()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn application_property_line(line: &str) -> bool {

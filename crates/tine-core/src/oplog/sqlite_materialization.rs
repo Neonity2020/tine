@@ -1639,6 +1639,7 @@ fn lower_reference(reference: &MaterializedReference) -> storage::PhysicalRefere
 fn lower_property(property: &MaterializedProperty) -> storage::PhysicalProperty {
     storage::PhysicalProperty {
         name: property.name.clone(),
+        normalized_name: crate::doc::property_key_norm(&property.name),
         value: property.value.clone(),
     }
 }
@@ -1970,6 +1971,12 @@ pub struct MaterializedPageReferrerCandidateRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPlainTextCandidatePageRow {
     pub page_id: PageId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockPropertyCandidateRow {
+    pub page_id: PageId,
+    pub block_id: BlockId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2321,6 +2328,25 @@ impl<'a> SqliteMaterializedRead<'a> {
             .collect()
     }
 
+    pub fn block_property_candidates_after(
+        &self,
+        normalized_name: &str,
+        after: Option<(PageId, BlockId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockPropertyCandidateRow>, MaterializationError> {
+        self.inner
+            .block_property_candidates_after(
+                normalized_name,
+                after.map(|(page, block)| {
+                    (page.as_uuid().into_bytes(), block.as_uuid().into_bytes())
+                }),
+                limit,
+            )?
+            .into_iter()
+            .map(block_property_candidate_row_from_storage)
+            .collect()
+    }
+
     pub fn properties(
         &self,
         owner: MaterializedEntityId,
@@ -2528,6 +2554,15 @@ fn plain_text_candidate_page_row_from_storage(
 ) -> Result<MaterializedPlainTextCandidatePageRow, MaterializationError> {
     Ok(MaterializedPlainTextCandidatePageRow {
         page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+    })
+}
+
+fn block_property_candidate_row_from_storage(
+    row: storage::PhysicalBlockPropertyCandidateRow,
+) -> Result<MaterializedBlockPropertyCandidateRow, MaterializationError> {
+    Ok(MaterializedBlockPropertyCandidateRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
     })
 }
 
