@@ -8486,7 +8486,7 @@ impl RuntimeActor {
                 max_rows,
                 max_bytes,
             } => SyncApplicationNavigationReply::SimpleQuery(
-                self.application_task_query_ready(&query, max_rows, max_bytes)?,
+                self.application_simple_query_ready(&query, max_rows, max_bytes)?,
             ),
         };
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
@@ -9397,13 +9397,15 @@ impl RuntimeActor {
         Ok(accumulator.finish())
     }
 
-    fn application_task_query_ready(
+    fn application_simple_query_ready(
         &self,
         query: &str,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<Option<SyncApplicationBoundedRefGroups>, SyncApplicationPageRequestError> {
-        let Some(markers) = crate::query::simple_query_task_candidate_markers(query) else {
+        use crate::query::SimpleQueryCandidateSource as Source;
+
+        let Some(sources) = crate::query::simple_query_candidate_sources(query) else {
             return Ok(None);
         };
         let overlay = self.application_navigation_overlay_ready()?;
@@ -9431,19 +9433,143 @@ impl RuntimeActor {
 
         const BATCH: usize = 512;
         let mut candidate_page_ids = BTreeSet::new();
-        for marker in markers {
+        for source in &sources {
+            match source {
+                Source::Task(marker) => {
+                    let mut cursor = None;
+                    loop {
+                        let rows = read
+                            .task_candidate_pages_after(marker, cursor, BATCH)
+                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                        if rows.is_empty() {
+                            break;
+                        }
+                        let len = rows.len();
+                        for row in rows {
+                            cursor = Some(row.page_id);
+                            if !masked_page_ids.contains(&row.page_id) {
+                                candidate_page_ids.insert(row.page_id);
+                            }
+                        }
+                        if len < BATCH {
+                            break;
+                        }
+                    }
+                }
+                Source::PageRef(normalized) => {
+                    let mut cursor = None;
+                    loop {
+                        let rows = read
+                            .page_referrer_candidates_after(normalized, cursor, BATCH)
+                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                        if rows.is_empty() {
+                            break;
+                        }
+                        let len = rows.len();
+                        for row in rows {
+                            cursor = Some((row.source_page_id, row.source));
+                            if !masked_page_ids.contains(&row.source_page_id) {
+                                candidate_page_ids.insert(row.source_page_id);
+                            }
+                        }
+                        if len < BATCH {
+                            break;
+                        }
+                    }
+                }
+                Source::BlockProperty(normalized) => {
+                    let mut cursor = None;
+                    loop {
+                        let rows = read
+                            .block_property_candidates_after(normalized, cursor, BATCH)
+                            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                        if rows.is_empty() {
+                            break;
+                        }
+                        let len = rows.len();
+                        for row in rows {
+                            cursor = Some((row.page_id, row.block_id));
+                            if !masked_page_ids.contains(&row.page_id) {
+                                candidate_page_ids.insert(row.page_id);
+                            }
+                        }
+                        if len < BATCH {
+                            break;
+                        }
+                    }
+                }
+                Source::PageProperty(_)
+                | Source::Page(_)
+                | Source::Namespace(_)
+                | Source::Journal => {}
+            }
+        }
+
+        let page_property_keys = sources
+            .iter()
+            .filter_map(|source| match source {
+                Source::PageProperty(key) => Some(key.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        if !page_property_keys.is_empty() {
             let mut cursor = None;
             loop {
                 let rows = read
-                    .task_candidate_pages_after(&marker, cursor, BATCH)
+                    .property_facet_rows_after(false, cursor.clone(), BATCH)
                     .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
                 if rows.is_empty() {
                     break;
                 }
                 let len = rows.len();
                 for row in rows {
-                    cursor = Some(row.page_id);
-                    if !masked_page_ids.contains(&row.page_id) {
+                    cursor = Some((row.owner, row.source_name.clone(), row.ordinal));
+                    if matches!(row.owner, MaterializedEntityId::Page(_))
+                        && page_property_keys.contains(row.normalized_name.as_str())
+                        && !masked_page_ids.contains(&row.page_id)
+                    {
+                        candidate_page_ids.insert(row.page_id);
+                    }
+                }
+                if len < BATCH {
+                    break;
+                }
+            }
+        }
+
+        let needs_inventory = sources.iter().any(|source| {
+            matches!(
+                source,
+                Source::PageRef(_) | Source::Page(_) | Source::Namespace(_) | Source::Journal
+            )
+        });
+        if needs_inventory {
+            let mut cursor: Option<(ManagedPath, PageId)> = None;
+            loop {
+                let rows = read
+                    .navigation_pages_after(
+                        cursor.as_ref().map(|(path, page_id)| (path, *page_id)),
+                        BATCH,
+                    )
+                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let len = rows.len();
+                for row in rows {
+                    cursor = Some((row.path.clone(), row.page_id));
+                    if masked_page_ids.contains(&row.page_id) {
+                        continue;
+                    }
+                    let matches = sources.iter().any(|source| match source {
+                        Source::PageRef(name) | Source::Page(name) => row.name_key == *name,
+                        Source::Namespace(namespace) => {
+                            row.name_key.starts_with(&format!("{namespace}/"))
+                        }
+                        Source::Journal => row.kind == ManagedTextKind::Journal,
+                        _ => false,
+                    });
+                    if matches {
                         candidate_page_ids.insert(row.page_id);
                     }
                 }
@@ -19400,6 +19526,43 @@ mod tests {
             serde_json::to_value(&direct_groups).unwrap(),
             "indexed managed task query must share Direct Files semantics"
         );
+        for indexed_query in [
+            "[[Compass]]",
+            "(property custom value)",
+            "(page-property icon 🧭)",
+            "(page \"Ordinary Ω\")",
+            "(journal)",
+            "(or (property custom value) (page \"Properties\"))",
+        ] {
+            let SyncApplicationNavigationReply::SimpleQuery(Some(managed_query)) =
+                navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                    query: indexed_query.into(),
+                    max_rows: 20_000,
+                    max_bytes: 32 * 1024 * 1024,
+                })
+            else {
+                panic!("indexed query did not use the managed candidate path: {indexed_query}")
+            };
+            let direct_query = graph.run_query_bounded(indexed_query, 20_000, 32 * 1024 * 1024);
+            assert_eq!(
+                managed_query.exceeded, direct_query.exceeded,
+                "{indexed_query}"
+            );
+            assert_eq!(managed_query.total, direct_query.total, "{indexed_query}");
+            let mut managed_groups = managed_query.groups;
+            let mut direct_groups = (*direct_query.groups).clone();
+            for group in &mut managed_groups {
+                erase_application_block_ids(&mut group.blocks);
+            }
+            for group in &mut direct_groups {
+                erase_application_block_ids(&mut group.blocks);
+            }
+            assert_eq!(
+                serde_json::to_value(&managed_groups).unwrap(),
+                serde_json::to_value(&direct_groups).unwrap(),
+                "indexed managed query must share Direct Files semantics: {indexed_query}"
+            );
+        }
         let SyncApplicationNavigationReply::SimpleQuery(None) =
             navigation(SyncApplicationNavigationRequest::SimpleQuery {
                 query: "\"gateway\"".into(),
@@ -19852,6 +20015,27 @@ mod tests {
             .any(|(key, values)| key == "new-prop" && values == &["new-value"]));
         assert!(!query_facets.iter().any(|(key, _)| key == "oldfacet"));
         assert!(!query_facets.iter().any(|(key, _)| key == "pagefacet"));
+        for (query, should_match) in [
+            ("(property oldfacet old-value)", false),
+            ("(property new-prop new-value)", true),
+            ("[[Old Phantom]]", false),
+            ("[[New Phantom]]", true),
+        ] {
+            let SyncApplicationNavigationReply::SimpleQuery(Some(result)) =
+                loaded(SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.into(),
+                    max_rows: 20_000,
+                    max_bytes: 32 * 1024 * 1024,
+                })
+            else {
+                panic!("overlay query did not use indexed managed path: {query}")
+            };
+            assert_eq!(
+                result.groups.iter().any(|group| group.page == "Navigation"),
+                should_match,
+                "overlay query visibility drifted for {query}"
+            );
+        }
         let SyncApplicationNavigationReply::PropertyFacets {
             facets: autocomplete_facets,
             exceeded: false,
@@ -19974,6 +20158,29 @@ mod tests {
         assert!(query_facets
             .iter()
             .any(|(key, values)| { key == "created-prop" && values == &["created-value"] }));
+        for query in [
+            "(property created-prop created-value)",
+            "[[Created Phantom]]",
+            "(page-property createdPage created-page)",
+            "(page \"Created Navigation\")",
+        ] {
+            let SyncApplicationNavigationReply::SimpleQuery(Some(result)) =
+                loaded(SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.into(),
+                    max_rows: 20_000,
+                    max_bytes: 32 * 1024 * 1024,
+                })
+            else {
+                panic!("new overlay query did not use indexed managed path: {query}")
+            };
+            assert!(
+                result
+                    .groups
+                    .iter()
+                    .any(|group| group.page == "Created Navigation"),
+                "new overlay page was absent for {query}"
+            );
+        }
         let SyncApplicationNavigationReply::PropertyFacets {
             facets: autocomplete_facets,
             exceeded: false,

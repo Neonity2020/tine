@@ -1758,24 +1758,65 @@ pub(crate) struct ApplicationQueryPage {
     pub(crate) recency: i64,
 }
 
-/// Conservative page-level candidate plan for the first managed simple-query
-/// slice. A returned marker set is complete: every matching block must live on a
-/// page containing one of these task markers. `None` means the shape cannot yet
-/// be narrowed safely and must retain the explicit transitional fallback.
-pub(crate) fn simple_query_task_candidate_markers(query_src: &str) -> Option<Vec<String>> {
-    fn markers(pred: &Pred) -> Option<std::collections::BTreeSet<String>> {
+/// One reconstructible, page-complete candidate source for a managed simple
+/// query. These facts only choose pages; the exact current parser DTO remains
+/// authoritative for block membership and result shape.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SimpleQueryCandidateSource {
+    Task(String),
+    PageRef(String),
+    BlockProperty(String),
+    PageProperty(String),
+    Page(String),
+    Namespace(String),
+    Journal,
+}
+
+/// Conservative page-level candidate plan for indexed managed simple-query
+/// families. A returned union is complete: every matching block must live on a
+/// page selected by at least one source. AND may choose one complete child; OR
+/// may union only when every branch is complete. `None` means the shape cannot
+/// yet be narrowed safely and must retain the explicit transitional fallback.
+pub(crate) fn simple_query_candidate_sources(
+    query_src: &str,
+) -> Option<Vec<SimpleQueryCandidateSource>> {
+    fn sources(pred: &Pred) -> Option<std::collections::BTreeSet<SimpleQueryCandidateSource>> {
         match pred {
             Pred::Task(markers) => Some(
                 markers
                     .iter()
-                    .map(|marker| marker.to_ascii_uppercase())
+                    .map(|marker| SimpleQueryCandidateSource::Task(marker.to_ascii_uppercase()))
                     .collect(),
             ),
-            Pred::And(children) => children.iter().find_map(markers),
+            Pred::PageRef(name) => Some(
+                std::iter::once(SimpleQueryCandidateSource::PageRef(refs::page_key(name)))
+                    .collect(),
+            ),
+            Pred::Property(key, _) => Some(
+                std::iter::once(SimpleQueryCandidateSource::BlockProperty(
+                    property_key_norm(key),
+                ))
+                .collect(),
+            ),
+            Pred::PageProperty(key, _) => Some(
+                std::iter::once(SimpleQueryCandidateSource::PageProperty(property_key_norm(
+                    key,
+                )))
+                .collect(),
+            ),
+            Pred::Page(name) => Some(
+                std::iter::once(SimpleQueryCandidateSource::Page(refs::page_key(name))).collect(),
+            ),
+            Pred::Namespace(name) => Some(
+                std::iter::once(SimpleQueryCandidateSource::Namespace(refs::page_key(name)))
+                    .collect(),
+            ),
+            Pred::Journal => Some(std::iter::once(SimpleQueryCandidateSource::Journal).collect()),
+            Pred::And(children) => children.iter().find_map(sources),
             Pred::Or(children) => {
                 let mut union = std::collections::BTreeSet::new();
                 for child in children {
-                    union.extend(markers(child)?);
+                    union.extend(sources(child)?);
                 }
                 Some(union)
             }
@@ -1785,7 +1826,7 @@ pub(crate) fn simple_query_task_candidate_markers(query_src: &str) -> Option<Vec
     }
 
     let pred = Pred::parse(query_src, JournalDate::today())?;
-    markers(&pred).map(|markers| markers.into_iter().collect())
+    sources(&pred).map(|sources| sources.into_iter().collect())
 }
 
 fn application_query_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
@@ -5056,28 +5097,46 @@ mod tests {
     }
 
     #[test]
-    fn managed_task_candidate_plan_is_conservative_across_boolean_shapes() {
+    fn managed_simple_query_candidate_plan_is_conservative_across_boolean_shapes() {
+        use SimpleQueryCandidateSource as Source;
+
         assert_eq!(
-            simple_query_task_candidate_markers(
-                "(and (task todo) (priority A) (not (page Templates)))"
-            ),
-            Some(vec!["TODO".into()])
+            simple_query_candidate_sources("(and (task todo) (priority A) (not (page Templates)))"),
+            Some(vec![Source::Task("TODO".into())])
         );
         assert_eq!(
-            simple_query_task_candidate_markers(
+            simple_query_candidate_sources(
                 "(or (and (task TODO) (property x y)) (task doing now))"
             ),
-            Some(vec!["DOING".into(), "NOW".into(), "TODO".into()])
+            Some(vec![
+                Source::Task("DOING".into()),
+                Source::Task("NOW".into()),
+                Source::Task("TODO".into())
+            ])
         );
         assert_eq!(
-            simple_query_task_candidate_markers("(and (not (task TODO)) \"x\")"),
+            simple_query_candidate_sources("(and (not (task TODO)) (property type book))"),
+            Some(vec![Source::BlockProperty("type".into())])
+        );
+        assert_eq!(
+            simple_query_candidate_sources(
+                "(or (page-ref Alpha) (page-property status public) (page Home))"
+            ),
+            Some(vec![
+                Source::PageRef("alpha".into()),
+                Source::PageProperty("status".into()),
+                Source::Page("home".into())
+            ])
+        );
+        assert_eq!(
+            simple_query_candidate_sources("(and (not (task TODO)) \"x\")"),
             None
         );
         assert_eq!(
-            simple_query_task_candidate_markers("(or (task TODO) \"x\")"),
+            simple_query_candidate_sources("(or (task TODO) \"x\")"),
             None
         );
-        assert_eq!(simple_query_task_candidate_markers("\"x\""), None);
+        assert_eq!(simple_query_candidate_sources("\"x\""), None);
     }
 
     #[test]
