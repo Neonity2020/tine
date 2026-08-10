@@ -1772,14 +1772,19 @@ pub(crate) enum SimpleQueryCandidateSource {
     Journal,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SimpleQueryCandidatePlan {
+    Empty,
+    Indexed(Vec<SimpleQueryCandidateSource>),
+    All,
+}
+
 /// Conservative page-level candidate plan for indexed managed simple-query
 /// families. A returned union is complete: every matching block must live on a
 /// page selected by at least one source. AND may choose one complete child; OR
-/// may union only when every branch is complete. `None` means the shape cannot
-/// yet be narrowed safely and must retain the explicit transitional fallback.
-pub(crate) fn simple_query_candidate_sources(
-    query_src: &str,
-) -> Option<Vec<SimpleQueryCandidateSource>> {
+/// may union only when every branch is complete. Valid shapes that cannot be
+/// narrowed use the explicit all-page plan; invalid shapes need no page reads.
+pub(crate) fn simple_query_candidate_plan(query_src: &str) -> SimpleQueryCandidatePlan {
     fn sources(pred: &Pred) -> Option<std::collections::BTreeSet<SimpleQueryCandidateSource>> {
         match pred {
             Pred::Task(markers) => Some(
@@ -1804,6 +1809,9 @@ pub(crate) fn simple_query_candidate_sources(
                 )))
                 .collect(),
             ),
+            Pred::PageTags(_) => Some(
+                std::iter::once(SimpleQueryCandidateSource::PageProperty("tags".into())).collect(),
+            ),
             Pred::Page(name) => Some(
                 std::iter::once(SimpleQueryCandidateSource::Page(refs::page_key(name))).collect(),
             ),
@@ -1811,7 +1819,9 @@ pub(crate) fn simple_query_candidate_sources(
                 std::iter::once(SimpleQueryCandidateSource::Namespace(refs::page_key(name)))
                     .collect(),
             ),
-            Pred::Journal => Some(std::iter::once(SimpleQueryCandidateSource::Journal).collect()),
+            Pred::Journal | Pred::Between(BetweenField::Journal, _, _) => {
+                Some(std::iter::once(SimpleQueryCandidateSource::Journal).collect())
+            }
             Pred::And(children) => children.iter().find_map(sources),
             Pred::Or(children) => {
                 let mut union = std::collections::BTreeSet::new();
@@ -1825,8 +1835,13 @@ pub(crate) fn simple_query_candidate_sources(
         }
     }
 
-    let pred = Pred::parse(query_src, JournalDate::today())?;
-    sources(&pred).map(|sources| sources.into_iter().collect())
+    let Some(pred) = Pred::parse(query_src, JournalDate::today()) else {
+        return SimpleQueryCandidatePlan::Empty;
+    };
+    match sources(&pred) {
+        Some(sources) => SimpleQueryCandidatePlan::Indexed(sources.into_iter().collect()),
+        None => SimpleQueryCandidatePlan::All,
+    }
 }
 
 fn application_query_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
@@ -5098,45 +5113,53 @@ mod tests {
 
     #[test]
     fn managed_simple_query_candidate_plan_is_conservative_across_boolean_shapes() {
+        use SimpleQueryCandidatePlan as Plan;
         use SimpleQueryCandidateSource as Source;
 
         assert_eq!(
-            simple_query_candidate_sources("(and (task todo) (priority A) (not (page Templates)))"),
-            Some(vec![Source::Task("TODO".into())])
+            simple_query_candidate_plan("(and (task todo) (priority A) (not (page Templates)))"),
+            Plan::Indexed(vec![Source::Task("TODO".into())])
         );
         assert_eq!(
-            simple_query_candidate_sources(
-                "(or (and (task TODO) (property x y)) (task doing now))"
-            ),
-            Some(vec![
+            simple_query_candidate_plan("(or (and (task TODO) (property x y)) (task doing now))"),
+            Plan::Indexed(vec![
                 Source::Task("DOING".into()),
                 Source::Task("NOW".into()),
                 Source::Task("TODO".into())
             ])
         );
         assert_eq!(
-            simple_query_candidate_sources("(and (not (task TODO)) (property type book))"),
-            Some(vec![Source::BlockProperty("type".into())])
+            simple_query_candidate_plan("(and (not (task TODO)) (property type book))"),
+            Plan::Indexed(vec![Source::BlockProperty("type".into())])
         );
         assert_eq!(
-            simple_query_candidate_sources(
+            simple_query_candidate_plan(
                 "(or (page-ref Alpha) (page-property status public) (page Home))"
             ),
-            Some(vec![
+            Plan::Indexed(vec![
                 Source::PageRef("alpha".into()),
                 Source::PageProperty("status".into()),
                 Source::Page("home".into())
             ])
         );
         assert_eq!(
-            simple_query_candidate_sources("(and (not (task TODO)) \"x\")"),
-            None
+            simple_query_candidate_plan("(and (not (task TODO)) \"x\")"),
+            Plan::All
         );
         assert_eq!(
-            simple_query_candidate_sources("(or (task TODO) \"x\")"),
-            None
+            simple_query_candidate_plan("(or (task TODO) \"x\")"),
+            Plan::All
         );
-        assert_eq!(simple_query_candidate_sources("\"x\""), None);
+        assert_eq!(simple_query_candidate_plan("\"x\""), Plan::All);
+        assert_eq!(
+            simple_query_candidate_plan("(page-tags public private)"),
+            Plan::Indexed(vec![Source::PageProperty("tags".into())])
+        );
+        assert_eq!(
+            simple_query_candidate_plan("(between journal -7d today)"),
+            Plan::Indexed(vec![Source::Journal])
+        );
+        assert_eq!(simple_query_candidate_plan(")"), Plan::Empty);
     }
 
     #[test]

@@ -1389,6 +1389,7 @@ mod managed_actor_command_boundary_tests {
             "get_unlinked_refs",
             "list_templates",
             "query_facets",
+            "run_query",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");
@@ -1447,7 +1448,7 @@ pub(crate) async fn run_query(
                     max_bytes: RESULT_BRIDGE_MAX_BYTES,
                 },
             )? {
-                SyncApplicationNavigationReply::SimpleQuery(Some(result)) => {
+                SyncApplicationNavigationReply::SimpleQuery(result) => {
                     if result.exceeded {
                         Err(format!(
                             "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
@@ -1457,15 +1458,6 @@ pub(crate) async fn run_query(
                         Ok(Arc::new(result.groups))
                     }
                 }
-                // Transitional C3d1 fallback: only task-constrained shapes have
-                // a complete indexed candidate plan in this packet.
-                SyncApplicationNavigationReply::SimpleQuery(None) => slot.with_read_graph(|g| {
-                    bounded_groups_or_error(g.run_query_bounded(
-                        &query,
-                        RESULT_BRIDGE_MAX_ROWS,
-                        RESULT_BRIDGE_MAX_BYTES,
-                    ))
-                }),
                 _ => Err("managed navigation returned the wrong reply".into()),
             },
             None => bounded_groups_or_error(slot.legacy_graph()?.run_query_bounded(

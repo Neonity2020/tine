@@ -1900,7 +1900,7 @@ pub enum SyncApplicationNavigationReply {
         facets: Vec<(String, Vec<String>)>,
         exceeded: bool,
     },
-    SimpleQuery(Option<SyncApplicationBoundedRefGroups>),
+    SimpleQuery(SyncApplicationBoundedRefGroups),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -9402,11 +9402,21 @@ impl RuntimeActor {
         query: &str,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Result<Option<SyncApplicationBoundedRefGroups>, SyncApplicationPageRequestError> {
-        use crate::query::SimpleQueryCandidateSource as Source;
+    ) -> Result<SyncApplicationBoundedRefGroups, SyncApplicationPageRequestError> {
+        use crate::query::{
+            SimpleQueryCandidatePlan as Plan, SimpleQueryCandidateSource as Source,
+        };
 
-        let Some(sources) = crate::query::simple_query_candidate_sources(query) else {
-            return Ok(None);
+        let (sources, scan_all) = match crate::query::simple_query_candidate_plan(query) {
+            Plan::Empty => {
+                return Ok(SyncApplicationBoundedRefGroups {
+                    groups: Vec::new(),
+                    total: 0,
+                    exceeded: false,
+                })
+            }
+            Plan::Indexed(sources) => (sources, false),
+            Plan::All => (Vec::new(), true),
         };
         let overlay = self.application_navigation_overlay_ready()?;
         let runtime = self
@@ -9537,12 +9547,13 @@ impl RuntimeActor {
             }
         }
 
-        let needs_inventory = sources.iter().any(|source| {
-            matches!(
-                source,
-                Source::PageRef(_) | Source::Page(_) | Source::Namespace(_) | Source::Journal
-            )
-        });
+        let needs_inventory = scan_all
+            || sources.iter().any(|source| {
+                matches!(
+                    source,
+                    Source::PageRef(_) | Source::Page(_) | Source::Namespace(_) | Source::Journal
+                )
+            });
         if needs_inventory {
             let mut cursor: Option<(ManagedPath, PageId)> = None;
             loop {
@@ -9561,14 +9572,15 @@ impl RuntimeActor {
                     if masked_page_ids.contains(&row.page_id) {
                         continue;
                     }
-                    let matches = sources.iter().any(|source| match source {
-                        Source::PageRef(name) | Source::Page(name) => row.name_key == *name,
-                        Source::Namespace(namespace) => {
-                            row.name_key.starts_with(&format!("{namespace}/"))
-                        }
-                        Source::Journal => row.kind == ManagedTextKind::Journal,
-                        _ => false,
-                    });
+                    let matches = scan_all
+                        || sources.iter().any(|source| match source {
+                            Source::PageRef(name) | Source::Page(name) => row.name_key == *name,
+                            Source::Namespace(namespace) => {
+                                row.name_key.starts_with(&format!("{namespace}/"))
+                            }
+                            Source::Journal => row.kind == ManagedTextKind::Journal,
+                            _ => false,
+                        });
                     if matches {
                         candidate_page_ids.insert(row.page_id);
                     }
@@ -9601,11 +9613,11 @@ impl RuntimeActor {
             .collect::<Vec<_>>();
         let result =
             crate::query::run_application_query_pages_bounded(&pages, query, max_rows, max_bytes);
-        Ok(Some(SyncApplicationBoundedRefGroups {
+        Ok(SyncApplicationBoundedRefGroups {
             groups: result.groups,
             total: result.total,
             exceeded: result.exceeded,
-        }))
+        })
     }
 
     fn application_backlink_filter_context_ready(
@@ -19260,6 +19272,31 @@ mod tests {
         }
     }
 
+    fn canonicalize_query_groups_for_mode_differential(groups: &mut [RefGroup]) {
+        for group in groups.iter_mut() {
+            // Managed storage retains the semantic page name supplied by the
+            // creating operation. Direct Files may only be able to recover the
+            // filename spelling when the projection has no title property.
+            // That is a legitimate identity-preserving mode difference.
+            group.page = crate::refs::page_key(&group.page);
+            erase_application_block_ids(&mut group.blocks);
+        }
+        groups.sort_by(|left, right| {
+            let kind_rank = |kind| match kind {
+                PageKind::Journal => 0,
+                PageKind::Page => 1,
+            };
+            left.page
+                .cmp(&right.page)
+                .then_with(|| kind_rank(left.kind).cmp(&kind_rank(right.kind)))
+                .then_with(|| {
+                    serde_json::to_string(&left.blocks)
+                        .unwrap()
+                        .cmp(&serde_json::to_string(&right.blocks).unwrap())
+                })
+        });
+    }
+
     fn assert_parser_dto_semantics(expected: &PageDto, actual: &PageDto) {
         let mut expected = expected.clone();
         let mut actual = actual.clone();
@@ -19501,7 +19538,7 @@ mod tests {
         }
         let compound_task_query =
             "(and (task TODO) (priority A) (not (page Templates)) (sort-by modified desc))";
-        let SyncApplicationNavigationReply::SimpleQuery(Some(managed_query)) =
+        let SyncApplicationNavigationReply::SimpleQuery(managed_query) =
             navigation(SyncApplicationNavigationRequest::SimpleQuery {
                 query: compound_task_query.into(),
                 max_rows: 20_000,
@@ -19534,7 +19571,7 @@ mod tests {
             "(journal)",
             "(or (property custom value) (page \"Properties\"))",
         ] {
-            let SyncApplicationNavigationReply::SimpleQuery(Some(managed_query)) =
+            let SyncApplicationNavigationReply::SimpleQuery(managed_query) =
                 navigation(SyncApplicationNavigationRequest::SimpleQuery {
                     query: indexed_query.into(),
                     max_rows: 20_000,
@@ -19563,15 +19600,43 @@ mod tests {
                 "indexed managed query must share Direct Files semantics: {indexed_query}"
             );
         }
-        let SyncApplicationNavigationReply::SimpleQuery(None) =
-            navigation(SyncApplicationNavigationRequest::SimpleQuery {
-                query: "\"gateway\"".into(),
-                max_rows: 20_000,
-                max_bytes: 32 * 1024 * 1024,
-            })
-        else {
-            panic!("unsupported simple-query shape must retain the explicit fallback")
-        };
+        for scan_query in [
+            "\"gateway\"",
+            "(search \"ordinary\")",
+            "(content-regex \"Ordinary\")",
+            "(priority A)",
+            "(scheduled)",
+            "(deadline)",
+            "(not (task DONE))",
+            "(sample 2)",
+            "(and",
+            ")",
+        ] {
+            let SyncApplicationNavigationReply::SimpleQuery(managed_query) =
+                navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                    query: scan_query.into(),
+                    max_rows: 20_000,
+                    max_bytes: 32 * 1024 * 1024,
+                })
+            else {
+                panic!("managed scan query did not return a complete result: {scan_query}")
+            };
+            let direct_query = graph.run_query_bounded(scan_query, 20_000, 32 * 1024 * 1024);
+            assert_eq!(
+                managed_query.exceeded, direct_query.exceeded,
+                "{scan_query}"
+            );
+            assert_eq!(managed_query.total, direct_query.total, "{scan_query}");
+            let mut managed_groups = managed_query.groups;
+            let mut direct_groups = (*direct_query.groups).clone();
+            canonicalize_query_groups_for_mode_differential(&mut managed_groups);
+            canonicalize_query_groups_for_mode_differential(&mut direct_groups);
+            assert_eq!(
+                serde_json::to_value(&managed_groups).unwrap(),
+                serde_json::to_value(&direct_groups).unwrap(),
+                "managed all-page query must share Direct Files semantics: {scan_query}"
+            );
+        }
         let requested = vec![
             genuine.to_owned(),
             genuine.to_owned(),
@@ -20020,8 +20085,10 @@ mod tests {
             ("(property new-prop new-value)", true),
             ("[[Old Phantom]]", false),
             ("[[New Phantom]]", true),
+            ("\"Old Plain\"", false),
+            ("\"New Plain\"", true),
         ] {
-            let SyncApplicationNavigationReply::SimpleQuery(Some(result)) =
+            let SyncApplicationNavigationReply::SimpleQuery(result) =
                 loaded(SyncApplicationNavigationRequest::SimpleQuery {
                     query: query.into(),
                     max_rows: 20_000,
@@ -20054,7 +20121,7 @@ mod tests {
         assert!(!autocomplete_facets
             .iter()
             .any(|(_, values)| values.iter().any(|value| value == "old-page")));
-        let SyncApplicationNavigationReply::SimpleQuery(Some(todo_query)) =
+        let SyncApplicationNavigationReply::SimpleQuery(todo_query) =
             loaded(SyncApplicationNavigationRequest::SimpleQuery {
                 query: "(task TODO)".into(),
                 max_rows: 20_000,
@@ -20163,8 +20230,9 @@ mod tests {
             "[[Created Phantom]]",
             "(page-property createdPage created-page)",
             "(page \"Created Navigation\")",
+            "\"Created Plain\"",
         ] {
-            let SyncApplicationNavigationReply::SimpleQuery(Some(result)) =
+            let SyncApplicationNavigationReply::SimpleQuery(result) =
                 loaded(SyncApplicationNavigationRequest::SimpleQuery {
                     query: query.into(),
                     max_rows: 20_000,
@@ -20196,7 +20264,7 @@ mod tests {
         assert!(autocomplete_facets
             .iter()
             .any(|(key, values)| { key == "createdpage" && values == &["created-page"] }));
-        let SyncApplicationNavigationReply::SimpleQuery(Some(todo_query)) =
+        let SyncApplicationNavigationReply::SimpleQuery(todo_query) =
             loaded(SyncApplicationNavigationRequest::SimpleQuery {
                 query: "(task TODO)".into(),
                 max_rows: 20_000,
@@ -36116,6 +36184,102 @@ mod tests {
                 "managed page-open p95 scales with unrelated graph size at {larger_pages} pages: smaller={smaller:?}, larger={larger:?}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "manual performance receipt: managed indexed and all-page simple queries"]
+    fn managed_simple_query_1000_page_manual_gate() {
+        assert!(
+            !cfg!(debug_assertions),
+            "run with cargo test -p tine-core --release managed_simple_query_1000_page_manual_gate -- --ignored --nocapture"
+        );
+        let total_pages = std::env::var("TINE_MANAGED_QUERY_GATE_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|pages| *pages >= 100)
+            .unwrap_or(1_000);
+        let samples = std::env::var("TINE_MANAGED_QUERY_GATE_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|samples| *samples >= 2)
+            .unwrap_or(3);
+        let fixture = ActivationFixture::scaled_mixed_with_journals(
+            "managed-simple-query-gate",
+            0xa1f0,
+            total_pages.saturating_sub(3),
+            4,
+        );
+        let indexed = "(task TODO)";
+        let broad = format!(
+            "(content-regex \"task {}-\")",
+            total_pages.saturating_sub(4)
+        );
+
+        let direct = Graph::open(&fixture.graph_root);
+        let direct_indexed = direct.run_query_bounded(indexed, 20_000, 32 * 1024 * 1024);
+        let direct_broad = direct.run_query_bounded(&broad, 20_000, 32 * 1024 * 1024);
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let activation_handle = activated.handle.expect("activation retains its actor");
+        drive_initial_feed(&activation_handle);
+        assert!(matches!(
+            activation_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        drop(activation_handle);
+
+        let opened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+        let handle = opened.handle.expect("managed reopen retains its actor");
+        let run = |query: &str| {
+            let started = Instant::now();
+            let outcome = handle
+                .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.into(),
+                    max_rows: 20_000,
+                    max_bytes: 32 * 1024 * 1024,
+                })
+                .unwrap();
+            let elapsed = started.elapsed();
+            let SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::SimpleQuery(result),
+            } = outcome
+            else {
+                panic!("managed query returned the wrong outcome: {outcome:?}")
+            };
+            (elapsed, result)
+        };
+
+        let mut indexed_samples = Vec::with_capacity(samples);
+        let mut broad_samples = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let (elapsed, result) = run(indexed);
+            assert_eq!(result.total, direct_indexed.total);
+            indexed_samples.push(elapsed);
+            let (elapsed, result) = run(&broad);
+            assert_eq!(result.total, direct_broad.total);
+            broad_samples.push(elapsed);
+        }
+        let indexed_p95 = startup_p95(&indexed_samples);
+        let broad_p95 = startup_p95(&broad_samples);
+        eprintln!(
+            "managed_simple_query pages={total_pages} samples={samples} indexed_p95_ms={:.3} broad_p95_ms={:.3}",
+            startup_ms(indexed_p95),
+            startup_ms(broad_p95),
+        );
+        assert!(
+            indexed_p95 < Duration::from_secs(1),
+            "indexed 1,000-page simple query exceeded one second"
+        );
+        assert!(
+            broad_p95 < Duration::from_secs(2),
+            "all-page 1,000-page simple query exceeded two seconds"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
     }
 
     #[test]
