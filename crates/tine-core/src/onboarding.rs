@@ -103,13 +103,30 @@ pub struct GuidePage {
     pub page: PageDto,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuideCopyResult {
     pub name: String,
     pub created: bool,
     pub created_pages: Vec<String>,
     pub skipped_pages: Vec<String>,
     pub copied_assets: Vec<String>,
+}
+
+pub(crate) struct GuideCopyPage {
+    pub(crate) name: String,
+    pub(crate) markdown: String,
+    pub(crate) page: PageDto,
+}
+
+pub(crate) struct GuideCopyAsset {
+    pub(crate) name: String,
+    pub(crate) bytes: &'static [u8],
+}
+
+pub(crate) struct GuideCopyPlan {
+    pub(crate) viewed_name: String,
+    pub(crate) pages: Vec<GuideCopyPage>,
+    pub(crate) assets: Vec<GuideCopyAsset>,
 }
 
 pub fn guide_page_name(title: &str) -> String {
@@ -189,6 +206,33 @@ fn bind_copied_page_title(markdown: String, copied_name: &str) -> String {
 }
 
 pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopyResult> {
+    let plan = guide_copy_plan(title)?;
+    let mut created_pages = Vec::new();
+    let mut skipped_pages = Vec::new();
+    for planned in plan.pages {
+        if graph.create_markdown_page_if_absent(&planned.name, &planned.markdown)? {
+            created_pages.push(planned.name);
+        } else {
+            skipped_pages.push(planned.name);
+        }
+    }
+    let mut copied_assets = Vec::new();
+    for asset in plan.assets {
+        if graph.create_asset_if_absent(&asset.name, asset.bytes)? {
+            copied_assets.push(asset.name);
+        }
+    }
+    let created = !created_pages.is_empty() || !copied_assets.is_empty();
+    Ok(GuideCopyResult {
+        name: plan.viewed_name,
+        created,
+        created_pages,
+        skipped_pages,
+        copied_assets,
+    })
+}
+
+pub(crate) fn guide_copy_plan(title: &str) -> io::Result<GuideCopyPlan> {
     let Some(viewed) = GUIDE_TEMPLATES
         .iter()
         .find(|t| crate::refs::same_page(t.title, title))
@@ -199,32 +243,37 @@ pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopy
         ));
     };
     let renames = guide_link_renames();
-    let mut created_pages = Vec::new();
-    let mut skipped_pages = Vec::new();
-    for template in GUIDE_TEMPLATES {
-        let name = guide_copy_page_name(template.title);
-        let markdown = bind_copied_page_title(
-            rewrite_bundled_guide_links(template.markdown, &renames),
-            &name,
-        );
-        if graph.create_markdown_page_if_absent(&name, &markdown)? {
-            created_pages.push(name);
-        } else {
-            skipped_pages.push(name);
-        }
-    }
-    let copied_assets = copy_referenced_guide_assets(graph)?;
-    let created = !created_pages.is_empty() || !copied_assets.is_empty();
-    Ok(GuideCopyResult {
-        name: guide_copy_page_name(viewed.title),
-        created,
-        created_pages,
-        skipped_pages,
-        copied_assets,
+    let pages = GUIDE_TEMPLATES
+        .iter()
+        .map(|template| {
+            let name = guide_copy_page_name(template.title);
+            let markdown = bind_copied_page_title(
+                rewrite_bundled_guide_links(template.markdown, &renames),
+                &name,
+            );
+            let page = markdown_page_dto(&name, &name, &markdown)?;
+            Ok(GuideCopyPage {
+                name,
+                markdown,
+                page,
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let assets = referenced_guide_assets()?
+        .into_iter()
+        .map(|asset| GuideCopyAsset {
+            name: asset.name.to_owned(),
+            bytes: asset.bytes,
+        })
+        .collect();
+    Ok(GuideCopyPlan {
+        viewed_name: guide_copy_page_name(viewed.title),
+        pages,
+        assets,
     })
 }
 
-fn copy_referenced_guide_assets(graph: &Graph) -> io::Result<Vec<String>> {
+fn referenced_guide_assets() -> io::Result<Vec<&'static GuideAsset>> {
     let mut referenced = HashSet::new();
     for template in GUIDE_TEMPLATES {
         collect_guide_asset_refs(template.markdown, &mut referenced);
@@ -232,7 +281,7 @@ fn copy_referenced_guide_assets(graph: &Graph) -> io::Result<Vec<String>> {
     let mut referenced: Vec<String> = referenced.into_iter().collect();
     referenced.sort();
 
-    let mut copied = Vec::new();
+    let mut assets = Vec::new();
     for name in referenced {
         if name.contains('/') || name.contains('\\') {
             return Err(io::Error::new(
@@ -246,11 +295,9 @@ fn copy_referenced_guide_assets(graph: &Graph) -> io::Result<Vec<String>> {
                 format!("missing bundled guide asset {name}"),
             ));
         };
-        if graph.create_asset_if_absent(&name, asset.bytes)? {
-            copied.push(name);
-        }
+        assets.push(asset);
     }
-    Ok(copied)
+    Ok(assets)
 }
 
 fn collect_guide_asset_refs(markdown: &str, into: &mut HashSet<String>) {

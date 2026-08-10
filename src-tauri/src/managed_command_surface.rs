@@ -98,7 +98,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("capture_target", NoGraphSlot),
     ("clipboard_files", NoGraphSlot),
     ("close_graph_window", NoGraphSlot),
-    ("copy_guide_into_graph", LegacyOnly),
+    ("copy_guide_into_graph", ManagedRouted),
     ("copy_image_to_clipboard", NoGraphSlot),
     ("create_graph", NoGraphSlot),
     ("debug_info", NoGraphSlot),
@@ -235,10 +235,6 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
 ///
 /// Each entry says what the command needs before it can come back.
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
-    (
-        "copy_guide_into_graph",
-        "creates guide pages: oplog transaction",
-    ),
     ("delete_page", "multi-page mutation: oplog transaction"),
     (
         "enable_managed_sync",

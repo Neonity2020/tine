@@ -16,12 +16,12 @@ use tine_core::model::{
     BacklinkFilterContext, BacklinkFilterTarget, BlockDto, PageDto, PageEntry, PageKind, RefGroup,
 };
 use tine_core::sync_runtime::{
-    SyncApplicationNavigationOutcome, SyncApplicationNavigationReply,
-    SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
-    SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
-    SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
-    SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome, SyncApplicationUnitOutcome,
-    SyncRuntimeHandle,
+    SyncApplicationGuideCopyOutcome, SyncApplicationNavigationOutcome,
+    SyncApplicationNavigationReply, SyncApplicationNavigationRequest,
+    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
+    SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
+    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncApplicationPdfOpenOutcome,
+    SyncApplicationPublishOutcome, SyncApplicationUnitOutcome, SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -1076,14 +1076,34 @@ pub(crate) fn guide_pages() -> Result<Vec<tine_core::onboarding::GuidePage>, Str
 }
 
 #[tauri::command]
-pub(crate) fn copy_guide_into_graph(
+pub(crate) async fn copy_guide_into_graph(
     title: String,
     state: GraphContext<'_>,
 ) -> Result<tine_core::onboarding::GuideCopyResult, String> {
-    let result: Result<tine_core::onboarding::GuideCopyResult, String> = with_graph(&state, |g| {
-        tine_core::onboarding::copy_guide_into_graph(g, &title).map_err(|e| e.to_string())
-    });
-    result
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .copy_application_guide(title)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationGuideCopyOutcome::Copied { result } => Ok(result),
+                SyncApplicationGuideCopyOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating pages. Try copying the guide again when it finishes."
+                        .into(),
+                ),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                tine_core::onboarding::copy_guide_into_graph(&graph, &title)
+                    .map_err(|error| error.to_string())
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

@@ -2658,6 +2658,7 @@ mod tests {
                     name: draft.name,
                     page_kind: draft.page_kind,
                     revision: draft.revision,
+                    format: None,
                 },
                 preamble: None,
                 blocks: vec![SyncEditorBlockDto {

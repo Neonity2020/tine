@@ -13225,6 +13225,15 @@ impl Graph {
         name: &str,
         kind: PageKind,
     ) -> io::Result<ManagedPath> {
+        self.new_sparse_page_path_for_format(name, kind, self.preferred_format())
+    }
+
+    pub(crate) fn new_sparse_page_path_for_format(
+        &self,
+        name: &str,
+        kind: PageKind,
+        format: Format,
+    ) -> io::Result<ManagedPath> {
         let name = name.trim();
         if name.is_empty() {
             return Err(io::Error::new(
@@ -13232,7 +13241,7 @@ impl Graph {
                 "empty page name",
             ));
         }
-        let extension = self.preferred_format().ext();
+        let extension = format.ext();
         let absolute = match kind {
             PageKind::Page => self.pages_path().join(format!(
                 "{}.{extension}",

@@ -1725,6 +1725,8 @@ pub enum SyncEditorSaveTarget {
         name: String,
         page_kind: SyncPageKind,
         revision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<Format>,
     },
 }
 
@@ -1974,6 +1976,17 @@ pub enum SyncApplicationPdfOpenOutcome {
 pub enum SyncApplicationPublishOutcome {
     Published { path: String, pages: usize },
     Deferred { state: SyncEditorDeferred },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationGuideCopyOutcome {
+    Copied {
+        result: crate::onboarding::GuideCopyResult,
+    },
+    Deferred {
+        state: SyncEditorDeferred,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3557,6 +3570,35 @@ impl SyncRuntimeHandle {
         let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::PublishApplicationHtml {
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
+    pub fn copy_application_guide(
+        &self,
+        title: String,
+    ) -> Result<SyncApplicationGuideCopyOutcome, SyncApplicationPageRequestError> {
+        if title.is_empty() {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidName,
+            ));
+        }
+        if title.len() > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    text_bytes: title.len(),
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::CopyApplicationGuide {
+            title,
             reply: reply_sender,
         })
         .map_err(map_application_actor_error)?;
@@ -6276,6 +6318,11 @@ enum ActorRequest {
     PublishApplicationHtml {
         reply: mpsc::Sender<Result<SyncApplicationPublishOutcome, SyncApplicationPageRequestError>>,
     },
+    CopyApplicationGuide {
+        title: String,
+        reply:
+            mpsc::Sender<Result<SyncApplicationGuideCopyOutcome, SyncApplicationPageRequestError>>,
+    },
     LoadEditorPage {
         request: SyncEditorLoadRequest,
         reply: mpsc::Sender<Result<SyncEditorLoadOutcome, SyncEditorRequestError>>,
@@ -6483,6 +6530,11 @@ fn run_actor_loop(
             }
             ActorRequest::PublishApplicationHtml { reply } => {
                 let result = actor.publish_application_html();
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::CopyApplicationGuide { title, reply } => {
+                let result = actor.copy_application_guide(&title);
                 let _ = reply.send(result);
                 false
             }
@@ -10862,38 +10914,44 @@ impl RuntimeActor {
                 )
             }
             SyncApplicationPageSaveTarget::New { name, page_kind } => {
-                validate_new_application_page_shape(&request.page, name, *page_kind, &self.graph)?;
+                validate_new_application_page_shape(&request.page, name, *page_kind)?;
                 let runtime = self
                     .runtime
                     .as_ref()
                     .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-                let current_revision =
-                    match editor_name_state(runtime, &self.graph, name.clone(), *page_kind)
-                        .map_err(map_editor_application_error)?
-                    {
-                        EditorNameState::Missing { revision, .. } => revision,
-                        EditorNameState::Exact(_) => {
-                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                                reason: SyncApplicationPageConflict::PageAlreadyExists,
-                            })
-                        }
-                        EditorNameState::Ambiguous => {
-                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                                reason: SyncApplicationPageConflict::AmbiguousPageName,
-                            })
-                        }
-                        EditorNameState::PathOccupied => {
-                            return Ok(SyncApplicationPageSaveOutcome::Conflict {
-                                reason: SyncApplicationPageConflict::DerivedPathOccupied,
-                            })
-                        }
-                    };
+                let current_revision = match editor_name_state_for_format(
+                    runtime,
+                    &self.graph,
+                    name.clone(),
+                    *page_kind,
+                    request.page.format,
+                )
+                .map_err(map_editor_application_error)?
+                {
+                    EditorNameState::Missing { revision, .. } => revision,
+                    EditorNameState::Exact(_) => {
+                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                            reason: SyncApplicationPageConflict::PageAlreadyExists,
+                        })
+                    }
+                    EditorNameState::Ambiguous => {
+                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                            reason: SyncApplicationPageConflict::AmbiguousPageName,
+                        })
+                    }
+                    EditorNameState::PathOccupied => {
+                        return Ok(SyncApplicationPageSaveOutcome::Conflict {
+                            reason: SyncApplicationPageConflict::DerivedPathOccupied,
+                        })
+                    }
+                };
                 (
                     SyncEditorSaveRequest {
                         target: SyncEditorSaveTarget::New {
                             name: name.clone(),
                             page_kind: *page_kind,
                             revision: current_revision,
+                            format: Some(request.page.format),
                         },
                         preamble: request.page.pre_block.clone(),
                         blocks: application_editor_blocks_new(&request.page)?,
@@ -11286,6 +11344,75 @@ impl RuntimeActor {
         Ok(SyncApplicationPublishOutcome::Published { path, pages })
     }
 
+    fn copy_application_guide(
+        &mut self,
+        title: &str,
+    ) -> Result<SyncApplicationGuideCopyOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationGuideCopyOutcome::Deferred { state });
+        }
+        let plan = crate::onboarding::guide_copy_plan(title)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("guide_copy_plan"))?;
+        let mut created_pages = Vec::new();
+        let mut skipped_pages = Vec::new();
+        for planned in plan.pages {
+            let state = {
+                let runtime = self
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+                editor_name_state_for_format(
+                    runtime,
+                    &self.graph,
+                    planned.name.clone(),
+                    SyncPageKind::Page,
+                    Format::Md,
+                )
+                .map_err(map_editor_application_error)?
+            };
+            let EditorNameState::Missing { .. } = state else {
+                skipped_pages.push(planned.name);
+                continue;
+            };
+            match self.save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::New {
+                    name: planned.name.clone(),
+                    page_kind: SyncPageKind::Page,
+                },
+                page: planned.page,
+            })? {
+                SyncApplicationPageSaveOutcome::Saved { .. }
+                | SyncApplicationPageSaveOutcome::Unchanged { .. } => {
+                    created_pages.push(planned.name)
+                }
+                SyncApplicationPageSaveOutcome::Conflict { .. } => skipped_pages.push(planned.name),
+                SyncApplicationPageSaveOutcome::Deferred { state } => {
+                    return Ok(SyncApplicationGuideCopyOutcome::Deferred { state })
+                }
+            }
+        }
+        let mut copied_assets = Vec::new();
+        for asset in plan.assets {
+            if self
+                .graph
+                .create_asset_if_absent(&asset.name, asset.bytes)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("guide_copy_asset"))?
+            {
+                copied_assets.push(asset.name);
+            }
+        }
+        let created = !created_pages.is_empty() || !copied_assets.is_empty();
+        Ok(SyncApplicationGuideCopyOutcome::Copied {
+            result: crate::onboarding::GuideCopyResult {
+                name: plan.viewed_name,
+                created,
+                created_pages,
+                skipped_pages,
+                copied_assets,
+            },
+        })
+    }
+
     fn settle_application_publication(
         &mut self,
         expected_batch_id: &str,
@@ -11668,34 +11795,40 @@ impl RuntimeActor {
                     name,
                     page_kind,
                     revision,
+                    format,
                 } => {
                     let runtime = self
                         .runtime
                         .as_ref()
                         .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    let (logical_name, path, current_revision) =
-                        match editor_name_state(runtime, &self.graph, name.clone(), *page_kind)? {
-                            EditorNameState::Missing {
-                                name,
-                                path,
-                                revision,
-                            } => (name, path, revision),
-                            EditorNameState::Exact(_) => {
-                                return Ok(SyncEditorSaveOutcome::Conflict {
-                                    reason: SyncEditorConflict::PageAlreadyExists,
-                                })
-                            }
-                            EditorNameState::Ambiguous => {
-                                return Ok(SyncEditorSaveOutcome::Conflict {
-                                    reason: SyncEditorConflict::AmbiguousPageName,
-                                })
-                            }
-                            EditorNameState::PathOccupied => {
-                                return Ok(SyncEditorSaveOutcome::Conflict {
-                                    reason: SyncEditorConflict::DerivedPathOccupied,
-                                })
-                            }
-                        };
+                    let (logical_name, path, current_revision) = match editor_name_state_for_format(
+                        runtime,
+                        &self.graph,
+                        name.clone(),
+                        *page_kind,
+                        format.unwrap_or_else(|| self.graph.preferred_format()),
+                    )? {
+                        EditorNameState::Missing {
+                            name,
+                            path,
+                            revision,
+                        } => (name, path, revision),
+                        EditorNameState::Exact(_) => {
+                            return Ok(SyncEditorSaveOutcome::Conflict {
+                                reason: SyncEditorConflict::PageAlreadyExists,
+                            })
+                        }
+                        EditorNameState::Ambiguous => {
+                            return Ok(SyncEditorSaveOutcome::Conflict {
+                                reason: SyncEditorConflict::AmbiguousPageName,
+                            })
+                        }
+                        EditorNameState::PathOccupied => {
+                            return Ok(SyncEditorSaveOutcome::Conflict {
+                                reason: SyncEditorConflict::DerivedPathOccupied,
+                            })
+                        }
+                    };
                     if current_revision != *revision {
                         return Ok(SyncEditorSaveOutcome::Conflict {
                             reason: SyncEditorConflict::StaleBase,
@@ -17437,7 +17570,6 @@ fn validate_new_application_page_shape(
     page: &PageDto,
     name: &str,
     page_kind: SyncPageKind,
-    graph: &Graph,
 ) -> Result<(), SyncApplicationPageRequestError> {
     if page.name != name
         || SyncPageKind::from(page.kind) != page_kind
@@ -17447,7 +17579,6 @@ fn validate_new_application_page_shape(
             .as_ref()
             .is_some_and(|preamble| preamble.contains('\0'))
         || page.rev.is_some()
-        || page.format != graph.preferred_format()
         || page.read_only
         || !page.path.is_empty()
         || page.guide
@@ -17520,6 +17651,16 @@ fn editor_name_state(
     name: String,
     page_kind: SyncPageKind,
 ) -> Result<EditorNameState, SyncEditorRequestError> {
+    editor_name_state_for_format(runtime, graph, name, page_kind, graph.preferred_format())
+}
+
+fn editor_name_state_for_format(
+    runtime: &PromotedLocalRuntime,
+    graph: &Graph,
+    name: String,
+    page_kind: SyncPageKind,
+    format: Format,
+) -> Result<EditorNameState, SyncEditorRequestError> {
     let name = LogicalPageName::parse(name).map_err(|_| {
         SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
     })?;
@@ -17539,7 +17680,7 @@ fn editor_name_state(
         });
     }
     let path = graph
-        .new_sparse_page_path(name.as_str(), sync_model_page_kind(page_kind))
+        .new_sparse_page_path_for_format(name.as_str(), sync_model_page_kind(page_kind), format)
         .map_err(|_| {
             SyncEditorRequestError::InvalidRequest(SyncEditorInvalidRequest::InvalidName)
         })?;
@@ -21234,6 +21375,57 @@ mod tests {
     }
 
     #[test]
+    fn application_guide_copy_is_idempotent_and_keeps_markdown_in_org_graph() {
+        let fixture = RuntimeHostFixture::safe_with_config(
+            "sync-runtime-application-guide-copy",
+            br#"{:preferred-format "Org"}"#,
+        );
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        let SyncApplicationGuideCopyOutcome::Copied { result: first } = handle
+            .copy_application_guide("Features/Sheets".into())
+            .unwrap()
+        else {
+            panic!("managed guide copy unexpectedly deferred")
+        };
+        assert_eq!(first.name, "tine-guide/Features/Sheets");
+        assert!(first.created);
+        assert!(first.created_pages.len() > 5);
+        assert!(first.skipped_pages.is_empty());
+        assert_eq!(first.copied_assets, vec!["quick-capture.png"]);
+
+        let copied_name = "tine-guide/Features/Sheets";
+        let (copied, _) = load_application_logical(&handle, copied_name, SyncPageKind::Page);
+        assert_eq!(copied.format, Format::Md);
+        assert!(copied.path.ends_with(".md"), "copied path: {}", copied.path);
+        assert!(!copied.read_only && !copied.guide);
+        assert!(copied
+            .blocks
+            .iter()
+            .any(|block| block.raw.contains("Sheets")));
+        assert!(fixture
+            .graph_root()
+            .join("assets/quick-capture.png")
+            .is_file());
+
+        let SyncApplicationGuideCopyOutcome::Copied { result: second } = handle
+            .copy_application_guide("Features/Sheets".into())
+            .unwrap()
+        else {
+            panic!("managed guide recopy unexpectedly deferred")
+        };
+        assert!(!second.created);
+        assert!(second.created_pages.is_empty());
+        assert_eq!(second.skipped_pages.len(), first.created_pages.len());
+        assert!(second.copied_assets.is_empty());
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     fn application_navigation_observes_the_immediately_committed_frontier() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-application-navigation-frontier");
         let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
@@ -23757,6 +23949,7 @@ mod tests {
                     name: draft.name,
                     page_kind: draft.page_kind,
                     revision: draft.revision,
+                    format: None,
                 },
                 preamble: Some(scenario.preamble.into()),
                 blocks: vec![SyncEditorBlockDto {
@@ -23979,6 +24172,7 @@ mod tests {
                         name: "Duplicate Owner".into(),
                         page_kind: SyncPageKind::Page,
                         revision: "opaque-stale-draft".into(),
+                        format: None,
                     },
                     preamble: None,
                     blocks: Vec::new(),
@@ -24011,6 +24205,7 @@ mod tests {
                     name: draft.name,
                     page_kind: draft.page_kind,
                     revision: draft.revision,
+                    format: None,
                 },
                 preamble: None,
                 blocks: vec![SyncEditorBlockDto {
@@ -24106,6 +24301,7 @@ mod tests {
                         name: draft.name,
                         page_kind: draft.page_kind,
                         revision: draft.revision,
+                        format: None,
                     },
                     preamble: None,
                     blocks: Vec::new(),
@@ -24161,6 +24357,7 @@ mod tests {
                     name: draft.name,
                     page_kind: draft.page_kind,
                     revision: draft.revision,
+                    format: None,
                 },
                 preamble: Some("created:: by actor".into()),
                 blocks: vec![
@@ -24607,6 +24804,7 @@ mod tests {
                         name: draft.name,
                         page_kind: draft.page_kind,
                         revision: draft.revision,
+                        format: None,
                     },
                     preamble: Some("title:: Collision Final".into()),
                     blocks: vec![SyncEditorBlockDto {
@@ -24876,6 +25074,7 @@ mod tests {
                         name: draft.name,
                         page_kind: draft.page_kind,
                         revision: draft.revision,
+                        format: None,
                     },
                     preamble: Some("authority:: oplog".into()),
                     blocks: (0..BLOCK_COUNT)
@@ -25078,6 +25277,7 @@ mod tests {
             name: draft.name.clone(),
             page_kind: draft.page_kind,
             revision: draft.revision.clone(),
+            format: None,
         };
         let before_status = handle.status().unwrap();
         let manifests_before = fixture.manifest_count();
