@@ -2710,6 +2710,32 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
 /// Only pages with `public:: true` are published, unless
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
+    let mut pages = Vec::new();
+    for entry in graph.list_pages() {
+        let content = fs::read_to_string(&entry.path)?;
+        let mut document = if entry
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("org"))
+        {
+            crate::org::parse_org(&content)
+        } else {
+            doc::parse(&content)
+        };
+        crate::model::assign_doc_runtime_ids(&mut document.roots, &entry.rel_path);
+        pages.push((entry, document));
+    }
+    publish_graph_documents(graph, pages)
+}
+
+/// Publish one already-authoritative graph snapshot. Managed storage obtains
+/// these documents in a single actor turn; Direct Files parses its fresh files
+/// immediately before entering the same renderer.
+pub(crate) fn publish_graph_documents(
+    graph: &Graph,
+    pages: Vec<(crate::model::PageEntry, doc::Document)>,
+) -> io::Result<(String, usize)> {
     let out = graph.root.join("publish");
     graph.ensure_write_target(&out)?;
     let stage = reserve_publish_stage(graph)?;
@@ -2726,20 +2752,23 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     let all_public = graph.config.all_pages_public;
     let favorites: HashSet<&str> = graph.config.favorites.iter().map(|s| s.as_str()).collect();
 
-    let pages = graph.list_pages();
+    let snapshot_pages = pages
+        .into_iter()
+        .map(|(entry, document)| (entry, Arc::new(document)))
+        .collect::<Vec<_>>();
     // Query/reference DTOs currently identify their source by logical page name.
     // If two physical files claim that identity, a name-only authorization check
     // cannot prove which file produced a result. Fail closed for that identity:
     // publish neither twin rather than let a private twin borrow the public
     // capability. Ordinary unique pages retain the exact one-file capability.
     let mut source_identity_counts: HashMap<String, usize> = HashMap::new();
-    for page in &pages {
+    for (page, _) in &snapshot_pages {
         *source_identity_counts
             .entry(crate::refs::page_key(&page.name))
             .or_default() += 1;
     }
-    let mut entries: Vec<_> = pages.iter().collect();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut entries = snapshot_pages.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
 
     // Pass 1: parse every page into one immutable query snapshot, while keeping
     // only authorized pages in the publication projection. `entries` is already
@@ -2748,23 +2777,8 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     // the renderer can honestly count matches omitted by the public capability;
     // result hydration still comes exclusively from `public` below.
     let mut public: Vec<(&str, PageKind, Arc<doc::Document>)> = Vec::new();
-    let mut snapshot_pages = Vec::new();
-    for e in entries {
-        let content = fs::read_to_string(&e.path)?;
-        let mut parsed = if e
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("org"))
-        {
-            crate::org::parse_org(&content)
-        } else {
-            doc::parse(&content)
-        };
+    for (e, parsed) in entries {
         let is_public = all_public || page_is_public(parsed.pre_block.as_deref());
-        crate::model::assign_doc_runtime_ids(&mut parsed.roots, &e.rel_path);
-        let parsed = Arc::new(parsed);
-        snapshot_pages.push((e.clone(), Arc::clone(&parsed)));
         if !is_public {
             continue;
         }
@@ -2780,7 +2794,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
             );
             continue;
         }
-        public.push((e.name.as_str(), e.kind, Arc::clone(&parsed)));
+        public.push((e.name.as_str(), e.kind, Arc::clone(parsed)));
     }
 
     // Every downstream resolver gets the same exact document revision as the
@@ -2788,7 +2802,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     // list, so a query cannot fall through to the live graph or a stale
     // pre-export cache. The render context's public-page map remains the sole
     // capability for hydrating any query/embed/namespace result into HTML.
-    let snapshot = PublicationGraphSnapshot::new(snapshot_pages)?;
+    let snapshot = PublicationGraphSnapshot::new(snapshot_pages.clone())?;
 
     // ONE source of truth: a unique, nonempty name→slug map for the exported set.
     // Every filename, cross-page link, block-ref target, and search-index entry is

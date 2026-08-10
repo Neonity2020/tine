@@ -20,7 +20,8 @@ use tine_core::sync_runtime::{
     SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
     SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
     SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
-    SyncApplicationPdfOpenOutcome, SyncApplicationUnitOutcome, SyncRuntimeHandle,
+    SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome, SyncApplicationUnitOutcome,
+    SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -1465,8 +1466,30 @@ mod managed_actor_command_boundary_tests {
 }
 
 #[tauri::command]
-pub(crate) fn publish_html(state: GraphContext<'_>) -> Result<(String, usize), String> {
-    with_graph(&state, |g| g.publish_html().map_err(|e| e.to_string()))
+pub(crate) async fn publish_html(state: GraphContext<'_>) -> Result<(String, usize), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .publish_application_html()
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationPublishOutcome::Published { path, pages } => Ok((path, pages)),
+                SyncApplicationPublishOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating pages. Try publishing again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .publish_html()
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Render one page to a self-contained HTML document (assets inlined, no sidebar)

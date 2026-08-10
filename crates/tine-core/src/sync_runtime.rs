@@ -1970,6 +1970,13 @@ pub enum SyncApplicationPdfOpenOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncApplicationPublishOutcome {
+    Published { path: String, pages: usize },
+    Deferred { state: SyncEditorDeferred },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SyncApplicationPageSelector {
     Logical {
@@ -3536,6 +3543,20 @@ impl SyncRuntimeHandle {
             label,
             highlights,
             base_ids,
+            reply: reply_sender,
+        })
+        .map_err(map_application_actor_error)?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncApplicationPageRequestError::ActorUnavailable)?
+    }
+
+    pub fn publish_application_html(
+        &self,
+    ) -> Result<SyncApplicationPublishOutcome, SyncApplicationPageRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::PublishApplicationHtml {
             reply: reply_sender,
         })
         .map_err(map_application_actor_error)?;
@@ -6252,6 +6273,9 @@ enum ActorRequest {
         base_ids: Vec<String>,
         reply: mpsc::Sender<Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError>>,
     },
+    PublishApplicationHtml {
+        reply: mpsc::Sender<Result<SyncApplicationPublishOutcome, SyncApplicationPageRequestError>>,
+    },
     LoadEditorPage {
         request: SyncEditorLoadRequest,
         reply: mpsc::Sender<Result<SyncEditorLoadOutcome, SyncEditorRequestError>>,
@@ -6454,6 +6478,11 @@ fn run_actor_loop(
                     &highlights,
                     &base_ids,
                 );
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::PublishApplicationHtml { reply } => {
+                let result = actor.publish_application_html();
                 let _ = reply.send(result);
                 false
             }
@@ -11230,6 +11259,31 @@ impl RuntimeActor {
             // the opposite half-pair. A retry is idempotent and 3-way merges it.
             Err(error) => Err(error),
         }
+    }
+
+    fn publish_application_html(
+        &mut self,
+    ) -> Result<SyncApplicationPublishOutcome, SyncApplicationPageRequestError> {
+        if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
+            return Ok(SyncApplicationPublishOutcome::Deferred { state });
+        }
+        let inventory = self.application_inventory_ready()?;
+        let mut pages = Vec::with_capacity(inventory.len());
+        for entry in inventory {
+            let loaded = self.load_application_exact_ready(&entry.rel_path)?;
+            let ApplicationExactLoad::Loaded(current) = loaded else {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "publish_page_identity",
+                ));
+            };
+            let document = crate::model::page_dto_document(&current.page).map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("publish_page_parse")
+            })?;
+            pages.push((entry, document));
+        }
+        let (path, pages) = crate::publish::publish_graph_documents(&self.graph, pages)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("publish_output"))?;
+        Ok(SyncApplicationPublishOutcome::Published { path, pages })
     }
 
     fn settle_application_publication(
@@ -21143,6 +21197,36 @@ mod tests {
             .blocks
             .iter()
             .any(|block| block.raw.contains("legacy-key highlight")));
+        let (mut publish_page, publish_revision) =
+            load_application_exact(&handle, "content/nested pages/Ordinary Ω.md");
+        publish_page.pre_block = Some("public:: true".into());
+        publish_page.blocks[0].raw =
+            format!("Actor publication frontier {}", publish_page.blocks[0].raw);
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: publish_page.path.clone(),
+                        revision: publish_revision,
+                    },
+                    page: publish_page,
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        let SyncApplicationPublishOutcome::Published {
+            path: publish_path,
+            pages: published_pages,
+        } = handle.publish_application_html().unwrap()
+        else {
+            panic!("managed static publication unexpectedly deferred")
+        };
+        assert!(published_pages >= 1);
+        let published = fs::read_to_string(
+            Path::new(&publish_path).join(format!("{}.html", crate::publish::slug("Ordinary Ω"))),
+        )
+        .unwrap();
+        assert!(published.contains("Actor publication frontier"));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

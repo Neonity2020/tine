@@ -160,7 +160,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("page_print_html", ManagedRouted),
     ("prepare_sparse_v2_share", NoGraphSlot),
     ("preview_block", ManagedRouted),
-    ("publish_html", LegacyOnly),
+    ("publish_html", ManagedRouted),
     ("query_facets", ManagedRouted),
     ("quick_switch", ManagedRouted),
     ("read_asset", Filesystem),
@@ -257,10 +257,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
         "legacy-only by construction: reports the migration",
     ),
     ("merge_pages", "multi-page mutation: oplog transaction"),
-    (
-        "publish_html",
-        "writes publish/, outside the oplog's domain, still on the legacy authority",
-    ),
     ("rename_file_to_page", "rename: oplog transaction"),
     ("rename_page", "rename: oplog transaction"),
     (
