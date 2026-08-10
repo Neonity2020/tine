@@ -1593,6 +1593,14 @@ export function mockBackend(): Backend {
       mockActivations.set(target, activation);
       return { activation, target, prospective: true };
     },
+    async presentConflictOverride(
+      _path: string,
+      _baseRev: string | null,
+      _activation: number,
+      _conflictEpoch: number,
+    ): Promise<"authorised" | "superseded" | "withdrawn"> {
+      return "authorised";
+    },
     async retireEditorActivation(path: string, activation: number) {
       if (mockActivations.get(path) !== activation) return false;
       mockActivations.delete(path);
