@@ -1406,6 +1406,7 @@ mod graph_wide_command_boundary_tests {
             "delete_page",
             "merge_pages",
             "rename_file_to_page",
+            "trash_journal_file",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("command stays async");
@@ -3331,10 +3332,26 @@ pub(crate) fn trash_sync_conflict(conflict: String, state: GraphContext<'_>) -> 
 
 /// Move one journal file (by exact filename) to the recoverable trash.
 #[tauri::command]
-pub(crate) fn trash_journal_file(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.trash_journal_file(&name).map_err(|e| e.to_string())
+pub(crate) async fn trash_journal_file(
+    name: String,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::TrashJournalFile { name },
+            )),
+            None => slot
+                .legacy_graph()?
+                .trash_journal_file(&name)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Raw contents of one journal file (by exact filename) — for inspecting a

@@ -1988,6 +1988,9 @@ pub enum SyncApplicationGraphMutationRequest {
         path: String,
         new_name: String,
     },
+    TrashJournalFile {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -5067,6 +5070,18 @@ fn validate_application_save_request(
 fn validate_application_graph_mutation_request(
     request: &SyncApplicationGraphMutationRequest,
 ) -> Result<(), SyncApplicationPageRequestError> {
+    if let SyncApplicationGraphMutationRequest::TrashJournalFile { name } = request {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.len() > MAX_LOCAL_MUTATION_PATH_BYTES
+        {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            ));
+        }
+        return Ok(());
+    }
     let (names, paths): (Vec<&str>, Vec<&str>) = match request {
         SyncApplicationGraphMutationRequest::RenamePage {
             old,
@@ -5094,6 +5109,7 @@ fn validate_application_graph_mutation_request(
         SyncApplicationGraphMutationRequest::RenameFileToPage { path, new_name } => {
             (vec![new_name.as_str()], vec![path.as_str()])
         }
+        SyncApplicationGraphMutationRequest::TrashJournalFile { .. } => unreachable!(),
     };
     let text_bytes = names
         .iter()
@@ -11198,6 +11214,9 @@ impl RuntimeActor {
             SyncApplicationGraphMutationRequest::RenameFileToPage { path, new_name } => {
                 self.plan_application_file_rescue(&path, &new_name)?
             }
+            SyncApplicationGraphMutationRequest::TrashJournalFile { name } => {
+                return self.trash_application_journal_file(&name)
+            }
         };
         let Some(transaction) = transaction else {
             return Ok(SyncApplicationUnitOutcome::Applied);
@@ -11532,6 +11551,61 @@ impl RuntimeActor {
                 }
             },
         }
+    }
+
+    fn trash_application_journal_file(
+        &mut self,
+        name: &str,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        let relative = self.graph.rel_path(&self.graph.journals_path().join(name));
+        let path = ManagedPath::parse(relative.clone()).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            )
+        })?;
+        let current = match self.load_application_exact_ready(&relative)? {
+            ApplicationExactLoad::Loaded(current) => current,
+            ApplicationExactLoad::Missing => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "journal_trash_missing",
+                ))
+            }
+            ApplicationExactLoad::Ambiguous => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "journal_trash_identity",
+                ))
+            }
+        };
+        if current.editor.page.kind != ManagedTextKind::Journal {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "journal_trash_kind",
+            ));
+        }
+        let bytes = self
+            .graph
+            .read_projection_input(&path)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("journal_trash_read"))?
+            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                "journal_trash_missing",
+            ))?;
+        let source = std::str::from_utf8(&bytes).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("journal_trash_encoding")
+        })?;
+        if current.page.rev.as_deref() != Some(crate::model::content_rev(source).as_str()) {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "journal_trash_stale_projection",
+            ));
+        }
+        self.graph
+            .preserve_projection_journal_in_trash(&path, source)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("journal_trash_preserve")
+            })?;
+        let transaction = OperationTransaction::new(vec![SemanticOperation::DeletePage {
+            page_id: current.editor.page.page_id,
+        }])
+        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("journal_trash_plan"))?;
+        self.execute_application_unit_transaction(transaction)
     }
 
     fn write_application_pdf_view_state(
@@ -22074,6 +22148,39 @@ mod tests {
                 .unwrap(),
             SyncApplicationPageLoadOutcome::Missing { .. }
         ));
+
+        let journal_bytes = "- duplicate journal content\n";
+        admit_external_page(
+            &handle,
+            &fixture,
+            "diary/日記/2026_08_10.md",
+            journal_bytes.as_bytes(),
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::TrashJournalFile {
+                    name: "2026_08_10.md".into(),
+                },)
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        assert!(matches!(
+            handle
+                .load_application_page(SyncApplicationPageLoadRequest {
+                    page: SyncApplicationPageSelector::ExactPath {
+                        path: "diary/日記/2026_08_10.md".into(),
+                    },
+                })
+                .unwrap(),
+            SyncApplicationPageLoadOutcome::Missing { .. }
+        ));
+        let journal_trash = fixture.graph_root().join("logseq/.tine-trash/journals");
+        let recovery = fs::read_dir(journal_trash)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(fs::read_to_string(&recovery[0]).unwrap(), journal_bytes);
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

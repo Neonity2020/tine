@@ -8243,6 +8243,64 @@ impl Graph {
         read_projection_optional(parent.final_dir(), &target.filename)
     }
 
+    /// Preserve the actor's exact current journal projection in user-visible,
+    /// typed recovery trash before the semantic page deletion is authored.
+    /// The digest-derived name makes retries idempotent; an existing destination
+    /// is accepted only when it contains the same bytes.
+    pub(crate) fn preserve_projection_journal_in_trash(
+        &self,
+        path: &ManagedPath,
+        expected: &str,
+    ) -> io::Result<PathBuf> {
+        let target = self.projection_page_target(path.as_str())?;
+        if !target.absolute_path.starts_with(self.journals_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal trash source is outside the configured journal tree",
+            ));
+        }
+        if self.read_projection_input(path)?.as_deref() != Some(expected.as_bytes()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "journal projection changed before recovery preservation",
+            ));
+        }
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Journal);
+        self.ensure_trash_write_target(&trash)?;
+        fs::create_dir_all(&trash)?;
+        let extension = target
+            .absolute_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("txt");
+        let mut identity = Sha256::new();
+        identity.update(path.as_str().as_bytes());
+        identity.update([0]);
+        identity.update(expected.as_bytes());
+        // A valid near-limit source name plus a digest prefix could itself
+        // exceed portable component limits on the recovery path.
+        let destination = trash.join(format!("managed-{:x}.{extension}", identity.finalize()));
+        match atomic_write_new(&destination, expected.as_bytes()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::read(&destination)?.as_slice() != expected.as_bytes() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "journal recovery destination contains different bytes",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        if fs::read(&destination)?.as_slice() != expected.as_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal recovery bytes changed after publication",
+            ));
+        }
+        Ok(destination)
+    }
+
     /// Configured managed roots visible to the sparse importer.
     ///
     /// These roots decide Page versus Journal for the paths they own and are

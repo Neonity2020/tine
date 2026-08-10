@@ -220,7 +220,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("tine_open_devtools", NoGraphSlot),
     ("tine_quit", NoGraphSlot),
     ("trash_asset", TrashWrite),
-    ("trash_journal_file", LegacyOnly),
+    ("trash_journal_file", ManagedRouted),
     ("trash_sync_conflict", TrashWrite),
     ("uninstall_plugin", NoGraphSlot),
     ("verify_plugin_registry", NoGraphSlot),
@@ -262,10 +262,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "set_backup_keep",
         "legacy zip backups have no managed analogue",
-    ),
-    (
-        "trash_journal_file",
-        "graph-text deletion: oplog transaction",
     ),
 ];
 
