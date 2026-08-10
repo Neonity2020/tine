@@ -1979,6 +1979,11 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     /// Per-part intermediate page/reference materializations run through
     /// ordinary event DML. Terminal construction must leave this at zero.
     pub(crate) intermediate_page_materializations: usize,
+    /// Exact terminal document-frontier constructions. Terminal construction
+    /// must build this authenticated map once, never rewrite a tree path for
+    /// every document in every accepted part.
+    pub(crate) terminal_frontier_bulk_seeds: usize,
+    pub(crate) terminal_frontier_documents_seeded: usize,
     pub(crate) terminal_materializations: usize,
     pub(crate) terminal_pages_materialized: usize,
     pub(crate) terminal_materialization_chunks: usize,
@@ -3750,7 +3755,14 @@ impl SqliteFrontier {
         if terminal.is_some() {
             match Self::build_candidate(path, claim, Arc::clone(&lease), source, terminal) {
                 Ok(built) => return Self::publish_candidate(path, claim, lease, source, built),
-                Err(_discarded) => refused = 1,
+                Err(discarded) => {
+                    if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
+                        eprintln!(
+                            "sqlite terminal construction refused; replaying archive: {discarded}"
+                        );
+                    }
+                    refused = 1;
+                }
             }
         }
         let mut built = Self::build_candidate(path, claim, Arc::clone(&lease), source, None)?;
@@ -4384,14 +4396,23 @@ impl SqliteFrontier {
         self.physical.begin_terminal_bootstrap_construction()?;
         let prefix_started = std::time::Instant::now();
         let mut provenance = Vec::with_capacity(material.accepted_events().len());
+        let mut terminal_documents = BTreeMap::new();
         for event in material.accepted_events() {
             instrumentation.accepted_events_validated += 1;
             instrumentation.max_live_events = instrumentation.max_live_events.max(1);
             instrumentation.max_live_evidence_records =
                 instrumentation.max_live_evidence_records.max(1);
             authenticate_event_for_engine(engine, event)?;
-            let (_, apply_stats) =
-                self.apply_candidate_with_materialization_and_stats(event, ApplyFault::None, None)?;
+            let (_, apply_stats) = self.apply_terminal_prefix_candidate_with_stats(event)?;
+            for document in event.affected_documents() {
+                terminal_documents.insert(
+                    document.document_id().as_uuid().into_bytes(),
+                    storage_frontier::PhysicalFrontierDocument {
+                        document_id: document.document_id().as_uuid().into_bytes(),
+                        canonical_bytes: encode_frontier_document(document)?,
+                    },
+                );
+            }
             instrumentation.cleanup_page_attempts += apply_stats.cleanup_page_attempts;
             instrumentation.cleanup_existing_pages += apply_stats.cleanup_existing_pages;
             instrumentation.cleanup_owned_rows += apply_stats.cleanup_owned_rows;
@@ -4425,6 +4446,12 @@ impl SqliteFrontier {
                     .into(),
             ));
         }
+        let terminal_physical_root = lower_physical_frontier_root(&reached)?;
+        let terminal_documents = terminal_documents.into_values().collect::<Vec<_>>();
+        self.physical
+            .seed_terminal_frontier_documents(&terminal_physical_root, &terminal_documents)?;
+        bootstrap.terminal_frontier_bulk_seeds = 1;
+        bootstrap.terminal_frontier_documents_seeded = terminal_documents.len();
         trace_terminal_phase("accepted prefix seed", prefix_started);
         let _ = super::hot_engine::take_current_path_cursor_probe();
         let rows_started = std::time::Instant::now();
@@ -4452,6 +4479,13 @@ impl SqliteFrontier {
             || instrumentation.reference_coverage_inductive_checks != 0
             || instrumentation.reference_coverage_full_scans != 0
             || bootstrap.intermediate_page_materializations != 0
+            || bootstrap.terminal_frontier_bulk_seeds != 1
+            || bootstrap.terminal_frontier_documents_seeded
+                != usize::try_from(source.exact_frontier_root.document_count()).map_err(|_| {
+                    ProjectionError::Rebuild(
+                        "terminal frontier document count exceeds platform usize".into(),
+                    )
+                })?
             || bootstrap.bootstrap_part_reads != 0
             || bootstrap.terminal_materializations != 1
             || bootstrap.terminal_reference_index_traversals != 1
@@ -4913,7 +4947,13 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
-        self.apply_with_materialization_transaction_policy(event, fault, materialization, false)
+        self.apply_with_materialization_transaction_policy(
+            event,
+            fault,
+            materialization,
+            false,
+            false,
+        )
     }
 
     fn apply_candidate_with_materialization_and_stats(
@@ -4928,7 +4968,32 @@ impl SqliteFrontier {
         ),
         ProjectionError,
     > {
-        self.apply_with_materialization_transaction_policy(event, fault, materialization, true)
+        self.apply_with_materialization_transaction_policy(
+            event,
+            fault,
+            materialization,
+            true,
+            false,
+        )
+    }
+
+    fn apply_terminal_prefix_candidate_with_stats(
+        &mut self,
+        event: &AcceptedBatchEvent,
+    ) -> Result<
+        (
+            ApplyDisposition,
+            super::sqlite_materialization::ApplyChangeInstrumentation,
+        ),
+        ProjectionError,
+    > {
+        self.apply_with_materialization_transaction_policy(
+            event,
+            ApplyFault::None,
+            None,
+            true,
+            true,
+        )
     }
 
     fn apply_with_materialization_transaction_policy(
@@ -4937,6 +5002,7 @@ impl SqliteFrontier {
         fault: ApplyFault,
         materialization: Option<&super::MaterializationChange>,
         candidate_build: bool,
+        terminal_prefix: bool,
     ) -> Result<
         (
             ApplyDisposition,
@@ -4981,6 +5047,9 @@ impl SqliteFrontier {
                 .and_then(|coverage| coverage.prior_rows_for(event.acceptance_sequence)),
             fault: storage_frontier::ApplyFault::None,
         };
+        if terminal_prefix {
+            request.prior_reference_coverage_count = None;
+        }
         let preflight = match self.physical.preflight(&current_physical, &request) {
             Ok(disposition) => disposition,
             Err(storage_frontier::FrontierError::BatchCollision(_)) => {
@@ -5036,10 +5105,12 @@ impl SqliteFrontier {
                 ));
             }
             for document in &event.affected_documents {
-                let _ = self.physical.frontier_document(
-                    &current_physical,
-                    document.document_id().as_uuid().into_bytes(),
-                )?;
+                if !terminal_prefix {
+                    let _ = self.physical.frontier_document(
+                        &current_physical,
+                        document.document_id().as_uuid().into_bytes(),
+                    )?;
+                }
                 if !document.direct_dependency_heads().contains(&event.batch_id) {
                     return Err(ProjectionError::InvalidAcceptedEvent(format!(
                         "affected document {} does not name accepted batch {} as a direct head",
@@ -5069,7 +5140,10 @@ impl SqliteFrontier {
                 request.fault = storage_frontier::ApplyFault::ReturnAfterMaterialization;
             }
         }
-        let result = if candidate_build {
+        let result = if terminal_prefix {
+            self.physical
+                .apply_terminal_prefix_candidate(&current_physical, &request)?
+        } else if candidate_build {
             self.physical.apply_candidate(&current_physical, &request)?
         } else {
             self.physical.apply(&current_physical, &request)?
