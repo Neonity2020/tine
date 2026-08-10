@@ -1303,6 +1303,8 @@ mod graph_wide_command_boundary_tests {
             "list_templates",
             "query_facets",
             "run_query",
+            "run_graph_search",
+            "search",
             "rename_page",
             "delete_page",
         ] {
@@ -1346,6 +1348,8 @@ mod managed_actor_command_boundary_tests {
             "list_templates",
             "query_facets",
             "run_query",
+            "run_graph_search",
+            "search",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1390,6 +1394,8 @@ mod managed_actor_command_boundary_tests {
             "list_templates",
             "query_facets",
             "run_query",
+            "run_graph_search",
+            "search",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("navigation command remains");
@@ -1540,24 +1546,48 @@ pub(crate) async fn run_graph_search(
     scope: Option<tine_core::query_plan::QueryPageScope>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
-    // QueryExecution carries backward-defaulted per-category `has_more` bits;
-    // returning it directly preserves those bits on the Tauri wire.
-    let execution = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
-        Some(lane) => graph.run_graph_search_latest_scoped(
-            lane,
-            &source,
-            page_limit,
-            block_limit,
-            scope,
-            explain,
-        ),
-        None => graph.run_graph_search_scoped(&source, page_limit, block_limit, scope, explain),
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    let execution = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::GraphSearch {
+                    source,
+                    page_limit,
+                    block_limit,
+                    lane,
+                    explain,
+                    scope,
+                },
+            )? {
+                SyncApplicationNavigationReply::GraphSearch(execution) => Ok(execution),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(match lane.as_deref() {
+                Some(lane) => slot.legacy_graph()?.run_graph_search_latest_scoped(
+                    lane,
+                    &source,
+                    page_limit,
+                    block_limit,
+                    scope,
+                    explain,
+                ),
+                None => slot.legacy_graph()?.run_graph_search_scoped(
+                    &source,
+                    page_limit,
+                    block_limit,
+                    scope,
+                    explain,
+                ),
+            }),
+        }
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     enforce_query_execution_budget(&execution)?;
     Ok(execution)
 }
@@ -1851,14 +1881,27 @@ pub(crate) async fn search(
     lane: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<RefGroup>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let limit = limit.min(RESULT_BRIDGE_MAX_ROWS);
-    let groups = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
-        Some(lane) => graph.search_latest(lane, &query, limit),
-        None => graph.search(&query, limit),
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    let groups = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BlockSearch { query, limit, lane },
+            )? {
+                SyncApplicationNavigationReply::BlockSearch(groups) => Ok(groups),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(match lane.as_deref() {
+                Some(lane) => slot.legacy_graph()?.search_latest(lane, &query, limit),
+                None => slot.legacy_graph()?.search(&query, limit),
+            }),
+        }
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     enforce_result_bridge_budget(&groups)?;
     Ok(groups)
 }

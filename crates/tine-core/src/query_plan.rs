@@ -7,7 +7,7 @@
 //! durable query workspace can grow into later.
 
 use crate::doc::DocBlock;
-use crate::model::{BlockDto, Graph, PageEntry, PageKind};
+use crate::model::{BlockDto, Format, Graph, PageDto, PageEntry, PageKind};
 use crate::refs;
 use crate::search_query::{canonical_fold, Matcher, Term};
 use regex::Regex;
@@ -206,6 +206,13 @@ pub struct QueryExecution {
     pub has_more: QueryHasMore,
     /// A cancelled latest-wins lane returns no partial results.
     pub cancelled: bool,
+}
+
+/// One exact current managed page paired with the same inventory entry used by
+/// Direct Files for scope, path tie-breaking and page-hit projection.
+pub(crate) struct ApplicationQueryPlanPage {
+    pub(crate) entry: PageEntry,
+    pub(crate) page: PageDto,
 }
 
 /// Compiled friendly graph-search plan.  Regexes are compiled once and kept off
@@ -441,6 +448,66 @@ impl QueryPlan {
             let branch_hits = match branch.target {
                 QueryTarget::Pages => execute_pages(self, graph, branch, &cancelled),
                 QueryTarget::Blocks => execute_blocks(self, graph, branch, &cancelled),
+            };
+            let Some((mut branch_hits, branch_has_more)) = branch_hits else {
+                return cancelled_execution(self, explanation);
+            };
+            match branch.target {
+                QueryTarget::Pages => has_more.pages |= branch_has_more,
+                QueryTarget::Blocks => has_more.blocks |= branch_has_more,
+            }
+            hits.append(&mut branch_hits);
+        }
+        QueryExecution {
+            hits,
+            diagnostics: self.diagnostics.clone(),
+            explanation,
+            has_more,
+            cancelled: false,
+        }
+    }
+
+    pub(crate) fn execute_application_with_explain(
+        &self,
+        file_pages: Vec<PageEntry>,
+        pages: &[ApplicationQueryPlanPage],
+        aliases: Vec<(String, String, String)>,
+        referenced: Vec<String>,
+        cancelled: impl Fn() -> bool,
+        explain: bool,
+    ) -> QueryExecution {
+        let explanation = if explain {
+            self.explanation()
+        } else {
+            QueryExplanation {
+                branches: Vec::new(),
+            }
+        };
+        if !self.diagnostics.is_empty() {
+            return QueryExecution {
+                hits: Vec::new(),
+                diagnostics: self.diagnostics.clone(),
+                explanation,
+                has_more: QueryHasMore::default(),
+                cancelled: false,
+            };
+        }
+        let mut hits = Vec::new();
+        let mut has_more = QueryHasMore::default();
+        for branch in &self.branches {
+            if cancelled() {
+                return cancelled_execution(self, explanation);
+            }
+            let branch_hits = match branch.target {
+                QueryTarget::Pages => execute_page_candidates(
+                    self,
+                    file_pages.clone(),
+                    aliases.clone(),
+                    referenced.clone(),
+                    branch,
+                    &cancelled,
+                ),
+                QueryTarget::Blocks => execute_application_blocks(self, pages, branch, &cancelled),
             };
             let Some((mut branch_hits, branch_has_more)) = branch_hits else {
                 return cancelled_execution(self, explanation);
@@ -1574,6 +1641,165 @@ fn execute_blocks(
             has_more,
         ))
     })
+}
+
+#[derive(Debug)]
+struct ApplicationScoredBlock {
+    relevance: BlockRelevance,
+    index: usize,
+    page: PageEntry,
+    block: BlockDto,
+    display_text: String,
+    evidence: Vec<MatchEvidence>,
+}
+
+impl ApplicationScoredBlock {
+    fn is_better_than(&self, other: &Self) -> bool {
+        let quality = self.relevance.cmp_quality(&other.relevance);
+        quality == Ordering::Greater
+            || (quality == Ordering::Equal
+                && (self.page.rel_path.as_str(), self.index)
+                    < (other.page.rel_path.as_str(), other.index))
+    }
+}
+
+impl PartialEq for ApplicationScoredBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.relevance.cmp_quality(&other.relevance) == Ordering::Equal
+            && (self.page.rel_path.as_str(), self.index)
+                == (other.page.rel_path.as_str(), other.index)
+    }
+}
+impl Eq for ApplicationScoredBlock {}
+impl PartialOrd for ApplicationScoredBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ApplicationScoredBlock {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.relevance.cmp_quality(&self.relevance).then_with(|| {
+            (self.page.rel_path.as_str(), self.index)
+                .cmp(&(other.page.rel_path.as_str(), other.index))
+        })
+    }
+}
+
+fn execute_application_blocks(
+    plan: &QueryPlan,
+    pages: &[ApplicationQueryPlanPage],
+    branch: &QueryBranch,
+    cancelled: &impl Fn() -> bool,
+) -> Option<(Vec<QueryHit>, bool)> {
+    if branch.limit == 0 {
+        return Some((Vec::new(), false));
+    }
+    let mut heap = BinaryHeap::new();
+    let mut has_more = false;
+    let mut index = 0usize;
+    for source in pages {
+        if cancelled() {
+            return None;
+        }
+        if let Some(scope) = &plan.page_scope {
+            let selected = match scope.path.as_deref() {
+                Some(path) => source.entry.rel_path == path,
+                None => {
+                    source.entry.kind == scope.page_kind
+                        && refs::same_page(&source.entry.name, &scope.name)
+                }
+            };
+            if !selected {
+                continue;
+            }
+        }
+        let roots = source
+            .page
+            .blocks
+            .iter()
+            .map(|block| {
+                crate::query::application_query_doc_block(block, source.page.format == Format::Org)
+            })
+            .collect::<Vec<_>>();
+        let mut ancestors = Vec::new();
+        walk_blocks(&roots, &mut ancestors, &mut |block, path| {
+            if cancelled() {
+                return false;
+            }
+            let candidate_index = index;
+            index = index.saturating_add(1);
+            let projection = block.projection();
+            let Some(relevance) = block_relevance(
+                plan,
+                &branch.predicate,
+                &projection.visible,
+                &projection.visible_lower,
+            ) else {
+                return true;
+            };
+            has_more |= heap.len() >= branch.limit;
+            let retain = heap.len() < branch.limit
+                || heap.peek().is_some_and(|worst: &ApplicationScoredBlock| {
+                    relevance.cmp_quality(&worst.relevance) == Ordering::Greater
+                        || (relevance.cmp_quality(&worst.relevance) == Ordering::Equal
+                            && (source.entry.rel_path.as_str(), candidate_index)
+                                < (worst.page.rel_path.as_str(), worst.index))
+                });
+            if retain {
+                let matched = eval_ranked_block_expr(
+                    plan,
+                    &branch.predicate,
+                    &projection.visible,
+                    &projection.visible_lower,
+                )
+                .expect("rank and evidence evaluators must agree");
+                let mut dto = crate::model::block_to_shallow_dto(block);
+                dto.breadcrumb = path.iter().map(|ancestor| crumb_line(ancestor)).collect();
+                let candidate = ApplicationScoredBlock {
+                    relevance,
+                    index: candidate_index,
+                    page: source.entry.clone(),
+                    block: dto,
+                    display_text: projection.visible.clone(),
+                    evidence: matched.evidence,
+                };
+                if heap.len() < branch.limit {
+                    heap.push(candidate);
+                } else if heap
+                    .peek()
+                    .is_some_and(|worst| candidate.is_better_than(worst))
+                {
+                    *heap.peek_mut().unwrap() = candidate;
+                }
+            }
+            true
+        });
+        if cancelled() {
+            return None;
+        }
+    }
+    let mut winners = heap.into_vec();
+    winners.sort_by(|a, b| {
+        b.relevance.cmp_quality(&a.relevance).then_with(|| {
+            (a.page.rel_path.as_str(), a.index).cmp(&(b.page.rel_path.as_str(), b.index))
+        })
+    });
+    Some((
+        winners
+            .into_iter()
+            .map(|winner| QueryHit::Block {
+                page: winner.page.name,
+                kind: winner.page.kind,
+                path: winner.page.rel_path,
+                block: winner.block,
+                display_text: winner.display_text,
+                evidence: winner.evidence,
+                score: winner.relevance.score(),
+                match_class: winner.relevance.match_class,
+            })
+            .collect(),
+        has_more,
+    ))
 }
 
 /// Convert typed block hits back to the exact grouped shape used by existing

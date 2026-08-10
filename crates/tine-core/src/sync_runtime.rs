@@ -1866,6 +1866,19 @@ pub enum SyncApplicationNavigationRequest {
         max_rows: usize,
         max_bytes: usize,
     },
+    GraphSearch {
+        source: String,
+        page_limit: usize,
+        block_limit: usize,
+        lane: Option<String>,
+        explain: bool,
+        scope: Option<crate::query_plan::QueryPageScope>,
+    },
+    BlockSearch {
+        query: String,
+        limit: usize,
+        lane: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1901,6 +1914,8 @@ pub enum SyncApplicationNavigationReply {
         exceeded: bool,
     },
     SimpleQuery(SyncApplicationBoundedRefGroups),
+    GraphSearch(crate::query_plan::QueryExecution),
+    BlockSearch(Vec<RefGroup>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2534,8 +2549,36 @@ struct HandleInner {
     sender: Mutex<Option<SyncSender<ActorRequest>>>,
     join: Mutex<Option<JoinHandle<()>>>,
     status: Arc<RwLock<SyncRuntimeStatusSnapshot>>,
+    application_search_lanes: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>,
     #[cfg(test)]
     workspace_id: WorkspaceId,
+}
+
+#[derive(Clone)]
+struct ApplicationSearchCancellation {
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    mine: u64,
+}
+
+impl ApplicationSearchCancellation {
+    fn cancelled(&self) -> bool {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire) != self.mine
+    }
+}
+
+fn begin_application_search_cancellation(
+    lanes: &Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU64>>>,
+    lane: &str,
+) -> ApplicationSearchCancellation {
+    let epoch = {
+        let mut lanes = lanes.lock().unwrap();
+        lanes
+            .entry(lane.to_owned())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            .clone()
+    };
+    let mine = epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    ApplicationSearchCancellation { epoch, mine }
 }
 
 impl Drop for HandleInner {
@@ -2723,6 +2766,7 @@ impl SyncRuntimeHandle {
                                 sender: Mutex::new(Some(sender)),
                                 join: Mutex::new(Some(join)),
                                 status,
+                                application_search_lanes: Mutex::new(HashMap::new()),
                                 #[cfg(test)]
                                 workspace_id,
                             }),
@@ -2829,6 +2873,7 @@ impl SyncRuntimeHandle {
                             sender: Mutex::new(Some(sender)),
                             join: Mutex::new(Some(join)),
                             status,
+                            application_search_lanes: Mutex::new(HashMap::new()),
                             #[cfg(test)]
                             workspace_id,
                         }),
@@ -3274,11 +3319,23 @@ impl SyncRuntimeHandle {
         &self,
         request: SyncApplicationNavigationRequest,
     ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
         validate_application_navigation_request(&request)?;
+        let lane = match &request {
+            SyncApplicationNavigationRequest::GraphSearch { lane, .. }
+            | SyncApplicationNavigationRequest::BlockSearch { lane, .. } => lane.as_deref(),
+            _ => None,
+        };
+        // Advance the epoch before waiting for the serialized actor turn. A
+        // newer search can therefore cancel an older scan that currently owns
+        // `operation`, rather than waiting uselessly for it to finish first.
+        let cancellation = lane.map(|lane| {
+            begin_application_search_cancellation(&self.inner.application_search_lanes, lane)
+        });
+        let _operation = self.inner.operation.lock().unwrap();
         let (reply_sender, reply_receiver) = mpsc::channel();
         self.send(ActorRequest::ApplicationNavigation {
             request,
+            cancellation,
             reply: reply_sender,
         })
         .map_err(map_application_actor_error)?;
@@ -4462,6 +4519,51 @@ fn validate_application_navigation_request(
         }
         return Ok(());
     }
+    if let SyncApplicationNavigationRequest::GraphSearch {
+        source,
+        page_limit,
+        block_limit,
+        lane,
+        scope,
+        ..
+    } = request
+    {
+        let rows = page_limit.saturating_add(*block_limit);
+        let text_bytes = source
+            .len()
+            .saturating_add(lane.as_ref().map_or(0, String::len))
+            .saturating_add(scope.as_ref().map_or(0, |scope| {
+                scope
+                    .name
+                    .len()
+                    .saturating_add(scope.path.as_ref().map_or(0, String::len))
+            }));
+        if rows > MAX_SYNC_APPLICATION_RESULT_ROWS || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: rows,
+                    text_bytes,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        return Ok(());
+    }
+    if let SyncApplicationNavigationRequest::BlockSearch { query, limit, lane } = request {
+        let text_bytes = query
+            .len()
+            .saturating_add(lane.as_ref().map_or(0, String::len));
+        if *limit > MAX_SYNC_APPLICATION_RESULT_ROWS || text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    blocks: *limit,
+                    text_bytes,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        return Ok(());
+    }
     let (names, query, limit) = match request {
         SyncApplicationNavigationRequest::ReferencedPageNames
         | SyncApplicationNavigationRequest::PageAliases
@@ -4567,6 +4669,8 @@ fn validate_application_navigation_request(
         }
         SyncApplicationNavigationRequest::BacklinkFilterContext { .. } => unreachable!(),
         SyncApplicationNavigationRequest::PropertyFacets { .. } => unreachable!(),
+        SyncApplicationNavigationRequest::GraphSearch { .. }
+        | SyncApplicationNavigationRequest::BlockSearch { .. } => unreachable!(),
     };
     if names.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS {
         return Err(SyncApplicationPageRequestError::RequestTooLarge(
@@ -5893,6 +5997,7 @@ enum ActorRequest {
     },
     ApplicationNavigation {
         request: SyncApplicationNavigationRequest,
+        cancellation: Option<ApplicationSearchCancellation>,
         reply:
             mpsc::Sender<Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError>>,
     },
@@ -6051,8 +6156,12 @@ fn run_actor_loop(
                 let _ = reply.send(result);
                 false
             }
-            ActorRequest::ApplicationNavigation { request, reply } => {
-                let result = actor.application_navigation(request);
+            ActorRequest::ApplicationNavigation {
+                request,
+                cancellation,
+                reply,
+            } => {
+                let result = actor.application_navigation(request, cancellation.as_ref());
                 let _ = reply.send(result);
                 false
             }
@@ -8337,6 +8446,7 @@ impl RuntimeActor {
     fn application_navigation(
         &mut self,
         request: SyncApplicationNavigationRequest,
+        cancellation: Option<&ApplicationSearchCancellation>,
     ) -> Result<SyncApplicationNavigationOutcome, SyncApplicationPageRequestError> {
         if let EditorTurnReadiness::Deferred(state) = self.prepare_page_read_turn() {
             return Ok(SyncApplicationNavigationOutcome::Deferred { state });
@@ -8488,6 +8598,35 @@ impl RuntimeActor {
             } => SyncApplicationNavigationReply::SimpleQuery(
                 self.application_simple_query_ready(&query, max_rows, max_bytes)?,
             ),
+            SyncApplicationNavigationRequest::GraphSearch {
+                source,
+                page_limit,
+                block_limit,
+                lane: _,
+                explain,
+                scope,
+            } => SyncApplicationNavigationReply::GraphSearch(self.application_graph_search_ready(
+                &source,
+                page_limit,
+                block_limit,
+                scope,
+                explain,
+                cancellation,
+            )?),
+            SyncApplicationNavigationRequest::BlockSearch {
+                query,
+                limit,
+                lane: _,
+            } => {
+                let execution = self.application_query_plan_ready(
+                    crate::query_plan::QueryPlan::block_search_literal(&query, limit),
+                    false,
+                    cancellation,
+                )?;
+                SyncApplicationNavigationReply::BlockSearch(
+                    crate::query_plan::block_hits_to_groups(execution.hits),
+                )
+            }
         };
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
     }
@@ -9618,6 +9757,75 @@ impl RuntimeActor {
             total: result.total,
             exceeded: result.exceeded,
         })
+    }
+
+    fn application_graph_search_ready(
+        &self,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+        cancellation: Option<&ApplicationSearchCancellation>,
+    ) -> Result<crate::query_plan::QueryExecution, SyncApplicationPageRequestError> {
+        let plan = match scope {
+            Some(scope) => {
+                crate::query_plan::QueryPlan::friendly_for_page(source, block_limit, scope)
+            }
+            None => crate::query_plan::QueryPlan::friendly(source, page_limit, block_limit),
+        };
+        self.application_query_plan_ready(plan, explain, cancellation)
+    }
+
+    fn application_query_plan_ready(
+        &self,
+        plan: crate::query_plan::QueryPlan,
+        explain: bool,
+        cancellation: Option<&ApplicationSearchCancellation>,
+    ) -> Result<crate::query_plan::QueryExecution, SyncApplicationPageRequestError> {
+        let cancelled = || cancellation.is_some_and(ApplicationSearchCancellation::cancelled);
+        let entries = self
+            .application_navigation_pages_ready()?
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .collect::<Vec<_>>();
+        if cancelled() {
+            return Ok(plan.execute_application_with_explain(
+                entries,
+                &[],
+                Vec::new(),
+                Vec::new(),
+                cancelled,
+                explain,
+            ));
+        }
+        let aliases = self.application_navigation_aliases_ready()?;
+        let referenced = self.application_navigation_reference_names_ready()?;
+        let needs_blocks = plan
+            .branches
+            .iter()
+            .any(|branch| branch.target == crate::query_plan::QueryTarget::Blocks);
+        let mut pages = Vec::new();
+        if needs_blocks {
+            for entry in &entries {
+                if cancelled() {
+                    break;
+                }
+                let current = match self.load_application_exact_ready(&entry.rel_path)? {
+                    ApplicationExactLoad::Loaded(current) => current,
+                    ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                        return Err(SyncApplicationPageRequestError::ActorRefused)
+                    }
+                };
+                pages.push(crate::query_plan::ApplicationQueryPlanPage {
+                    entry: entry.clone(),
+                    page: current.page,
+                });
+            }
+        }
+        Ok(plan.execute_application_with_explain(
+            entries, &pages, aliases, referenced, cancelled, explain,
+        ))
     }
 
     fn application_backlink_filter_context_ready(
@@ -17885,6 +18093,20 @@ mod tests {
     use std::sync::Barrier;
     use uuid::Uuid;
 
+    #[test]
+    fn application_search_lane_epoch_cancels_only_the_older_same_lane_request() {
+        let lanes = Mutex::new(HashMap::new());
+        let first = begin_application_search_cancellation(&lanes, "ctrl-k");
+        let independent = begin_application_search_cancellation(&lanes, "block-picker");
+        assert!(!first.cancelled());
+        assert!(!independent.cancelled());
+
+        let second = begin_application_search_cancellation(&lanes, "ctrl-k");
+        assert!(first.cancelled());
+        assert!(!second.cancelled());
+        assert!(!independent.cancelled());
+    }
+
     fn install_shared_join_pause(
         workspace_id: WorkspaceId,
         point: SharedJoinTestPausePoint,
@@ -19297,6 +19519,17 @@ mod tests {
         });
     }
 
+    fn canonicalize_graph_search_for_mode_differential(
+        execution: &mut crate::query_plan::QueryExecution,
+    ) {
+        for hit in &mut execution.hits {
+            if let crate::query_plan::QueryHit::Block { page, block, .. } = hit {
+                *page = crate::refs::page_key(page);
+                erase_application_block_ids(std::slice::from_mut(block));
+            }
+        }
+    }
+
     fn assert_parser_dto_semantics(expected: &PageDto, actual: &PageDto) {
         let mut expected = expected.clone();
         let mut actual = actual.clone();
@@ -19489,6 +19722,62 @@ mod tests {
                 .map(|page| (&page.name, &page.rel_path))
                 .collect::<Vec<_>>(),
             "managed navigation must share Direct Files quick-switch semantics"
+        );
+        for (source, scope, page_limit, block_limit) in [
+            ("comp", None, 8, 16),
+            ("ordinary", None, 8, 16),
+            ("ordinary", None, 1, 1),
+            ("gateway", None, 8, 16),
+            ("(and", None, 8, 16),
+            (
+                "ordinary",
+                Some(crate::query_plan::QueryPageScope {
+                    name: "Ref source".into(),
+                    page_kind: PageKind::Page,
+                    path: Some("content/nested pages/Ref source.md".into()),
+                }),
+                8,
+                16,
+            ),
+        ] {
+            let SyncApplicationNavigationReply::GraphSearch(mut managed) =
+                navigation(SyncApplicationNavigationRequest::GraphSearch {
+                    source: source.into(),
+                    page_limit,
+                    block_limit,
+                    lane: None,
+                    explain: true,
+                    scope: scope.clone(),
+                })
+            else {
+                panic!("wrong graph-search reply for {source:?}")
+            };
+            let mut direct =
+                graph.run_graph_search_scoped(source, page_limit, block_limit, scope, true);
+            canonicalize_graph_search_for_mode_differential(&mut managed);
+            canonicalize_graph_search_for_mode_differential(&mut direct);
+            assert_eq!(
+                serde_json::to_value(managed).unwrap(),
+                serde_json::to_value(direct).unwrap(),
+                "managed graph search must share Direct Files semantics for {source:?}"
+            );
+        }
+        let SyncApplicationNavigationReply::BlockSearch(mut managed_search) =
+            navigation(SyncApplicationNavigationRequest::BlockSearch {
+                query: "ordinary".into(),
+                limit: 16,
+                lane: None,
+            })
+        else {
+            panic!("wrong block-search reply")
+        };
+        let mut direct_search = graph.search("ordinary", 16);
+        canonicalize_query_groups_for_mode_differential(&mut managed_search);
+        canonicalize_query_groups_for_mode_differential(&mut direct_search);
+        assert_eq!(
+            serde_json::to_value(managed_search).unwrap(),
+            serde_json::to_value(direct_search).unwrap(),
+            "managed block search must share Direct Files semantics"
         );
         let SyncApplicationNavigationReply::Templates(managed_templates) =
             navigation(SyncApplicationNavigationRequest::ListTemplates)
@@ -20134,6 +20423,52 @@ mod tests {
             .groups
             .iter()
             .any(|group| group.page == "Navigation"));
+        for request in [
+            SyncApplicationNavigationRequest::GraphSearch {
+                source: "Old Plain".into(),
+                page_limit: 0,
+                block_limit: 8,
+                lane: None,
+                explain: false,
+                scope: None,
+            },
+            SyncApplicationNavigationRequest::BlockSearch {
+                query: "Old Plain".into(),
+                limit: 8,
+                lane: None,
+            },
+        ] {
+            let reply = loaded(request);
+            let has_old = match reply {
+                SyncApplicationNavigationReply::GraphSearch(result) => !result.hits.is_empty(),
+                SyncApplicationNavigationReply::BlockSearch(groups) => !groups.is_empty(),
+                _ => unreachable!(),
+            };
+            assert!(!has_old, "search retained pre-save block text");
+        }
+        for request in [
+            SyncApplicationNavigationRequest::GraphSearch {
+                source: "New Plain".into(),
+                page_limit: 0,
+                block_limit: 8,
+                lane: None,
+                explain: false,
+                scope: None,
+            },
+            SyncApplicationNavigationRequest::BlockSearch {
+                query: "New Plain".into(),
+                limit: 8,
+                lane: None,
+            },
+        ] {
+            let reply = loaded(request);
+            let has_new = match reply {
+                SyncApplicationNavigationReply::GraphSearch(result) => !result.hits.is_empty(),
+                SyncApplicationNavigationReply::BlockSearch(groups) => !groups.is_empty(),
+                _ => unreachable!(),
+            };
+            assert!(has_new, "search missed immediately saved block text");
+        }
 
         let mut created_block = BlockDto::default();
         created_block.raw = format!(
@@ -20281,6 +20616,29 @@ mod tests {
             .groups
             .iter()
             .any(|group| group.page == "Navigation"));
+        for request in [
+            SyncApplicationNavigationRequest::GraphSearch {
+                source: "Created Plain".into(),
+                page_limit: 0,
+                block_limit: 8,
+                lane: None,
+                explain: false,
+                scope: None,
+            },
+            SyncApplicationNavigationRequest::BlockSearch {
+                query: "Created Plain".into(),
+                limit: 8,
+                lane: None,
+            },
+        ] {
+            let reply = loaded(request);
+            let has_created = match reply {
+                SyncApplicationNavigationReply::GraphSearch(result) => !result.hits.is_empty(),
+                SyncApplicationNavigationReply::BlockSearch(groups) => !groups.is_empty(),
+                _ => unreachable!(),
+            };
+            assert!(has_created, "search missed immediately created block text");
+        }
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -36187,7 +36545,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual performance receipt: managed indexed and all-page simple queries"]
+    #[ignore = "manual performance receipt: managed simple queries and graph search"]
     fn managed_simple_query_1000_page_manual_gate() {
         assert!(
             !cfg!(debug_assertions),
@@ -36218,6 +36576,7 @@ mod tests {
         let direct = Graph::open(&fixture.graph_root);
         let direct_indexed = direct.run_query_bounded(indexed, 20_000, 32 * 1024 * 1024);
         let direct_broad = direct.run_query_bounded(&broad, 20_000, 32 * 1024 * 1024);
+        let direct_graph_search = direct.run_graph_search("task", 20, 20, false);
 
         let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
@@ -36253,6 +36612,7 @@ mod tests {
 
         let mut indexed_samples = Vec::with_capacity(samples);
         let mut broad_samples = Vec::with_capacity(samples);
+        let mut graph_search_samples = Vec::with_capacity(samples);
         for _ in 0..samples {
             let (elapsed, result) = run(indexed);
             assert_eq!(result.total, direct_indexed.total);
@@ -36260,13 +36620,41 @@ mod tests {
             let (elapsed, result) = run(&broad);
             assert_eq!(result.total, direct_broad.total);
             broad_samples.push(elapsed);
+            let started = Instant::now();
+            let outcome = handle
+                .application_navigation(SyncApplicationNavigationRequest::GraphSearch {
+                    source: "task".into(),
+                    page_limit: 20,
+                    block_limit: 20,
+                    lane: Some("performance-receipt".into()),
+                    explain: false,
+                    scope: None,
+                })
+                .unwrap();
+            let elapsed = started.elapsed();
+            let SyncApplicationNavigationOutcome::Loaded {
+                reply: SyncApplicationNavigationReply::GraphSearch(mut result),
+            } = outcome
+            else {
+                panic!("managed graph search returned the wrong outcome: {outcome:?}")
+            };
+            let mut expected = direct_graph_search.clone();
+            canonicalize_graph_search_for_mode_differential(&mut result);
+            canonicalize_graph_search_for_mode_differential(&mut expected);
+            assert_eq!(
+                serde_json::to_value(result).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            graph_search_samples.push(elapsed);
         }
         let indexed_p95 = startup_p95(&indexed_samples);
         let broad_p95 = startup_p95(&broad_samples);
+        let graph_search_p95 = startup_p95(&graph_search_samples);
         eprintln!(
-            "managed_simple_query pages={total_pages} samples={samples} indexed_p95_ms={:.3} broad_p95_ms={:.3}",
+            "managed_simple_query pages={total_pages} samples={samples} indexed_p95_ms={:.3} broad_p95_ms={:.3} graph_search_p95_ms={:.3}",
             startup_ms(indexed_p95),
             startup_ms(broad_p95),
+            startup_ms(graph_search_p95),
         );
         assert!(
             indexed_p95 < Duration::from_secs(1),
@@ -36275,6 +36663,10 @@ mod tests {
         assert!(
             broad_p95 < Duration::from_secs(2),
             "all-page 1,000-page simple query exceeded two seconds"
+        );
+        assert!(
+            graph_search_p95 < Duration::from_secs(2),
+            "1,000-page graph search exceeded two seconds"
         );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),

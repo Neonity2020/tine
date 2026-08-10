@@ -1844,7 +1844,7 @@ pub(crate) fn simple_query_candidate_plan(query_src: &str) -> SimpleQueryCandida
     }
 }
 
-fn application_query_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
+pub(crate) fn application_query_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
     DocBlock {
         raw: block.raw.clone(),
         children: block
