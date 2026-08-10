@@ -373,7 +373,7 @@ export function tombstoneIfQuiescent(
   path?: string,
 ): boolean {
   if (
-    dirty.has(name)
+    (dirty.has(name) && !allowConflicted)
     || saveChain.has(name)
     || (!allowConflicted && isConflicted(name))
     || deletedPages.has(name)
@@ -962,7 +962,10 @@ export async function flushPage(name: string): Promise<boolean> {
  * bounded; graph-wide flushAll semantics (assets and unrelated drafts) are not
  * part of deleting one page. */
 export async function flushPageToQuiescence(name: string): Promise<boolean> {
-  if (!doc.loaded || isConflicted(name) || deletedPages.has(name)) return false;
+  if (isConflicted(name) || deletedPages.has(name)) return false;
+  // A clean satellite page needs no write to be quiescent. A dirty or saving
+  // page still requires an armed main store so its draft can actually drain.
+  if (!doc.loaded && (dirty.has(name) || saveChain.has(name))) return false;
   for (let attempt = 0; attempt < 4; attempt++) {
     if (isConflicted(name) || deletedPages.has(name)) return false;
     const inFlight = saveChain.get(name);
