@@ -1302,6 +1302,7 @@ mod graph_wide_command_boundary_tests {
             "get_backlink_filter_context",
             "list_templates",
             "query_facets",
+            "run_query",
             "rename_page",
             "delete_page",
         ] {
@@ -1344,6 +1345,7 @@ mod managed_actor_command_boundary_tests {
             "get_unlinked_refs",
             "list_templates",
             "query_facets",
+            "run_query",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1427,18 +1429,54 @@ pub(crate) fn page_print_html(
 }
 
 #[tauri::command]
-pub(crate) fn run_query(
+pub(crate) async fn run_query(
     query: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     validate_query_source(&query)?;
-    with_read_graph(&state, |g| {
-        bounded_groups_or_error(g.run_query_bounded(
-            &query,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.clone(),
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::SimpleQuery(Some(result)) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                // Transitional C3d1 fallback: only task-constrained shapes have
+                // a complete indexed candidate plan in this packet.
+                SyncApplicationNavigationReply::SimpleQuery(None) => slot.with_read_graph(|g| {
+                    bounded_groups_or_error(g.run_query_bounded(
+                        &query,
+                        RESULT_BRIDGE_MAX_ROWS,
+                        RESULT_BRIDGE_MAX_BYTES,
+                    ))
+                }),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.run_query_bounded(
+                &query,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Resolve every query macro in one Copy / Export session under one cumulative

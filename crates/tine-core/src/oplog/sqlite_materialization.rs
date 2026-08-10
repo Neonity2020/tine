@@ -1990,6 +1990,11 @@ pub struct MaterializedPropertyFacetRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedTaskCandidatePageRow {
+    pub page_id: PageId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedPropertyRow {
     pub owner: MaterializedEntityId,
     pub page_id: PageId,
@@ -2411,6 +2416,27 @@ impl<'a> SqliteMaterializedRead<'a> {
         limit: usize,
     ) -> Result<Vec<MaterializedTaskRow>, MaterializationError> {
         convert_rows(self.inner.tasks(marker, limit)?, task_row_from_storage)
+    }
+
+    pub fn task_candidate_pages_after(
+        &self,
+        marker: &str,
+        after: Option<PageId>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedTaskCandidatePageRow>, MaterializationError> {
+        self.inner
+            .task_candidate_pages_after(
+                marker,
+                after.map(|page| page.as_uuid().into_bytes()),
+                limit,
+            )?
+            .into_iter()
+            .map(|row| {
+                Ok(MaterializedTaskCandidatePageRow {
+                    page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+                })
+            })
+            .collect()
     }
 
     pub fn search(

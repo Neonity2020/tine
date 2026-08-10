@@ -1590,7 +1590,7 @@ fn run_pred_bounded(
     // a single time axis: journal pages by the day they represent, other pages by
     // file mtime. Only computed when such a sort is active (else we skip the stat).
     let want_recency = matches!(&opts.sort, Some((f, _)) if is_recency_field(f));
-    let (mut groups, recency_by_page) = graph.with_pages(|pages| {
+    let (groups, recency_by_page) = graph.with_pages(|pages| {
         let mut groups: Vec<RefGroup> = Vec::new();
         let mut recency: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         for (entry, doc) in pages {
@@ -1647,9 +1647,18 @@ fn run_pred_bounded(
         (groups, recency)
     });
 
-    // `with_pages` inherits filesystem/cache enumeration order. Make the base
-    // order stable before sampling and before it becomes the tie-breaker for an
-    // explicit sort; otherwise identical graph exports can differ by machine.
+    finish_query_groups(groups, recency_by_page, opts, budget)
+}
+
+fn finish_query_groups(
+    mut groups: Vec<RefGroup>,
+    recency_by_page: std::collections::HashMap<String, i64>,
+    opts: &QueryOpts,
+    budget: ConstructionBudget,
+) -> BoundedGroups {
+    // The source traversal is path-stable in both Direct Files and the managed
+    // application gateway. Make the displayed base order stable before sampling
+    // and before it becomes the tie-breaker for an explicit sort.
     groups.sort_by(|a, b| {
         a.page.cmp(&b.page).then_with(|| {
             let rank = |kind| match kind {
@@ -1740,6 +1749,149 @@ fn run_pred_bounded(
         total: budget.total,
         exceeded: budget.exceeded,
     }
+}
+
+/// One exact parser-owned page selected by the managed query candidate plan.
+/// `recency` shares Direct Files' axis: journal midnight or projected-file mtime.
+pub(crate) struct ApplicationQueryPage {
+    pub(crate) page: PageDto,
+    pub(crate) recency: i64,
+}
+
+/// Conservative page-level candidate plan for the first managed simple-query
+/// slice. A returned marker set is complete: every matching block must live on a
+/// page containing one of these task markers. `None` means the shape cannot yet
+/// be narrowed safely and must retain the explicit transitional fallback.
+pub(crate) fn simple_query_task_candidate_markers(query_src: &str) -> Option<Vec<String>> {
+    fn markers(pred: &Pred) -> Option<std::collections::BTreeSet<String>> {
+        match pred {
+            Pred::Task(markers) => Some(
+                markers
+                    .iter()
+                    .map(|marker| marker.to_ascii_uppercase())
+                    .collect(),
+            ),
+            Pred::And(children) => children.iter().find_map(markers),
+            Pred::Or(children) => {
+                let mut union = std::collections::BTreeSet::new();
+                for child in children {
+                    union.extend(markers(child)?);
+                }
+                Some(union)
+            }
+            Pred::Not(_) => None,
+            _ => None,
+        }
+    }
+
+    let pred = Pred::parse(query_src, JournalDate::today())?;
+    markers(&pred).map(|markers| markers.into_iter().collect())
+}
+
+fn application_query_doc_block(block: &BlockDto, is_org: bool) -> DocBlock {
+    DocBlock {
+        raw: block.raw.clone(),
+        children: block
+            .children
+            .iter()
+            .map(|child| application_query_doc_block(child, is_org))
+            .collect(),
+        uuid: block.id.clone(),
+        is_org,
+        proj: std::sync::OnceLock::new(),
+    }
+}
+
+/// Evaluate one already-narrowed exact managed page set with the same predicate,
+/// OG top-level-root filter, result budgets, sorting and sampling as Direct Files.
+pub(crate) fn run_application_query_pages_bounded(
+    pages: &[ApplicationQueryPage],
+    query_src: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> BoundedGroups {
+    if !query_source_within_limit(query_src) || !query_nesting_within_limit(query_src) {
+        return BoundedGroups {
+            groups: Vec::new(),
+            total: 0,
+            exceeded: false,
+        };
+    }
+    let Some(pred) = Pred::parse(query_src, JournalDate::today()) else {
+        return BoundedGroups {
+            groups: Vec::new(),
+            total: 0,
+            exceeded: false,
+        };
+    };
+    let mut opts = QueryOpts::default();
+    pred.collect_opts(&mut opts);
+    let mut budget = ConstructionBudget::new(max_rows, max_bytes);
+    let sample_admission_cap = opts.sample.filter(|_| opts.sort.is_none());
+    let want_recency = matches!(&opts.sort, Some((field, _)) if is_recency_field(field));
+    let mut groups = Vec::new();
+    let mut recency_by_page = std::collections::HashMap::new();
+
+    for source in pages {
+        let page = &source.page;
+        let (page_props, page_tags) = page_facets(page.pre_block.as_deref());
+        let ctx = EvalCtx {
+            journal: (page.kind == PageKind::Journal)
+                .then(|| journal_ordinal(&page.name))
+                .flatten(),
+            is_journal: page.kind == PageKind::Journal,
+            page_name: &page.name,
+            page_props: &page_props,
+            page_tags: &page_tags,
+        };
+        let roots = page
+            .blocks
+            .iter()
+            .map(|block| application_query_doc_block(block, page.format == Format::Org))
+            .collect::<Vec<_>>();
+        let mut matched = Vec::new();
+        let mut path = Vec::new();
+        let mut path_refs = PathRefCounts::new();
+        let track_path_refs = pred.uses_path_refs();
+        collect_og_query_roots(
+            &roots,
+            &mut path,
+            &mut path_refs,
+            track_path_refs,
+            false,
+            &mut |block, _, ancestor_refs| {
+                pred.eval_with_path_refs(block, ancestor_refs, &ctx)
+                    .then_some(())
+            },
+            &mut |block, _, ()| {
+                if sample_admission_cap.is_some_and(|cap| budget.rows >= cap) {
+                    return None;
+                }
+                if budget.closed() {
+                    budget.deny_match();
+                    return None;
+                }
+                if !budget.admit_estimated(&page.name, shallow_dto_estimated_bytes(block, &[])) {
+                    return None;
+                }
+                Some(result_dto(block))
+            },
+            &mut matched,
+        );
+        if !matched.is_empty() {
+            if want_recency {
+                recency_by_page.insert(page.name.clone(), source.recency);
+            }
+            groups.push(RefGroup {
+                page: page.name.clone(),
+                kind: page.kind,
+                blocks: matched,
+                evidence: Vec::new(),
+            });
+        }
+    }
+
+    finish_query_groups(groups, recency_by_page, &opts, budget)
 }
 
 // --- Scoped-invalidation support (#52) --------------------------------------
@@ -4901,6 +5053,31 @@ mod tests {
             )]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_task_candidate_plan_is_conservative_across_boolean_shapes() {
+        assert_eq!(
+            simple_query_task_candidate_markers(
+                "(and (task todo) (priority A) (not (page Templates)))"
+            ),
+            Some(vec!["TODO".into()])
+        );
+        assert_eq!(
+            simple_query_task_candidate_markers(
+                "(or (and (task TODO) (property x y)) (task doing now))"
+            ),
+            Some(vec!["DOING".into(), "NOW".into(), "TODO".into()])
+        );
+        assert_eq!(
+            simple_query_task_candidate_markers("(and (not (task TODO)) \"x\")"),
+            None
+        );
+        assert_eq!(
+            simple_query_task_candidate_markers("(or (task TODO) \"x\")"),
+            None
+        );
+        assert_eq!(simple_query_task_candidate_markers("\"x\""), None);
     }
 
     #[test]

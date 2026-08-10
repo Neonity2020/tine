@@ -1861,6 +1861,11 @@ pub enum SyncApplicationNavigationRequest {
         max_items: usize,
         max_bytes: usize,
     },
+    SimpleQuery {
+        query: String,
+        max_rows: usize,
+        max_bytes: usize,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1895,6 +1900,7 @@ pub enum SyncApplicationNavigationReply {
         facets: Vec<(String, Vec<String>)>,
         exceeded: bool,
     },
+    SimpleQuery(Option<SyncApplicationBoundedRefGroups>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4537,6 +4543,28 @@ fn validate_application_navigation_request(
             }
             (&[][..], Some(name.as_str()), None)
         }
+        SyncApplicationNavigationRequest::SimpleQuery {
+            query,
+            max_rows,
+            max_bytes,
+        } => {
+            if !crate::query::query_source_within_limit(query)
+                || !crate::query::query_nesting_within_limit(query)
+                || *max_rows == 0
+                || *max_rows > MAX_SYNC_APPLICATION_RESULT_ROWS
+                || *max_bytes == 0
+                || *max_bytes > MAX_SYNC_APPLICATION_RESULT_BYTES
+            {
+                return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                    SyncEditorRequestSize {
+                        blocks: *max_rows,
+                        text_bytes: query.len().max(*max_bytes),
+                        ..SyncEditorRequestSize::default()
+                    },
+                ));
+            }
+            (&[][..], Some(query.as_str()), None)
+        }
         SyncApplicationNavigationRequest::BacklinkFilterContext { .. } => unreachable!(),
         SyncApplicationNavigationRequest::PropertyFacets { .. } => unreachable!(),
     };
@@ -6595,6 +6623,21 @@ fn application_crumb_line(raw: &str, is_org: bool) -> String {
     }
 }
 
+fn application_query_page_recency(graph_root: &Path, page: &PageDto) -> i64 {
+    if page.kind == PageKind::Journal {
+        return crate::date::JournalDate::from_title(&page.name)
+            .map(|date| date.to_days() * 86_400)
+            .unwrap_or(i64::MIN);
+    }
+    ManagedPath::parse(page.path.clone())
+        .ok()
+        .and_then(|path| std::fs::metadata(graph_root.join(path.as_str())).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(i64::MIN)
+}
+
 fn application_page_block_referrers(
     page: &PageDto,
     target: &str,
@@ -8438,6 +8481,13 @@ impl RuntimeActor {
                 )?;
                 SyncApplicationNavigationReply::PropertyFacets { facets, exceeded }
             }
+            SyncApplicationNavigationRequest::SimpleQuery {
+                query,
+                max_rows,
+                max_bytes,
+            } => SyncApplicationNavigationReply::SimpleQuery(
+                self.application_task_query_ready(&query, max_rows, max_bytes)?,
+            ),
         };
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
     }
@@ -9345,6 +9395,91 @@ impl RuntimeActor {
             }
         }
         Ok(accumulator.finish())
+    }
+
+    fn application_task_query_ready(
+        &self,
+        query: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Option<SyncApplicationBoundedRefGroups>, SyncApplicationPageRequestError> {
+        let Some(markers) = crate::query::simple_query_task_candidate_markers(query) else {
+            return Ok(None);
+        };
+        let overlay = self.application_navigation_overlay_ready()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+
+        let mut masked_page_ids = HashSet::new();
+        for path in overlay.keys() {
+            let rows = read
+                .pages_by_path(path, 2)
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+            if rows.len() > 1 {
+                return Err(SyncApplicationPageRequestError::ActorRefused);
+            }
+            masked_page_ids.extend(rows.into_iter().map(|page| page.page_id));
+        }
+
+        const BATCH: usize = 512;
+        let mut candidate_page_ids = BTreeSet::new();
+        for marker in markers {
+            let mut cursor = None;
+            loop {
+                let rows = read
+                    .task_candidate_pages_after(&marker, cursor, BATCH)
+                    .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+                if rows.is_empty() {
+                    break;
+                }
+                let len = rows.len();
+                for row in rows {
+                    cursor = Some(row.page_id);
+                    if !masked_page_ids.contains(&row.page_id) {
+                        candidate_page_ids.insert(row.page_id);
+                    }
+                }
+                if len < BATCH {
+                    break;
+                }
+            }
+        }
+        drop(read);
+
+        let mut sources = Vec::new();
+        for (path, current) in overlay {
+            let Some((_, page)) = current else {
+                continue;
+            };
+            sources.push((path.as_str().to_owned(), page));
+        }
+        for page_id in candidate_page_ids {
+            let current = self.load_application_page_id_ready(page_id)?;
+            sources.push((current.editor.page.path.as_str().to_owned(), current.page));
+        }
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+        let pages = sources
+            .into_iter()
+            .map(|(_, page)| crate::query::ApplicationQueryPage {
+                recency: application_query_page_recency(&self.graph.root, &page),
+                page,
+            })
+            .collect::<Vec<_>>();
+        let result =
+            crate::query::run_application_query_pages_bounded(&pages, query, max_rows, max_bytes);
+        Ok(Some(SyncApplicationBoundedRefGroups {
+            groups: result.groups,
+            total: result.total,
+            exceeded: result.exceeded,
+        }))
     }
 
     fn application_backlink_filter_context_ready(
@@ -19238,6 +19373,42 @@ mod tests {
                 "managed property facets must share Direct Files policy"
             );
         }
+        let compound_task_query =
+            "(and (task TODO) (priority A) (not (page Templates)) (sort-by modified desc))";
+        let SyncApplicationNavigationReply::SimpleQuery(Some(managed_query)) =
+            navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: compound_task_query.into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong managed simple-query reply")
+        };
+        let direct_query = graph.run_query_bounded(compound_task_query, 20_000, 32 * 1024 * 1024);
+        assert_eq!(managed_query.exceeded, direct_query.exceeded);
+        assert_eq!(managed_query.total, direct_query.total);
+        let mut managed_groups = managed_query.groups.clone();
+        let mut direct_groups = (*direct_query.groups).clone();
+        for group in &mut managed_groups {
+            erase_application_block_ids(&mut group.blocks);
+        }
+        for group in &mut direct_groups {
+            erase_application_block_ids(&mut group.blocks);
+        }
+        assert_eq!(
+            serde_json::to_value(&managed_groups).unwrap(),
+            serde_json::to_value(&direct_groups).unwrap(),
+            "indexed managed task query must share Direct Files semantics"
+        );
+        let SyncApplicationNavigationReply::SimpleQuery(None) =
+            navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: "\"gateway\"".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("unsupported simple-query shape must retain the explicit fallback")
+        };
         let requested = vec![
             genuine.to_owned(),
             genuine.to_owned(),
@@ -19528,7 +19699,7 @@ mod tests {
             &fixture,
             "content/nested pages/Navigation.md",
             format!(
-                "icon:: old\nalias:: Old Alias\npageFacet:: old-page\n\n- mentions Old Plain [[Old Phantom]] (({old_reference}))\n  template:: Old template\n  oldFacet:: old-value\n  id:: {identity}\n"
+                "icon:: old\nalias:: Old Alias\npageFacet:: old-page\n\n- TODO mentions Old Plain [[Old Phantom]] (({old_reference}))\n  template:: Old template\n  oldFacet:: old-value\n  id:: {identity}\n"
             )
             .as_bytes(),
         );
@@ -19536,7 +19707,7 @@ mod tests {
             load_application_exact(&handle, "content/nested pages/Navigation.md");
         page.pre_block = Some("icon:: new\nalias:: New Alias\npageFacet:: new-page".into());
         page.blocks[0].raw = format!(
-            "- mentions New Plain [[New Phantom]] (({new_reference}))\n  Template:: New template\n  new_prop:: new-value\n  id:: {identity}"
+            "DONE mentions New Plain [[New Phantom]] (({new_reference}))\nTemplate:: New template\nnew_prop:: new-value\nid:: {identity}"
         );
         let saved = handle
             .save_application_page(SyncApplicationPageSaveRequest {
@@ -19699,10 +19870,23 @@ mod tests {
         assert!(!autocomplete_facets
             .iter()
             .any(|(_, values)| values.iter().any(|value| value == "old-page")));
+        let SyncApplicationNavigationReply::SimpleQuery(Some(todo_query)) =
+            loaded(SyncApplicationNavigationRequest::SimpleQuery {
+                query: "(task TODO)".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong immediate task-query reply")
+        };
+        assert!(!todo_query
+            .groups
+            .iter()
+            .any(|group| group.page == "Navigation"));
 
         let mut created_block = BlockDto::default();
         created_block.raw = format!(
-            "- links Created Plain [[Created Phantom]] (({new_reference}))\n  template:: Created template\n  created_prop:: created-value"
+            "TODO links Created Plain [[Created Phantom]] (({new_reference}))\ntemplate:: Created template\ncreated_prop:: created-value"
         );
         let created = handle
             .save_application_page(SyncApplicationPageSaveRequest {
@@ -19805,6 +19989,23 @@ mod tests {
         assert!(autocomplete_facets
             .iter()
             .any(|(key, values)| { key == "createdpage" && values == &["created-page"] }));
+        let SyncApplicationNavigationReply::SimpleQuery(Some(todo_query)) =
+            loaded(SyncApplicationNavigationRequest::SimpleQuery {
+                query: "(task TODO)".into(),
+                max_rows: 20_000,
+                max_bytes: 32 * 1024 * 1024,
+            })
+        else {
+            panic!("wrong created task-query reply")
+        };
+        assert!(todo_query
+            .groups
+            .iter()
+            .any(|group| group.page == "Created Navigation"));
+        assert!(!todo_query
+            .groups
+            .iter()
+            .any(|group| group.page == "Navigation"));
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
