@@ -175,7 +175,7 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("rename_page", ManagedRouted),
     ("resolve_block", ManagedRouted),
     ("resolve_blocks", ManagedRouted),
-    ("resolve_sync_conflict", LegacyOnly),
+    ("resolve_sync_conflict", ManagedRouted),
     ("restore_backup", LegacyOnly),
     ("run_advanced_query", ManagedRouted),
     ("run_graph_search", ManagedRouted),
@@ -250,10 +250,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
         "managed_sync_status",
         "legacy-only by construction: reports the migration",
-    ),
-    (
-        "resolve_sync_conflict",
-        "rewrites graph text: oplog transaction",
     ),
     (
         "restore_backup",

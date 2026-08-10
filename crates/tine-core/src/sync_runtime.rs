@@ -1991,6 +1991,14 @@ pub enum SyncApplicationGraphMutationRequest {
     TrashJournalFile {
         name: String,
     },
+    ResolveSyncConflict {
+        winner_path: String,
+        conflict_path: String,
+        decisions: HashMap<String, String>,
+        base_revision: String,
+        conflict_revision: String,
+        pre_choice: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -5082,6 +5090,48 @@ fn validate_application_graph_mutation_request(
         }
         return Ok(());
     }
+    if let SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+        winner_path,
+        conflict_path,
+        decisions,
+        base_revision,
+        conflict_revision,
+        pre_choice,
+    } = request
+    {
+        if decisions.len() > MAX_SYNC_APPLICATION_PAGE_BLOCKS
+            || ManagedPath::parse(winner_path.clone()).is_err()
+            || ManagedPath::parse(conflict_path.clone()).is_err()
+        {
+            return Err(SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            ));
+        }
+        let text_bytes = [
+            winner_path.len(),
+            conflict_path.len(),
+            base_revision.len(),
+            conflict_revision.len(),
+            pre_choice.len(),
+        ]
+        .into_iter()
+        .chain(
+            decisions
+                .iter()
+                .flat_map(|(key, value)| [key.len(), value.len()]),
+        )
+        .try_fold(0_usize, usize::checked_add)
+        .unwrap_or(usize::MAX);
+        if text_bytes > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    text_bytes,
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        return Ok(());
+    }
     let (names, paths): (Vec<&str>, Vec<&str>) = match request {
         SyncApplicationGraphMutationRequest::RenamePage {
             old,
@@ -5110,6 +5160,7 @@ fn validate_application_graph_mutation_request(
             (vec![new_name.as_str()], vec![path.as_str()])
         }
         SyncApplicationGraphMutationRequest::TrashJournalFile { .. } => unreachable!(),
+        SyncApplicationGraphMutationRequest::ResolveSyncConflict { .. } => unreachable!(),
     };
     let text_bytes = names
         .iter()
@@ -11217,6 +11268,23 @@ impl RuntimeActor {
             SyncApplicationGraphMutationRequest::TrashJournalFile { name } => {
                 return self.trash_application_journal_file(&name)
             }
+            SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                winner_path,
+                conflict_path,
+                decisions,
+                base_revision,
+                conflict_revision,
+                pre_choice,
+            } => {
+                return self.resolve_application_sync_conflict(
+                    &winner_path,
+                    &conflict_path,
+                    &decisions,
+                    &base_revision,
+                    &conflict_revision,
+                    &pre_choice,
+                )
+            }
         };
         let Some(transaction) = transaction else {
             return Ok(SyncApplicationUnitOutcome::Applied);
@@ -11606,6 +11674,144 @@ impl RuntimeActor {
         }])
         .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("journal_trash_plan"))?;
         self.execute_application_unit_transaction(transaction)
+    }
+
+    fn resolve_application_sync_conflict(
+        &mut self,
+        winner_path: &str,
+        conflict_path: &str,
+        decisions: &HashMap<String, String>,
+        base_revision: &str,
+        conflict_revision: &str,
+        pre_choice: &str,
+    ) -> Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError> {
+        if winner_path == conflict_path
+            || Format::from_path(Path::new(winner_path))
+                != Format::from_path(Path::new(conflict_path))
+        {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "sync_conflict_identity",
+            ));
+        }
+        let current = match self.load_application_exact_ready(winner_path)? {
+            ApplicationExactLoad::Loaded(current) => current,
+            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
+                return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "sync_conflict_winner_identity",
+                ))
+            }
+        };
+        if current.page.rev.as_deref() != Some(base_revision) {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "sync_conflict_changed",
+            ));
+        }
+        let conflict = self
+            .graph
+            .read_sync_conflict_copy(conflict_path)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("sync_conflict_read"))?
+            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                "sync_conflict_identity",
+            ))?;
+        if conflict.len() > MAX_SYNC_EDITOR_REQUEST_BYTES {
+            return Err(SyncApplicationPageRequestError::RequestTooLarge(
+                SyncEditorRequestSize {
+                    text_bytes: conflict.len(),
+                    ..SyncEditorRequestSize::default()
+                },
+            ));
+        }
+        if crate::model::content_rev(&conflict) != conflict_revision {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "sync_conflict_changed",
+            ));
+        }
+        let format = current.page.format;
+        if current.page.read_only || (format == Format::Org && !crate::org::org_editable(&conflict))
+        {
+            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "sync_conflict_read_only",
+            ));
+        }
+        let mine = crate::model::page_dto_document(&current.page).map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("sync_conflict_winner_parse")
+        })?;
+        let theirs = crate::model::parse_document_source(Path::new(conflict_path), &conflict);
+        let pre_block = match pre_choice {
+            "theirs" => theirs.pre_block.clone(),
+            "mine" => mine.pre_block.clone(),
+            _ if format == Format::Md => merge_markdown_page_properties(
+                mine.pre_block.as_deref(),
+                theirs.pre_block.as_deref(),
+            ),
+            _ => mine.pre_block.clone(),
+        };
+        let merged = crate::model::existing_document_page_dto(
+            &current.page,
+            crate::doc::Document {
+                pre_block,
+                roots: crate::sync_diff::merge_blocks(&mine.roots, &theirs.roots, decisions),
+            },
+        )
+        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("sync_conflict_merge"))?;
+        validate_application_page_bounds(&merged)?;
+        let staged = self
+            .graph
+            .stage_sync_conflict_trash(conflict_path, conflict.as_bytes())
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    SyncApplicationPageRequestError::ActorRefusedAt("sync_conflict_changed")
+                } else {
+                    SyncApplicationPageRequestError::ActorRefusedAt("sync_conflict_stage")
+                }
+            })?;
+        let outcome = self.save_application_page(SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: winner_path.to_owned(),
+                revision: current.revision,
+            },
+            page: merged,
+        });
+        match outcome {
+            Ok(SyncApplicationPageSaveOutcome::Saved { .. })
+            | Ok(SyncApplicationPageSaveOutcome::Unchanged { .. }) => {
+                Ok(SyncApplicationUnitOutcome::Applied)
+            }
+            Ok(SyncApplicationPageSaveOutcome::Conflict { .. }) => {
+                self.graph
+                    .rollback_sync_conflict_trash(&staged)
+                    .map_err(|_| {
+                        SyncApplicationPageRequestError::ActorRefusedAt(
+                            "sync_conflict_pair_rollback",
+                        )
+                    })?;
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "sync_conflict_changed",
+                ))
+            }
+            Ok(SyncApplicationPageSaveOutcome::Deferred { state }) => {
+                let no_authored_batch = matches!(
+                    &state,
+                    SyncEditorDeferred::RetryableExternalWork
+                        | SyncEditorDeferred::BlockedRecovery { batch_id: None, .. }
+                        | SyncEditorDeferred::Revoked { batch_id: None, .. }
+                );
+                if no_authored_batch {
+                    self.graph
+                        .rollback_sync_conflict_trash(&staged)
+                        .map_err(|_| {
+                            SyncApplicationPageRequestError::ActorRefusedAt(
+                                "sync_conflict_pair_rollback",
+                            )
+                        })?;
+                }
+                Ok(SyncApplicationUnitOutcome::Deferred { state })
+            }
+            // An actor error may follow durable acceptance while reconstructing
+            // the reply. Keep the exact staged copy; restoring it could make a
+            // later retry apply the same user merge twice.
+            Err(error) => Err(error),
+        }
     }
 
     fn write_application_pdf_view_state(
@@ -22181,6 +22387,101 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(recovery.len(), 1);
         assert_eq!(fs::read_to_string(&recovery[0]).unwrap(), journal_bytes);
+
+        let winner_path = "content/nested pages/Conflict Winner.md";
+        let conflict_path =
+            "content/nested pages/Conflict Winner.sync-conflict-20260810-120000-DEVICE.md";
+        admit_external_page(
+            &handle,
+            &fixture,
+            winner_path,
+            b"status:: mine\n\n- shared block\n- local wording\n",
+        );
+        fs::write(
+            fixture.graph_root().join(conflict_path),
+            b"status:: theirs\n\n- shared block\n- peer wording\n",
+        )
+        .unwrap();
+        let diff = Graph::open_derived_read_only(fixture.graph_root())
+            .sync_conflict_diff(winner_path, conflict_path)
+            .unwrap()
+            .expect("managed point view must expose the conflict diff");
+        fn choose_theirs(
+            rows: &[crate::sync_diff::DiffRow],
+            decisions: &mut HashMap<String, String>,
+        ) {
+            for row in rows {
+                decisions.insert(row.id.clone(), "theirs".into());
+                choose_theirs(&row.children, decisions);
+            }
+        }
+        let mut decisions = HashMap::new();
+        choose_theirs(&diff.rows, &mut decisions);
+        assert!(matches!(
+            handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                    winner_path: winner_path.into(),
+                    conflict_path: conflict_path.into(),
+                    decisions: decisions.clone(),
+                    base_revision: "stale".into(),
+                    conflict_revision: diff.conflict_rev.clone(),
+                    pre_choice: "theirs".into(),
+                }
+            ),
+            Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "sync_conflict_changed"
+            ))
+        ));
+        assert!(fixture.graph_root().join(conflict_path).is_file());
+        assert!(matches!(
+            handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                    winner_path: winner_path.into(),
+                    conflict_path: conflict_path.into(),
+                    decisions: decisions.clone(),
+                    base_revision: diff.base_rev.clone(),
+                    conflict_revision: "stale".into(),
+                    pre_choice: "theirs".into(),
+                }
+            ),
+            Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "sync_conflict_changed"
+            ))
+        ));
+        assert!(fixture.graph_root().join(conflict_path).is_file());
+        assert_eq!(
+            handle
+                .mutate_application_graph(
+                    SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                        winner_path: winner_path.into(),
+                        conflict_path: conflict_path.into(),
+                        decisions,
+                        base_revision: diff.base_rev,
+                        conflict_revision: diff.conflict_rev,
+                        pre_choice: "theirs".into(),
+                    },
+                )
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        let (winner, _) = load_application_logical(&handle, "Conflict Winner", SyncPageKind::Page);
+        assert!(winner
+            .pre_block
+            .as_deref()
+            .unwrap()
+            .contains("status:: theirs"));
+        assert_eq!(winner.blocks[1].raw, "peer wording");
+        assert!(!fixture.graph_root().join(conflict_path).exists());
+        let conflict_trash = fixture.graph_root().join("logseq/.tine-trash/conflicts");
+        let conflict_recovery = fs::read_dir(conflict_trash)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(conflict_recovery.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&conflict_recovery[0]).unwrap(),
+            "status:: theirs\n\n- shared block\n- peer wording\n"
+        );
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)

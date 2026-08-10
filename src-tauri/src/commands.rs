@@ -294,6 +294,20 @@ fn map_managed_graph_mutation(
     }
 }
 
+fn map_managed_sync_conflict_resolution(
+    outcome: Result<
+        SyncApplicationUnitOutcome,
+        tine_core::sync_runtime::SyncApplicationPageRequestError,
+    >,
+) -> Result<(), String> {
+    match outcome {
+        Err(tine_core::sync_runtime::SyncApplicationPageRequestError::ActorRefusedAt(
+            "sync_conflict_changed",
+        )) => Err("conflict".into()),
+        other => map_managed_graph_mutation(other),
+    }
+}
+
 fn sparse_page_inventory(handle: &SyncRuntimeHandle) -> Result<Vec<PageEntry>, String> {
     let outcome = handle
         .application_page_inventory()
@@ -1407,6 +1421,7 @@ mod graph_wide_command_boundary_tests {
             "merge_pages",
             "rename_file_to_page",
             "trash_journal_file",
+            "resolve_sync_conflict",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("command stays async");
@@ -3293,7 +3308,7 @@ pub(crate) fn sync_conflict_diff(
 /// trash the conflict copy. `base_rev` guards against the winner changing under
 /// the merge; returns "conflict" if it did. `pre_choice`: "mine"/"theirs"/"union".
 #[tauri::command]
-pub(crate) fn resolve_sync_conflict(
+pub(crate) async fn resolve_sync_conflict(
     winner: String,
     conflict: String,
     decisions: std::collections::HashMap<String, String>,
@@ -3302,23 +3317,42 @@ pub(crate) fn resolve_sync_conflict(
     pre_choice: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.resolve_sync_conflict(
-            &winner,
-            &conflict,
-            &decisions,
-            &base_rev,
-            &conflict_rev,
-            pre_choice.as_deref().unwrap_or("union"),
-        )
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                "conflict".to_string()
-            } else {
-                e.to_string()
-            }
-        })
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_sync_conflict_resolution(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                    winner_path: winner,
+                    conflict_path: conflict,
+                    decisions,
+                    base_revision: base_rev,
+                    conflict_revision: conflict_rev,
+                    pre_choice: pre_choice.unwrap_or_else(|| "union".into()),
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .resolve_sync_conflict(
+                    &winner,
+                    &conflict,
+                    &decisions,
+                    &base_rev,
+                    &conflict_rev,
+                    pre_choice.as_deref().unwrap_or("union"),
+                )
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        "conflict".to_string()
+                    } else {
+                        error.to_string()
+                    }
+                }),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Discard a sync-conflict copy without merging (move it to the recoverable

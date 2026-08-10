@@ -935,6 +935,15 @@ impl PdfHighlightSidecarCommit {
     }
 }
 
+/// Exact excluded-file retirement staged around one managed winner merge.
+/// The actor may restore it only when it knows no semantic batch was authored;
+/// retained or ambiguous publication keeps the recoverable copy in trash.
+pub(crate) struct SyncConflictTrashCommit {
+    source: PathBuf,
+    staged: PathBuf,
+    expected: Vec<u8>,
+}
+
 /// What enabling managed sync would change in the plain-text projection.
 ///
 /// The migration is deliberately inspectable before it writes: every block needs
@@ -12803,32 +12812,109 @@ impl Graph {
         winner_rel: &str,
         conflict_rel: &str,
     ) -> io::Result<Option<crate::sync_diff::SyncConflictDiff>> {
-        let read = self.admit_managed_text_writer()?;
-        let (Some(win), Some(conf)) = (
-            self.resolve_managed_rel(&read, winner_rel)?,
-            self.resolve_managed_rel(&read, conflict_rel)?,
-        ) else {
+        let winner = ManagedPath::parse(winner_rel.to_owned()).map_err(|_| bad_path())?;
+        let Some(win_bytes) = self.read_projection_input(&winner)? else {
             return Ok(None);
         };
-        // Provider conflict copies are deliberately outside normal graph-text
-        // discovery. This explicit conflict workflow is their only read path.
-        if !path_is_sync_conflict(&conf) {
+        let Some(conf_c) = self.read_sync_conflict_copy(conflict_rel)? else {
             return Ok(None);
-        }
-        let (win_c, conf_c) = match (
-            self.managed_read_to_string(&read, &win),
-            self.managed_read_to_string(&read, &conf),
-        ) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) | (_, Err(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            (Err(e), _) | (_, Err(e)) => return Err(e),
         };
+        let win_c = String::from_utf8(win_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "winner is not UTF-8"))?;
+        let win = self.root.join(winner_rel);
+        let conf = self.root.join(conflict_rel);
         let mine = parse_doc(&win, &win_c);
         let theirs = parse_doc(&conf, &conf_c);
         let mut diff = crate::sync_diff::diff_docs(&mine, &theirs);
         diff.base_rev = content_rev(&win_c);
         diff.conflict_rev = content_rev(&conf_c);
         Ok(Some(diff))
+    }
+
+    /// Read one explicitly recognized provider conflict copy through the same
+    /// confined, no-follow point capability used by managed projections.
+    pub(crate) fn read_sync_conflict_copy(&self, conflict_rel: &str) -> io::Result<Option<String>> {
+        let conflict = self
+            .resolve_configured_rel_lexical(conflict_rel)
+            .ok_or_else(bad_path)?;
+        if !path_is_sync_conflict(&conflict) {
+            return Ok(None);
+        }
+        let path = ManagedPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
+        self.read_projection_input(&path)?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "conflict copy is not UTF-8"))
+    }
+
+    /// Stage exact conflict bytes in typed recoverable trash. The source is
+    /// excluded from graph discovery, so this changes no oplog-owned document.
+    pub(crate) fn stage_sync_conflict_trash(
+        &self,
+        conflict_rel: &str,
+        expected: &[u8],
+    ) -> io::Result<SyncConflictTrashCommit> {
+        let source = self
+            .resolve_configured_rel_lexical(conflict_rel)
+            .ok_or_else(bad_path)?;
+        if !path_is_sync_conflict(&source) {
+            return Err(bad_path());
+        }
+        self.ensure_within_graph_root(&source)?;
+        let path = ManagedPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
+        if self.read_projection_input(&path)?.as_deref() != Some(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "conflict copy changed before recoverable staging",
+            ));
+        }
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+        self.ensure_trash_write_target(&trash)?;
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("txt");
+        let mut identity = Sha256::new();
+        identity.update(conflict_rel.as_bytes());
+        identity.update([0]);
+        identity.update(expected);
+        let staged = trash.join(format!(
+            "{}__managed-{:x}.{extension}",
+            trash_stamp(),
+            identity.finalize()
+        ));
+        move_to_trash(&source, &staged, &trash)?;
+        if fs::read(&staged)?.as_slice() != expected {
+            let _ = move_file_noreplace(&staged, &source);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "conflict copy changed during recoverable staging",
+            ));
+        }
+        Ok(SyncConflictTrashCommit {
+            source,
+            staged,
+            expected: expected.to_vec(),
+        })
+    }
+
+    pub(crate) fn rollback_sync_conflict_trash(
+        &self,
+        receipt: &SyncConflictTrashCommit,
+    ) -> io::Result<()> {
+        if receipt.source.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "conflict source reappeared while its recovery copy was staged",
+            ));
+        }
+        if fs::read(&receipt.staged)?.as_slice() != receipt.expected.as_slice() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "staged conflict recovery bytes changed",
+            ));
+        }
+        move_file_noreplace(&receipt.staged, &receipt.source)
     }
 
     /// Resolve a sync-conflict copy: build the merged winner from the user's
@@ -12959,29 +13045,11 @@ impl Graph {
     /// that the target actually IS a conflict copy so this can never trash a real
     /// page. Recoverable in `logseq/.tine-trash` (ADR 0007).
     pub fn trash_sync_conflict(&self, conflict_rel: &str) -> io::Result<()> {
-        let conf = self
-            .resolve_configured_rel_lexical(conflict_rel)
-            .ok_or_else(bad_path)?;
-        if !path_is_sync_conflict(&conf) {
-            return Err(bad_path()); // refuse anything that isn't a conflict copy
-        }
-        self.ensure_within_graph_root(&conf)?;
-        match fs::symlink_metadata(&conf) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => return Err(bad_path()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no such conflict file",
-                ))
-            }
-            Err(error) => return Err(error),
-        }
-        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        self.ensure_trash_write_target(&trash)?;
-        let name = conf.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-        let dest = trash.join(format!("{}__{name}", trash_stamp()));
-        move_to_trash(&conf, &dest, &trash)
+        let content = self
+            .read_sync_conflict_copy(conflict_rel)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such conflict file"))?;
+        self.stage_sync_conflict_trash(conflict_rel, content.as_bytes())
+            .map(|_| ())
     }
 
     /// Raw contents of ONE journal file (by exact filename) — lets the UI show a
@@ -23972,6 +24040,10 @@ pub(crate) fn page_dto_document(page: &PageDto) -> io::Result<Document> {
         pre_block: page.pre_block.clone(),
         roots: dto_blocks_to_doc_checked(&page.blocks, page.format == Format::Org)?,
     })
+}
+
+pub(crate) fn parse_document_source(path: &Path, content: &str) -> Document {
+    parse_doc(path, content)
 }
 
 pub(crate) fn existing_document_page_dto(
@@ -34991,7 +35063,18 @@ mod tests {
             .expect("emptying the asset trash is an asset-side write");
         assert_eq!(removed, 1, "the emptied entry must be counted");
 
-        view.trash_sync_conflict(&format!("pages/{conflict}"))
+        let conflict_path = format!("pages/{conflict}");
+        let staged = view
+            .stage_sync_conflict_trash(&conflict_path, b"- conflict evidence\n")
+            .expect("excluded conflict evidence can be staged recoverably");
+        assert!(!dir.join("pages").join(conflict).exists());
+        view.rollback_sync_conflict_trash(&staged)
+            .expect("a definitely unauthored operation can restore its staged evidence");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join(conflict)).unwrap(),
+            "- conflict evidence\n"
+        );
+        view.trash_sync_conflict(&conflict_path)
             .expect("a conflict copy is excluded from the graph-text domain");
         assert!(!dir.join("pages").join(conflict).exists());
         assert_eq!(view.asset_trash_stats().conflicts, 1);
