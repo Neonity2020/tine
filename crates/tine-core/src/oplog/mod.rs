@@ -36,6 +36,10 @@ pub mod import;
 pub(crate) mod local_active;
 #[allow(dead_code)] // routed by the later sync-runtime lane
 pub(crate) mod local_journal_drain;
+// Schema-2 authority is deliberately inert until the managed-runtime rollover
+// packet wires this codec and selector into startup and mutation.
+#[allow(dead_code)]
+pub(crate) mod local_journal_v2_anchor;
 pub(crate) mod loro_store;
 #[allow(dead_code)]
 pub(crate) mod migration_backup;
