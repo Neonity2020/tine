@@ -157,7 +157,8 @@ use crate::oplog::{
     MaterializedPropertyRow, MaterializedSearchHit, MaterializedTagRow, MaterializedTaskRow,
     OperationBatch, OperationObject, OperationTransaction, PageId, ProjectionEndpointId,
     ReferenceCatalogPolicyV1, ReferenceFactV1, ReferenceSourceLocatorV1, SemanticOperation,
-    SessionId, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+    SessionId, SqliteMaterializedRead, WorkspaceId, MAX_MATERIALIZATION_QUERY_BYTES,
+    MAX_MATERIALIZATION_QUERY_ROWS,
 };
 use uuid::Uuid;
 
@@ -9206,6 +9207,27 @@ impl RuntimeActor {
         Ok(SyncApplicationNavigationOutcome::Loaded { reply })
     }
 
+    /// Open the disposable physical read projection only when it represents the
+    /// actor's exact accepted application frontier.
+    ///
+    /// Keeping this check at one seam prevents a newly added managed read from
+    /// accidentally observing a structurally valid but stale SQLite candidate.
+    fn application_materialized_read_ready(
+        &self,
+    ) -> Result<SqliteMaterializedRead<'_>, SyncApplicationPageRequestError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let read = runtime
+            .database()
+            .materialized_read()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        ensure_editor_frontier(runtime, read.acceptance_sequence())
+            .map_err(map_editor_application_error)?;
+        Ok(read)
+    }
+
     fn application_block_candidates_ready(
         &self,
         uuids: &[String],
@@ -9233,16 +9255,7 @@ impl RuntimeActor {
             }
         }
 
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         let mut candidates: HashMap<PageId, Vec<String>> = HashMap::new();
         for uuid in wanted {
             if resolved.contains_key(uuid) {
@@ -9344,16 +9357,7 @@ impl RuntimeActor {
         &self,
     ) -> Result<HashMap<String, usize>, SyncApplicationPageRequestError> {
         let overlay = self.application_navigation_overlay_ready()?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut counts = HashMap::new();
         let mut cursor = None;
@@ -9451,16 +9455,7 @@ impl RuntimeActor {
         let mut candidates: HashMap<PageId, HashSet<BlockId>> = HashMap::new();
         let mut candidate_count = 0_usize;
 
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor = None;
         let mut page_paths: HashMap<PageId, ManagedPath> = HashMap::new();
@@ -9650,16 +9645,7 @@ impl RuntimeActor {
         let excluded = crate::refs::page_key(&self_page);
         let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
 
         const BATCH: usize = 256;
         let mut candidates = HashMap::<PageId, ApplicationPageReferenceCandidates>::new();
@@ -9838,16 +9824,7 @@ impl RuntimeActor {
 
         let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut candidate_pages = BTreeSet::<PageId>::new();
         let mut page_headers = HashMap::<PageId, (ManagedPath, String)>::new();
@@ -9954,16 +9931,7 @@ impl RuntimeActor {
     ) -> Result<Vec<TemplateDto>, SyncApplicationPageRequestError> {
         let overlay = self.application_navigation_overlay_ready()?;
         let masked_paths = overlay.keys().cloned().collect::<HashSet<_>>();
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
 
         const BATCH: usize = 256;
         let mut candidates = BTreeMap::<PageId, HashSet<BlockId>>::new();
@@ -10035,16 +10003,7 @@ impl RuntimeActor {
         max_bytes: usize,
     ) -> Result<(Vec<(String, Vec<String>)>, bool), SyncApplicationPageRequestError> {
         let overlay = self.application_navigation_overlay_ready()?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
 
         // Resolve only the small committed suffix to page IDs once. This masks
         // stale rows (including deletions) without a page lookup per property or
@@ -10133,16 +10092,7 @@ impl RuntimeActor {
             Plan::All => (Vec::new(), true),
         };
         let overlay = self.application_navigation_overlay_ready()?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
 
         let mut masked_page_ids = HashSet::new();
         for path in overlay.keys() {
@@ -10553,16 +10503,7 @@ impl RuntimeActor {
         &self,
     ) -> Result<Vec<(PageEntry, Option<String>)>, SyncApplicationPageRequestError> {
         let overlay = self.application_navigation_overlay_ready()?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, PageId)> = None;
         let mut output: Vec<(PageId, PageEntry, Option<String>)> = Vec::new();
@@ -10650,16 +10591,7 @@ impl RuntimeActor {
         &self,
     ) -> Result<Vec<(String, String, String)>, SyncApplicationPageRequestError> {
         let overlay = self.application_navigation_overlay_ready()?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, String, PageId)> = None;
         let mut output = Vec::new();
@@ -10712,16 +10644,7 @@ impl RuntimeActor {
         &self,
     ) -> Result<Vec<String>, SyncApplicationPageRequestError> {
         let overlay = self.application_navigation_overlay_ready()?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         const BATCH: usize = 256;
         let mut cursor: Option<(ManagedPath, String, String, PageId)> = None;
         let mut seen = HashSet::new();
@@ -10767,16 +10690,7 @@ impl RuntimeActor {
     fn application_inventory_ready(
         &self,
     ) -> Result<Vec<PageEntry>, SyncApplicationPageRequestError> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         const INVENTORY_BATCH: usize = 256;
         let mut pages = Vec::new();
         let mut cursor: Option<(ManagedPath, PageId)> = None;
@@ -10931,12 +10845,7 @@ impl RuntimeActor {
             .runtime
             .as_ref()
             .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
-        let read = runtime
-            .database()
-            .materialized_read()
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
-        ensure_editor_frontier(runtime, read.acceptance_sequence())
-            .map_err(map_editor_application_error)?;
+        let read = self.application_materialized_read_ready()?;
         if let [page] = read
             .pages_by_path(&path, 2)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?
