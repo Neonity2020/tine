@@ -145,23 +145,37 @@ try {
     timeoutMsg: "the GH #295 demonstration page did not open",
   });
 
-  const clicked = await browser.execute((marker) => {
+  // The navigation click can leave the pointer over a page-reference at the
+  // same screen coordinates, opening a hover peek above the target row. Close
+  // that real transient, then use WebDriver for the edit-entry click as well as
+  // the measured keys; DOM Element.click() alone does not emit Tine's mousedown
+  // edit gesture on historical candidates.
+  await browser.$("h1.page-title").moveTo();
+  await sleep(750);
+  if (await browser.$(".peek-popup").isExisting()) {
+    await browser.keys(["Escape"]);
+    await browser.$(".peek-popup").waitForExist({ reverse: true, timeout: 5_000 });
+  }
+  const targetFound = await browser.execute((marker) => {
     const blocks = [...document.querySelectorAll(".ls-block")];
     const markerIndex = blocks.findIndex((block) => {
-      const content = block.querySelector(".block-content");
+      const content = block.querySelector(":scope > .block-main .block-content");
       return content?.textContent?.includes(marker);
     });
     if (markerIndex < 0) return false;
     for (const block of blocks.slice(markerIndex + 1)) {
-      const content = block.querySelector(".block-content");
+      const content = block.querySelector(":scope > .block-main .block-content");
       if (content instanceof HTMLElement && !content.textContent?.trim()) {
-        content.click();
+        content.dataset.e2eIssue295EditorTarget = "true";
         return true;
       }
     }
     return false;
   }, MARKER);
-  if (!clicked) throw new Error("the demonstrated empty child block was not found");
+  if (!targetFound) throw new Error("the demonstrated empty child block was not found");
+  const target = await browser.$('[data-e2e-issue295-editor-target="true"]');
+  await target.scrollIntoView({ block: "center", inline: "center" });
+  await target.click();
   const editor = await browser.$("textarea.block-editor");
   await editor.waitForExist({ timeout: 10_000 });
   await editor.click();
@@ -176,10 +190,9 @@ try {
     const state = {
       pending: [],
       keys: [],
-      invokes: [],
       issue248: [],
       popupPaintAt: null,
-      instrumentation: "pending",
+      instrumentation: "webdriver-keys+native-direct-probe+frontend-save-probe",
     };
     window.__tineIssue295 = state;
     window.__tineIssue248Bench = {
@@ -217,37 +230,6 @@ try {
     });
     popupObserver.observe(document.documentElement, { subtree: true, childList: true });
 
-    try {
-      const internals = window.__TAURI_INTERNALS__;
-      const originalInvoke = internals.invoke.bind(internals);
-      internals.invoke = (...args) => {
-        const command = String(args[0]);
-        if (command !== "quick_switch" && command !== "save_page") return originalInvoke(...args);
-        const span = { command, startedAt: performance.now(), endedAt: null, outcome: "pending" };
-        state.invokes.push(span);
-        try {
-          return Promise.resolve(originalInvoke(...args)).then(
-            (value) => {
-              span.endedAt = performance.now();
-              span.outcome = "ok";
-              return value;
-            },
-            (error) => {
-              span.endedAt = performance.now();
-              span.outcome = "error";
-              throw error;
-            },
-          );
-        } catch (error) {
-          span.endedAt = performance.now();
-          span.outcome = "throw";
-          throw error;
-        }
-      };
-      state.instrumentation = "invoke-wrapped";
-    } catch (error) {
-      state.instrumentation = `unavailable: ${String(error)}`;
-    }
   });
 
   const hostDispatchRoundTripMs = [];
@@ -272,35 +254,55 @@ try {
     await sleep(KEY_PERIOD_MS);
   }
 
-  await browser.waitUntil(async () => browser.execute(() => {
-    const state = window.__tineIssue295;
-    const quickSwitchFinished = state.invokes.some((span) => span.command === "quick_switch" && span.endedAt !== null);
-    return state.popupPaintAt !== null && quickSwitchFinished;
-  }), { timeout: 30_000, timeoutMsg: "page-reference candidates did not complete and paint" });
+  await browser.$(".autocomplete .ac-item").waitForExist({
+    timeout: 30_000,
+    timeoutMsg: "page-reference candidates did not paint",
+  });
   await sleep(1500);
 
   const measurements = await browser.execute(() => window.__tineIssue295);
-  if (measurements.instrumentation !== "invoke-wrapped") {
-    throw new Error(`native command timing unavailable: ${measurements.instrumentation}`);
-  }
   if (measurements.keys.length !== [...TYPED].length) {
     throw new Error(`literal key evidence is incomplete: ${measurements.keys.length}/${[...TYPED].length}`);
   }
+  const nativeProbe = await browser.executeAsync((graphPath, query, done) => {
+    const invoke = window.__TAURI_INTERNALS__.invoke.bind(window.__TAURI_INTERNALS__);
+    const loadStartedAt = performance.now();
+    invoke("load_graph", { path: graphPath }).then((loaded) => {
+      const loadEndedAt = performance.now();
+      const bindingGeneration = loaded?.binding_generation;
+      if (!Number.isSafeInteger(bindingGeneration)) {
+        done({ error: `load_graph omitted binding_generation: ${JSON.stringify(loaded)}` });
+        return;
+      }
+      const quickSwitchStartedAt = performance.now();
+      invoke("quick_switch", { query, limit: 100, bindingGeneration }).then(
+        (rows) => done({
+          bindingGeneration,
+          loadGraphMs: loadEndedAt - loadStartedAt,
+          quickSwitchMs: performance.now() - quickSwitchStartedAt,
+          rows: Array.isArray(rows) ? rows.length : null,
+        }),
+        (error) => done({ error: `quick_switch failed: ${String(error)}` }),
+      );
+    }, (error) => done({ error: `load_graph failed: ${String(error)}` }));
+  }, graph, TYPED.slice(2));
+  if (nativeProbe.error) throw new Error(`native quick_switch probe unavailable: ${nativeProbe.error}`);
   const dispatchToInput = measurements.keys.map((row) => row.inputAt - row.dispatchAt);
   const keydownToInput = measurements.keys.map((row) => row.inputAt - row.keydownAt);
   const dispatchToSecondPaint = measurements.keys.map((row) => row.secondFrameAt - row.dispatchAt);
   const keydownToSecondPaint = measurements.keys.map((row) => row.secondFrameAt - row.keydownAt);
-  const quickSwitch = measurements.invokes
-    .filter((span) => span.command === "quick_switch" && span.endedAt !== null)
-    .map((span) => span.endedAt - span.startedAt);
-  const saves = measurements.invokes
-    .filter((span) => span.command === "save_page" && span.endedAt !== null)
-    .map((span) => span.endedAt - span.startedAt);
-  const finalInputAt = measurements.keys.at(-1).inputAt;
-  const stalledKeysDuringQuickSwitch = measurements.keys.filter((row) =>
-    measurements.invokes.some((span) => span.command === "quick_switch"
-      && span.startedAt <= row.dispatchAt
-      && (span.endedAt ?? Number.POSITIVE_INFINITY) >= row.secondFrameAt)
+  const quickSwitch = [nativeProbe.quickSwitchMs];
+  const saveSpans = measurements.issue248.filter((span) => span.metric === "frontend.ipcSaveRoundTripMs");
+  const saves = saveSpans.map((span) => span.valueMs);
+  const popupTrigger = measurements.keys
+    .filter((row) => row.inputAt <= measurements.popupPaintAt)
+    .at(-1);
+  if (!popupTrigger) throw new Error("candidate-popup paint has no preceding literal input");
+  const missedKeyIndices = measurements.keys
+    .filter((row) => row.secondFrameAt - row.keydownAt > 33)
+    .map((row) => row.index);
+  const keysDuringDirectSave = measurements.keys.filter((row) =>
+    saveSpans.some((span) => span.startedAt <= row.dispatchAt && span.endedAt >= row.secondFrameAt)
   ).map((row) => row.index);
 
   Object.assign(receipt, {
@@ -312,7 +314,8 @@ try {
       keydownToInput: summary(keydownToInput),
       dispatchToSecondPaint: summary(dispatchToSecondPaint),
       keydownToSecondPaint: summary(keydownToSecondPaint),
-      debouncePlusPopupPaintMs: measurements.popupPaintAt - finalInputAt,
+      debouncePlusFirstPopupPaintMs: measurements.popupPaintAt - popupTrigger.inputAt,
+      bindingRefreshMs: nativeProbe.loadGraphMs,
       quickSwitch: summary(quickSwitch),
       directSave: summary(saves),
     },
@@ -321,14 +324,23 @@ try {
       quickSwitch: quickSwitch.length,
       directSave: saves.length,
     },
-    stalledKeysDuringQuickSwitch,
+    missedKeyIndices,
+    keysDuringDirectSave,
+    nativeProbe,
     raw: measurements,
   });
   fs.writeFileSync(path.join(artifacts, "windows-page-reference-latency-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
   console.log(`PASS: GH #295 literal Windows key timing: ${JSON.stringify(receipt.timings)}`);
 } catch (error) {
+  let raw = null;
+  try { raw = await browser?.execute(() => window.__tineIssue295 ?? null); } catch {}
   try { await browser?.saveScreenshot(path.join(artifacts, "failure.png")); } catch {}
-  const failure = { ...receipt, result: "fail", error: String(error).split("\n").slice(0, 10).join(" | ") };
+  const failure = {
+    ...receipt,
+    result: "fail",
+    error: String(error).split("\n").slice(0, 10).join(" | "),
+    raw,
+  };
   fs.writeFileSync(path.join(artifacts, "failure-capsule.json"), `${JSON.stringify(failure, null, 2)}\n`);
   throw error;
 } finally {
