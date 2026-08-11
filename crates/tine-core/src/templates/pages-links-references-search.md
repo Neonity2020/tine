@@ -1,0 +1,42 @@
+icon:: 🔗
+
+- # Pages, links, references, and search
+  - The precise rules behind the moving parts: pages and aliases, links and tags, block references and embeds, the two reference panels on every page, and every search surface from the switcher to the saved-search page. [[Workflows/Find and revisit]] walks through using them in order; [[Feature showcase]] shows each construct rendered.
+- ## Pages and namespaces
+  - A page is any name you link to. Type `[[` while editing and completion offers existing pages; whether **Enter** prefers the strongest existing match or exactly what you typed is Settings → **Editor** → Advanced → **Link autocomplete default**, and an exact existing name always wins.
+  - A link to a page that does not exist yet renders muted with a dotted underline. It isn't broken — opening it creates the page. (Logseq draws missing and live links identically; Tine marks the difference on purpose.)
+  - A name with slashes, like [[Project/Roadmap]], is a namespace: it nests under `Project` in the sidebar's collapsible namespace tree, and a namespaced page gains an automatic **Hierarchy** section with the breadcrumb paths of its descendant pages.
+  - Journals are pages too — one per day, reachable from **Journals** in the sidebar. Their formats, templates, tasks, and agenda are mapped in [[Reference/Journals, tasks, and scheduling]].
+- ## Links and tags
+  - `[[Page]]` links and `#tag` tags run on the same machinery: a tag links and collects references like any page, and a tag with no page of its own is perfectly normal. A page's `tags::` property values render as navigable links too; quoted property values stay literal text.
+  - A labelled page link such as [read the welcome]([[Welcome to Tine]]) shows your words while opening the page. External `[label](https://…)` links are ordinary Markdown, bare URLs and emails autolink, and **Mod+L** wraps the selection as an external link.
+  - Click a link to follow it. While editing, **Ctrl+O** opens the link at the caret and **Ctrl+Shift+O** opens it in the right sidebar — matching Logseq's shortcuts, no mouse needed.
+- ## Aliases
+  - Put `alias:: Another name, Third name` among the page properties at the top of a page — as [[Feature showcase]] does with `alias:: Kitchen sink (features)` — and links under those names land on the same page.
+  - The page then shows read-only **aka** chips for every name it answers to ("Also known as — other names that link here"), and the raw `alias::` property stays out of the under-title property list.
+- ## Block references and embeds
+  - Type `((` while editing: the popup full-text-searches blocks, and choosing one inserts a durable `((reference))` — Tine first writes a stable `id::` on the source block, so the reference survives renames, reloads, and restarts.
+  - The reference renders as a link-styled copy of the source text — not a grey chip — and stays in sync: edit the source and every reference updates. A per-block reference-count badge reveals the referencing blocks, grouped by page with ancestor breadcrumbs.
+  - Right-click an inline reference for **open in sidebar**, **go to block**, **copy ref**, and **copy embed**; **Mod+C** with nothing selected copies a reference to the block you're editing.
+  - Copying a block to the clipboard strips its `id::`, like Logseq, so an internal id never leaks into a paste; the id stays in your file.
+  - `{{embed [[Page]]}}` and `{{embed ((id))}}` inline a whole page or a block with its context. Embeds are live editing surfaces: edit inside an embed and the source changes, while folding inside an embed stays local to that embed.
+- ## The reference panels on every page
+  - **Linked References** sits at the bottom of the page (and of a page opened in the right sidebar): every block that links here — large panels group them by source page with bounded, highlighted excerpts. It's live — edit in place — and the chip filter narrows to blocks that also mention a second page, cycling include → exclude → off like Logseq's filter.
+  - **Unlinked References**, folded by default: plain-text mentions of the page title that were never linked — the fastest way to find where a name was written without brackets.
+  - Deep matches start folded behind an ancestor breadcrumb, in a view-local copy that never changes the source block's own collapse state; hover previews show surrounding context without leaving the page.
+- ## Finding things
+  - **Ctrl+K**, the quick switcher, searches page titles plus the visible text of blocks — hidden properties and ids never produce phantom hits. **Shift+Enter** opens the highlighted result in the right sidebar; middle-click opens a background tab.
+  - **Ctrl+Shift+K** searches only the open page's blocks, including folded descendants. **Mod+F** opens the in-page find bar with next/previous and an n-of-total count; folded branches are expanded before the match is highlighted.
+  - The five **Search syntax** forms, listed in the switcher footer: `foo bar` (both terms), `foo OR bar` (either), `foo -draft` (exclude), `"exact phrase"`, and `/[A-Z]{3}/` (case-sensitive regular expression).
+  - Title matches rank exact, then prefix, then substring, then fuzzy. After you deliberately open the same result more than once for a query, it may break ties among equally strong matches; that history stays on this device and in this graph, and Settings → **Editor** → **Learn Ctrl+K choices** disables or resets it.
+  - Composed and decomposed Unicode spellings of the same text share matches (so both forms of an accented name are found); accent folding is deliberately not added, so `cafe` does not match `café`.
+  - The in-app Guide itself stays out of search, page lists, and backlinks.
+- ## Search tabs and saved searches
+  - **Open search tab** in the switcher footer turns the current search into a graph-scoped search tab with its own search box. The tab survives restarts and writes nothing to your graph until you name it.
+  - **Search / List / Table / Board** are presentations of one result membership: switching the view never changes which blocks matched. **Filters / Advanced** narrows by friendly fields and date ranges; **Edit as visual query** opens the chip-by-chip builder; **Explain query** shows what Tine understood. Choosing blocks and choosing a presentation are separate steps — see [[Workflows/Structure repeated information]] for that split in action.
+  - Naming a search tab — typing into "Name this search to save it as a page" and pressing **Save page** — creates one ordinary page whose only block is a `{{query}}` (plus a `tine.view::` line unless you chose the plain List view). From then on it behaves like any page: linkable, searchable, always fresh. A page that already exists with the chosen name is never overwritten — you pick another name.
+  - A `{{query [[Page]]}}` block uses Logseq's path-refs rule: a block matches when it mentions the page, when a bullet it lives under does, or when it sits on that page — so the page's own outline always appears. The backlinks-only answer to the same question is the page's **Linked References** panel.
+- ## Related
+  - [[Workflows/Find and revisit]] — the task-first path over these pieces.
+  - [[Features/Tips & shortcuts]] — the wider shortcut map: tabs, sidebars, focus mode.
+  - [[Feature showcase]] — every construct above, rendered live.

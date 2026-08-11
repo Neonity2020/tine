@@ -1,0 +1,26 @@
+icon:: 🔍
+
+- # Find and revisit
+  - Three moves cover most of finding things: jump to what you remember, follow the trail of links, and keep a search that's worth keeping. No syntax is needed up front. The exact rules live in [[Reference/Pages, links, references, and search]].
+- ## "I saw it somewhere" — jump with Ctrl+K
+  - 1. Press **Ctrl+K** (Cmd on Mac) and type any words from the title or the text you remember. The switcher matches page titles and the visible text of blocks — not hidden properties or ids.
+  - 2. Too many hits? Narrow with the **Search syntax** forms listed in the switcher footer: `-draft` excludes a word, `OR` offers alternatives, quotes pin an exact phrase, `/…/` is a case-sensitive regular expression.
+  - 3. **Enter** opens the highlighted result; **Shift+Enter** opens it in the right sidebar beside your current page; middle-click a result for a background tab.
+  - 4. Sure it's on the open page? **Ctrl+Shift+K** searches only that page's blocks, including the ones folded away, and **Ctrl+F** is the slim in-page find bar with match counts.
+  - What you should see: Tine jumps to the page or block. Exact title matches lead the list; over time Tine may prefer a result you deliberately picked before, but only among equally strong matches — Settings → **Editor** → **Learn Ctrl+K choices** resets or disables that.
+- ## Follow the trail: links, tags, and references
+  - 1. Click any `[[link]]` or `#tag` to open its page. A dimmed, dotted-underlined link isn't broken — opening it creates the page. While editing, **Ctrl+O** follows the link at the caret and **Ctrl+Shift+O** opens it in the right sidebar.
+  - 2. On the page you reach, scroll to **Linked References**: every block that points here — busy pages group them by source — with a chip filter to narrow to blocks that also mention something else. Open **Unlinked References** to catch plain-text mentions you never linked.
+  - 3. Found a line worth quoting in your own note? Edit the note, type `((`, and search the line's text to insert a block reference — a live copy that updates whenever the original changes.
+  - What you should see: the reference renders as link-styled text with the source's current words, and the source block gains a small reference-count badge that lists its referrers.
+- ## Keep the search: make a search tab
+  - 1. From any Ctrl+K search, press **Open search tab** in the footer. The whole search becomes its own tab with its own search box — nothing is written to your graph yet, and the tab comes back after a restart.
+  - 2. Refine it there: switch **Search / List / Table / Board** freely — that changes only how results are shown, never which blocks matched. Open **Filters / Advanced** for fields and date ranges, or **Edit as visual query** to build filters chip by chip; **Explain query** describes what Tine understood.
+  - 3. Worth keeping? Type a name into **Name this search to save it as a page** and press **Save page**.
+  - 4. What you should see: the tab becomes an ordinary page in your graph holding one query block. You can link to it, favorite it, and its results refresh themselves; an existing page with the same name is never overwritten.
+- ## Try it: find every mention of one page
+  - 1. Text search finds visible words. A page query asks a different question: "which blocks connect to [[Project/Roadmap]]?" — written as the page's name inside a query, like this live example:
+  - {{query [[Project/Roadmap]]}}
+  - 2. What you should see in a copied Guide or the public demo: the Roadmap outline itself (a block always counts its own page, and a nested bullet counts whatever its parents mention), the bullets elsewhere in the Guide that link there — [[Welcome to Tine]] has one — and this numbered bullet, which links too. In this read-only Guide the same block runs against your own graph instead, so it lists your pages' mentions — often nothing yet; it comes alive after you copy the Guide into your graph.
+- ## Where next
+  - The exact rules — ranking, search scope, saved-page behavior — are mapped in [[Reference/Pages, links, references, and search]]. For turning found or structured blocks into tables and boards, see [[Workflows/Structure repeated information]]; the wider shortcut map is [[Features/Tips & shortcuts]].

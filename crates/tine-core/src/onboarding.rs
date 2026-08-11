@@ -108,6 +108,14 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Reference/Journals, tasks, and scheduling",
         markdown: include_str!("templates/journals-tasks-scheduling.md"),
     },
+    GuideTemplate {
+        title: "Workflows/Find and revisit",
+        markdown: include_str!("templates/find-and-revisit.md"),
+    },
+    GuideTemplate {
+        title: "Reference/Pages, links, references, and search",
+        markdown: include_str!("templates/pages-links-references-search.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -869,6 +877,109 @@ mod tests {
             .expect("journals/scheduling reference page was copied");
         assert!(copied_markdown.contains("`++1w`"));
         assert!(copied_markdown.contains("[[tine-guide/Workflows/Capture and plan your day]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_revisit_workflow_is_registered_linked_and_copyable() {
+        let title = "Workflows/Find and revisit";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("find-and-revisit workflow is registered");
+        assert!(page.markdown.contains("- # Find and revisit"));
+        assert!(page.markdown.contains("**Ctrl+K**"));
+        assert!(page.markdown.contains("Open search tab"));
+        assert!(page.markdown.contains("{{query [[Project/Roadmap]]}}"));
+        assert!(page
+            .markdown
+            .contains("Name this search to save it as a page"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page
+            .markdown
+            .contains("[[Reference/Pages, links, references, and search]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index.markdown.contains("[[Workflows/Find and revisit]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("find-and-revisit workflow is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Workflows/Find and revisit"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-find-revisit-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Workflows/Find and revisit"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("find-and-revisit workflow was copied");
+        assert!(copied_markdown.contains("{{query [[tine-guide/Project/Roadmap]]}}"));
+        assert!(copied_markdown
+            .contains("[[tine-guide/Reference/Pages, links, references, and search]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pages_links_search_reference_is_registered_linked_and_copyable() {
+        let title = "Reference/Pages, links, references, and search";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("pages/links/search reference page is registered");
+        assert!(page
+            .markdown
+            .contains("- # Pages, links, references, and search"));
+        assert!(page.markdown.contains("Unlinked References"));
+        assert!(page.markdown.contains("dotted underline"));
+        assert!(page.markdown.contains("alias:: Kitchen sink (features)"));
+        assert!(page.markdown.contains("Save page"));
+        assert!(page.markdown.contains("tine.view::"));
+        assert!(page.markdown.contains("[[Workflows/Find and revisit]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Reference/Pages, links, references, and search]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("pages/links/search reference is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Reference/Pages, links, references, and search"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-pages-links-search-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Reference/Pages, links, references, and search"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("pages/links/search reference was copied");
+        assert!(copied_markdown.contains("[[tine-guide/Workflows/Find and revisit]]"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Tips & shortcuts]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

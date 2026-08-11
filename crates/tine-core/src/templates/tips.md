@@ -8,6 +8,7 @@ icon:: ⌨️
 	- Use **Search syntax** for phrases, alternatives, exclusions, and regular expressions. Choose **Open all results** to keep the complete search in a graph-specific tab instead of choosing only one hit.
 	- That result tab can switch between **Search**, **List**, **Table**, and **Board** without changing what matched. Rename it when the search is worth keeping: Tine turns it into an ordinary query page in your graph. The compact filter button handles friendly fields and date ranges; **Query builder** opens the deeper visual editor when needed.
 	- Page-title matching keeps exact, prefix, substring, and fuzzy results in that order. Repeated choices may break ties inside one class using device-local history; disable or reset this under Search settings if you prefer fixed ordering.
+	- For a task-first tour of finding things and keeping searches, see [[Workflows/Find and revisit]]; for the exact rules, [[Reference/Pages, links, references, and search]].
 - ## Follow a link without the mouse — Ctrl+O
 	- With the caret inside a `[[link]]` or a `#tag`, **Ctrl+O** opens that page and **Ctrl+Shift+O** opens it in the right sidebar. This works while you are editing, so you can follow a name you just typed without reaching for the mouse.
 	- A link whose page does not exist yet is drawn dimmed with a dotted underline. It still works — opening it creates the page — but you can see before clicking that it will start empty. Tags are left alone, since a tag with no page of its own is perfectly normal.
