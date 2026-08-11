@@ -7,11 +7,6 @@
 //! locators; persisted `id::` values remain a separate external reference identity.
 
 use crate::config::{Config, FileNameFormat};
-use crate::crdt::{
-    BlockId as CrdtBlockId, BlockSnapshot as CrdtBlockSnapshot, CrdtGraph, CrdtStatus,
-    ManagedSyncStoreState, PageId as CrdtPageId, PageSnapshot as CrdtPageSnapshot,
-    ProjectionPrecondition,
-};
 use crate::date::{JournalDate, JournalFormat};
 use crate::doc::{self, DocBlock, Document, StructuralLayoutIdentity};
 use crate::graph_text_scope::{GraphTextScope, GraphTextScopeBinding};
@@ -979,43 +974,6 @@ pub(crate) struct SyncConflictTrashCommit {
     source: PathBuf,
     staged: PathBuf,
     expected: Vec<u8>,
-}
-
-/// What enabling managed sync would change in the plain-text projection.
-///
-/// The migration is deliberately inspectable before it writes: every block needs
-/// a durable Logseq-compatible id so a later edit made by OG Logseq or a plain
-/// editor can be reconciled against the CRDT without guessing its identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncIdentityPlan {
-    pub pages: usize,
-    pub blocks: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncIdentityMigration {
-    pub pages_changed: usize,
-    pub blocks_changed: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ManagedSyncEnableResult {
-    pub migration: SyncIdentityMigration,
-    pub status: CrdtStatus,
-}
-
-#[derive(Debug, Clone)]
-pub struct ManagedSyncProjectionChange {
-    pub entry: PageEntry,
-    pub created: bool,
-    pub removed: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ManagedSyncPull {
-    pub imported_chunks: usize,
-    pub changes: Vec<ManagedSyncProjectionChange>,
-    pub conflicts_changed: bool,
 }
 
 /// Exact durable graph target produced by one journal-authorized existing-page
@@ -2493,11 +2451,6 @@ pub struct Graph {
     /// Lock order is ALWAYS page_lock → cache → disk_revs; never the reverse.
     page_locks:
         std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
-    /// Present only for an opt-in `.tine-sync/v1` workspace. The mutex serializes
-    /// Loro transactions and immutable-chunk replay; callers must never hold it
-    /// while acquiring a page lock (save uses page-lock → sync-lock, while remote
-    /// replay releases sync-lock before projecting pages).
-    managed_sync: std::sync::Mutex<Option<CrdtGraph>>,
     /// Resource-scoped shared admission boundary for all managed page/journal
     /// writers. Identity acquisition failure is retained as an error so an open
     /// can never fall back to an unshared gate.
@@ -3450,12 +3403,55 @@ struct PageCacheIndex {
     by_path: std::collections::HashMap<PathBuf, usize>,
 }
 
-#[derive(Clone)]
 struct EffectiveIdentityIndex {
-    generation: u64,
+    generation: std::sync::atomic::AtomicU64,
     owners: std::collections::HashMap<(PageKind, String), Vec<PageEntry>>,
     physical_paths: std::collections::HashSet<PathBuf>,
     failures: Vec<String>,
+}
+
+impl Clone for EffectiveIdentityIndex {
+    fn clone(&self) -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(self.generation()),
+            owners: self.owners.clone(),
+            physical_paths: self.physical_paths.clone(),
+            failures: self.failures.clone(),
+        }
+    }
+}
+
+impl EffectiveIdentityIndex {
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn retag_generation(&self, previous: u64, next: u64) -> bool {
+        self.generation
+            .compare_exchange(
+                previous,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectCreationCensusFile {
+    content_digest: [u8; 32],
+    file_resource_id: ContentDigest,
+    link_count: u64,
+}
+
+/// Single-use evidence for an ordinary Direct Files creation. The census owns
+/// only exact names and fingerprints; graph bytes are streamed through one
+/// fixed buffer and are never retained here.
+struct DirectCreationProof {
+    target: ManagedPath,
+    generation: u64,
+    files: std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>,
 }
 
 const REFERENCE_SIGNATURE_WORDS: usize = 64; // 4096 bits = 512 bytes/page
@@ -3803,7 +3799,7 @@ fn build_effective_identity_index(
             .push(entry.clone());
     }
     EffectiveIdentityIndex {
-        generation,
+        generation: std::sync::atomic::AtomicU64::new(generation),
         owners,
         physical_paths,
         failures,
@@ -4058,6 +4054,8 @@ pub(crate) struct ProjectionGraphTestCounters {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct GraphTextAdmissionTestCounters {
     builder_enumerations: usize,
+    direct_creation_censuses: usize,
+    direct_creation_files_hashed: usize,
     point_query_attempts: usize,
     parser_invocations: usize,
     index_map_insertions: usize,
@@ -4084,6 +4082,8 @@ impl GraphTextAdmissionTestCounters {
         }
         Self {
             builder_enumerations: difference!(builder_enumerations),
+            direct_creation_censuses: difference!(direct_creation_censuses),
+            direct_creation_files_hashed: difference!(direct_creation_files_hashed),
             point_query_attempts: difference!(point_query_attempts),
             parser_invocations: difference!(parser_invocations),
             index_map_insertions: difference!(index_map_insertions),
@@ -4095,20 +4095,6 @@ impl GraphTextAdmissionTestCounters {
             persistent_payload_members: difference!(persistent_payload_members),
         }
     }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ManagedMigrationWriterBoundary {
-    final_reread_retained: u64,
-    final_reread_bytes: u64,
-    retained_before_writer: u64,
-    writer_reservation_bytes: u64,
-    writer_reservation_attempted: bool,
-    retained_after_writer: u64,
-    pre_mutation_retained: u64,
-    pre_mutation_peak: u64,
-    pre_mutation_observations: usize,
 }
 
 #[cfg(test)]
@@ -4139,7 +4125,6 @@ thread_local! {
     static INITIAL_SHADOW_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE: std::cell::RefCell<Option<ManagedTextInventoryLimits>> = const { std::cell::RefCell::new(None) };
     static MANAGED_TEXT_BUDGET_LAST_PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static MANAGED_MIGRATION_WRITER_OBSERVER: std::cell::RefCell<Option<Rc<Cell<ManagedMigrationWriterBoundary>>>> = const { std::cell::RefCell::new(None) };
     static BOUNDED_READ_AFTER_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static HANDOFF_MINT_AFTER_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static HANDOFF_TRANSFER_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
@@ -4158,9 +4143,7 @@ thread_local! {
     static EDITOR_COMMIT_BEFORE_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static CONFLICT_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static MANAGED_WRITE_REPLACEMENT_HANDOFF: std::cell::RefCell<Option<HandoffSafe>> = const { std::cell::RefCell::new(None) };
-    static SYNC_IDENTITY_AFTER_PREPARE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static MANAGED_SYNC_ENABLE_AFTER_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static GRAPH_TEXT_ADMISSION_TEST_COUNTERS: std::cell::Cell<GraphTextAdmissionTestCounters> = const { std::cell::Cell::new(GraphTextAdmissionTestCounters { builder_enumerations: 0, point_query_attempts: 0, parser_invocations: 0, index_map_insertions: 0, event_map_key_reads: 0, event_map_key_writes: 0, event_reverse_members: 0, persistent_node_allocations: 0, persistent_rotations: 0, persistent_payload_members: 0 }) };
+    static GRAPH_TEXT_ADMISSION_TEST_COUNTERS: std::cell::Cell<GraphTextAdmissionTestCounters> = const { std::cell::Cell::new(GraphTextAdmissionTestCounters { builder_enumerations: 0, direct_creation_censuses: 0, direct_creation_files_hashed: 0, point_query_attempts: 0, parser_invocations: 0, index_map_insertions: 0, event_map_key_reads: 0, event_map_key_writes: 0, event_reverse_members: 0, persistent_node_allocations: 0, persistent_rotations: 0, persistent_payload_members: 0 }) };
     static GRAPH_TEXT_PARSE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static GRAPH_TEXT_PORTABLE_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -4168,6 +4151,7 @@ thread_local! {
     static GRAPH_TEXT_EXACT_FEED_AFTER_PREFLIGHT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static GRAPH_TEXT_EXACT_FEED_PREPARE_PATH: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -4222,59 +4206,6 @@ fn projection_case_alias_is_armed(requested: &str) -> bool {
 }
 
 #[cfg(test)]
-struct ManagedMigrationWriterObserver {
-    observation: Rc<Cell<ManagedMigrationWriterBoundary>>,
-}
-
-#[cfg(test)]
-impl ManagedMigrationWriterObserver {
-    fn new() -> Self {
-        let observation = Rc::new(Cell::new(ManagedMigrationWriterBoundary::default()));
-        MANAGED_MIGRATION_WRITER_OBSERVER.with(|observer| {
-            let mut observer = observer.borrow_mut();
-            assert!(
-                observer.is_none(),
-                "managed migration writer observer is already installed"
-            );
-            *observer = Some(Rc::clone(&observation));
-        });
-        Self { observation }
-    }
-
-    fn observation(&self) -> ManagedMigrationWriterBoundary {
-        self.observation.get()
-    }
-}
-
-#[cfg(test)]
-impl Drop for ManagedMigrationWriterObserver {
-    fn drop(&mut self) {
-        MANAGED_MIGRATION_WRITER_OBSERVER.with(|observer| {
-            let mut observer = observer.borrow_mut();
-            if observer
-                .as_ref()
-                .is_some_and(|current| Rc::ptr_eq(current, &self.observation))
-            {
-                observer.take();
-            }
-        });
-    }
-}
-
-#[cfg(test)]
-fn observe_managed_migration_writer(update: impl FnOnce(&mut ManagedMigrationWriterBoundary)) {
-    MANAGED_MIGRATION_WRITER_OBSERVER.with(|observer| {
-        let observer = observer.borrow();
-        let Some(observation) = observer.as_ref() else {
-            return;
-        };
-        let mut value = observation.get();
-        update(&mut value);
-        observation.set(value);
-    });
-}
-
-#[cfg(test)]
 pub(crate) fn reset_projection_graph_test_counters() {
     PROJECTION_GRAPH_CALLS.with(|counters| counters.set(ProjectionGraphTestCounters::default()));
 }
@@ -4306,6 +4237,8 @@ fn assert_graph_text_admission_point_query_only(
 ) {
     assert_eq!(counters.point_query_attempts, exact_attempts);
     assert_eq!(counters.builder_enumerations, 0);
+    assert_eq!(counters.direct_creation_censuses, 0);
+    assert_eq!(counters.direct_creation_files_hashed, 0);
     assert_eq!(counters.parser_invocations, 0);
     assert_eq!(counters.index_map_insertions, 0);
     assert_eq!(counters.event_map_key_reads, 0);
@@ -4349,6 +4282,30 @@ fn count_graph_text_admission_builder_enumeration() {
 
 #[cfg(not(test))]
 fn count_graph_text_admission_builder_enumeration() {}
+
+#[cfg(test)]
+fn count_direct_creation_census() {
+    GRAPH_TEXT_ADMISSION_TEST_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.direct_creation_censuses += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(not(test))]
+fn count_direct_creation_census() {}
+
+#[cfg(test)]
+fn count_direct_creation_file_hashed() {
+    GRAPH_TEXT_ADMISSION_TEST_COUNTERS.with(|counters| {
+        let mut value = counters.get();
+        value.direct_creation_files_hashed += 1;
+        counters.set(value);
+    });
+}
+
+#[cfg(not(test))]
+fn count_direct_creation_file_hashed() {}
 
 #[cfg(test)]
 fn count_graph_text_admission_point_query() {
@@ -5245,32 +5202,6 @@ fn conflict_observation_hook() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn sync_identity_after_prepare_hook() -> io::Result<()> {
-    SYNC_IDENTITY_AFTER_PREPARE.with(|hook| match hook.borrow_mut().take() {
-        Some(hook) => hook(),
-        None => Ok(()),
-    })
-}
-
-#[cfg(not(test))]
-fn sync_identity_after_prepare_hook() -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-fn managed_sync_enable_after_snapshot_hook() -> io::Result<()> {
-    MANAGED_SYNC_ENABLE_AFTER_SNAPSHOT.with(|hook| match hook.borrow_mut().take() {
-        Some(hook) => hook(),
-        None => Ok(()),
-    })
-}
-
-#[cfg(not(test))]
-fn managed_sync_enable_after_snapshot_hook() -> io::Result<()> {
-    Ok(())
-}
-
 #[cfg(not(test))]
 fn rename_source_remove_failpoint() -> io::Result<()> {
     Ok(())
@@ -5393,7 +5324,6 @@ impl Graph {
         validate_managed_dir(&graph.root, "logseq", "logseq")?;
         validate_managed_dir(&graph.root, "publish", "publish")?;
         validate_managed_dir(&graph.root, ".tine-sync", "managed sync")?;
-        validate_managed_dir(&graph.root, ".tine-sync/v1", "managed sync store")?;
         if let Some(resolved) = Self::external_assets_target(&graph.root)? {
             let approved = approved_assets.ok_or_else(|| {
                 io::Error::new(
@@ -5608,7 +5538,6 @@ impl Graph {
             editor_activations: std::sync::Mutex::new(EditorActivationState::default()),
             referenced_names_cache: RwLock::new(None),
             page_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            managed_sync: std::sync::Mutex::new(None),
             managed_write_binding,
             handoff_instance_token: Arc::new(HandoffGraphInstanceToken),
             search_lanes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -5842,22 +5771,6 @@ impl Graph {
             _reservation: reservation
                 .expect("budgeted managed inventory returns its retained charge"),
         })
-    }
-
-    fn managed_text_entries_with_limits(
-        &self,
-        permit: &ManagedTextWritePermit,
-        include_sync_conflicts: bool,
-        limits: ManagedTextInventoryLimits,
-    ) -> io::Result<Vec<PageEntry>> {
-        Ok(self
-            .managed_text_entries_with_limits_and_budget(
-                permit,
-                include_sync_conflicts,
-                limits,
-                None,
-            )?
-            .0)
     }
 
     fn managed_text_entries_with_limits_and_budget(
@@ -6336,9 +6249,10 @@ impl Graph {
     /// its 200 ms coalescing delay. Exact file paths update the retained final
     /// state under the same resource-wide authority as Tine writes. Overflow,
     /// notify errors, directory/configuration events, poll cycles, and any
-    /// ambiguous path invalidate the generation. Missing-target creation must
-    /// rebuild complete semantic proof; an existing exact-owner save uses its
-    /// retained path-local and single-link proofs instead.
+    /// ambiguous path invalidate the generation. Missing-target creation binds
+    /// one streaming byte digest census to this generation's cached semantic
+    /// evidence; an existing exact-owner save uses its retained path-local and
+    /// single-link proofs instead.
     pub fn observe_graph_text_external_paths<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
@@ -7366,6 +7280,7 @@ impl Graph {
         &self,
         permit: &ManagedTextWritePermit,
         managed_path: &ManagedPath,
+        strict_creation: bool,
     ) -> io::Result<()> {
         #[cfg(test)]
         GRAPH_TEXT_PORTABLE_TRAVERSALS.with(|count| count.set(count.get().saturating_add(1)));
@@ -7396,6 +7311,7 @@ impl Graph {
             // directory entry is slower than the code this replaced.
             let requested_probe = PortablePathKey::graph_text_component_probe(requested_component);
             let is_filename = component_index + 1 == components.len();
+            let requested_relative = components[..=component_index].join("/");
             let mut next = Vec::new();
 
             for prefix in prefixes {
@@ -7443,6 +7359,12 @@ impl Graph {
                     };
                     let file_type = entry.file_type()?;
                     if file_type.is_symlink() {
+                        if strict_creation {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "projection path has no retained no-follow directory or file",
+                            ));
+                        }
                         continue;
                     }
 
@@ -7477,6 +7399,16 @@ impl Graph {
                         .ok_or_else(|| managed_text_inventory_limit_error("directory count"))?;
                     if directory_count > limits.directories {
                         return Err(managed_text_inventory_limit_error("directory count"));
+                    }
+                    if strict_creation && relative != requested_relative {
+                        projection_real_directory(&prefix.directory, name)?;
+                        let _alias = open_projection_dir_nofollow(&prefix.directory, name)?;
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "graph text paths share one portable case/NFC identity: {relative} and {requested_relative}"
+                            ),
+                        ));
                     }
                     if next.len() == limits.pending_directories {
                         return Err(managed_text_inventory_limit_error("pending directories"));
@@ -7577,11 +7509,305 @@ impl Graph {
         Ok(entries)
     }
 
+    /// Bind the warm parsed ownership cache to one current filesystem census.
+    /// This is deliberately a fail-fast proof constructor: it never warms,
+    /// rebuilds, parses, retries, or enters the retained shadow-import capture.
+    fn direct_creation_proof(
+        &self,
+        permit: &ManagedTextWritePermit,
+        target: &Path,
+        kind: PageKind,
+        name: &str,
+    ) -> io::Result<(DirectCreationProof, bool)> {
+        let (generation, identity_index, disk_revs) = {
+            let cache = self.cache.read().unwrap();
+            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            let pages = cache.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "cold graph has no parsed identity evidence for name-only creation",
+                )
+            })?;
+            let identity_index = self
+                .effective_identity_index
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "graph has unknown effective identities for name-only creation",
+                    )
+                })?;
+            let failures = self.page_index_failures.read().unwrap().clone();
+            let disk_revs = self.disk_revs.read().unwrap().clone();
+            let cached_paths = pages
+                .iter()
+                .map(|(entry, _)| entry.path.clone())
+                .collect::<std::collections::HashSet<_>>();
+            if identity_index.generation() != generation
+                || identity_index.failures != failures
+                || identity_index.physical_paths != cached_paths
+                || disk_revs.len() != cached_paths.len()
+                || !disk_revs.keys().all(|path| cached_paths.contains(path))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "parsed identity and disk revision evidence is not one coherent generation",
+                ));
+            }
+            if !failures.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
+                        failures.len()
+                    ),
+                ));
+            }
+            (generation, identity_index, disk_revs)
+        };
+
+        let target = ManagedPath::parse(self.rel_path(target)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        let files = self.capture_direct_creation_census(permit)?;
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "effective page identity evidence changed during the creation census",
+            ));
+        }
+        if files.len() != disk_revs.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "creation census paths do not match the parsed identity snapshot",
+            ));
+        }
+
+        let mut resources = std::collections::BTreeMap::new();
+        for (path, file) in &files {
+            let absolute = self.root.join(path.as_str());
+            if disk_revs.get(&absolute).map(String::as_str)
+                != Some(hex_digest(&file.content_digest).as_str())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "creation census revisions do not match the parsed identity snapshot",
+                ));
+            }
+            if file.link_count != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "graph text files alias one physical resource: {} has link count {}",
+                        path.as_str(),
+                        file.link_count
+                    ),
+                ));
+            }
+            if let Some(first) = resources.insert(file.file_resource_id, path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "graph text files alias one physical resource: {} and {}",
+                        first.as_str(),
+                        path.as_str()
+                    ),
+                ));
+            }
+            if path != &target && path.portable_key() == target.portable_key() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "graph text paths share one portable case/NFC identity: {} and {}",
+                        path.as_str(),
+                        target.as_str()
+                    ),
+                ));
+            }
+        }
+        let requested_identity_elsewhere = identity_index
+            .owners
+            .get(&page_cache_key(kind, name))
+            .is_some_and(|owners| !owners.is_empty());
+        Ok((
+            DirectCreationProof {
+                target,
+                generation,
+                files,
+            },
+            requested_identity_elsewhere,
+        ))
+    }
+
+    fn capture_direct_creation_census(
+        &self,
+        permit: &ManagedTextWritePermit,
+    ) -> io::Result<std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>> {
+        self.capture_direct_creation_census_with_limits(permit, INITIAL_SHADOW_LIMITS)
+    }
+
+    fn capture_direct_creation_census_with_limits(
+        &self,
+        permit: &ManagedTextWritePermit,
+        limits: InitialShadowLimits,
+    ) -> io::Result<std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>> {
+        struct PendingDirectory {
+            directory: Dir,
+            relative: String,
+            depth: usize,
+        }
+
+        count_direct_creation_census();
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![PendingDirectory {
+            directory: self.managed_permit_root(permit)?.try_clone()?,
+            relative: String::new(),
+            depth: 0,
+        }];
+        let mut all_entries = 0_usize;
+        let mut directories = 1_usize;
+        let mut path_bytes = 0_u64;
+        let mut hashed_bytes = 0_u64;
+        while let Some(PendingDirectory {
+            directory,
+            relative,
+            depth,
+        }) = pending.pop()
+        {
+            for entry in directory.entries()? {
+                all_entries = all_entries
+                    .checked_add(1)
+                    .ok_or_else(|| initial_shadow_limit_error("all directory entries"))?;
+                if all_entries > limits.all_entries {
+                    return Err(initial_shadow_limit_error("all directory entries"));
+                }
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed text entry name is not UTF-8",
+                    )
+                })?;
+                let relative_len = relative
+                    .len()
+                    .checked_add(usize::from(!relative.is_empty()))
+                    .and_then(|length| length.checked_add(name.len()))
+                    .ok_or_else(|| initial_shadow_limit_error("aggregate path bytes"))?;
+                path_bytes = path_bytes
+                    .checked_add(usize_to_u64(relative_len)?)
+                    .ok_or_else(|| initial_shadow_limit_error("aggregate path bytes"))?;
+                if path_bytes > limits.path_bytes {
+                    return Err(initial_shadow_limit_error("aggregate path bytes"));
+                }
+                let child_relative = if relative.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{relative}/{name}")
+                };
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if !self.graph_text_scope.should_descend(&child_relative) {
+                        continue;
+                    }
+                    let child_depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| initial_shadow_limit_error("managed directory depth"))?;
+                    if child_depth > limits.directory_depth {
+                        return Err(initial_shadow_limit_error("managed directory depth"));
+                    }
+                    directories = directories
+                        .checked_add(1)
+                        .ok_or_else(|| initial_shadow_limit_error("directory count"))?;
+                    if directories > limits.directories
+                        || pending.len() == limits.pending_directories
+                    {
+                        return Err(initial_shadow_limit_error("directory count"));
+                    }
+                    projection_real_directory(&directory, name)?;
+                    let child = open_projection_dir_nofollow(&directory, name)?;
+                    let rebound = open_projection_dir_nofollow(&directory, name)?;
+                    if projection_dir_identity(&child)? != projection_dir_identity(&rebound)? {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "managed directory changed during creation census",
+                        ));
+                    }
+                    pending.push(PendingDirectory {
+                        directory: child,
+                        relative: child_relative,
+                        depth: child_depth,
+                    });
+                    continue;
+                }
+                if !self.graph_text_scope.is_eligible(&child_relative) {
+                    continue;
+                }
+                if !file_type.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("managed text entry is not a regular file: {child_relative}"),
+                    ));
+                }
+                if files.len() == limits.managed_files {
+                    return Err(initial_shadow_limit_error("managed file count"));
+                }
+                let path = ManagedPath::parse(child_relative).map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                })?;
+                let mut file = open_projection_file_nofollow(&directory, name)?;
+                let file_resource_id = canonical_projection_file_resource_id(&file)?;
+                let link_count = projection_file_link_count(&file)?;
+                let content_digest = hash_direct_creation_census_file(
+                    &mut file,
+                    path.as_str(),
+                    file_resource_id,
+                    link_count,
+                    &mut hashed_bytes,
+                    limits.raw_bytes,
+                )?;
+                let rebound = open_projection_file_nofollow(&directory, name)?;
+                if canonical_projection_file_resource_id(&rebound)? != file_resource_id
+                    || projection_file_link_count(&rebound)? != link_count
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "managed file changed during creation census",
+                    ));
+                }
+                count_direct_creation_file_hashed();
+                files.insert(
+                    path,
+                    DirectCreationCensusFile {
+                        content_digest,
+                        file_resource_id,
+                        link_count,
+                    },
+                );
+            }
+        }
+        #[cfg(test)]
+        if DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN.with(|armed| armed.replace(false)) {
+            self.cache_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        Ok(files)
+    }
+
     fn current_effective_identity_index(&self) -> io::Result<Arc<EffectiveIdentityIndex>> {
         loop {
             let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
             if let Some(index) = self.effective_identity_index.read().unwrap().as_ref() {
-                if index.generation == generation {
+                if index.generation() == generation {
                     return Ok(Arc::clone(index));
                 }
             }
@@ -7627,7 +7853,7 @@ impl Graph {
                 .as_ref()
                 .map(Arc::clone);
             if let Some(index) = retained {
-                if index.generation == generation {
+                if index.generation() == generation {
                     index
                 } else if !current_entries.is_empty() || !failures.is_empty() {
                     return Err(io::Error::new(
@@ -7636,7 +7862,7 @@ impl Graph {
                     ));
                 } else {
                     let index = Arc::new(EffectiveIdentityIndex {
-                        generation,
+                        generation: std::sync::atomic::AtomicU64::new(generation),
                         owners: std::collections::HashMap::new(),
                         physical_paths: std::collections::HashSet::new(),
                         failures: Vec::new(),
@@ -7651,7 +7877,7 @@ impl Graph {
                 ));
             } else {
                 let index = Arc::new(EffectiveIdentityIndex {
-                    generation,
+                    generation: std::sync::atomic::AtomicU64::new(generation),
                     owners: std::collections::HashMap::new(),
                     physical_paths: std::collections::HashSet::new(),
                     failures: Vec::new(),
@@ -7671,7 +7897,7 @@ impl Graph {
                 ),
             ));
         }
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != index.generation {
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != index.generation() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "effective page identity evidence changed during name-only creation",
@@ -7703,12 +7929,13 @@ impl Graph {
         let Some(current) = guard.as_ref() else {
             return;
         };
-        if current.generation.checked_add(1) != Some(generation) {
+        if current.generation().checked_add(1) != Some(generation) {
             *guard = None;
             return;
         }
         let mut next = (**current).clone();
-        next.generation = generation;
+        next.generation
+            .store(generation, std::sync::atomic::Ordering::Release);
         next.physical_paths.insert(entry.path.clone());
         for owners in next.owners.values_mut() {
             owners.retain(|owner| owner.path != entry.path);
@@ -7746,14 +7973,15 @@ impl Graph {
                 let retained = self.effective_identity_index.read().unwrap().clone();
                 Some(Arc::new(retained.map_or_else(
                     || EffectiveIdentityIndex {
-                        generation,
+                        generation: std::sync::atomic::AtomicU64::new(generation),
                         owners: std::collections::HashMap::new(),
                         physical_paths: std::iter::once(path.to_path_buf()).collect(),
                         failures: failures.clone(),
                     },
                     |current| {
                         let mut next = (*current).clone();
-                        next.generation = generation;
+                        next.generation
+                            .store(generation, std::sync::atomic::Ordering::Release);
                         next.physical_paths.insert(path.to_path_buf());
                         next.failures = failures.clone();
                         next
@@ -7799,12 +8027,13 @@ impl Graph {
                         .as_deref()
                         .cloned()
                         .unwrap_or_else(|| EffectiveIdentityIndex {
-                            generation,
+                            generation: std::sync::atomic::AtomicU64::new(generation),
                             owners: std::collections::HashMap::new(),
                             physical_paths: std::collections::HashSet::new(),
                             failures: Vec::new(),
                         });
-                next.generation = generation;
+                next.generation
+                    .store(generation, std::sync::atomic::Ordering::Release);
                 next.physical_paths.insert(entry.path.clone());
                 for owners in next.owners.values_mut() {
                     owners.retain(|owner| owner.path != entry.path);
@@ -7842,16 +8071,17 @@ impl Graph {
             return Ok(ExactGraphValidation {
                 target: loaded_target,
                 requested_identity_elsewhere: false,
+                creation_proof: None,
             });
         }
-        if let (None, Some((kind, name))) = (loaded_target.as_ref(), requested_identity.as_ref()) {
-            // A watcher failure can make the guarded collision generation
-            // undecodable. Its generation-bound effective-identity evidence is
-            // already sufficient to refuse name-only creation, so consult that
-            // evidence before attempting a semantic guarded-index rebuild.
-            if !self.page_index_failures.read().unwrap().is_empty() {
-                self.validate_name_only_effective_identity(&[], *kind, name)?;
-            }
+        if let Some((kind, name)) = requested_identity {
+            let (creation_proof, requested_identity_elsewhere) =
+                self.direct_creation_proof(permit, target, kind, name)?;
+            return Ok(ExactGraphValidation {
+                target: None,
+                requested_identity_elsewhere,
+                creation_proof: Some(creation_proof),
+            });
         }
         let index = self.validate_current_graph_text_collision_strict(permit, target, None)?;
         let requested_identity_elsewhere = match (loaded_target.as_ref(), requested_identity) {
@@ -7879,6 +8109,7 @@ impl Graph {
         Ok(ExactGraphValidation {
             target: loaded_target,
             requested_identity_elsewhere,
+            creation_proof: None,
         })
     }
 
@@ -8036,80 +8267,6 @@ impl Graph {
         Ok(BudgetedString { value, reservation })
     }
 
-    fn managed_read_optional_text_with_budget(
-        &self,
-        permit: &ManagedTextWritePermit,
-        path: &Path,
-        budget: &RetainedContentBudget,
-        resource: &'static str,
-    ) -> io::Result<Option<BudgetedString>> {
-        let target = match self.managed_target(permit, path, false) {
-            Ok(target) => target,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        projection_optional_regular_metadata(target.parent(), &target.filename)?;
-        let (_file, bytes, mut reservation) = match open_and_read_projection_regular_with_budget(
-            target.parent(),
-            &target.filename,
-            MAX_PROJECTION_EVIDENCE_BYTES,
-            budget,
-            resource,
-        ) {
-            Ok(value) => value,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let value = String::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed text file is not valid UTF-8",
-            )
-        })?;
-        reservation.resize(usize_to_u64(value.capacity())?, resource)?;
-        Ok(Some(BudgetedString { value, reservation }))
-    }
-
-    /// The raw read allocation becomes `baseline`; it is deliberately charged
-    /// once, rather than again merely because that same allocation changes role.
-    fn managed_load_page_with_budget(
-        &self,
-        permit: &ManagedTextWritePermit,
-        entry: &PageEntry,
-        budget: &RetainedContentBudget,
-    ) -> io::Result<ManagedLoadedPage> {
-        let content = self.managed_read_to_string_with_budget(
-            permit,
-            &entry.path,
-            budget,
-            "managed page baseline bytes",
-        )?;
-        let mut page_reservation = budget.reserve(
-            managed_page_build_upper_bound(&content)?,
-            "managed parsed page construction bound",
-        )?;
-        let mut doc = parse_doc(&entry.path, &content);
-        assign_runtime_ids_checked(
-            &mut doc.roots,
-            runtime_owner_namespace("file-block-runtime-v1", &entry.rel_path),
-        )?;
-        let mut page = page_dto_checked(entry, &doc)?;
-        page.read_only = read_only_org(&entry.path, &content);
-        page.rev = Some(content_rev(&content));
-        page.path = entry.rel_path.clone();
-        drop(doc);
-        page_reservation.resize(
-            page_dto_retained_bytes(&page)?,
-            "retained managed page allocation",
-        )?;
-        Ok(ManagedLoadedPage {
-            page,
-            baseline: content.value,
-            baseline_reservation: content.reservation,
-            page_reservation,
-        })
-    }
-
     fn managed_exists(&self, permit: &ManagedTextWritePermit, path: &Path) -> io::Result<bool> {
         let target = match self.managed_target(permit, path, false) {
             Ok(target) => target,
@@ -8134,6 +8291,95 @@ impl Graph {
         create_new: bool,
     ) -> io::Result<()> {
         self.managed_atomic_write_with_conflict(permit, path, bytes, create_new, None)
+    }
+
+    fn validate_direct_creation_proof_before_mutation(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        proof: &DirectCreationProof,
+    ) -> io::Result<()> {
+        let managed_path = ManagedPath::parse(self.rel_path(path)).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("guarded graph-text target is not portable: {error}"),
+            )
+        })?;
+        if managed_path != proof.target || proof.files.contains_key(&managed_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "creation proof does not bind one absent exact target",
+            ));
+        }
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != proof.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "effective page identity evidence changed before creation publication",
+            ));
+        }
+        self.validate_graph_text_portable_aliases_path_local(permit, &managed_path, true)?;
+        match self.managed_target(permit, path, false) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(target) => match target.parent().symlink_metadata(&target.filename) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => {
+                    projection_optional_regular_metadata(target.parent(), &target.filename)?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "direct creation target is already present",
+                    ));
+                }
+            },
+        }
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != proof.generation {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "effective page identity evidence changed during creation publication validation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn managed_atomic_create_with_proof(
+        &self,
+        permit: &ManagedTextWritePermit,
+        path: &Path,
+        bytes: &[u8],
+        proof: DirectCreationProof,
+        editor_episode: Option<&ConflictEditorEpisode>,
+    ) -> io::Result<()> {
+        let _identity = self.lock_graph_text_identity_mutation()?;
+        self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
+        let target = self.managed_target(permit, path, true)?;
+        // Parent creation is itself a mutation, so the first validation above
+        // precedes it. Re-run only the path-local portable/no-follow boundary
+        // after the chain exists; the graph-wide census remains singular.
+        self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
+        let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
+        managed_write_before_mutation_hook()?;
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != proof.generation {
+            let _ = target.parent().remove_file(&temp);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "effective page identity evidence changed before no-replace publication",
+            ));
+        }
+        if let Err(error) = rename_projection_noreplace(target.parent(), &temp, &target.filename) {
+            let _ = target.parent().remove_file(&temp);
+            if error.kind() == io::ErrorKind::AlreadyExists && editor_episode.is_some() {
+                return Err(self.observe_editor_conflict(
+                    permit,
+                    path,
+                    editor_episode,
+                    EditorConflictSite::CreatePublicationCollision,
+                ));
+            }
+            return Err(error);
+        }
+        sync_projection_chain_required(&target.chain)?;
+        self.finish_tine_owned_graph_text_identity_paths(std::iter::once(path))
     }
 
     fn managed_atomic_write_with_conflict(
@@ -8270,7 +8516,7 @@ impl Graph {
             // final byte reread and after force-save's final retained-identity
             // validation, but before the first live-name mutation.
             managed_write_before_mutation_hook()?;
-            self.validate_graph_text_portable_aliases_path_local(permit, &managed_path)?;
+            self.validate_graph_text_portable_aliases_path_local(permit, &managed_path, false)?;
             if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
                 &managed_path,
@@ -8591,17 +8837,6 @@ impl Graph {
                 open_dir_nofollow(&directory, component).map_err(managed_trash_filesystem_error)?;
         }
         Ok(directory)
-    }
-
-    /// Configured managed roots visible to the sparse importer.
-    ///
-    /// These roots decide Page versus Journal for the paths they own and are
-    /// where a page with no file yet is created. They are not the boundary of
-    /// what the importer accepts: ordinary graph text elsewhere in the graph is
-    /// decoded by `managed_entry_for_managed_path` from its file name, exactly
-    /// as OG's whole-directory walk does.
-    pub(crate) fn raw_managed_text_layout(&self) -> (&str, &str) {
-        (&self.config.pages_dir, &self.config.journals_dir)
     }
 
     /// Classify one exact managed path against this graph's configured text
@@ -11264,848 +11499,6 @@ impl Graph {
         self.root.join(&self.config.pages_dir)
     }
 
-    pub fn managed_sync_store_path(&self) -> PathBuf {
-        self.root.join(".tine-sync").join("v1")
-    }
-
-    pub fn managed_sync_configured(&self) -> bool {
-        self.managed_sync_store_state()
-            .is_ok_and(|state| state == ManagedSyncStoreState::Initialized)
-    }
-
-    pub fn managed_sync_store_state(&self) -> io::Result<ManagedSyncStoreState> {
-        let binding = self.managed_write_binding()?;
-        CrdtGraph::store_state_at(&binding.root).map_err(crdt_io_error)
-    }
-
-    /// Replay an existing managed-sync workspace for this process. A configured
-    /// but invalid workspace fails closed: callers must not let the graph accept
-    /// projection-only edits while its operation truth is unavailable.
-    pub fn start_managed_sync(&self, device_id: Uuid, session_id: Uuid) -> io::Result<bool> {
-        let write = self.admit_managed_text_writer()?;
-        self.start_managed_sync_with_permit(&write, device_id, session_id)
-    }
-
-    fn start_managed_sync_with_permit(
-        &self,
-        write: &ManagedTextWritePermit,
-        device_id: Uuid,
-        session_id: Uuid,
-    ) -> io::Result<bool> {
-        let root = self.managed_permit_root(write)?;
-        if CrdtGraph::store_state_at(root).map_err(crdt_io_error)?
-            != ManagedSyncStoreState::Initialized
-        {
-            return Ok(false);
-        }
-        let crdt =
-            CrdtGraph::open_at(&self.root, root, device_id, session_id).map_err(crdt_io_error)?;
-        *self.managed_sync.lock().unwrap() = Some(crdt);
-        Ok(true)
-    }
-
-    /// One-time compatible-mode activation. Identity writes happen first through
-    /// the normal guarded save path; genesis is published only after every page
-    /// was re-read and its exact revision rechecked.
-    pub fn enable_managed_sync(
-        &self,
-        device_id: Uuid,
-        session_id: Uuid,
-    ) -> io::Result<ManagedSyncEnableResult> {
-        let write = self.admit_managed_text_writer()?;
-        let root = self.managed_permit_root(&write)?;
-        let store_state = CrdtGraph::store_state_at(root).map_err(crdt_io_error)?;
-        if store_state == ManagedSyncStoreState::Initialized {
-            self.start_managed_sync_with_permit(&write, device_id, session_id)?;
-            let status = self
-                .managed_sync_status()
-                .ok_or_else(|| io::Error::other("managed sync did not start"))?;
-            return Ok(ManagedSyncEnableResult {
-                migration: SyncIdentityMigration {
-                    pages_changed: 0,
-                    blocks_changed: 0,
-                },
-                status,
-            });
-        }
-        if store_state == ManagedSyncStoreState::Claimed {
-            CrdtGraph::validate_resume_device_at(root, device_id).map_err(crdt_io_error)?;
-        }
-
-        let mut budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        self.preflight_managed_sync_enable_budget(&write, &budget)?;
-        let migration = self.migrate_sync_identities_with_permit(&write, &mut budget)?;
-        let mut prepared = Vec::new();
-        let mut prepared_charge =
-            RetainedHeapCharge::new(Some(&budget), "managed enable prepared entries")?;
-        let entries = self.managed_text_entries_with_budget(&write, false, &budget)?;
-        for entry in entries.iter() {
-            let ManagedLoadedPage {
-                page,
-                baseline,
-                baseline_reservation,
-                page_reservation,
-            } = self.managed_load_page_with_budget(&write, &entry, &mut budget)?;
-            if page.read_only {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("{} is read-only and cannot join managed sync", page.path),
-                ));
-            }
-            let snapshot = crdt_snapshot_for_page(&page, CrdtPageId::new(), &budget)?;
-            drop(page);
-            drop(page_reservation);
-            prepared_charge.grow(
-                checked_add_bytes(
-                    conservative_vec_entry_bytes::<PreparedGenesisPage>()?,
-                    owned_path_upper_bound(&entry.path)?,
-                )?,
-                "managed enable prepared entries",
-            )?;
-            prepared.push(PreparedGenesisPage {
-                snapshot,
-                path: entry.path.clone(),
-                baseline: Some(baseline),
-                baseline_reservation: Some(baseline_reservation),
-            });
-        }
-        drop(entries);
-        managed_sync_enable_after_snapshot_hook()?;
-        let mut projection_contents = Vec::new();
-        let mut projection_contents_charge =
-            RetainedHeapCharge::new(Some(&budget), "managed enable projection vector")?;
-        for page in &mut prepared {
-            let current = self.managed_read_to_string_with_budget(
-                &write,
-                &page.path,
-                &mut budget,
-                "managed genesis projection bytes",
-            )?;
-            if current.as_ref()
-                != page
-                    .baseline
-                    .as_ref()
-                    .expect("baseline retained until revalidation")
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "{} changed while managed sync was being enabled",
-                        page.path.display()
-                    ),
-                ));
-            }
-            drop(page.baseline.take());
-            drop(page.baseline_reservation.take());
-            let relative = self.rel_path(&page.path);
-            projection_contents_charge.grow(
-                checked_add_bytes(
-                    conservative_vec_entry_bytes::<(String, String, RetainedContentReservation)>()?,
-                    owned_string_upper_bound(&relative)?,
-                )?,
-                "managed enable projection vector",
-            )?;
-            projection_contents.push((relative, current.value, current.reservation));
-        }
-
-        let mut pages = PreparedCrdtPageBatch::with_capacity(
-            prepared.len(),
-            &budget,
-            "managed enable snapshot batch capacities",
-        )?;
-        for page in prepared {
-            pages.push(page.snapshot);
-        }
-        let crdt = pages
-            .admit_operation(&budget, "managed enable CRDT/store operation")?
-            .initialize_at(&self.root, root, device_id, session_id)?;
-        for (path, content, content_reservation) in projection_contents {
-            crdt.record_projection(&path, &content)
-                .map_err(crdt_io_error)?;
-            drop(content_reservation);
-        }
-        let status = crdt.status().map_err(crdt_io_error)?;
-        *self.managed_sync.lock().unwrap() = Some(crdt);
-        Ok(ManagedSyncEnableResult { migration, status })
-    }
-
-    /// Prove the combined migrate-then-genesis allocation envelope before the
-    /// migration may write its first identity. Prospective serialized baselines
-    /// and snapshots stay reserved together, matching the later genesis phase;
-    /// no disk, store, projection receipt, or cache mutation occurs here.
-    fn preflight_managed_sync_enable_budget(
-        &self,
-        write: &ManagedTextWritePermit,
-        budget: &RetainedContentBudget,
-    ) -> io::Result<()> {
-        let mut prospective = Vec::new();
-        let entries = self.managed_text_entries_with_budget(write, false, budget)?;
-        let mut prospective_slots =
-            RetainedHeapCharge::new(Some(budget), "managed enable preflight vector capacity")?;
-        let mut migration_prepared_bound = 0_u64;
-        let mut migration_writer_phase_bound = 0_u64;
-        let mut migration_blocks = 0_u64;
-        let mut migration_owned_ids_bound = 0_u64;
-        let mut migration_projection_scan_bound = 0_u64;
-        let mut genesis_metadata_bound = 0_u64;
-        for entry in entries.iter() {
-            let ManagedLoadedPage {
-                mut page,
-                baseline,
-                baseline_reservation,
-                mut page_reservation,
-            } = self.managed_load_page_with_budget(write, &entry, budget)?;
-            if page.read_only {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("{} is read-only and cannot join managed sync", page.path),
-                ));
-            }
-            let missing = count_missing_sync_ids(&page.blocks, page.format, budget)?;
-            persist_page_sync_ids_with_budget(&mut page, &mut page_reservation, budget)?;
-            if missing != 0 {
-                migration_prepared_bound = checked_add_bytes(
-                    migration_prepared_bound,
-                    checked_add_bytes(
-                        conservative_vec_entry_bytes::<PreparedMigrationPage>()?,
-                        checked_add_bytes(
-                            usize_to_u64(baseline.capacity())?,
-                            page_dto_retained_bytes(&page)?,
-                        )?,
-                    )?,
-                )?;
-                migration_writer_phase_bound = migration_writer_phase_bound.max(checked_add_bytes(
-                    usize_to_u64(baseline.capacity())?,
-                    page_write_construction_upper_bound(&page, Some(&baseline))?,
-                )?);
-            }
-            migration_blocks =
-                checked_add_bytes(migration_blocks, page_block_count_checked(&page.blocks)?)?;
-            migration_owned_ids_bound = checked_add_bytes(
-                migration_owned_ids_bound,
-                sync_id_owned_source_upper_bound(&page.blocks, true)?,
-            )?;
-            migration_projection_scan_bound = migration_projection_scan_bound.max(
-                sync_id_projection_scan_upper_bound(&page.blocks, SyncIdProjectionInput::Expanded)?,
-            );
-            genesis_metadata_bound = checked_add_bytes(
-                genesis_metadata_bound,
-                checked_add_bytes(
-                    checked_add_bytes(
-                        conservative_vec_entry_bytes::<PreparedGenesisPage>()?,
-                        owned_path_upper_bound(&entry.path)?,
-                    )?,
-                    checked_add_bytes(
-                        checked_add_bytes(
-                            conservative_vec_entry_bytes::<(
-                                String,
-                                String,
-                                RetainedContentReservation,
-                            )>()?,
-                            owned_string_upper_bound(&entry.rel_path)?,
-                        )?,
-                        checked_add_bytes(
-                            conservative_vec_entry_bytes::<CrdtPageSnapshot>()?,
-                            conservative_vec_entry_bytes::<RetainedContentReservation>()?,
-                        )?,
-                    )?,
-                )?,
-            )?;
-            let (prospective_baseline_bytes, _) =
-                page_serialized_output_upper_bound(&page, Some(&baseline))?;
-            drop(baseline);
-            drop(baseline_reservation);
-            let prospective_baseline = budget.reserve(
-                prospective_baseline_bytes,
-                "prospective managed genesis baseline bound",
-            )?;
-            let snapshot = crdt_snapshot_for_page(&page, CrdtPageId::new(), budget)?;
-            drop(page);
-            drop(page_reservation);
-            prospective_slots.grow(
-                conservative_vec_entry_bytes::<(
-                    RetainedContentReservation,
-                    PreparedCrdtPageSnapshot,
-                )>()?,
-                "managed enable preflight vector capacity",
-            )?;
-            prospective.push((prospective_baseline, snapshot));
-        }
-        let genesis_metadata = budget.reserve(
-            genesis_metadata_bound,
-            "prospective managed genesis metadata",
-        )?;
-        let migration_graph_ids_bound =
-            sync_id_hash_set_build_upper_bound(migration_blocks, migration_owned_ids_bound)?;
-        let migration_execution = budget.reserve(
-            checked_add_bytes(
-                migration_prepared_bound,
-                checked_add_bytes(
-                    checked_add_bytes(migration_graph_ids_bound, migration_projection_scan_bound)?,
-                    migration_writer_phase_bound,
-                )?,
-            )?,
-            "prospective managed migration retained/writer bound",
-        )?;
-        drop(migration_execution);
-        drop(genesis_metadata);
-        drop(prospective);
-        drop(prospective_slots);
-        Ok(())
-    }
-
-    pub fn managed_sync_status(&self) -> Option<CrdtStatus> {
-        self.managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|sync| sync.status().ok())
-    }
-
-    /// Commit a verified backup's complete graph-text set as the new operation
-    /// truth before the caller copies any projection files. Every block must
-    /// already carry a persisted UUID; accepting an older pre-migration backup
-    /// would make a crash choose fresh identities nondeterministically.
-    pub fn commit_managed_restore(&self, files: &[(String, String)]) -> io::Result<bool> {
-        let write = self.admit_managed_text_writer()?;
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        let mut guard = self.managed_sync.lock().unwrap();
-        let Some(sync) = guard.as_mut() else {
-            return Ok(false);
-        };
-        let current_pages = sync.materialize_pages().map_err(crdt_io_error)?;
-        let current_by_path: std::collections::HashMap<String, CrdtPageId> = current_pages
-            .iter()
-            .cloned()
-            .into_iter()
-            .map(|page| (page.path, page.id))
-            .collect();
-
-        let mut snapshots = PreparedCrdtPageBatch::with_capacity(
-            files.len(),
-            &budget,
-            "managed restore snapshot batch capacities",
-        )?;
-        let mut graph_ids = std::collections::HashSet::new();
-        let mut graph_ids_reservation = budget.reserve(0, "managed restore graph sync id set")?;
-        let mut seen_paths = std::collections::HashSet::new();
-        for (rel, content) in files {
-            if !seen_paths.insert(rel.clone()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("backup contains duplicate graph path {rel}"),
-                ));
-            }
-            let path = self.resolve_managed_rel(&write, rel)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("backup contains invalid graph path {rel}"),
-                )
-            })?;
-            let entry = self.entry_for_path(&path).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("backup path is not a page or journal: {rel}"),
-                )
-            })?;
-            let _page_construction = budget.reserve(
-                managed_page_build_upper_bound(content)?,
-                "managed restore page construction bound",
-            )?;
-            let mut doc = parse_doc(&path, content);
-            assign_runtime_ids_checked(
-                &mut doc.roots,
-                runtime_owner_namespace("file-block-runtime-v1", rel),
-            )?;
-            let mut page = page_dto_checked(&entry, &doc)?;
-            page.path = rel.clone();
-            if page.read_only {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("backup contains read-only Org content at {rel}"),
-                ));
-            }
-            if count_missing_sync_ids(&page.blocks, page.format, &budget)? != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "backup {rel} predates managed-sync identities and cannot be restored while managed sync is active"
-                    ),
-                ));
-            }
-            validate_graph_sync_ids(
-                &page.blocks,
-                page.format,
-                &mut graph_ids,
-                &mut graph_ids_reservation,
-                &budget,
-            )?;
-            let page_id = current_by_path
-                .get(rel)
-                .copied()
-                .unwrap_or_else(CrdtPageId::new);
-            snapshots.push(crdt_snapshot_for_page(&page, page_id, &budget)?);
-        }
-        let affected_paths: std::collections::BTreeSet<String> = current_pages
-            .iter()
-            .map(|page| page.path.clone())
-            .chain(files.iter().map(|(path, _)| path.clone()))
-            .collect();
-        let _precondition_vectors = budget.reserve(
-            checked_mul_bytes(
-                u64::try_from(affected_paths.len()).map_err(|_| allocation_overflow())?,
-                checked_add_bytes(
-                    conservative_vec_entry_bytes::<ProjectionPrecondition>()?,
-                    conservative_vec_entry_bytes::<RetainedContentReservation>()?,
-                )?,
-            )?,
-            "managed restore projection precondition vectors",
-        )?;
-        let mut projection_preconditions = Vec::with_capacity(affected_paths.len());
-        let mut projection_precondition_reservations = Vec::with_capacity(affected_paths.len());
-        for rel in affected_paths {
-            let path = self.resolve_managed_rel(&write, &rel)?.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("managed-sync restore contains invalid path {rel}"),
-                )
-            })?;
-            let expected_content = self.managed_read_optional_text_with_budget(
-                &write,
-                &path,
-                &budget,
-                "managed restore projection precondition content",
-            )?;
-            let expected_content = match expected_content {
-                Some(content) => {
-                    projection_precondition_reservations.push(content.reservation);
-                    Some(content.value)
-                }
-                None => None,
-            };
-            projection_preconditions.push(ProjectionPrecondition {
-                path: rel,
-                expected_content,
-            });
-        }
-        let pages = snapshots.admit_operation(&budget, "managed restore CRDT/store operation")?;
-        PreparedCrdtReplacement::new(
-            pages,
-            projection_preconditions,
-            projection_precondition_reservations,
-            &current_pages,
-            &budget,
-        )?
-        .replace(sync)
-        .map(|report| report.changed)
-    }
-
-    /// Import newly delivered immutable chunks, project their affected pages,
-    /// and clean only conflict copies proven to be old generated projections.
-    pub fn pull_managed_sync(&self) -> io::Result<ManagedSyncPull> {
-        let report = {
-            let mut guard = self.managed_sync.lock().unwrap();
-            let Some(sync) = guard.as_mut() else {
-                return Ok(ManagedSyncPull::default());
-            };
-            sync.import_pending().map_err(crdt_io_error)?
-        };
-
-        let mut changes = Vec::new();
-        for affected in &report.affected_pages {
-            changes.extend(self.project_managed_page(affected.page_id, &affected.paths)?);
-        }
-        let conflicts_changed = self.cleanup_known_projection_conflicts()?;
-        {
-            let mut guard = self.managed_sync.lock().unwrap();
-            guard
-                .as_mut()
-                .ok_or_else(|| io::Error::other("managed sync is not active"))?
-                .acknowledge_pending_projection();
-        }
-        Ok(ManagedSyncPull {
-            imported_chunks: report.imported_chunks,
-            changes,
-            conflicts_changed,
-        })
-    }
-
-    /// Reconcile every current CRDT page against its projection after opening a
-    /// workspace. This covers the case where provider chunks arrived while Tine
-    /// was closed, so `open()` already replayed them and `import_pending()` has no
-    /// newly-seen chunk to report.
-    pub fn project_all_managed_sync(&self) -> io::Result<ManagedSyncPull> {
-        let affected_pages = {
-            let guard = self.managed_sync.lock().unwrap();
-            let Some(sync) = guard.as_ref() else {
-                return Ok(ManagedSyncPull::default());
-            };
-            sync.affected_pages_history().map_err(crdt_io_error)?
-        };
-        let mut changes = Vec::new();
-        for affected in affected_pages {
-            changes.extend(self.project_managed_page(affected.page_id, &affected.paths)?);
-        }
-        let conflicts_changed = self.cleanup_known_projection_conflicts()?;
-        Ok(ManagedSyncPull {
-            imported_chunks: 0,
-            changes,
-            conflicts_changed,
-        })
-    }
-
-    fn project_managed_page(
-        &self,
-        page_id: CrdtPageId,
-        affected_paths: &[String],
-    ) -> io::Result<Vec<ManagedSyncProjectionChange>> {
-        let write = self.admit_managed_text_writer()?;
-        let snapshot = {
-            let guard = self.managed_sync.lock().unwrap();
-            guard
-                .as_ref()
-                .ok_or_else(|| io::Error::other("managed sync is not active"))?
-                .materialize_page(page_id)
-                .map_err(crdt_io_error)?
-        };
-        let Some(snapshot) = snapshot else {
-            return self.project_managed_deletion(&write, page_id, affected_paths);
-        };
-        let path = self
-            .resolve_managed_rel(&write, &snapshot.path)?
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid synced page path")
-            })?;
-        let lock = self.page_lock(&path);
-        let _guard = lock.lock().unwrap();
-        let before = self.managed_read_optional_text(&write, &path)?;
-        if let Some(content) = before.as_deref() {
-            let authorized = {
-                let guard = self.managed_sync.lock().unwrap();
-                guard
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("managed sync is not active"))?
-                    .is_projection_authorized(&snapshot.path, before.as_deref())
-                    .map_err(crdt_io_error)?
-            };
-            if !authorized
-                && self.reconcile_managed_external_locked(&write, &path, content, Some(page_id))?
-            {
-                let mut changes = self
-                    .entry_for_path(&path)
-                    .map(|entry| {
-                        vec![ManagedSyncProjectionChange {
-                            entry,
-                            created: false,
-                            removed: false,
-                        }]
-                    })
-                    .unwrap_or_default();
-                drop(_guard);
-                changes.extend(self.cleanup_superseded_managed_paths(
-                    &write,
-                    &snapshot.path,
-                    affected_paths,
-                )?);
-                return Ok(changes);
-            }
-        }
-
-        // Re-materialize after the external check: it may have committed a local
-        // operation on another path while this pull was in progress.
-        let snapshot = {
-            let guard = self.managed_sync.lock().unwrap();
-            guard
-                .as_ref()
-                .ok_or_else(|| io::Error::other("managed sync is not active"))?
-                .materialize_page(page_id)
-                .map_err(crdt_io_error)?
-                .ok_or_else(|| io::Error::other("synced page vanished during projection"))?
-        };
-        let page = page_dto_from_crdt(&snapshot)?;
-        let cache = self.managed_path_is_cacheable(&write, &path)?;
-        self.write_page(
-            &write,
-            &page,
-            &path,
-            before.as_deref(),
-            true,
-            None,
-            None,
-            cache,
-        )?;
-        self.record_managed_projection(&write, &path);
-        let after = self.managed_read_optional_text(&write, &path)?;
-        let mut changes = Vec::new();
-        if before == after {
-            drop(_guard);
-            changes.extend(self.cleanup_superseded_managed_paths(
-                &write,
-                &snapshot.path,
-                affected_paths,
-            )?);
-            return Ok(changes);
-        }
-        if let Some(entry) = self.entry_for_path(&path) {
-            changes.push(ManagedSyncProjectionChange {
-                entry,
-                created: before.is_none(),
-                removed: false,
-            });
-        }
-        drop(_guard);
-        changes.extend(self.cleanup_superseded_managed_paths(
-            &write,
-            &snapshot.path,
-            affected_paths,
-        )?);
-        Ok(changes)
-    }
-
-    fn cleanup_superseded_managed_paths(
-        &self,
-        write: &ManagedTextWritePermit,
-        current_path: &str,
-        affected_paths: &[String],
-    ) -> io::Result<Vec<ManagedSyncProjectionChange>> {
-        let mut changes = Vec::new();
-        for rel in affected_paths {
-            if rel == current_path {
-                continue;
-            }
-            let Some(path) = self.resolve_managed_rel(write, rel)? else {
-                continue;
-            };
-            let lock = self.page_lock(&path);
-            let _guard = lock.lock().unwrap();
-            let Some(content) = self.managed_read_optional_text(write, &path)? else {
-                continue;
-            };
-            let sync_guard = self.managed_sync.lock().unwrap();
-            let sync = sync_guard
-                .as_ref()
-                .ok_or_else(|| io::Error::other("managed sync is not active"))?;
-            // A historical old path may already be the current projection of a
-            // different live identity (for example, a rename swap). Keep the
-            // ownership check and trash move atomic against CRDT mutations.
-            if sync
-                .materialize_page(rel.as_str())
-                .map_err(crdt_io_error)?
-                .is_some()
-            {
-                continue;
-            }
-            let removable = sync
-                .is_projection_authorized(rel, Some(&content))
-                .map_err(crdt_io_error)?
-                || sync
-                    .is_known_projection(rel, &content)
-                    .map_err(crdt_io_error)?;
-            if !removable {
-                continue; // unexplained bytes are evidence, never auto-removed
-            }
-            let Some(entry) = self.entry_for_path(&path) else {
-                continue;
-            };
-            let trash = typed_trash_dir(
-                &self.root,
-                match entry.kind {
-                    PageKind::Journal => TrashEntryKind::Journal,
-                    PageKind::Page => TrashEntryKind::Page,
-                },
-            );
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("page");
-            let dest = trash.join(format!("{}__{name}", trash_stamp()));
-            self.managed_move_to_trash(write, &path, &dest, &trash)?;
-            drop(sync_guard);
-            self.cache_remove(&entry.name, entry.kind);
-            changes.push(ManagedSyncProjectionChange {
-                entry,
-                created: false,
-                removed: true,
-            });
-        }
-        Ok(changes)
-    }
-
-    fn project_managed_deletion(
-        &self,
-        write: &ManagedTextWritePermit,
-        page_id: CrdtPageId,
-        affected_paths: &[String],
-    ) -> io::Result<Vec<ManagedSyncProjectionChange>> {
-        let mut changes = Vec::new();
-        for rel in affected_paths {
-            let Some(path) = self.resolve_managed_rel(write, rel)? else {
-                continue;
-            };
-            let lock = self.page_lock(&path);
-            let _guard = lock.lock().unwrap();
-            let Some(content) = self.managed_read_optional_text(write, &path)? else {
-                continue;
-            };
-            let sync_guard = self.managed_sync.lock().unwrap();
-            let sync = sync_guard
-                .as_ref()
-                .ok_or_else(|| io::Error::other("managed sync is not active"))?;
-            // Chunk envelopes retain deleted identities and historical paths.
-            // They may request deletion after another live identity has already
-            // materialized at the same path; ownership always wins over a receipt.
-            if sync
-                .materialize_page(rel.as_str())
-                .map_err(crdt_io_error)?
-                .is_some()
-            {
-                continue;
-            }
-            let removable = sync
-                .is_projection_authorized(rel, Some(&content))
-                .map_err(crdt_io_error)?
-                || sync
-                    .is_known_projection(rel, &content)
-                    .map_err(crdt_io_error)?;
-            if !removable {
-                drop(sync_guard);
-                if self.reconcile_managed_external_locked(write, &path, &content, Some(page_id))? {
-                    if let Some(entry) = self.entry_for_path(&path) {
-                        changes.push(ManagedSyncProjectionChange {
-                            entry,
-                            created: false,
-                            removed: false,
-                        });
-                    }
-                }
-                continue;
-            }
-            let Some(entry) = self.entry_for_path(&path) else {
-                continue;
-            };
-            let trash = typed_trash_dir(
-                &self.root,
-                match entry.kind {
-                    PageKind::Journal => TrashEntryKind::Journal,
-                    PageKind::Page => TrashEntryKind::Page,
-                },
-            );
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("page");
-            let dest = trash.join(format!("{}__{name}", trash_stamp()));
-            self.managed_move_to_trash(write, &path, &dest, &trash)?;
-            drop(sync_guard);
-            self.cache_remove(&entry.name, entry.kind);
-            changes.push(ManagedSyncProjectionChange {
-                entry,
-                created: false,
-                removed: true,
-            });
-        }
-        Ok(changes)
-    }
-
-    pub fn cleanup_known_projection_conflicts(&self) -> io::Result<bool> {
-        let write = self.admit_managed_text_writer()?;
-        let mut changed = false;
-        for conflict in self.managed_sync_conflicts(&write)? {
-            let Some(base_path) = conflict.base_path.as_deref() else {
-                continue;
-            };
-            let Some(conflict_path) = self.resolve_managed_rel(&write, &conflict.path)? else {
-                continue;
-            };
-            let content = self.managed_read_to_string(&write, &conflict_path)?;
-            let known = {
-                let guard = self.managed_sync.lock().unwrap();
-                let Some(sync) = guard.as_ref() else {
-                    return Ok(changed);
-                };
-                sync.is_known_projection(base_path, &content)
-                    .map_err(crdt_io_error)?
-            };
-            if known {
-                self.trash_sync_conflict(&conflict.path)?;
-                changed = true;
-            }
-        }
-        Ok(changed)
-    }
-
-    fn managed_sync_conflicts(
-        &self,
-        write: &ManagedTextWritePermit,
-    ) -> io::Result<Vec<SyncConflict>> {
-        let mut out = Vec::new();
-        for entry in self.managed_text_entries(write, true)? {
-            let path = entry.path;
-            let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            let Some(base_stem) = sync_conflict_base(stem) else {
-                continue;
-            };
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let base_file = parent.join(format!("{base_stem}.{extension}"));
-            let base_path = self
-                .managed_exists(write, &base_file)?
-                .then(|| self.rel_path(&base_file));
-            let base_name = match entry.kind {
-                PageKind::Journal => self
-                    .journal_format
-                    .parse(base_stem)
-                    .map(|date| self.journal_format.title(date))
-                    .unwrap_or_else(|| base_stem.to_owned()),
-                PageKind::Page => decode_page_name(base_stem, self.config.file_name_format),
-            };
-            let tag = stem[base_stem.len()..]
-                .trim_matches(|character: char| {
-                    character == '.' || character == ' ' || character == '(' || character == ')'
-                })
-                .to_owned();
-            let preview = self
-                .managed_read_optional_text(write, &path)?
-                .and_then(|content| {
-                    content
-                        .lines()
-                        .map(|line| {
-                            line.trim_start_matches(|character| {
-                                character == '*'
-                                    || character == '-'
-                                    || character == ' '
-                                    || character == '\t'
-                            })
-                            .trim()
-                            .to_owned()
-                        })
-                        .find(|line| !line.is_empty())
-                })
-                .map(|line| line.chars().take(80).collect())
-                .unwrap_or_default();
-            out.push(SyncConflict {
-                path: self.rel_path(&path),
-                base_name,
-                base_path,
-                kind: entry.kind,
-                tag,
-                preview,
-            });
-        }
-        out.sort_by(|left, right| {
-            left.base_name
-                .cmp(&right.base_name)
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        Ok(out)
-    }
-
     /// Graph-root-relative, forward-slashed path for an absolute file path inside
     /// the graph (`…/journals/2026_06_26.org` → `journals/2026_06_26.org`). The
     /// stable, machine-portable id Tine hands the frontend so a page can be pinned
@@ -12830,7 +12223,6 @@ impl Graph {
 
     pub fn migrate_journal_filenames_checked(&self) -> io::Result<usize> {
         let write = self.admit_managed_text_writer()?;
-        let content_budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let entries = self.managed_text_entries(&write, false)?;
         let mut n = 0;
         for entry in entries
@@ -12842,95 +12234,7 @@ impl Graph {
                 if self.managed_exists(&write, &target)? {
                     continue;
                 }
-                let managed = self.managed_sync.lock().unwrap().is_some();
-                if !managed {
-                    if self.managed_move_noreplace(&write, &p, &target).is_ok() {
-                        n += 1;
-                    }
-                    continue;
-                }
-
-                let mut lock_paths = [p.clone(), target.clone()];
-                lock_paths.sort();
-                let locks: Vec<_> = lock_paths.iter().map(|path| self.page_lock(path)).collect();
-                let guards: Vec<_> = locks.iter().map(|lock| lock.lock().unwrap()).collect();
-                if self.managed_exists(&write, &target)?
-                    || self.journal_filename_migration_target(&p).as_ref() != Some(&target)
-                    || !self.managed_exists(&write, &p)?
-                {
-                    continue;
-                }
-                let content = self.managed_read_to_string_with_budget(
-                    &write,
-                    &p,
-                    &content_budget,
-                    "managed journal migration source content",
-                )?;
-                let source_rel = self.rel_path(&p);
-                let target_rel = self.rel_path(&target);
-                let (prepared, sync_guard, page_id) = {
-                    let mut sync_guard = self.managed_sync.lock().unwrap();
-                    let sync = sync_guard
-                        .as_mut()
-                        .ok_or_else(|| io::Error::other("managed sync stopped during migration"))?;
-                    let existing = sync
-                        .materialize_page(source_rel.as_str())
-                        .map_err(crdt_io_error)?
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "managed-sync operation truth has no journal at {source_rel}"
-                                ),
-                            )
-                        })?;
-                    let entry = self.entry_for_path(&target).ok_or_else(bad_path)?;
-                    let page_construction = content_budget.reserve(
-                        managed_page_build_upper_bound(&content)?,
-                        "managed journal migration page construction bound",
-                    )?;
-                    let mut doc = parse_doc(&target, &content);
-                    assign_runtime_ids_checked(
-                        &mut doc.roots,
-                        runtime_owner_namespace("file-block-runtime-v1", &target_rel),
-                    )?;
-                    let mut page = page_dto_checked(&entry, &doc)?;
-                    page.path = target_rel;
-                    page.format = Format::from_path(&target);
-                    let mut page_reservation = content_budget.reserve(
-                        page_dto_retained_bytes(&page)?,
-                        "managed journal migration page",
-                    )?;
-                    persist_page_sync_ids_with_budget(
-                        &mut page,
-                        &mut page_reservation,
-                        &content_budget,
-                    )?;
-                    let page_id = existing.id;
-                    let cache = self.managed_path_is_cacheable(&write, &target)?;
-                    let publication_reservation = content_budget.reserve(
-                        checked_add_bytes(
-                            crdt_to_page_dto_upper_bound(&page)?,
-                            self.managed_save_writer_upper_bound(&page, &target, None, cache)?,
-                        )?,
-                        "managed journal migration projection publication bound",
-                    )?;
-                    let snapshot = crdt_snapshot_for_page(&page, page_id, &content_budget)?;
-                    let prepared = PreparedJournalMigrationPublication {
-                        budget: content_budget.clone(),
-                        page: BudgetedPageDto {
-                            page,
-                            _reservation: page_reservation,
-                        },
-                        snapshot,
-                        _page_construction: page_construction,
-                        _publication_reservation: publication_reservation,
-                    };
-                    (prepared, sync_guard, page_id)
-                };
-                drop(guards);
-                prepared.commit_and_project(self, sync_guard, page_id)?;
-                if self.managed_exists(&write, &target)? && !self.managed_exists(&write, &p)? {
+                if self.managed_move_noreplace(&write, &p, &target).is_ok() {
                     n += 1;
                 }
             }
@@ -13314,6 +12618,7 @@ impl Graph {
             true,
             None,
             None,
+            None,
             win_cacheable,
         ) {
             let _ = managed_write_during_rollback_hook();
@@ -13492,6 +12797,7 @@ impl Graph {
             &dst,
             Some(&dst_content),
             true,
+            None,
             None,
             None,
             dst_cacheable,
@@ -13706,6 +13012,12 @@ impl Graph {
         if validation.target.is_some() || validation.requested_identity_elsewhere {
             return Ok(false);
         }
+        let creation_proof = validation.creation_proof.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "missing guide target lacks its creation proof",
+            )
+        })?;
         if self
             .managed_find_entry(&write, name, PageKind::Page)?
             .is_some()
@@ -13713,8 +13025,13 @@ impl Graph {
         {
             return Ok(false);
         }
-        self.managed_create_dir_all(&write, &self.pages_path())?;
-        match self.managed_atomic_write(&write, &path, content.as_bytes(), true) {
+        match self.managed_atomic_create_with_proof(
+            &write,
+            &path,
+            content.as_bytes(),
+            creation_proof,
+            None,
+        ) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
             Err(e) => return Err(e),
@@ -14760,9 +14077,16 @@ impl Graph {
             && !failures_changed
         {
             // Exact content-only publication does not alter effective identity.
-            // Drop the generation tag instead of rebuilding every unrelated
-            // owner now; name-only creation can reconstruct it on demand.
-            *self.effective_identity_index.write().unwrap() = None;
+            // Advance the shared generation tag in O(1): creation requires warm
+            // parsed semantic evidence and must not rebuild it merely because
+            // unrelated bytes changed.
+            let mut identity_guard = self.effective_identity_index.write().unwrap();
+            let advanced = identity_guard
+                .as_ref()
+                .is_some_and(|index| index.retag_generation(newgen - 1, newgen));
+            if !advanced {
+                *identity_guard = None;
+            }
         } else if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() = Some(Arc::new(
                 build_effective_identity_index(newgen, pages, resulting_failures.clone()),
@@ -15951,75 +15275,6 @@ impl Graph {
             }
         }
 
-        // Phase 2.5 — operation truth first. The whole rename set (moved page
-        // paths plus every reference rewrite) is one Loro transaction/chunk.
-        // If a later projection write fails, the durable operation remains
-        // recoverable and the watcher can finish projecting it.
-        {
-            let mut sync_guard = self.managed_sync.lock().unwrap();
-            if let Some(sync) = sync_guard.as_mut() {
-                let mut snapshots = PreparedCrdtPageBatch::with_capacity(
-                    edits.len(),
-                    &content_budget,
-                    "managed rename snapshot batch capacities",
-                )?;
-                for e in &edits {
-                    let _materialized_scratch = content_budget.reserve(
-                        checked_add_bytes(
-                            checked_mul_bytes(managed_page_build_upper_bound(&e.orig)?, 2)?,
-                            checked_add_bytes(
-                                owned_path_upper_bound(&e.src)?,
-                                owned_path_upper_bound(&e.dst)?,
-                            )?,
-                        )?,
-                        "managed rename materialized snapshot scratch",
-                    )?;
-                    let src_rel = self.rel_path(&e.src);
-                    let dst_rel = self.rel_path(&e.dst);
-                    let existing = sync
-                        .materialize_page(src_rel.as_str())
-                        .map_err(crdt_io_error)?;
-                    let existing = match existing {
-                        Some(page) => Some(page),
-                        None => sync
-                            .materialize_page(dst_rel.as_str())
-                            .map_err(crdt_io_error)?,
-                    };
-                    let page_id = existing.map(|page| page.id).unwrap_or_else(CrdtPageId::new);
-                    let entry = self.entry_for_path(&e.dst).ok_or_else(bad_path)?;
-                    let mut page_reservation = content_budget.reserve(
-                        managed_page_build_upper_bound(&e.new_content)?,
-                        "managed rename parsed page construction bound",
-                    )?;
-                    let mut doc = parse_doc(&e.dst, &e.new_content);
-                    assign_runtime_ids_checked(
-                        &mut doc.roots,
-                        runtime_owner_namespace("file-block-runtime-v1", &dst_rel),
-                    )?;
-                    let mut page = page_dto_checked(&entry, &doc)?;
-                    page.path = dst_rel;
-                    page.format = Format::from_path(&e.dst);
-                    drop(doc);
-                    page_reservation.resize(
-                        page_dto_retained_bytes(&page)?,
-                        "retained managed rename page",
-                    )?;
-                    persist_page_sync_ids_with_budget(
-                        &mut page,
-                        &mut page_reservation,
-                        &content_budget,
-                    )?;
-                    let prepared = crdt_snapshot_for_page(&page, page_id, &content_budget)?;
-                    drop(page);
-                    drop(page_reservation);
-                    snapshots.push(prepared);
-                }
-                snapshots
-                    .admit_operation(&content_budget, "managed rename CRDT/store operation")?
-                    .commit_pages(sync)?;
-            }
-        }
-
         // Phase 3 — commit, tracking writes for rollback. Move sources are
         // atomically staged into recoverable trash rather than unlinked, so an
         // external replacement at the syscall boundary is preserved as an inode.
@@ -16106,9 +15361,6 @@ impl Graph {
             return Err(err);
         }
         self.invalidate_cache_after_tine_mutation();
-        for edit in &edits {
-            self.record_managed_projection(&write, &edit.dst);
-        }
         self.finish_successful_rename_editor_lifecycle();
         Ok(())
     }
@@ -16165,7 +15417,6 @@ impl Graph {
         if let Some(entry) = matching.into_iter().next() {
             let lock = self.page_lock(&entry.path);
             let _guard = lock.lock().unwrap();
-            self.commit_managed_delete(&write, &entry.path)?;
             let trash = typed_trash_dir(
                 &self.root,
                 match entry.kind {
@@ -16930,8 +16181,8 @@ impl Graph {
                 format,
             );
             let content = serialize_pdf_hls_page(&page_path, &page_doc, None)?;
-            let page_rev =
-                self.commit_editor_write(&write, &page_path, &content, None, true, None, None)?;
+            let page_rev = self
+                .commit_editor_write(&write, &page_path, &content, None, true, None, None, None)?;
             let name = crate::pdf::hls_page_name(&key);
             let entry = PageEntry {
                 name,
@@ -17387,6 +16638,7 @@ impl Graph {
             &page_md,
             page_baseline.as_deref(),
             true,
+            None,
             None,
             None,
         ) {
@@ -19553,17 +18805,19 @@ impl Graph {
         recheck: bool,
         expected_identity: Option<ContentDigest>,
         editor_episode: Option<&ConflictEditorEpisode>,
+        creation_proof: Option<DirectCreationProof>,
     ) -> io::Result<String> {
+        let create_parent = creation_proof.is_none();
         let (rev, ()) = self.commit_write(
             write,
             path,
             content,
             baseline,
             recheck,
-            true,
+            create_parent,
             editor_episode,
-            || match expected_identity {
-                Some(identity) => self.managed_atomic_replace_bound(
+            || match (expected_identity, creation_proof) {
+                (Some(identity), _) => self.managed_atomic_replace_bound(
                     write,
                     path,
                     content.as_bytes(),
@@ -19571,7 +18825,15 @@ impl Graph {
                     recheck.then_some(baseline).flatten().map(str::as_bytes),
                     editor_episode,
                 ),
-                None => self.managed_atomic_write_with_conflict(
+                (None, Some(creation_proof)) if baseline.is_none() => self
+                    .managed_atomic_create_with_proof(
+                        write,
+                        path,
+                        content.as_bytes(),
+                        creation_proof,
+                        editor_episode,
+                    ),
+                (None, _) => self.managed_atomic_write_with_conflict(
                     write,
                     path,
                     content.as_bytes(),
@@ -19642,8 +18904,7 @@ impl Graph {
         }
     }
 
-    /// Checked watcher entrypoint. When managed sync is active, an unexplained
-    /// file must be durably imported before its bytes enter the live cache.
+    /// Checked watcher entrypoint for an externally changed page file.
     pub fn sync_file_checked(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
@@ -19662,42 +18923,18 @@ impl Graph {
         // unreadable or ambiguous path poisons the retained generation and the
         // next guarded write rebuilds instead of trusting stale ownership.
         let _ = self.update_guarded_graph_text_identity_paths(std::iter::once(path), true);
-        let (mut content, mut identity) =
-            match self.managed_read_optional_text_with_identity(&write, path) {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => {
-                    self.record_watcher_identity_failure(path);
-                    return Ok(None);
-                }
-                Err(error) => {
-                    self.record_watcher_identity_failure(path);
-                    return Err(error);
-                }
-            };
-        let imported_external =
-            match self.reconcile_managed_external_locked(&write, path, &content, None) {
-                Ok(imported) => imported,
-                Err(error) => {
-                    self.record_watcher_identity_failure(path);
-                    return Err(error);
-                }
-            };
-        if imported_external {
-            match self.managed_read_optional_text_with_identity(&write, path) {
-                Ok(Some(snapshot)) => {
-                    content = snapshot.0;
-                    identity = snapshot.1;
-                }
-                Ok(None) => {
-                    self.record_watcher_identity_failure(path);
-                    return Ok(None);
-                }
-                Err(error) => {
-                    self.record_watcher_identity_failure(path);
-                    return Err(error);
-                }
+        let (content, identity) = match self.managed_read_optional_text_with_identity(&write, path)
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.record_watcher_identity_failure(path);
+                return Ok(None);
             }
-        }
+            Err(error) => {
+                self.record_watcher_identity_failure(path);
+                return Err(error);
+            }
+        };
         let current = match self.managed_read_optional_text_with_identity(&write, path) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
@@ -19738,195 +18975,7 @@ impl Graph {
             effective
         };
         self.clear_watcher_identity_failure_after_reconciliation(&entry);
-        if imported_external {
-            Ok(reconciled.or_else(|| self.entry_for_path(path)))
-        } else {
-            Ok(reconciled)
-        }
-    }
-
-    /// Import an unexplained page-file snapshot and immediately publish the
-    /// joined CRDT projection. Caller holds this path's page lock. Returns true
-    /// when the input was external (as opposed to a receipt-backed projection).
-    fn reconcile_managed_external_locked(
-        &self,
-        write: &ManagedTextWritePermit,
-        path: &Path,
-        content: &str,
-        page_id_hint: Option<CrdtPageId>,
-    ) -> io::Result<bool> {
-        let content_budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        if path_is_sync_conflict(path) {
-            return Ok(false);
-        }
-        let rel = self.rel_path(path);
-        if self.resolve_configured_rel_lexical(&rel).is_none() {
-            // The graph-wide watcher/cache path may observe this file, but this
-            // packet does not enroll external scope in sparse sync.
-            return Ok(false);
-        }
-        let mut sync_guard = self.managed_sync.lock().unwrap();
-        let Some(sync) = sync_guard.as_mut() else {
-            return Ok(false);
-        };
-        if sync
-            .is_known_projection(&rel, content)
-            .map_err(crdt_io_error)?
-        {
-            return Ok(false);
-        }
-        let entry = self.entry_for_path(path).ok_or_else(bad_path)?;
-        let _page_construction = content_budget.reserve(
-            managed_page_build_upper_bound(content)?,
-            "managed external import page construction bound",
-        )?;
-        let mut doc = parse_doc(path, content);
-        assign_runtime_ids_checked(
-            &mut doc.roots,
-            runtime_owner_namespace("file-block-runtime-v1", &rel),
-        )?;
-        let mut page = page_dto_checked(&entry, &doc)?;
-        page.path = rel.clone();
-        page.rev = Some(content_rev(content));
-        page.format = Format::from_path(path);
-        page.read_only = read_only_org(path, content);
-        if page.read_only {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "read-only Org projection cannot be imported into managed sync",
-            ));
-        }
-        let mut page_reservation = content_budget.reserve(
-            page_dto_retained_bytes(&page)?,
-            "managed external import page",
-        )?;
-        persist_page_sync_ids_with_budget(&mut page, &mut page_reservation, &content_budget)?;
-        let current_pages = sync.materialize_pages().map_err(crdt_io_error)?;
-        let current_at_path = current_pages.iter().find(|snapshot| snapshot.path == rel);
-        let mut incoming_ids = std::collections::HashSet::new();
-        let incoming_blocks = page_block_count_checked(&page.blocks)?;
-        let incoming_id_payload = sync_id_owned_source_upper_bound(&page.blocks, false)?;
-        let incoming_sets = checked_mul_bytes(
-            sync_id_hash_set_build_upper_bound(incoming_blocks, incoming_id_payload)?,
-            2,
-        )?;
-        let mut owner_blocks = 0_u64;
-        let mut owner_payload = 0_u64;
-        for snapshot in &current_pages {
-            let snapshot_blocks =
-                u64::try_from(snapshot.blocks.len()).map_err(|_| allocation_overflow())?;
-            owner_blocks = checked_add_bytes(owner_blocks, snapshot_blocks)?;
-            owner_payload = checked_add_bytes(
-                owner_payload,
-                checked_mul_bytes(
-                    snapshot_blocks,
-                    checked_add_bytes(
-                        owned_string_len_upper_bound(usize_to_u64(
-                            std::mem::size_of::<[u8; 36]>(),
-                        )?)?,
-                        owned_string_upper_bound(&snapshot.path)?,
-                    )?,
-                )?,
-            )?;
-        }
-        let owner_map = checked_add_bytes(
-            checked_mul_bytes(
-                owner_blocks,
-                conservative_hash_entry_bytes::<String, (CrdtPageId, String)>()?,
-            )?,
-            owner_payload,
-        )?;
-        let conflicting_owners = checked_add_bytes(
-            checked_mul_bytes(
-                incoming_blocks,
-                conservative_hash_entry_bytes::<(CrdtPageId, String), ()>()?,
-            )?,
-            owner_payload,
-        )?;
-        let rekey_scratch = checked_add_bytes(
-            owned_string_len_upper_bound(checked_add_bytes(
-                largest_block_raw_bytes(&page.blocks)?,
-                usize_to_u64(std::mem::size_of::<[u8; 36]>())?,
-            )?)?,
-            owned_string_len_upper_bound(usize_to_u64(std::mem::size_of::<[u8; 36]>())?)?,
-        )?;
-        let incoming_scan = SyncIdProjectionScanReservation::reserve(
-            &content_budget,
-            &page.blocks,
-            SyncIdProjectionInput::Existing,
-            checked_add_bytes(
-                incoming_sets,
-                checked_add_bytes(
-                    owner_map,
-                    checked_add_bytes(conflicting_owners, rekey_scratch)?,
-                )?,
-            )?,
-            "managed external incoming id projection/set bound",
-        )?;
-        collect_persisted_sync_ids(&page.blocks, page.format, &mut incoming_ids, &incoming_scan)?;
-        let mut owners = std::collections::HashMap::new();
-        for snapshot in &current_pages {
-            if snapshot.path == rel {
-                continue;
-            }
-            for block in &snapshot.blocks {
-                owners.insert(block.id.to_string(), (snapshot.id, snapshot.path.clone()));
-            }
-        }
-        let conflicting_ids: std::collections::HashSet<String> = incoming_ids
-            .iter()
-            .filter(|id| owners.contains_key(*id))
-            .cloned()
-            .collect();
-        let conflicting_owners: std::collections::HashSet<(CrdtPageId, String)> = conflicting_ids
-            .iter()
-            .filter_map(|id| owners.get(id).cloned())
-            .collect();
-
-        // A destination-first file copy and a rename initially look alike because
-        // both retain `id::`. The old projection still existing makes the case
-        // ambiguous, so preserve both pages by assigning the copy fresh durable
-        // identities. Only one now-missing source is sufficient rename evidence.
-        let rename_owner = (current_at_path.is_none() && conflicting_owners.len() == 1)
-            .then(|| conflicting_owners.iter().next().cloned())
-            .flatten()
-            .filter(|(_, source_path)| {
-                self.resolve_managed_rel(write, source_path)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|source| !self.managed_exists(write, &source).unwrap_or(false))
-            });
-        if rename_owner.is_none() && !conflicting_ids.is_empty() {
-            rekey_conflicting_sync_ids(
-                &mut page.blocks,
-                page.format,
-                &conflicting_ids,
-                &incoming_scan,
-            )?;
-        }
-        let page_id = page_id_hint
-            .or_else(|| current_at_path.map(|snapshot| snapshot.id))
-            .or_else(|| rename_owner.map(|(id, _)| id))
-            .unwrap_or_else(CrdtPageId::new);
-        let cache = self.managed_path_is_cacheable(write, path)?;
-        let _publication_reservation = content_budget.reserve(
-            checked_add_bytes(
-                crdt_to_page_dto_upper_bound(&page)?,
-                self.managed_save_writer_upper_bound(&page, path, Some(content), cache)?,
-            )?,
-            "managed external import DTO/writer/cache publication bound",
-        )?;
-        crdt_snapshot_for_page(&page, page_id, &content_budget)?.commit_page(sync)?;
-        let joined = sync
-            .materialize_page(page_id)
-            .map_err(crdt_io_error)?
-            .ok_or_else(|| io::Error::other("imported page vanished from managed sync"))?;
-        let joined = page_dto_from_crdt(&joined)?;
-        drop(sync_guard);
-
-        self.write_page(write, &joined, path, Some(content), true, None, None, cache)?;
-        self.record_managed_projection(write, path);
-        Ok(true)
+        Ok(reconciled)
     }
 
     /// Reconcile the cache for `path` given its already-read `content` — so a
@@ -20078,9 +19127,7 @@ impl Graph {
         was_cached.then_some(entry)
     }
 
-    /// Checked watcher path for an externally removed projection. A Tine delete
-    /// or rename already removed the CRDT page/path, so this is idempotent; an OG
-    /// Logseq/provider deletion becomes operation truth before cache eviction.
+    /// Checked watcher path for an externally removed page file.
     pub fn sync_deleted_file(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         let write = self.admit_managed_text_writer()?;
         let _identity = self.lock_graph_text_identity_mutation()?;
@@ -20092,433 +19139,9 @@ impl Graph {
         if self.managed_exists(&write, path)? {
             return Ok(None);
         }
-        if self
-            .resolve_configured_rel_lexical(&self.rel_path(path))
-            .is_none()
-        {
-            let forgotten = self.forget_file(path);
-            drop(guard);
-            return Ok(forgotten);
-        }
-        let promoted = self.commit_managed_delete(&write, path)?;
         let forgotten = self.forget_file(path);
         drop(guard);
-        if let Some((page_id, paths)) = promoted {
-            self.project_managed_page(page_id, &paths)?;
-        }
         Ok(forgotten)
-    }
-
-    /// Advisory count of blocks that appear to need a durable on-disk identity.
-    /// This read-only UI preview may observe the ambient pathname; its result is
-    /// never accepted as write authority. Migration inventories, validates, and
-    /// revalidates independently through one retained writer capability.
-    pub fn sync_identity_plan(&self) -> io::Result<SyncIdentityPlan> {
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        let mut plan = SyncIdentityPlan {
-            pages: 0,
-            blocks: 0,
-        };
-        let read = self.admit_retained_managed_text_writer()?;
-        for entry in self.managed_text_entries(&read, false)? {
-            let page = self.load_page(&entry)?;
-            let missing = count_missing_sync_ids(&page.blocks, page.format, &budget)?;
-            if missing != 0 {
-                plan.pages += 1;
-                plan.blocks += missing;
-            }
-        }
-        Ok(plan)
-    }
-
-    /// Persist exact block identities through the ordinary guarded page-save
-    /// path. All pages are parsed and validated before the first write. A race
-    /// with an external writer can still stop the write phase part-way through;
-    /// that is safe and resumable because adding an id is semantically inert and
-    /// the next run skips every block already migrated.
-    pub fn migrate_sync_identities(&self) -> io::Result<SyncIdentityMigration> {
-        let write = self.admit_managed_text_writer()?;
-        let mut budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        self.migrate_sync_identities_with_permit(&write, &mut budget)
-    }
-
-    fn migrate_sync_identities_with_permit(
-        &self,
-        write: &ManagedTextWritePermit,
-        budget: &RetainedContentBudget,
-    ) -> io::Result<SyncIdentityMigration> {
-        let mut prepared = Vec::new();
-        let mut prepared_slots =
-            RetainedHeapCharge::new(Some(budget), "managed migration prepared vector capacity")?;
-        let mut graph_ids = std::collections::HashSet::new();
-        let mut graph_ids_reservation =
-            budget.reserve(0, "managed graph sync id validation set")?;
-        let entries = self.managed_text_entries_with_budget(write, false, budget)?;
-        for entry in entries.iter() {
-            let ManagedLoadedPage {
-                mut page,
-                baseline,
-                baseline_reservation,
-                mut page_reservation,
-            } = self.managed_load_page_with_budget(write, &entry, budget)?;
-            let missing = count_missing_sync_ids(&page.blocks, page.format, budget)?;
-            if page.read_only {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("{} is read-only and cannot join managed sync", page.path),
-                ));
-            }
-            persist_page_sync_ids_with_budget(&mut page, &mut page_reservation, budget)?;
-            validate_graph_sync_ids(
-                &page.blocks,
-                page.format,
-                &mut graph_ids,
-                &mut graph_ids_reservation,
-                budget,
-            )?;
-            if missing != 0 {
-                prepared_slots.grow(
-                    conservative_vec_entry_bytes::<PreparedMigrationPage>()?,
-                    "managed migration prepared vector capacity",
-                )?;
-                prepared.push(PreparedMigrationPage {
-                    page,
-                    baseline,
-                    _baseline_reservation: baseline_reservation,
-                    _page_reservation: page_reservation,
-                    missing,
-                });
-            }
-        }
-        let managed_sync_active = self.managed_sync.lock().unwrap().is_some();
-        for page in &prepared {
-            let _serialization = budget.reserve(
-                page_write_construction_upper_bound(&page.page, Some(&page.baseline))?,
-                "prepared managed migration serialization bound",
-            )?;
-            let _operation = if managed_sync_active {
-                Some(budget.reserve(
-                    checked_add_bytes(
-                        page_dto_retained_bytes(&page.page)?,
-                        checked_add_bytes(
-                            crdt_snapshot_build_upper_bound(&page.page)?,
-                            crdt_operation_page_build_upper_bound(&page.page)?,
-                        )?,
-                    )?,
-                    "prepared managed migration operation snapshot bound",
-                )?)
-            } else {
-                None
-            };
-        }
-        sync_identity_after_prepare_hook()?;
-
-        for page in &prepared {
-            let path = self
-                .resolve_managed_rel(write, &page.page.path)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid page path"))?;
-            let current = self.managed_read_to_string_with_budget(
-                write,
-                &path,
-                budget,
-                "managed migration revalidation bytes",
-            )?;
-            if current.as_ref() != page.baseline {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "{} changed while managed-sync identities were being prepared",
-                        page.page.path
-                    ),
-                ));
-            }
-        }
-
-        let mut result = SyncIdentityMigration {
-            pages_changed: 0,
-            blocks_changed: 0,
-        };
-        for page in prepared {
-            self.save_migrated_page_with_permit(write, &page.page, &page.baseline, budget)?;
-            result.pages_changed += 1;
-            result.blocks_changed += page.missing;
-        }
-        Ok(result)
-    }
-
-    fn save_migrated_page_with_permit(
-        &self,
-        write: &ManagedTextWritePermit,
-        page: &PageDto,
-        baseline: &str,
-        budget: &RetainedContentBudget,
-    ) -> io::Result<()> {
-        let path = self
-            .resolve_managed_rel(write, &page.path)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid page path"))?;
-        let cache = self.managed_path_is_cacheable(write, &path)?;
-        let lock = self.page_lock(&path);
-        let _guard = lock.lock().unwrap();
-        let current = self.managed_read_to_string_with_budget(
-            write,
-            &path,
-            budget,
-            "managed migration write revalidation bytes",
-        )?;
-        if current.as_ref() != baseline {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "{} changed while managed-sync identities were being prepared",
-                    path.display()
-                ),
-            ));
-        }
-        #[cfg(test)]
-        observe_managed_migration_writer(|observation| {
-            observation.final_reread_retained = budget.retained();
-            observation.final_reread_bytes = current.reservation.bytes;
-        });
-        if let Some(prepared) =
-            self.prepare_managed_save(page, &path, Some(&current), cache, budget)?
-        {
-            prepared.commit_and_publish(
-                self,
-                write,
-                &path,
-                Some(&current),
-                true,
-                None,
-                None,
-                cache,
-            )?;
-        } else {
-            self.write_page(write, page, &path, Some(&current), true, None, None, cache)?;
-        }
-        Ok(())
-    }
-
-    /// Return a save-ready clone whose every block id is represented in the
-    /// page's native Logseq syntax. Managed-sync saves use this for new blocks
-    /// created after the one-time graph migration.
-    pub fn page_with_sync_ids(&self, page: &PageDto) -> io::Result<PageDto> {
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        page_with_persisted_sync_ids(page, &budget)
-    }
-
-    /// Prepare the complete managed save before operation truth can change.
-    /// The returned owner retains the expanded page, snapshot, scan/snapshot/
-    /// CRDT operation charges, and the source-derived writer/cache charge until
-    /// commit, filesystem publication, marker bookkeeping, and cache publication
-    /// have all returned.
-    fn prepare_managed_save(
-        &self,
-        page: &PageDto,
-        path: &Path,
-        existing: Option<&str>,
-        cache: bool,
-        budget: &RetainedContentBudget,
-    ) -> io::Result<Option<PreparedManagedSaveOperation>> {
-        let relative = self.rel_path(path);
-        if self.resolve_configured_rel_lexical(&relative).is_none() {
-            // Existing graph-wide documents are editable in place, but discovery
-            // is not sparse enrollment or CRDT projection authority.
-            return Ok(None);
-        }
-        let sync_guard = self.managed_sync.lock().unwrap();
-        let Some(sync) = sync_guard.as_ref() else {
-            return Ok(None);
-        };
-        let mut prepared = page_with_persisted_sync_ids_budgeted(page, budget)?;
-        prepared.replace_path(self.rel_path(path), budget)?;
-        let page_id = sync
-            .materialize_page(prepared.page.path.as_str())
-            .map_err(crdt_io_error)?
-            .map(|snapshot| snapshot.id)
-            .unwrap_or_else(CrdtPageId::new);
-        let snapshot = crdt_snapshot_for_page(&prepared.page, page_id, budget)?;
-        let operation_scan_reservation = budget.reserve(
-            checked_add_bytes(
-                sync_id_expansion_construction_upper_bound(&prepared.page.blocks)?,
-                sync_id_projection_scan_upper_bound(
-                    &prepared.page.blocks,
-                    SyncIdProjectionInput::Existing,
-                )?,
-            )?,
-            "managed save retained expansion/projection scan bound",
-        )?;
-        let writer_reservation_bytes =
-            self.managed_save_writer_upper_bound(&prepared.page, path, existing, cache)?;
-        #[cfg(test)]
-        observe_managed_migration_writer(|observation| {
-            observation.retained_before_writer = budget.retained();
-            observation.writer_reservation_bytes = writer_reservation_bytes;
-            observation.writer_reservation_attempted = true;
-        });
-        let writer_reservation = budget.reserve(
-            writer_reservation_bytes,
-            "managed save writer/serialization/cache publication bound",
-        )?;
-        #[cfg(test)]
-        observe_managed_migration_writer(|observation| {
-            observation.retained_after_writer = budget.retained();
-        });
-        Ok(Some(PreparedManagedSaveOperation {
-            budget: budget.clone(),
-            page: prepared,
-            snapshot,
-            _operation_scan_reservation: operation_scan_reservation,
-            _writer_reservation: writer_reservation,
-        }))
-    }
-
-    fn managed_save_writer_upper_bound(
-        &self,
-        page: &PageDto,
-        path: &Path,
-        existing: Option<&str>,
-        cache: bool,
-    ) -> io::Result<u64> {
-        let (serialized, lines) = page_serialized_output_upper_bound(page, existing)?;
-        let mut bytes = page_write_construction_upper_bound(page, existing)?;
-        // The last-moment baseline recheck owns a second file String while the
-        // caller's baseline remains live.
-        if let Some(existing) = existing {
-            bytes = checked_add_bytes(bytes, owned_string_upper_bound(existing)?)?;
-        }
-        // content_rev, recent-write marker, disk-rev publication, and their map
-        // keys can coexist with the serialized bytes and cache document.
-        let revision = owned_string_len_upper_bound(64)?;
-        bytes = checked_add_bytes(bytes, checked_mul_bytes(revision, 4)?)?;
-        bytes = checked_add_bytes(bytes, checked_mul_bytes(owned_path_upper_bound(path)?, 4)?)?;
-        bytes = checked_add_bytes(
-            bytes,
-            checked_mul_bytes(conservative_hash_entry_bytes::<PathBuf, String>()?, 2)?,
-        )?;
-        if page.format == Format::Org {
-            bytes = checked_add_bytes(
-                bytes,
-                managed_page_build_metrics_upper_bound(serialized, lines)?,
-            )?;
-        }
-        if cache {
-            let relative = self.rel_path(path);
-            let entry = PageEntry {
-                name: page.name.clone(),
-                kind: page.kind,
-                date_key: None,
-                rel_path: relative,
-                path: path.to_path_buf(),
-            };
-            // cache_upsert owns the entry, its eviction clone, path/name index
-            // keys, and the Arc<Document> built by the serializer.
-            bytes = checked_add_bytes(
-                bytes,
-                checked_mul_bytes(page_entry_clone_upper_bound(&entry)?, 2)?,
-            )?;
-            bytes = checked_add_bytes(bytes, owned_string_upper_bound(&entry.name)?)?;
-            bytes = checked_add_bytes(
-                bytes,
-                checked_add_bytes(
-                    conservative_hash_entry_bytes::<PathBuf, usize>()?,
-                    conservative_hash_entry_bytes::<(PageKind, String), usize>()?,
-                )?,
-            )?;
-            let (page_blocks, page_source, page_largest_raw) = dto_page_source_metrics(page)?;
-            bytes = checked_add_bytes(
-                bytes,
-                cache_page_derived_upper_bound(&entry, page_blocks, page_source, page_largest_raw)?,
-            )?;
-            let guard = self.cache.read().unwrap();
-            if let Some(pages) = guard.as_ref() {
-                let next_len = pages.len().checked_add(1).ok_or_else(allocation_overflow)?;
-                bytes = checked_add_bytes(
-                    bytes,
-                    conservative_vec_capacity_upper_bound::<(PageEntry, Arc<Document>)>(
-                        usize_to_u64(next_len)?,
-                    )?,
-                )?;
-                // Arc::make_mut clones each PageEntry when any reader retains the
-                // cache Arc. Charging every entry is conservative and source-bound
-                // even when this particular save has unique ownership.
-                for (cached, _doc) in pages.iter() {
-                    bytes = checked_add_bytes(bytes, page_entry_clone_upper_bound(cached)?)?;
-                    let (blocks, source, largest_raw) = document_source_metrics(_doc)?;
-                    bytes = checked_add_bytes(
-                        bytes,
-                        cache_page_derived_upper_bound(cached, blocks, source, largest_raw)?,
-                    )?;
-                }
-            }
-        }
-        Ok(bytes)
-    }
-
-    fn record_managed_projection(&self, write: &ManagedTextWritePermit, path: &Path) {
-        let Ok(content) = self.managed_read_to_string(write, path) else {
-            return;
-        };
-        let rel = self.rel_path(path);
-        let sync_guard = self.managed_sync.lock().unwrap();
-        let Some(sync) = sync_guard.as_ref() else {
-            return;
-        };
-        // A missing receipt is conservative (the file is treated as external),
-        // not data loss. Do not turn a successful page save into a false conflict
-        // if this secondary provenance write fails.
-        if let Err(_error) = sync.record_projection(&rel, &content) {
-            #[cfg(debug_assertions)]
-            eprintln!("managed-sync projection receipt failed for {rel}: {_error}");
-        }
-    }
-
-    fn commit_managed_delete(
-        &self,
-        write: &ManagedTextWritePermit,
-        path: &Path,
-    ) -> io::Result<Option<(CrdtPageId, Vec<String>)>> {
-        let rel = self.rel_path(path);
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        let mut guard = self.managed_sync.lock().unwrap();
-        let Some(sync) = guard.as_mut() else {
-            return Ok(None);
-        };
-        let source = sync.materialize_page(rel.as_str()).map_err(crdt_io_error)?;
-        if let Some(source) = source.as_ref() {
-            let _candidate_vector = budget.reserve(
-                conservative_vec_capacity_upper_bound::<(CrdtPageId, PreparedCrdtPageSnapshot)>(
-                    u64::try_from(sync.status().map_err(crdt_io_error)?.page_count)
-                        .map_err(|_| allocation_overflow())?,
-                )?,
-                "managed copy promotion candidate vector",
-            )?;
-            let mut candidates = Vec::new();
-            for destination in sync.materialize_pages().map_err(crdt_io_error)? {
-                if destination.id == source.id
-                    || !self
-                        .resolve_managed_rel(write, &destination.path)?
-                        .is_some_and(|candidate| {
-                            self.managed_exists(write, &candidate).unwrap_or(false)
-                        })
-                {
-                    continue;
-                }
-                if let Some(promoted) = copy_promotion_snapshot(source, &destination, &budget)? {
-                    candidates.push((destination.id, promoted));
-                }
-            }
-            if candidates.len() == 1 {
-                let (copy_id, promoted) = candidates.pop().unwrap();
-                let source_id = source.id;
-                let report = promoted.promote_copy(sync, source_id, copy_id)?;
-                return Ok(Some((source_id, report.affected_paths)));
-            }
-        }
-        let result = PreparedCrdtDelete::new(rel, source.as_ref(), &budget)?.delete(sync);
-        match result {
-            Ok(_) | Err(crate::crdt::CrdtError::PageNotFound) => Ok(None),
-            Err(error) => Err(crdt_io_error(error)),
-        }
     }
 
     /// Resolve the file a save writes to, and whether it participates in the
@@ -21100,7 +19723,7 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        self.validate_graph_text_portable_aliases_path_local(write, &managed_path)
+        self.validate_graph_text_portable_aliases_path_local(write, &managed_path, false)
     }
 
     fn observe_editor_conflict(
@@ -21682,6 +20305,7 @@ impl Graph {
                 true,
                 Some(plan.expected_identity),
                 None,
+                None,
             )?;
         }
 
@@ -21806,6 +20430,7 @@ impl Graph {
                 "another graph document owns this effective page identity",
             ));
         }
+        let creation_proof = validation.creation_proof;
         let existing: Option<(String, ContentDigest)> = match validation.target {
             Some(ExactGraphLoadedPage {
                 content: disk_s,
@@ -21874,34 +20499,19 @@ impl Graph {
         // M2: write to the SAME path we locked + read the baseline from — never
         // re-resolve `path_for` under the lock (an `exists()`-probe could otherwise
         // pick a different extension if a twin appears mid-save).
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let existing_content = existing.as_ref().map(|(content, _)| content.as_str());
         let expected_identity = existing.as_ref().map(|(_, identity)| *identity);
-        let result = if let Some(prepared) =
-            self.prepare_managed_save(page, &path, existing_content, cache, &budget)?
-        {
-            prepared.commit_and_publish(
-                self,
-                &write,
-                &path,
-                existing_content,
-                true,
-                expected_identity,
-                Some(&editor_episode),
-                cache,
-            )
-        } else {
-            self.write_page(
-                &write,
-                page,
-                &path,
-                existing_content,
-                true,
-                expected_identity,
-                Some(&editor_episode),
-                cache,
-            )
-        };
+        let result = self.write_page(
+            &write,
+            page,
+            &path,
+            existing_content,
+            true,
+            expected_identity,
+            Some(&editor_episode),
+            creation_proof,
+            cache,
+        );
         if result.is_ok() {
             self.revoke_conflict_authority(&path);
         }
@@ -22104,36 +20714,22 @@ impl Graph {
             }
             ConflictSnapshot::Absent => None,
         };
+        let creation_proof = validation.creation_proof;
         // Force is the ordinary editor-save protocol with a substituted baseline.
         // Both the late byte recheck and exact-identity publication remain enabled.
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
         let existing_content = existing.as_ref().map(|(content, _)| content.as_str());
         let expected_identity = existing.as_ref().map(|(_, identity)| *identity);
-        let result = if let Some(prepared) =
-            self.prepare_managed_save(page, &path, existing_content, cache, &budget)?
-        {
-            prepared.commit_and_publish(
-                self,
-                &write,
-                &path,
-                existing_content,
-                true,
-                expected_identity,
-                Some(&editor_episode),
-                cache,
-            )
-        } else {
-            self.write_page(
-                &write,
-                page,
-                &path,
-                existing_content,
-                true,
-                expected_identity,
-                Some(&editor_episode),
-                cache,
-            )
-        };
+        let result = self.write_page(
+            &write,
+            page,
+            &path,
+            existing_content,
+            true,
+            expected_identity,
+            Some(&editor_episode),
+            creation_proof,
+            cache,
+        );
         if result.is_ok() {
             self.revoke_conflict_authority(&path);
         }
@@ -22152,6 +20748,7 @@ impl Graph {
         recheck: bool,
         expected_identity: Option<ContentDigest>,
         editor_episode: Option<&ConflictEditorEpisode>,
+        creation_proof: Option<DirectCreationProof>,
         cache: bool,
     ) -> io::Result<String> {
         let (doc, content) = self.serialize_page_dto_for_path(page, path, existing)?;
@@ -22172,6 +20769,7 @@ impl Graph {
                 recheck,
                 expected_identity,
                 editor_episode,
+                creation_proof,
             )?
         } else {
             content_rev(&content)
@@ -23303,1322 +21901,6 @@ fn dto_blocks_to_doc_checked(blocks: &[BlockDto], is_org: bool) -> io::Result<Ve
             len += 1;
         }
     }
-}
-
-fn persisted_sync_id(
-    raw: &str,
-    format: Format,
-    _scan: &SyncIdProjectionScanReservation,
-) -> Option<String> {
-    let mut block = DocBlock::new(raw);
-    block.is_org = format == Format::Org;
-    block.property("id").filter(|id| !id.is_empty())
-}
-
-fn count_missing_sync_ids_reserved(
-    blocks: &[BlockDto],
-    format: Format,
-    scan: &SyncIdProjectionScanReservation,
-) -> io::Result<usize> {
-    let mut missing = 0_usize;
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        missing = missing
-            .checked_add(usize::from(
-                persisted_sync_id(&block.raw, format, scan).is_none(),
-            ))
-            .ok_or_else(allocation_overflow)?;
-    }
-    Ok(missing)
-}
-
-fn count_missing_sync_ids(
-    blocks: &[BlockDto],
-    format: Format,
-    budget: &RetainedContentBudget,
-) -> io::Result<usize> {
-    let scan = SyncIdProjectionScanReservation::reserve(
-        budget,
-        blocks,
-        SyncIdProjectionInput::Existing,
-        0,
-        "managed missing sync id projection scan",
-    )?;
-    count_missing_sync_ids_reserved(blocks, format, &scan)
-}
-
-fn validate_graph_sync_ids(
-    blocks: &[BlockDto],
-    format: Format,
-    seen: &mut std::collections::HashSet<String>,
-    seen_reservation: &mut RetainedContentReservation,
-    budget: &RetainedContentBudget,
-) -> io::Result<()> {
-    let prospective_ids = checked_add_bytes(
-        u64::try_from(seen.len()).map_err(|_| allocation_overflow())?,
-        page_block_count_checked(blocks)?,
-    )?;
-    let scan = SyncIdProjectionScanReservation::reserve(
-        budget,
-        blocks,
-        SyncIdProjectionInput::Existing,
-        sync_id_hash_set_build_upper_bound(
-            prospective_ids,
-            checked_add_bytes(
-                string_hash_set_retained_bytes(seen)?,
-                sync_id_owned_source_upper_bound(blocks, false)?,
-            )?,
-        )?,
-        "managed graph sync id validation projection/set bound",
-    )?;
-    let validation = validate_graph_sync_ids_reserved(blocks, format, seen, &scan);
-    seen_reservation.replace_with_temporary(
-        scan.into_reservation(),
-        string_hash_set_retained_bytes(seen)?,
-    )?;
-    validation
-}
-
-fn validate_graph_sync_ids_reserved(
-    blocks: &[BlockDto],
-    format: Format,
-    seen: &mut std::collections::HashSet<String>,
-    scan: &SyncIdProjectionScanReservation,
-) -> io::Result<()> {
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        let id = persisted_sync_id(&block.raw, format, scan).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed-sync block has no persisted id",
-            )
-        })?;
-        if Uuid::parse_str(&id).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("persisted block id {id} is not a UUID"),
-            ));
-        }
-        if !seen.insert(id.clone()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("duplicate persisted block id {id} across graph"),
-            ));
-        }
-        drop(id);
-    }
-    Ok(())
-}
-
-fn org_raw_with_sync_id(raw: &str, id: &str) -> String {
-    let newline = if raw.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut offset = 0usize;
-    let mut in_drawer = false;
-    for segment in raw.split_inclusive('\n') {
-        let line = segment.trim_end_matches(['\r', '\n']);
-        let trimmed = line.trim();
-        if trimmed.eq_ignore_ascii_case(":PROPERTIES:") {
-            in_drawer = true;
-        } else if in_drawer && trimmed.eq_ignore_ascii_case(":END:") {
-            let indent_len = line.len() - line.trim_start().len();
-            let indent = &line[..indent_len];
-            let mut out = String::with_capacity(raw.len() + id.len() + 7);
-            out.push_str(&raw[..offset]);
-            out.push_str(indent);
-            out.push_str(":ID: ");
-            out.push_str(id);
-            out.push_str(newline);
-            out.push_str(&raw[offset..]);
-            return out;
-        }
-        offset += segment.len();
-    }
-
-    let separator = if raw.is_empty() || raw.ends_with('\n') {
-        ""
-    } else {
-        newline
-    };
-    format!("{raw}{separator}:PROPERTIES:{newline}:ID: {id}{newline}:END:")
-}
-
-fn raw_with_sync_id(raw: &str, id: &str, format: Format) -> String {
-    if format == Format::Org {
-        return org_raw_with_sync_id(raw, id);
-    }
-    let separator = if raw.is_empty() || raw.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    format!("{raw}{separator}id:: {id}")
-}
-
-fn try_for_each_block_mut(
-    blocks: &mut [BlockDto],
-    mut visit: impl FnMut(&mut BlockDto) -> io::Result<()>,
-) -> io::Result<()> {
-    let mut frames: [Option<std::slice::IterMut<'_, BlockDto>>; MAX_MANAGED_BLOCK_DEPTH] =
-        std::array::from_fn(|_| None);
-    let mut len = usize::from(!blocks.is_empty());
-    if len != 0 {
-        frames[0] = Some(blocks.iter_mut());
-    }
-    while len != 0 {
-        let mut frame = frames[len - 1].take().expect("active mutable block frame");
-        let Some(block) = frame.next() else {
-            len -= 1;
-            continue;
-        };
-        frames[len - 1] = Some(frame);
-        visit(block)?;
-        if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed page block nesting exceeds 128 levels",
-                ));
-            }
-            frames[len] = Some(block.children.iter_mut());
-            len += 1;
-        }
-    }
-    Ok(())
-}
-
-fn persist_block_sync_ids(
-    blocks: &mut [BlockDto],
-    format: Format,
-    seen: &mut std::collections::HashSet<String>,
-    scan: &SyncIdProjectionScanReservation,
-) -> io::Result<()> {
-    try_for_each_block_mut(blocks, |block| {
-        let persisted = persisted_sync_id(&block.raw, format, scan);
-        let id = match persisted {
-            Some(id) => id,
-            None => {
-                let id = Uuid::new_v4().to_string();
-                block.raw = raw_with_sync_id(&block.raw, &id, format);
-                id
-            }
-        };
-        if !seen.insert(id.clone()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("duplicate persisted block id {id}"),
-            ));
-        }
-        Ok(())
-    })
-}
-
-fn page_with_persisted_sync_ids(
-    page: &PageDto,
-    budget: &RetainedContentBudget,
-) -> io::Result<PageDto> {
-    Ok(page_with_persisted_sync_ids_budgeted(page, budget)?.into_page())
-}
-
-struct BudgetedPageDto {
-    page: PageDto,
-    _reservation: RetainedContentReservation,
-}
-
-impl BudgetedPageDto {
-    fn into_page(self) -> PageDto {
-        self.page
-    }
-
-    fn replace_path(&mut self, path: String, budget: &RetainedContentBudget) -> io::Result<()> {
-        let replacement = budget.reserve(
-            owned_string_upper_bound(&path)?,
-            "managed prepared page storage path",
-        )?;
-        self.page.path = path;
-        self._reservation
-            .replace_with_temporary(replacement, page_dto_retained_bytes(&self.page)?)?;
-        Ok(())
-    }
-}
-
-fn clone_block_dtos_checked(blocks: &[BlockDto]) -> io::Result<Vec<BlockDto>> {
-    struct Frame<'a> {
-        source: &'a [BlockDto],
-        next: usize,
-        output: Vec<BlockDto>,
-    }
-    let mut frames: [Option<Frame<'_>>; MAX_MANAGED_BLOCK_DEPTH] = std::array::from_fn(|_| None);
-    frames[0] = Some(Frame {
-        source: blocks,
-        next: 0,
-        output: Vec::with_capacity(blocks.len()),
-    });
-    let mut len = 1_usize;
-    loop {
-        let frame = frames[len - 1].as_mut().expect("active block clone frame");
-        if frame.next == frame.source.len() {
-            let completed = frames[len - 1]
-                .take()
-                .expect("completed block clone frame")
-                .output;
-            len -= 1;
-            if len == 0 {
-                return Ok(completed);
-            }
-            frames[len - 1]
-                .as_mut()
-                .expect("parent block clone frame")
-                .output
-                .last_mut()
-                .expect("child frame has parent")
-                .children = completed;
-            continue;
-        }
-        let block = &frame.source[frame.next];
-        frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
-        frame.output.push(BlockDto {
-            id: block.id.clone(),
-            raw: block.raw.clone(),
-            collapsed: block.collapsed,
-            children: Vec::new(),
-            breadcrumb: block.breadcrumb.clone(),
-            page_property: block.page_property,
-            marker: block.marker.clone(),
-            priority: block.priority.clone(),
-            heading_level: block.heading_level,
-            scheduled: block.scheduled.clone(),
-            deadline: block.deadline.clone(),
-            tags: block.tags.clone(),
-            properties: block.properties.clone(),
-        });
-        if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed page block nesting exceeds 128 levels",
-                ));
-            }
-            frames[len] = Some(Frame {
-                source: &block.children,
-                next: 0,
-                output: Vec::with_capacity(block.children.len()),
-            });
-            len += 1;
-        }
-    }
-}
-
-fn clone_page_dto_checked(page: &PageDto) -> io::Result<PageDto> {
-    Ok(PageDto {
-        // A CLONE is never the live editor. Copying the activation here is
-        // exactly the defect increment 3 exists to close: a cloned DTO carrying
-        // the same identity could spend the real editor's override authority.
-        activation: None,
-        name: page.name.clone(),
-        kind: page.kind,
-        title: page.title.clone(),
-        pre_block: page.pre_block.clone(),
-        blocks: clone_block_dtos_checked(&page.blocks)?,
-        rev: page.rev.clone(),
-        format: page.format,
-        read_only: page.read_only,
-        path: page.path.clone(),
-        guide: page.guide,
-    })
-}
-
-fn page_with_persisted_sync_ids_budgeted(
-    page: &PageDto,
-    budget: &RetainedContentBudget,
-) -> io::Result<BudgetedPageDto> {
-    let mut page_reservation = budget.reserve(
-        page_dto_clone_upper_bound(page)?,
-        "managed sync id page clone",
-    )?;
-    let mut page = clone_page_dto_checked(page)?;
-    persist_page_sync_ids_with_budget(&mut page, &mut page_reservation, budget)?;
-    Ok(BudgetedPageDto {
-        page,
-        _reservation: page_reservation,
-    })
-}
-
-fn persist_page_sync_ids_with_budget(
-    page: &mut PageDto,
-    page_reservation: &mut RetainedContentReservation,
-    budget: &RetainedContentBudget,
-) -> io::Result<()> {
-    let simultaneous = sync_id_expansion_simultaneous_upper_bound(&page.blocks)?;
-    let construction = SyncIdProjectionScanReservation::reserve(
-        budget,
-        &page.blocks,
-        SyncIdProjectionInput::Expanded,
-        simultaneous,
-        "managed sync id expansion projection/construction bound",
-    )?;
-    let result = (|| {
-        let _missing = count_missing_sync_ids_reserved(&page.blocks, page.format, &construction)?;
-        let mut seen = std::collections::HashSet::new();
-        persist_block_sync_ids(&mut page.blocks, page.format, &mut seen, &construction)?;
-        Ok(())
-    })();
-    page_reservation.replace_with_temporary(
-        construction.into_reservation(),
-        page_dto_retained_bytes(page)?,
-    )?;
-    result
-}
-
-fn sync_id_expansion_simultaneous_upper_bound(blocks: &[BlockDto]) -> io::Result<u64> {
-    let count = page_block_count_checked(blocks)?;
-    let largest_raw = largest_block_raw_bytes(blocks)?;
-    let uuid_bytes = usize_to_u64(std::mem::size_of::<[u8; 36]>())?;
-    let markdown_suffix = checked_add_bytes(usize_to_u64("\nid:: ".len())?, uuid_bytes)?;
-    let org_suffix = checked_add_bytes(
-        usize_to_u64("\n:PROPERTIES:\n:ID: \n:END:".len())?,
-        uuid_bytes,
-    )?;
-    let suffix = markdown_suffix.max(org_suffix);
-    checked_add_bytes(
-        sync_id_hash_set_build_upper_bound(count, sync_id_owned_source_upper_bound(blocks, true)?)?,
-        checked_add_bytes(
-            checked_mul_bytes(count, suffix)?,
-            checked_add_bytes(
-                checked_add_bytes(largest_raw, suffix)?,
-                managed_block_walk_stack_upper_bound::<std::slice::IterMut<'_, BlockDto>>()?,
-            )?,
-        )?,
-    )
-}
-
-fn sync_id_expansion_construction_upper_bound(blocks: &[BlockDto]) -> io::Result<u64> {
-    checked_add_bytes(
-        sync_id_projection_scan_upper_bound(blocks, SyncIdProjectionInput::Expanded)?,
-        sync_id_expansion_simultaneous_upper_bound(blocks)?,
-    )
-}
-
-fn string_hash_set_retained_bytes(values: &std::collections::HashSet<String>) -> io::Result<u64> {
-    let buckets = checked_mul_bytes(
-        u64::try_from(values.capacity()).map_err(|_| allocation_overflow())?,
-        checked_add_bytes(usize_to_u64(std::mem::size_of::<String>())?, 16)?,
-    )?;
-    values.iter().try_fold(buckets, |bytes, value| {
-        checked_add_bytes(
-            bytes,
-            u64::try_from(value.capacity()).map_err(|_| allocation_overflow())?,
-        )
-    })
-}
-
-fn collect_persisted_sync_ids(
-    blocks: &[BlockDto],
-    format: Format,
-    output: &mut std::collections::HashSet<String>,
-    scan: &SyncIdProjectionScanReservation,
-) -> io::Result<()> {
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        if let Some(id) = persisted_sync_id(&block.raw, format, scan) {
-            output.insert(id);
-        }
-    }
-    Ok(())
-}
-
-fn replace_persisted_sync_id(
-    raw: &str,
-    old: &str,
-    new: &str,
-    format: Format,
-) -> io::Result<String> {
-    let growth = new.len().checked_sub(old.len()).unwrap_or(0);
-    let capacity = raw
-        .len()
-        .checked_add(growth)
-        .ok_or_else(allocation_overflow)?;
-    let mut output = String::with_capacity(capacity);
-    let mut replaced = false;
-    for segment in raw.split_inclusive('\n') {
-        let (line, ending) = segment
-            .strip_suffix("\r\n")
-            .map(|line| (line, "\r\n"))
-            .or_else(|| segment.strip_suffix('\n').map(|line| (line, "\n")))
-            .unwrap_or((segment, ""));
-        let delimiter = if format == Format::Org {
-            let trimmed = line.trim_start();
-            trimmed
-                .strip_prefix(':')
-                .and_then(|rest| {
-                    rest.find(':')
-                        .map(|index| line.len() - rest.len() + index + 1)
-                })
-                .filter(|index| line[..*index].trim_matches(':').eq_ignore_ascii_case("id"))
-        } else {
-            line.find("::")
-                .filter(|index| line[..*index].trim().eq_ignore_ascii_case("id"))
-                .map(|index| index + 2)
-        };
-        if !replaced && delimiter.is_some_and(|index| line[index..].trim() == old) {
-            let index = delimiter.unwrap();
-            output.push_str(&line[..index]);
-            output.push(' ');
-            output.push_str(new);
-            output.push_str(ending);
-            replaced = true;
-        } else {
-            output.push_str(segment);
-        }
-    }
-    debug_assert!(replaced, "persisted id selected for replacement must exist");
-    Ok(output)
-}
-
-fn rekey_conflicting_sync_ids(
-    blocks: &mut [BlockDto],
-    format: Format,
-    conflicts: &std::collections::HashSet<String>,
-    scan: &SyncIdProjectionScanReservation,
-) -> io::Result<()> {
-    try_for_each_block_mut(blocks, |block| {
-        if let Some(id) = persisted_sync_id(&block.raw, format, scan) {
-            if conflicts.contains(&id) {
-                block.raw = replace_persisted_sync_id(
-                    &block.raw,
-                    &id,
-                    &Uuid::new_v4().to_string(),
-                    format,
-                )?;
-            }
-        }
-        Ok(())
-    })
-}
-
-fn crdt_io_error(error: crate::crdt::CrdtError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error)
-}
-
-fn flatten_crdt_blocks(
-    blocks: &[BlockDto],
-    format: Format,
-    output: &mut Vec<CrdtBlockSnapshot>,
-    scan: &SyncIdProjectionScanReservation,
-) -> io::Result<()> {
-    #[derive(Clone, Copy)]
-    struct Frame<'a> {
-        blocks: &'a [BlockDto],
-        next: usize,
-        parent: Option<CrdtBlockId>,
-    }
-    let empty = Frame {
-        blocks: &[],
-        next: 0,
-        parent: None,
-    };
-    let mut frames = [empty; MAX_MANAGED_BLOCK_DEPTH];
-    let mut len = usize::from(!blocks.is_empty());
-    if len != 0 {
-        frames[0] = Frame {
-            blocks,
-            next: 0,
-            parent: None,
-        };
-    }
-    while len != 0 {
-        let frame = &mut frames[len - 1];
-        if frame.next == frame.blocks.len() {
-            len -= 1;
-            continue;
-        }
-        let order = frame.next;
-        let parent = frame.parent;
-        let block = &frame.blocks[order];
-        frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
-        let persisted = persisted_sync_id(&block.raw, format, scan).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed-sync block has no persisted id",
-            )
-        })?;
-        let uuid = Uuid::parse_str(&persisted).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("persisted block id {persisted} is not a UUID"),
-            )
-        })?;
-        let id = CrdtBlockId::from_uuid(uuid);
-        output.push(CrdtBlockSnapshot {
-            id,
-            parent,
-            order: u32::try_from(order)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many siblings"))?,
-            raw: block.raw.clone(),
-        });
-        if !block.children.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed page block nesting exceeds 128 levels",
-                ));
-            }
-            frames[len] = Frame {
-                blocks: &block.children,
-                next: 0,
-                parent: Some(id),
-            };
-            len += 1;
-        }
-    }
-    Ok(())
-}
-
-struct PreparedCrdtPageSnapshot {
-    snapshot: CrdtPageSnapshot,
-    _reservation: RetainedContentReservation,
-}
-
-struct PreparedJournalMigrationPublication {
-    budget: RetainedContentBudget,
-    page: BudgetedPageDto,
-    snapshot: PreparedCrdtPageSnapshot,
-    _page_construction: RetainedContentReservation,
-    _publication_reservation: RetainedContentReservation,
-}
-
-struct PreparedManagedSaveOperation {
-    budget: RetainedContentBudget,
-    page: BudgetedPageDto,
-    snapshot: PreparedCrdtPageSnapshot,
-    _operation_scan_reservation: RetainedContentReservation,
-    _writer_reservation: RetainedContentReservation,
-}
-
-impl PreparedManagedSaveOperation {
-    fn commit_and_publish(
-        self,
-        graph: &Graph,
-        write: &ManagedTextWritePermit,
-        path: &Path,
-        existing: Option<&str>,
-        recheck: bool,
-        expected_identity: Option<ContentDigest>,
-        editor_episode: Option<&ConflictEditorEpisode>,
-        cache: bool,
-    ) -> io::Result<String> {
-        let Self {
-            budget: _budget,
-            page,
-            snapshot,
-            _operation_scan_reservation,
-            _writer_reservation,
-        } = self;
-        #[cfg(test)]
-        observe_managed_migration_writer(|observation| {
-            observation.pre_mutation_retained = _budget.retained();
-            observation.pre_mutation_peak = _budget.state.peak.get();
-            observation.pre_mutation_observations += 1;
-        });
-        let sync_guard = graph.managed_sync.lock().unwrap();
-        snapshot.commit_page_with_guard_then(sync_guard, || {
-            let result = graph.write_page(
-                write,
-                &page.page,
-                path,
-                existing,
-                recheck,
-                expected_identity,
-                editor_episode,
-                cache,
-            );
-            if result.is_ok() {
-                graph.record_managed_projection(write, path);
-            }
-            result
-        })
-    }
-}
-
-impl std::ops::Deref for PreparedCrdtPageSnapshot {
-    type Target = CrdtPageSnapshot;
-
-    fn deref(&self) -> &Self::Target {
-        &self.snapshot
-    }
-}
-
-struct PreparedCrdtPageBatch {
-    pages: Vec<PreparedCrdtPageSnapshot>,
-    _capacity_reservation: RetainedContentReservation,
-    _operation_reservation: Option<RetainedContentReservation>,
-}
-
-impl PreparedCrdtPageBatch {
-    fn with_capacity(
-        capacity: usize,
-        budget: &RetainedContentBudget,
-        resource: &'static str,
-    ) -> io::Result<Self> {
-        let count = usize_to_u64(capacity)?;
-        let capacity_reservation = budget.reserve(
-            checked_add_bytes(
-                conservative_vec_capacity_upper_bound::<PreparedCrdtPageSnapshot>(count)?,
-                checked_add_bytes(
-                    conservative_vec_capacity_upper_bound::<CrdtPageSnapshot>(count)?,
-                    conservative_vec_capacity_upper_bound::<RetainedContentReservation>(count)?,
-                )?,
-            )?,
-            resource,
-        )?;
-        Ok(Self {
-            pages: Vec::with_capacity(capacity),
-            _capacity_reservation: capacity_reservation,
-            _operation_reservation: None,
-        })
-    }
-
-    fn push(&mut self, page: PreparedCrdtPageSnapshot) {
-        assert!(
-            self.pages.len() < self.pages.capacity(),
-            "prepared CRDT batch capacity was admitted before allocation"
-        );
-        self.pages.push(page);
-    }
-
-    fn admit_operation(
-        mut self,
-        budget: &RetainedContentBudget,
-        resource: &'static str,
-    ) -> io::Result<Self> {
-        let count = usize_to_u64(self.pages.len())?;
-        let mut operation_payload = 0_u64;
-        let mut blocks = 0_u64;
-        for page in &self.pages {
-            let snapshot = &page.snapshot;
-            operation_payload =
-                checked_add_bytes(operation_payload, crdt_snapshot_retained_bytes(snapshot)?)?;
-            blocks = checked_add_bytes(blocks, usize_to_u64(snapshot.blocks.len())?)?;
-        }
-        self._operation_reservation = Some(budget.reserve(
-            crdt_operation_components_upper_bound(count, blocks, operation_payload)?,
-            resource,
-        )?);
-        Ok(self)
-    }
-
-    fn into_owned_parts(
-        self,
-    ) -> (
-        Vec<CrdtPageSnapshot>,
-        Vec<RetainedContentReservation>,
-        RetainedContentReservation,
-        RetainedContentReservation,
-    ) {
-        let Self {
-            pages,
-            _capacity_reservation,
-            _operation_reservation,
-        } = self;
-        let operation_reservation =
-            _operation_reservation.expect("CRDT batch operation must be admitted");
-        let mut snapshots = Vec::with_capacity(pages.len());
-        let mut reservations = Vec::with_capacity(pages.len());
-        for page in pages {
-            snapshots.push(page.snapshot);
-            reservations.push(page._reservation);
-        }
-        (
-            snapshots,
-            reservations,
-            _capacity_reservation,
-            operation_reservation,
-        )
-    }
-}
-
-struct PreparedCrdtReplacement {
-    pages: PreparedCrdtPageBatch,
-    preconditions: Vec<ProjectionPrecondition>,
-    _precondition_reservations: Vec<RetainedContentReservation>,
-    _reservation: RetainedContentReservation,
-}
-
-impl PreparedCrdtReplacement {
-    fn new(
-        pages: PreparedCrdtPageBatch,
-        preconditions: Vec<ProjectionPrecondition>,
-        precondition_reservations: Vec<RetainedContentReservation>,
-        current_pages: &[CrdtPageSnapshot],
-        budget: &RetainedContentBudget,
-    ) -> io::Result<Self> {
-        let count = usize_to_u64(preconditions.len())?;
-        let mut bound = crdt_operation_build_upper_bound(current_pages)?;
-        bound = checked_add_bytes(
-            bound,
-            conservative_vec_capacity_upper_bound::<ProjectionPrecondition>(count)?,
-        )?;
-        bound = checked_add_bytes(
-            bound,
-            conservative_vec_capacity_upper_bound::<RetainedContentReservation>(count)?,
-        )?;
-        for precondition in &preconditions {
-            bound = checked_add_bytes(bound, owned_string_upper_bound(&precondition.path)?)?;
-            if let Some(content) = &precondition.expected_content {
-                bound = checked_add_bytes(bound, owned_string_upper_bound(content)?)?;
-            }
-        }
-        let reservation = budget.reserve(bound, "managed restore replacement/serializer bound")?;
-        Ok(Self {
-            pages,
-            preconditions,
-            _precondition_reservations: precondition_reservations,
-            _reservation: reservation,
-        })
-    }
-}
-
-struct PreparedCrdtDelete {
-    path: String,
-    _reservation: RetainedContentReservation,
-}
-
-impl PreparedCrdtDelete {
-    fn new(
-        path: String,
-        source: Option<&CrdtPageSnapshot>,
-        budget: &RetainedContentBudget,
-    ) -> io::Result<Self> {
-        let bound = match source {
-            Some(source) => crdt_operation_build_upper_bound(std::slice::from_ref(source))?,
-            None => crdt_operation_components_upper_bound(1, 0, owned_string_upper_bound(&path)?)?,
-        };
-        Ok(Self {
-            path,
-            _reservation: budget.reserve(bound, "managed delete CRDT/store construction bound")?,
-        })
-    }
-}
-
-/// The only model-side CRDT mutation boundary. The capability constructor is
-/// private to this child module, whose methods consume complete prepared owners;
-/// parent-module production code can neither mint the proof nor detach it from
-/// the reservation and payload that authorize the mutation.
-mod prepared_crdt_mutation {
-    use super::*;
-
-    pub(crate) struct PreparedCrdtMutationCapability<'a> {
-        _reservation: &'a RetainedContentReservation,
-        _not_send: std::marker::PhantomData<Rc<()>>,
-    }
-
-    impl<'a> PreparedCrdtMutationCapability<'a> {
-        fn new(reservation: &'a RetainedContentReservation) -> Self {
-            Self {
-                _reservation: reservation,
-                _not_send: std::marker::PhantomData,
-            }
-        }
-    }
-
-    impl PreparedJournalMigrationPublication {
-        pub(super) fn commit_and_project(
-            self,
-            graph: &Graph,
-            mut sync_guard: std::sync::MutexGuard<'_, Option<CrdtGraph>>,
-            page_id: CrdtPageId,
-        ) -> io::Result<()> {
-            let Self {
-                budget: _budget,
-                page: _page,
-                snapshot:
-                    PreparedCrdtPageSnapshot {
-                        snapshot,
-                        _reservation,
-                    },
-                _page_construction,
-                _publication_reservation,
-            } = self;
-            let report = {
-                let sync = sync_guard.as_mut().ok_or_else(|| {
-                    io::Error::other("managed sync stopped during journal migration")
-                })?;
-                let mut authority = PreparedCrdtMutationCapability::new(&_reservation);
-                sync.commit_page_owned(snapshot, &mut authority)
-                    .map_err(crdt_io_error)?
-            };
-            drop(sync_guard);
-            graph.project_managed_page(page_id, &report.affected_paths)?;
-            Ok(())
-        }
-    }
-
-    impl PreparedCrdtPageSnapshot {
-        pub(super) fn commit_page(
-            self,
-            sync: &mut CrdtGraph,
-        ) -> io::Result<crate::crdt::CommitReport> {
-            let Self {
-                snapshot,
-                _reservation,
-            } = self;
-            let mut authority = PreparedCrdtMutationCapability::new(&_reservation);
-            sync.commit_page_owned(snapshot, &mut authority)
-                .map_err(crdt_io_error)
-        }
-
-        pub(super) fn commit_page_with_guard_then<R>(
-            self,
-            mut sync_guard: std::sync::MutexGuard<'_, Option<CrdtGraph>>,
-            after_commit: impl FnOnce() -> io::Result<R>,
-        ) -> io::Result<R> {
-            let Self {
-                snapshot,
-                _reservation,
-            } = self;
-            let sync = sync_guard
-                .as_mut()
-                .ok_or_else(|| io::Error::other("managed sync stopped during save"))?;
-            let mut authority = PreparedCrdtMutationCapability::new(&_reservation);
-            sync.commit_page_owned(snapshot, &mut authority)
-                .map_err(crdt_io_error)?;
-            drop(sync_guard);
-            after_commit()
-        }
-
-        pub(super) fn promote_copy(
-            self,
-            sync: &mut CrdtGraph,
-            source_page_id: CrdtPageId,
-            copy_page_id: CrdtPageId,
-        ) -> io::Result<crate::crdt::CommitReport> {
-            let Self {
-                snapshot,
-                _reservation,
-            } = self;
-            let mut authority = PreparedCrdtMutationCapability::new(&_reservation);
-            sync.promote_copy_owned(source_page_id, copy_page_id, snapshot, &mut authority)
-                .map_err(crdt_io_error)
-        }
-    }
-
-    impl PreparedCrdtPageBatch {
-        pub(super) fn initialize_at(
-            self,
-            sync_root: &Path,
-            graph: &Dir,
-            device_id: Uuid,
-            session_id: Uuid,
-        ) -> io::Result<CrdtGraph> {
-            let (
-                snapshots,
-                _snapshot_reservations,
-                _batch_capacity_reservation,
-                _batch_operation_reservation,
-            ) = self.into_owned_parts();
-            let mut authority = PreparedCrdtMutationCapability::new(&_batch_operation_reservation);
-            CrdtGraph::initialize_at_owned(
-                sync_root,
-                graph,
-                device_id,
-                session_id,
-                snapshots,
-                &mut authority,
-            )
-            .map_err(crdt_io_error)
-        }
-
-        pub(super) fn commit_pages(
-            self,
-            sync: &mut CrdtGraph,
-        ) -> io::Result<crate::crdt::CommitReport> {
-            let (
-                snapshots,
-                _snapshot_reservations,
-                _batch_capacity_reservation,
-                _batch_operation_reservation,
-            ) = self.into_owned_parts();
-            let mut authority = PreparedCrdtMutationCapability::new(&_batch_operation_reservation);
-            sync.commit_pages_owned(snapshots, &mut authority)
-                .map_err(crdt_io_error)
-        }
-    }
-
-    impl PreparedCrdtReplacement {
-        pub(super) fn replace(self, sync: &mut CrdtGraph) -> io::Result<crate::crdt::CommitReport> {
-            let Self {
-                pages,
-                preconditions,
-                _precondition_reservations,
-                _reservation,
-            } = self;
-            let (
-                snapshots,
-                _snapshot_reservations,
-                _batch_capacity_reservation,
-                _batch_operation_reservation,
-            ) = pages.into_owned_parts();
-            let mut authority = PreparedCrdtMutationCapability::new(&_reservation);
-            sync.replace_pages_with_projection_preconditions_owned(
-                snapshots,
-                preconditions,
-                &mut authority,
-            )
-            .map_err(crdt_io_error)
-        }
-    }
-
-    impl PreparedCrdtDelete {
-        pub(super) fn delete(
-            self,
-            sync: &mut CrdtGraph,
-        ) -> Result<crate::crdt::CommitReport, crate::crdt::CrdtError> {
-            let Self { path, _reservation } = self;
-            let mut authority = PreparedCrdtMutationCapability::new(&_reservation);
-            sync.delete_page_owned(path, &mut authority)
-        }
-    }
-}
-
-pub(crate) use prepared_crdt_mutation::PreparedCrdtMutationCapability;
-
-fn crdt_snapshot_for_page(
-    page: &PageDto,
-    id: CrdtPageId,
-    budget: &RetainedContentBudget,
-) -> io::Result<PreparedCrdtPageSnapshot> {
-    if page.path.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "managed-sync page snapshot has no storage path",
-        ));
-    }
-    let reservation = budget.reserve(
-        checked_add_bytes(
-            crdt_snapshot_build_upper_bound(page)?,
-            crdt_operation_page_build_upper_bound(page)?,
-        )?,
-        "managed CRDT snapshot/operation construction bound",
-    )?;
-    let block_count = usize::try_from(page_block_count_checked(&page.blocks)?)
-        .map_err(|_| allocation_overflow())?;
-    let mut blocks = Vec::with_capacity(block_count);
-    let scan = SyncIdProjectionScanReservation::reserve(
-        budget,
-        &page.blocks,
-        SyncIdProjectionInput::Existing,
-        0,
-        "managed CRDT snapshot sync id projection scan",
-    )?;
-    flatten_crdt_blocks(&page.blocks, page.format, &mut blocks, &scan)?;
-    drop(scan);
-    Ok(PreparedCrdtPageSnapshot {
-        snapshot: CrdtPageSnapshot {
-            id,
-            path: page.path.clone(),
-            name: page.name.clone(),
-            kind: match page.kind {
-                PageKind::Page => "page",
-                PageKind::Journal => "journal",
-            }
-            .into(),
-            format: page.format.ext().into(),
-            pre_block: page.pre_block.clone(),
-            blocks,
-        },
-        _reservation: reservation,
-    })
-}
-
-fn copy_promotion_snapshot(
-    source: &CrdtPageSnapshot,
-    destination: &CrdtPageSnapshot,
-    budget: &RetainedContentBudget,
-) -> io::Result<Option<PreparedCrdtPageSnapshot>> {
-    if source.kind != destination.kind
-        || source.format != destination.format
-        || source.pre_block != destination.pre_block
-    {
-        return Ok(None);
-    }
-    let format = match source.format.as_str() {
-        "md" => Format::Md,
-        "org" => Format::Org,
-        _ => return Ok(None),
-    };
-    let source_blocks = u64::try_from(source.blocks.len()).map_err(|_| allocation_overflow())?;
-    let destination_blocks =
-        u64::try_from(destination.blocks.len()).map_err(|_| allocation_overflow())?;
-    let map_entries = checked_add_bytes(source_blocks, destination_blocks)?;
-    let mut construction = checked_add_bytes(
-        crdt_snapshot_source_owned_upper_bound(source)?,
-        crdt_snapshot_source_owned_upper_bound(destination)?,
-    )?;
-    for class in [
-        conservative_hash_entry_bytes::<Option<CrdtBlockId>, Vec<&CrdtBlockSnapshot>>()?,
-        conservative_hash_entry_bytes::<Option<CrdtBlockId>, Vec<&CrdtBlockSnapshot>>()?,
-        conservative_hash_entry_bytes::<CrdtBlockId, CrdtBlockId>()?,
-        conservative_vec_entry_bytes::<&CrdtBlockSnapshot>()?,
-        conservative_vec_entry_bytes::<&CrdtBlockSnapshot>()?,
-    ] {
-        construction = checked_add_bytes(construction, checked_mul_bytes(map_entries, class)?)?;
-    }
-    construction = checked_add_bytes(
-        construction,
-        checked_mul_bytes(
-            checked_add_bytes(source_blocks, destination_blocks)?,
-            owned_string_len_upper_bound(usize_to_u64(std::mem::size_of::<[u8; 36]>())?)?,
-        )?,
-    )?;
-    construction = checked_add_bytes(
-        construction,
-        managed_block_walk_stack_upper_bound::<(
-            &[&CrdtBlockSnapshot],
-            &[&CrdtBlockSnapshot],
-            usize,
-        )>()?,
-    )?;
-    let reservation = budget.reserve(
-        checked_add_bytes(
-            construction,
-            crdt_operation_build_upper_bound(std::slice::from_ref(destination))?,
-        )?,
-        "managed copy promotion construction/operation bound",
-    )?;
-    fn ordered_children<'a>(
-        blocks: &'a [CrdtBlockSnapshot],
-    ) -> std::collections::HashMap<Option<CrdtBlockId>, Vec<&'a CrdtBlockSnapshot>> {
-        let mut children = std::collections::HashMap::new();
-        for block in blocks {
-            children
-                .entry(block.parent)
-                .or_insert_with(Vec::new)
-                .push(block);
-        }
-        for siblings in children.values_mut() {
-            siblings.sort_by_key(|block| (block.order, block.id));
-        }
-        children
-    }
-    let source_children = ordered_children(&source.blocks);
-    let destination_children = ordered_children(&destination.blocks);
-    let mut id_map = std::collections::HashMap::new();
-    #[derive(Clone, Copy)]
-    struct PairFrame<'a> {
-        source: &'a [&'a CrdtBlockSnapshot],
-        destination: &'a [&'a CrdtBlockSnapshot],
-        next: usize,
-    }
-    let empty = PairFrame {
-        source: &[],
-        destination: &[],
-        next: 0,
-    };
-    let mut frames = [empty; MAX_MANAGED_BLOCK_DEPTH];
-    let source_roots = source_children.get(&None).map(Vec::as_slice).unwrap_or(&[]);
-    let destination_roots = destination_children
-        .get(&None)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    if source_roots.len() != destination_roots.len() {
-        return Ok(None);
-    }
-    frames[0] = PairFrame {
-        source: source_roots,
-        destination: destination_roots,
-        next: 0,
-    };
-    let mut len = 1_usize;
-    let marker = Uuid::nil().to_string();
-    let mut matched = true;
-    while len != 0 {
-        let frame = &mut frames[len - 1];
-        if frame.next == frame.source.len() {
-            len -= 1;
-            continue;
-        }
-        let source_block = frame.source[frame.next];
-        let destination_block = frame.destination[frame.next];
-        frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
-        let source_raw = replace_persisted_sync_id(
-            &source_block.raw,
-            &source_block.id.to_string(),
-            &marker,
-            format,
-        )?;
-        let destination_raw = replace_persisted_sync_id(
-            &destination_block.raw,
-            &destination_block.id.to_string(),
-            &marker,
-            format,
-        )?;
-        if source_block.order != destination_block.order || source_raw != destination_raw {
-            matched = false;
-            break;
-        }
-        id_map.insert(destination_block.id, source_block.id);
-        let source_nested = source_children
-            .get(&Some(source_block.id))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let destination_nested = destination_children
-            .get(&Some(destination_block.id))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if source_nested.len() != destination_nested.len() {
-            matched = false;
-            break;
-        }
-        if !source_nested.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed copy promotion nesting exceeds 128 levels",
-                ));
-            }
-            frames[len] = PairFrame {
-                source: source_nested,
-                destination: destination_nested,
-                next: 0,
-            };
-            len += 1;
-        }
-    }
-
-    if !matched || id_map.len() != source.blocks.len() || id_map.len() != destination.blocks.len() {
-        return Ok(None);
-    }
-
-    let mut promoted = destination.clone();
-    promoted.id = source.id;
-    for block in &mut promoted.blocks {
-        let old = block.id;
-        let Some(new) = id_map.get(&old).copied() else {
-            return Ok(None);
-        };
-        block.id = new;
-        block.parent = block.parent.and_then(|parent| id_map.get(&parent).copied());
-        block.raw =
-            replace_persisted_sync_id(&block.raw, &old.to_string(), &new.to_string(), format)?;
-    }
-    Ok(Some(PreparedCrdtPageSnapshot {
-        snapshot: promoted,
-        _reservation: reservation,
-    }))
-}
-
-fn dto_blocks_from_crdt(blocks: &[CrdtBlockSnapshot], is_org: bool) -> io::Result<Vec<DocBlock>> {
-    let mut children: std::collections::HashMap<Option<CrdtBlockId>, Vec<&CrdtBlockSnapshot>> =
-        std::collections::HashMap::new();
-    for block in blocks {
-        children.entry(block.parent).or_default().push(block);
-    }
-    for siblings in children.values_mut() {
-        siblings.sort_by_key(|block| (block.order, block.id));
-    }
-    struct Frame<'a> {
-        source: &'a [&'a CrdtBlockSnapshot],
-        next: usize,
-        output: Vec<DocBlock>,
-    }
-    let roots = children.get(&None).map(Vec::as_slice).unwrap_or(&[]);
-    let mut frames: [Option<Frame<'_>>; MAX_MANAGED_BLOCK_DEPTH] = std::array::from_fn(|_| None);
-    frames[0] = Some(Frame {
-        source: roots,
-        next: 0,
-        output: Vec::with_capacity(roots.len()),
-    });
-    let mut len = 1_usize;
-    loop {
-        let frame = frames[len - 1]
-            .as_mut()
-            .expect("active CRDT conversion frame");
-        if frame.next == frame.source.len() {
-            let completed = frames[len - 1]
-                .take()
-                .expect("completed CRDT conversion frame")
-                .output;
-            len -= 1;
-            if len == 0 {
-                return Ok(completed);
-            }
-            frames[len - 1]
-                .as_mut()
-                .expect("parent CRDT conversion frame")
-                .output
-                .last_mut()
-                .expect("child frame has parent")
-                .children = completed;
-            continue;
-        }
-        let block = frame.source[frame.next];
-        frame.next = frame.next.checked_add(1).ok_or_else(allocation_overflow)?;
-        frame.output.push(DocBlock {
-            raw: block.raw.clone(),
-            children: Vec::new(),
-            uuid: String::new(),
-            is_org,
-            proj: std::sync::OnceLock::new(),
-        });
-        let nested = children
-            .get(&Some(block.id))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if !nested.is_empty() {
-            if len == MAX_MANAGED_BLOCK_DEPTH {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "managed CRDT page nesting exceeds 128 levels",
-                ));
-            }
-            frames[len] = Some(Frame {
-                source: nested,
-                next: 0,
-                output: Vec::with_capacity(nested.len()),
-            });
-            len += 1;
-        }
-    }
-}
-
-fn page_dto_from_crdt(snapshot: &CrdtPageSnapshot) -> io::Result<PageDto> {
-    let kind = match snapshot.kind.as_str() {
-        "page" => PageKind::Page,
-        "journal" => PageKind::Journal,
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown managed-sync page kind {other}"),
-            ))
-        }
-    };
-    let format = match snapshot.format.as_str() {
-        "md" => Format::Md,
-        "org" => Format::Org,
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown managed-sync page format {other}"),
-            ))
-        }
-    };
-    let mut doc_blocks = dto_blocks_from_crdt(&snapshot.blocks, format == Format::Org)?;
-    assign_runtime_ids_checked(
-        &mut doc_blocks,
-        runtime_owner_namespace("file-block-runtime-v1", &snapshot.path),
-    )?;
-    Ok(PageDto {
-        activation: None,
-        name: snapshot.name.clone(),
-        kind,
-        title: snapshot.name.clone(),
-        pre_block: snapshot.pre_block.clone(),
-        blocks: doc_blocks_to_dto_checked(&doc_blocks)?,
-        rev: None,
-        format,
-        read_only: false,
-        path: snapshot.path.clone(),
-        guide: false,
-    })
 }
 
 fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
@@ -26830,106 +24112,6 @@ fn page_dto_clone_upper_bound(page: &PageDto) -> io::Result<u64> {
     Ok(bytes)
 }
 
-fn crdt_snapshot_retained_bytes(snapshot: &CrdtPageSnapshot) -> io::Result<u64> {
-    let mut bytes = 0_u64;
-    for value in [
-        &snapshot.path,
-        &snapshot.name,
-        &snapshot.kind,
-        &snapshot.format,
-    ] {
-        bytes = checked_add_bytes(bytes, string_retained_bytes(value)?)?;
-    }
-    bytes = checked_add_bytes(
-        bytes,
-        capacity_bytes::<CrdtBlockSnapshot>(snapshot.blocks.capacity())?,
-    )?;
-    if let Some(pre_block) = &snapshot.pre_block {
-        bytes = checked_add_bytes(bytes, string_retained_bytes(pre_block)?)?;
-    }
-    for block in &snapshot.blocks {
-        bytes = checked_add_bytes(bytes, string_retained_bytes(&block.raw)?)?;
-    }
-    Ok(bytes)
-}
-
-fn crdt_snapshot_source_owned_upper_bound(snapshot: &CrdtPageSnapshot) -> io::Result<u64> {
-    let mut bytes = owned_string_upper_bound(&snapshot.path)?;
-    for value in [
-        snapshot.name.as_str(),
-        snapshot.kind.as_str(),
-        snapshot.format.as_str(),
-    ] {
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(value)?)?;
-    }
-    if let Some(pre_block) = &snapshot.pre_block {
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(pre_block)?)?;
-    }
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_vec_capacity_upper_bound::<CrdtBlockSnapshot>(
-            u64::try_from(snapshot.blocks.len()).map_err(|_| allocation_overflow())?,
-        )?,
-    )?;
-    for block in &snapshot.blocks {
-        bytes = checked_add_bytes(bytes, owned_string_upper_bound(&block.raw)?)?;
-    }
-    Ok(bytes)
-}
-
-fn page_block_count_checked(blocks: &[BlockDto]) -> io::Result<u64> {
-    let mut count = 0_u64;
-    let mut walk = BlockDtoWalk::new(blocks);
-    while walk.next()?.is_some() {
-        count = checked_add_bytes(count, 1)?;
-    }
-    Ok(count)
-}
-
-fn sync_id_owned_source_upper_bound(blocks: &[BlockDto], generated: bool) -> io::Result<u64> {
-    let mut bytes = 0_u64;
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        let source_len = if generated {
-            block.raw.len().max(std::mem::size_of::<[u8; 36]>())
-        } else {
-            block.raw.len()
-        };
-        bytes = checked_add_bytes(
-            bytes,
-            owned_string_len_upper_bound(
-                u64::try_from(source_len).map_err(|_| allocation_overflow())?,
-            )?,
-        )?;
-    }
-    Ok(bytes)
-}
-
-fn sync_id_root_to_leaf_upper_bound(blocks: &[BlockDto]) -> io::Result<u64> {
-    let mut largest = 0_u64;
-    let mut per_depth = [0_u64; MAX_MANAGED_BLOCK_DEPTH];
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, depth)) = walk.next()? {
-        let slot = depth.checked_sub(1).ok_or_else(allocation_overflow)?;
-        per_depth[slot] = owned_string_upper_bound(&block.raw)?;
-        let mut path = 0_u64;
-        for value in &per_depth[..depth] {
-            path = checked_add_bytes(path, *value)?;
-        }
-        largest = largest.max(path);
-    }
-    Ok(largest)
-}
-
-fn largest_block_raw_bytes(blocks: &[BlockDto]) -> io::Result<u64> {
-    let mut largest = 0_u64;
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        largest = largest.max(u64::try_from(block.raw.len()).map_err(|_| allocation_overflow())?);
-    }
-    Ok(largest)
-}
-
 /// Source-derived upper bound for the parser, runtime-id assignment, lsdoc
 /// projections, DTO construction, and all simultaneously live parser/DTO
 /// buffers. Every term is tied to an owned lsdoc/Tine allocation class. A
@@ -27002,250 +24184,6 @@ fn managed_page_build_metrics_upper_bound(source: u64, lines: u64) -> io::Result
         managed_block_walk_stack_upper_bound::<(&[DocBlock], usize, Vec<BlockDto>)>()?,
     )?;
     Ok(bytes)
-}
-
-#[derive(Clone, Copy)]
-enum SyncIdProjectionInput {
-    Existing,
-    Expanded,
-}
-
-struct SyncIdProjectionScanReservation {
-    reservation: RetainedContentReservation,
-}
-
-impl SyncIdProjectionScanReservation {
-    fn reserve(
-        budget: &RetainedContentBudget,
-        blocks: &[BlockDto],
-        input: SyncIdProjectionInput,
-        simultaneous_bytes: u64,
-        resource: &'static str,
-    ) -> io::Result<Self> {
-        let projection = sync_id_projection_scan_upper_bound(blocks, input)?;
-        let retained_ancestor_ids = sync_id_root_to_leaf_upper_bound(blocks)?;
-        Ok(Self {
-            reservation: budget.reserve(
-                checked_add_bytes(
-                    projection,
-                    checked_add_bytes(
-                        retained_ancestor_ids,
-                        checked_add_bytes(
-                            simultaneous_bytes,
-                            managed_block_walk_stack_upper_bound::<BlockDtoWalkFrame<'_>>()?,
-                        )?,
-                    )?,
-                )?,
-                resource,
-            )?,
-        })
-    }
-
-    fn into_reservation(self) -> RetainedContentReservation {
-        self.reservation
-    }
-}
-
-/// One `persisted_sync_id` call owns a cloned `DocBlock::raw`, lsdoc's complete
-/// parse/projection, and the cloned property result. The appended syntax is
-/// built mechanically from the longest native property spelling.
-fn sync_id_projection_block_upper_bound(
-    raw: &str,
-    input: SyncIdProjectionInput,
-) -> io::Result<u64> {
-    let source = u64::try_from(raw.len()).map_err(|_| allocation_overflow())?;
-    let lines = if raw.is_empty() {
-        0
-    } else {
-        checked_add_bytes(
-            u64::try_from(raw.bytes().filter(|byte| *byte == b'\n').count())
-                .map_err(|_| allocation_overflow())?,
-            1,
-        )?
-    };
-    let (source, lines) = match input {
-        SyncIdProjectionInput::Existing => (source, lines),
-        SyncIdProjectionInput::Expanded => {
-            let uuid_bytes = usize_to_u64(std::mem::size_of::<[u8; 36]>())?;
-            let markdown_bytes = checked_add_bytes(usize_to_u64("\nid:: ".len())?, uuid_bytes)?;
-            let org_bytes = checked_add_bytes(
-                usize_to_u64("\n:PROPERTIES:\n:ID: \n:END:".len())?,
-                uuid_bytes,
-            )?;
-            (
-                checked_add_bytes(source, markdown_bytes.max(org_bytes))?,
-                checked_add_bytes(lines, 3)?,
-            )
-        }
-    };
-    checked_add_bytes(
-        managed_page_build_metrics_upper_bound(source, lines)?,
-        owned_string_len_upper_bound(source)?,
-    )
-}
-
-fn sync_id_projection_scan_upper_bound(
-    blocks: &[BlockDto],
-    input: SyncIdProjectionInput,
-) -> io::Result<u64> {
-    let mut largest = 0_u64;
-    let mut walk = BlockDtoWalk::new(blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        largest = largest.max(sync_id_projection_block_upper_bound(&block.raw, input)?);
-    }
-    Ok(largest)
-}
-
-/// HashSet buckets and String headers are type-derived; owned payload storage is
-/// source-derived because accepted legacy properties may contain arbitrary
-/// nonempty UTF-8 text before the caller applies its UUID policy.
-fn sync_id_hash_set_build_upper_bound(entries: u64, owned_ids: u64) -> io::Result<u64> {
-    checked_add_bytes(
-        checked_mul_bytes(entries, conservative_hash_entry_bytes::<String, ()>()?)?,
-        owned_ids,
-    )
-}
-
-/// The snapshot clones page/path/name/pre-block and every raw block string into
-/// one flat vector. All terms are computed from the source DTO before the first
-/// snapshot allocation; conservative capacity helpers cover geometric growth
-/// and allocator rounding.
-fn crdt_snapshot_build_upper_bound(page: &PageDto) -> io::Result<u64> {
-    let retained = crdt_snapshot_payload_upper_bound(page)?;
-    let flatten_locals = sync_id_root_to_leaf_upper_bound(&page.blocks)?;
-    let flatten_stack = managed_block_walk_stack_upper_bound::<BlockDtoWalkFrame<'_>>()?;
-    checked_add_bytes(
-        retained,
-        checked_add_bytes(
-            sync_id_projection_scan_upper_bound(&page.blocks, SyncIdProjectionInput::Existing)?,
-            checked_add_bytes(flatten_locals, flatten_stack)?,
-        )?,
-    )
-}
-
-fn crdt_snapshot_payload_upper_bound(page: &PageDto) -> io::Result<u64> {
-    let blocks = page_block_count_checked(&page.blocks)?;
-    let mut retained = owned_string_upper_bound(&page.path)?;
-    retained = checked_add_bytes(retained, owned_string_upper_bound(&page.name)?)?;
-    retained = checked_add_bytes(
-        retained,
-        owned_string_upper_bound(match page.kind {
-            PageKind::Page => "page",
-            PageKind::Journal => "journal",
-        })?,
-    )?;
-    retained = checked_add_bytes(retained, owned_string_upper_bound(page.format.ext())?)?;
-    if let Some(pre_block) = &page.pre_block {
-        retained = checked_add_bytes(retained, owned_string_upper_bound(pre_block)?)?;
-    }
-    let mut walk = BlockDtoWalk::new(&page.blocks);
-    while let Some((block, _depth)) = walk.next()? {
-        retained = checked_add_bytes(retained, owned_string_upper_bound(&block.raw)?)?;
-    }
-    retained = checked_add_bytes(
-        retained,
-        conservative_vec_capacity_upper_bound::<CrdtBlockSnapshot>(blocks)?,
-    )?;
-    Ok(retained)
-}
-
-fn crdt_operation_build_upper_bound(pages: &[CrdtPageSnapshot]) -> io::Result<u64> {
-    let mut payload = 0_u64;
-    let mut blocks = 0_u64;
-    for page in pages {
-        payload = checked_add_bytes(payload, crdt_snapshot_retained_bytes(page)?)?;
-        blocks = checked_add_bytes(
-            blocks,
-            u64::try_from(page.blocks.len()).map_err(|_| allocation_overflow())?,
-        )?;
-    }
-    crdt_operation_components_upper_bound(
-        u64::try_from(pages.len()).map_err(|_| allocation_overflow())?,
-        blocks,
-        payload,
-    )
-}
-
-fn crdt_operation_page_build_upper_bound(page: &PageDto) -> io::Result<u64> {
-    crdt_operation_components_upper_bound(
-        1,
-        page_block_count_checked(&page.blocks)?,
-        crdt_snapshot_payload_upper_bound(page)?,
-    )
-}
-
-fn crdt_operation_components_upper_bound(pages: u64, blocks: u64, payload: u64) -> io::Result<u64> {
-    let mut bytes = 0_u64;
-    // Simultaneously live owned payloads: Loro tree/text state, exported update,
-    // Store::publish's payload, and the final immutable envelope.
-    for _class in ["loro state", "exported update", "store payload", "envelope"] {
-        bytes = checked_add_bytes(bytes, payload)?;
-    }
-    // Snapshot validation and apply_page container allocations.
-    for class in [
-        conservative_hash_entry_bytes::<CrdtBlockId, &CrdtBlockSnapshot>()?,
-        conservative_hash_entry_bytes::<(Option<CrdtBlockId>, u32), ()>()?,
-        conservative_hash_entry_bytes::<CrdtBlockId, CrdtBlockId>()?,
-        conservative_hash_entry_bytes::<CrdtBlockId, usize>()?,
-        conservative_vec_entry_bytes::<&CrdtBlockSnapshot>()?,
-    ] {
-        bytes = checked_add_bytes(bytes, checked_mul_bytes(blocks, class)?)?;
-    }
-    // Per-page affected-page/path state and page-level validation/apply maps.
-    let affected_page = checked_add_bytes(
-        conservative_vec_entry_bytes::<crate::crdt::AffectedPage>()?,
-        conservative_vec_entry_bytes::<String>()?,
-    )?;
-    bytes = checked_add_bytes(bytes, checked_mul_bytes(pages, affected_page)?)?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(
-            pages,
-            conservative_hash_entry_bytes::<CrdtPageId, String>()?,
-        )?,
-    )?;
-    // Each logical field produces a bounded CRDT operation record. The record
-    // shape is derived from its actual identifiers/order/value headers.
-    let page_record = conservative_vec_entry_bytes::<(CrdtPageId, &'static str, String)>()?;
-    for field in [
-        "node_type",
-        "page_id",
-        "path",
-        "name",
-        "kind",
-        "format",
-        "pre_block_present",
-        "pre_block",
-    ] {
-        bytes = checked_add_bytes(
-            bytes,
-            checked_mul_bytes(
-                pages,
-                checked_add_bytes(page_record, owned_string_upper_bound(field)?)?,
-            )?,
-        )?;
-    }
-    let block_record = conservative_vec_entry_bytes::<(
-        CrdtBlockId,
-        Option<CrdtBlockId>,
-        u32,
-        &'static str,
-        String,
-    )>()?;
-    for field in ["node_type", "block_id", "raw", "parent/order"] {
-        bytes = checked_add_bytes(
-            bytes,
-            checked_mul_bytes(
-                blocks,
-                checked_add_bytes(block_record, owned_string_upper_bound(field)?)?,
-            )?,
-        )?;
-    }
-    // SHA-256 state/checksum and envelope fixed-width lengths.
-    bytes = checked_add_bytes(bytes, usize_to_u64(std::mem::size_of::<Sha256>())?)?;
-    bytes = checked_add_bytes(bytes, usize_to_u64(std::mem::size_of::<[u8; 32]>())?)?;
-    bytes = checked_add_bytes(bytes, usize_to_u64(std::mem::size_of::<u32>())?)?;
-    checked_add_bytes(bytes, usize_to_u64(std::mem::size_of::<u64>())?)
 }
 
 fn page_serialized_output_upper_bound(
@@ -27341,41 +24279,6 @@ fn page_document_clone_upper_bound(page: &PageDto) -> io::Result<u64> {
     Ok(bytes)
 }
 
-fn crdt_to_page_dto_upper_bound(page: &PageDto) -> io::Result<u64> {
-    let blocks = page_block_count_checked(&page.blocks)?;
-    let mut bytes = page_document_clone_upper_bound(page)?;
-    bytes = checked_add_bytes(bytes, page_dto_clone_upper_bound(page)?)?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(
-            blocks,
-            conservative_hash_entry_bytes::<Option<CrdtBlockId>, Vec<&CrdtBlockSnapshot>>()?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(
-            blocks,
-            conservative_vec_entry_bytes::<&CrdtBlockSnapshot>()?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(
-            blocks,
-            owned_string_len_upper_bound(usize_to_u64(std::mem::size_of::<[u8; 36]>())?)?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        managed_block_walk_stack_upper_bound::<(&[&CrdtBlockSnapshot], usize, Vec<DocBlock>)>()?,
-    )?;
-    checked_add_bytes(
-        bytes,
-        managed_block_walk_stack_upper_bound::<(&[DocBlock], usize, Vec<BlockDto>)>()?,
-    )
-}
-
 fn rename_rewrite_upper_bound(
     content: &str,
     renames: &std::collections::HashMap<String, String>,
@@ -27433,13 +24336,6 @@ fn rename_rewrite_upper_bound(
     )
 }
 
-struct ManagedLoadedPage {
-    page: PageDto,
-    baseline: String,
-    baseline_reservation: RetainedContentReservation,
-    page_reservation: RetainedContentReservation,
-}
-
 /// What entitles a save to write the file its page is pinned to.
 enum PinnedSaveAuthority<'a> {
     /// The revision the editor loaded. The retained pin must still agree with
@@ -27493,21 +24389,7 @@ struct ExactGraphLoadedPage {
 struct ExactGraphValidation {
     target: Option<ExactGraphLoadedPage>,
     requested_identity_elsewhere: bool,
-}
-
-struct PreparedMigrationPage {
-    page: PageDto,
-    baseline: String,
-    _baseline_reservation: RetainedContentReservation,
-    _page_reservation: RetainedContentReservation,
-    missing: usize,
-}
-
-struct PreparedGenesisPage {
-    snapshot: PreparedCrdtPageSnapshot,
-    path: PathBuf,
-    baseline: Option<String>,
-    baseline_reservation: Option<RetainedContentReservation>,
+    creation_proof: Option<DirectCreationProof>,
 }
 
 #[cfg(not(test))]
@@ -30745,6 +27627,50 @@ fn bootstrap_source_capture_before_final_proof_hook() -> io::Result<()> {
 #[cfg(not(test))]
 fn bootstrap_source_capture_before_final_proof_hook() -> io::Result<()> {
     Ok(())
+}
+
+fn hash_direct_creation_census_file(
+    file: &mut fs::File,
+    relative: &str,
+    expected_resource: ContentDigest,
+    expected_link_count: u64,
+    aggregate_hashed_bytes: &mut u64,
+    per_file_limit: u64,
+) -> io::Result<[u8; 32]> {
+    const READ_BUFFER_BYTES: usize = 64 * 1024;
+    let advertised_len = file.metadata()?.len();
+    if advertised_len > per_file_limit {
+        return Err(initial_shadow_limit_error("file raw bytes"));
+    }
+    let mut buffer = vec![0_u8; READ_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    let mut byte_length = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        byte_length = byte_length
+            .checked_add(read as u64)
+            .ok_or_else(|| initial_shadow_limit_error("aggregate raw bytes"))?;
+        *aggregate_hashed_bytes = aggregate_hashed_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| initial_shadow_limit_error("aggregate raw bytes"))?;
+        if byte_length > per_file_limit {
+            return Err(initial_shadow_limit_error("file raw bytes"));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if byte_length != advertised_len
+        || canonical_projection_file_resource_id(file)? != expected_resource
+        || projection_file_link_count(file)? != expected_link_count
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!("graph text file changed while hashing: {relative}"),
+        ));
+    }
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(test)]
@@ -35025,6 +31951,7 @@ mod tests {
             let expected_rel = format!("pages/{expected_stem}.md");
 
             let graph = Graph::open(&dir);
+            graph.warm_cache();
             let page = markdown_page_dto(title, title, "- created\n").unwrap();
             graph.save_page(&page, None).unwrap();
             assert_eq!(fs::read(dir.join(&expected_rel)).unwrap(), b"- created\n");
@@ -35198,137 +32125,6 @@ mod tests {
         assert_ne!(parent.uuid, parent.children[0].uuid);
         assert_ne!(parent.uuid, "x");
         assert_ne!(parent.children[0].uuid, "x");
-    }
-
-    #[test]
-    fn sync_identity_projection_persists_every_markdown_block() {
-        let page = markdown_page_dto("Sync", "Sync", "- parent\n\t- child\n").unwrap();
-        let budget = RetainedContentBudget::new(MANAGED_TEXT_INVENTORY_LIMITS);
-        let runtime_ids = [
-            page.blocks[0].id.clone(),
-            page.blocks[0].children[0].id.clone(),
-        ];
-        let migrated = page_with_persisted_sync_ids(&page, &budget).unwrap();
-        let scan = SyncIdProjectionScanReservation::reserve(
-            &budget,
-            &migrated.blocks,
-            SyncIdProjectionInput::Existing,
-            0,
-            "test sync id projection",
-        )
-        .unwrap();
-        let parent_id = persisted_sync_id(&migrated.blocks[0].raw, Format::Md, &scan).unwrap();
-        let child_id =
-            persisted_sync_id(&migrated.blocks[0].children[0].raw, Format::Md, &scan).unwrap();
-        assert!(Uuid::parse_str(&parent_id).is_ok());
-        assert!(Uuid::parse_str(&child_id).is_ok());
-        assert_ne!(parent_id, runtime_ids[0]);
-        assert_ne!(child_id, runtime_ids[1]);
-        assert_eq!(migrated.blocks[0].id, runtime_ids[0]);
-        assert_eq!(migrated.blocks[0].children[0].id, runtime_ids[1]);
-        drop(scan);
-        assert_eq!(
-            count_missing_sync_ids(&migrated.blocks, Format::Md, &budget).unwrap(),
-            0
-        );
-        // Resuming the migration is byte-stable and does not add duplicate ids.
-        let resumed = page_with_persisted_sync_ids(&migrated, &budget).unwrap();
-        assert_eq!(resumed.blocks[0].raw, migrated.blocks[0].raw);
-        assert_eq!(
-            resumed.blocks[0].children[0].raw,
-            migrated.blocks[0].children[0].raw
-        );
-    }
-
-    #[test]
-    fn sync_identity_projection_extends_an_org_drawer() {
-        let mut page = markdown_page_dto("Org", "Org", "- placeholder\n").unwrap();
-        let budget = RetainedContentBudget::new(MANAGED_TEXT_INVENTORY_LIMITS);
-        page.format = Format::Org;
-        page.blocks[0].raw = "Task\n:PROPERTIES:\n:foo: bar\n:END:".into();
-        let runtime_id = page.blocks[0].id.clone();
-        let migrated = page_with_persisted_sync_ids(&page, &budget).unwrap();
-        let scan = SyncIdProjectionScanReservation::reserve(
-            &budget,
-            &migrated.blocks,
-            SyncIdProjectionInput::Existing,
-            0,
-            "test org sync id projection",
-        )
-        .unwrap();
-        let persisted = persisted_sync_id(&migrated.blocks[0].raw, Format::Org, &scan).unwrap();
-        assert!(Uuid::parse_str(&persisted).is_ok());
-        assert_ne!(persisted, runtime_id);
-        assert_eq!(migrated.blocks[0].id, runtime_id);
-        assert_eq!(
-            migrated.blocks[0].raw,
-            format!("Task\n:PROPERTIES:\n:foo: bar\n:ID: {persisted}\n:END:")
-        );
-    }
-
-    #[test]
-    fn sync_identity_projection_rejects_duplicate_persisted_ids() {
-        let page = markdown_page_dto("Dup", "Dup", "- a\n  id:: same\n- b\n  id:: same\n").unwrap();
-        let budget = RetainedContentBudget::new(MANAGED_TEXT_INVENTORY_LIMITS);
-        let err = page_with_persisted_sync_ids(&page, &budget).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err
-            .to_string()
-            .contains("duplicate persisted block id same"));
-    }
-
-    #[test]
-    fn sync_identity_graph_validation_requires_unique_uuids() {
-        let budget = RetainedContentBudget::new(MANAGED_TEXT_INVENTORY_LIMITS);
-        let mut a = markdown_page_dto(
-            "A",
-            "A",
-            "- a\n  id:: aaaaaaaa-0000-4000-8000-000000000001\n",
-        )
-        .unwrap();
-        let mut b = markdown_page_dto(
-            "B",
-            "B",
-            "- b\n  id:: aaaaaaaa-0000-4000-8000-000000000001\n",
-        )
-        .unwrap();
-        a = page_with_persisted_sync_ids(&a, &budget).unwrap();
-        b = page_with_persisted_sync_ids(&b, &budget).unwrap();
-        let mut seen = std::collections::HashSet::new();
-        let mut seen_reservation = budget.reserve(0, "test graph id set").unwrap();
-        validate_graph_sync_ids(
-            &a.blocks,
-            a.format,
-            &mut seen,
-            &mut seen_reservation,
-            &budget,
-        )
-        .unwrap();
-        let duplicate = validate_graph_sync_ids(
-            &b.blocks,
-            b.format,
-            &mut seen,
-            &mut seen_reservation,
-            &budget,
-        )
-        .unwrap_err();
-        assert!(duplicate
-            .to_string()
-            .contains("duplicate persisted block id"));
-
-        let invalid = markdown_page_dto("Bad", "Bad", "- bad\n  id:: legacy-id\n").unwrap();
-        let invalid = page_with_persisted_sync_ids(&invalid, &budget).unwrap();
-        let mut invalid_seen = std::collections::HashSet::new();
-        let mut invalid_reservation = budget.reserve(0, "test invalid graph id set").unwrap();
-        let err = validate_graph_sync_ids(
-            &invalid.blocks,
-            invalid.format,
-            &mut invalid_seen,
-            &mut invalid_reservation,
-            &budget,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("is not a UUID"));
     }
 
     #[test]
@@ -36166,23 +32962,6 @@ mod tests {
         out
     }
 
-    fn projection_heavy_managed_block(id: Option<Uuid>, namespace: &str) -> String {
-        let mut content = format!("- Übergröße Καλημέρα résumé [[{namespace}]] #{namespace}/根 ");
-        for index in 0..96 {
-            content.push_str(&format!("[[{namespace}/页面{index}]] #标签{index} "));
-        }
-        content.push('\n');
-        for index in 0..64 {
-            content.push_str(&format!(
-                "  eigenschaft-{index}:: Значение [[{namespace}/属性{index}]] #метка{index} naïve\n"
-            ));
-        }
-        if let Some(id) = id {
-            content.push_str(&format!("  id:: {id}\n"));
-        }
-        content
-    }
-
     fn set_managed_content_budget_limit(limit: u64) {
         MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
             *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
@@ -36961,17 +33740,12 @@ mod tests {
     }
 
     #[test]
-    fn graph_wide_discovery_never_grants_sparse_enrollment_or_id_stamping() {
-        let dir = scratch("graph-text-sparse-authority");
+    fn graph_wide_discovery_preserves_direct_files_without_id_stamping() {
+        let dir = scratch("graph-text-direct-files");
         fs::create_dir_all(dir.join("external")).unwrap();
         let path = dir.join("external/Outside.md");
         fs::write(&path, "- outside\n").unwrap();
         let graph = Graph::open(&dir);
-
-        assert_eq!(graph.sync_identity_plan().unwrap().pages, 0);
-        graph
-            .enable_managed_sync(Uuid::from_u128(246_001), Uuid::from_u128(246_002))
-            .unwrap();
 
         let mut page = graph.load_by_path("external/Outside.md").unwrap().unwrap();
         page.blocks[0].raw = "edited outside".into();
@@ -36979,53 +33753,20 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert_eq!(saved, "- edited outside\n");
         assert!(!saved.contains("id::"));
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("external/Outside.md")
-            .unwrap()
-            .is_none());
-
         fs::write(&path, "- watcher outside\n").unwrap();
         graph.sync_file_checked(&path).unwrap();
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("external/Outside.md")
-            .unwrap()
-            .is_none());
         fs::remove_file(&path).unwrap();
         graph.sync_deleted_file(&path).unwrap();
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("external/Outside.md")
-            .unwrap()
-            .is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn graph_wide_markdown_discovery_remains_outside_sparse_authority() {
-        let dir = scratch("graph-text-markdown-sparse-authority");
+    fn graph_wide_markdown_discovery_preserves_direct_files_without_id_stamping() {
+        let dir = scratch("graph-text-markdown-direct-files");
         fs::create_dir_all(dir.join("external")).unwrap();
         let path = dir.join("external/Outside.markdown");
         fs::write(&path, "- outside\n").unwrap();
         let graph = Graph::open(&dir);
-
-        assert_eq!(graph.sync_identity_plan().unwrap().pages, 0);
-        graph
-            .enable_managed_sync(Uuid::from_u128(246_003), Uuid::from_u128(246_004))
-            .unwrap();
 
         let mut page = graph
             .load_by_path("external/Outside.markdown")
@@ -37037,16 +33778,6 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert_eq!(saved, "- edited outside\n");
         assert!(!saved.contains("id::"));
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("external/Outside.markdown")
-            .unwrap()
-            .is_none());
-
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -38326,11 +35057,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_cold_graph_advances_effective_identity_evidence_incrementally() {
+    fn empty_cold_graph_fails_closed_then_warm_evidence_advances_incrementally() {
         let dir = scratch("cold-empty-effective-identity");
         let graph = Graph::open(&dir);
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let cold = markdown_page_dto("Cold Refused", "Cold Refused", "- body\n").unwrap();
+        assert_eq!(
+            graph.save_page(&cold, None).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(!dir.join("pages/Cold Refused.md").exists());
+        graph.warm_cache();
         for name in ["First Cold", "Second Cold"] {
             let page = markdown_page_dto(name, name, "- body\n").unwrap();
             graph.save_page(&page, None).unwrap();
@@ -38439,7 +35177,7 @@ mod tests {
             .as_ref()
             .cloned()
             .unwrap();
-        assert_eq!(installed.generation, graph.cache_generation());
+        assert_eq!(installed.generation(), graph.cache_generation());
         assert_eq!(installed.failures, vec!["pages/Invalid.md"]);
         let _ = fs::remove_dir_all(&dir);
 
@@ -38468,7 +35206,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(failed.generation, graph.cache_generation());
+            assert_eq!(failed.generation(), graph.cache_generation());
             assert_eq!(failed.failures, vec!["pages/Mutable.md"]);
             let blocked =
                 markdown_page_dto("Blocked Watcher", "Blocked Watcher", "- no\n").unwrap();
@@ -38485,7 +35223,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(repaired.generation, graph.cache_generation());
+            assert_eq!(repaired.generation(), graph.cache_generation());
             assert!(repaired.failures.is_empty());
             assert!(repaired
                 .owners
@@ -38535,7 +35273,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(failed.generation, graph.cache_generation());
+            assert_eq!(failed.generation(), graph.cache_generation());
             assert_eq!(failed.failures, vec!["pages/Mutable.md"]);
             let blocked =
                 markdown_page_dto("Blocked Snapshot", "Blocked Snapshot", "- no\n").unwrap();
@@ -38584,7 +35322,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .expect("cold watcher failure must install effective evidence");
-            assert_eq!(failed.generation, graph.cache_generation());
+            assert_eq!(failed.generation(), graph.cache_generation());
             assert_eq!(failed.failures, vec!["pages/Cold Failure.md"]);
             assert!(failed.physical_paths.contains(&path));
 
@@ -38603,7 +35341,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(repaired.generation, graph.cache_generation());
+            assert_eq!(repaired.generation(), graph.cache_generation());
             assert!(repaired.failures.is_empty());
             assert!(repaired
                 .owners
@@ -38883,7 +35621,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resource_epoch_uses_local_existing_proofs_and_complete_creation_proof() {
+    fn resource_epoch_uses_local_existing_proofs_and_cached_creation_proof() {
         // Portable path identity.
         let dir = scratch("guarded-resource-epoch-portable");
         let primary = dir.join("pages/Case.md");
@@ -38950,7 +35688,11 @@ mod tests {
             graph_b.save_page(&claimed, None).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(graph_b.guarded_graph_text_identity_stats().0, 2);
+        assert_eq!(
+            graph_b.guarded_graph_text_identity_stats().0,
+            1,
+            "creation must not rebuild the retained complete index"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -42810,6 +39552,189 @@ mod tests {
         }
     }
 
+    /// A content-only existing save must carry the already-warm semantic
+    /// evidence forward. The immediately following creation may stream one
+    /// census, but may not rebuild/capture/parse the graph to recover evidence
+    /// that the existing save already proved unchanged.
+    #[test]
+    fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
+        let dir = scratch("existing-save-then-create-warm-evidence");
+        fs::write(dir.join("pages/Existing.md"), b"- before\n").unwrap();
+        fs::write(
+            dir.join("pages/Explicit Owner.md"),
+            b"title:: Claimed Identity\n\n- owner\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut existing = graph.load_by_path("pages/Existing.md").unwrap().unwrap();
+        existing.blocks[0].raw = "after".into();
+        graph
+            .save_page(&existing, existing.rev.as_deref())
+            .expect("identity-preserving existing save");
+        let installed = graph
+            .effective_identity_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("content-only save must retain warm semantic evidence");
+        assert_eq!(installed.generation(), graph.cache_generation());
+
+        let before = graph.guarded_graph_text_identity_report();
+        reset_graph_text_admission_test_counters();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
+            .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        graph
+            .save_page(
+                &direct_save_bench_new_page("Fresh After Existing Save"),
+                None,
+            )
+            .expect("warm evidence must authorize the noncolliding creation");
+        let after = graph.guarded_graph_text_identity_report();
+        let counters = graph_text_admission_test_counters();
+        assert_eq!(counters.direct_creation_censuses, 1);
+        assert_eq!(counters.direct_creation_files_hashed, 2);
+        assert_eq!(counters.builder_enumerations, 0);
+        assert_eq!(counters.parser_invocations, 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(
+            GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
+            Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
+            "creation consumed the retained shadow capture hook"
+        );
+        assert_eq!(
+            fs::read(dir.join("pages/Existing.md")).unwrap(),
+            b"- after\n"
+        );
+        assert!(dir.join("pages/Fresh After Existing Save.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The O(1) content-only path is not authority to retain stale semantic
+    /// ownership when an ordinary existing save changes `title::`.
+    #[test]
+    fn identity_changing_existing_save_refreshes_creation_evidence() {
+        let dir = scratch("existing-save-retitles-identity-evidence");
+        fs::write(
+            dir.join("pages/Physical Owner.md"),
+            b"title:: Alpha Identity\n\n- owner\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut owner = graph
+            .load_by_path("pages/Physical Owner.md")
+            .unwrap()
+            .unwrap();
+        owner.pre_block = Some("title:: Omega Identity\n".into());
+        graph
+            .save_page(&owner, owner.rev.as_deref())
+            .expect("identity-changing existing save");
+
+        let installed = graph
+            .effective_identity_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("identity-changing save must publish replacement evidence");
+        assert_eq!(installed.generation(), graph.cache_generation());
+        assert!(!installed
+            .owners
+            .contains_key(&page_cache_key(PageKind::Page, "Alpha Identity")));
+        assert!(installed
+            .owners
+            .contains_key(&page_cache_key(PageKind::Page, "Omega Identity")));
+        let target = dir.join("pages/Omega Identity.md");
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Omega Identity"), None)
+            .expect_err("the new effective owner must refuse a duplicate creation");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Existing exact-target authority is not invalidated by a noncolliding
+    /// sibling under another spelling of the same portable ancestor. A leaf
+    /// collision under that ancestor remains a hard refusal.
+    #[test]
+    fn existing_save_allows_portable_ancestor_neighbor_but_refuses_colliding_leaf() {
+        for (tag, alias_leaf, should_save) in [
+            ("noncolliding", "Other.md", true),
+            ("colliding", "Target.md", false),
+        ] {
+            let dir = scratch(&format!("existing-save-portable-ancestor-{tag}"));
+            fs::create_dir_all(dir.join("logseq")).unwrap();
+            fs::write(
+                dir.join("logseq/config.edn"),
+                "{:pages-directory \"Pages\"}\n",
+            )
+            .unwrap();
+            fs::create_dir_all(dir.join("Pages")).unwrap();
+            let target = dir.join("Pages/Target.md");
+            let neighbor = dir.join("pages").join(alias_leaf);
+            fs::write(&target, b"- before\n").unwrap();
+            fs::write(&neighbor, b"- neighbor\n").unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let mut page = graph.load_by_path("Pages/Target.md").unwrap().unwrap();
+            page.blocks[0].raw = "after".into();
+
+            let result = graph.save_page(&page, page.rev.as_deref());
+            if should_save {
+                result.expect("noncolliding portable ancestor neighbor must not block save");
+                assert_eq!(fs::read(&target).unwrap(), b"- after\n");
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+                assert_eq!(fs::read(&target).unwrap(), b"- before\n");
+            }
+            assert_eq!(fs::read(&neighbor).unwrap(), b"- neighbor\n");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A portable-equivalent symlink branch is not traversal authority over an
+    /// already loaded exact target. The save stays on the retained exact path.
+    #[cfg(unix)]
+    #[test]
+    fn existing_save_allows_portable_equivalent_symlink_neighbor() {
+        let dir = scratch("existing-save-portable-symlink-neighbor");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:pages-directory \"Pages\"}\n",
+        )
+        .unwrap();
+        fs::remove_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("Pages")).unwrap();
+        let target = dir.join("Pages/Target.md");
+        fs::write(&target, b"- before\n").unwrap();
+        let outside = dir.with_extension("portable-symlink-neighbor");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("Other.md"), b"- outside neighbor\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("pages")).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("Pages/Target.md").unwrap().unwrap();
+        page.blocks[0].raw = "after".into();
+
+        graph
+            .save_page(&page, page.rev.as_deref())
+            .expect("portable-equivalent symlink neighbor must not block exact save");
+        assert_eq!(fs::read(&target).unwrap(), b"- after\n");
+        assert_eq!(
+            fs::read(outside.join("Other.md")).unwrap(),
+            b"- outside neighbor\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
     /// Repeated existing saves never need to construct the complete admission
     /// index, even when their own exact publications leave that optional index
     /// invalidated. State this as counters rather than a CI stopwatch.
@@ -42837,11 +39762,70 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The deliberately more expensive half of the split: a missing target
-    /// still needs a complete semantic owner proof after index invalidation.
+    /// REG-DIRECT-CREATE-RETAINED-SHADOW-LIMIT-249-266 causal witness. On the
+    /// parent behavior, ordinary missing-target creation entered the retained
+    /// shadow-import builder and surfaced the exact v0.6.92 reporter suffix.
     #[test]
-    fn invalidated_missing_target_creation_rebuilds_complete_semantic_proof() {
-        let dir = scratch("missing-target-complete-semantic-proof");
+    fn missing_target_creation_ignores_the_retained_shadow_peak_limit() {
+        let dir = scratch("missing-target-retained-shadow-limit");
+        fs::write(dir.join("pages/Existing.md"), b"- existing\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
+            .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        let target = dir.join("pages/Noncolliding Missing Target.md");
+        graph
+            .save_page(
+                &direct_save_bench_new_page("Noncolliding Missing Target"),
+                None,
+            )
+            .expect("ordinary creation must not consult the retained shadow peak bound");
+        assert!(target.is_file(), "the admitted creation must publish bytes");
+        assert_eq!(
+            GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
+            Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
+            "ordinary creation consumed the retained shadow capture hook"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The retained-shadow raw-byte ceiling remains a sensible per-file stream
+    /// bound, but is not a cumulative graph-size cap. Exercise the production
+    /// census decision with tiny real files instead of a 512 MiB allocation.
+    #[test]
+    fn direct_creation_census_accepts_aggregate_above_retained_byte_limit() {
+        let dir = scratch("creation-census-aggregate-stream-bound");
+        fs::write(dir.join("pages/First.md"), b"123456").unwrap();
+        fs::write(dir.join("pages/Second.md"), b"abcdef").unwrap();
+        let graph = Graph::open(&dir);
+        let permit = graph.admit_retained_managed_text_writer().unwrap();
+        let limits = InitialShadowLimits {
+            raw_bytes: 6,
+            ..INITIAL_SHADOW_LIMITS
+        };
+
+        let files = graph
+            .capture_direct_creation_census_with_limits(&permit, limits)
+            .expect("aggregate streamed bytes may exceed the retained-byte ceiling");
+        assert_eq!(files.len(), 2);
+        let aggregate = fs::metadata(dir.join("pages/First.md")).unwrap().len()
+            + fs::metadata(dir.join("pages/Second.md")).unwrap().len();
+        assert!(aggregate > limits.raw_bytes);
+
+        fs::write(dir.join("pages/Oversized.md"), b"1234567").unwrap();
+        let error = graph
+            .capture_direct_creation_census_with_limits(&permit, limits)
+            .expect_err("the per-file streamed resource bound must remain enforced");
+        assert!(error.to_string().contains("file raw bytes"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The whole validation/publication path consumes one streaming census and
+    /// no managed retained-capture, complete-index, or parse work.
+    #[test]
+    fn missing_target_creation_has_one_census_and_zero_shadow_or_parse_work() {
+        let dir = scratch("missing-target-one-streaming-census");
         for index in 0..24 {
             fs::write(
                 dir.join("pages").join(format!("Unrelated {index}.md")),
@@ -42860,126 +39844,285 @@ mod tests {
             .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
             .unwrap();
         let before = graph.guarded_graph_text_identity_report();
+        reset_graph_text_admission_test_counters();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        let error = graph
-            .save_page(&direct_save_bench_new_page("Claimed Name"), None)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        graph
+            .save_page(&direct_save_bench_new_page("Fresh Claimed Name"), None)
+            .unwrap();
         let after = graph.guarded_graph_text_identity_report();
+        let counters = graph_text_admission_test_counters();
+        assert_eq!(counters.direct_creation_censuses, 1);
+        assert_eq!(counters.direct_creation_files_hashed, 25);
+        assert_eq!(counters.builder_enumerations, 0);
+        assert_eq!(counters.parser_invocations, 0);
         assert_eq!(
-            after.complete_builds,
-            before.complete_builds + 1,
-            "missing-target creation must construct complete semantic evidence"
+            after.complete_builds, before.complete_builds,
+            "missing-target creation entered the complete semantic builder"
         );
-        assert!(
-            GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get) >= 25,
-            "complete creation proof must parse all possible semantic owners"
+        assert_eq!(
+            GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
+            0,
+            "missing-target creation parsed a graph document"
         );
-        assert!(!dir.join("pages/Claimed Name.md").exists());
+        assert!(dir.join("pages/Fresh Claimed Name.md").is_file());
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Complete semantic proof remains incremental even though an existing
-    /// save no longer invokes it. Missing-target creation is the legitimate
-    /// caller: unchanged parsed semantics are reused and one changed document
-    /// causes exactly one additional parse.
+    /// An external retitle can preserve path, inode, and byte length. The
+    /// content digest installed with the parsed cache is what closes that gap.
     #[test]
-    fn a_rebuild_parses_only_the_documents_whose_bytes_changed() {
-        let dir = scratch("rebuild-reuses-parsed-semantics");
-        for index in 0..24 {
-            fs::write(
-                dir.join("pages").join(format!("Unrelated {index}.md")),
-                format!("title:: Unrelated {index}\n\n- body {index}\n"),
-            )
-            .unwrap();
-        }
-        fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
+    fn same_path_same_length_retitle_without_reconciliation_refuses_creation() {
+        let dir = scratch("same-length-retitle-creation-proof");
+        let owner = dir.join("pages/Owner.md");
+        let before = b"title:: Alpha Name\n\n- owner\n";
+        let after = b"title:: Omega Name\n\n- owner\n";
+        assert_eq!(before.len(), after.len());
+        fs::write(&owner, before).unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        guarded_test_prime_identity(&graph);
-
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
+        fs::write(&owner, after).unwrap();
+        reset_graph_text_admission_test_counters();
         GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        graph
-            .save_page(&direct_save_bench_new_page("First Semantic Proof"), None)
-            .unwrap();
-        let full = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
-        assert!(
-            full >= 25,
-            "first semantic rebuild must parse the graph: {full}"
-        );
-
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
-        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        graph
-            .save_page(
-                &direct_save_bench_new_page("Unchanged Semantic Proof"),
-                None,
-            )
-            .unwrap();
-        let unchanged = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
-
-        fs::write(
-            dir.join("pages/Unrelated 7.md"),
-            b"title:: Unrelated 7\n\n- externally edited\n",
-        )
-        .unwrap();
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
-        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        graph
-            .save_page(&direct_save_bench_new_page("Changed Semantic Proof"), None)
-            .unwrap();
-        let incremental = GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get);
-
+        let target = dir.join("pages/Omega Name.md");
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Omega Name"), None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read(&owner).unwrap(), after);
+        assert!(!target.exists());
         assert_eq!(
-            incremental,
-            unchanged + 1,
-            "one changed document must cause exactly one additional parse \
-             (unchanged rebuild {unchanged}, changed rebuild {incremental})"
+            graph_text_admission_test_counters().direct_creation_censuses,
+            1
         );
-        assert!(incremental < full, "incremental {incremental}, full {full}");
+        assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The complete capture still has a bounded retry contract for callers
-    /// that require it. A one-shot concurrent change is retried internally and
-    /// does not escape from missing-target creation.
+    /// A generation change during the one census fails closed. Creation neither
+    /// retries the census nor mutates the target.
     #[test]
-    fn a_concurrent_change_during_capture_is_retried_not_surfaced() {
-        let dir = scratch("complete-capture-retry");
+    fn cache_generation_change_during_creation_census_fails_without_retry() {
+        let dir = scratch("creation-census-generation-change");
         fs::write(dir.join("pages/Target.md"), b"- before\n").unwrap();
         fs::write(dir.join("pages/Other.md"), b"- other\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        guarded_test_prime_identity(&graph);
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
-
-        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-            let other = dir.join("pages/Other.md");
-            *hook.borrow_mut() = Some(Box::new(move || fs::write(&other, b"- pulled in\n")));
-        });
-
-        graph
-            .save_page(&direct_save_bench_new_page("Created After Retry"), None)
-            .expect("one capture disagreement must be retried");
-        INITIAL_SHADOW_REVALIDATION_RACE.with(|hook| {
-            assert!(
-                hook.borrow().is_none(),
-                "complete capture must consume the race hook"
-            );
-        });
-        assert!(dir.join("pages/Created After Retry.md").is_file());
+        reset_graph_text_admission_test_counters();
+        DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN.with(|armed| armed.set(true));
+        let target = dir.join("pages/Must Not Retry.md");
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Must Not Retry"), None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
         assert_eq!(
-            fs::read_to_string(dir.join("pages/Other.md")).unwrap(),
-            "- pulled in\n"
+            graph_text_admission_test_counters().direct_creation_censuses,
+            1
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read(dir.join("pages/Target.md")).unwrap(),
+            b"- before\n"
+        );
+        assert_eq!(fs::read(dir.join("pages/Other.md")).unwrap(), b"- other\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creation_refuses_historical_arbitrary_and_explicit_semantic_owners() {
+        for (extension, content) in [
+            ("md", "- incumbent md\n"),
+            ("markdown", "- incumbent markdown\n"),
+            ("org", "* incumbent org\n"),
+        ] {
+            let dir = scratch(&format!("creation-semantic-owner-{extension}"));
+            fs::create_dir_all(dir.join("arbitrary/deep")).unwrap();
+            let incumbent = dir.join(format!("arbitrary/deep/Claimed Owner.{extension}"));
+            fs::write(&incumbent, content).unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let target = dir.join("pages/Claimed Owner.md");
+            let error = graph
+                .save_page(&direct_save_bench_new_page("Claimed Owner"), None)
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "{extension}: {error}"
+            );
+            assert_eq!(fs::read_to_string(&incumbent).unwrap(), content);
+            assert!(!target.exists());
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        let dir = scratch("creation-explicit-title-owner");
+        fs::create_dir_all(dir.join("arbitrary/deep")).unwrap();
+        let incumbent = dir.join("arbitrary/deep/Different Physical Name.md");
+        let content = "title:: Claimed Explicit Owner\n\n- incumbent\n";
+        fs::write(&incumbent, content).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Claimed Explicit Owner.md");
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Claimed Explicit Owner"), None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read_to_string(&incumbent).unwrap(), content);
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_refuses_hardlinks_without_changing_either_name() {
+        let dir = scratch("creation-hardlink-refusal");
+        fs::create_dir_all(dir.join("arbitrary")).unwrap();
+        let incumbent = dir.join("pages/Owner.md");
+        let alias = dir.join("arbitrary/Alias.md");
+        fs::write(&incumbent, b"- incumbent\n").unwrap();
+        fs::hard_link(&incumbent, &alias).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Fresh Hardlink Check.md");
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Fresh Hardlink Check"), None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read(&incumbent).unwrap(), b"- incumbent\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"- incumbent\n");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation() {
+        for (label, configured, alias) in [
+            ("case", "Pages", "pages"),
+            ("nfc", "Caf\u{e9}Pages", "Cafe\u{301}Pages"),
+        ] {
+            let dir = scratch(&format!("creation-portable-ancestor-{label}"));
+            fs::create_dir_all(dir.join("logseq")).unwrap();
+            fs::write(
+                dir.join("logseq/config.edn"),
+                format!("{{:pages-directory \"{configured}\"}}\n"),
+            )
+            .unwrap();
+            fs::create_dir_all(dir.join(alias)).unwrap();
+            let incumbent = dir.join(alias).join("Incumbent.md");
+            fs::write(&incumbent, b"- incumbent\n").unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let target = dir.join(configured).join("Fresh.md");
+            let error = graph
+                .save_page(&direct_save_bench_new_page("Fresh"), None)
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "{label}: {error}"
+            );
+            assert_eq!(fs::read(&incumbent).unwrap(), b"- incumbent\n");
+            assert!(!target.exists());
+            assert!(!dir.join(configured).exists());
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        for (label, incumbent_name, requested) in [
+            ("case", "leaf.md", "Leaf"),
+            ("nfc", "Caf\u{e9}.md", "Cafe\u{301}"),
+        ] {
+            let dir = scratch(&format!("creation-portable-leaf-{label}"));
+            let incumbent = dir.join("pages").join(incumbent_name);
+            fs::write(&incumbent, b"- incumbent\n").unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let error = graph
+                .save_page(&direct_save_bench_new_page(requested), None)
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "{label}: {error}"
+            );
+            assert_eq!(fs::read(&incumbent).unwrap(), b"- incumbent\n");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_refuses_symlink_parent_and_leaf_without_touching_outside_bytes() {
+        let dir = scratch("creation-symlink-leaf-refusal");
+        let outside = dir.with_extension("leaf-outside");
+        fs::write(&outside, b"outside leaf\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        std::os::unix::fs::symlink(&outside, dir.join("pages/Leaf.md")).unwrap();
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Leaf"), None)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::AlreadyExists
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside leaf\n");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&outside);
+
+        let dir = scratch("creation-symlink-parent-refusal");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:pages-directory \"linked/pages\"}\n",
+        )
+        .unwrap();
+        let outside = dir.with_extension("parent-outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("incumbent"), b"outside parent\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        std::os::unix::fs::symlink(&outside, dir.join("linked")).unwrap();
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Fresh"), None)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::AlreadyExists
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(outside.join("incumbent")).unwrap(),
+            b"outside parent\n"
+        );
+        assert!(!outside.join("pages/Fresh.md").exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn external_exact_target_creator_wins_without_byte_change() {
+        let dir = scratch("creation-external-target-race");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Raced.md");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let target = target.clone();
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(target, b"external winner\n")));
+        });
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Raced"), None)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read(&target).unwrap(), b"external winner\n");
+        assert_eq!(
+            fs::read(dir.join("pages/Anchor.md")).unwrap(),
+            b"- anchor\n"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -43086,35 +40229,36 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A missing-target creation still rebuilds semantic evidence after an
-    /// external retitle, even though existing-target saves no longer do so.
+    /// A watcher-free external retitle invalidates the cached byte snapshot and
+    /// refuses creation without rebuilding semantic evidence.
     #[test]
     fn missing_target_creation_refuses_an_externally_retitled_owner() {
         let dir = scratch("creation-proof-follows-external-retitle");
         fs::write(dir.join("pages/Owner.md"), b"title:: Alpha Name\n\n- o\n").unwrap();
         let graph = Graph::open(&dir);
         graph.warm_cache();
-        guarded_test_prime_identity(&graph);
-
         fs::write(dir.join("pages/Owner.md"), b"title:: Omega Name\n\n- o\n").unwrap();
-        graph
-            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
-            .unwrap();
         let before = graph.guarded_graph_text_identity_report();
+        reset_graph_text_admission_test_counters();
         let error = graph
             .save_page(&direct_save_bench_new_page("Omega Name"), None)
             .expect_err("the retitled document owns this effective page identity");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
         assert_eq!(
             graph.guarded_graph_text_identity_report().complete_builds,
-            before.complete_builds + 1
+            before.complete_builds
         );
+        assert_eq!(
+            graph_text_admission_test_counters().direct_creation_censuses,
+            1
+        );
+        assert_eq!(graph_text_admission_test_counters().builder_enumerations, 0);
         assert!(!dir.join("pages/Omega Name.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Semantic reuse is keyed by content, not by an inode or stat tuple. A
-    /// same-bytes replacement is reusable; a same-length retitle is not.
+    /// Cached semantic evidence is keyed by content, not inode identity. A
+    /// same-byte republication remains admissible; changed bytes fail closed.
     #[test]
     fn reused_semantics_follow_the_bytes_not_the_file() {
         let dir = scratch("rebuild-reuse-follows-bytes");
@@ -43152,8 +40296,8 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
         assert_eq!(
             GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get),
-            same_bytes + 1,
-            "the changed bytes must add exactly one parse"
+            same_bytes,
+            "changed census bytes must fail without parsing"
         );
         assert!(!dir.join("pages/Omega Name.md").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -48997,1038 +46141,6 @@ mod tests {
         let _ = fs::remove_dir_all(&moved);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn sync_identity_migration_keeps_nested_multi_page_inventory_and_writes_on_retained_a() {
-        let dir = scratch("handoff-sync-id-migration-retained");
-        let moved = dir.with_file_name("tine-handoff-sync-id-migration-retained-moved");
-        let _ = fs::remove_dir_all(&moved);
-        fs::create_dir_all(dir.join("logseq")).unwrap();
-        fs::write(
-            dir.join("logseq/config.edn"),
-            "{:pages-directory \"archive/pages\"\n :journals-directory \"archive/journals\"}\n",
-        )
-        .unwrap();
-        fs::create_dir_all(dir.join("archive/pages/team/deep")).unwrap();
-        fs::create_dir_all(dir.join("archive/journals/2026/07")).unwrap();
-        fs::write(dir.join("archive/pages/team/deep/Alpha.md"), "- alpha A\n").unwrap();
-        fs::write(dir.join("archive/pages/Beta.md"), "- beta A\n").unwrap();
-        fs::write(
-            dir.join("archive/journals/2026/07/2026_07_24.md"),
-            "- journal A\n",
-        )
-        .unwrap();
-        let graph = Graph::open(&dir);
-        MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-            let dir = dir.clone();
-            let moved = moved.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::rename(&dir, &moved)?;
-                fs::create_dir_all(dir.join("logseq"))?;
-                fs::write(
-                    dir.join("logseq/config.edn"),
-                    "{:pages-directory \"archive/pages\"\n :journals-directory \"archive/journals\"}\n",
-                )?;
-                fs::create_dir_all(dir.join("archive/pages/team/deep"))?;
-                fs::create_dir_all(dir.join("archive/journals/2026/07"))?;
-                fs::write(
-                    dir.join("archive/pages/team/deep/Alpha.md"),
-                    "- alpha B sentinel\n",
-                )?;
-                fs::write(
-                    dir.join("archive/journals/2026/07/2026_07_24.md"),
-                    "- journal B sentinel\n",
-                )?;
-                hold_replacement_handoff(&dir, 91_047_010)
-            }));
-        });
-
-        let migration = graph.migrate_sync_identities().unwrap();
-        assert_eq!(migration.pages_changed, 3);
-        assert_eq!(migration.blocks_changed, 3);
-        for path in [
-            "archive/pages/team/deep/Alpha.md",
-            "archive/pages/Beta.md",
-            "archive/journals/2026/07/2026_07_24.md",
-        ] {
-            assert!(
-                fs::read_to_string(moved.join(path))
-                    .unwrap()
-                    .contains("id:: "),
-                "{path} was not migrated on retained A"
-            );
-        }
-        assert_eq!(
-            fs::read(dir.join("archive/pages/team/deep/Alpha.md")).unwrap(),
-            b"- alpha B sentinel\n"
-        );
-        assert_eq!(
-            fs::read(dir.join("archive/journals/2026/07/2026_07_24.md")).unwrap(),
-            b"- journal B sentinel\n"
-        );
-        assert!(!dir.join("archive/pages/Beta.md").exists());
-        assert!(!dir.join(".tine-sync").exists());
-        let replacement = Graph::open(&dir);
-        assert_handoff_blocked(
-            replacement.create_markdown_page_if_absent("blocked on B", "- blocked\n"),
-        );
-
-        release_replacement_handoff();
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&moved);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_sync_enable_genesis_receipts_restart_and_store_state_stay_on_retained_a() {
-        let dir = scratch("handoff-managed-sync-enable-retained");
-        let moved = dir.with_file_name("tine-handoff-managed-sync-enable-retained-moved");
-        let _ = fs::remove_dir_all(&moved);
-        let page_content = format!(
-            "- retained page A\n  id:: {}\n",
-            Uuid::from_u128(91_047_020)
-        );
-        let journal_content = format!(
-            "- retained journal A\n  id:: {}\n",
-            Uuid::from_u128(91_047_021)
-        );
-        fs::write(dir.join("pages/Retained.md"), &page_content).unwrap();
-        fs::write(dir.join("journals/2026_07_24.md"), &journal_content).unwrap();
-        let graph = Graph::open(&dir);
-        MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-            let dir = dir.clone();
-            let moved = moved.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::rename(&dir, &moved)?;
-                fs::create_dir_all(dir.join("pages"))?;
-                fs::create_dir_all(dir.join("journals"))?;
-                fs::write(dir.join("pages/Retained.md"), "- replacement page B\n")?;
-                fs::write(dir.join("pages/B-only.md"), "- B-only sentinel\n")?;
-                hold_replacement_handoff(&dir, 91_047_030)
-            }));
-        });
-
-        let enabled = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_022), Uuid::from_u128(91_047_023))
-            .unwrap();
-        assert_eq!(enabled.status.page_count, 2);
-        assert!(moved.join(".tine-sync/v1").is_dir());
-        assert!(!dir.join(".tine-sync").exists());
-        {
-            let guard = graph.managed_sync.lock().unwrap();
-            let sync = guard.as_ref().unwrap();
-            assert!(sync
-                .materialize_page("pages/Retained.md")
-                .unwrap()
-                .is_some());
-            assert!(sync.materialize_page("pages/B-only.md").unwrap().is_none());
-            assert!(sync
-                .is_known_projection("pages/Retained.md", &page_content)
-                .unwrap());
-            assert!(sync
-                .is_known_projection("journals/2026_07_24.md", &journal_content)
-                .unwrap());
-            assert!(!sync
-                .is_known_projection("pages/Retained.md", "- replacement page B\n")
-                .unwrap());
-        }
-        assert_eq!(
-            fs::read(dir.join("pages/Retained.md")).unwrap(),
-            b"- replacement page B\n"
-        );
-        assert_eq!(
-            fs::read(dir.join("pages/B-only.md")).unwrap(),
-            b"- B-only sentinel\n"
-        );
-
-        graph.managed_sync.lock().unwrap().take();
-        assert_eq!(
-            graph.managed_sync_store_state().unwrap(),
-            ManagedSyncStoreState::Initialized
-        );
-        assert!(graph
-            .start_managed_sync(Uuid::from_u128(91_047_022), Uuid::from_u128(91_047_024),)
-            .unwrap());
-        assert_eq!(graph.managed_sync_status().unwrap().page_count, 2);
-        let replacement = Graph::open(&dir);
-        assert_eq!(
-            replacement.managed_sync_store_state().unwrap(),
-            ManagedSyncStoreState::Absent
-        );
-        assert_handoff_blocked(
-            replacement.create_markdown_page_if_absent("still blocked on B", "- blocked\n"),
-        );
-
-        release_replacement_handoff();
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&moved);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn sync_identity_migration_fails_closed_when_retained_a_baseline_changes() {
-        let dir = scratch("handoff-sync-id-baseline-change");
-        let first = dir.join("pages/A.md");
-        let second = dir.join("pages/B.md");
-        fs::write(&first, "- original A\n").unwrap();
-        fs::write(&second, "- original B\n").unwrap();
-        let graph = Graph::open(&dir);
-        SYNC_IDENTITY_AFTER_PREPARE.with(|hook| {
-            let first = first.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::write(&first, "- concurrent external A\n")
-            }));
-        });
-
-        let error = graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            fs::read(&first).unwrap(),
-            b"- concurrent external A\n",
-            "migration must preserve the external replacement"
-        );
-        assert_eq!(
-            fs::read(&second).unwrap(),
-            b"- original B\n",
-            "validation failure on the first baseline must precede every write"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn overlapping_managed_roots_inventory_each_file_once_for_identity_migration() {
-        let dir = scratch("handoff-overlapping-roots-migration");
-        fs::create_dir_all(dir.join("logseq")).unwrap();
-        fs::write(
-            dir.join("logseq/config.edn"),
-            "{:pages-directory \"managed/text\"\n :journals-directory \"managed/text/daily\"}\n",
-        )
-        .unwrap();
-        let page = dir.join("managed/text/projects/Parent.md");
-        let journal = dir.join("managed/text/daily/2026/07/2026_07_24.md");
-        fs::create_dir_all(page.parent().unwrap()).unwrap();
-        fs::create_dir_all(journal.parent().unwrap()).unwrap();
-        fs::write(&page, "- parent\n").unwrap();
-        fs::write(&journal, "- journal\n").unwrap();
-
-        let graph = Graph::open(&dir);
-        let write = graph.admit_managed_text_writer().unwrap();
-        let entries = graph.managed_text_entries(&write, false).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries
-            .iter()
-            .any(|entry| entry.path == page && entry.kind == PageKind::Page));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.path == journal && entry.kind == PageKind::Journal));
-        drop(write);
-        let migration = graph.migrate_sync_identities().unwrap();
-        assert_eq!(migration.pages_changed, 2);
-        assert_eq!(migration.blocks_changed, 2);
-        assert!(fs::read_to_string(&page).unwrap().contains("id:: "));
-        assert!(fs::read_to_string(&journal).unwrap().contains("id:: "));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn overlapping_managed_roots_enable_genesis_uses_canonical_kinds_without_migration() {
-        let dir = scratch("handoff-overlapping-roots-enable");
-        fs::create_dir_all(dir.join("logseq")).unwrap();
-        fs::write(
-            dir.join("logseq/config.edn"),
-            "{:pages-directory \"managed/text\"\n :journals-directory \"managed/text/daily\"}\n",
-        )
-        .unwrap();
-        let page = dir.join("managed/text/projects/Parent.md");
-        let journal = dir.join("managed/text/daily/2026/07/2026_07_24.md");
-        fs::create_dir_all(page.parent().unwrap()).unwrap();
-        fs::create_dir_all(journal.parent().unwrap()).unwrap();
-        fs::write(
-            &page,
-            format!("- parent\n  id:: {}\n", Uuid::from_u128(91_047_200)),
-        )
-        .unwrap();
-        fs::write(
-            &journal,
-            format!("- journal\n  id:: {}\n", Uuid::from_u128(91_047_201)),
-        )
-        .unwrap();
-
-        let graph = Graph::open(&dir);
-        let enabled = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_202), Uuid::from_u128(91_047_203))
-            .unwrap();
-        assert_eq!(enabled.migration.pages_changed, 0);
-        assert_eq!(enabled.migration.blocks_changed, 0);
-        assert_eq!(enabled.status.page_count, 2);
-        let sync = graph.managed_sync.lock().unwrap();
-        let sync = sync.as_ref().unwrap();
-        assert!(sync
-            .materialize_page("managed/text/projects/Parent.md")
-            .unwrap()
-            .is_some());
-        assert!(sync
-            .materialize_page("managed/text/daily/2026/07/2026_07_24.md")
-            .unwrap()
-            .is_some());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn overlapping_managed_roots_migration_retries_after_baseline_race() {
-        let dir = scratch("handoff-overlapping-roots-retry");
-        fs::create_dir_all(dir.join("logseq")).unwrap();
-        fs::write(
-            dir.join("logseq/config.edn"),
-            "{:pages-directory \"managed/text\"\n :journals-directory \"managed/text/daily\"}\n",
-        )
-        .unwrap();
-        let page = dir.join("managed/text/projects/Parent.md");
-        let journal = dir.join("managed/text/daily/2026_07_24.md");
-        fs::create_dir_all(page.parent().unwrap()).unwrap();
-        fs::create_dir_all(journal.parent().unwrap()).unwrap();
-        fs::write(&page, "- parent\n").unwrap();
-        fs::write(&journal, "- journal\n").unwrap();
-
-        let graph = Graph::open(&dir);
-        SYNC_IDENTITY_AFTER_PREPARE.with(|hook| {
-            let journal = journal.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::write(&journal, "- concurrent journal\n")
-            }));
-        });
-        let error = graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read_to_string(&page).unwrap(), "- parent\n");
-        assert_eq!(
-            fs::read_to_string(&journal).unwrap(),
-            "- concurrent journal\n"
-        );
-
-        let retry = graph.migrate_sync_identities().unwrap();
-        assert_eq!(retry.pages_changed, 2);
-        assert_eq!(retry.blocks_changed, 2);
-        assert!(fs::read_to_string(&page).unwrap().contains("id:: "));
-        assert!(fs::read_to_string(&journal).unwrap().contains("id:: "));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn equal_managed_roots_fail_before_identity_writes_or_genesis() {
-        let dir = scratch("handoff-equal-managed-roots");
-        fs::create_dir_all(dir.join("logseq")).unwrap();
-        fs::write(
-            dir.join("logseq/config.edn"),
-            "{:pages-directory \"managed/text\"\n :journals-directory \"managed/text\"}\n",
-        )
-        .unwrap();
-        let page = dir.join("managed/text/Only.md");
-        fs::create_dir_all(page.parent().unwrap()).unwrap();
-        fs::write(&page, "- untouched\n").unwrap();
-
-        let graph = Graph::open(&dir);
-        let migration = graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(migration.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(fs::read_to_string(&page).unwrap(), "- untouched\n");
-        let enable = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_204), Uuid::from_u128(91_047_205))
-            .unwrap_err();
-        assert_eq!(enable.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(fs::read_to_string(&page).unwrap(), "- untouched\n");
-        assert!(!dir.join(".tine-sync").exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn reverse_overlapping_managed_roots_share_longest_owner_with_cache_paths() {
-        let dir = scratch("handoff-reverse-overlapping-roots");
-        fs::create_dir_all(dir.join("logseq")).unwrap();
-        fs::write(
-            dir.join("logseq/config.edn"),
-            "{:pages-directory \"managed/text/daily\"\n :journals-directory \"managed/text\"}\n",
-        )
-        .unwrap();
-        let page = dir.join("managed/text/daily/2026/07/Parent.md");
-        let journal = dir.join("managed/text/archive/2026_07_24.md");
-        fs::create_dir_all(page.parent().unwrap()).unwrap();
-        fs::create_dir_all(journal.parent().unwrap()).unwrap();
-        fs::write(&page, "- nested page\n").unwrap();
-        fs::write(&journal, "- outer journal\n").unwrap();
-
-        let graph = Graph::open(&dir);
-        assert_eq!(graph.entry_for_path(&page).unwrap().kind, PageKind::Page);
-        assert_eq!(
-            graph.entry_for_path(&journal).unwrap().kind,
-            PageKind::Journal
-        );
-        let write = graph.admit_managed_text_writer().unwrap();
-        let entries = graph.managed_text_entries(&write, false).unwrap();
-        assert!(entries
-            .iter()
-            .any(|entry| entry.path == page && entry.kind == PageKind::Page));
-        assert!(entries
-            .iter()
-            .any(|entry| entry.path == journal && entry.kind == PageKind::Journal));
-        drop(write);
-        graph.migrate_sync_identities().unwrap();
-        assert_eq!(graph.entry_for_path(&page).unwrap().kind, PageKind::Page);
-        assert!(graph
-            .list_pages()
-            .iter()
-            .any(|entry| entry.path == page && entry.kind == PageKind::Page));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn projection_windows_held_handle_link_count_tracks_one_and_two_links() {
-        let dir = scratch("projection-windows-held-handle-link-count");
-        let target = dir.join("pages/Target.md");
-        let alias = dir.join("pages/Alias.md");
-        fs::write(&target, b"- retained\n").unwrap();
-        let file = fs::File::open(&target).unwrap();
-
-        assert_eq!(projection_file_link_count(&file).unwrap(), 1);
-        fs::hard_link(&target, &alias).unwrap();
-        assert_eq!(projection_file_link_count(&file).unwrap(), 2);
-
-        let graph = Graph::open(&dir);
-        let migration = graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(migration.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(fs::read(&target).unwrap(), b"- retained\n");
-        assert_eq!(fs::read(&alias).unwrap(), b"- retained\n");
-        assert!(!dir.join(".tine-sync").exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_inventory_rejects_hardlinked_files_before_migration_or_genesis() {
-        let dir = scratch("handoff-managed-inventory-hardlink");
-        let page = dir.join("pages/A.md");
-        let alias = dir.join("pages/B.md");
-        fs::write(&page, "- untouched\n").unwrap();
-        fs::hard_link(&page, &alias).unwrap();
-        let graph = Graph::open(&dir);
-
-        let migration = graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(migration.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(fs::read_to_string(&page).unwrap(), "- untouched\n");
-        assert_eq!(fs::read_to_string(&alias).unwrap(), "- untouched\n");
-        let enable = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_206), Uuid::from_u128(91_047_207))
-            .unwrap_err();
-        assert_eq!(enable.kind(), io::ErrorKind::InvalidData);
-        assert!(!dir.join(".tine-sync").exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_inventory_limits_fail_closed_before_migration_or_genesis() {
-        let dir = scratch("handoff-managed-inventory-limits");
-        fs::write(dir.join("pages/A.md"), "- untouched\n").unwrap();
-        fs::create_dir_all(dir.join("pages/nested")).unwrap();
-        fs::write(dir.join("pages/nested/B.md"), "- nested\n").unwrap();
-        let graph = Graph::open(&dir);
-        let write = graph.admit_managed_text_writer().unwrap();
-        for limits in [
-            ManagedTextInventoryLimits {
-                managed_files: 0,
-                ..MANAGED_TEXT_INVENTORY_LIMITS
-            },
-            ManagedTextInventoryLimits {
-                directory_depth: 1,
-                ..MANAGED_TEXT_INVENTORY_LIMITS
-            },
-            ManagedTextInventoryLimits {
-                all_entries: 0,
-                ..MANAGED_TEXT_INVENTORY_LIMITS
-            },
-            ManagedTextInventoryLimits {
-                directories: 0,
-                ..MANAGED_TEXT_INVENTORY_LIMITS
-            },
-            ManagedTextInventoryLimits {
-                pending_directories: 0,
-                ..MANAGED_TEXT_INVENTORY_LIMITS
-            },
-            ManagedTextInventoryLimits {
-                path_bytes: 0,
-                ..MANAGED_TEXT_INVENTORY_LIMITS
-            },
-        ] {
-            assert!(graph
-                .managed_text_entries_with_limits(&write, false, limits)
-                .is_err());
-        }
-        drop(write);
-
-        MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-            *override_limits.borrow_mut() = Some(ManagedTextInventoryLimits {
-                managed_files: 0,
-                ..MANAGED_TEXT_INVENTORY_LIMITS
-            });
-        });
-        let migration = graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(migration.kind(), io::ErrorKind::InvalidData);
-        let enable = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_208), Uuid::from_u128(91_047_209))
-            .unwrap_err();
-        MANAGED_TEXT_INVENTORY_LIMITS_OVERRIDE.with(|override_limits| {
-            *override_limits.borrow_mut() = None;
-        });
-        assert_eq!(enable.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(
-            fs::read_to_string(dir.join("pages/A.md")).unwrap(),
-            "- untouched\n"
-        );
-        assert!(!dir.join(".tine-sync").exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn migration_projection_scan_budget_has_exact_pre_mutation_boundary() {
-        let content = projection_heavy_managed_block(None, "Project");
-        assert!(content.len() > 256);
-
-        let probe = scratch("projection-budget-migration-probe");
-        fs::write(probe.join("pages/A.md"), &content).unwrap();
-        Graph::open(&probe).migrate_sync_identities().unwrap();
-        let peak = last_managed_content_budget_peak();
-
-        let rejected = scratch("projection-budget-migration-retry");
-        let page = rejected.join("pages/A.md");
-        fs::write(&page, &content).unwrap();
-        let graph = Graph::open(&rejected);
-        let before = regular_file_tree(&rejected);
-        set_managed_content_budget_limit(peak - 1);
-        assert_eq!(
-            graph.migrate_sync_identities().unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&rejected), before);
-        assert!(graph.cache.read().unwrap().is_none());
-        assert!(graph.recent_writes.lock().unwrap().is_empty());
-        assert!(!rejected.join(".tine-sync").exists());
-
-        set_managed_content_budget_limit(peak);
-        let retry = graph.migrate_sync_identities().unwrap();
-        clear_managed_content_budget_limit();
-        assert_eq!(retry.pages_changed, 1);
-        assert!(fs::read_to_string(&page).unwrap().contains("id:: "));
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn enable_projection_scan_budget_has_exact_pre_store_boundary() {
-        let content = projection_heavy_managed_block(Some(Uuid::from_u128(91_049_000)), "Project");
-        assert!(content.len() > 256);
-
-        let probe = scratch("projection-budget-enable-probe");
-        fs::write(probe.join("pages/A.md"), &content).unwrap();
-        Graph::open(&probe)
-            .enable_managed_sync(Uuid::from_u128(91_049_001), Uuid::from_u128(91_049_002))
-            .unwrap();
-        let peak = last_managed_content_budget_peak();
-
-        let rejected = scratch("projection-budget-enable-retry");
-        let page = rejected.join("pages/A.md");
-        fs::write(&page, &content).unwrap();
-        let graph = Graph::open(&rejected);
-        let before = regular_file_tree(&rejected);
-        set_managed_content_budget_limit(peak - 1);
-        assert_eq!(
-            graph
-                .enable_managed_sync(Uuid::from_u128(91_049_003), Uuid::from_u128(91_049_004),)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&rejected), before);
-        assert!(graph.cache.read().unwrap().is_none());
-        assert!(graph.recent_writes.lock().unwrap().is_empty());
-        assert!(!rejected.join(".tine-sync").exists());
-
-        set_managed_content_budget_limit(peak);
-        let retry = graph
-            .enable_managed_sync(Uuid::from_u128(91_049_003), Uuid::from_u128(91_049_004))
-            .unwrap();
-        clear_managed_content_budget_limit();
-        assert_eq!(retry.migration.pages_changed, 0);
-        assert_eq!(retry.status.page_count, 1);
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn active_rename_projection_scan_budget_has_exact_pre_commit_boundary() {
-        fn populate(dir: &Path) {
-            fs::write(
-                dir.join("pages/Project.md"),
-                projection_heavy_managed_block(Some(Uuid::from_u128(91_049_010)), "Project"),
-            )
-            .unwrap();
-        }
-
-        let probe = scratch("projection-budget-rename-probe");
-        populate(&probe);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_049_011), Uuid::from_u128(91_049_012))
-            .unwrap();
-        probe_graph.rename_page("Project", "Archive").unwrap();
-        let peak = last_managed_content_budget_peak();
-
-        let rejected = scratch("projection-budget-rename-retry");
-        populate(&rejected);
-        let graph = Graph::open(&rejected);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_049_013), Uuid::from_u128(91_049_014))
-            .unwrap();
-        let before = regular_file_tree(&rejected);
-        let snapshot_before = graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Project.md")
-            .unwrap();
-
-        set_managed_content_budget_limit(peak - 1);
-        assert_eq!(
-            graph.rename_page("Project", "Archive").unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&rejected), before);
-        assert_eq!(
-            graph
-                .managed_sync
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .materialize_page("pages/Project.md")
-                .unwrap(),
-            snapshot_before
-        );
-        assert!(graph.recent_writes.lock().unwrap().is_empty());
-
-        set_managed_content_budget_limit(peak);
-        graph.rename_page("Project", "Archive").unwrap();
-        clear_managed_content_budget_limit();
-        assert!(rejected.join("pages/Archive.md").exists());
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Archive.md")
-            .unwrap()
-            .is_some());
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_migration_content_budget_bounds_multi_file_preparation_before_writes() {
-        let content = "- retained block\n";
-        let probe = scratch("budget-migration-a");
-        fs::write(probe.join("pages/A.md"), content).unwrap();
-        fs::write(probe.join("pages/B.md"), content).unwrap();
-        Graph::open(&probe).migrate_sync_identities().unwrap();
-        let peak = last_managed_content_budget_peak();
-        assert!(peak > content.len() as u64);
-
-        let accepted = scratch("budget-migration-b");
-        fs::write(accepted.join("pages/A.md"), content).unwrap();
-        fs::write(accepted.join("pages/B.md"), content).unwrap();
-        set_managed_content_budget_limit(peak);
-        let migration = Graph::open(&accepted).migrate_sync_identities().unwrap();
-        assert_eq!(migration.pages_changed, 2);
-        assert!(fs::read_to_string(accepted.join("pages/A.md"))
-            .unwrap()
-            .contains("id:: "));
-        clear_managed_content_budget_limit();
-
-        let rejected = scratch("budget-migration-c");
-        let first = rejected.join("pages/A.md");
-        let second = rejected.join("pages/B.md");
-        fs::write(&first, content).unwrap();
-        fs::write(&second, content).unwrap();
-        let pages_before = regular_file_tree(&rejected.join("pages"));
-        set_managed_content_budget_limit(peak - 1);
-        let rejected_graph = Graph::open(&rejected);
-        let error = rejected_graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(regular_file_tree(&rejected.join("pages")), pages_before);
-        assert!(!rejected.join(".tine-sync").exists());
-        assert!(!rejected.join(".tine-sync/v1/genesis").exists());
-        set_managed_content_budget_limit(peak);
-        let retry = rejected_graph.migrate_sync_identities().unwrap();
-        assert_eq!(retry.pages_changed, 2);
-        assert!(fs::read_to_string(&first).unwrap().contains("id:: "));
-        clear_managed_content_budget_limit();
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&accepted);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn active_sync_migration_admits_writer_with_reread_before_crdt_mutation() {
-        fn populate(dir: &Path) -> (String, String) {
-            let initial = format!("- existing\n  id:: {}\n", Uuid::from_u128(91_047_500));
-            let changed = format!("{initial}- needs identity\n");
-            fs::write(dir.join("pages/A.md"), &initial).unwrap();
-            (initial, changed)
-        }
-
-        let probe = scratch("active-migration-writer-bound-a");
-        let (_, probe_changed) = populate(&probe);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_047_501), Uuid::from_u128(91_047_502))
-            .unwrap();
-        fs::write(probe.join("pages/A.md"), &probe_changed).unwrap();
-        probe_graph.warm_cache();
-        let probe_observer = ManagedMigrationWriterObserver::new();
-        probe_graph.migrate_sync_identities().unwrap();
-        let boundary = probe_observer.observation();
-        drop(probe_observer);
-        assert_eq!(boundary.pre_mutation_observations, 1);
-        assert!(boundary.final_reread_bytes > 0);
-        assert!(boundary.final_reread_retained >= boundary.final_reread_bytes);
-        assert!(boundary.retained_before_writer >= boundary.final_reread_retained);
-        assert!(boundary.writer_reservation_bytes > boundary.final_reread_bytes);
-        assert_eq!(
-            boundary.retained_after_writer,
-            boundary.retained_before_writer + boundary.writer_reservation_bytes,
-        );
-        assert_eq!(
-            boundary.pre_mutation_retained,
-            boundary.retained_after_writer,
-            "the reread and source-derived writer/cache/serialization reservation must remain live until CRDT mutation"
-        );
-        assert_eq!(
-            boundary.pre_mutation_peak, boundary.pre_mutation_retained,
-            "the final writer reservation must define the exact pre-mutation peak"
-        );
-        let admitted_writer_boundary = boundary.pre_mutation_retained;
-
-        let rejected = scratch("active-migration-writer-bound-b");
-        let (initial, changed) = populate(&rejected);
-        let graph = Graph::open(&rejected);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_047_503), Uuid::from_u128(91_047_504))
-            .unwrap();
-        fs::write(rejected.join("pages/A.md"), &changed).unwrap();
-        graph.warm_cache();
-        let disk_before = fs::read(rejected.join("pages/A.md")).unwrap();
-        let store_before = regular_file_tree(&rejected.join(".tine-sync"));
-        let cache_generation_before = graph.cache_generation();
-        let (snapshot_before, status_before, initial_projection_before, changed_projection_before) = {
-            let sync = graph.managed_sync.lock().unwrap();
-            let sync = sync.as_ref().unwrap();
-            (
-                sync.materialize_page("pages/A.md").unwrap(),
-                sync.status().unwrap(),
-                sync.is_known_projection("pages/A.md", &initial).unwrap(),
-                sync.is_known_projection("pages/A.md", &changed).unwrap(),
-            )
-        };
-
-        set_managed_content_budget_limit(admitted_writer_boundary - 1);
-        let rejected_observer = ManagedMigrationWriterObserver::new();
-        let error = graph.migrate_sync_identities().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let rejected_boundary = rejected_observer.observation();
-        drop(rejected_observer);
-        assert_eq!(rejected_boundary.pre_mutation_observations, 0);
-        assert_eq!(
-            rejected_boundary.final_reread_retained, boundary.final_reread_retained,
-            "the rejected run must retain the same final reread state"
-        );
-        assert_eq!(
-            rejected_boundary.final_reread_bytes, boundary.final_reread_bytes,
-            "the rejected run must reserve the same final reread bytes"
-        );
-        assert_eq!(
-            rejected_boundary.retained_before_writer, boundary.retained_before_writer,
-            "the rejected run must reach the same pre-writer retained state"
-        );
-        assert_eq!(
-            rejected_boundary.writer_reservation_bytes, boundary.writer_reservation_bytes,
-            "the rejected run must attempt the same source-derived writer reservation"
-        );
-        assert!(rejected_boundary.writer_reservation_attempted);
-        assert_eq!(rejected_boundary.retained_after_writer, 0);
-        assert_eq!(rejected_boundary.pre_mutation_retained, 0);
-        assert_eq!(rejected_boundary.pre_mutation_peak, 0);
-        assert_eq!(fs::read(rejected.join("pages/A.md")).unwrap(), disk_before);
-        assert_eq!(
-            regular_file_tree(&rejected.join(".tine-sync")),
-            store_before
-        );
-        assert_eq!(graph.cache_generation(), cache_generation_before);
-        assert!(graph.recent_writes.lock().unwrap().is_empty());
-        {
-            let sync = graph.managed_sync.lock().unwrap();
-            let sync = sync.as_ref().unwrap();
-            assert_eq!(
-                sync.materialize_page("pages/A.md").unwrap(),
-                snapshot_before
-            );
-            assert_eq!(sync.status().unwrap(), status_before);
-            assert_eq!(
-                sync.is_known_projection("pages/A.md", &initial).unwrap(),
-                initial_projection_before
-            );
-            assert_eq!(
-                sync.is_known_projection("pages/A.md", &changed).unwrap(),
-                changed_projection_before
-            );
-        }
-
-        set_managed_content_budget_limit(admitted_writer_boundary);
-        let retry_observer = ManagedMigrationWriterObserver::new();
-        let retry = graph.migrate_sync_identities().unwrap();
-        clear_managed_content_budget_limit();
-        let retry_boundary = retry_observer.observation();
-        drop(retry_observer);
-        assert_eq!(retry_boundary, boundary);
-        assert_eq!(retry.pages_changed, 1);
-        assert!(
-            fs::read_to_string(rejected.join("pages/A.md"))
-                .unwrap()
-                .matches("id:: ")
-                .count()
-                >= 2
-        );
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn migration_many_small_files_charges_linear_metadata_before_writes() {
-        fn populate(dir: &Path, count: usize) {
-            for index in 0..count {
-                fs::write(
-                    dir.join("pages").join(format!("Tiny{index:03}.md")),
-                    "- x\n",
-                )
-                .unwrap();
-            }
-        }
-
-        let small = scratch("migration-small-container-probe");
-        populate(&small, 1);
-        Graph::open(&small).migrate_sync_identities().unwrap();
-        let small_peak = last_managed_content_budget_peak();
-
-        let many = scratch("migration-many-container-a");
-        populate(&many, 32);
-        Graph::open(&many).migrate_sync_identities().unwrap();
-        let many_peak = last_managed_content_budget_peak();
-        assert!(many_peak > small_peak);
-
-        let rejected = scratch("migration-many-container-b");
-        populate(&rejected, 32);
-        let before = regular_file_tree(&rejected.join("pages"));
-        let graph = Graph::open(&rejected);
-        set_managed_content_budget_limit(many_peak - 1);
-        assert_eq!(
-            graph.migrate_sync_identities().unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&rejected.join("pages")), before);
-        assert!(graph.recent_writes.lock().unwrap().is_empty());
-        set_managed_content_budget_limit(many_peak);
-        assert_eq!(graph.migrate_sync_identities().unwrap().pages_changed, 32);
-        clear_managed_content_budget_limit();
-
-        let _ = fs::remove_dir_all(&small);
-        let _ = fs::remove_dir_all(&many);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_enable_content_budget_bounds_multi_file_genesis_before_store_creation() {
-        let first_content = format!("- retained block\n  id:: {}\n", Uuid::from_u128(91_047_220));
-        let second_content = format!("- retained block\n  id:: {}\n", Uuid::from_u128(91_047_221));
-        assert_eq!(first_content.len(), second_content.len());
-        let probe = scratch("budget-enable-a");
-        fs::write(probe.join("pages/A.md"), &first_content).unwrap();
-        fs::write(probe.join("pages/B.md"), &second_content).unwrap();
-        Graph::open(&probe)
-            .enable_managed_sync(Uuid::from_u128(91_047_218), Uuid::from_u128(91_047_219))
-            .unwrap();
-        let peak = last_managed_content_budget_peak();
-        assert!(peak > first_content.len() as u64);
-
-        let accepted = scratch("budget-enable-b");
-        fs::write(accepted.join("pages/A.md"), &first_content).unwrap();
-        fs::write(accepted.join("pages/B.md"), &second_content).unwrap();
-        set_managed_content_budget_limit(peak);
-        let enabled = Graph::open(&accepted)
-            .enable_managed_sync(Uuid::from_u128(91_047_221), Uuid::from_u128(91_047_222))
-            .unwrap();
-        assert_eq!(enabled.migration.pages_changed, 0);
-        assert_eq!(enabled.status.page_count, 2);
-        clear_managed_content_budget_limit();
-
-        let rejected = scratch("budget-enable-c");
-        let first = rejected.join("pages/A.md");
-        let second = rejected.join("pages/B.md");
-        fs::write(&first, &first_content).unwrap();
-        fs::write(&second, &second_content).unwrap();
-        let pages_before = regular_file_tree(&rejected.join("pages"));
-        set_managed_content_budget_limit(peak - 1);
-        let rejected_graph = Graph::open(&rejected);
-        let error = rejected_graph
-            .enable_managed_sync(Uuid::from_u128(91_047_223), Uuid::from_u128(91_047_224))
-            .unwrap_err();
-        clear_managed_content_budget_limit();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(regular_file_tree(&rejected.join("pages")), pages_before);
-        assert!(!rejected.join(".tine-sync").exists());
-        assert!(!rejected.join(".tine-sync/v1/genesis").exists());
-        assert!(rejected_graph.cache.read().unwrap().is_none());
-        assert!(rejected_graph.recent_writes.lock().unwrap().is_empty());
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&accepted);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn enable_many_small_files_charges_linear_metadata_before_store_creation() {
-        fn populate(dir: &Path, count: usize) {
-            for index in 0..count {
-                fs::write(
-                    dir.join("pages").join(format!("Tiny{index:03}.md")),
-                    format!(
-                        "- x\n  id:: {}\n",
-                        Uuid::from_u128(91_048_000 + index as u128)
-                    ),
-                )
-                .unwrap();
-            }
-        }
-
-        let small = scratch("enable-container-probe-small");
-        populate(&small, 1);
-        Graph::open(&small)
-            .enable_managed_sync(Uuid::from_u128(91_048_100), Uuid::from_u128(91_048_101))
-            .unwrap();
-        let small_peak = last_managed_content_budget_peak();
-
-        let many = scratch("enable-container-many-a");
-        populate(&many, 32);
-        Graph::open(&many)
-            .enable_managed_sync(Uuid::from_u128(91_048_102), Uuid::from_u128(91_048_103))
-            .unwrap();
-        let many_peak = last_managed_content_budget_peak();
-        assert!(many_peak > small_peak);
-
-        let rejected = scratch("enable-container-many-b");
-        populate(&rejected, 32);
-        let before = regular_file_tree(&rejected.join("pages"));
-        let graph = Graph::open(&rejected);
-        set_managed_content_budget_limit(many_peak - 1);
-        assert_eq!(
-            graph
-                .enable_managed_sync(Uuid::from_u128(91_048_104), Uuid::from_u128(91_048_105),)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&rejected.join("pages")), before);
-        assert!(!rejected.join(".tine-sync").exists());
-        assert!(graph.recent_writes.lock().unwrap().is_empty());
-        set_managed_content_budget_limit(many_peak);
-        let retry = graph
-            .enable_managed_sync(Uuid::from_u128(91_048_104), Uuid::from_u128(91_048_105))
-            .unwrap();
-        clear_managed_content_budget_limit();
-        assert_eq!(retry.status.page_count, 32);
-
-        let _ = fs::remove_dir_all(&small);
-        let _ = fs::remove_dir_all(&many);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_enable_content_budget_rechecks_growth_before_genesis() {
-        let probe = scratch("budget-growth-a");
-        let dir = scratch("budget-growth-b");
-        let first_content = format!("- retained block\n  id:: {}\n", Uuid::from_u128(91_047_225));
-        let second_content = format!("- retained block\n  id:: {}\n", Uuid::from_u128(91_047_226));
-        assert_eq!(first_content.len(), second_content.len());
-        fs::write(probe.join("pages/A.md"), &first_content).unwrap();
-        fs::write(probe.join("pages/B.md"), &second_content).unwrap();
-        Graph::open(&probe)
-            .enable_managed_sync(Uuid::from_u128(91_047_228), Uuid::from_u128(91_047_229))
-            .unwrap();
-        let peak = last_managed_content_budget_peak();
-        let first = dir.join("pages/A.md");
-        let second = dir.join("pages/B.md");
-        fs::write(&first, &first_content).unwrap();
-        fs::write(&second, &second_content).unwrap();
-        set_managed_content_budget_limit(peak);
-        MANAGED_SYNC_ENABLE_AFTER_SNAPSHOT.with(|hook| {
-            let first = first.clone();
-            let grown = format!("{first_content}x");
-            *hook.borrow_mut() = Some(Box::new(move || fs::write(first, grown)));
-        });
-
-        let error = Graph::open(&dir)
-            .enable_managed_sync(Uuid::from_u128(91_047_226), Uuid::from_u128(91_047_227))
-            .unwrap_err();
-        clear_managed_content_budget_limit();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            fs::read_to_string(&first).unwrap(),
-            format!("{first_content}x")
-        );
-        assert_eq!(fs::read_to_string(&second).unwrap(), second_content);
-        assert!(!dir.join(".tine-sync").exists());
-        assert!(!dir.join(".tine-sync/v1/genesis").exists());
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn retained_content_budget_failed_reservation_is_atomic_and_retryable() {
         let budget = RetainedContentBudget::new(ManagedTextInventoryLimits {
@@ -50088,49 +46200,6 @@ mod tests {
             assert_eq!(budget.retained(), 0);
         }
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn combined_migrate_then_enable_budget_fails_before_writes_and_retries_at_boundary() {
-        let content = "- parent\n\t- child\n";
-        let probe = scratch("budget-combined-a");
-        fs::write(probe.join("pages/A.md"), content).unwrap();
-        fs::write(probe.join("pages/B.md"), content).unwrap();
-        let probe_result = Graph::open(&probe)
-            .enable_managed_sync(Uuid::from_u128(91_047_300), Uuid::from_u128(91_047_301))
-            .unwrap();
-        assert_eq!(probe_result.migration.pages_changed, 2);
-        let peak = last_managed_content_budget_peak();
-
-        let rejected = scratch("budget-combined-b");
-        let first = rejected.join("pages/A.md");
-        let second = rejected.join("pages/B.md");
-        fs::write(&first, content).unwrap();
-        fs::write(&second, content).unwrap();
-        let pages_before = regular_file_tree(&rejected.join("pages"));
-        set_managed_content_budget_limit(peak - 1);
-        let graph = Graph::open(&rejected);
-        let error = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_302), Uuid::from_u128(91_047_303))
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(regular_file_tree(&rejected.join("pages")), pages_before);
-        assert!(!rejected.join(".tine-sync").exists());
-        assert!(graph.cache.read().unwrap().is_none());
-        assert!(graph.recent_writes.lock().unwrap().is_empty());
-
-        set_managed_content_budget_limit(peak);
-        let retry = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_302), Uuid::from_u128(91_047_303))
-            .unwrap();
-        clear_managed_content_budget_limit();
-        assert_eq!(retry.migration.pages_changed, 2);
-        assert_eq!(retry.status.page_count, 2);
-        assert!(rejected.join(".tine-sync/v1/genesis").exists());
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&rejected);
     }
 
     #[cfg(any(unix, windows))]
@@ -50249,111 +46318,6 @@ mod tests {
         let _ = fs::remove_dir_all(&rejected);
     }
 
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_namespace_rename_snapshot_budget_rejects_before_operation_or_projection() {
-        fn populate(dir: &Path) {
-            fs::write(
-                dir.join("pages/Project.md"),
-                format!(
-                    "- [[Project/Child]]\n  id:: {}\n",
-                    Uuid::from_u128(91_047_320)
-                ),
-            )
-            .unwrap();
-            fs::write(
-                dir.join("pages/Project%2FChild.md"),
-                format!(
-                    "- child\n  tags:: Project\n  id:: {}\n",
-                    Uuid::from_u128(91_047_321)
-                ),
-            )
-            .unwrap();
-        }
-
-        let probe = scratch("budget-managed-rename-a");
-        populate(&probe);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_047_322), Uuid::from_u128(91_047_323))
-            .unwrap();
-        probe_graph.rename_page("Project", "Archive").unwrap();
-        let peak = last_managed_content_budget_peak();
-
-        let rejected = scratch("budget-managed-rename-b");
-        populate(&rejected);
-        let graph = Graph::open(&rejected);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_047_324), Uuid::from_u128(91_047_325))
-            .unwrap();
-        let project_path = rejected.join("pages/Project.md");
-        let child_path = rejected.join("pages/Project%2FChild.md");
-        let project_before = fs::read(&project_path).unwrap();
-        let child_before = fs::read(&child_path).unwrap();
-        let snapshot_before = graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Project.md")
-            .unwrap();
-
-        set_managed_content_budget_limit(peak - 1);
-        let error = graph.rename_page("Project", "Archive").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(fs::read(&project_path).unwrap(), project_before);
-        assert_eq!(fs::read(&child_path).unwrap(), child_before);
-        assert!(!rejected.join("pages/Archive.md").exists());
-        let snapshot_after = graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Project.md")
-            .unwrap();
-        assert_eq!(snapshot_after, snapshot_before);
-
-        set_managed_content_budget_limit(peak);
-        graph.rename_page("Project", "Archive").unwrap();
-        clear_managed_content_budget_limit();
-        assert!(rejected.join("pages/Archive.md").exists());
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Archive.md")
-            .unwrap()
-            .is_some());
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&rejected);
-    }
-
-    fn exact_budget_managed_pages(graph: &Graph) -> Vec<CrdtPageSnapshot> {
-        graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_pages()
-            .unwrap()
-    }
-
-    fn exact_budget_frontier(graph: &Graph) -> loro::VersionVector {
-        graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .test_frontier()
-    }
-
     fn assert_exact_budget_cache_unchanged(
         graph: &Graph,
         before: &Option<Arc<Vec<(PageEntry, Arc<Document>)>>>,
@@ -50363,224 +46327,6 @@ mod tests {
             (None, None) => {}
             (Some(after), Some(before)) => assert!(Arc::ptr_eq(after, before)),
             _ => panic!("managed cache changed across rejected admission"),
-        }
-    }
-
-    fn populate_exact_active_save(dir: &Path, id: Uuid) {
-        fs::write(
-            dir.join("pages/Exact.md"),
-            format!("- before\n  id:: {id}\n"),
-        )
-        .unwrap();
-    }
-
-    fn exercise_active_save_boundary(forced: bool, label: &str) {
-        let id = Uuid::from_u128(91_050_000);
-        let probe = scratch(&format!("exact-{label}-probe"));
-        populate_exact_active_save(&probe, id);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_050_001), Uuid::from_u128(91_050_002))
-            .unwrap();
-        let mut probe_page = probe_graph
-            .load_named("Exact", PageKind::Page)
-            .unwrap()
-            .unwrap();
-        let probe_rev = probe_page.rev.clone().unwrap();
-        as_editor(&probe_graph, &mut probe_page);
-        probe_page.blocks[0].raw = format!("after\nid:: {id}");
-        if forced {
-            fs::write(
-                probe.join("pages/Exact.md"),
-                format!("- external baseline\n  id:: {id}\n"),
-            )
-            .unwrap();
-            let conflict = probe_graph
-                .save_page(&probe_page, Some(&probe_rev))
-                .unwrap_err();
-            probe_graph
-                .force_save_page_at_revision(&probe_page, Some(&probe_rev), gh254_shown(&conflict))
-                .unwrap();
-        } else {
-            probe_graph
-                .save_page(&probe_page, Some(&probe_rev))
-                .unwrap();
-        }
-        let peak = last_managed_content_budget_peak();
-
-        let retry = scratch(&format!("exact-{label}-retry"));
-        populate_exact_active_save(&retry, id);
-        let graph = Graph::open(&retry);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_050_003), Uuid::from_u128(91_050_004))
-            .unwrap();
-        let mut page = graph.load_named("Exact", PageKind::Page).unwrap().unwrap();
-        as_editor(&graph, &mut page);
-        let rev = page.rev.clone().unwrap();
-        page.blocks[0].raw = format!("after\nid:: {id}");
-        if forced {
-            fs::write(
-                retry.join("pages/Exact.md"),
-                format!("- external baseline\n  id:: {id}\n"),
-            )
-            .unwrap();
-            graph.save_page(&page, Some(&rev)).unwrap_err();
-        }
-        let files_before = regular_file_tree(&retry);
-        let pages_before = exact_budget_managed_pages(&graph);
-        let frontier_before = exact_budget_frontier(&graph);
-        let cache_before = graph.cache.read().unwrap().clone();
-        let recent_before = graph.recent_writes.lock().unwrap().clone();
-        let disk_revs_before = graph.disk_revs.read().unwrap().clone();
-        let cache_gen_before = graph.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-
-        set_managed_content_budget_limit(peak - 1);
-        let error = if forced {
-            let shown = graph
-                .outstanding_conflict_override(&page)
-                .unwrap()
-                .expect("the refused save captured explicit force authority");
-            graph
-                .force_save_page_at_revision(&page, Some(&rev), shown)
-                .unwrap_err()
-        } else {
-            graph.save_page(&page, Some(&rev)).unwrap_err()
-        };
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(regular_file_tree(&retry), files_before);
-        assert_eq!(exact_budget_managed_pages(&graph), pages_before);
-        assert_eq!(exact_budget_frontier(&graph), frontier_before);
-        assert_exact_budget_cache_unchanged(&graph, &cache_before);
-        assert_eq!(*graph.recent_writes.lock().unwrap(), recent_before);
-        assert_eq!(*graph.disk_revs.read().unwrap(), disk_revs_before);
-        assert_eq!(
-            graph.cache_gen.load(std::sync::atomic::Ordering::Acquire),
-            cache_gen_before,
-        );
-
-        set_managed_content_budget_limit(peak);
-        if forced {
-            let conflict = graph.save_page(&page, Some(&rev)).unwrap_err();
-            graph
-                .force_save_page_at_revision(&page, Some(&rev), gh254_shown(&conflict))
-                .unwrap();
-        } else {
-            graph.save_page(&page, Some(&rev)).unwrap();
-        }
-        clear_managed_content_budget_limit();
-        assert!(fs::read_to_string(retry.join("pages/Exact.md"))
-            .unwrap()
-            .contains("after"));
-
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&retry);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn normal_active_save_has_exact_pre_commit_budget_boundary() {
-        exercise_active_save_boundary(false, "active-save");
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn forced_active_save_has_exact_pre_commit_budget_boundary() {
-        exercise_active_save_boundary(true, "forced-save");
-    }
-
-    #[test]
-    fn production_crdt_mutations_are_confined_to_prepared_owners() {
-        fn braced_item_range(source: &str, marker: &str) -> std::ops::Range<usize> {
-            let start = source.find(marker).expect("prepared mutation module");
-            let open = start + marker.find('{').expect("owner impl opening brace");
-            let mut depth = 0_usize;
-            for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
-                match byte {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return start..open + offset + 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            panic!("unterminated prepared mutation module");
-        }
-
-        let source = include_str!("model.rs");
-        let production = source
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .expect("model production source");
-        assert!(!production.contains("PreparedCrdtPageSnapshot::into_parts"));
-        assert!(!production.contains(".snapshot.into_parts()"));
-        for raw in [
-            "sync.commit_page(",
-            "sync.commit_pages(",
-            "sync.replace_pages_with_projection_preconditions(",
-            "sync.promote_copy(",
-            "sync.delete_page(",
-        ] {
-            assert!(
-                !production.contains(raw),
-                "model production bypasses prepared mutation capability via {raw}",
-            );
-        }
-
-        let owner_module = braced_item_range(production, "mod prepared_crdt_mutation {");
-        for needle in [
-            "PreparedCrdtMutationCapability::new(",
-            "sync.commit_page_owned(",
-            "sync.commit_pages_owned(",
-            "sync.replace_pages_with_projection_preconditions_owned(",
-            "sync.promote_copy_owned(",
-            "sync.delete_page_owned(",
-            "CrdtGraph::initialize_at_owned(",
-        ] {
-            let positions: Vec<_> = production
-                .match_indices(needle)
-                .map(|(position, _)| position)
-                .collect();
-            assert!(
-                !positions.is_empty(),
-                "missing prepared mutation path {needle}"
-            );
-            assert!(
-                positions
-                    .iter()
-                    .all(|position| owner_module.contains(position)),
-                "{needle} escaped the private prepared-owner module",
-            );
-        }
-        assert!(
-            !production[..owner_module.start].contains("PreparedCrdtMutationCapability::new(")
-                && !production[owner_module.end..].contains("PreparedCrdtMutationCapability::new("),
-            "typed mutation authority can be constructed outside prepared owners",
-        );
-
-        let graph_source = include_str!("crdt/graph.rs");
-        for method in [
-            "initialize_at_owned",
-            "commit_page_owned",
-            "commit_pages_owned",
-            "replace_pages_with_projection_preconditions_owned",
-            "promote_copy_owned",
-            "delete_page_owned",
-        ] {
-            let start = graph_source
-                .find(method)
-                .expect("owned graph mutation method");
-            let signature = &graph_source[start
-                ..graph_source[start..]
-                    .find('{')
-                    .map(|offset| start + offset)
-                    .expect("owned graph mutation body")];
-            assert!(
-                signature.contains("PreparedCrdtMutationCapability"),
-                "{method} lost its typed capability parameter",
-            );
         }
     }
 
@@ -50792,479 +46538,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn breadth_and_nesting_use_checked_iterative_batch_aggregation() {
-        fn nested_blocks(seed: u128) -> Vec<BlockDto> {
-            let mut children = Vec::new();
-            for depth in (0..32_u128).rev() {
-                children = vec![BlockDto {
-                    id: format!("runtime-{seed}-{depth}"),
-                    raw: format!(
-                        "node {seed}-{depth}\nid:: {}",
-                        Uuid::from_u128(seed + depth),
-                    ),
-                    children,
-                    ..BlockDto::default()
-                }];
-            }
-            children
-        }
-        fn page(name: &str, seed: u128) -> PageDto {
-            let mut blocks = Vec::new();
-            for breadth in 0..24_u128 {
-                blocks.extend(nested_blocks(seed + breadth * 64));
-            }
-            PageDto {
-                activation: None,
-                name: name.to_owned(),
-                kind: PageKind::Page,
-                title: name.to_owned(),
-                pre_block: None,
-                blocks,
-                rev: None,
-                format: Format::Md,
-                read_only: false,
-                path: format!("pages/{name}.md"),
-                guide: false,
-            }
-        }
-        fn prepare(limit: u64) -> io::Result<()> {
-            set_managed_content_budget_limit(limit);
-            let budget = RetainedContentBudget::new(managed_text_inventory_limits());
-            let first = page("Breadth-A", 91_052_000);
-            let second = page("Breadth-B", 91_054_000);
-            let mut batch = PreparedCrdtPageBatch::with_capacity(
-                2,
-                &budget,
-                "breadth/nested test batch capacities",
-            )?;
-            batch.push(crdt_snapshot_for_page(&first, CrdtPageId::new(), &budget)?);
-            batch.push(crdt_snapshot_for_page(&second, CrdtPageId::new(), &budget)?);
-            let _batch =
-                batch.admit_operation(&budget, "breadth/nested test operation aggregation")?;
-            Ok(())
-        }
-
-        prepare(u64::MAX).unwrap();
-        let peak = last_managed_content_budget_peak();
-        assert_eq!(
-            prepare(peak - 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidData,
-        );
-        prepare(peak).unwrap();
-        clear_managed_content_budget_limit();
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_restore_has_exact_pre_replace_budget_boundary() {
-        fn populate(dir: &Path, id: Uuid) -> String {
-            let content = format!("- original\n  id:: {id}\n");
-            fs::write(dir.join("pages/Restore.md"), &content).unwrap();
-            content
-        }
-        let id = Uuid::from_u128(91_050_010);
-        let restored = format!("- restored\n  id:: {id}\n");
-        let probe = scratch("exact-restore-probe");
-        populate(&probe, id);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_050_011), Uuid::from_u128(91_050_012))
-            .unwrap();
-        probe_graph
-            .commit_managed_restore(&[("pages/Restore.md".to_owned(), restored.clone())])
-            .unwrap();
-        let peak = last_managed_content_budget_peak();
-
-        let retry = scratch("exact-restore-retry");
-        populate(&retry, id);
-        let graph = Graph::open(&retry);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_050_013), Uuid::from_u128(91_050_014))
-            .unwrap();
-        let files_before = regular_file_tree(&retry);
-        let pages_before = exact_budget_managed_pages(&graph);
-        let frontier_before = exact_budget_frontier(&graph);
-        let cache_before = graph.cache.read().unwrap().clone();
-        let recent_before = graph.recent_writes.lock().unwrap().clone();
-        set_managed_content_budget_limit(peak - 1);
-        assert_eq!(
-            graph
-                .commit_managed_restore(&[("pages/Restore.md".to_owned(), restored.clone(),)])
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&retry), files_before);
-        assert_eq!(exact_budget_managed_pages(&graph), pages_before);
-        assert_eq!(exact_budget_frontier(&graph), frontier_before);
-        assert_exact_budget_cache_unchanged(&graph, &cache_before);
-        assert_eq!(*graph.recent_writes.lock().unwrap(), recent_before);
-        set_managed_content_budget_limit(peak);
-        graph
-            .commit_managed_restore(&[("pages/Restore.md".to_owned(), restored)])
-            .unwrap();
-        clear_managed_content_budget_limit();
-        assert!(exact_budget_managed_pages(&graph)[0].blocks[0]
-            .raw
-            .contains("restored"));
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&retry);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_journal_migration_has_exact_pre_commit_budget_boundary() {
-        fn populate(dir: &Path, id: Uuid) {
-            fs::write(
-                dir.join("journals/Jun 24th, 2026.md"),
-                format!("- journal\n  id:: {id}\n"),
-            )
-            .unwrap();
-        }
-        let id = Uuid::from_u128(91_050_020);
-        let probe = scratch("exact-journal-migration-probe");
-        populate(&probe, id);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_050_021), Uuid::from_u128(91_050_022))
-            .unwrap();
-        assert_eq!(probe_graph.migrate_journal_filenames_checked().unwrap(), 1);
-        let peak = last_managed_content_budget_peak();
-
-        let retry = scratch("exact-journal-migration-retry");
-        populate(&retry, id);
-        let graph = Graph::open(&retry);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_050_023), Uuid::from_u128(91_050_024))
-            .unwrap();
-        let files_before = regular_file_tree(&retry);
-        let pages_before = exact_budget_managed_pages(&graph);
-        let frontier_before = exact_budget_frontier(&graph);
-        let cache_before = graph.cache.read().unwrap().clone();
-        let recent_before = graph.recent_writes.lock().unwrap().clone();
-        set_managed_content_budget_limit(peak - 1);
-        assert_eq!(
-            graph
-                .migrate_journal_filenames_checked()
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&retry), files_before);
-        assert_eq!(exact_budget_managed_pages(&graph), pages_before);
-        assert_eq!(exact_budget_frontier(&graph), frontier_before);
-        assert_exact_budget_cache_unchanged(&graph, &cache_before);
-        assert_eq!(*graph.recent_writes.lock().unwrap(), recent_before);
-        set_managed_content_budget_limit(peak);
-        assert_eq!(graph.migrate_journal_filenames_checked().unwrap(), 1);
-        clear_managed_content_budget_limit();
-        assert!(retry.join("journals/2026_06_24.md").exists());
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&retry);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn incoming_conflict_rekey_has_exact_pre_commit_budget_boundary() {
-        fn populate(dir: &Path, id: Uuid) -> String {
-            let content = format!("- copied\n  id:: {id}\n");
-            fs::write(dir.join("pages/Source.md"), &content).unwrap();
-            content
-        }
-        let id = Uuid::from_u128(91_050_030);
-        let probe = scratch("exact-incoming-rekey-probe");
-        let content = populate(&probe, id);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_050_031), Uuid::from_u128(91_050_032))
-            .unwrap();
-        fs::write(probe.join("pages/Copy.md"), &content).unwrap();
-        probe_graph
-            .sync_file_checked(&probe.join("pages/Copy.md"))
-            .unwrap();
-        let peak = last_managed_content_budget_peak();
-
-        let retry = scratch("exact-incoming-rekey-retry");
-        let content = populate(&retry, id);
-        let graph = Graph::open(&retry);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_050_033), Uuid::from_u128(91_050_034))
-            .unwrap();
-        let copy = retry.join("pages/Copy.md");
-        fs::write(&copy, &content).unwrap();
-        let files_before = regular_file_tree(&retry);
-        let pages_before = exact_budget_managed_pages(&graph);
-        let frontier_before = exact_budget_frontier(&graph);
-        let cache_before = graph.cache.read().unwrap().clone();
-        let recent_before = graph.recent_writes.lock().unwrap().clone();
-        set_managed_content_budget_limit(peak - 1);
-        assert_eq!(
-            graph.sync_file_checked(&copy).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&retry), files_before);
-        assert_eq!(exact_budget_managed_pages(&graph), pages_before);
-        assert_eq!(exact_budget_frontier(&graph), frontier_before);
-        assert_exact_budget_cache_unchanged(&graph, &cache_before);
-        assert_eq!(*graph.recent_writes.lock().unwrap(), recent_before);
-        set_managed_content_budget_limit(peak);
-        graph.sync_file_checked(&copy).unwrap();
-        clear_managed_content_budget_limit();
-        let pages = exact_budget_managed_pages(&graph);
-        let source_id = pages
-            .iter()
-            .find(|page| page.path == "pages/Source.md")
-            .unwrap()
-            .blocks[0]
-            .id;
-        let copy_id = pages
-            .iter()
-            .find(|page| page.path == "pages/Copy.md")
-            .unwrap()
-            .blocks[0]
-            .id;
-        assert_ne!(source_id, copy_id);
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&retry);
-    }
-
-    #[test]
-    fn long_unique_legacy_ids_have_exact_source_derived_budget_boundary() {
-        let mut content = String::new();
-        for index in 0..24 {
-            content.push_str(&format!(
-                "- block {index}\n  id:: legacy-{index}-{}\n",
-                "長".repeat(2048),
-            ));
-        }
-        let page = markdown_page_dto("Legacy", "Legacy", &content).unwrap();
-        {
-            let budget = RetainedContentBudget::new(MANAGED_TEXT_INVENTORY_LIMITS);
-            page_with_persisted_sync_ids(&page, &budget).unwrap();
-        }
-        let peak = last_managed_content_budget_peak();
-        let before = page.clone();
-        set_managed_content_budget_limit(peak - 1);
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        assert_eq!(
-            page_with_persisted_sync_ids(&page, &budget)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        drop(budget);
-        assert_eq!(page.name, before.name);
-        assert_eq!(page.path, before.path);
-        assert_eq!(
-            page.blocks
-                .iter()
-                .map(|block| &block.raw)
-                .collect::<Vec<_>>(),
-            before
-                .blocks
-                .iter()
-                .map(|block| &block.raw)
-                .collect::<Vec<_>>(),
-        );
-        set_managed_content_budget_limit(peak);
-        let budget = RetainedContentBudget::new(managed_text_inventory_limits());
-        let retry = page_with_persisted_sync_ids(&page, &budget).unwrap();
-        drop(budget);
-        clear_managed_content_budget_limit();
-        assert_eq!(retry.blocks.len(), 24);
-        assert!(retry.blocks[23].raw.contains("legacy-23-"));
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn maximally_deep_nested_page_has_exact_pre_commit_budget_boundary() {
-        const DEPTH: usize = 128;
-        fn populate(dir: &Path) {
-            let mut content = String::new();
-            for depth in 0..DEPTH {
-                content.push_str(&"\t".repeat(depth));
-                content.push_str(&format!("- level {depth}\n"));
-                content.push_str(&"\t".repeat(depth));
-                content.push_str(&format!(
-                    "  id:: {}\n",
-                    Uuid::from_u128(91_051_000 + depth as u128),
-                ));
-            }
-            fs::write(dir.join("pages/Deep.md"), content).unwrap();
-        }
-        fn edited_page(graph: &Graph) -> PageDto {
-            let mut page = graph.load_named("Deep", PageKind::Page).unwrap().unwrap();
-            let mut block = &mut page.blocks[0];
-            for _ in 1..DEPTH {
-                block = &mut block.children[0];
-            }
-            block.raw = format!(
-                "deepest changed\nid:: {}",
-                Uuid::from_u128(91_051_000 + DEPTH as u128 - 1),
-            );
-            page
-        }
-        let probe = scratch("exact-deep-probe");
-        populate(&probe);
-        let probe_graph = Graph::open(&probe);
-        probe_graph
-            .enable_managed_sync(Uuid::from_u128(91_051_200), Uuid::from_u128(91_051_201))
-            .unwrap();
-        let probe_page = edited_page(&probe_graph);
-        let probe_rev = probe_page.rev.clone().unwrap();
-        probe_graph
-            .save_page(&probe_page, Some(&probe_rev))
-            .unwrap();
-        let peak = last_managed_content_budget_peak();
-
-        let retry = scratch("exact-deep-retry");
-        populate(&retry);
-        let graph = Graph::open(&retry);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_051_202), Uuid::from_u128(91_051_203))
-            .unwrap();
-        let page = edited_page(&graph);
-        let rev = page.rev.clone().unwrap();
-        let files_before = regular_file_tree(&retry);
-        let pages_before = exact_budget_managed_pages(&graph);
-        let frontier_before = exact_budget_frontier(&graph);
-        let cache_before = graph.cache.read().unwrap().clone();
-        let recent_before = graph.recent_writes.lock().unwrap().clone();
-        set_managed_content_budget_limit(peak - 1);
-        assert_eq!(
-            graph.save_page(&page, Some(&rev)).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(regular_file_tree(&retry), files_before);
-        assert_eq!(exact_budget_managed_pages(&graph), pages_before);
-        assert_eq!(exact_budget_frontier(&graph), frontier_before);
-        assert_exact_budget_cache_unchanged(&graph, &cache_before);
-        assert_eq!(*graph.recent_writes.lock().unwrap(), recent_before);
-        set_managed_content_budget_limit(peak);
-        graph.save_page(&page, Some(&rev)).unwrap();
-        clear_managed_content_budget_limit();
-        assert!(fs::read_to_string(retry.join("pages/Deep.md"))
-            .unwrap()
-            .contains("deepest changed"));
-        let _ = fs::remove_dir_all(&probe);
-        let _ = fs::remove_dir_all(&retry);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn managed_inventory_rejects_casefolded_root_aliases_before_mutation() {
-        let dir = scratch("handoff-managed-inventory-root-alias");
-        fs::create_dir_all(dir.join("Pages")).unwrap();
-        let Ok(lowercase) = fs::canonicalize(dir.join("pages")) else {
-            return; // This volume has case-sensitive directory semantics.
-        };
-        if fs::canonicalize(dir.join("Pages")).unwrap() != lowercase {
-            return; // This volume has opted into case-sensitive directory semantics.
-        }
-        fs::create_dir_all(dir.join("logseq")).unwrap();
-        fs::write(
-            dir.join("logseq/config.edn"),
-            "{:pages-directory \"Pages\"\n :journals-directory \"pages\"}\n",
-        )
-        .unwrap();
-        let page = dir.join("Pages/Only.md");
-        fs::write(&page, "- untouched\n").unwrap();
-        let graph = Graph::open(&dir);
-
-        assert_eq!(
-            graph.migrate_sync_identities().unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(fs::read_to_string(&page).unwrap(), "- untouched\n");
-        assert_eq!(
-            graph
-                .enable_managed_sync(Uuid::from_u128(91_047_210), Uuid::from_u128(91_047_211))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(!dir.join(".tine-sync").exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn managed_sync_enable_revalidates_retained_a_before_genesis() {
-        let dir = scratch("handoff-managed-sync-enable-baseline-change");
-        let path = dir.join("pages/Page.md");
-        fs::write(
-            &path,
-            format!("- original A\n  id:: {}\n", Uuid::from_u128(91_047_040)),
-        )
-        .unwrap();
-        let graph = Graph::open(&dir);
-        MANAGED_SYNC_ENABLE_AFTER_SNAPSHOT.with(|hook| {
-            let path = path.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::write(&path, "- concurrent external A\n")
-            }));
-        });
-
-        let error = graph
-            .enable_managed_sync(Uuid::from_u128(91_047_041), Uuid::from_u128(91_047_042))
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read(&path).unwrap(), b"- concurrent external A\n");
-        assert!(!dir.join(".tine-sync").exists());
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_restore_preconditions_and_operation_truth_stay_on_retained_a() {
-        let dir = scratch("handoff-managed-restore-retained");
-        let moved = dir.with_file_name("tine-handoff-managed-restore-retained-moved");
-        let _ = fs::remove_dir_all(&moved);
-        fs::write(dir.join("pages/Page.md"), "- original A\n").unwrap();
-        let graph = Graph::open(&dir);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_047_050), Uuid::from_u128(91_047_051))
-            .unwrap();
-        let original = fs::read_to_string(dir.join("pages/Page.md")).unwrap();
-        let restored = original.replacen("original A", "restored A", 1);
-        MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-            let dir = dir.clone();
-            let moved = moved.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::rename(&dir, &moved)?;
-                fs::create_dir_all(dir.join("pages"))?;
-                fs::create_dir_all(dir.join("journals"))?;
-                fs::write(dir.join("pages/Page.md"), "- replacement B\n")?;
-                hold_replacement_handoff(&dir, 91_047_052)
-            }));
-        });
-
-        assert!(graph
-            .commit_managed_restore(&[("pages/Page.md".to_owned(), restored.clone())])
-            .unwrap());
-        graph.project_all_managed_sync().unwrap();
-        assert_eq!(
-            fs::read_to_string(moved.join("pages/Page.md")).unwrap(),
-            restored
-        );
-        assert_eq!(
-            fs::read(dir.join("pages/Page.md")).unwrap(),
-            b"- replacement B\n"
-        );
-        assert!(!dir.join(".tine-sync").exists());
-        let replacement = Graph::open(&dir);
-        assert_handoff_blocked(
-            replacement.create_markdown_page_if_absent("restore blocked on B", "- blocked\n"),
-        );
-
-        release_replacement_handoff();
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&moved);
-    }
-
     #[cfg(unix)]
     #[test]
     fn rename_inventory_and_referrer_reads_stay_on_retained_a_after_reserved_b_replacement() {
@@ -51324,7 +46597,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&moved);
     }
-
     #[cfg(unix)]
     #[test]
     fn journal_migration_selection_stays_on_nested_retained_a_after_reserved_b_replacement() {
@@ -51435,91 +46707,6 @@ mod tests {
             fs::read(dir.join("pages/other/deep/Victim.md")).unwrap(),
             b"- victim B\n"
         );
-
-        release_replacement_handoff();
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&moved);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn watcher_rename_and_delete_detection_use_retained_a_under_reserved_b() {
-        let dir = scratch("handoff-watcher-selection-retained");
-        let moved = dir.with_file_name("tine-handoff-watcher-selection-retained-moved");
-        let _ = fs::remove_dir_all(&moved);
-        fs::write(dir.join("pages/Old.md"), "- old A\n").unwrap();
-        fs::write(dir.join("pages/Delete.md"), "- delete A\n").unwrap();
-        let graph = Graph::open(&dir);
-        graph
-            .enable_managed_sync(Uuid::from_u128(91_047_401), Uuid::from_u128(91_047_402))
-            .unwrap();
-        let old_id = graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Old.md")
-            .unwrap()
-            .unwrap()
-            .id;
-        fs::rename(dir.join("pages/Old.md"), dir.join("pages/New.md")).unwrap();
-        MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
-            let dir = dir.clone();
-            let moved = moved.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                fs::rename(&dir, &moved)?;
-                fs::create_dir_all(dir.join("pages"))?;
-                fs::create_dir_all(dir.join("journals"))?;
-                fs::write(dir.join("pages/Old.md"), "- old B\n")?;
-                fs::write(dir.join("pages/Delete.md"), "- delete B\n")?;
-                hold_replacement_handoff(&dir, 91_047_400)
-            }));
-        });
-
-        graph.sync_file_checked(&dir.join("pages/New.md")).unwrap();
-        let renamed = graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/New.md")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            renamed.id, old_id,
-            "watcher must classify the A move as a rename"
-        );
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Old.md")
-            .unwrap()
-            .is_none());
-
-        fs::remove_file(moved.join("pages/Delete.md")).unwrap();
-        graph
-            .sync_deleted_file(&dir.join("pages/Delete.md"))
-            .unwrap();
-        assert!(graph
-            .managed_sync
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .materialize_page("pages/Delete.md")
-            .unwrap()
-            .is_none());
-        assert_eq!(fs::read(dir.join("pages/Old.md")).unwrap(), b"- old B\n");
-        assert_eq!(
-            fs::read(dir.join("pages/Delete.md")).unwrap(),
-            b"- delete B\n"
-        );
-        assert!(!dir.join("pages/New.md").exists());
 
         release_replacement_handoff();
         let _ = fs::remove_dir_all(&dir);
@@ -53696,7 +48883,10 @@ mod tests {
         };
         // An ABSENT editor: no file, no revision. Increment 3 gives it a real
         // activation anyway, because it can meet an external-create conflict on
-        // its very first save — which is exactly what this test then does.
+        // its very first save — which is exactly what this test then does. Direct
+        // creation deliberately fails closed without a warm semantic snapshot,
+        // so install the ordinary open-time evidence before arming the race.
+        graph.warm_cache();
         let handle = graph.activate_absent_editor("New", PageKind::Page).unwrap();
         assert!(handle.prospective, "no file exists for New yet");
         page.activation = Some(handle.activation.as_u64());
