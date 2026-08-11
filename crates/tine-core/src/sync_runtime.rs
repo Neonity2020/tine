@@ -23299,10 +23299,11 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            handle.clean_shutdown(),
-            Err(SyncRuntimeRequestError::ActorRefused(_))
-        ));
+        let shutdown = handle.clean_shutdown();
+        assert!(
+            matches!(shutdown, Err(SyncRuntimeRequestError::ActorRefused(_))),
+            "a revoked runtime must not report a clean shutdown: {shutdown:?}"
+        );
         assert!(matches!(
             fixture.handoff(),
             EnrollmentDiscoveryHandoff::Unsafe { .. }

@@ -13857,8 +13857,15 @@ mod tests {
         assert_eq!(multi_opened.rebuild.accepted_events_applied, parts);
         assert_eq!(multi_opened.rebuild.max_live_events, 1);
         assert_eq!(multi_opened.rebuild.max_live_evidence_records, 1);
-        assert_eq!(multi_opened.rebuild.accepted_root_authentications, parts);
-        assert_eq!(multi_opened.rebuild.exact_catalog_loads, parts);
+        // One, not one per part, for both of these, and that is the point: the
+        // accepted root is authenticated once per rebuild and the exact catalog
+        // is loaded once, however many parts the publication has. Pinning the
+        // literals keeps it that way — a `<= parts` bound would pass while
+        // quietly letting a large graph's rebuild scale with its part count
+        // again. The two counters above stay per-part, because validating and
+        // applying each accepted event is exactly what a part costs.
+        assert_eq!(multi_opened.rebuild.accepted_root_authentications, 1);
+        assert_eq!(multi_opened.rebuild.exact_catalog_loads, 1);
         assert_eq!(
             multi_opened.rebuild.reference_coverage_inductive_checks,
             multi.aggregate().parts().len()

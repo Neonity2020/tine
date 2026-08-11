@@ -3517,10 +3517,15 @@ fn manifested_semantic_refusals_block_initial_and_reserved_restart_attempts_then
     let refusal =
         execute_manifested_projection_work(&graph, &receipts, &mut engine, &initial_refusal)
             .unwrap_err();
+    // GuardedConflict, not Io: a semantic refusal blocks this work for external
+    // reconciliation, and the variant is what tells the coordinator that
+    // retrying the same job cannot make progress -- the Blocked status asserted
+    // below is the other half of that contract. Pinned to the exact variant on
+    // purpose: a regression back to plain Io would read as retryable and spin.
     assert!(
         matches!(
             refusal,
-            ProjectionError::Io(ref error)
+            ProjectionError::GuardedConflict(ref error)
                 if error.kind() == std::io::ErrorKind::InvalidData
                     && error.to_string().contains("refusing to drop an existing page preamble")
         ),
@@ -3631,10 +3636,15 @@ fn manifested_semantic_refusals_block_initial_and_reserved_restart_attempts_then
     let refusal =
         execute_manifested_projection_work(&graph, &receipts, &mut restarted, &restart_refusal)
             .unwrap_err();
+    // GuardedConflict, not Io: a semantic refusal blocks this work for external
+    // reconciliation, and the variant is what tells the coordinator that
+    // retrying the same job cannot make progress -- the Blocked status asserted
+    // below is the other half of that contract. Pinned to the exact variant on
+    // purpose: a regression back to plain Io would read as retryable and spin.
     assert!(
         matches!(
             refusal,
-            ProjectionError::Io(ref error)
+            ProjectionError::GuardedConflict(ref error)
                 if error.kind() == std::io::ErrorKind::InvalidData
                     && error.to_string().contains("refusing to drop an existing page preamble")
         ),
