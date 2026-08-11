@@ -43653,12 +43653,13 @@ mod tests {
             startup_open_phase_receipt(&open),
             startup_promoted_open_phase_receipt(&promoted),
         );
-        // Not a tuned budget: a tripwire far above the measured cost, so a
-        // return of the per-document whole-graph anchor work (which put this
-        // same case at 72 s) fails loudly instead of being read as "slow today".
+        // Hard real-corpus recovery ceiling. A return of the per-document
+        // whole-graph anchor work (which put this same case at 72 s) must fail
+        // loudly instead of being read as "slow today".
         assert!(
-            elapsed < Duration::from_secs(45),
-            "aged-history crash reopen exceeded 45 seconds"
+            elapsed < Duration::from_secs(10),
+            "aged-history crash reopen exceeded the 10-second real-corpus recovery ceiling: elapsed_ms={:.3}",
+            startup_ms(elapsed),
         );
         drop(reopened.handle);
     }
@@ -43905,6 +43906,11 @@ mod tests {
         assert!(
             promoted.projection_applied_batches > 0,
             "a rebuild that applied no accepted batches did not reconstruct anything"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "projection rebuild exceeded the 10-second real-corpus recovery ceiling: elapsed_ms={:.3}",
+            startup_ms(elapsed),
         );
         drop(reopened.handle);
     }
