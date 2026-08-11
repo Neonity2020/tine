@@ -7,12 +7,12 @@ icon:: 🗺️
   - Everything you write is a **block** (one bullet). Blocks nest under other blocks to form the outline, and any block can carry a task, a date, a link, or its own id for references from elsewhere.
   - Press **Ctrl+K** at any time to jump to a page by name or to text inside any block.
 - ## The left sidebar: your graph's contents
-  - At the very top sits the workspace switcher — saved window layouts, covered in [[Workflows/Keep context visible]]. Just under it, the graph-name menu switches between the graphs Tine knows, with **Open graph…** and **New graph…** beside them — Shift-click a graph row to open it in a second window instead of switching this one.
+  - At the very top sits the workspace switcher — saved window layouts, covered in [[Workflows/Keep context visible]]. Just under it, the graph-name menu switches between the graphs Tine knows, with **Open graph…** and **New graph…** beside them — on desktop, Shift-click a graph row to open it in a second window instead of switching this one.
   - Below the menu: **Journals**, then fold-up **Favorites**, **Recent**, **All pages**, and the **Namespaces** tree, where `Project/Roadmap` nests under `Project`. Favorites and Recent remember per graph whether you left them open or folded.
   - The **+ New page** button at the bottom opens the same Ctrl+K box; a name that matches nothing becomes a page you can create. Press **t l** to fold the whole sidebar away, and **t l** again to bring it back.
 - ## The tab strip: what's open
   - Every open page keeps a tab along the top, browser-style: click to switch, **Ctrl+W** to close. Middle-click anything that opens a page — a link, a search result, a bullet's dot — to park it in a background tab without leaving this one. Tabs come back after a restart.
-  - Tabs are Tine's own addition (Logseq core has none) and a desktop feature — the phone app hides the strip so one page keeps the screen.
+  - Tabs are a desktop feature — the mobile app hides the strip so one page keeps the screen.
 - ## The right sidebar: parked context
   - Anything you want **beside** the current page rather than instead of it — another page, or zoomed into one bullet — goes to the right sidebar: **Shift-click** a link or a bullet's dot. Items there are live editors, not previews. Press **t r** to show or hide the whole sidebar.
 - ## Settings and Help

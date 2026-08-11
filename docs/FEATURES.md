@@ -331,8 +331,9 @@ within a column; merged cells are still v2+.
   session and restored on launch.
 - ⊕ **Named workspaces** — save the whole window context (split layout, every
   pane's tabs and back/forward history, both sidebars, and Recent) as a named
-  workspace and switch between them in place from the switcher at the far left of
-  the tab bar (hover for a quick switch, click for New / Rename / Delete). Each
+  workspace and switch between them in place from the switcher at the top of the
+  left sidebar (hover for a quick switch, click for New / Rename / Delete; a compact
+  control stays in the toolbar while the sidebar is folded). Each
   graph keeps its own set and the active one persists across restarts. Workspaces
   are device-local session state — saving, switching, or deleting one never writes
   to your graph.

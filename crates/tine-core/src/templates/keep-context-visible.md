@@ -24,7 +24,7 @@ icon:: 📌
 - ## Save the arrangement as a workspace
   - 1. With the layout where you want it — splits, every pane's tabs and histories, both sidebars — click the workspace name at the top of the left sidebar and choose **+ New workspace**; name it once.
   - 2. Come back to it from the same switcher: hover the name for a quick-switch list, or click it for the full menu with **Rename** and **Delete**. Each graph keeps its own set, and the active one comes back after a restart.
-  - What you should see: the whole window return exactly as saved. Workspaces are device-local session state — saving, switching, or deleting one never writes to your graph.
+  - What you should see: the saved pane layout, tabs and histories, sidebars, and Recent return together. Workspaces are device-local session state — saving, switching, or deleting one never writes to your graph.
 - ## Clear everything else away
   - **t f** (focus mode) hides the sidebars and toolbar so the screen is just text — on desktop it also takes the window full screen. Hover the top edge to reach the toolbar again; layered **Esc** steps back out.
   - **t b** fades every block except the one you're editing. Settings → **Appearance** → **Dim in focus mode** can dim for you while focus mode is on — without rewriting your manual **t b** choice.
