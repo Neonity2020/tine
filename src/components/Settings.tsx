@@ -2,6 +2,8 @@ import { For, Show, createEffect, createMemo, createResource, createSignal, crea
 import { getHomePageSetting, setHomePageSetting } from "../homePage";
 import { ImproveTab } from "./ImproveTab";
 import { AboutTab } from "./AboutTab";
+import { writeClipboardTextResilient } from "../clipboard";
+import { safeManagedErrorDetail } from "../managedDiagnostics";
 import {
   settingsOpen,
   closeSettings,
@@ -2202,40 +2204,6 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     return null;
   };
 
-  // Invocation errors have no structured status envelope. Preserve a useful
-  // one-line failure class, but never echo arbitrary paths, quoted graph data,
-  // links, credentials, stacks, or unbounded backend output into the UI.
-  const safeManagedErrorDetail = (error: unknown): string => {
-    const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-    const firstLine = message.split(/[\r\n]/, 1)[0]?.trim() ?? "";
-    if (!firstLine) return "The command did not provide a safe diagnostic detail.";
-    let safe = firstLine
-      .replace(/\bfile:\/\/\/[^\s"'<>]+/giu, "[path]")
-      .replace(/\\\\(?:[^\\\s"'<>]+\\)+[^\\\s"'<>]*/gu, "[path]")
-      .replace(/\b[A-Za-z]:\\(?:[^\\\s"'<>]+\\)*[^\\\s"'<>]*/gu, "[path]")
-      .replace(/(^|[\s("'=])\/(?:[^/\s"'<>]+\/)*[^/\s"'<>]*/gu, "$1[path]")
-      .replace(/\b(?:https?|ssh):\/\/[^\s"'<>]+/giu, "[link]")
-      .replace(/\b(authorization|bearer|token|secret|password)\b(?:\s*[:=]\s*|\s+)[^\s,;]+/giu, "$1 [redacted]")
-      .replace(/"[^"]*"|'[^']*'/gu, (quoted) => (
-        /\[(?:path|link|redacted)\]/u.test(quoted) ? quoted : '"[redacted]"'
-      ))
-      .replace(/\s+/g, " ")
-      .trim();
-    const hasDiagnosticClass = /\b(?:activation|archive|actor|binding|blocked|close|command|conflict|corrupt|database|denied|drain|error|failed|failure|invalid|join|malformed|managed|materialization|open|operation|permission|projection|provider|reason|recovery|refused|save|scratch|setup|sqlite|storage|sync|timeout|unavailable)\b/iu.test(safe) || /lease|contended/iu.test(safe);
-    if (
-      !safe ||
-      !hasDiagnosticClass ||
-      /[\u0000-\u001f\u007f]/u.test(safe) ||
-      /[{}<>\\/]/u.test(safe) ||
-      /\S{80,}/u.test(safe)
-    ) {
-      return "The command failed without a safe diagnostic detail.";
-    }
-    const maxLength = 280;
-    if (safe.length > maxLength) safe = `${safe.slice(0, maxLength - 1).trimEnd()}…`;
-    return safe;
-  };
-
   const reportManagedFailure = (summary: string, detail: string) => {
     pushToast(`${summary}: ${detail}`, "error", { sticky: true });
   };
@@ -2257,7 +2225,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
     const details = managedDiagnostics();
     if (!details.length) return;
     try {
-      await backend().writeText(details.join("\n"));
+      await writeClipboardTextResilient(details.join("\n"));
       pushToast("Managed storage details copied.", "success");
     } catch (error) {
       reportManagedFailure("Couldn't copy managed storage details", safeManagedErrorDetail(error));

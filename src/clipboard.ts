@@ -115,6 +115,33 @@ export function writeClipboardText(text: string): Promise<void> {
   return backend().writeText(text);
 }
 
+function boundedClipboardWrite(write: Promise<void>, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const deadline = setTimeout(() => reject(new Error("clipboard write timed out")), timeoutMs);
+    write.then(
+      () => { clearTimeout(deadline); resolve(); },
+      (error) => { clearTimeout(deadline); reject(error); },
+    );
+  });
+}
+
+/**
+ * Recovery UI cannot depend exclusively on the native invoke bridge it is
+ * diagnosing. Try the normal native transport first, then the browser clipboard,
+ * bounding both so a Copy details button always settles and can report failure.
+ */
+export async function writeClipboardTextResilient(text: string, timeoutMs = 1_000): Promise<void> {
+  clearClipboardPayload();
+  try {
+    await boundedClipboardWrite(backend().writeText(text), timeoutMs);
+    return;
+  } catch {
+    const browserWrite = globalThis.navigator?.clipboard?.writeText;
+    if (typeof browserWrite !== "function") throw new Error("clipboard recovery transport is unavailable");
+    await boundedClipboardWrite(browserWrite.call(globalThis.navigator.clipboard, text), timeoutMs);
+  }
+}
+
 /**
  * Strict text write for UI that reports clipboard rejection to the user.
  * This preserves ImproveTab's former navigator transport semantics while still

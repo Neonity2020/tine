@@ -8958,6 +8958,76 @@ img.emoji {
   cursor: progress;
 }
 
+/* Cold-start liveness: a slow native lookup/open must remain visible and, at
+   the watchdog boundary, actionable even before any graph binding exists. */
+.startup-recovery-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100100;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 46px 20px 24px;
+  overflow: auto;
+  background: color-mix(in srgb, var(--bg-primary) 96%, transparent);
+  color: var(--text-primary);
+}
+.startup-recovery-winchrome {
+  position: fixed;
+  inset: 0 0 auto;
+  height: 34px;
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 4px;
+}
+.startup-recovery-card {
+  width: min(100%, 560px);
+  padding: 28px;
+  box-sizing: border-box;
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  background: var(--bg-secondary);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .24);
+  text-align: center;
+}
+.startup-recovery-card h1 { margin: 10px 0 8px; font-size: 1.45rem; }
+.startup-recovery-mark {
+  width: 42px;
+  height: 42px;
+  margin: 0 auto;
+  border: 2px solid var(--link-color);
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--link-color);
+  font-weight: 700;
+}
+.startup-recovery-target,
+.startup-recovery-phase,
+.startup-recovery-elapsed,
+.startup-recovery-detail,
+.startup-recovery-safety { margin: 8px 0; line-height: 1.45; }
+.startup-recovery-target,
+.startup-recovery-elapsed { color: var(--text-muted); font-size: 13px; }
+.startup-recovery-phase { font-weight: 600; }
+.startup-recovery-detail { color: var(--text-secondary); }
+.startup-recovery-safety { color: var(--text-muted); font-size: 13px; }
+.startup-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 20px;
+}
+.startup-recovery-technical { margin-top: 18px; color: var(--text-muted); font-size: 12px; }
+.startup-recovery-technical summary { cursor: pointer; }
+.startup-recovery-technical code { display: block; margin-top: 6px; overflow-wrap: anywhere; }
+@media (max-width: 520px) {
+  .startup-recovery-card { padding: 22px 16px; }
+  .startup-recovery-actions { flex-direction: column; }
+  .startup-recovery-actions .settings-btn { width: 100%; }
+}
+
 /* Search/query workspace --------------------------------------------------
    A virtual route uses the same pane shell as pages, but keeps its friendly
    source, presentation, and save action visibly separate from graph content. */

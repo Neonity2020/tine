@@ -16,7 +16,7 @@ afterEach(() => {
 });
 
 describe("missing remembered graph recovery (GH #250)", () => {
-  it("finishes startup and offers a usable graph chooser when the remembered root is gone", async () => {
+  it("keeps the failed target actionable and offers a usable graph chooser", async () => {
     const missingRoot = "/Volumes/logseq";
     setGraphMeta(null);
     setFirstLoadDone(false);
@@ -31,12 +31,14 @@ describe("missing remembered graph recovery (GH #250)", () => {
 
     await vi.waitFor(() => {
       expect(loadGraph).toHaveBeenCalledWith(missingRoot);
-      expect(host.querySelector(".welcome-overlay")).not.toBeNull();
+      expect(host.querySelector(".startup-recovery-overlay")).not.toBeNull();
     });
 
-    const openExisting = [...host.querySelectorAll<HTMLButtonElement>(".welcome-choice")]
-      .find((button) => button.textContent?.includes("Open an existing graph"));
+    const openExisting = [...host.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("Open another graph"));
     expect(openExisting).toBeDefined();
     expect(openExisting?.disabled).toBe(false);
+    expect(host.textContent).toContain("Return logseq to Direct Files");
+    expect(host.textContent).not.toContain(missingRoot);
   });
 });

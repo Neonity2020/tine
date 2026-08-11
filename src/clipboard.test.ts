@@ -10,6 +10,7 @@ import {
   writeClipboardImage,
   writeClipboardRich,
   writeClipboardText,
+  writeClipboardTextResilient,
   writeClipboardTextStrict,
   type ClipboardPayloadData,
 } from "./clipboard";
@@ -20,6 +21,7 @@ const payload: ClipboardPayloadData = {
 };
 
 afterEach(() => {
+  vi.useRealTimers();
   clearClipboardPayload();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -83,6 +85,19 @@ describe("private clipboard slot + facade", () => {
 
     await expect(writeClipboardTextStrict("report")).rejects.toBe(failure);
     expect(peekClipboardPayload()).toBeNull();
+  });
+
+  it("bounds a stuck native diagnostic copy and falls back to the browser clipboard", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(backend(), "writeText").mockImplementation(() => new Promise(() => {}));
+    const browserWrite = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText: browserWrite } });
+
+    const copying = writeClipboardTextResilient("safe diagnostics", 50);
+    await vi.advanceTimersByTimeAsync(50);
+    await copying;
+
+    expect(browserWrite).toHaveBeenCalledWith("safe diagnostics");
   });
 
   it("consumes a generation-tagged cut grant up front and downgrades the slot", () => {
