@@ -2367,13 +2367,12 @@
           "crates/tine-core/src/model.rs::invalidated_graph_index_does_not_expand_an_existing_save",
           "crates/tine-core/src/model.rs::changed_existing_save_has_one_portable_traversal_and_no_graph_capture",
           "crates/tine-core/src/model.rs::steady_state_direct_saves_never_build_the_graph_index",
-          "crates/tine-core/src/model.rs::a_rebuild_parses_only_the_documents_whose_bytes_changed",
           "crates/tine-core/src/model.rs::direct_save_latency_manual_benchmark"
         ],
         "scenario": "direct-markdown.save-latency",
         "failBefore": "proven"
       },
-      "notes": "Reopened after the reporter confirmed the defect remained in v0.6.91 Direct Files. The diagnostic refusal was `precheck.limit: guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`; GH #295 independently measured one complete 1,046-file / 16.7 MB capture on every Windows save (roughly 0.9-1.1 s). Root cause was architectural: both existing-target validation and the atomic replacement transaction invoked the complete managed shadow-import admission index. The cut now keeps an existing save local: one exact target parse/read, one capability-safe traversal following only portable-equivalent target path components (including case/NFC aliases in ancestor directories), exact file identity and link-count-one checks, and the existing no-replace/retire/restore/fsync protocol. Missing-target creation alone retains the complete semantic proof and its parsed-semantic reuse. On the attached #295 graph in release mode, warm save median was 1.13 ms and forcibly invalidated save median 0.98 ms, with complete builds unchanged at one; the prior current-master measurement was 2.75 ms warm and 70 ms invalidated. Structural tests prove exactly one portable traversal, zero graph capture enumerations, one target parse, and no write on portable/hard-link/external-byte conflicts."
+      "notes": "Reopened after the reporter confirmed the defect remained in v0.6.91 Direct Files. The diagnostic refusal was `precheck.limit: guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`; GH #295 independently measured one complete 1,046-file / 16.7 MB capture on every Windows save (roughly 0.9-1.1 s). Root cause was architectural: both existing-target validation and the atomic replacement transaction invoked the complete managed shadow-import admission index. The cut keeps an existing save local: one exact target parse/read, one capability-safe traversal following only portable-equivalent target path components (including case/NFC aliases in ancestor directories), exact file identity and link-count-one checks, and the existing no-replace/retire/restore/fsync protocol. Missing-target creation now uses its separate single-census cached-evidence proof recorded by REG-DIRECT-CREATE-RETAINED-SHADOW-LIMIT-249-266. On the attached #295 graph in release mode, warm save median was 1.13 ms and forcibly invalidated save median 0.98 ms, with complete builds unchanged at one; the prior current-master measurement was 2.75 ms warm and 70 ms invalidated. Structural tests prove exactly one portable traversal, zero graph capture enumerations, one target parse, and no write on portable/hard-link/external-byte conflicts."
     },
     {
       "id": "REG-DIRECT-CREATE-RETAINED-SHADOW-LIMIT-249-266",
@@ -2393,13 +2392,29 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
-        "tests": [],
+        "tests": [
+          "crates/tine-core/src/model.rs::missing_target_creation_ignores_the_retained_shadow_peak_limit",
+          "crates/tine-core/src/model.rs::missing_target_creation_has_one_census_and_zero_shadow_or_parse_work",
+          "crates/tine-core/src/model.rs::same_path_same_length_retitle_without_reconciliation_refuses_creation",
+          "crates/tine-core/src/model.rs::cache_generation_change_during_creation_census_fails_without_retry",
+          "crates/tine-core/src/model.rs::creation_refuses_historical_arbitrary_and_explicit_semantic_owners",
+          "crates/tine-core/src/model.rs::creation_refuses_hardlinks_without_changing_either_name",
+          "crates/tine-core/src/model.rs::creation_refuses_portable_leaf_and_ancestor_aliases_without_mutation",
+          "crates/tine-core/src/model.rs::creation_refuses_symlink_parent_and_leaf_without_touching_outside_bytes",
+          "crates/tine-core/src/model.rs::external_exact_target_creator_wins_without_byte_change",
+          "crates/tine-core/src/model.rs::unsafe_page_titles_save_and_reopen_through_one_safe_identity",
+          "crates/tine-core/src/model.rs::generation_bound_identity_validation_avoids_save_time_graph_reparse",
+          "crates/tine-core/src/model.rs::failed_unknown_and_stale_effective_identity_evidence_blocks_name_only_creation",
+          "crates/tine-core/src/model.rs::changed_existing_save_has_one_portable_traversal_and_no_graph_capture",
+          "crates/tine-core/src/model.rs::invalidated_graph_index_does_not_expand_an_existing_save",
+          "crates/tine-core/src/model.rs::steady_state_direct_saves_never_build_the_graph_index"
+        ],
         "scenario": "direct-markdown.missing-target-save-admission",
-        "failBefore": "reported-exact-diagnostic"
+        "failBefore": "proven"
       },
-      "notes": "Post-v0.6.92 reporter evidence revoked the complete save/reopen claim for GH #249 without disproving its Windows-safe filename codec: the timestamp page reaches the editor but save fails with the exact diagnostic `precheck.limit: guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`. GH #266's v0.6.92 Windows trace records the same 12.8-14.2 s refusal three times while instrumented graph open itself takes 18 ms, leaving open/switch blocked for about 41 s and close eventually offering to discard unsaved work. Commit 0394d6e0 correctly cut the complete admission index from existing-target saves, but deliberately left missing-target creation and its atomic writer on the two-pass byte-retaining managed shadow-import capture. The required fix must cut that retained inventory from ordinary Direct creation while preserving portable case/NFC, hard-link, semantic-owner, no-follow, no-replace, and external-race refusal with no overwrite of existing bytes. Windows packaged pass-after remains required before a released claim."
+      "notes": "Post-v0.6.92 reporter evidence revoked the complete save/reopen claim for GH #249 without disproving its Windows-safe filename codec: the timestamp page reaches the editor but save fails with the exact diagnostic `precheck.limit: guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`. GH #266's v0.6.92 Windows trace records the same 12.8-14.2 s refusal three times while instrumented graph open itself takes 18 ms, leaving open/switch blocked for about 41 s and close eventually offering to discard unsaved work. Commit 0394d6e0 correctly cut the complete admission index from existing-target saves, but deliberately left missing-target creation and its atomic writer on the two-pass byte-retaining managed shadow-import capture. The source fix binds the generation-current parsed identity index, exact cached disk revisions, and page-index failures to one capability/no-follow streaming census; creation retains paths, digests, resource identities, and link counts only, performs no save-time graph parse or retained-byte capture, fails closed without retry, and gives the resulting proof to the exact no-replace publisher. Portable case/NFC aliases including ancestors, historical graph extensions and arbitrary eligible paths, explicit semantic owners, hard links/resource aliases, symlink parents/leaves, stale same-length retitles, generation changes, and exact-target races all refuse without changing incumbent or outside bytes. A test-only initial-capture charge equal to the parent peak limit proved the parent failed locally with the exact suffix `initial shadow peak build memory bound exceeded`, classifier `precheck.limit`, and no created file; the same armed limit is untouched by the fixed creation path. This construction used generated temporary graph data only. The reversible timestamp codec is exercised in both filename formats. Packaged Windows pass-after remains required before a released Windows claim."
     },
     {
       "id": "REG-SAME-BYTES-EXTERNAL-REPLACE-STRANDS-EDITOR-001",
@@ -2480,7 +2495,7 @@
     },
     {
       "id": "REG-CAPTURE-TWO-PASS-CONCURRENCY-001",
-      "title": "A sync client touching an unrelated file does not fail the save in progress",
+      "title": "A generation change during the Direct creation census fails closed without repeated whole-graph work",
       "family": "direct-save-data-safety",
       "sources": {
         "issues": [
@@ -2494,15 +2509,16 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "released",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "crates/tine-core/src/model.rs::a_concurrent_change_during_capture_is_retried_not_surfaced"
+          "crates/tine-core/src/model.rs::cache_generation_change_during_creation_census_fails_without_retry",
+          "crates/tine-core/src/model.rs::missing_target_creation_has_one_census_and_zero_shadow_or_parse_work"
         ],
-        "scenario": "direct-markdown.capture-concurrency",
+        "scenario": "direct-markdown.creation-census-concurrency",
         "failBefore": "proven"
       },
-      "notes": "The save-time admission capture runs two full-graph passes that must agree exactly, and ANY concurrent filesystem activity anywhere in the graph makes them disagree. On a Syncthing / Dropbox / OneDrive folder that is not an anomaly, it is the steady state -- and a single disagreement surfaced as a failed save. Disagreement means 'something moved while we looked', not 'the graph is broken', so it is now retried in place up to 4 attempts; every other error still surfaces immediately, and the caller holds the identity-mutation authority across all attempts so this cannot interleave with one of our own writes. Fail-before proven by setting CAPTURE_ATTEMPTS to 1."
+      "notes": "The former Direct missing-target admission capture ran two byte-retaining full-graph passes and retried their disagreement, amplifying unrelated concurrent filesystem activity into repeated whole-graph work. Ordinary Direct creation no longer enters that managed shadow-import capture. It performs exactly one capability/no-follow streaming census and binds it to the generation-current cached semantic snapshot; a cache generation change during that census fails closed immediately, without parsing, a second census, retry, or mutation. The deterministic generation-change hook proves the one-census refusal and unchanged neighboring bytes."
     },
     {
       "id": "REG-SAVE-RETRY-AMPLIFICATION-001",
