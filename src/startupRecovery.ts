@@ -326,10 +326,18 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
     if (previous.mode !== "recovery" || !previous.target) return;
     const attempt = invalidate();
     const startedAt = now();
-    setSnapshot({ ...previous, attempt, phase: "direct.confirm", startedAt, elapsedMs: 0 });
+    begin(attempt, "cold_return", "direct.confirm", previous.target, startedAt, previous.nativeAttempt);
+    armActionWatchdog(
+      attempt,
+      previous.target,
+      startedAt,
+      "The native recovery confirmation is unavailable. Managed files remain preserved; retry or close and relaunch Tine.",
+    );
     const approved = await deps.confirmColdReturn(startupGraphName(previous.target));
     if (attempt !== sequence || disposed) return;
     if (!approved) {
+      if (watchdog !== undefined) clearTimeout(watchdog);
+      watchdog = undefined;
       setSnapshot({ ...previous, attempt, startedAt, elapsedMs: Math.max(0, now() - startedAt) });
       return;
     }

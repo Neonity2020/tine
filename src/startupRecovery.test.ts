@@ -182,6 +182,35 @@ describe("cold-start recovery controller", () => {
     controller.dispose();
   });
 
+  it("recovers from a stuck native confirmation and ignores its late answer after another action", async () => {
+    vi.useFakeTimers();
+    const lookup = deferred<string | null>();
+    const confirmation = deferred<boolean>();
+    const coldReturn = vi.fn(async () => fakeCancelResult());
+    const deps = dependencies({
+      lookupGraphPath: vi.fn(() => lookup.promise),
+      confirmColdReturn: vi.fn(() => confirmation.promise),
+      coldReturn,
+      actionWatchdogMs: 500,
+    });
+    const controller = createStartupRecoveryController(deps);
+    controller.start();
+    await vi.advanceTimersByTimeAsync(STARTUP_LOOKUP_WATCHDOG_MS);
+
+    void controller.returnToDirectFiles();
+    expect(controller.snapshot()).toMatchObject({ mode: "working", phase: "direct.confirm" });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(controller.snapshot()).toMatchObject({ mode: "recovery", phase: "native.unavailable" });
+    expect(controller.snapshot().detail).toContain("confirmation is unavailable");
+
+    controller.retry();
+    confirmation.resolve(true);
+    await settle();
+    expect(coldReturn).not.toHaveBeenCalled();
+    expect(deps.lookupGraphPath).toHaveBeenCalledTimes(2);
+    controller.dispose();
+  });
+
   it("uses the privacy-safe native phase vocabulary without accepting it as an outcome", async () => {
     vi.useFakeTimers();
     const lookup = deferred<string | null>();
