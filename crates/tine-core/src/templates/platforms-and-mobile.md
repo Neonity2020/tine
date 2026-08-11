@@ -1,0 +1,34 @@
+icon:: 📱
+
+- # Platforms and mobile
+  - "Does this work on my phone?" hides two different questions: what changes because a **window is narrow**, and what changes because Tine is **running as the Android app** instead of a desktop one. This page keeps them apart and maps what current public releases ship on each side.
+- ## Question 1 — is the window narrow?
+  - Below a 640 px window width — on any device, including a desktop window you shrank yourself — the left and right sidebars stop squeezing the page and become **drawers over it**. Dismiss one by tapping the shaded outside edge, using its close control, pressing **Esc**, or pressing Android **Back**.
+  - At 640 px and wider — including tablets — both sidebars are persistent panes that can stay open together and keep their resize controls.
+  - The boundary is width, nothing else: it follows the window, not the device, so the same desktop shows both faces as you resize it.
+- ## Question 2 — which app is running?
+  - Some behavior keys off Tine detecting a **native mobile platform**, whatever the window width. The Android app hides the tab strip and disables split panes, so one page keeps the phone screen; workspaces carry the simple one-pane layout there.
+  - The desktop apps (Linux, macOS, Windows) keep the full window model — tabs, pinned tabs, split panes, saved workspaces, and multiple windows — toured in [[Workflows/Keep context visible]].
+  - In both cases your graph is the same ordinary Markdown/Org files, so these are interface and surface differences, never different content formats.
+- ## On Android
+  - **Your graph is a real folder.** On first run you grant "All files access" and pick the graph folder (a Syncthing folder works), and Tine reads and writes that folder directly — coexisting with the Logseq mobile app on one graph. The file watcher polls there by default, so external edits appear shortly after they land.
+  - **An editing toolbar docks above the on-screen keyboard** with the actions a keyboard lacks: Outdent / Indent, Move block up / down, Soft newline, TODO, **Camera**, **Voice memo**, Date picker, `[[ ]]` and `(( ))`, the Slash menu, Undo/Redo, and a pinned hide-keyboard button.
+  - **Camera and Voice memo** capture a photo (or an existing image) or an `.m4a` recording straight into the graph's `assets/` folder and insert the link at the caret — permission-prompted on first use.
+  - **Hardware Back navigates within Tine** — dismissing a drawer or dialog first and stepping back through page history, exiting to the system only at the root.
+  - **Plugins and themes follow the same lifecycle as desktop** — browse, install (always disabled at first), review its capabilities, enable, settings, disable, uninstall — and a package that did not declare Android shows **Unavailable** on it. The hands-on path is [[Workflows/Extend Tine]].
+  - The whole interface scales through **Interface size** (saved per device) and the native status/navigation icons follow your selected theme.
+- ## What stays different on Android
+  - **Global quick capture is desktop-only** — the `tine --capture` desktop shortcut and its always-on-top capture window have no Android counterpart. Its setup lives on [[Features/Quick capture]].
+  - **One page at a time** — no tab strip, no split panes, no second windows; the desktop multi-window model does not exist here.
+  - **Context menus open from the bullet affordance** rather than a right-click anywhere; long-press on text stays with the system, so text selection works natively.
+  - In the PDF reader, highlight recolor and remove work, but the highlight menu's **Copy ref** and **Linked references** entries appear only on desktop.
+  - **Updates come from you.** The in-app update checker and installer are off on mobile; take each new release-signed APK from the GitHub releases page and sideload it. Distribution today is a sideloaded, release-signed APK attached to each GitHub release; Play Store and F-Droid are planned, and the F-Droid build will omit the network plugin/theme catalogue while keeping local sideloading.
+- ## On desktop (Linux, macOS, Windows)
+  - Everything the phone skips is here: tabs with pin, reorder, and reopen, split panes, saved workspaces, multiple windows, the modifier-click gestures, and global quick capture.
+  - **In-app updates** run on Windows and Linux — the app checks once per launch and Settings → **About** → **Check for updates** downloads, installs, and relaunches in place. On macOS the same notice opens the releases page instead, because today's unsigned app bundle cannot safely replace itself.
+  - Any folder on your disk can be a graph — choose it with the ordinary folder picker; there is no sandboxed document picker.
+- ## iOS today
+  - There is **no public iOS app** — public releases ship the desktop apps and the Android APK, and iOS is being scoped.
+  - Some iOS words already exist in the source so a future app is prepared for — the folder-picker handling and the plugin manifest's `ios` platform value — but that is checked-in scaffolding and developer vocabulary, not an installable app. A plugin declaring only `ios` has no host to run on today.
+- ## Where next
+  - [[Workflows/Keep context visible]] for tabs, panes, sidebars and workspaces (desktop), [[Features/Quick capture]] for the desktop capture window, [[Workflows/Extend Tine]] for the per-platform plugin and theme lifecycle, and [[Features/PDF annotation]] for the full reader tour.

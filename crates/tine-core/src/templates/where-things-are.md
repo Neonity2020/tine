@@ -20,5 +20,6 @@ icon:: 🗺️
   - The **?** button at the bottom right (or press **Shift+?**) opens Help: this Guide, the shortcut reference, and links out to release notes and bug reports.
 - ## On a phone
   - Below a 640 px window width, either sidebar opens as an overlay on top of the page instead of shrinking it — tap the shaded outside edge, press Esc, or use Android Back to dismiss. Split panes and the tab strip are desktop-only.
+  - [[Reference/Platforms and mobile]] separates narrow-window behavior from native-app behavior and maps each platform's shipping surface.
 - ## Where next
   - New here? [[Welcome to Tine]] walks the first hands-on minutes. To put these places to work — parking, pinning, splitting, and saving the layout — continue with [[Workflows/Keep context visible]]; [[Features/Tips & shortcuts]] is the compact shortcut map.

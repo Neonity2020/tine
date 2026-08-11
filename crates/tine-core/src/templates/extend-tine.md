@@ -25,6 +25,6 @@ icon:: 🔌
 - ## Platform and distribution lines
   - Desktop and Android share the same plugin and theme lifecycle; a package that did not declare your platform shows as unavailable rather than failing later.
   - The F-Droid build ships without the network community catalogue to comply with its runtime-code-download policy. The plugin host, your already-installed plugins and themes, local `manifest.json` + `.wasm` and theme packages, and the built-in gallery all keep working.
-  - Current public releases do not include an iOS app, and the iOS plugin host is not enabled. The platform reference in this Guide carries the full map.
+  - Current public releases do not include an iOS app, and the iOS plugin host is not enabled. [[Reference/Platforms and mobile]] carries the full platform map.
 - ## Where next
   - [[Features/Plugins]] keeps the detailed reference, including the safety-report fields and the cascade order — and links the authoring, packaging, and registry guide used by plugin developers.

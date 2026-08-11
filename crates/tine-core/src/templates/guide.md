@@ -27,6 +27,7 @@ icon:: 🧭
   - [[Reference/Troubleshooting and recovery]] — follow numbered recovery steps for conflict banners, deleted pages, snapshots, sync copies, duplicate days, and bad starts.
   - [[Reference/Journals, tasks, and scheduling]] — map journal setup, task markers and priorities, scheduling dates, the agenda, time tracking, and repeating tasks.
   - [[Reference/Pages, links, references, and search]] — the exact rules for pages, links, tags, aliases, block references, reference panels, and every search surface.
+  - [[Reference/Platforms and mobile]] — learn what changes on a narrow window versus on the Android app, and what ships on each platform today.
 - ## Feature showcase
   - [[Feature showcase]] — inspect one live example of each supported Logseq rendering feature.
 - ## Create one yourself

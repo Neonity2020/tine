@@ -132,6 +132,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Workflows/Extend Tine",
         markdown: include_str!("templates/extend-tine.md"),
     },
+    GuideTemplate {
+        title: "Reference/Platforms and mobile",
+        markdown: include_str!("templates/platforms-and-mobile.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -1178,6 +1182,69 @@ mod tests {
         let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
             .expect("extend-tine workflow was copied");
         assert!(copied_markdown.contains("[[tine-guide/Features/Plugins]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn platforms_and_mobile_reference_is_registered_linked_and_copyable() {
+        let title = "Reference/Platforms and mobile";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("platforms-and-mobile reference is registered");
+        assert!(page.markdown.contains("- # Platforms and mobile"));
+        // The page's core contract: the two questions stay distinct.
+        assert!(page.markdown.contains("Question 1"));
+        assert!(page.markdown.contains("Question 2"));
+        assert!(page.markdown.contains("640 px"));
+        assert!(page.markdown.contains("All files access"));
+        assert!(page.markdown.contains("no public iOS app"));
+        assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
+        assert!(page.markdown.contains("[[Workflows/Extend Tine]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Reference/Platforms and mobile]]"));
+        // Both existing pages that deferred their platform detail to J10 link it.
+        for referrer in ["Start/Where things are", "Workflows/Extend Tine"] {
+            let template = GUIDE_TEMPLATES
+                .iter()
+                .find(|template| template.title == referrer)
+                .expect("referrer template is registered");
+            assert!(
+                template
+                    .markdown
+                    .contains("[[Reference/Platforms and mobile]]"),
+                "{referrer} links the platform reference"
+            );
+        }
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("platforms-and-mobile reference is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Reference/Platforms and mobile"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-platforms-and-mobile-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Reference/Platforms and mobile"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("platforms-and-mobile reference was copied");
+        assert!(copied_markdown.contains("[[tine-guide/Workflows/Keep context visible]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
