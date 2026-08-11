@@ -2376,6 +2376,32 @@
       "notes": "Reopened after the reporter confirmed the defect remained in v0.6.91 Direct Files. The diagnostic refusal was `precheck.limit: guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`; GH #295 independently measured one complete 1,046-file / 16.7 MB capture on every Windows save (roughly 0.9-1.1 s). Root cause was architectural: both existing-target validation and the atomic replacement transaction invoked the complete managed shadow-import admission index. The cut now keeps an existing save local: one exact target parse/read, one capability-safe traversal following only portable-equivalent target path components (including case/NFC aliases in ancestor directories), exact file identity and link-count-one checks, and the existing no-replace/retire/restore/fsync protocol. Missing-target creation alone retains the complete semantic proof and its parsed-semantic reuse. On the attached #295 graph in release mode, warm save median was 1.13 ms and forcibly invalidated save median 0.98 ms, with complete builds unchanged at one; the prior current-master measurement was 2.75 ms warm and 70 ms invalidated. Structural tests prove exactly one portable traversal, zero graph capture enumerations, one target parse, and no write on portable/hard-link/external-byte conflicts."
     },
     {
+      "id": "REG-DIRECT-CREATE-RETAINED-SHADOW-LIMIT-249-266",
+      "title": "Creating a Direct Files page does not build the managed shadow-import retained-byte inventory or strand the edit behind precheck.limit",
+      "family": "direct-save-data-safety",
+      "sources": {
+        "issues": [
+          249,
+          266,
+          267
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "layer": "core-native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [],
+        "scenario": "direct-markdown.missing-target-save-admission",
+        "failBefore": "reported-exact-diagnostic"
+      },
+      "notes": "Post-v0.6.92 reporter evidence revoked the complete save/reopen claim for GH #249 without disproving its Windows-safe filename codec: the timestamp page reaches the editor but save fails with the exact diagnostic `precheck.limit: guarded graph-text identity construction failed: initial shadow peak build memory bound exceeded`. GH #266's v0.6.92 Windows trace records the same 12.8-14.2 s refusal three times while instrumented graph open itself takes 18 ms, leaving open/switch blocked for about 41 s and close eventually offering to discard unsaved work. Commit 0394d6e0 correctly cut the complete admission index from existing-target saves, but deliberately left missing-target creation and its atomic writer on the two-pass byte-retaining managed shadow-import capture. The required fix must cut that retained inventory from ordinary Direct creation while preserving portable case/NFC, hard-link, semantic-owner, no-follow, no-replace, and external-race refusal with no overwrite of existing bytes. Windows packaged pass-after remains required before a released claim."
+    },
+    {
       "id": "REG-SAME-BYTES-EXTERNAL-REPLACE-STRANDS-EDITOR-001",
       "title": "A page whose file was replaced with identical content can still be saved instead of stranding the edit",
       "family": "direct-save-data-safety",
