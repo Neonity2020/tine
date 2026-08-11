@@ -76,17 +76,18 @@ use crate::oplog::import::{
 use crate::oplog::import::{
     BootstrapStreamingImportInstrumentation, InactiveBootstrapOrchestrationInstrumentation,
 };
+#[cfg(test)]
+use crate::oplog::local_active::{
+    act_once_at_resume_lifecycle_cut_for_workspace_for_test,
+    reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
+    PromotedRuntimeOpenInstrumentation, ResumeLifecycleCut,
+};
 use crate::oplog::local_active::{
     activate_verified_local_with_retained_validation, reopen_promoted_local_runtime,
     seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
     InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
     PromotedLocalRuntime, PromotedRuntimeOpen, PromotedRuntimeRecoveryDiagnostics,
     RuntimeRecoveryState,
-};
-#[cfg(test)]
-use crate::oplog::local_active::{
-    reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
-    PromotedRuntimeOpenInstrumentation,
 };
 use crate::oplog::local_journal_drain::{
     resume_managed_local_journal_drain_with_superseding_projection,
@@ -381,6 +382,7 @@ struct RuntimeOpenInstrumentation {
 struct ManagedApplicationSaveInstrumentation {
     application_stages: ManagedApplicationSaveStageTimings,
     preparation_stages: TrustedLocalPreparationStageTimings,
+    local_mutation_detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
     commit_stages: TrustedLocalCommitStageTimings,
     forbidden: ForbiddenCommitWork,
     graph_wide: GraphWideCommitWork,
@@ -481,11 +483,78 @@ struct ManagedApplicationSaveStageTimings {
     editor_prepare_turn: Duration,
     editor_total: Duration,
     editor_transaction_build: Duration,
+    editor_current_page_admission: Duration,
+    editor_page_id_and_block_id_resolution: Duration,
+    editor_requested_page_build: Duration,
+    editor_exact_base_read: Duration,
+    editor_accepted_projection_render: Duration,
+    editor_target_projection_render: Duration,
+    editor_target_byte_clone: Duration,
+    editor_accepted_baseline_parse: Duration,
+    editor_requested_target_parse: Duration,
+    editor_identity_and_rename_kind_checks: Duration,
+    editor_target_dto_and_response_evidence: Duration,
+    editor_affine_artifact_and_reply_assembly: Duration,
+    transaction_current_map_and_existing_validation: Duration,
+    transaction_desired_memberships: Duration,
+    transaction_outline_depths: Duration,
+    transaction_create_scan_sort_emit: Duration,
+    transaction_edit_scan_emit: Duration,
+    transaction_reorder_scan_sort_emit: Duration,
+    transaction_preamble_check_emit: Duration,
+    transaction_delete_sets_scan_sort_emit: Duration,
+    transaction_inner_finish_validate: Duration,
+    transaction_outer_merge_finish_validate: Duration,
+    editor_request_remainder: Duration,
     promoted_mutation_admission: Duration,
     application_outcome: Duration,
     response_target_parses: usize,
     response_target_dto_conversions: usize,
     response_target_exact_dto_reparses: usize,
+    editor_block_id_resolution_passes: usize,
+    editor_block_ids_visited: usize,
+    editor_requested_current_map_builds: usize,
+    editor_requested_current_map_entries: usize,
+    editor_requested_membership_derivations: usize,
+    editor_requested_membership_entries: usize,
+    editor_accepted_renders: usize,
+    editor_accepted_rendered_blocks: usize,
+    editor_target_renders: usize,
+    editor_target_rendered_blocks: usize,
+    editor_accepted_parses: usize,
+    editor_accepted_parse_bytes: usize,
+    editor_target_parses: usize,
+    editor_target_parse_bytes: usize,
+    editor_target_dto_converted_blocks: usize,
+    transaction_current_map_builds: usize,
+    transaction_current_map_entries: usize,
+    transaction_membership_derivations: usize,
+    transaction_membership_entries: usize,
+    transaction_outline_depth_derivations: usize,
+    transaction_outline_depth_entries: usize,
+    transaction_create_scan_passes: usize,
+    transaction_create_scan_entries: usize,
+    transaction_edit_scan_passes: usize,
+    transaction_edit_scan_entries: usize,
+    transaction_reorder_scan_passes: usize,
+    transaction_reorder_scan_entries: usize,
+    transaction_delete_desired_set_scans: usize,
+    transaction_delete_desired_set_entries: usize,
+    transaction_delete_current_set_scans: usize,
+    transaction_delete_current_set_entries: usize,
+    transaction_delete_root_scans: usize,
+    transaction_delete_root_entries: usize,
+    transaction_emitted_create: usize,
+    transaction_emitted_edit: usize,
+    transaction_emitted_reorder: usize,
+    transaction_emitted_delete: usize,
+    transaction_emitted_preamble: usize,
+    transaction_emitted_rename: usize,
+    transaction_emitted_kind: usize,
+    transaction_inner_validations: usize,
+    transaction_inner_validation_operations: usize,
+    transaction_outer_validations: usize,
+    transaction_outer_validation_operations: usize,
 }
 
 #[cfg(test)]
@@ -499,11 +568,78 @@ thread_local! {
             editor_prepare_turn: Duration::ZERO,
             editor_total: Duration::ZERO,
             editor_transaction_build: Duration::ZERO,
+            editor_current_page_admission: Duration::ZERO,
+            editor_page_id_and_block_id_resolution: Duration::ZERO,
+            editor_requested_page_build: Duration::ZERO,
+            editor_exact_base_read: Duration::ZERO,
+            editor_accepted_projection_render: Duration::ZERO,
+            editor_target_projection_render: Duration::ZERO,
+            editor_target_byte_clone: Duration::ZERO,
+            editor_accepted_baseline_parse: Duration::ZERO,
+            editor_requested_target_parse: Duration::ZERO,
+            editor_identity_and_rename_kind_checks: Duration::ZERO,
+            editor_target_dto_and_response_evidence: Duration::ZERO,
+            editor_affine_artifact_and_reply_assembly: Duration::ZERO,
+            transaction_current_map_and_existing_validation: Duration::ZERO,
+            transaction_desired_memberships: Duration::ZERO,
+            transaction_outline_depths: Duration::ZERO,
+            transaction_create_scan_sort_emit: Duration::ZERO,
+            transaction_edit_scan_emit: Duration::ZERO,
+            transaction_reorder_scan_sort_emit: Duration::ZERO,
+            transaction_preamble_check_emit: Duration::ZERO,
+            transaction_delete_sets_scan_sort_emit: Duration::ZERO,
+            transaction_inner_finish_validate: Duration::ZERO,
+            transaction_outer_merge_finish_validate: Duration::ZERO,
+            editor_request_remainder: Duration::ZERO,
             promoted_mutation_admission: Duration::ZERO,
             application_outcome: Duration::ZERO,
             response_target_parses: 0,
             response_target_dto_conversions: 0,
             response_target_exact_dto_reparses: 0,
+            editor_block_id_resolution_passes: 0,
+            editor_block_ids_visited: 0,
+            editor_requested_current_map_builds: 0,
+            editor_requested_current_map_entries: 0,
+            editor_requested_membership_derivations: 0,
+            editor_requested_membership_entries: 0,
+            editor_accepted_renders: 0,
+            editor_accepted_rendered_blocks: 0,
+            editor_target_renders: 0,
+            editor_target_rendered_blocks: 0,
+            editor_accepted_parses: 0,
+            editor_accepted_parse_bytes: 0,
+            editor_target_parses: 0,
+            editor_target_parse_bytes: 0,
+            editor_target_dto_converted_blocks: 0,
+            transaction_current_map_builds: 0,
+            transaction_current_map_entries: 0,
+            transaction_membership_derivations: 0,
+            transaction_membership_entries: 0,
+            transaction_outline_depth_derivations: 0,
+            transaction_outline_depth_entries: 0,
+            transaction_create_scan_passes: 0,
+            transaction_create_scan_entries: 0,
+            transaction_edit_scan_passes: 0,
+            transaction_edit_scan_entries: 0,
+            transaction_reorder_scan_passes: 0,
+            transaction_reorder_scan_entries: 0,
+            transaction_delete_desired_set_scans: 0,
+            transaction_delete_desired_set_entries: 0,
+            transaction_delete_current_set_scans: 0,
+            transaction_delete_current_set_entries: 0,
+            transaction_delete_root_scans: 0,
+            transaction_delete_root_entries: 0,
+            transaction_emitted_create: 0,
+            transaction_emitted_edit: 0,
+            transaction_emitted_reorder: 0,
+            transaction_emitted_delete: 0,
+            transaction_emitted_preamble: 0,
+            transaction_emitted_rename: 0,
+            transaction_emitted_kind: 0,
+            transaction_inner_validations: 0,
+            transaction_inner_validation_operations: 0,
+            transaction_outer_validations: 0,
+            transaction_outer_validation_operations: 0,
         });
 }
 
@@ -524,6 +660,48 @@ fn note_application_save_stage(update: impl FnOnce(&mut ManagedApplicationSaveSt
 #[cfg(test)]
 fn last_application_save_stage_timings() -> ManagedApplicationSaveStageTimings {
     LAST_APPLICATION_SAVE_STAGE_TIMINGS.get()
+}
+
+#[cfg(test)]
+fn checked_editor_request_remainder(timings: &ManagedApplicationSaveStageTimings) -> Duration {
+    let leaves = [
+        timings.editor_current_page_admission,
+        timings.editor_page_id_and_block_id_resolution,
+        timings.editor_requested_page_build,
+        timings.editor_exact_base_read,
+        timings.editor_accepted_projection_render,
+        timings.editor_target_projection_render,
+        timings.editor_target_byte_clone,
+        timings.editor_accepted_baseline_parse,
+        timings.editor_requested_target_parse,
+        timings.editor_identity_and_rename_kind_checks,
+        timings.editor_target_dto_and_response_evidence,
+        timings.editor_affine_artifact_and_reply_assembly,
+        timings.transaction_current_map_and_existing_validation,
+        timings.transaction_desired_memberships,
+        timings.transaction_outline_depths,
+        timings.transaction_create_scan_sort_emit,
+        timings.transaction_edit_scan_emit,
+        timings.transaction_reorder_scan_sort_emit,
+        timings.transaction_preamble_check_emit,
+        timings.transaction_delete_sets_scan_sort_emit,
+        timings.transaction_inner_finish_validate,
+        timings.transaction_outer_merge_finish_validate,
+    ];
+    let accounted = leaves
+        .into_iter()
+        .try_fold(Duration::ZERO, |sum, leaf| {
+            sum.checked_add(leaf)
+                .ok_or("managed editor request timing leaves overflow")
+        })
+        .expect("managed editor request timing leaves overflow");
+    timings
+        .editor_transaction_build
+        .checked_sub(accounted)
+        .unwrap_or_else(|| panic!(
+            "managed editor request timing leaves exceed parent: parent={:?} accounted={accounted:?}",
+            timings.editor_transaction_build,
+        ))
 }
 
 #[cfg(test)]
@@ -3809,6 +3987,22 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn force_generic_before_projection_affine_reuse_for_test(
+        &self,
+        force: bool,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ForceGenericBeforeProjectionAffineReuse {
+            force,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn reset_managed_application_query_instrumentation(
         &self,
     ) -> Result<(), SyncRuntimeRequestError> {
@@ -3923,6 +4117,47 @@ impl SyncRuntimeHandle {
                 .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?;
         }
         Ok(outcome)
+    }
+
+    /// Explicit crash-style stop for the user-confirmed Direct Files escape.
+    ///
+    /// This deliberately does not attempt a drain, reconciliation, or Safe
+    /// handoff.  It serializes with all public actor requests, closes the sole
+    /// private sender, and joins the actor before returning, so callers may
+    /// archive private managed state without racing a live writer.  It is
+    /// idempotent: a previously Safe runtime stays Safe, while every other
+    /// stopped state truthfully records that it was stopped without a clean
+    /// drain.
+    pub fn stop_without_clean_drain(
+        &self,
+    ) -> Result<SyncRuntimeStatusSnapshot, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        self.inner.sender.lock().unwrap().take();
+        let joined = self
+            .inner
+            .join
+            .lock()
+            .unwrap()
+            .take()
+            .map(|join| join.join().is_ok())
+            .unwrap_or(true);
+
+        let mut status = self.inner.status.write().unwrap();
+        if status.lifecycle != SyncRuntimeLifecycle::StoppedSafe {
+            status.lifecycle = SyncRuntimeLifecycle::StoppedCrashed;
+            status.detail = Some(
+                "explicit Direct Files override stopped managed storage without a clean drain"
+                    .into(),
+            );
+            status.shared_role = None;
+            status.shared_phase = None;
+        }
+        let snapshot = status.clone();
+        if joined {
+            Ok(snapshot)
+        } else {
+            Err(SyncRuntimeRequestError::ActorUnavailable)
+        }
     }
 
     #[cfg(test)]
@@ -6719,6 +6954,11 @@ enum ActorRequest {
         reply: mpsc::Sender<ManagedApplicationSaveInstrumentation>,
     },
     #[cfg(test)]
+    ForceGenericBeforeProjectionAffineReuse {
+        force: bool,
+        reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
     ResetManagedApplicationQueryInstrumentation { reply: mpsc::Sender<()> },
     #[cfg(test)]
     ManagedApplicationQueryInstrumentation {
@@ -7010,6 +7250,8 @@ fn run_actor_loop(
                 let _ = reply.send(ManagedApplicationSaveInstrumentation {
                     application_stages: last_application_save_stage_timings(),
                     preparation_stages: last_trusted_local_preparation_stage_timings(),
+                    local_mutation_detail:
+                        crate::oplog::hot_engine::last_local_mutation_detail_timings(),
                     commit_stages: last_commit_stage_timings(),
                     forbidden: forbidden_commit_work(),
                     graph_wide: graph_wide_commit_work(),
@@ -7027,6 +7269,14 @@ fn run_actor_loop(
                     guarded_graph_validation_parse_pairs:
                         crate::model::journal_projection_guarded_parse_pairs_for_runtime_test(),
                 });
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ForceGenericBeforeProjectionAffineReuse { force, reply } => {
+                crate::oplog::hot_engine::force_generic_before_projection_affine_reuse_for_test(
+                    force,
+                );
+                let _ = reply.send(());
                 false
             }
             #[cfg(test)]
@@ -14305,7 +14555,17 @@ impl RuntimeActor {
         let (page_id, transaction, affected_page_ids, existing_application, trusted_target) =
             match &request.target {
                 SyncEditorSaveTarget::Existing { page_id, revision } => {
+                    #[cfg(test)]
+                    let page_id_started = Instant::now();
                     let page_id = parse_editor_page_id(page_id)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_page_id_and_block_id_resolution = timings
+                            .editor_page_id_and_block_id_resolution
+                            .saturating_add(page_id_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let current_page_admission_started = Instant::now();
                     let runtime = self
                         .runtime
                         .as_ref()
@@ -14346,9 +14606,38 @@ impl RuntimeActor {
                             reason: SyncEditorConflict::StaleBase,
                         });
                     }
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_current_page_admission = timings
+                            .editor_current_page_admission
+                            .saturating_add(current_page_admission_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let block_id_resolution_started = Instant::now();
                     let resolved = resolve_editor_block_ids(&request.blocks)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_page_id_and_block_id_resolution = timings
+                            .editor_page_id_and_block_id_resolution
+                            .saturating_add(block_id_resolution_started.elapsed());
+                        timings.editor_block_id_resolution_passes =
+                            timings.editor_block_id_resolution_passes.saturating_add(1);
+                        timings.editor_block_ids_visited = timings
+                            .editor_block_ids_visited
+                            .saturating_add(resolved.len());
+                    });
+                    #[cfg(test)]
+                    let requested_page_started = Instant::now();
                     let requested_page =
                         requested_existing_editor_page(&current, &request, &resolved)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_requested_page_build = timings
+                            .editor_requested_page_build
+                            .saturating_add(requested_page_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let exact_base_started = Instant::now();
                     let base = self
                         .graph
                         .read_projection_input(&current.page.path)
@@ -14360,6 +14649,12 @@ impl RuntimeActor {
                         .ok_or(SyncEditorRequestError::ActorRefusedAt(
                             "reading the current Markdown or Org projection",
                         ))?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_exact_base_read = timings
+                            .editor_exact_base_read
+                            .saturating_add(exact_base_started.elapsed());
+                    });
                     let prepared_editor_projection =
                         PreparedEditorProjection::prepare(requested_page, &current.page, base)
                             .map_err(|_| {
@@ -14367,8 +14662,38 @@ impl RuntimeActor {
                                     "rendering the requested page edit",
                                 )
                             })?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        let projection = prepared_editor_projection_instrumentation();
+                        timings.editor_accepted_projection_render = timings
+                            .editor_accepted_projection_render
+                            .saturating_add(projection.accepted_render);
+                        timings.editor_target_projection_render = timings
+                            .editor_target_projection_render
+                            .saturating_add(projection.target_render);
+                        timings.editor_accepted_renders =
+                            timings.editor_accepted_renders.saturating_add(1);
+                        timings.editor_accepted_rendered_blocks = timings
+                            .editor_accepted_rendered_blocks
+                            .saturating_add(projection.accepted_blocks_visited);
+                        timings.editor_target_renders =
+                            timings.editor_target_renders.saturating_add(1);
+                        timings.editor_target_rendered_blocks = timings
+                            .editor_target_rendered_blocks
+                            .saturating_add(projection.target_blocks_visited);
+                    });
+                    #[cfg(test)]
+                    let target_clone_started = Instant::now();
                     let target = prepared_editor_projection.target().to_vec();
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_target_byte_clone = timings
+                            .editor_target_byte_clone
+                            .saturating_add(target_clone_started.elapsed());
+                    });
                     let accepted_target = prepared_editor_projection.accepted_target();
+                    #[cfg(test)]
+                    let accepted_parse_started = Instant::now();
                     let accepted_source = self
                         .graph
                         .parse_external_document(&current.page.path, &accepted_target, false)
@@ -14377,6 +14702,19 @@ impl RuntimeActor {
                                 "parsing the accepted page baseline",
                             )
                         })?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_accepted_baseline_parse = timings
+                            .editor_accepted_baseline_parse
+                            .saturating_add(accepted_parse_started.elapsed());
+                        timings.editor_accepted_parses =
+                            timings.editor_accepted_parses.saturating_add(1);
+                        timings.editor_accepted_parse_bytes = timings
+                            .editor_accepted_parse_bytes
+                            .saturating_add(accepted_target.len());
+                    });
+                    #[cfg(test)]
+                    let target_parse_started = Instant::now();
                     let parsed = self
                         .graph
                         .parse_external_document(&current.page.path, &target, false)
@@ -14387,9 +14725,19 @@ impl RuntimeActor {
                         })?;
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
+                        timings.editor_requested_target_parse = timings
+                            .editor_requested_target_parse
+                            .saturating_add(target_parse_started.elapsed());
+                        timings.editor_target_parses =
+                            timings.editor_target_parses.saturating_add(1);
+                        timings.editor_target_parse_bytes = timings
+                            .editor_target_parse_bytes
+                            .saturating_add(target.len());
                         timings.response_target_parses =
                             timings.response_target_parses.saturating_add(1);
                     });
+                    #[cfg(test)]
+                    let identity_and_kind_started = Instant::now();
                     let identity =
                         parsed.resolve_identity(Some(AcceptedExternalDocumentIdentity {
                             name: current.page.name.as_str(),
@@ -14405,6 +14753,14 @@ impl RuntimeActor {
                         )
                     })?;
                     let final_kind = model_sync_page_kind(identity.kind);
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_identity_and_rename_kind_checks = timings
+                            .editor_identity_and_rename_kind_checks
+                            .saturating_add(identity_and_kind_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let target_dto_started = Instant::now();
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
                         timings.response_target_dto_conversions =
@@ -14440,6 +14796,18 @@ impl RuntimeActor {
                         parsed_target_revision,
                     );
                     trusted_target_page.rev = current_application.page.rev.clone();
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_target_dto_and_response_evidence = timings
+                            .editor_target_dto_and_response_evidence
+                            .saturating_add(target_dto_started.elapsed());
+                        timings.editor_target_dto_converted_blocks =
+                            timings.editor_target_dto_converted_blocks.saturating_add(
+                                flatten_application_blocks(&trusted_target_page.blocks).len(),
+                            );
+                    });
+                    #[cfg(test)]
+                    let identity_rename_kind_started = Instant::now();
                     if final_name != current.page.name {
                         match runtime
                             .engine()
@@ -14482,22 +14850,101 @@ impl RuntimeActor {
                             kind: final_kind,
                         });
                     }
-                    if let Some(content) = build_existing_editor_transaction(
-                        &current, &request, &resolved,
-                    )
-                    .map_err(|error| {
-                        editor_refusal_at(error, "building the semantic page transaction")
-                    })? {
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_identity_and_rename_kind_checks = timings
+                            .editor_identity_and_rename_kind_checks
+                            .saturating_add(identity_rename_kind_started.elapsed());
+                    });
+                    let content = build_existing_editor_transaction(&current, &request, &resolved)
+                        .map_err(|error| {
+                            editor_refusal_at(error, "building the semantic page transaction")
+                        })?;
+                    #[cfg(test)]
+                    let outer_transaction_started = Instant::now();
+                    if let Some(content) = content {
                         // Requested page bytes are authoritative over any stale
                         // target-page snapshot carried by the rename planner.
                         operations.extend(content.operations);
                     }
                     let transaction = finish_editor_transaction(operations)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.transaction_outer_merge_finish_validate = timings
+                            .transaction_outer_merge_finish_validate
+                            .saturating_add(outer_transaction_started.elapsed());
+                        timings.transaction_outer_validations =
+                            timings.transaction_outer_validations.saturating_add(1);
+                        timings.transaction_outer_validation_operations = timings
+                            .transaction_outer_validation_operations
+                            .saturating_add(
+                                transaction
+                                    .as_ref()
+                                    .map_or(0, |transaction| transaction.operations.len()),
+                            );
+                        if let Some(transaction) = transaction.as_ref() {
+                            for operation in &transaction.operations {
+                                match operation {
+                                    SemanticOperation::CreateBlock { .. } => {
+                                        timings.transaction_emitted_create =
+                                            timings.transaction_emitted_create.saturating_add(1)
+                                    }
+                                    SemanticOperation::EditBlockContent { .. } => {
+                                        timings.transaction_emitted_edit =
+                                            timings.transaction_emitted_edit.saturating_add(1)
+                                    }
+                                    SemanticOperation::ReorderBlock { .. } => {
+                                        timings.transaction_emitted_reorder =
+                                            timings.transaction_emitted_reorder.saturating_add(1)
+                                    }
+                                    SemanticOperation::DeleteSubtree { .. } => {
+                                        timings.transaction_emitted_delete =
+                                            timings.transaction_emitted_delete.saturating_add(1)
+                                    }
+                                    SemanticOperation::SetPagePreamble { .. } => {
+                                        timings.transaction_emitted_preamble =
+                                            timings.transaction_emitted_preamble.saturating_add(1)
+                                    }
+                                    SemanticOperation::RenamePagesAndRewriteReferrers {
+                                        ..
+                                    } => {
+                                        timings.transaction_emitted_rename =
+                                            timings.transaction_emitted_rename.saturating_add(1)
+                                    }
+                                    SemanticOperation::SetPageKind { .. } => {
+                                        timings.transaction_emitted_kind =
+                                            timings.transaction_emitted_kind.saturating_add(1)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
+                    #[cfg(test)]
+                    let affine_artifact_started = Instant::now();
+                    // This transaction consumes the existing application
+                    // snapshot. Move its already authenticated materialized
+                    // pre-page into the affine editor artifact rather than
+                    // cloning a second whole page solely for draft-time
+                    // before-projection reuse.
+                    let ApplicationCurrentPage { editor, .. } = current_application;
+                    let EditorCurrentPage {
+                        page: accepted_page,
+                        ..
+                    } = editor;
+                    let prepared_editor_projection =
+                        prepared_editor_projection.bind_accepted_page(accepted_page);
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_affine_artifact_and_reply_assembly = timings
+                            .editor_affine_artifact_and_reply_assembly
+                            .saturating_add(affine_artifact_started.elapsed());
+                    });
                     (
                         page_id,
                         transaction,
                         affected.into_iter().map(|id| id.to_string()).collect(),
-                        Some(current_application),
+                        None::<ApplicationCurrentPage>,
                         Some((
                             trusted_target_page,
                             trusted_target_evidence,
@@ -14605,6 +15052,7 @@ impl RuntimeActor {
         #[cfg(test)]
         note_application_save_stage(|timings| {
             timings.editor_transaction_build = transaction_started.elapsed();
+            timings.editor_request_remainder = checked_editor_request_remainder(timings);
         });
 
         let Some(transaction) = transaction else {
@@ -21527,6 +21975,8 @@ fn requested_existing_editor_page(
         .iter()
         .map(|block| (block.block_id, block))
         .collect::<HashMap<_, _>>();
+    #[cfg(test)]
+    let current_map_entries = current_by_id.len();
     if resolved
         .iter()
         .zip(&request.blocks)
@@ -21539,7 +21989,25 @@ fn requested_existing_editor_page(
             SyncEditorInvalidRequest::InvalidExistingId,
         ));
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.editor_requested_current_map_builds = timings
+            .editor_requested_current_map_builds
+            .saturating_add(1);
+        timings.editor_requested_current_map_entries = timings
+            .editor_requested_current_map_entries
+            .saturating_add(current_map_entries);
+    });
     let desired = desired_editor_memberships(&request.blocks, resolved)?;
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.editor_requested_membership_derivations = timings
+            .editor_requested_membership_derivations
+            .saturating_add(1);
+        timings.editor_requested_membership_entries = timings
+            .editor_requested_membership_entries
+            .saturating_add(desired.len());
+    });
     let blocks = request
         .blocks
         .iter()
@@ -21627,11 +22095,15 @@ fn build_existing_editor_transaction(
     request: &SyncEditorSaveRequest,
     resolved: &[BlockId],
 ) -> Result<Option<OperationTransaction>, SyncEditorRequestError> {
+    #[cfg(test)]
+    let current_map_started = Instant::now();
     let current_by_id = current
         .blocks
         .iter()
         .map(|block| (block.block_id, block))
         .collect::<HashMap<_, _>>();
+    #[cfg(test)]
+    let current_map_entries = current_by_id.len();
     if resolved
         .iter()
         .zip(&request.blocks)
@@ -21644,10 +22116,50 @@ fn build_existing_editor_transaction(
             SyncEditorInvalidRequest::InvalidExistingId,
         ));
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_current_map_and_existing_validation = timings
+            .transaction_current_map_and_existing_validation
+            .saturating_add(current_map_started.elapsed());
+        timings.transaction_current_map_builds =
+            timings.transaction_current_map_builds.saturating_add(1);
+        timings.transaction_current_map_entries = timings
+            .transaction_current_map_entries
+            .saturating_add(current_map_entries);
+    });
+    #[cfg(test)]
+    let desired_started = Instant::now();
     let desired = desired_editor_memberships(&request.blocks, resolved)?;
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_desired_memberships = timings
+            .transaction_desired_memberships
+            .saturating_add(desired_started.elapsed());
+        timings.transaction_membership_derivations =
+            timings.transaction_membership_derivations.saturating_add(1);
+        timings.transaction_membership_entries = timings
+            .transaction_membership_entries
+            .saturating_add(desired.len());
+    });
+    #[cfg(test)]
+    let outline_depths_started = Instant::now();
     let depths = editor_outline_depths(&request.blocks);
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_outline_depths = timings
+            .transaction_outline_depths
+            .saturating_add(outline_depths_started.elapsed());
+        timings.transaction_outline_depth_derivations = timings
+            .transaction_outline_depth_derivations
+            .saturating_add(1);
+        timings.transaction_outline_depth_entries = timings
+            .transaction_outline_depth_entries
+            .saturating_add(depths.len());
+    });
     let mut operations = Vec::new();
 
+    #[cfg(test)]
+    let create_started = Instant::now();
     let mut new_indexes = request
         .blocks
         .iter()
@@ -21670,7 +22182,20 @@ fn build_existing_editor_transaction(
             content: block.content.clone(),
         });
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_create_scan_sort_emit = timings
+            .transaction_create_scan_sort_emit
+            .saturating_add(create_started.elapsed());
+        timings.transaction_create_scan_passes =
+            timings.transaction_create_scan_passes.saturating_add(1);
+        timings.transaction_create_scan_entries = timings
+            .transaction_create_scan_entries
+            .saturating_add(request.blocks.len());
+    });
 
+    #[cfg(test)]
+    let edit_started = Instant::now();
     for (index, block) in request.blocks.iter().enumerate() {
         let SyncEditorBlockKey::Existing(_) = &block.key else {
             continue;
@@ -21691,7 +22216,20 @@ fn build_existing_editor_transaction(
             });
         }
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_edit_scan_emit = timings
+            .transaction_edit_scan_emit
+            .saturating_add(edit_started.elapsed());
+        timings.transaction_edit_scan_passes =
+            timings.transaction_edit_scan_passes.saturating_add(1);
+        timings.transaction_edit_scan_entries = timings
+            .transaction_edit_scan_entries
+            .saturating_add(request.blocks.len());
+    });
 
+    #[cfg(test)]
+    let reorder_started = Instant::now();
     let mut reorder_indexes = request
         .blocks
         .iter()
@@ -21714,14 +22252,35 @@ fn build_existing_editor_transaction(
             order: desired[index].1.clone(),
         });
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_reorder_scan_sort_emit = timings
+            .transaction_reorder_scan_sort_emit
+            .saturating_add(reorder_started.elapsed());
+        timings.transaction_reorder_scan_passes =
+            timings.transaction_reorder_scan_passes.saturating_add(1);
+        timings.transaction_reorder_scan_entries = timings
+            .transaction_reorder_scan_entries
+            .saturating_add(request.blocks.len());
+    });
 
+    #[cfg(test)]
+    let preamble_started = Instant::now();
     if current.page.preamble != request.preamble {
         operations.push(SemanticOperation::SetPagePreamble {
             page_id: current.page.page_id,
             preamble: request.preamble.clone(),
         });
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_preamble_check_emit = timings
+            .transaction_preamble_check_emit
+            .saturating_add(preamble_started.elapsed());
+    });
 
+    #[cfg(test)]
+    let delete_started = Instant::now();
     let desired_existing = request
         .blocks
         .iter()
@@ -21752,7 +22311,57 @@ fn build_existing_editor_transaction(
         });
     }
 
-    finish_editor_transaction(operations)
+    #[cfg(test)]
+    let delete_desired_entries = request.blocks.len();
+    #[cfg(test)]
+    let delete_current_entries = current_by_id.len();
+    #[cfg(test)]
+    let delete_root_entries = current.blocks.len();
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_delete_sets_scan_sort_emit = timings
+            .transaction_delete_sets_scan_sort_emit
+            .saturating_add(delete_started.elapsed());
+        timings.transaction_delete_desired_set_scans = timings
+            .transaction_delete_desired_set_scans
+            .saturating_add(1);
+        timings.transaction_delete_desired_set_entries = timings
+            .transaction_delete_desired_set_entries
+            .saturating_add(delete_desired_entries);
+        timings.transaction_delete_current_set_scans = timings
+            .transaction_delete_current_set_scans
+            .saturating_add(1);
+        timings.transaction_delete_current_set_entries = timings
+            .transaction_delete_current_set_entries
+            .saturating_add(delete_current_entries);
+        timings.transaction_delete_root_scans =
+            timings.transaction_delete_root_scans.saturating_add(1);
+        timings.transaction_delete_root_entries = timings
+            .transaction_delete_root_entries
+            .saturating_add(delete_root_entries);
+    });
+
+    #[cfg(test)]
+    let inner_finish_started = Instant::now();
+    let transaction = finish_editor_transaction(operations);
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_inner_finish_validate = timings
+            .transaction_inner_finish_validate
+            .saturating_add(inner_finish_started.elapsed());
+        timings.transaction_inner_validations =
+            timings.transaction_inner_validations.saturating_add(1);
+        timings.transaction_inner_validation_operations = timings
+            .transaction_inner_validation_operations
+            .saturating_add(
+                transaction
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(0, |transaction| transaction.operations.len()),
+            );
+    });
+    transaction
 }
 
 fn build_new_editor_transaction(
@@ -22125,6 +22734,7 @@ mod tests {
     use crate::model::Format;
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::exact_external_feed::tests::RuntimeHostFixture;
+    use crate::oplog::resume_point::RuntimeResumePointV2;
     use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
     use std::collections::BTreeMap;
     use std::fs;
@@ -23744,6 +24354,11 @@ mod tests {
             .managed_application_save_instrumentation()
             .expect("managed application save exposes post-save instrumentation");
         assert_managed_application_save_foreground_counters(before, after, page_blocks);
+        let _detail_accounting = assert_managed_application_save_detail_accounting(
+            after.preparation_stages,
+            after.local_mutation_detail,
+            page_blocks,
+        );
         match outcome {
             SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
             other => panic!("managed-local application save was not direct: {other:?}"),
@@ -27031,7 +27646,8 @@ mod tests {
     }
 
     #[test]
-    fn prepared_editor_projection_reuses_one_511_block_crlf_markdown_save() {
+    fn prepared_editor_projection_seals_the_pending_local_predecessor_for_two_511_block_crlf_saves()
+    {
         let fixture = ActivationFixture::empty("prepared-editor-projection-crlf", 0xa13d);
         let runtime_request = reopen_request(&fixture.request);
         let source = (0..MAX_SYNC_EDITOR_BLOCKS)
@@ -27065,12 +27681,25 @@ mod tests {
         assert_eq!(counters.finalizer_post_state_render, 0);
         assert_eq!(
             counters.finalizer_predecessor_replay_render, 1,
-            "the retained predecessor replay remains a separately counted safety render"
+            "fail-before: the first save has no pending managed-local predecessor to seal"
         );
+        assert_eq!(
+            counters.capture_sealed_pending_local_predecessor_success, 0,
+            "fail-before: the first save must retain the complete generic predecessor replay"
+        );
+        assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 0);
         assert_eq!(
             instrumentation.guarded_graph_validation_parse_pairs, 1,
             "reuse must still execute Graph's guarded base/target validation parse pair"
         );
+        let before_detail = instrumentation.local_mutation_detail;
+        assert_eq!(
+            before_detail.before_projection_full_materializations, 1,
+            "the first save has no authenticated pending-local predecessor"
+        );
+        assert_eq!(before_detail.before_projection_affine_attempts, 1);
+        assert_eq!(before_detail.before_projection_affine_reuses, 0);
+        assert_eq!(before_detail.before_projection_affine_fallbacks, 1);
 
         let (saved, saved_revision) = match saved {
             SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
@@ -27083,20 +27712,92 @@ mod tests {
             serde_json::to_value(&fresh).unwrap(),
             "reused target must match the ordinary exact parser DTO"
         );
+        let first_target = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
+
+        let mut second_page = saved.clone();
+        second_page.blocks[0].raw = "after capture-sealed pending-local predecessor".into();
+        let second_saved = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: second_page.path.clone(),
+                    revision: saved_revision.clone(),
+                },
+                page: second_page,
+            })
+            .unwrap();
+        let instrumentation = handle
+            .managed_application_save_instrumentation()
+            .expect("consecutive save exposes capture-sealed instrumentation");
+        let before_detail = instrumentation.local_mutation_detail;
+        assert_eq!(
+            before_detail.before_projection_full_materializations, 0,
+            "second pending-local 511-block save must not reconstruct its pre-page"
+        );
+        assert_eq!(before_detail.before_projection_affine_attempts, 1);
+        assert_eq!(before_detail.before_projection_affine_reuses, 1);
+        assert_eq!(before_detail.before_projection_affine_fallbacks, 0);
+        assert_eq!(
+            before_detail.before_projection_affine_snapshot_blocks, MAX_SYNC_EDITOR_BLOCKS,
+            "the affine proof must compare every pre-page block exactly once"
+        );
+        let counters = instrumentation.prepared_editor_projection;
+        assert_eq!(counters.created, 1);
+        assert_eq!(counters.reused, 1);
+        assert_eq!(counters.fallback, 0);
+        assert_eq!(counters.finalizer_post_state_render, 0);
+        assert_eq!(
+            counters.finalizer_predecessor_replay_render, 0,
+            "pass-after: finalization must consume the capture-sealed predecessor instead of replaying it"
+        );
+        assert_eq!(
+            counters.capture_sealed_pending_local_predecessor_success, 1,
+            "pass-after: the fresh exact pending managed-local predecessor is sealed at capture"
+        );
+        assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 1);
+        assert_eq!(
+            instrumentation.guarded_graph_validation_parse_pairs, 1,
+            "the sealed fast path preserves Graph's guarded base/target validation parse pair"
+        );
+        let (second_saved, second_revision) = match second_saved {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("capture-sealed consecutive save was not durable: {other:?}"),
+        };
+        let (fresh, fresh_revision) = load_application_exact(&handle, &second_saved.path);
+        assert_eq!(second_revision, fresh_revision);
+        assert_eq!(
+            serde_json::to_value(&second_saved).unwrap(),
+            serde_json::to_value(&fresh).unwrap(),
+            "the capture-sealed target must match the immediate exact parser DTO"
+        );
 
         let frames = managed_local_journal_frames(&runtime_request);
         assert_eq!(
             frames.len(),
-            1,
-            "one durable foreground save appends one frame"
+            2,
+            "two consecutive undrained foreground saves append two ordered frames"
         );
-        let record = decode_managed_local_record(&frames[0]).unwrap();
-        assert_eq!(record.projection().intent().path().as_str(), saved.path);
+        let first_record = decode_managed_local_record(&frames[0]).unwrap();
+        let second_record = decode_managed_local_record(&frames[1]).unwrap();
+        assert_eq!(first_record.sequence(), 0);
+        assert_eq!(second_record.sequence(), 1);
+        assert_eq!(
+            first_record.projection().intent().path().as_str(),
+            saved.path
+        );
+        assert_eq!(
+            second_record.projection().intent().path().as_str(),
+            second_saved.path
+        );
         let journal_target = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
         assert_eq!(
-            record.projection().intent().target().bytes(),
+            first_record.projection().intent().target().bytes(),
+            Some(first_target.as_slice()),
+            "the first frame retains its exact predecessor target"
+        );
+        assert_eq!(
+            second_record.projection().intent().target().bytes(),
             Some(journal_target.as_slice()),
-            "the journal records the exact reused projection target"
+            "the second frame records the exact capture-sealed target"
         );
 
         drain_managed_local(&handle);
@@ -27107,12 +27808,13 @@ mod tests {
 
         let reopened = active_handle(SyncRuntimeHandle::open(runtime_request));
         drive_initial_feed(&reopened);
-        let (clean_reopen, clean_reopen_revision) = load_application_exact(&reopened, &saved.path);
-        assert_eq!(clean_reopen_revision, saved_revision);
+        let (clean_reopen, clean_reopen_revision) =
+            load_application_exact(&reopened, &second_saved.path);
+        assert_eq!(clean_reopen_revision, second_revision);
         assert_eq!(
             serde_json::to_value(&clean_reopen).unwrap(),
-            serde_json::to_value(&saved).unwrap(),
-            "a clean reopen must retain the same complete reused DTO"
+            serde_json::to_value(&second_saved).unwrap(),
+            "Safe drain and clean reopen retain the capture-sealed DTO"
         );
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),
@@ -27125,6 +27827,86 @@ mod tests {
     // Retryable when it is not. Open as GH #310. Un-ignore with the fix, not
     // before.
     #[ignore = "GH #310: one non-round-tripping Org file makes activation fail for the whole graph"]
+    #[test]
+    fn affine_before_projection_matches_forced_generic_application_save() {
+        let run = |label: &str, force_generic: bool| {
+            let fixture = ActivationFixture::empty(label, 0xa13f);
+            let source = (0..4)
+                .map(|index| format!("- before {index}\r\n"))
+                .collect::<String>();
+            fs::write(fixture.graph_root.join("Tine.md"), source).unwrap();
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let handle = activated.handle.expect("activation retains a runtime");
+            drive_initial_feed(&handle);
+
+            let (mut first_page, first_revision) =
+                load_application_logical(&handle, "Tine", SyncPageKind::Page);
+            first_page.blocks[0].raw = "first exact pre-page".into();
+            let (first_page, first_revision) = accepted_application_save(
+                &handle,
+                handle
+                    .save_application_page(SyncApplicationPageSaveRequest {
+                        target: SyncApplicationPageSaveTarget::Existing {
+                            path: first_page.path.clone(),
+                            revision: first_revision,
+                        },
+                        page: first_page,
+                    })
+                    .unwrap(),
+                "Tine",
+                SyncPageKind::Page,
+            );
+
+            let mut second_page = first_page;
+            second_page.blocks[0].raw = "second exact pre-page".into();
+            if force_generic {
+                handle
+                    .force_generic_before_projection_affine_reuse_for_test(true)
+                    .unwrap();
+            }
+            let second = handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: second_page.path.clone(),
+                    revision: first_revision,
+                },
+                page: second_page,
+            });
+            if force_generic {
+                handle
+                    .force_generic_before_projection_affine_reuse_for_test(false)
+                    .unwrap();
+            }
+            let (second, _) =
+                accepted_application_save(&handle, second.unwrap(), "Tine", SyncPageKind::Page);
+            let target = fs::read(fixture.graph_root.join(&second.path)).unwrap();
+            let detail = handle
+                .managed_application_save_instrumentation()
+                .expect("second save reports local mutation detail")
+                .local_mutation_detail;
+
+            drain_managed_local(&handle);
+            assert!(matches!(
+                handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+            (second, target, detail)
+        };
+
+        let generic = run("before-projection-generic", true);
+        let affine = run("before-projection-affine", false);
+
+        assert_parser_dto_semantics(&generic.0, &affine.0);
+        assert_eq!(generic.1, affine.1);
+        assert_eq!(generic.2.before_projection_full_materializations, 1);
+        assert_eq!(generic.2.before_projection_affine_attempts, 0);
+        assert_eq!(generic.2.before_projection_affine_reuses, 0);
+        assert_eq!(affine.2.before_projection_full_materializations, 0);
+        assert_eq!(affine.2.before_projection_affine_attempts, 1);
+        assert_eq!(affine.2.before_projection_affine_reuses, 1);
+        assert_eq!(affine.2.before_projection_affine_fallbacks, 0);
+    }
+
     #[test]
     fn non_round_tripping_org_application_save_refuses_before_prepared_projection() {
         let fixture = ActivationFixture::empty("prepared-editor-projection-read-only-org", 0xa13e);
@@ -42356,6 +43138,129 @@ mod tests {
         files
     }
 
+    fn recursive_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        if !root.is_dir() {
+            return files;
+        }
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    files.insert(relative, fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    fn immutable_archive_bytes(archive_root: &Path) -> BTreeMap<String, Vec<u8>> {
+        recursive_file_bytes(archive_root)
+            .into_iter()
+            .filter(|(path, _)| {
+                ["objects/", "batches/", "bootstrap-v1/"]
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    fn immutable_engine_history_bytes(archive_root: &Path) -> BTreeMap<String, Vec<u8>> {
+        recursive_file_bytes(&archive_root.join("engine-history"))
+            .into_iter()
+            .filter(|(path, _)| {
+                !path.contains("/resume-points/")
+                    && !path.ends_with("/engine-history.head")
+                    && !path.ends_with("/engine-history.transition.lock")
+            })
+            .collect()
+    }
+
+    fn immutable_projection_receipt_bytes(receipt_root: &Path) -> BTreeMap<String, Vec<u8>> {
+        recursive_file_bytes(receipt_root)
+            .into_iter()
+            .filter(|(path, _)| {
+                path == "projection-receipts.claim"
+                    || path == "projection-receipts.init"
+                    || ["bases/", "intents/", "completions/"]
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    fn assert_byte_map_is_strict_extension(
+        before: &BTreeMap<String, Vec<u8>>,
+        after: &BTreeMap<String, Vec<u8>>,
+        label: &str,
+    ) {
+        for (path, bytes) in before {
+            assert_eq!(
+                after.get(path),
+                Some(bytes),
+                "{label} rewrote or removed accepted bytes at {path}"
+            );
+        }
+        assert!(
+            after.len() > before.len(),
+            "{label} did not append durable evidence for the accepted save"
+        );
+    }
+
+    /// Resolve the run named by the newest concrete resume-point record, rather
+    /// than choosing an arbitrary retained directory.  The runtime itself
+    /// makes the same record selection before it tries to adopt the run.
+    fn selected_retained_scratch_run_for_test(archive_root: &Path) -> (Uuid, PathBuf) {
+        let history_root = archive_root.join("engine-history");
+        let mut endpoints = fs::read_dir(&history_root)
+            .unwrap_or_else(|error| panic!("promoted archive has engine history: {error}"))
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_dir())
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "fixture has exactly one durable history endpoint"
+        );
+        let mut points = fs::read_dir(endpoints.pop().unwrap().join("resume-points"))
+            .unwrap_or_else(|error| panic!("safe handoff published a resume point: {error}"))
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                RuntimeResumePointV2::decode(
+                    &fs::read(entry.path())
+                        .unwrap_or_else(|error| panic!("resume point is readable: {error}")),
+                )
+                .unwrap_or_else(|error| panic!("resume point is canonical: {error}"))
+            })
+            .collect::<Vec<_>>();
+        let point = points
+            .drain(..)
+            .max_by_key(RuntimeResumePointV2::resume_sequence)
+            .expect("safe handoff leaves a resume point to select the retained run");
+        let run_id = point.scratch_run_id();
+        let run = archive_root
+            .join("engine-scratch-v2")
+            .join(format!("run-{run_id}"));
+        assert!(run.is_dir(), "selected retained scratch run exists");
+        (run_id, run)
+    }
+
     #[derive(Debug)]
     struct ActivationScaleReceipt {
         source_files: usize,
@@ -43094,8 +43999,18 @@ mod tests {
         caller: Duration,
         application_stages: ManagedApplicationSaveStageTimings,
         preparation_stages: TrustedLocalPreparationStageTimings,
+        local_mutation_detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
+        local_mutation_detail_accounting: ManagedApplicationSaveDetailAccounting,
         stages: TrustedLocalCommitStageTimings,
         page_local_reads: ManagedApplicationSavePageLocalReads,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ManagedApplicationSaveDetailAccounting {
+        author_operations_ex_snapshot: Duration,
+        core_remainder: Duration,
+        draft_remainder: Duration,
+        finalize_remainder: Duration,
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -43184,6 +44099,606 @@ mod tests {
         (p50, p95, *values.last().unwrap())
     }
 
+    fn checked_save_detail_remainder(
+        parent: Duration,
+        children: impl IntoIterator<Item = Duration>,
+        label: &str,
+    ) -> Duration {
+        let used = children.into_iter().fold(Duration::ZERO, |sum, child| {
+            sum.checked_add(child)
+                .unwrap_or_else(|| panic!("managed save {label} child durations overflow"))
+        });
+        parent.checked_sub(used).unwrap_or_else(|| {
+            panic!(
+                "managed save {label} timing children exceed their parent: parent={parent:?} children={used:?}"
+            )
+        })
+    }
+
+    fn assert_save_detail_remainder_bounded(parent: Duration, remainder: Duration, label: &str) {
+        let fractional = parent.checked_div(20).unwrap_or(Duration::ZERO);
+        let ceiling = Duration::from_millis(1).max(fractional);
+        assert!(
+            remainder <= ceiling,
+            "managed save {label} instrumentation leaves too much unaccounted time: parent={parent:?} remainder={remainder:?} ceiling={ceiling:?}"
+        );
+    }
+
+    fn assert_managed_application_save_detail_accounting(
+        preparation: TrustedLocalPreparationStageTimings,
+        detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
+        page_blocks: usize,
+    ) -> ManagedApplicationSaveDetailAccounting {
+        let author_operations_ex_snapshot = detail
+            .author_operations_inclusive
+            .checked_sub(detail.before_semantic_snapshots_child)
+            .unwrap_or_else(|| {
+                panic!(
+                    "managed save nested before-snapshot timing exceeds author operations: {detail:?}"
+                )
+            });
+        let core_remainder = checked_save_detail_remainder(
+            detail.core_total,
+            [
+                detail.core_preflight,
+                detail.author_operations_inclusive,
+                detail.identity_trigger_validation,
+                detail.after_semantic_snapshots,
+                detail.effect_derive_encode,
+                detail.dependencies_frontier,
+                detail.delta_export_object_construction,
+                detail.manifest_path_authority,
+                detail.prospective_document_capture,
+            ],
+            "core",
+        );
+        let draft_remainder = checked_save_detail_remainder(
+            preparation.draft,
+            [
+                detail.core_total,
+                detail.before_projection_materialization,
+                detail.post_projection_materialization,
+                detail.projection_requirement_assembly,
+            ],
+            "draft",
+        );
+        let finalize_remainder = checked_save_detail_remainder(
+            preparation.finalize,
+            [
+                detail.finalize_authority_checks,
+                detail.finalize_base_objects,
+                detail.finalize_projection_intents,
+                detail.finalize_seal_pending,
+            ],
+            "finalize",
+        );
+        assert_save_detail_remainder_bounded(detail.core_total, core_remainder, "core");
+        assert_save_detail_remainder_bounded(preparation.draft, draft_remainder, "draft");
+        assert_save_detail_remainder_bounded(preparation.finalize, finalize_remainder, "finalize");
+        assert_eq!(detail.draft_calls, 1, "ordinary save drafts exactly once");
+        assert_eq!(detail.core_calls, 1, "ordinary save prepares one core");
+        assert_eq!(
+            detail.finalize_calls, 1,
+            "ordinary save finalizes exactly once"
+        );
+        assert_eq!(
+            detail.operation_count, 1,
+            "ordinary save emits one semantic operation"
+        );
+        assert_eq!(
+            detail.effect_block_deltas, 1,
+            "ordinary save changes exactly one semantic block"
+        );
+        assert_eq!(
+            detail.affected_documents, 1,
+            "ordinary save affects one document"
+        );
+        assert_eq!(
+            detail.affected_heads, 1,
+            "ordinary save records one document head"
+        );
+        assert_eq!(
+            detail.before_projection_pages, 1,
+            "ordinary save materializes one pre-page"
+        );
+        assert_eq!(
+            detail.post_projection_pages, 1,
+            "ordinary save materializes one post-page"
+        );
+        assert_eq!(
+            detail.projection_requirements, 1,
+            "ordinary save assembles one requirement"
+        );
+        assert_eq!(
+            detail.delta_exports, 1,
+            "ordinary save exports one CRDT delta"
+        );
+        assert_eq!(
+            detail.captured_documents, 1,
+            "ordinary save captures one post-document"
+        );
+        assert_eq!(
+            detail.finalize_captured_inputs, 1,
+            "ordinary save finalizer sees one input"
+        );
+        assert_eq!(
+            detail.finalize_projection_intents_count, 1,
+            "ordinary save finalizer seals one intent"
+        );
+        assert_eq!(
+            detail.before_snapshot_documents, 1,
+            "ordinary save snapshots one pre-document"
+        );
+        assert_eq!(
+            detail.after_snapshot_documents, 1,
+            "ordinary save snapshots one post-document"
+        );
+        assert_eq!(
+            detail.before_snapshot_blocks, page_blocks,
+            "ordinary save pre-snapshot block count"
+        );
+        assert_eq!(
+            detail.after_snapshot_blocks, page_blocks,
+            "ordinary save post-snapshot block count"
+        );
+        assert!(
+            detail.delta_export_bytes > 0,
+            "ordinary save exports nonempty CRDT bytes"
+        );
+        assert!(
+            detail.constructed_object_bytes > 0,
+            "ordinary save constructs objects"
+        );
+        assert!(
+            detail.finalize_projection_intent_bytes > 0,
+            "ordinary save encodes an intent"
+        );
+        ManagedApplicationSaveDetailAccounting {
+            author_operations_ex_snapshot,
+            core_remainder,
+            draft_remainder,
+            finalize_remainder,
+        }
+    }
+
+    fn assert_managed_application_save_editor_request_accounting(
+        stages: ManagedApplicationSaveStageTimings,
+        page_blocks: usize,
+        detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
+        prepared: PreparedEditorProjectionInstrumentation,
+    ) {
+        assert_save_detail_remainder_bounded(
+            stages.editor_transaction_build,
+            stages.editor_request_remainder,
+            "editor request",
+        );
+        assert_eq!(
+            (
+                stages.editor_block_id_resolution_passes,
+                stages.editor_block_ids_visited
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_requested_current_map_builds,
+                stages.editor_requested_current_map_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_requested_membership_derivations,
+                stages.editor_requested_membership_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_accepted_renders,
+                stages.editor_accepted_rendered_blocks
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_target_renders,
+                stages.editor_target_rendered_blocks
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(stages.editor_accepted_parses, 1);
+        assert_eq!(stages.editor_target_parses, 1);
+        assert!(stages.editor_accepted_parse_bytes > 0);
+        assert!(stages.editor_target_parse_bytes > 0);
+        assert_eq!(stages.editor_target_dto_converted_blocks, page_blocks);
+        assert_eq!(
+            (
+                stages.transaction_current_map_builds,
+                stages.transaction_current_map_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_membership_derivations,
+                stages.transaction_membership_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_outline_depth_derivations,
+                stages.transaction_outline_depth_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_create_scan_passes,
+                stages.transaction_create_scan_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_edit_scan_passes,
+                stages.transaction_edit_scan_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_reorder_scan_passes,
+                stages.transaction_reorder_scan_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_delete_desired_set_scans,
+                stages.transaction_delete_desired_set_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_delete_current_set_scans,
+                stages.transaction_delete_current_set_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_delete_root_scans,
+                stages.transaction_delete_root_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_emitted_create,
+                stages.transaction_emitted_edit,
+                stages.transaction_emitted_reorder,
+                stages.transaction_emitted_delete,
+                stages.transaction_emitted_preamble,
+                stages.transaction_emitted_rename,
+                stages.transaction_emitted_kind,
+            ),
+            (0, 1, 0, 0, 0, 0, 0),
+        );
+        assert_eq!(
+            (
+                stages.transaction_inner_validations,
+                stages.transaction_inner_validation_operations
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                stages.transaction_outer_validations,
+                stages.transaction_outer_validation_operations
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (prepared.created, prepared.reused, prepared.fallback),
+            (1, 1, 0)
+        );
+        assert_eq!(detail.before_projection_full_materializations, 0);
+        assert_eq!(detail.before_projection_affine_attempts, 1);
+        assert_eq!(detail.before_projection_affine_reuses, 1);
+        assert_eq!(detail.before_projection_affine_fallbacks, 0);
+        assert_eq!(prepared.capture_sealed_pending_local_predecessor_success, 1);
+        assert_eq!(prepared.finalizer_sealed_pending_local_predecessor_use, 1);
+        assert_eq!(prepared.finalizer_predecessor_replay_render, 0);
+    }
+
+    fn managed_application_save_detail_phase_receipt(
+        samples: &[ManagedApplicationSaveBenchmarkSample],
+    ) -> String {
+        macro_rules! duration_quantiles {
+            ($field:ident) => {{
+                let (p50, p95) = managed_application_save_quantiles(samples, |sample| {
+                    sample.local_mutation_detail.$field
+                });
+                format!(
+                    "{}p50_ms={:.3} {}p95_ms={:.3}",
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p50),
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p95),
+                )
+            }};
+        }
+        macro_rules! count_summary {
+            ($field:ident) => {{
+                let mut values = samples
+                    .iter()
+                    .map(|sample| sample.local_mutation_detail.$field)
+                    .collect::<Vec<_>>();
+                values.sort_unstable();
+                format!(
+                    "{}min={} {}median={} {}max={}",
+                    concat!(stringify!($field), "_"),
+                    values[0],
+                    concat!(stringify!($field), "_"),
+                    values[values.len() / 2],
+                    concat!(stringify!($field), "_"),
+                    values[values.len() - 1],
+                )
+            }};
+        }
+        macro_rules! accounting_duration_quantiles {
+            ($field:ident) => {{
+                let (p50, p95) = managed_application_save_quantiles(samples, |sample| {
+                    sample.local_mutation_detail_accounting.$field
+                });
+                format!(
+                    "{}p50_ms={:.3} {}p95_ms={:.3}",
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p50),
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p95),
+                )
+            }};
+        }
+        let correlated_vector = |sample: &ManagedApplicationSaveBenchmarkSample| {
+            format!(
+                "caller={:?} application_stages={:?} preparation_stages={:?} commit_stages={:?} local_mutation_detail={:?} derived={:?}",
+                sample.caller,
+                sample.application_stages,
+                sample.preparation_stages,
+                sample.stages,
+                sample.local_mutation_detail,
+                sample.local_mutation_detail_accounting,
+            )
+        };
+        let mut actor_ranked = samples.iter().collect::<Vec<_>>();
+        actor_ranked.sort_unstable_by_key(|sample| sample.application_stages.actor_total);
+        let p50 = actor_ranked[actor_ranked.len() / 2];
+        let p95 = actor_ranked[(actor_ranked.len() * 95).div_ceil(100).saturating_sub(1)];
+        [
+            duration_quantiles!(core_total),
+            duration_quantiles!(core_preflight),
+            duration_quantiles!(author_operations_inclusive),
+            duration_quantiles!(before_semantic_snapshots_child),
+            duration_quantiles!(identity_trigger_validation),
+            duration_quantiles!(after_semantic_snapshots),
+            duration_quantiles!(effect_derive_encode),
+            duration_quantiles!(dependencies_frontier),
+            duration_quantiles!(delta_export_object_construction),
+            duration_quantiles!(manifest_path_authority),
+            duration_quantiles!(prospective_document_capture),
+            duration_quantiles!(before_projection_materialization),
+            duration_quantiles!(post_projection_materialization),
+            duration_quantiles!(projection_requirement_assembly),
+            duration_quantiles!(finalize_authority_checks),
+            duration_quantiles!(finalize_base_objects),
+            duration_quantiles!(finalize_projection_intents),
+            duration_quantiles!(finalize_seal_pending),
+            accounting_duration_quantiles!(author_operations_ex_snapshot),
+            accounting_duration_quantiles!(core_remainder),
+            accounting_duration_quantiles!(draft_remainder),
+            accounting_duration_quantiles!(finalize_remainder),
+            count_summary!(core_calls),
+            count_summary!(operation_count),
+            count_summary!(before_snapshot_documents),
+            count_summary!(before_snapshot_blocks),
+            count_summary!(after_snapshot_documents),
+            count_summary!(after_snapshot_blocks),
+            count_summary!(effect_block_deltas),
+            count_summary!(affected_documents),
+            count_summary!(affected_heads),
+            count_summary!(delta_exports),
+            count_summary!(delta_export_bytes),
+            count_summary!(constructed_object_bytes),
+            count_summary!(captured_documents),
+            count_summary!(before_projection_pages),
+            count_summary!(post_projection_pages),
+            count_summary!(projection_requirements),
+            count_summary!(draft_calls),
+            count_summary!(finalize_captured_inputs),
+            count_summary!(finalize_base_objects_count),
+            count_summary!(finalize_projection_intents_count),
+            count_summary!(finalize_projection_intent_bytes),
+            count_summary!(finalize_final_objects),
+            count_summary!(finalize_calls),
+            format!("actor_ranked_p50_vector={}", correlated_vector(p50)),
+            format!("actor_ranked_p95_vector={}", correlated_vector(p95)),
+        ]
+        .join(" ")
+    }
+
+    fn managed_application_save_run_receipt(
+        runs: &[Vec<ManagedApplicationSaveBenchmarkSample>],
+    ) -> String {
+        assert!(
+            !runs.is_empty() && runs.iter().all(|samples| !samples.is_empty()),
+            "managed application save receipt requires timed samples for every run"
+        );
+        let mut p50s = Vec::with_capacity(runs.len());
+        let mut p95s = Vec::with_capacity(runs.len());
+        let per_run = runs
+            .iter()
+            .enumerate()
+            .map(|(run, samples)| {
+                let (p50, p95) =
+                    managed_application_save_quantiles(samples, |sample| sample.caller);
+                p50s.push(p50);
+                p95s.push(p95);
+                format!(
+                    "run{run}_caller_p50_ms={:.3} run{run}_caller_p95_ms={:.3}",
+                    startup_ms(p50),
+                    startup_ms(p95),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let median_p50 = startup_median(&p50s);
+        let median_p95 = startup_median(&p95s);
+        let spread = |values: &mut Vec<Duration>| {
+            values.sort_unstable();
+            values[values.len() - 1]
+                .checked_sub(values[0])
+                .expect("sorted durations have a nonnegative range")
+        };
+        let mad = |values: &[Duration], median: Duration| {
+            let deviations = values
+                .iter()
+                .map(|value| value.abs_diff(median))
+                .collect::<Vec<_>>();
+            startup_median(&deviations)
+        };
+        let p50_mad = mad(&p50s, median_p50);
+        let p95_mad = mad(&p95s, median_p95);
+        let p50_range = spread(&mut p50s);
+        let p95_range = spread(&mut p95s);
+        format!(
+            "{per_run} run_p50_median_ms={:.3} run_p50_range_ms={:.3} run_p50_mad_ms={:.3} run_p95_median_ms={:.3} run_p95_range_ms={:.3} run_p95_mad_ms={:.3}",
+            startup_ms(median_p50),
+            startup_ms(p50_range),
+            startup_ms(p50_mad),
+            startup_ms(median_p95),
+            startup_ms(p95_range),
+            startup_ms(p95_mad),
+        )
+    }
+
+    fn managed_application_save_editor_request_receipt(
+        samples: &[ManagedApplicationSaveBenchmarkSample],
+    ) -> String {
+        macro_rules! duration {
+            ($field:ident) => {{
+                let (p50, p95) = managed_application_save_quantiles(samples, |sample| {
+                    sample.application_stages.$field
+                });
+                format!(
+                    concat!(
+                        stringify!($field),
+                        "_p50_ms={:.3} ",
+                        stringify!($field),
+                        "_p95_ms={:.3}"
+                    ),
+                    startup_ms(p50),
+                    startup_ms(p95)
+                )
+            }};
+        }
+        macro_rules! count {
+            ($field:ident) => {{
+                let mut values = samples
+                    .iter()
+                    .map(|sample| sample.application_stages.$field)
+                    .collect::<Vec<_>>();
+                values.sort_unstable();
+                format!(
+                    concat!(
+                        stringify!($field),
+                        "_min={} ",
+                        stringify!($field),
+                        "_median={} ",
+                        stringify!($field),
+                        "_max={}"
+                    ),
+                    values[0],
+                    values[values.len() / 2],
+                    values[values.len() - 1]
+                )
+            }};
+        }
+        [
+            duration!(editor_current_page_admission),
+            duration!(editor_page_id_and_block_id_resolution),
+            duration!(editor_requested_page_build),
+            duration!(editor_exact_base_read),
+            duration!(editor_accepted_projection_render),
+            duration!(editor_target_projection_render),
+            duration!(editor_target_byte_clone),
+            duration!(editor_accepted_baseline_parse),
+            duration!(editor_requested_target_parse),
+            duration!(editor_identity_and_rename_kind_checks),
+            duration!(editor_target_dto_and_response_evidence),
+            duration!(editor_affine_artifact_and_reply_assembly),
+            duration!(transaction_current_map_and_existing_validation),
+            duration!(transaction_desired_memberships),
+            duration!(transaction_outline_depths),
+            duration!(transaction_create_scan_sort_emit),
+            duration!(transaction_edit_scan_emit),
+            duration!(transaction_reorder_scan_sort_emit),
+            duration!(transaction_preamble_check_emit),
+            duration!(transaction_delete_sets_scan_sort_emit),
+            duration!(transaction_inner_finish_validate),
+            duration!(transaction_outer_merge_finish_validate),
+            duration!(editor_request_remainder),
+            count!(editor_block_id_resolution_passes),
+            count!(editor_block_ids_visited),
+            count!(editor_requested_current_map_builds),
+            count!(editor_requested_current_map_entries),
+            count!(editor_requested_membership_derivations),
+            count!(editor_requested_membership_entries),
+            count!(editor_accepted_renders),
+            count!(editor_accepted_rendered_blocks),
+            count!(editor_target_renders),
+            count!(editor_target_rendered_blocks),
+            count!(editor_accepted_parses),
+            count!(editor_accepted_parse_bytes),
+            count!(editor_target_parses),
+            count!(editor_target_parse_bytes),
+            count!(editor_target_dto_converted_blocks),
+            count!(transaction_current_map_builds),
+            count!(transaction_current_map_entries),
+            count!(transaction_membership_derivations),
+            count!(transaction_membership_entries),
+            count!(transaction_outline_depth_derivations),
+            count!(transaction_outline_depth_entries),
+            count!(transaction_create_scan_passes),
+            count!(transaction_create_scan_entries),
+            count!(transaction_edit_scan_passes),
+            count!(transaction_edit_scan_entries),
+            count!(transaction_reorder_scan_passes),
+            count!(transaction_reorder_scan_entries),
+            count!(transaction_delete_desired_set_scans),
+            count!(transaction_delete_desired_set_entries),
+            count!(transaction_delete_current_set_scans),
+            count!(transaction_delete_current_set_entries),
+            count!(transaction_delete_root_scans),
+            count!(transaction_delete_root_entries),
+            count!(transaction_emitted_create),
+            count!(transaction_emitted_edit),
+            count!(transaction_emitted_reorder),
+            count!(transaction_emitted_delete),
+            count!(transaction_emitted_preamble),
+            count!(transaction_emitted_rename),
+            count!(transaction_emitted_kind),
+            count!(transaction_inner_validations),
+            count!(transaction_inner_validation_operations),
+            count!(transaction_outer_validations),
+            count!(transaction_outer_validation_operations),
+        ]
+        .join(" ")
+    }
+
     fn managed_application_save_phase_receipt(
         samples: &[ManagedApplicationSaveBenchmarkSample],
     ) -> String {
@@ -43265,8 +44780,10 @@ mod tests {
             managed_application_save_read_quantiles(samples, |sample| {
                 sample.page_local_reads.history_points
             });
+        let detail = managed_application_save_detail_phase_receipt(samples);
+        let editor_request = managed_application_save_editor_request_receipt(samples);
         format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} editor_request: {} local_mutation_detail: {}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
             startup_ms(actor_total_p50),
@@ -43319,6 +44836,8 @@ mod tests {
             history_reads_p50,
             history_reads_p95,
             history_reads_max,
+            editor_request,
+            detail,
         )
     }
 
@@ -44025,6 +45544,231 @@ mod tests {
                     .expect("the projection file is writable");
             },
             "rebuilt-preserving-evidence",
+        );
+    }
+
+    /// A retained run is a reconstructible accelerator, not authority.  This
+    /// captures the pre-recovery failure journey by corrupting only the
+    /// `blobs.data` file of the exact run selected by the published resume
+    /// point, then forcing SQLite to materialize documents from that selected
+    /// run on reopen.
+    #[test]
+    fn managed_reopen_rebuilds_after_malformed_retained_scratch_blob() {
+        let fixture = ActivationFixture::nested_unicode(
+            "managed-reopen-malformed-retained-scratch-blob",
+            0xa0ed,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "accepted before retained scratch corruption",
+        );
+        let (written, _) = load_application_exact(&handle, "Root.md");
+        assert!(
+            written
+                .blocks
+                .iter()
+                .any(|block| block.raw.contains("accepted before retained scratch corruption")),
+            "the fresh activation's current retained scratch must serve a read-after-write before any restart"
+        );
+        drain_managed_local(&handle);
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the selected run is emitted only after a safe, settled handoff"
+        );
+        drop(handle);
+
+        let expected_graph = user_graph_bytes(&fixture.graph_root);
+        let immutable_archive_before_recovery =
+            immutable_archive_bytes(&fixture.request.archive_root);
+        let immutable_history_before_recovery =
+            immutable_engine_history_bytes(&fixture.request.archive_root);
+        let immutable_receipts_before_recovery =
+            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
+
+        let (selected_run_id, selected_run) =
+            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
+        let selected_before = fs::read_dir(&selected_run)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let selected_blobs = selected_run.join(tine_storage::formats::SCRATCH_BLOBS_FILE);
+        assert!(
+            selected_blobs.is_file(),
+            "selected retained run has blobs.data"
+        );
+
+        // The retained SQLite projection would otherwise remain a valid cache
+        // and hide the fault.  It is disposable, so force its normal rebuild
+        // without touching any accepted immutable archive bytes.
+        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
+            .remove()
+            .expect("the disposable SQLite projection is removable");
+        fs::write(&selected_blobs, b"not a scratch blob").unwrap();
+        let selected_corrupted = fs::read_dir(&selected_run)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let selected_at_reclamation = Arc::new(Mutex::new(None));
+        let selected_at_reclamation_result = Arc::clone(&selected_at_reclamation);
+        let selected_at_reclamation_path = selected_run.clone();
+        let selected_at_reclamation_expected = selected_corrupted.clone();
+        act_once_at_resume_lifecycle_cut_for_workspace_for_test(
+            fixture.request.identities.workspace_id,
+            ResumeLifecycleCut::BeforeReclamation,
+            Box::new(move || {
+                let observed = recursive_file_bytes(&selected_at_reclamation_path);
+                assert_eq!(
+                    observed, selected_at_reclamation_expected,
+                    "recovery must leave the refused run byte-exact through replacement publication and up to authenticated reclamation"
+                );
+                *selected_at_reclamation_result.lock().unwrap() = Some(observed);
+            }),
+        );
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened
+            .handle
+            .expect("typed retained-scratch failure replays into an active runtime");
+        assert_eq!(
+            immutable_archive_bytes(&fixture.request.archive_root),
+            immutable_archive_before_recovery,
+            "cache-only retained-scratch recovery must not alter immutable archive authority"
+        );
+        assert_eq!(
+            immutable_engine_history_bytes(&fixture.request.archive_root),
+            immutable_history_before_recovery,
+            "cache-only retained-scratch recovery must not alter immutable engine history"
+        );
+        assert_eq!(
+            immutable_projection_receipt_bytes(&fixture.request.receipt_root),
+            immutable_receipts_before_recovery,
+            "cache-only retained-scratch recovery must not alter immutable projection receipts"
+        );
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            expected_graph,
+            "replay recovery must not rewrite direct graph bytes"
+        );
+        assert_eq!(
+            selected_at_reclamation.lock().unwrap().as_ref(),
+            Some(&selected_corrupted),
+            "the exact pre-reclamation preservation seam must fire during post-open publication"
+        );
+        let (replacement_after_recovery, replacement_after_recovery_path) =
+            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
+        assert_ne!(replacement_after_recovery, selected_run_id);
+        assert!(replacement_after_recovery_path.is_dir());
+        if selected_run.is_dir() {
+            assert_eq!(
+                recursive_file_bytes(&selected_run),
+                selected_corrupted,
+                "an unreclaimed refused run must remain byte-for-byte intact"
+            );
+        } else {
+            assert!(
+                !selected_run.exists(),
+                "authenticated reclamation must remove the whole refused run, never leave a partial entry"
+            );
+        }
+        assert_ne!(selected_corrupted, selected_before);
+
+        let (recovered_page, recovered_revision) = load_application_exact(&reopened, "Root.md");
+        assert!(
+            recovered_page.blocks.iter().any(|block| block
+                .raw
+                .contains("accepted before retained scratch corruption")),
+            "the recovered public application page must contain the last accepted edit"
+        );
+        let _ = save_application_block_text(
+            &reopened,
+            recovered_page,
+            recovered_revision,
+            "accepted after retained scratch recovery",
+        );
+        let (saved_page, _) = load_application_exact(&reopened, "Root.md");
+        assert!(
+            saved_page.blocks.iter().any(|block| block
+                .raw
+                .contains("accepted after retained scratch recovery")),
+            "a public application save after recovery must be immediately readable"
+        );
+        drain_managed_local(&reopened);
+
+        let immutable_archive_after_save = immutable_archive_bytes(&fixture.request.archive_root);
+        let immutable_history_after_save =
+            immutable_engine_history_bytes(&fixture.request.archive_root);
+        let immutable_receipts_after_save =
+            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
+        assert_byte_map_is_strict_extension(
+            &immutable_archive_before_recovery,
+            &immutable_archive_after_save,
+            "immutable archive",
+        );
+        assert_byte_map_is_strict_extension(
+            &immutable_history_before_recovery,
+            &immutable_history_after_save,
+            "immutable engine history",
+        );
+        assert_byte_map_is_strict_extension(
+            &immutable_receipts_before_recovery,
+            &immutable_receipts_after_save,
+            "immutable projection receipts",
+        );
+        let graph_after_save = user_graph_bytes(&fixture.graph_root);
+        assert_ne!(
+            graph_after_save, expected_graph,
+            "the accepted post-recovery save must update the direct graph projection"
+        );
+        assert!(
+            graph_after_save.values().any(|bytes| bytes
+                .windows(b"accepted after retained scratch recovery".len())
+                .any(|window| window == b"accepted after retained scratch recovery")),
+            "the direct graph projection must contain the accepted post-recovery edit"
+        );
+        if selected_run.is_dir() {
+            assert_eq!(
+                recursive_file_bytes(&selected_run),
+                selected_corrupted,
+                "the accepted post-recovery save must not reuse or alter abandoned run {selected_run_id}"
+            );
+        } else {
+            assert!(
+                !selected_run.exists(),
+                "later lifecycle work must not recreate a partially retired refused run"
+            );
+        }
+        assert!(matches!(
+            reopened.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        let (replacement_run_id, _) =
+            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
+        assert_ne!(
+            replacement_run_id, selected_run_id,
+            "safe recovery publishes a fresh retained run rather than reusing the malformed one"
         );
     }
 
@@ -45495,9 +47239,11 @@ mod tests {
         for total_pages in page_counts {
             let additional_pages = total_pages - 3;
             let mut managed_samples = Vec::with_capacity(runs * samples_per_run);
+            let mut managed_runs = Vec::with_capacity(runs);
             let mut direct_files_samples = Vec::with_capacity(runs * samples_per_run);
 
             for run in 0..runs {
+                let mut managed_run_samples = Vec::with_capacity(samples_per_run);
                 let unrelated_blocks = if total_pages >= 10_000 { 1 } else { 10 };
                 let fixture = ActivationFixture::scaled_with_target_and_unrelated_blocks(
                     &format!("managed-application-save-{total_pages}-run-{run}"),
@@ -45608,13 +47354,29 @@ mod tests {
                             counters_after,
                             page_blocks,
                         );
-                        managed_samples.push(ManagedApplicationSaveBenchmarkSample {
+                        let local_mutation_detail_accounting =
+                            assert_managed_application_save_detail_accounting(
+                                counters_after.preparation_stages,
+                                counters_after.local_mutation_detail,
+                                page_blocks,
+                            );
+                        assert_managed_application_save_editor_request_accounting(
+                            counters_after.application_stages,
+                            page_blocks,
+                            counters_after.local_mutation_detail,
+                            counters_after.prepared_editor_projection,
+                        );
+                        let sample = ManagedApplicationSaveBenchmarkSample {
                             caller,
                             application_stages: counters_after.application_stages,
                             preparation_stages: counters_after.preparation_stages,
+                            local_mutation_detail: counters_after.local_mutation_detail,
+                            local_mutation_detail_accounting,
                             stages: counters_after.commit_stages,
                             page_local_reads,
-                        });
+                        };
+                        managed_samples.push(sample);
+                        managed_run_samples.push(sample);
                     }
                     page = returned;
                     revision = returned_revision;
@@ -45738,17 +47500,20 @@ mod tests {
                     direct_expected_graph,
                     "the completed Direct Files edit sequence changes exactly its target file"
                 );
+                managed_runs.push(managed_run_samples);
             }
 
             assert_eq!(managed_samples.len(), runs * samples_per_run);
+            assert_eq!(managed_runs.len(), runs);
             assert_eq!(direct_files_samples.len(), runs * samples_per_run);
             let (managed_p50, managed_p95) =
                 managed_application_save_quantiles(&managed_samples, |sample| sample.caller);
             let direct_files_p50 = startup_median(&direct_files_samples);
             let direct_files_p95 = startup_p95(&direct_files_samples);
             eprintln!(
-                "managed_application_save_bench total_pages={total_pages} target_blocks={target_blocks} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
+                "managed_application_save_bench total_pages={total_pages} target_blocks={target_blocks} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} managed_application_save_runs: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
                 managed_application_save_phase_receipt(&managed_samples),
+                managed_application_save_run_receipt(&managed_runs),
                 startup_ms(direct_files_p50),
                 startup_ms(direct_files_p95),
             );

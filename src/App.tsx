@@ -31,11 +31,12 @@ import {
 import { PageProps } from "./components/PageProps";
 import { ExportModal } from "./components/ExportModal";
 import { PdfExportDialog } from "./components/PdfExportDialog";
+import { StartupRecoveryLayer } from "./components/StartupRecovery";
 import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
-import { loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities } from "./graph";
+import { loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
 import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type QueryRoute } from "./router";
@@ -107,7 +108,7 @@ import { initAssetSettings } from "./assetSettings";
 import { initMediaEditorSettings } from "./mediaEditorSettings";
 import { initSpellcheckSettings } from "./spellcheckSettings";
 import { initLinkDefault } from "./editor/linkDefault";
-import { initDebug, dbg } from "./debug";
+import { initDebug } from "./debug";
 import { WindowControls, ResizeGrips, installWindowChrome, maximized } from "./components/WindowChrome";
 import { initNativeChrome, isMac, isMobilePlatform, osDrawsWindowControls } from "./nativeChrome";
 import {
@@ -130,6 +131,8 @@ import { createAndroidRootCloseCoordinator, installAndroidBackHandler } from "./
 import { createSafeCloseCoordinator } from "./safeClose";
 import { drainPdfWork } from "./pdfOwnership";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
+import { createStartupRecoveryController } from "./startupRecovery";
+import { writeClipboardTextResilient } from "./clipboard";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -588,6 +591,26 @@ export function App(): JSX.Element {
     back: () => goBack(),
     forward: () => goForward(),
   };
+  const startupRecovery = createStartupRecoveryController({
+    lookupGraphPath: (attempt) => backend().startupGraphPath(attempt),
+    injectedGraphPath: () => (window as any).__GRAPH_PATH__ ?? "",
+    persistedGraphPath,
+    openGraph: (path) => loadGraphPath(path),
+    pickGraph: switchGraph,
+    coldReturn: (path, attempt) => backend().cancelSparseV2Cold(path, attempt),
+    acceptColdReturn: (result) => {
+      managedStorageRuntime.clear();
+      managedStorageRuntime.bind(result.binding_generation);
+      managedStorageRuntime.receiveStatus(result.status);
+    },
+    confirmColdReturn: (name) => backend().confirm(
+      `Return ${name} to Direct Files?\n\nTine will archive its durable managed-storage and provider state before reopening the Markdown files directly. This is a recovery exit, not confirmation that every pending or remote change synchronized.`,
+      "Return to Direct Files?",
+    ),
+    copyText: writeClipboardTextResilient,
+    notify: (message, kind) => pushToast(message, kind, kind === "error" ? { sticky: true } : undefined),
+    completeFirstLoad: () => setFirstLoadDone(true),
+  });
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.
   onMount(() => void initDebug());
@@ -677,27 +700,22 @@ export function App(): JSX.Element {
     }
   });
 
-  onMount(async () => {
-    const injected = (window as any).__GRAPH_PATH__ ?? "";
-    let startup = "";
-    try {
-      startup = (await backend().startupGraphPath()) ?? "";
-    } catch {
-      startup = "";
-    }
-    const graphPath = injected || startup || persistedGraphPath();
-    dbg(`loading graph: ${graphPath || "(default/configured)"}`);
-    try {
-      await loadGraphPath(graphPath);
-      dbg("graph load call returned");
-    } catch (e) {
-      // No graph configured (fresh install), or it failed to open. Fall through to
-      // the onboarding Welcome screen instead of leaving a blank app; don't toast
-      // on first run (the empty/`""` path legitimately has no graph yet).
-      dbg(`graph load failed: ${String(e)}`);
-    } finally {
-      setFirstLoadDone(true);
-    }
+  onMount(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    void backend().onStartupProgress(startupRecovery.receiveProgress).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => {
+      // The watchdog remains independent of this subscription. If the native
+      // bridge itself is unavailable, the recovery panel still appears.
+    });
+    startupRecovery.start();
+    onCleanup(() => {
+      disposed = true;
+      unlisten();
+      startupRecovery.dispose();
+    });
   });
 
   // Warn (loudly) if the webview is painting on the CPU — Tine's whole pitch is
@@ -1347,6 +1365,7 @@ export function App(): JSX.Element {
         optionalOpen={welcomeOpen()}
         onClose={closeWelcome}
       />
+      <StartupRecoveryLayer controller={startupRecovery} />
       <DrawerBackground class="drawer-floating-background" blockedBy="any">
         <Toasts />
       </DrawerBackground>

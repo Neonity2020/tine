@@ -37,6 +37,7 @@ import {
   undo,
   redo,
   selectBlock,
+  extendSelectionTo,
   selectedIds,
   moveSelection,
   deleteSelection,
@@ -45,6 +46,8 @@ import {
   moveBlockFeed,
   moveBlock,
   indentSelection,
+  outdentSelection,
+  __setStoreMutationObserverForTest,
   reloadPage,
   forgetPage,
   pageByName,
@@ -123,6 +126,36 @@ function shape(ids: string[] = doc.pages[0].roots): any[] {
     const n = doc.byId[id];
     return n.children.length ? [n.raw, shape(n.children)] : [n.raw];
   });
+}
+
+/** A normalized whole-page state receipt for structural Undo/Redo checks. */
+function pageState(name: string): unknown {
+  const page = pageByName(name)!;
+  const ids = new Set<string>();
+  const visit = (id: string) => {
+    if (ids.has(id)) return;
+    ids.add(id);
+    for (const child of doc.byId[id]?.children ?? []) visit(child);
+  };
+  page.roots.forEach(visit);
+  return JSON.parse(JSON.stringify({
+    page,
+    nodes: [...ids].sort().map((id) => doc.byId[id]),
+  }));
+}
+
+function countStoreMutations(run: () => void): { publications: number; dirtyMarks: number } {
+  const counts = { publications: 0, dirtyMarks: 0 };
+  __setStoreMutationObserverForTest((observation) => {
+    if (observation.kind === "publication") counts.publications++;
+    else if (observation.kind === "dirty") counts.dirtyMarks++;
+  });
+  try {
+    run();
+  } finally {
+    __setStoreMutationObserverForTest(null);
+  }
+  return counts;
 }
 
 describe("properties-only first block", () => {
@@ -1658,6 +1691,296 @@ describe("selection indent is single-page (ds8-2)", () => {
     expect(pageByName("Older")!.roots).toContain(o1);
     expect(doc.byId[t2].parent).toBe(t1);
     expect(doc.byId[t2].page).toBe("Today");
+  });
+});
+
+describe("selection indent/outdent batches one shared-store command (F1)", () => {
+  function selectRange(first: string, last: string, scope?: { roots: string[]; forceExpandedRoot?: string }) {
+    selectBlock(first, scope);
+    extendSelectionTo(last, scope);
+  }
+
+  function assertOnePublicationAndDirty(run: () => void) {
+    expect(countStoreMutations(run)).toEqual({ publications: 1, dirtyMarks: 1 });
+  }
+
+  it.each([50, 200])("indents %i flat selected roots with one publication and one dirty mark", (count) => {
+    const predecessor = blk("predecessor");
+    const roots = Array.from({ length: count }, (_, i) => blk(`selected-${i}`));
+    const tail = blk("tail");
+    load([predecessor, ...roots, tail]);
+    selectRange(roots[0].id, roots.at(-1)!.id);
+    const before = pageState("Test");
+    const selectedBefore = selectedIds();
+
+    // On the old per-root loop this receives N `moveBlockInternal` publications
+    // plus `writeCollapsed`, and N dirty marks. The observer sits at those real
+    // boundaries, so this is a causal fail-before work-shape assertion.
+    assertOnePublicationAndDirty(indentSelection);
+
+    expect(selectedIds()).toEqual(selectedBefore);
+    expect(doc.pages[0].roots).toEqual([predecessor.id, tail.id]);
+    expect(doc.byId[predecessor.id].children).toEqual(roots.map((root) => root.id));
+    expect(roots.map((root) => doc.byId[root.id].parent)).toEqual(Array(count).fill(predecessor.id));
+    const after = pageState("Test");
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it.each([50, 200])("outdents %i selected children with one publication and one dirty mark", (count) => {
+    const selected = Array.from({ length: count }, (_, i) => blk(`selected-${i}`));
+    const parent = blk("parent", selected);
+    const tail = blk("tail");
+    load([parent, tail]);
+    selectRange(selected[0].id, selected.at(-1)!.id);
+    const before = pageState("Test");
+    const selectedBefore = selectedIds();
+
+    assertOnePublicationAndDirty(outdentSelection);
+
+    expect(selectedIds()).toEqual(selectedBefore);
+    expect(doc.pages[0].roots).toEqual([parent.id, ...selected.map((root) => root.id), tail.id]);
+    expect(doc.byId[parent.id].children).toEqual([]);
+    expect(selected.map((root) => doc.byId[root.id].parent)).toEqual(Array(count).fill(null));
+    const after = pageState("Test");
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it.each(["indent", "outdent"] as const)("%s preserves every descendant in a 50-by-8 selection", (command) => {
+    const descendants = Array.from({ length: 50 }, (_, i) =>
+      Array.from({ length: 8 }, (_, j) => blk(`child-${i}-${j}`)),
+    );
+    const selected = descendants.map((children, i) => blk(`selected-${i}`, children));
+    let first: string;
+    let last: string;
+    if (command === "indent") {
+      const predecessor = blk("predecessor");
+      load([blk("lead"), predecessor, ...selected, blk("tail")]);
+      first = selected[0].id;
+      last = selected.at(-1)!.id;
+    } else {
+      const parent = blk("parent", selected);
+      load([blk("lead"), parent, blk("tail")]);
+      first = selected[0].id;
+      last = selected.at(-1)!.id;
+    }
+    const descendantsBefore = descendants.flat().map((block) => ({
+      id: block.id,
+      state: JSON.parse(JSON.stringify(doc.byId[block.id])),
+    }));
+    selectRange(first, last);
+    const before = pageState("Test");
+
+    assertOnePublicationAndDirty(command === "indent" ? indentSelection : outdentSelection);
+
+    for (const { id, state } of descendantsBefore) {
+      expect(JSON.parse(JSON.stringify(doc.byId[id]))).toEqual(state);
+    }
+    const after = pageState("Test");
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it("indent removes roots from different original sibling arrays once and inserts them in visible order", () => {
+    const destination = blk("destination");
+    const child = blk("child");
+    const branch = blk("branch", [destination, child]);
+    const laterRoot = blk("later-root");
+    const tail = blk("tail");
+    load([branch, laterRoot, tail]);
+    selectRange(child.id, laterRoot.id);
+    const before = pageState("Test");
+
+    assertOnePublicationAndDirty(indentSelection);
+
+    expect(doc.byId[branch.id].children).toEqual([destination.id]);
+    expect(doc.pages[0].roots).toEqual([branch.id, tail.id]);
+    expect(doc.byId[destination.id].children).toEqual([child.id, laterRoot.id]);
+    expect(doc.byId[child.id].parent).toBe(destination.id);
+    expect(doc.byId[laterRoot.id].parent).toBe(destination.id);
+    const after = pageState("Test");
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it("outdent removes roots from different original sibling arrays once and inserts them after the first parent", () => {
+    const child = blk("child");
+    const parent = blk("parent", [child]);
+    const laterRoot = blk("later-root");
+    const tail = blk("tail");
+    load([parent, laterRoot, tail]);
+    selectRange(child.id, laterRoot.id);
+    const before = pageState("Test");
+
+    assertOnePublicationAndDirty(outdentSelection);
+
+    expect(doc.byId[parent.id].children).toEqual([]);
+    expect(doc.pages[0].roots).toEqual([parent.id, child.id, laterRoot.id, tail.id]);
+    expect(doc.byId[child.id].parent).toBeNull();
+    expect(doc.byId[laterRoot.id].parent).toBeNull();
+    const after = pageState("Test");
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it.each([
+    ["markdown", "md", "target\ncollapsed:: true", /(^|\n)collapsed::/i],
+    ["org", "org", "target\n:PROPERTIES:\n:collapsed: true\n:END:\nbody", /(^|\n):collapsed:/i],
+  ] as const)("%s expands a collapsed indent target with one format-correct property removal and exact Undo/Redo", (_label, format, raw, property) => {
+    const target = { ...blk(raw), collapsed: true };
+    const selected = blk("selected", [blk("selected-child")]);
+    load([target, selected], format);
+    selectBlock(selected.id);
+    const before = pageState("Test");
+
+    assertOnePublicationAndDirty(indentSelection);
+    const after = pageState("Test");
+    expect(raw.match(new RegExp(property.source, "gi"))).toHaveLength(1);
+    expect(doc.byId[target.id].collapsed).toBe(false);
+    expect(doc.byId[target.id].raw).not.toMatch(property);
+    expect(doc.byId[target.id].children).toEqual([selected.id]);
+
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it("does not add a collapse property when an already-expanded target receives a selection", () => {
+    const target = blk("target");
+    const selected = blk("selected");
+    load([target, selected]);
+    selectBlock(selected.id);
+    const before = pageState("Test");
+
+    assertOnePublicationAndDirty(indentSelection);
+
+    expect(doc.byId[target.id].collapsed).toBe(false);
+    expect(doc.byId[target.id].raw).toBe("target");
+    const after = pageState("Test");
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it("keeps an indent selection inside its zoom scope when the preceding sibling is outside", () => {
+    const outside = blk("outside");
+    const selected = blk("selected");
+    const parent = blk("parent", [outside, selected]);
+    load([parent]);
+    const before = pageState("Test");
+    selectBlock(selected.id, { roots: [selected.id] });
+
+    expect(countStoreMutations(indentSelection)).toEqual({ publications: 0, dirtyMarks: 0 });
+    expect(pageState("Test")).toEqual(before);
+  });
+
+  it("keeps a force-expanded zoom root's children inside that root on outdent", () => {
+    const selected = blk("selected");
+    const zoomRoot = { ...blk("zoom\ncollapsed:: true", [selected]), collapsed: true };
+    load([zoomRoot]);
+    const before = pageState("Test");
+    selectBlock(selected.id, { roots: [zoomRoot.id], forceExpandedRoot: zoomRoot.id });
+
+    expect(countStoreMutations(outdentSelection)).toEqual({ publications: 0, dirtyMarks: 0 });
+    expect(pageState("Test")).toEqual(before);
+  });
+
+  it("refuses a feed-spanning selection when any initially selected block is read-only", async () => {
+    const todayPredecessor = blk("today predecessor");
+    const todaySelected = blk("today selected");
+    const otherSelected = blk("other selected");
+    const today: PageDto = {
+      name: "Today", kind: "journal", title: "Today", pre_block: null,
+      blocks: [todayPredecessor, todaySelected],
+    };
+    const other: PageDto = {
+      name: "Other", kind: "journal", title: "Other", pre_block: null,
+      read_only: true, blocks: [otherSelected],
+    };
+    await loadFeed([today, other]);
+    const beforeToday = pageState("Today");
+    const beforeOther = pageState("Other");
+    selectRange(todaySelected.id, otherSelected.id);
+
+    expect(selectedIds()).toEqual([todaySelected.id, otherSelected.id]);
+    expect(countStoreMutations(indentSelection)).toEqual({ publications: 0, dirtyMarks: 0 });
+    expect(pageState("Today")).toEqual(beforeToday);
+    expect(pageState("Other")).toEqual(beforeOther);
+    expect(isDirty("Today")).toBe(false);
+    expect(isDirty("Other")).toBe(false);
+  });
+
+  it("refuses a feed-spanning outdent when another selected day is read-only and dirties neither page", async () => {
+    const todaySelected = blk("today selected");
+    const todayParent = blk("today parent", [todaySelected]);
+    const otherSelected = blk("other selected");
+    const today: PageDto = {
+      name: "Today", kind: "journal", title: "Today", pre_block: null,
+      blocks: [todayParent],
+    };
+    const other: PageDto = {
+      name: "Other", kind: "journal", title: "Other", pre_block: null,
+      read_only: true, blocks: [otherSelected],
+    };
+    await loadFeed([today, other]);
+    const beforeToday = pageState("Today");
+    const beforeOther = pageState("Other");
+    selectRange(todaySelected.id, otherSelected.id);
+
+    expect(selectedIds()).toEqual([todaySelected.id, otherSelected.id]);
+    expect(countStoreMutations(outdentSelection)).toEqual({ publications: 0, dirtyMarks: 0 });
+    expect(pageState("Today")).toEqual(beforeToday);
+    expect(pageState("Other")).toEqual(beforeOther);
+    expect(isDirty("Today")).toBe(false);
+    expect(isDirty("Other")).toBe(false);
+  });
+
+  it("outdents only the first page of a writable feed-spanning selection, keeping the other day byte-identical and clean", async () => {
+    const todaySelected = blk("today selected", [blk("today descendant")]);
+    const todayParent = blk("today parent", [todaySelected]);
+    const otherSelected = blk("other selected", [blk("other descendant")]);
+    const today: PageDto = {
+      name: "Today", kind: "journal", title: "Today", pre_block: null,
+      blocks: [todayParent],
+    };
+    const other: PageDto = {
+      name: "Other", kind: "journal", title: "Other", pre_block: null,
+      blocks: [otherSelected],
+    };
+    await loadFeed([today, other]);
+    const beforeToday = pageState("Today");
+    const beforeOther = pageState("Other");
+    selectRange(todaySelected.id, otherSelected.id);
+
+    assertOnePublicationAndDirty(outdentSelection);
+
+    const afterToday = pageState("Today");
+    expect(doc.pages.find((page) => page.name === "Today")!.roots).toEqual([todayParent.id, todaySelected.id]);
+    expect(doc.byId[todayParent.id].children).toEqual([]);
+    expect(doc.byId[todaySelected.id].parent).toBeNull();
+    expect(pageState("Other")).toEqual(beforeOther);
+    expect(isDirty("Today")).toBe(true);
+    expect(isDirty("Other")).toBe(false);
+
+    undo();
+    expect(pageState("Today")).toEqual(beforeToday);
+    expect(pageState("Other")).toEqual(beforeOther);
+    redo();
+    expect(pageState("Today")).toEqual(afterToday);
+    expect(pageState("Other")).toEqual(beforeOther);
   });
 });
 

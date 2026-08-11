@@ -95,6 +95,9 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("block_ref_counts", ManagedRouted),
     ("block_referrers", ManagedRouted),
     ("cancel_sparse_v2", NoGraphSlot),
+    // Cold recovery starts without a bound GraphContext. Its blocking worker
+    // takes graph_load before reserving the replacement Direct Files slot.
+    ("cancel_sparse_v2_cold", NoGraphSlot),
     ("capture_frontend_ready", NoGraphSlot),
     ("capture_graph_binding", NoGraphSlot),
     ("capture_quick_switch", NoGraphSlot),

@@ -3,8 +3,8 @@ use crate::settings::{
     approved_external_assets, remember_external_assets_approval, remember_graph,
 };
 use crate::state::{canonical_graph_root, poke_watcher, slot_for_window, AppState, GraphSlot};
-use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
@@ -85,9 +85,169 @@ pub(crate) fn resolve_root(path: &str) -> Option<String> {
     std::env::args().skip(1).find(|arg| !arg.starts_with('-'))
 }
 
+pub(crate) const STARTUP_PROGRESS_EVENT: &str = "startup-progress";
+const STARTUP_PROGRESS_MAX_ELAPSED_MS: u64 = 86_400_000;
+
+fn bounded_startup_elapsed_ms(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(STARTUP_PROGRESS_MAX_ELAPSED_MS)
+}
+
+/// A bounded, content-free startup receipt.  It is intentionally suitable for
+/// both stderr diagnostics and the still-unbound startup webview: neither the
+/// graph path nor an underlying I/O error belongs in this event.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct StartupProgressEvent {
+    phase: &'static str,
+    elapsed_ms: u64,
+    terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'static str>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StartupProgressReporter {
+    app: tauri::AppHandle,
+    label: String,
+    started: Instant,
+    terminal_emitted: Arc<AtomicBool>,
+}
+
+impl StartupProgressReporter {
+    pub(crate) fn for_window(app: &tauri::AppHandle, label: &str) -> Self {
+        Self {
+            app: app.clone(),
+            label: label.to_string(),
+            started: Instant::now(),
+            terminal_emitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn phase(&self, phase: &'static str) {
+        self.emit(phase, false, None);
+    }
+
+    /// Emit exactly one terminal receipt even when the owning blocking worker
+    /// is interrupted while Tauri is awaiting it.
+    pub(crate) fn terminal(&self, phase: &'static str, outcome: &'static str) {
+        if self
+            .terminal_emitted
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        self.emit(phase, true, Some(outcome));
+    }
+
+    fn emit(&self, phase: &'static str, terminal: bool, outcome: Option<&'static str>) {
+        let event = StartupProgressEvent {
+            phase,
+            elapsed_ms: bounded_startup_elapsed_ms(self.started.elapsed()),
+            terminal,
+            outcome,
+        };
+        crate::debug::diag(format!(
+            "startup progress: phase={}; elapsed_ms={}; terminal={}; outcome={}",
+            event.phase,
+            event.elapsed_ms,
+            event.terminal,
+            event.outcome.unwrap_or("none"),
+        ));
+        let _ = self.app.emit_to(&self.label, STARTUP_PROGRESS_EVENT, event);
+    }
+}
+
+/// The remembered-graph lookup retains its historical best-effort semantics:
+/// unavailable, truncated, and malformed device settings simply yield no
+/// remembered graph.  Unlike the old `last_graph_path` composition, every
+/// operation is reported with a bounded code so a stuck startup never looks
+/// silent.  The supplied path is never included in a diagnostic.
+fn remembered_startup_graph_path_at(
+    configured: Option<String>,
+    settings_path: Option<&Path>,
+    mut report: impl FnMut(&'static str, bool, Option<&'static str>),
+) -> Option<String> {
+    report("lookup.entry", false, None);
+    report("lookup.app_data", false, None);
+
+    report("lookup.settings_stat", false, None);
+    let settings_exists = settings_path
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some();
+
+    report("lookup.settings_read", false, None);
+    let contents = settings_exists
+        .then(|| settings_path.and_then(|path| std::fs::read_to_string(path).ok()))
+        .flatten();
+
+    report("lookup.settings_parse", false, None);
+    let remembered = contents
+        .as_deref()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
+        .and_then(|json| {
+            json.get("last_graph_path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        });
+
+    let result = configured.or(remembered);
+    report("lookup.complete", true, Some("ok"));
+    result
+}
+
+fn startup_graph_path_blocking(
+    app: &tauri::AppHandle,
+    reporter: &StartupProgressReporter,
+) -> Option<String> {
+    let settings_path = crate::settings::settings_path(app);
+    remembered_startup_graph_path_at(
+        resolve_root(""),
+        settings_path.as_deref(),
+        |phase, terminal, outcome| {
+            if terminal {
+                reporter.terminal(
+                    phase,
+                    outcome.expect("terminal startup lookup has an outcome"),
+                );
+            } else {
+                reporter.phase(phase);
+            }
+        },
+    )
+}
+
 #[tauri::command]
-pub(crate) fn startup_graph_path(app: tauri::AppHandle) -> Option<String> {
-    resolve_root("").or_else(|| crate::settings::last_graph_path(&app))
+pub(crate) async fn startup_graph_path(
+    attempt: u64,
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Option<String> {
+    let label = window.label().to_string();
+    let state = app.state::<AppState>();
+    state.begin_startup_recovery_attempt(&label, attempt);
+    let reporter = StartupProgressReporter::for_window(&app, &label);
+    let worker_app = app.clone();
+    let worker_reporter = reporter.clone();
+    let worker_label = label.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let result = startup_graph_path_blocking(&worker_app, &worker_reporter);
+        let canonical_target = result
+            .as_deref()
+            .and_then(|path| canonical_graph_root(path).ok());
+        worker_app
+            .state::<AppState>()
+            .authorize_startup_recovery_target(&worker_label, attempt, canonical_target);
+        result
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            reporter.terminal("lookup.complete", "error");
+            None
+        }
+    }
 }
 
 #[tauri::command]
@@ -362,83 +522,25 @@ fn graph_load_phase(started: Option<Instant>, previous: &mut Option<Instant>, ph
     *previous = Some(now);
 }
 
-pub(crate) fn load_graph_for_label(
-    path: String,
+/// The one Direct Files publish lifecycle used by ordinary graph open and the
+/// cold managed-storage escape.  Callers must already have made their storage
+/// authority decision (and, for a cold return, preserved the managed state).
+/// It deliberately includes the normal backup, migration, remembered-graph,
+/// title, watcher, and cache scheduling work so a recovery binding is not a
+/// half-open graph that only happens to answer `AlreadyCurrent` later.
+pub(crate) struct DirectFilesOpen {
+    pub(crate) meta: GraphMeta,
+    pub(crate) binding_generation: u64,
+}
+
+pub(crate) fn open_and_publish_direct_files(
     app: &tauri::AppHandle,
     window_label: &str,
-    state: &State<'_, AppState>,
-) -> Result<LoadGraphResult, String> {
-    let started = crate::debug::debug_enabled().then(Instant::now);
-    let mut previous = started;
-    let root = resolve_root(&path)
-        .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
-    let root_key = canonical_graph_root(&root)?;
-    graph_load_phase(started, &mut previous, "canonical graph root");
-    let _load = state.graph_load.lock().unwrap();
-    graph_load_phase(started, &mut previous, "serialized graph-open lock");
-    if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
-        if owner == window_label {
-            let slot = slot_for_window(&state, &owner)?;
-            return Ok(LoadGraphResult::AlreadyCurrent {
-                meta: slot.graph_meta(),
-                binding_generation: slot.binding_generation,
-            });
-        }
-        if let Some(existing) = app.get_webview_window(&owner) {
-            let _ = existing.show();
-            #[cfg(desktop)]
-            let _ = existing.unminimize();
-            let _ = existing.set_focus();
-            // `FocusedExisting` is an explicit activation request. Update
-            // capture routing now instead of depending solely on a subsequent
-            // OS focus event, which is not guaranteed on every WM/headless
-            // environment.
-            if state.note_focused(&owner) {
-                if let Ok(slot) = slot_for_window(state, &owner) {
-                    let _ = remember_graph(app, &slot.root_key.display().to_string());
-                }
-            }
-        }
-        return Ok(LoadGraphResult::FocusedExisting {
-            window_label: owner,
-        });
-    }
-    let binding_record = state.sync_runtime.binding_record(app, &root_key)?;
-    graph_load_phase(started, &mut previous, "private storage discovery");
-    if let Some(record) = binding_record {
-        let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
-        let binding = state.sync_runtime.open_record(app, &record)?;
-        graph_load_phase(started, &mut previous, "managed storage recovery");
-        let slot = Arc::new(GraphSlot::from_sparse_v2(
-            binding,
-            root_key.clone(),
-            meta.clone(),
-        ));
-        state
-            .graphs
-            .write()
-            .unwrap()
-            .bind(window_label.to_string(), Arc::clone(&slot))?;
-        state.note_focused(window_label);
-        poke_watcher(state);
-        remember_graph(app, &meta.root)?;
-        if let Some(window) = app.get_webview_window(window_label) {
-            let name = Path::new(&meta.root)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("Graph");
-            let _ = window.set_title(&format!("Tine — {name}"));
-        }
-        return Ok(LoadGraphResult::Loaded {
-            meta,
-            binding_generation: slot.binding_generation,
-        });
-    }
-    refuse_unclaimed_sparse_archive(&root_key)?;
-    graph_load_phase(started, &mut previous, "shared storage discovery");
+    state: &AppState,
+    root_key: PathBuf,
+) -> Result<DirectFilesOpen, String> {
     let root = root_key.display().to_string();
     let approved_assets = approved_external_assets(app, &root_key);
-    graph_load_phase(started, &mut previous, "asset approval lookup");
     let LoadedGraph {
         graph,
         meta,
@@ -446,11 +548,9 @@ pub(crate) fn load_graph_for_label(
     } = open_graph_for_load(&root, approved_assets.as_deref(), |graph| {
         backup_graph_now(app, graph, "")
     })?;
-    graph_load_phase(started, &mut previous, "Direct Files core open");
     let managed_state = graph
         .managed_sync_store_state()
         .map_err(|error| format!("managed sync store is unsafe or invalid: {error}"))?;
-    graph_load_phase(started, &mut previous, "legacy managed-store discovery");
     if managed_state != ManagedSyncStoreState::Absent {
         launch_backup_done = ensure_managed_sync_safety_snapshot(
             app,
@@ -472,14 +572,12 @@ pub(crate) fn load_graph_for_label(
         .graphs
         .write()
         .unwrap()
-        .bind(window_label.to_string(), slot.clone())?;
+        .bind(window_label.to_string(), Arc::clone(&slot))?;
     state.note_focused(window_label);
-    poke_watcher(&state);
-    graph_load_phase(started, &mut previous, "graph binding and watcher poke");
+    poke_watcher(state);
     if !launch_backup_done {
         backup_async(app.clone(), slot.clone())?;
     }
-    graph_load_phase(started, &mut previous, "backup scheduling");
     remember_graph(app, &meta.root)?;
     if let Some(window) = app.get_webview_window(window_label) {
         let name = Path::new(&meta.root)
@@ -488,13 +586,99 @@ pub(crate) fn load_graph_for_label(
             .unwrap_or("Graph");
         let _ = window.set_title(&format!("Tine — {name}"));
     }
-    graph_load_phase(started, &mut previous, "settings and window title");
     let binding_generation = slot.binding_generation;
     warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
-    graph_load_phase(started, &mut previous, "warm-cache scheduling complete");
-    Ok(LoadGraphResult::Loaded {
+    state.clear_startup_recovery_target(window_label);
+    Ok(DirectFilesOpen {
         meta,
         binding_generation,
+    })
+}
+
+pub(crate) fn load_graph_for_label(
+    path: String,
+    app: &tauri::AppHandle,
+    window_label: &str,
+    state: &State<'_, AppState>,
+) -> Result<LoadGraphResult, String> {
+    let started = crate::debug::debug_enabled().then(Instant::now);
+    let mut previous = started;
+    let root = resolve_root(&path)
+        .ok_or_else(|| "no graph path provided (set TINE_GRAPH or pass a path)".to_string())?;
+    let root_key = canonical_graph_root(&root)?;
+    graph_load_phase(started, &mut previous, "canonical graph root");
+    let _load = state.graph_load.lock().unwrap();
+    graph_load_phase(started, &mut previous, "serialized graph-open lock");
+    if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
+        if owner == window_label {
+            let slot = slot_for_window(&state, &owner)?;
+            state.clear_startup_recovery_target(window_label);
+            return Ok(LoadGraphResult::AlreadyCurrent {
+                meta: slot.graph_meta(),
+                binding_generation: slot.binding_generation,
+            });
+        }
+        if let Some(existing) = app.get_webview_window(&owner) {
+            let _ = existing.show();
+            #[cfg(desktop)]
+            let _ = existing.unminimize();
+            let _ = existing.set_focus();
+            // `FocusedExisting` is an explicit activation request. Update
+            // capture routing now instead of depending solely on a subsequent
+            // OS focus event, which is not guaranteed on every WM/headless
+            // environment.
+            if state.note_focused(&owner) {
+                if let Ok(slot) = slot_for_window(state, &owner) {
+                    let _ = remember_graph(app, &slot.root_key.display().to_string());
+                }
+            }
+        }
+        state.clear_startup_recovery_target(window_label);
+        return Ok(LoadGraphResult::FocusedExisting {
+            window_label: owner,
+        });
+    }
+    let binding_record = state.sync_runtime.binding_record(app, &root_key)?;
+    graph_load_phase(started, &mut previous, "private storage discovery");
+    if let Some(record) = binding_record {
+        let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
+        let binding = state
+            .sync_runtime
+            .open_record_for_window(app, window_label, &record)?;
+        graph_load_phase(started, &mut previous, "managed storage recovery");
+        let slot = Arc::new(GraphSlot::from_sparse_v2(
+            binding,
+            root_key.clone(),
+            meta.clone(),
+        ));
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind(window_label.to_string(), Arc::clone(&slot))?;
+        state.note_focused(window_label);
+        poke_watcher(state);
+        remember_graph(app, &meta.root)?;
+        if let Some(window) = app.get_webview_window(window_label) {
+            let name = Path::new(&meta.root)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("Graph");
+            let _ = window.set_title(&format!("Tine — {name}"));
+        }
+        state.clear_startup_recovery_target(window_label);
+        return Ok(LoadGraphResult::Loaded {
+            meta,
+            binding_generation: slot.binding_generation,
+        });
+    }
+    refuse_unclaimed_sparse_archive(&root_key)?;
+    graph_load_phase(started, &mut previous, "shared storage discovery");
+    let direct = open_and_publish_direct_files(app, window_label, state, root_key)?;
+    graph_load_phase(started, &mut previous, "Direct Files open and publish");
+    Ok(LoadGraphResult::Loaded {
+        meta: direct.meta,
+        binding_generation: direct.binding_generation,
     })
 }
 
@@ -750,6 +934,101 @@ mod tests {
             }
         }
         (copied, !failed)
+    }
+
+    #[test]
+    fn remembered_startup_lookup_has_one_bounded_terminal_receipt_without_paths() {
+        let dir = scratch("startup-lookup-diagnostics");
+        let settings = dir.join("tine-settings.json");
+        let remembered = dir.join("remembered-graph");
+        std::fs::write(
+            &settings,
+            serde_json::json!({ "last_graph_path": remembered }).to_string(),
+        )
+        .unwrap();
+        let mut receipts = Vec::new();
+        let result =
+            remembered_startup_graph_path_at(None, Some(&settings), |phase, terminal, outcome| {
+                receipts.push((phase, terminal, outcome));
+            });
+        assert_eq!(result, Some(remembered.display().to_string()));
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|(phase, ..)| *phase)
+                .collect::<Vec<_>>(),
+            vec![
+                "lookup.entry",
+                "lookup.app_data",
+                "lookup.settings_stat",
+                "lookup.settings_read",
+                "lookup.settings_parse",
+                "lookup.complete",
+            ]
+        );
+        assert_eq!(
+            receipts.iter().filter(|(_, terminal, _)| *terminal).count(),
+            1
+        );
+        assert_eq!(
+            receipts.last(),
+            Some(&("lookup.complete", true, Some("ok")))
+        );
+        let encoded = serde_json::to_string(&StartupProgressEvent {
+            phase: "lookup.complete",
+            elapsed_ms: 1,
+            terminal: true,
+            outcome: Some("ok"),
+        })
+        .unwrap();
+        assert!(!encoded.contains(&remembered.display().to_string()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_progress_elapsed_is_clamped_to_the_frontend_contract_before_serialization() {
+        assert_eq!(
+            bounded_startup_elapsed_ms(std::time::Duration::from_millis(
+                STARTUP_PROGRESS_MAX_ELAPSED_MS - 1
+            )),
+            STARTUP_PROGRESS_MAX_ELAPSED_MS - 1
+        );
+        let elapsed_ms = bounded_startup_elapsed_ms(std::time::Duration::from_millis(
+            STARTUP_PROGRESS_MAX_ELAPSED_MS + 1,
+        ));
+        assert_eq!(elapsed_ms, STARTUP_PROGRESS_MAX_ELAPSED_MS);
+        let encoded = serde_json::to_value(StartupProgressEvent {
+            phase: "lookup.complete",
+            elapsed_ms,
+            terminal: true,
+            outcome: Some("ok"),
+        })
+        .unwrap();
+        assert_eq!(
+            encoded["elapsed_ms"],
+            serde_json::Value::from(STARTUP_PROGRESS_MAX_ELAPSED_MS)
+        );
+    }
+
+    #[test]
+    fn startup_lookup_keeps_all_settings_io_inside_spawn_blocking() {
+        let source = include_str!("graph.rs");
+        let start = source
+            .find("pub(crate) async fn startup_graph_path")
+            .expect("startup lookup command");
+        let command = &source[start
+            ..source[start..]
+                .find("#[tauri::command]")
+                .map(|end| start + end)
+                .unwrap_or(source.len())];
+        let blocking = command
+            .find("tauri::async_runtime::spawn_blocking")
+            .expect("startup lookup worker");
+        assert!(
+            !command[..blocking].contains("settings_path"),
+            "invoke dispatch must not synchronously read device settings"
+        );
+        assert!(command[blocking..].contains("startup_graph_path_blocking"));
     }
 
     #[test]

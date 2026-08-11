@@ -70,6 +70,15 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) fallback: usize,
     pub(crate) finalizer_post_state_render: usize,
     pub(crate) finalizer_predecessor_replay_render: usize,
+    pub(crate) capture_sealed_pending_local_predecessor_success: usize,
+    pub(crate) finalizer_sealed_pending_local_predecessor_use: usize,
+    /// The two renders are separate evidence obligations.  Keep their timing
+    /// separate so the managed-save receipt never presents the pair as one
+    /// opaque "projection" cost.
+    pub(crate) accepted_render: std::time::Duration,
+    pub(crate) target_render: std::time::Duration,
+    pub(crate) accepted_blocks_visited: usize,
+    pub(crate) target_blocks_visited: usize,
 }
 
 #[cfg(test)]
@@ -80,6 +89,12 @@ impl PreparedEditorProjectionInstrumentation {
         fallback: 0,
         finalizer_post_state_render: 0,
         finalizer_predecessor_replay_render: 0,
+        capture_sealed_pending_local_predecessor_success: 0,
+        finalizer_sealed_pending_local_predecessor_use: 0,
+        accepted_render: std::time::Duration::ZERO,
+        target_render: std::time::Duration::ZERO,
+        accepted_blocks_visited: 0,
+        target_blocks_visited: 0,
     };
 }
 
@@ -120,6 +135,24 @@ pub(crate) fn note_finalizer_predecessor_replay_render() {
     note_prepared_editor_projection(|instrumentation| {
         instrumentation.finalizer_predecessor_replay_render = instrumentation
             .finalizer_predecessor_replay_render
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_capture_sealed_pending_local_predecessor_success() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.capture_sealed_pending_local_predecessor_success = instrumentation
+            .capture_sealed_pending_local_predecessor_success
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_finalizer_sealed_pending_local_predecessor_use() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.finalizer_sealed_pending_local_predecessor_use = instrumentation
+            .finalizer_sealed_pending_local_predecessor_use
             .saturating_add(1);
     });
 }
@@ -251,6 +284,35 @@ struct RenderedProjection {
     generated_anchors: Vec<PolicyGeneratedAnchor>,
 }
 
+/// The affine pre-state half of an editor request.  The page is transferred
+/// from the already authenticated editor load; it is never reconstructed from
+/// a cache or persisted.  `hot_engine` may consume it exactly once while
+/// proving a narrow current pending-local predecessor.  The accepted render
+/// remains process-local evidence only.
+pub(crate) struct PreparedEditorProjectionBeforeCandidate {
+    accepted_page: Option<MaterializedPage>,
+    accepted_rendered: RenderedProjection,
+}
+
+impl PreparedEditorProjectionBeforeCandidate {
+    fn bind_accepted_page(&mut self, accepted_page: MaterializedPage) {
+        debug_assert!(self.accepted_page.is_none());
+        self.accepted_page = Some(accepted_page);
+    }
+
+    pub(crate) fn into_page_and_accepted_render(
+        self,
+    ) -> Option<(MaterializedPage, Vec<u8>, Vec<AnnotatedIdentity>)> {
+        self.accepted_page.map(|accepted_page| {
+            (
+                accepted_page,
+                self.accepted_rendered.target,
+                self.accepted_rendered.annotations,
+            )
+        })
+    }
+}
+
 /// One editor-requested post-state rendering, retained only while the same
 /// trusted-local mutation crosses draft, capture, and finalization.  It is
 /// affine: neither the artifact nor its candidate layout identities are
@@ -260,7 +322,7 @@ pub(crate) struct PreparedEditorProjection {
     requested_page: MaterializedPage,
     exact_base: Vec<u8>,
     candidate_base_layout: Vec<StructuralLayoutIdentity>,
-    accepted_target: Vec<u8>,
+    before_candidate: Option<PreparedEditorProjectionBeforeCandidate>,
     rendered: RenderedProjection,
 }
 
@@ -274,23 +336,47 @@ impl PreparedEditorProjection {
         accepted_page: &MaterializedPage,
         exact_base: Vec<u8>,
     ) -> Result<Self, ProjectionError> {
+        #[cfg(test)]
+        let accepted_started = std::time::Instant::now();
         let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
+        #[cfg(test)]
+        let accepted_elapsed = accepted_started.elapsed();
         let candidate_base_layout = structural_layout_identities(&accepted.annotations);
-        let accepted_target = accepted.target;
+        #[cfg(test)]
+        let target_started = std::time::Instant::now();
         let rendered = render_projection_page_with_layout_identities(
             &requested_page,
             Some(&exact_base),
             &candidate_base_layout,
         )?;
         #[cfg(test)]
+        let target_elapsed = target_started.elapsed();
+        #[cfg(test)]
         note_prepared_editor_projection(|instrumentation| {
             instrumentation.created = instrumentation.created.saturating_add(1);
+            instrumentation.accepted_render = instrumentation
+                .accepted_render
+                .saturating_add(accepted_elapsed);
+            instrumentation.target_render =
+                instrumentation.target_render.saturating_add(target_elapsed);
+            instrumentation.accepted_blocks_visited = instrumentation
+                .accepted_blocks_visited
+                .saturating_add(accepted_page.blocks.len());
+            instrumentation.target_blocks_visited = instrumentation
+                .target_blocks_visited
+                .saturating_add(requested_page.blocks.len());
         });
         Ok(Self {
             requested_page,
             exact_base,
             candidate_base_layout,
-            accepted_target,
+            before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
+                // The caller binds the owned accepted page below.  Keeping the
+                // render here first lets the UI boundary use the same borrowed
+                // page for all ordinary request construction.
+                accepted_page: None,
+                accepted_rendered: accepted,
+            }),
             rendered,
         })
     }
@@ -300,7 +386,36 @@ impl PreparedEditorProjection {
     }
 
     pub(crate) fn accepted_target(&self) -> &[u8] {
-        &self.accepted_target
+        &self
+            .before_candidate
+            .as_ref()
+            .expect("accepted editor projection remains available before draft")
+            .accepted_rendered
+            .target
+    }
+
+    /// Replace the provisional accepted page with the exact editor-owned
+    /// value.  The ordinary editor route calls this after it has finished
+    /// reading that page, avoiding a second 511-block clone solely for the
+    /// affine before-projection candidate.
+    pub(crate) fn bind_accepted_page(mut self, accepted_page: MaterializedPage) -> Self {
+        self.before_candidate
+            .as_mut()
+            .expect("new editor projection has an accepted render")
+            .bind_accepted_page(accepted_page);
+        self
+    }
+
+    pub(crate) fn before_candidate_matches_exact_base(&self) -> bool {
+        self.before_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.accepted_rendered.target == self.exact_base)
+    }
+
+    pub(crate) fn take_before_candidate(
+        &mut self,
+    ) -> Option<PreparedEditorProjectionBeforeCandidate> {
+        self.before_candidate.take()
     }
 
     /// Consume the artifact only after final capture proves that its accepted
@@ -3539,16 +3654,22 @@ mod tests {
             );
         }
 
+        let instrumentation = prepared_editor_projection_instrumentation();
+        assert_eq!(instrumentation.created, 10);
+        assert_eq!(instrumentation.reused, 1);
+        assert_eq!(instrumentation.fallback, 9);
+        assert_eq!(instrumentation.finalizer_post_state_render, 0);
+        assert_eq!(instrumentation.finalizer_predecessor_replay_render, 0);
         assert_eq!(
-            prepared_editor_projection_instrumentation(),
-            PreparedEditorProjectionInstrumentation {
-                created: 10,
-                reused: 1,
-                fallback: 9,
-                finalizer_post_state_render: 0,
-                finalizer_predecessor_replay_render: 0,
-            }
+            instrumentation.capture_sealed_pending_local_predecessor_success,
+            0
         );
+        assert_eq!(
+            instrumentation.finalizer_sealed_pending_local_predecessor_use,
+            0
+        );
+        assert!(instrumentation.accepted_render > std::time::Duration::ZERO);
+        assert!(instrumentation.target_render > std::time::Duration::ZERO);
     }
 
     /// Planning the same state over the same bytes must yield the same intent

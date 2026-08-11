@@ -356,6 +356,11 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+static WORKSPACE_RESUME_LIFECYCLE_CUTS: Mutex<
+    BTreeMap<WorkspaceId, (ResumeLifecycleCut, Box<dyn FnOnce() + Send>)>,
+> = Mutex::new(BTreeMap::new());
+
 /// Exact causal accounting for one promoted-runtime boundary or admission.
 ///
 /// Counters, never timing.
@@ -4184,17 +4189,52 @@ fn automatically_publish_post_open(
     // Libtest's worker stack is substantially smaller than the application's
     // main thread. Keep the exact production call but give the large promoted
     // runtime fixture enough stack for its snapshot frame.
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("tine-post-open-publication".into())
-            .stack_size(16 * 1024 * 1024)
-            .spawn_scoped(scope, || {
-                runtime.publish_post_open_resume_point(authority, graph);
-            })
-            .expect("post-open publication test thread must start")
-            .join()
-            .expect("post-open publication test thread must not panic");
-    });
+    {
+        // The lifecycle cut remains thread-local so parallel tests cannot
+        // consume one another's hooks. This one production-equivalent call is
+        // moved to a larger scoped test thread, so carry the caller's one-shot
+        // seam with it and return it if the requested cut was not reached.
+        let workspace = runtime.state.workspace_id;
+        let inherited_thread_cut = take_resume_lifecycle_cut_for_test();
+        let inherited_workspace_cut = if inherited_thread_cut.is_none() {
+            WORKSPACE_RESUME_LIFECYCLE_CUTS
+                .lock()
+                .unwrap()
+                .remove(&workspace)
+        } else {
+            None
+        };
+        let came_from_workspace = inherited_workspace_cut.is_some();
+        let inherited_cut = inherited_thread_cut.or(inherited_workspace_cut);
+        let leftover_cut = std::thread::scope(|scope| {
+            let runtime_for_publication = &mut *runtime;
+            std::thread::Builder::new()
+                .name("tine-post-open-publication".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    restore_resume_lifecycle_cut_for_test(inherited_cut);
+                    runtime_for_publication.publish_post_open_resume_point(authority, graph);
+                    take_resume_lifecycle_cut_for_test()
+                })
+                .expect("post-open publication test thread must start")
+                .join()
+                .expect("post-open publication test thread must not panic")
+        });
+        if came_from_workspace {
+            if let Some(leftover_cut) = leftover_cut {
+                assert!(
+                    WORKSPACE_RESUME_LIFECYCLE_CUTS
+                        .lock()
+                        .unwrap()
+                        .insert(workspace, leftover_cut)
+                        .is_none(),
+                    "workspace lifecycle cut was replaced while publication ran"
+                );
+            }
+        } else {
+            restore_resume_lifecycle_cut_for_test(leftover_cut);
+        }
+    }
     // The report-only attempt authenticates the retained enrollment session
     // again before it derives the Unsafe binding. That full read advances the
     // session-local generation even though the exclusive session proves no
@@ -4505,7 +4545,7 @@ pub(crate) enum ResumeLifecycleCut {
 
 #[cfg(test)]
 thread_local! {
-    static RESUME_LIFECYCLE_CUT: std::cell::RefCell<Option<(ResumeLifecycleCut, Box<dyn FnOnce()>)>> =
+    static RESUME_LIFECYCLE_CUT: std::cell::RefCell<Option<(ResumeLifecycleCut, Box<dyn FnOnce() + Send>)>> =
         const { std::cell::RefCell::new(None) };
     static SAFE_GRAPH_WRITER_PROBE_ARMED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -4518,9 +4558,37 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn act_once_at_resume_lifecycle_cut_for_test(
     cut: ResumeLifecycleCut,
-    action: Box<dyn FnOnce()>,
+    action: Box<dyn FnOnce() + Send>,
 ) {
     RESUME_LIFECYCLE_CUT.with(|slot| *slot.borrow_mut() = Some((cut, action)));
+}
+
+#[cfg(test)]
+pub(crate) fn act_once_at_resume_lifecycle_cut_for_workspace_for_test(
+    workspace: WorkspaceId,
+    cut: ResumeLifecycleCut,
+    action: Box<dyn FnOnce() + Send>,
+) {
+    assert!(
+        WORKSPACE_RESUME_LIFECYCLE_CUTS
+            .lock()
+            .unwrap()
+            .insert(workspace, (cut, action))
+            .is_none(),
+        "workspace lifecycle cut was already armed"
+    );
+}
+
+#[cfg(test)]
+fn take_resume_lifecycle_cut_for_test() -> Option<(ResumeLifecycleCut, Box<dyn FnOnce() + Send>)> {
+    RESUME_LIFECYCLE_CUT.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn restore_resume_lifecycle_cut_for_test(
+    armed: Option<(ResumeLifecycleCut, Box<dyn FnOnce() + Send>)>,
+) {
+    RESUME_LIFECYCLE_CUT.with(|slot| *slot.borrow_mut() = armed);
 }
 
 #[cfg(test)]
@@ -5443,7 +5511,7 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     let engine_open_started = diagnostic_started.map(|_| Instant::now());
     #[cfg(test)]
     let phase_started = Instant::now();
-    let (engine, receipt, _outcomes) =
+    let (mut engine, receipt, _outcomes) =
         try_release!(ShardedHotEngine::open_enrolled_projection_with_retention(
             archive,
             state.lineage_digest,
@@ -5472,8 +5540,8 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             "runtime resume restore refused: {error}"
         )));
     }
-    let resume_observation = engine.runtime_resume_observation();
-    let resume_open = RuntimeResumeOpenStatus {
+    let mut resume_observation = engine.runtime_resume_observation();
+    let mut resume_open = RuntimeResumeOpenStatus {
         plan: retention_plan,
         unavailable,
         observation: resume_observation,
@@ -5534,11 +5602,6 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
         .reference_catalog_root()
         .map_err(RuntimePromotionError::Engine));
 
-    let Some(store) = engine.archive_store() else {
-        release!(RuntimePromotionError::Anchor(
-            "promoted engine retained no archive capability",
-        ));
-    };
     let claim = ProjectionClaim::current(state.workspace_id, state.lineage_digest);
     // A promoted lineage's leading accepted sequences are its retained
     // immutable bootstrap parts, which live in the archive's bootstrap
@@ -5562,37 +5625,68 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     let sqlite_open_started = diagnostic_started.map(|_| Instant::now());
     #[cfg(test)]
     let phase_started = Instant::now();
-    let (projection, ()) = match LeasedWorkspaceProjection::open_under::<(), ProjectionError>(
-        workspace_lease,
-        |slot| {
-            let source = RebuildSource::from_promoted_runtime(&engine, store, &publication)
-                .map_err(ProjectionError::from)?;
-            match projection_open {
-                PromotedProjectionOpen::AllowRebuild => {
-                    SqliteFrontier::open_or_rebuild_with_applier_slot(
-                        open.database_path,
-                        open.application_runtime_root,
-                        claim,
-                        source,
-                        slot,
+    // A malformed retained scratch run can evade the lazy engine-open path and
+    // surface only when SQLite materializes documents.  Keep the error typed
+    // through this seam so one selected/adopted run may be retired and rebuilt
+    // from immutable history; every other failure still fails closed.
+    macro_rules! open_promoted_projection {
+        ($lease:expr, $mode:expr) => {
+            LeasedWorkspaceProjection::open_under::<(), ProjectionError>($lease, |slot| {
+                let store = engine.archive_store().ok_or_else(|| {
+                    ProjectionError::Rebuild(
+                        "promoted engine retained no archive capability".into(),
                     )
+                })?;
+                let source = RebuildSource::from_promoted_runtime(&engine, store, &publication)
+                    .map_err(ProjectionError::from)?;
+                match $mode {
+                    PromotedProjectionOpen::AllowRebuild => {
+                        SqliteFrontier::open_or_rebuild_with_applier_slot(
+                            open.database_path,
+                            open.application_runtime_root,
+                            claim,
+                            source,
+                            slot,
+                        )
+                    }
+                    PromotedProjectionOpen::ExistingOnly => {
+                        SqliteFrontier::open_existing_with_applier_slot(
+                            open.database_path,
+                            open.application_runtime_root,
+                            claim,
+                            source,
+                            slot,
+                        )
+                    }
                 }
-                PromotedProjectionOpen::ExistingOnly => {
-                    SqliteFrontier::open_existing_with_applier_slot(
-                        open.database_path,
-                        open.application_runtime_root,
-                        claim,
-                        source,
-                        slot,
-                    )
-                }
-            }
-            .map(|opened| (opened, ()))
-        },
-    ) {
+                .map(|opened| (opened, ()))
+            })
+        };
+    }
+    let (projection, ()) = match open_promoted_projection!(workspace_lease, projection_open) {
         Ok(opened) => opened,
         Err((lease, error)) => {
-            return Err(custody.refuse_returning(lease, RuntimePromotionError::Sqlite(error)))
+            let Some(failure) = error.retained_scratch_resume_failure().cloned() else {
+                return Err(custody.refuse_returning(lease, RuntimePromotionError::Sqlite(error)));
+            };
+            if let Err(error) = engine.recover_from_retained_scratch_resume_failure(&failure) {
+                return Err(custody.refuse_returning(lease, RuntimePromotionError::Engine(error)));
+            }
+            // A successful replay owns a different retained run and a newer
+            // frontier.  The predecessor SQLite cache is disposable, so the
+            // sole retry must rebuild it rather than demand same-process reuse.
+            resume_candidate = "retained_scratch_replayed";
+            resume_observation = engine.runtime_resume_observation();
+            resume_open.observation = resume_observation;
+            verified_same_process_sqlite = None;
+            match open_promoted_projection!(lease, PromotedProjectionOpen::AllowRebuild) {
+                Ok(opened) => opened,
+                Err((lease, error)) => {
+                    return Err(
+                        custody.refuse_returning(lease, RuntimePromotionError::Sqlite(error))
+                    );
+                }
+            }
         }
     };
     #[cfg(test)]
@@ -5664,6 +5758,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     let tail_construction_started = diagnostic_started.map(|_| Instant::now());
     #[cfg(test)]
     let phase_started = Instant::now();
+    let Some(store) = engine.archive_store() else {
+        close_and_release!(RuntimePromotionError::Anchor(
+            "promoted engine retained no archive capability",
+        ));
+    };
     let tail_source = match RebuildSource::from_promoted_runtime(&engine, store, &publication) {
         Ok(source) => source,
         Err(error) => close_and_release!(RuntimePromotionError::from(error)),

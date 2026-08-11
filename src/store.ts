@@ -61,7 +61,7 @@ import { clearMatrixDimensionCache, invalidateAllMatrixDimensions } from "./shee
 import { applyMarkerTransition } from "./logbook";
 import { cycleMarkerSmart } from "./editor/repeat";
 import {
-  markDirty,
+  markDirty as markDirtyInner,
   isDirty,
   scheduleSave,
   flushPage,
@@ -88,8 +88,27 @@ import {
 } from "./persistence";
 // The debounced persistence engine lives in persistence.ts; re-exported here so
 // the rest of the app keeps importing the save API from the store.
+type StoreMutationObservation = { kind: "publication" | "dirty"; page?: string };
+let storeMutationObserverForTest: ((observation: StoreMutationObservation) => void) | null = null;
+
+/** Test-only observation seam for proving work shape at the actual store and
+ * persistence entry points. Production leaves this unset. */
+export function __setStoreMutationObserverForTest(
+  observer: ((observation: StoreMutationObservation) => void) | null,
+) {
+  storeMutationObserverForTest = observer;
+}
+
+/** Production keeps the exact persistence function identity and call path. Vitest
+ * selects the observing façade once at module initialization, never per edit. */
+export const markDirty: typeof markDirtyInner = import.meta.env.MODE === "test"
+  ? ((...args: Parameters<typeof markDirtyInner>) => {
+      storeMutationObserverForTest?.({ kind: "dirty", page: args[0] });
+      return markDirtyInner(...args);
+    }) as typeof markDirtyInner
+  : markDirtyInner;
+
 export {
-  markDirty,
   isDirty,
   isSaving,
   scheduleSave,
@@ -147,7 +166,18 @@ interface DocState {
   loaded: boolean;
 }
 
-export const [doc, setDoc] = createStore<DocState>({ byId: {}, pages: [], feed: [], loaded: false });
+const [doc, setDocInner] = createStore<DocState>({ byId: {}, pages: [], feed: [], loaded: false });
+export { doc };
+
+/** Production keeps Solid's original setter. Vitest chooses the observing
+ * façade once at module initialization, so there is no production wrapper or
+ * observer check on the editing hot path. */
+export const setDoc: typeof setDocInner = import.meta.env.MODE === "test"
+  ? ((...args: unknown[]) => {
+      storeMutationObserverForTest?.({ kind: "publication" });
+      return (setDocInner as (...innerArgs: unknown[]) => unknown)(...args);
+    }) as typeof setDocInner
+  : setDocInner;
 
 function docHasBlockIdentity(id: string): boolean {
   if (doc.byId[id]) return true;
@@ -4062,6 +4092,98 @@ function reselectSurvivingBlock(id: string | null) {
   else clearSelection();
 }
 
+/**
+ * Confirm the assumptions that the old per-root `moveBlockInternal` loop made
+ * before we start the one-shot selection mutation. A normal visible selection
+ * always meets these; a stale or malformed tree instead remains a guarded
+ * no-op, rather than committing only a prefix of the selection.
+ */
+function canBatchMoveSelectionRoots(ids: readonly string[], destPage: string, newParent: string | null): boolean {
+  if (newParent !== null) {
+    const parent = doc.byId[newParent];
+    if (!parent || !blockWritable(newParent) || parent.page !== destPage) return false;
+  }
+
+  for (const id of ids) {
+    const node = doc.byId[id];
+    if (!node || !blockWritable(id) || node.page !== destPage || id === newParent) return false;
+    if (!rootsOf(id).includes(id)) return false;
+
+    // Keep the old "never make a block its own ancestor" guard, but fail
+    // closed on a malformed parent cycle instead of spinning forever.
+    const seen = new Set<string>();
+    let cursor = newParent;
+    while (cursor !== null) {
+      if (cursor === id || seen.has(cursor)) return false;
+      seen.add(cursor);
+      const ancestor = doc.byId[cursor];
+      if (!ancestor) return false;
+      cursor = ancestor.parent;
+    }
+  }
+  return true;
+}
+
+/** Remove every selected root from its actual present sibling array, then put
+ * them at one destination in visible/document order. This is deliberately one
+ * Solid/Immer publication: selection indent/outdent is one editor command, not
+ * N independent drag operations. */
+function moveSelectionRootsInOneMutation(
+  ids: readonly string[],
+  destPage: string,
+  destinationParent: string | null,
+  destinationIndex: (state: DocState) => number,
+  expandParent: string | null = null,
+) {
+  setDoc(
+    produce((state) => {
+      const siblingsFor = (id: string): string[] | null => {
+        const node = state.byId[id];
+        if (!node) return null;
+        if (node.parent === null) return state.pages.find((page) => page.name === node.page)?.roots ?? null;
+        return state.byId[node.parent]?.children ?? null;
+      };
+
+      // Gather every removal before changing any array. This matters when a
+      // visible selection crosses parent arrays: each root must leave its own
+      // original array exactly once.
+      const removals = ids.map((id) => {
+        const siblings = siblingsFor(id);
+        return siblings ? { siblings, index: siblings.indexOf(id) } : null;
+      });
+      if (removals.some((removal) => !removal || removal.index < 0)) return;
+
+      // Re-read each index while removing: multiple selected roots can share a
+      // sibling array, so their preflight indices shift after the first splice.
+      // We have already established every membership above, before any mutation.
+      for (const id of ids) {
+        const siblings = siblingsFor(id)!;
+        siblings.splice(siblings.indexOf(id), 1);
+      }
+
+      const destination = destinationParent === null
+        ? state.pages.find((page) => page.name === destPage)?.roots
+        : state.byId[destinationParent]?.children;
+      if (!destination) return;
+      const at = destinationIndex(state);
+      if (at < 0) return;
+
+      for (const id of ids) state.byId[id].parent = destinationParent;
+      destination.splice(Math.min(at, destination.length), 0, ...ids);
+
+      if (expandParent !== null) {
+        const target = state.byId[expandParent];
+        if (!target) return;
+        // One raw rewrite plus the structure move, rather than the old
+        // writeCollapsed() publication after every selected root had moved.
+        target.raw = rawWithCollapsed(target.raw, false, formatForBlock(expandParent));
+        target.collapsed = false;
+      }
+    })
+  );
+  markDirty(destPage);
+}
+
 export function indentSelection() {
   const ids = topSelected();
   if (!ids.length || ids.some((id) => !blockWritable(id))) return;
@@ -4078,10 +4200,15 @@ export function indentSelection() {
   // already on the target page.
   const destPage = doc.byId[newParent].page;
   const same = ids.filter((id) => doc.byId[id]?.page === destPage);
-  if (!same.length) return;
+  if (!same.length || !canBatchMoveSelectionRoots(same, destPage, newParent)) return;
   pushUndo("indent-sel", [destPage]);
-  for (const id of same) moveBlockInternal(id, newParent, doc.byId[newParent].children.length);
-  writeCollapsed(newParent, false);
+  moveSelectionRootsInOneMutation(
+    same,
+    destPage,
+    newParent,
+    (state) => state.byId[newParent].children.length,
+    newParent,
+  );
 }
 
 export function outdentSelection() {
@@ -4095,13 +4222,21 @@ export function outdentSelection() {
   // ids[0]'s page — so restrict to the blocks already on that page.
   const destPage = doc.byId[parentId].page;
   const same = ids.filter((id) => doc.byId[id]?.page === destPage);
-  if (!same.length) return;
+  if (!same.length || !canBatchMoveSelectionRoots(same, destPage, grand)) return;
+  if (!rootsOf(parentId).includes(parentId)) return;
   pushUndo("outdent-sel", [destPage]);
-  let after = parentId;
-  for (const id of same) {
-    moveBlockInternal(id, grand, indexInSiblings(after) + 1);
-    after = id;
-  }
+  moveSelectionRootsInOneMutation(
+    same,
+    destPage,
+    grand,
+    (state) => {
+      const siblings = grand === null
+        ? state.pages.find((page) => page.name === destPage)?.roots
+        : state.byId[grand]?.children;
+      const parentIndex = siblings?.indexOf(parentId) ?? -1;
+      return parentIndex < 0 ? -1 : parentIndex + 1;
+    },
+  );
 }
 
 export function deleteSelection() {
@@ -4152,48 +4287,6 @@ export function selectionMarkdown(): string {
   return topSelected()
     .map((id) => blockSubtreeMarkdown(id, 0, true, stripCollapsed, onlySel))
     .join("\n");
-}
-
-/** Move a block to be a child of `newParent` (or root of its page) at `index`.
- *  Used by drag-and-drop. */
-/** Move without pushing an undo entry (for batched selection ops). */
-function moveBlockInternal(id: string, newParent: string | null, index: number) {
-  const node = doc.byId[id];
-  if (!node || !blockWritable(id) || (newParent !== null && !blockWritable(newParent))) return;
-  let p = newParent;
-  while (p !== null) {
-    if (p === id) return;
-    p = doc.byId[p].parent;
-  }
-  const oldPage = node.page;
-  const newPage = newParent ? doc.byId[newParent].page : oldPage;
-  setDoc(
-    produce((s) => {
-      const oldArr =
-        node.parent === null
-          ? s.pages[s.pages.findIndex((x) => x.name === oldPage)].roots
-          : s.byId[node.parent!].children;
-      const from = oldArr.indexOf(id);
-      oldArr.splice(from, 1);
-      s.byId[id].parent = newParent;
-      const newArr =
-        newParent === null
-          ? s.pages[s.pages.findIndex((x) => x.name === newPage)].roots
-          : s.byId[newParent].children;
-      let idx = index;
-      if (oldArr === newArr && from < idx) idx -= 1;
-      newArr.splice(Math.max(0, Math.min(idx, newArr.length)), 0, id);
-      if (newPage !== oldPage) {
-        const reassign = (bid: string) => {
-          s.byId[bid].page = newPage;
-          s.byId[bid].children.forEach(reassign);
-        };
-        reassign(id);
-      }
-    })
-  );
-  markDirty(oldPage);
-  if (newPage !== oldPage) markDirty(newPage);
 }
 
 /** Move a block under `newParent` (or, when `newParent` is null, to the roots of

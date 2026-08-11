@@ -783,10 +783,20 @@ mod tests {
 
     use super::*;
     use crate::fast_commit::{forbidden_commit_work, graph_wide_commit_work, GraphWideCommitWork};
+    use crate::oplog::hot_engine::{
+        force_generic_before_projection_affine_reuse_for_test,
+        force_generic_pending_local_predecessor_replay_for_test,
+        last_local_mutation_detail_timings, reset_local_mutation_detail_timings,
+        LocalAuthorCapture,
+    };
     use crate::oplog::hot_engine_integration_tests::hot_overlay_tests::OverlayFixture;
     use crate::oplog::local_active::LocalRuntimeAdmission;
     use crate::oplog::operational_coordinator::{
         OperationalCoordinator, PreparedLocalMutationState,
+    };
+    use crate::oplog::projection::{
+        prepared_editor_projection_instrumentation,
+        reset_prepared_editor_projection_instrumentation, PreparedEditorProjection,
     };
     use crate::oplog::{
         BlockLocation, DocumentId, LogicalPageName, LogseqIdentityMutation, LogseqIdentityTrigger,
@@ -1074,6 +1084,341 @@ mod tests {
         let managed = fixture.engine.managed_local_work().since(managed_before);
         assert_eq!(managed.accepted_base_documents_loaded, 0);
         assert_eq!(managed.retained_author_candidates_used, 12);
+    }
+
+    #[test]
+    fn capture_sealed_pending_local_predecessor_matches_forced_generic_prepared_and_journal_bytes()
+    {
+        let mut fixture = OverlayFixture::new("capture-sealed-byte-equivalence", "md", 32);
+        let (_, mut journal) = fixture.journal("sealed-byte-equivalence");
+        let first = commit_edit(&mut fixture, &mut journal, 1_211_000, 1);
+        assert!(matches!(first, TrustedLocalCommitOutcome::Committed(_)));
+        assert_eq!(
+            fixture.engine.managed_local_prefix_state().records_applied,
+            1
+        );
+
+        reset_prepared_editor_projection_instrumentation();
+        force_generic_pending_local_predecessor_replay_for_test(true);
+        let generic = prepared_edit(&mut fixture, 1_211_100, 2)
+            .prepared_batch()
+            .clone();
+        force_generic_pending_local_predecessor_replay_for_test(false);
+        let generic_counters = prepared_editor_projection_instrumentation();
+        assert_eq!(generic_counters.finalizer_predecessor_replay_render, 1);
+        assert_eq!(
+            generic_counters.capture_sealed_pending_local_predecessor_success,
+            0
+        );
+        assert_eq!(
+            generic_counters.finalizer_sealed_pending_local_predecessor_use,
+            0
+        );
+
+        reset_prepared_editor_projection_instrumentation();
+        let sealed = prepared_edit(&mut fixture, 1_211_100, 2)
+            .prepared_batch()
+            .clone();
+        let sealed_counters = prepared_editor_projection_instrumentation();
+        assert_eq!(sealed_counters.finalizer_predecessor_replay_render, 0);
+        assert_eq!(
+            sealed_counters.capture_sealed_pending_local_predecessor_success,
+            1
+        );
+        assert_eq!(
+            sealed_counters.finalizer_sealed_pending_local_predecessor_use,
+            1
+        );
+
+        assert_eq!(
+            generic.manifest().encode().unwrap(),
+            sealed.manifest().encode().unwrap()
+        );
+        let object_bytes = |prepared: &crate::oplog::PreparedBatch| {
+            prepared
+                .objects()
+                .iter()
+                .map(|object| object.encode().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(object_bytes(&generic), object_bytes(&sealed));
+        let sequence = fixture.engine.managed_local_prefix_state().next_sequence;
+        let generic_record = fixture
+            .engine
+            .prepare_managed_local_record(generic, sequence)
+            .unwrap();
+        let sealed_record = fixture
+            .engine
+            .prepare_managed_local_record(sealed, sequence)
+            .unwrap();
+        assert_eq!(
+            generic_record.journal_payload(),
+            sealed_record.journal_payload(),
+            "the capture-only seal cannot alter durable managed-local journal bytes"
+        );
+    }
+
+    #[test]
+    fn affine_before_projection_matches_forced_generic_same_state_same_author_bytes() {
+        let mut fixture = OverlayFixture::new("affine-before-projection-differential", "md", 32);
+        let (_, mut journal) = fixture.journal("affine-before-projection-differential");
+        let first = commit_edit(&mut fixture, &mut journal, 1_211_150, 1);
+        assert!(matches!(first, TrustedLocalCommitOutcome::Committed(_)));
+
+        let prepare = |force_generic| {
+            reset_local_mutation_detail_timings();
+            let accepted_page = fixture.engine.materialize_page(fixture.page_id).unwrap();
+            let mut requested_page = accepted_page.clone();
+            requested_page.blocks[0].content = "managed revision 2".into();
+            let exact_base = fixture
+                .graph
+                .read_projection_input(&fixture.page_path)
+                .unwrap()
+                .expect("the first pending-local commit owns the next exact editor base");
+            let prepared_editor_projection =
+                PreparedEditorProjection::prepare(requested_page, &accepted_page, exact_base)
+                    .unwrap()
+                    .bind_accepted_page(accepted_page);
+            force_generic_before_projection_affine_reuse_for_test(force_generic);
+            let drafted = fixture
+                .engine
+                .draft_author_transaction_with_prepared_editor_for_test(
+                    fixture.local_author(1_211_160),
+                    &fixture.content_edit(2),
+                    prepared_editor_projection,
+                );
+            force_generic_before_projection_affine_reuse_for_test(false);
+            let prepared = fixture
+                .engine
+                .finalize_author_transaction(
+                    drafted.unwrap(),
+                    &fixture.graph,
+                    &fixture.receipts,
+                    fixture.binding,
+                )
+                .unwrap();
+            (prepared, last_local_mutation_detail_timings())
+        };
+
+        let (generic, generic_detail) = prepare(true);
+        let (affine, affine_detail) = prepare(false);
+
+        assert_eq!(generic_detail.before_projection_full_materializations, 1);
+        assert_eq!(generic_detail.before_projection_affine_attempts, 0);
+        assert_eq!(generic_detail.before_projection_affine_reuses, 0);
+        assert_eq!(affine_detail.before_projection_full_materializations, 0);
+        assert_eq!(affine_detail.before_projection_affine_attempts, 1);
+        assert_eq!(affine_detail.before_projection_affine_reuses, 1);
+        assert_eq!(affine_detail.before_projection_affine_fallbacks, 0);
+
+        assert_eq!(
+            generic.manifest().encode().unwrap(),
+            affine.manifest().encode().unwrap()
+        );
+        let object_bytes = |prepared: &crate::oplog::PreparedBatch| {
+            prepared
+                .objects()
+                .iter()
+                .map(|object| object.encode().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(object_bytes(&generic), object_bytes(&affine));
+
+        let generic_projection = crate::oplog::projection_manifest::validate_projection_object_set(
+            generic.manifest(),
+            generic.objects(),
+        )
+        .unwrap();
+        let affine_projection = crate::oplog::projection_manifest::validate_projection_object_set(
+            affine.manifest(),
+            affine.objects(),
+        )
+        .unwrap();
+        assert_eq!(generic_projection.intents(), affine_projection.intents());
+        assert_eq!(generic_projection.intents().len(), 1);
+        assert_eq!(
+            generic_projection.intents()[0].post_frontier(),
+            affine_projection.intents()[0].post_frontier()
+        );
+        assert_eq!(
+            generic_projection.intents()[0].target().annotations(),
+            affine_projection.intents()[0].target().annotations()
+        );
+
+        let sequence = fixture.engine.managed_local_prefix_state().next_sequence;
+        let generic_record = fixture
+            .engine
+            .prepare_managed_local_record(generic, sequence)
+            .unwrap();
+        let affine_record = fixture
+            .engine
+            .prepare_managed_local_record(affine, sequence)
+            .unwrap();
+        assert_eq!(
+            generic_record.journal_payload(),
+            affine_record.journal_payload(),
+            "the affine pre-page reuse cannot alter canonical managed-local journal bytes"
+        );
+    }
+
+    #[test]
+    fn affine_before_projection_refuses_multi_document_pre_snapshot() {
+        let mut fixture =
+            OverlayFixture::new("affine-before-projection-snapshot-negative", "md", 32);
+        let (_, mut journal) = fixture.journal("affine-before-projection-snapshot-negative");
+        assert!(matches!(
+            commit_edit(&mut fixture, &mut journal, 1_211_170, 1),
+            TrustedLocalCommitOutcome::Committed(_)
+        ));
+
+        let accepted_page = fixture.engine.materialize_page(fixture.page_id).unwrap();
+        let mut requested_page = accepted_page.clone();
+        requested_page.blocks[0].content = "managed revision 2".into();
+        let exact_base = fixture
+            .graph
+            .read_projection_input(&fixture.page_path)
+            .unwrap()
+            .expect("the first pending-local commit owns the next exact editor base");
+        let prepared_editor_projection =
+            PreparedEditorProjection::prepare(requested_page, &accepted_page, exact_base)
+                .unwrap()
+                .bind_accepted_page(accepted_page);
+
+        reset_local_mutation_detail_timings();
+        let drafted = fixture
+            .engine
+            .draft_author_transaction_with_prepared_editor_for_test(
+                fixture.local_author(1_211_180),
+                &fixture.content_edit_with_noop_foreign_read(2),
+                prepared_editor_projection,
+            )
+            .unwrap();
+        let detail = last_local_mutation_detail_timings();
+        assert_eq!(detail.before_projection_affine_attempts, 1);
+        assert_eq!(detail.before_projection_affine_reuses, 0);
+        assert_eq!(detail.before_projection_affine_fallbacks, 1);
+        assert_eq!(detail.before_projection_full_materializations, 1);
+        fixture
+            .engine
+            .finalize_author_transaction(
+                drafted,
+                &fixture.graph,
+                &fixture.receipts,
+                fixture.binding,
+            )
+            .expect("the generic path remains valid after rejecting the multi-document snapshot");
+    }
+
+    #[test]
+    fn affine_before_projection_refuses_foreign_pending_local_frontier_before_append() {
+        let mut fixture =
+            OverlayFixture::new("affine-before-projection-frontier-negative", "md", 32);
+        let (_, mut journal) = fixture.journal("affine-before-projection-frontier-negative");
+        let first = commit_edit(&mut fixture, &mut journal, 1_211_190, 1);
+        let TrustedLocalCommitOutcome::Committed(first) = first else {
+            panic!("first pending managed-local record was not durable");
+        };
+        let graph_before = fs::read(fixture.graph_path.join(fixture.page_path.as_str())).unwrap();
+        let frames_before = journal.stats().frames_appended;
+        assert!(fixture
+            .engine
+            .rewrite_managed_local_projection_frontier_with_foreign_document_for_test(
+                first.sequence(),
+                first.batch_id(),
+            ));
+
+        let accepted_page = fixture.engine.materialize_page(fixture.page_id).unwrap();
+        let mut requested_page = accepted_page.clone();
+        requested_page.blocks[0].content = "managed revision 2".into();
+        let exact_base = fixture
+            .graph
+            .read_projection_input(&fixture.page_path)
+            .unwrap()
+            .expect("the first pending-local commit owns the next exact editor base");
+        let prepared_editor_projection =
+            PreparedEditorProjection::prepare(requested_page, &accepted_page, exact_base)
+                .unwrap()
+                .bind_accepted_page(accepted_page);
+
+        reset_local_mutation_detail_timings();
+        fixture
+            .engine
+            .draft_author_transaction_with_prepared_editor_for_test(
+                fixture.local_author(1_211_200),
+                &fixture.content_edit(2),
+                prepared_editor_projection,
+            )
+            .expect("the generic draft remains available after frontier rejection");
+        let detail = last_local_mutation_detail_timings();
+        assert_eq!(detail.before_projection_affine_attempts, 1);
+        assert_eq!(detail.before_projection_affine_reuses, 0);
+        assert_eq!(detail.before_projection_affine_fallbacks, 1);
+        assert_eq!(detail.before_projection_full_materializations, 1);
+        assert_eq!(journal.stats().frames_appended, frames_before);
+        assert_eq!(
+            fs::read(fixture.graph_path.join(fixture.page_path.as_str())).unwrap(),
+            graph_before,
+            "frontier rejection must happen before a new managed-local append or graph overwrite"
+        );
+    }
+
+    #[test]
+    fn capture_sealed_pending_local_predecessor_refuses_changed_overlay_endpoint_before_append() {
+        let mut fixture = OverlayFixture::new("capture-sealed-overlay-removal", "md", 32);
+        let (_, mut journal) = fixture.journal("capture-sealed-overlay-removal");
+        let first = commit_edit(&mut fixture, &mut journal, 1_211_200, 1);
+        let TrustedLocalCommitOutcome::Committed(first) = first else {
+            panic!("first pending managed-local record was not durable");
+        };
+        let graph_before = fs::read(fixture.graph_path.join(fixture.page_path.as_str())).unwrap();
+        let frames_before = journal.stats().frames_appended;
+        let draft = fixture
+            .engine
+            .draft_author_transaction(
+                fixture.local_author(1_211_300),
+                crate::oplog::BatchOrigin::LocalMutation,
+                &fixture.content_edit(2),
+            )
+            .unwrap();
+
+        reset_prepared_editor_projection_instrumentation();
+        let captured = match fixture
+            .engine
+            .capture_local_author_transaction(
+                draft,
+                &fixture.graph,
+                &fixture.receipts,
+                fixture.binding,
+                None,
+            )
+            .unwrap()
+        {
+            LocalAuthorCapture::Captured(captured) => captured,
+            LocalAuthorCapture::ReconciliationNeeded(_) => {
+                panic!("fresh pending managed-local predecessor unexpectedly reconciled")
+            }
+        };
+        assert!(fixture
+            .engine
+            .rewrite_managed_local_authority_endpoint_for_test(first.sequence(), first.batch_id()));
+
+        assert!(matches!(
+            fixture
+                .engine
+                .finalize_captured_author_transaction(captured, &fixture.receipts),
+            Err(crate::oplog::EngineError::ProjectionManifest(message))
+                if message.contains("authority") || message.contains("binding")
+        ));
+        let counters = prepared_editor_projection_instrumentation();
+        assert_eq!(counters.capture_sealed_pending_local_predecessor_success, 1);
+        assert_eq!(counters.finalizer_predecessor_replay_render, 0);
+        assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 0);
+        assert_eq!(journal.stats().frames_appended, frames_before);
+        assert_eq!(
+            fs::read(fixture.graph_path.join(fixture.page_path.as_str())).unwrap(),
+            graph_before,
+            "a failed sealed finalization must not append or overwrite the graph"
+        );
     }
 
     #[test]

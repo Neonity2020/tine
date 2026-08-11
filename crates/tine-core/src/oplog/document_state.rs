@@ -1231,7 +1231,11 @@ fn decode_canonical<T: for<'de> Deserialize<'de> + Serialize>(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DocumentStateError {
-    Scratch(String),
+    /// Keep the reconstructible-scratch failure typed until the runtime has
+    /// decided whether this was an adopted retained accelerator.  Reducing it
+    /// to text here used to make a late SQLite materialization failure
+    /// indistinguishable from an authoritative archive failure.
+    Scratch(super::scratch_store::ScratchError),
     ExternalStore(String),
     InvalidCrdt(String),
     MisboundRecord,
@@ -1256,7 +1260,7 @@ impl std::error::Error for DocumentStateError {}
 
 impl From<super::scratch_store::ScratchError> for DocumentStateError {
     fn from(error: super::scratch_store::ScratchError) -> Self {
-        Self::Scratch(error.to_string())
+        Self::Scratch(error)
     }
 }
 

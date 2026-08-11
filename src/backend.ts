@@ -43,6 +43,7 @@ import type {
   SparseV2EditorLoadRequest,
   SparseV2EditorSaveRequest,
   SparseV2EditorOutcome,
+  StartupProgressEvent,
   PdfState,
   QueryExecution,
   QueryPageScope,
@@ -202,7 +203,8 @@ export interface Backend {
   approveExternalAssets(graphRoot: string, assetsPath: string): Promise<void>;
   loadGraph(path: string): Promise<LoadGraphResult>;
   openGraphWindow(path: string): Promise<LoadGraphResult>;
-  startupGraphPath(): Promise<string | null>;
+  startupGraphPath(attempt: number): Promise<string | null>;
+  onStartupProgress(cb: (progress: StartupProgressEvent) => void): Promise<() => void>;
   captureTarget(): Promise<string>;
   /** Lease the graph selected for this Quick Capture show before issuing
    * graph-scoped reads from its independent WebView. */
@@ -282,6 +284,7 @@ export interface Backend {
   ): Promise<() => void>;
   activateSparseV2(): Promise<SparseV2Status>;
   cancelSparseV2(): Promise<SparseV2CancelResult>;
+  cancelSparseV2Cold(path: string, attempt: number): Promise<SparseV2CancelResult>;
   prepareSparseV2Share(): Promise<SparseV2Status>;
   joinSparseV2Shared(): Promise<SparseV2Status>;
   sparseV2Query(request: SparseV2QueryRequest): Promise<SparseV2QueryReply>;
@@ -710,8 +713,12 @@ class TauriBackend implements Backend {
   openGraphWindow(path: string) {
     return this.call<LoadGraphResult>("open_graph_window", { path });
   }
-  startupGraphPath() {
-    return this.call<string | null>("startup_graph_path");
+  startupGraphPath(attempt: number) {
+    return this.call<string | null>("startup_graph_path", { attempt });
+  }
+  async onStartupProgress(cb: (progress: StartupProgressEvent) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<StartupProgressEvent>("startup-progress", (event) => cb(event.payload));
   }
   captureTarget() {
     return this.call<string>("capture_target");
@@ -863,6 +870,11 @@ class TauriBackend implements Backend {
   }
   async cancelSparseV2() {
     const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2");
+    this.bindingGeneration = result.binding_generation;
+    return result;
+  }
+  async cancelSparseV2Cold(path: string, attempt: number) {
+    const result = await this.call<SparseV2CancelResult>("cancel_sparse_v2_cold", { path, attempt });
     this.bindingGeneration = result.binding_generation;
     return result;
   }

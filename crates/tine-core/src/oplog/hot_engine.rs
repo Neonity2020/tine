@@ -78,9 +78,9 @@ use super::{
     ManifestedProjectionIntent, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
     PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
-    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionReceiptStore,
-    ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget, SemanticEffect,
-    SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
+    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
+    ProjectionReceiptStore, ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget,
+    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -112,6 +112,133 @@ const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 5;
 pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
+
+/// Test-only, per-thread attribution for the ordinary trusted-local authoring
+/// path.  This is deliberately an observation receipt, not engine state: it
+/// is reset by the trusted-local coordinator and is absent from release
+/// artifacts.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LocalMutationDetailTimings {
+    pub(crate) core_total: std::time::Duration,
+    pub(crate) core_preflight: std::time::Duration,
+    pub(crate) author_operations_inclusive: std::time::Duration,
+    pub(crate) before_semantic_snapshots_child: std::time::Duration,
+    pub(crate) identity_trigger_validation: std::time::Duration,
+    pub(crate) after_semantic_snapshots: std::time::Duration,
+    pub(crate) effect_derive_encode: std::time::Duration,
+    pub(crate) dependencies_frontier: std::time::Duration,
+    pub(crate) delta_export_object_construction: std::time::Duration,
+    pub(crate) manifest_path_authority: std::time::Duration,
+    pub(crate) prospective_document_capture: std::time::Duration,
+    pub(crate) before_projection_materialization: std::time::Duration,
+    pub(crate) post_projection_materialization: std::time::Duration,
+    pub(crate) projection_requirement_assembly: std::time::Duration,
+    pub(crate) finalize_authority_checks: std::time::Duration,
+    pub(crate) finalize_base_objects: std::time::Duration,
+    pub(crate) finalize_projection_intents: std::time::Duration,
+    pub(crate) finalize_seal_pending: std::time::Duration,
+    pub(crate) core_calls: usize,
+    pub(crate) operation_count: usize,
+    pub(crate) before_snapshot_documents: usize,
+    pub(crate) before_snapshot_blocks: usize,
+    pub(crate) after_snapshot_documents: usize,
+    pub(crate) after_snapshot_blocks: usize,
+    pub(crate) effect_block_deltas: usize,
+    pub(crate) affected_documents: usize,
+    pub(crate) affected_heads: usize,
+    pub(crate) delta_exports: usize,
+    pub(crate) delta_export_bytes: usize,
+    pub(crate) constructed_object_bytes: usize,
+    pub(crate) captured_documents: usize,
+    pub(crate) before_projection_pages: usize,
+    pub(crate) before_projection_full_materializations: usize,
+    pub(crate) before_projection_affine_attempts: usize,
+    pub(crate) before_projection_affine_reuses: usize,
+    pub(crate) before_projection_affine_fallbacks: usize,
+    pub(crate) before_projection_affine_snapshot_blocks: usize,
+    pub(crate) post_projection_pages: usize,
+    pub(crate) projection_requirements: usize,
+    pub(crate) draft_calls: usize,
+    pub(crate) finalize_captured_inputs: usize,
+    pub(crate) finalize_base_objects_count: usize,
+    pub(crate) finalize_projection_intents_count: usize,
+    pub(crate) finalize_projection_intent_bytes: usize,
+    pub(crate) finalize_final_objects: usize,
+    pub(crate) finalize_calls: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_LOCAL_MUTATION_DETAIL_TIMINGS: Cell<LocalMutationDetailTimings> =
+        Cell::new(LocalMutationDetailTimings {
+            core_total: std::time::Duration::ZERO,
+            core_preflight: std::time::Duration::ZERO,
+            author_operations_inclusive: std::time::Duration::ZERO,
+            before_semantic_snapshots_child: std::time::Duration::ZERO,
+            identity_trigger_validation: std::time::Duration::ZERO,
+            after_semantic_snapshots: std::time::Duration::ZERO,
+            effect_derive_encode: std::time::Duration::ZERO,
+            dependencies_frontier: std::time::Duration::ZERO,
+            delta_export_object_construction: std::time::Duration::ZERO,
+            manifest_path_authority: std::time::Duration::ZERO,
+            prospective_document_capture: std::time::Duration::ZERO,
+            before_projection_materialization: std::time::Duration::ZERO,
+            post_projection_materialization: std::time::Duration::ZERO,
+            projection_requirement_assembly: std::time::Duration::ZERO,
+            finalize_authority_checks: std::time::Duration::ZERO,
+            finalize_base_objects: std::time::Duration::ZERO,
+            finalize_projection_intents: std::time::Duration::ZERO,
+            finalize_seal_pending: std::time::Duration::ZERO,
+            core_calls: 0,
+            operation_count: 0,
+            before_snapshot_documents: 0,
+            before_snapshot_blocks: 0,
+            after_snapshot_documents: 0,
+            after_snapshot_blocks: 0,
+            effect_block_deltas: 0,
+            affected_documents: 0,
+            affected_heads: 0,
+            delta_exports: 0,
+            delta_export_bytes: 0,
+            constructed_object_bytes: 0,
+            captured_documents: 0,
+            before_projection_pages: 0,
+            before_projection_full_materializations: 0,
+            before_projection_affine_attempts: 0,
+            before_projection_affine_reuses: 0,
+            before_projection_affine_fallbacks: 0,
+            before_projection_affine_snapshot_blocks: 0,
+            post_projection_pages: 0,
+            projection_requirements: 0,
+            draft_calls: 0,
+            finalize_captured_inputs: 0,
+            finalize_base_objects_count: 0,
+            finalize_projection_intents_count: 0,
+            finalize_projection_intent_bytes: 0,
+            finalize_final_objects: 0,
+            finalize_calls: 0,
+        });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_local_mutation_detail_timings() {
+    LAST_LOCAL_MUTATION_DETAIL_TIMINGS.set(LocalMutationDetailTimings::default());
+}
+
+#[cfg(test)]
+pub(crate) fn last_local_mutation_detail_timings() -> LocalMutationDetailTimings {
+    LAST_LOCAL_MUTATION_DETAIL_TIMINGS.get()
+}
+
+#[cfg(test)]
+fn note_local_mutation_detail(update: impl FnOnce(&mut LocalMutationDetailTimings)) {
+    LAST_LOCAL_MUTATION_DETAIL_TIMINGS.with(|timings| {
+        let mut current = timings.get();
+        update(&mut current);
+        timings.set(current);
+    });
+}
 
 // This is a run-local, authenticated view over the accepted catalog. It is
 // deliberately not an object-store, receipt, or projection format.
@@ -444,6 +571,7 @@ struct PreparedTransactionParts {
     prepared: PreparedBatch,
     semantic_effect: SemanticEffect,
     prospective_documents: BTreeMap<DocumentId, LoroDoc>,
+    projection_before_snapshots: Option<BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
     detached_bootstrap: Option<DetachedBootstrapAuthoredState>,
     portable_path_root: PortablePathIndexRoot,
     external_observation: Option<ExternalImportObservationMaterial>,
@@ -3715,6 +3843,211 @@ pub(crate) struct CapturedAuthorTransaction {
     requirement_digest: ContentDigest,
     requirement_index: AuthorRequirementIndex,
     captured_inputs: Vec<CapabilityCapturedProjectionInput>,
+    sealed_pending_local_predecessor: Option<CaptureSealedPendingLocalPredecessor>,
+}
+
+/// One-process evidence that an exact pending managed-local predecessor was
+/// completely rendered during capture.  This is deliberately affine and
+/// private: it can only be consumed by the captured transaction finalizer and
+/// never reaches a prepared batch, journal record, overlay, receipt, or
+/// recovery state.
+struct CaptureSealedPendingLocalPredecessor {
+    workspace_id: WorkspaceId,
+    endpoint: ProjectionEndpointBinding,
+    page_id: PageId,
+    path: ManagedPath,
+    pre_frontier: FrontierV2,
+    claim_evidence: Vec<ProjectionClaimEvidence>,
+    prior_intent: ProjectionIntent,
+    prior_intent_id: ProjectionIntentId,
+    target: BlobDescription,
+    bytes: Vec<u8>,
+    annotations: Vec<AnnotatedIdentity>,
+    sequence: u64,
+    batch_id: BatchId,
+}
+
+impl CaptureSealedPendingLocalPredecessor {
+    #[allow(clippy::too_many_arguments)]
+    fn try_mint(
+        workspace_id: WorkspaceId,
+        endpoint: ProjectionEndpointBinding,
+        external: bool,
+        requirement_count: usize,
+        requirement: &ProjectionRequirement,
+        roles: AuthorRequirementPathRoles,
+        before: Option<&ProjectionPageState>,
+        current: Option<&[u8]>,
+        prior: Option<&CapabilityCapturedPriorProjection>,
+    ) -> Result<Option<Self>, EngineError> {
+        if external
+            || requirement_count != 1
+            || requirement.precondition != ProjectionRequirementState::Present
+            || requirement.target != ProjectionRequirementState::Present
+            || roles.semantic_predecessor != Some(roles.owner)
+            || !capture_sealed_pending_local_predecessor_enabled()
+        {
+            return Ok(None);
+        }
+        let (Some(before), Some(prior)) = (before, prior) else {
+            return Ok(None);
+        };
+        let Some((sequence, batch_id)) = prior.managed_local_authority else {
+            return Ok(None);
+        };
+        if prior.completion.is_some()
+            || prior.bootstrap_owner_binding.is_some()
+            || prior.receipt_backed_live_authority
+            || before.page.page_id != requirement.page_id
+            || before.page.path != requirement.path
+            || current != Some(prior.bytes.as_slice())
+            || prior.intent.workspace_id() != workspace_id
+            || prior.intent.page_id() != requirement.page_id
+            || prior.intent.path() != &requirement.path
+            || prior.intent.frontier() != &before.frontier
+            || prior.intent.claim_evidence() != before.claim_evidence
+            || prior.intent.target() != BlobDescription::of(&prior.bytes)
+        {
+            return Ok(None);
+        }
+        let prior_intent_id = prior
+            .intent
+            .id()
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        Ok(Some(Self {
+            workspace_id,
+            endpoint,
+            page_id: requirement.page_id,
+            path: requirement.path.clone(),
+            pre_frontier: before.frontier.clone(),
+            claim_evidence: before.claim_evidence.clone(),
+            prior_intent: prior.intent.clone(),
+            prior_intent_id,
+            target: prior.intent.target(),
+            bytes: prior.bytes.clone(),
+            annotations: prior.intent.annotations().to_vec(),
+            sequence,
+            batch_id,
+        }))
+    }
+
+    fn verify_and_take_annotations(
+        self,
+        engine: &ShardedHotEngine,
+        source: ProjectionEndpointBinding,
+        path: &ManagedPath,
+        before: &ProjectionPageState,
+        prior: &CapabilityCapturedPriorProjection,
+    ) -> Result<Vec<AnnotatedIdentity>, EngineError> {
+        if self.workspace_id != engine.workspace_id
+            || self.endpoint != source
+            || self.page_id != before.page.page_id
+            || self.path != *path
+            || self.pre_frontier != before.frontier
+            || self.claim_evidence != before.claim_evidence
+            || self.prior_intent_id
+                != self
+                    .prior_intent
+                    .id()
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+            || self.prior_intent != prior.intent
+            || self.target != BlobDescription::of(&self.bytes)
+            || self.target != self.prior_intent.target()
+            || self.bytes != prior.bytes
+            || self.annotations != self.prior_intent.annotations()
+            || self.annotations != prior.intent.annotations()
+            || prior.managed_local_authority != Some((self.sequence, self.batch_id))
+        {
+            return Err(EngineError::ProjectionManifest(
+                "capture-sealed managed-local predecessor binding changed before finalization"
+                    .into(),
+            ));
+        }
+        let entry = engine
+            .local_overlay
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == self.sequence && entry.batch_id == self.batch_id)
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(
+                    "capture-sealed managed-local predecessor authority was removed before finalization"
+                        .into(),
+                )
+            })?;
+        let intent = &entry.projection.intent;
+        let target = intent.target();
+        if intent.workspace_id() != self.workspace_id
+            || intent.source_endpoint_id() != source.endpoint_id
+            || intent.source_batch_id() != self.batch_id
+            || intent.page_id() != self.page_id
+            || intent.path() != path
+            || intent.post_frontier() != &self.pre_frontier
+            || intent.claim_evidence() != self.claim_evidence
+            || target.bytes() != Some(self.bytes.as_slice())
+            || target.description() != Some(self.target)
+            || target.annotations() != self.annotations.as_slice()
+        {
+            return Err(EngineError::ProjectionManifest(
+                "capture-sealed managed-local predecessor authority no longer binds the captured target"
+                    .into(),
+            ));
+        }
+        Ok(self.annotations)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FORCE_GENERIC_BEFORE_PROJECTION_AFFINE_REUSE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_generic_pending_local_predecessor_replay_for_test(force: bool) {
+    FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY.with(|enabled| enabled.set(force));
+}
+
+#[cfg(test)]
+pub(crate) fn force_generic_before_projection_affine_reuse_for_test(force: bool) {
+    FORCE_GENERIC_BEFORE_PROJECTION_AFFINE_REUSE.with(|enabled| enabled.set(force));
+}
+
+fn before_projection_affine_reuse_enabled() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_GENERIC_BEFORE_PROJECTION_AFFINE_REUSE.with(|force| !force.get());
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+fn affine_before_projection_frontier_documents_are_exact(
+    frontier: &FrontierV2,
+    page_home_document_id: DocumentId,
+    catalog_document_id: DocumentId,
+) -> bool {
+    frontier.documents().len() == 2
+        && frontier
+            .documents()
+            .iter()
+            .map(DocumentDependencies::document_id)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([page_home_document_id, catalog_document_id])
+}
+
+fn capture_sealed_pending_local_predecessor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY.with(|force| !force.get());
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 impl AuthorTransactionDraft {
@@ -5814,6 +6147,88 @@ pub struct RuntimeResumeObservation {
     pub live_history_generation: u64,
     /// Durable records this recovery actually authenticated and replayed.
     pub replayed_generations: u64,
+}
+
+/// A recoverable read failure in the retained scratch run selected by an
+/// authenticated runtime-resume point.  Retained scratch is an accelerator,
+/// not authority: the immutable archive remains sufficient to reconstruct a
+/// fresh run.  This type deliberately preserves that distinction until the
+/// promoted-runtime boundary can make the one allowed recovery decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RetainedScratchFault {
+    Unreadable,
+    UnsafeEntry,
+    MalformedMarker,
+    MalformedPage,
+    MalformedBlob,
+    PageTooLarge,
+    PageDigestMismatch,
+    BlobDigestMismatch,
+    PageBindingMismatch,
+}
+
+impl fmt::Display for RetainedScratchFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable => f.write_str("scratch I/O failed"),
+            Self::UnsafeEntry => f.write_str("unsafe scratch entry"),
+            Self::MalformedMarker => f.write_str("malformed scratch marker"),
+            Self::MalformedPage => f.write_str("malformed or non-canonical scratch page"),
+            Self::MalformedBlob => f.write_str("malformed scratch blob"),
+            Self::PageTooLarge => f.write_str("scratch page is too large"),
+            Self::PageDigestMismatch => f.write_str("scratch page digest mismatch"),
+            Self::BlobDigestMismatch => f.write_str("scratch blob digest mismatch"),
+            Self::PageBindingMismatch => f.write_str("scratch page reference is misbound"),
+        }
+    }
+}
+
+/// Typed provenance for a reconstructible retained-scratch failure.  The run
+/// identifier is not an authority; it only proves the error arose while this
+/// engine was reading the exact run it adopted at open.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetainedScratchResumeFailure {
+    run_id: Uuid,
+    fault: RetainedScratchFault,
+}
+
+impl RetainedScratchResumeFailure {
+    fn from_scratch(run_id: Uuid, error: &super::scratch_store::ScratchError) -> Option<Self> {
+        use super::scratch_store::ScratchError;
+
+        let fault = match error {
+            ScratchError::Io(_) => RetainedScratchFault::Unreadable,
+            ScratchError::UnsafeEntry(_) => RetainedScratchFault::UnsafeEntry,
+            ScratchError::MalformedMarker(_) => RetainedScratchFault::MalformedMarker,
+            ScratchError::MalformedPage => RetainedScratchFault::MalformedPage,
+            ScratchError::MalformedBlob => RetainedScratchFault::MalformedBlob,
+            ScratchError::PageTooLarge(_) => RetainedScratchFault::PageTooLarge,
+            ScratchError::PageDigestMismatch(_) => RetainedScratchFault::PageDigestMismatch,
+            ScratchError::BlobDigestMismatch(_) => RetainedScratchFault::BlobDigestMismatch,
+            ScratchError::PageBindingMismatch => RetainedScratchFault::PageBindingMismatch,
+            // These are engine/programming invariants, not an untrusted
+            // retained-cache representation.  Do not turn them into an
+            // automatic replay signal.
+            ScratchError::KeyDigestCollision
+            | ScratchError::IndexCapacity
+            | ScratchError::Poisoned => return None,
+        };
+        Some(Self { run_id, fault })
+    }
+
+    pub(crate) const fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
+    pub(crate) const fn fault(&self) -> &RetainedScratchFault {
+        &self.fault
+    }
+}
+
+impl fmt::Display for RetainedScratchResumeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "document scratch index failed: {}", self.fault)
+    }
 }
 
 /// The complete authenticated Patricia inventory owned by a store-backed hot
@@ -8852,6 +9267,22 @@ impl ShardedHotEngine {
         self.retained_scratch.map(|identity| identity.run_id())
     }
 
+    fn document_state_error(
+        &self,
+        error: super::document_state::DocumentStateError,
+    ) -> EngineError {
+        if self.resume_observation.adopted {
+            if let (Some(run_id), super::document_state::DocumentStateError::Scratch(scratch)) =
+                (self.retained_scratch_run_id(), &error)
+            {
+                if let Some(failure) = RetainedScratchResumeFailure::from_scratch(run_id, scratch) {
+                    return EngineError::RetainedScratchResumeFailure(failure);
+                }
+            }
+        }
+        EngineError::Archive(error.to_string())
+    }
+
     /// This engine's runtime-resume observation. Set once, at startup.
     pub(crate) const fn runtime_resume_observation(&self) -> RuntimeResumeObservation {
         self.resume_observation
@@ -9503,7 +9934,7 @@ impl ShardedHotEngine {
             super::document_state::DocumentLane::Visible,
             self.catalog_document_id,
         )
-        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .map_err(|error| self.document_state_error(error))?
         else {
             return Ok(RunLocalCatalogHotState {
                 catalog_heads: BTreeSet::new(),
@@ -9539,7 +9970,7 @@ impl ShardedHotEngine {
             super::document_state::DocumentLane::Visible,
             self.catalog_document_id,
         )
-        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .map_err(|error| self.document_state_error(error))?
         else {
             return Ok(BTreeSet::new());
         };
@@ -9637,6 +10068,41 @@ impl ShardedHotEngine {
             .committed_manifests()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         self.validate_retained_bootstrap_publication()?;
+        self.rotate_to_fresh_retained_scratch()?;
+        self.prepare_operational_recovery_replay()?;
+        self.resume_observation.adopted = false;
+        self.replay_operational_history(&committed_manifests, false)?;
+        Ok(())
+    }
+
+    /// Recover once from a late read failure in the exact retained run adopted
+    /// at open.  This boundary is intentionally narrower than generic SQLite
+    /// recovery: it accepts only typed reconstructible-scratch faults tied to
+    /// the selected run, revalidates immutable bootstrap authority, leaves the
+    /// old run untouched, and replays the complete authenticated history into
+    /// a fresh retained run.
+    pub(crate) fn recover_from_retained_scratch_resume_failure(
+        &mut self,
+        failure: &RetainedScratchResumeFailure,
+    ) -> Result<(), EngineError> {
+        if !self.resume_observation.adopted
+            || self.retained_scratch_run_id() != Some(failure.run_id())
+        {
+            return Err(EngineError::Archive(
+                "retained scratch recovery is not bound to the adopted resume run".into(),
+            ));
+        }
+        let committed_manifests = self
+            .archive_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?
+            .committed_manifests()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.validate_retained_bootstrap_publication()?;
+        eprintln!(
+            "[tine] retained scratch resume read failed ({}) ; rebuilding from immutable history",
+            failure.fault()
+        );
         self.rotate_to_fresh_retained_scratch()?;
         self.prepare_operational_recovery_replay()?;
         self.resume_observation.adopted = false;
@@ -9971,6 +10437,82 @@ impl ShardedHotEngine {
             records_applied: self.local_overlay.entries.len(),
             commitment: self.local_overlay.commitment,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rewrite_managed_local_authority_endpoint_for_test(
+        &mut self,
+        sequence: u64,
+        batch_id: BatchId,
+    ) -> bool {
+        let Some(entry) = self
+            .local_overlay
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence && entry.batch_id == batch_id)
+        else {
+            return false;
+        };
+        let intent = &entry.projection.intent;
+        entry.projection.intent = ManifestedProjectionIntent::new(
+            intent.workspace_id(),
+            intent.source_batch_id(),
+            intent.source_author_device_id(),
+            intent.source_author_session_id(),
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0xfeed_face)),
+            intent.page_id(),
+            intent.path().clone(),
+            intent.portable_path_index_root(),
+            intent.precondition().clone(),
+            intent.render_base().cloned(),
+            intent.target().clone(),
+            intent.post_frontier().clone(),
+            intent.claim_evidence().to_vec(),
+        )
+        .expect("test-only endpoint rewrite retains a valid manifested projection intent");
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rewrite_managed_local_projection_frontier_with_foreign_document_for_test(
+        &mut self,
+        sequence: u64,
+        batch_id: BatchId,
+    ) -> bool {
+        let Some(entry) = self
+            .local_overlay
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence && entry.batch_id == batch_id)
+        else {
+            return false;
+        };
+        let intent = &entry.projection.intent;
+        let foreign_document_id = DocumentId::from_uuid(Uuid::from_u128(0xfeed_f00d));
+        let mut documents = intent.post_frontier().documents().to_vec();
+        documents.push(
+            DocumentDependencies::new(foreign_document_id, Vec::new(), vec![batch_id])
+                .expect("test-only foreign frontier document is well formed"),
+        );
+        let frontier = FrontierV2::new(documents)
+            .expect("test-only foreign frontier remains canonically ordered");
+        entry.projection.intent = ManifestedProjectionIntent::new(
+            intent.workspace_id(),
+            intent.source_batch_id(),
+            intent.source_author_device_id(),
+            intent.source_author_session_id(),
+            intent.source_endpoint_id(),
+            intent.page_id(),
+            intent.path().clone(),
+            intent.portable_path_index_root(),
+            intent.precondition().clone(),
+            intent.render_base().cloned(),
+            intent.target().clone(),
+            frontier,
+            intent.claim_evidence().to_vec(),
+        )
+        .expect("test-only foreign frontier rewrite retains a valid manifested projection intent");
+        true
     }
 
     /// Materialize one exact current path from accepted state plus the
@@ -11180,7 +11722,7 @@ impl ShardedHotEngine {
             &requested,
             external_exact_session,
         )
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        .map_err(|error| self.document_state_error(error))?;
         dependencies
             .into_iter()
             .flatten()
@@ -14627,6 +15169,22 @@ impl ShardedHotEngine {
         self.draft_author_transaction_with_observation(author, origin, transaction, None, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn draft_author_transaction_with_prepared_editor_for_test(
+        &self,
+        author: AuthorBatch,
+        transaction: &OperationTransaction,
+        prepared_editor_projection: super::projection::PreparedEditorProjection,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
+        self.draft_author_transaction_with_observation(
+            author,
+            BatchOrigin::LocalMutation,
+            transaction,
+            None,
+            Some(prepared_editor_projection),
+        )
+    }
+
     /// Prepare one canonical managed-local record from the exact finalized
     /// `PreparedBatch` that the archive expander will later publish.
     ///
@@ -15594,8 +16152,12 @@ impl ShardedHotEngine {
         origin: BatchOrigin,
         transaction: &OperationTransaction,
         observation: Option<ExternalImportObservationMaterial>,
-        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        mut prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.draft_calls = detail.draft_calls.saturating_add(1);
+        });
         if origin == BatchOrigin::BootstrapImport {
             return Err(EngineError::InvalidTransaction(
                 "bootstrap import must use the origin-explicit bootstrap helper".into(),
@@ -15613,11 +16175,24 @@ impl ShardedHotEngine {
         let affected_pages = affected_projection_pages(&parts.semantic_effect);
         let mut pages = BTreeMap::new();
         for page_id in affected_pages {
-            let before = match self.materialize_page_for_projection(page_id) {
-                Ok(state) => Some(state),
-                Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => None,
-                Err(error) => return Err(error),
-            };
+            #[cfg(test)]
+            let before_projection_started = Instant::now();
+            let before = self.materialize_before_projection_for_draft(
+                page_id,
+                origin,
+                &parts.semantic_effect,
+                parts.projection_before_snapshots.as_ref(),
+                prepared_editor_projection.as_mut(),
+            )?;
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_projection_materialization = detail
+                    .before_projection_materialization
+                    .saturating_add(before_projection_started.elapsed());
+                detail.before_projection_pages = detail.before_projection_pages.saturating_add(1);
+            });
+            #[cfg(test)]
+            let post_projection_started = Instant::now();
             let after = self.prospective_projection_page(
                 page_id,
                 author.batch_id,
@@ -15633,6 +16208,13 @@ impl ShardedHotEngine {
                     &parts.prospective_documents,
                 )?,
             };
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.post_projection_materialization = detail
+                    .post_projection_materialization
+                    .saturating_add(post_projection_started.elapsed());
+                detail.post_projection_pages = detail.post_projection_pages.saturating_add(1);
+            });
             pages.insert(
                 page_id,
                 DraftProjectionPage {
@@ -15642,7 +16224,18 @@ impl ShardedHotEngine {
                 },
             );
         }
+        #[cfg(test)]
+        let requirements_started = Instant::now();
         let requirements = projection_requirements(&pages)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.projection_requirement_assembly = detail
+                .projection_requirement_assembly
+                .saturating_add(requirements_started.elapsed());
+            detail.projection_requirements = detail
+                .projection_requirements
+                .saturating_add(requirements.len());
+        });
         if origin == BatchOrigin::LocalMutation && requirements.is_empty() {
             // This is valid only for a semantic transaction whose exact
             // projection transition set is empty. Closed-set acceptance
@@ -15662,6 +16255,255 @@ impl ShardedHotEngine {
             external_observation: parts.external_observation,
             prepared_editor_projection,
         })
+    }
+
+    /// Use an editor-owned pre-page only after proving that it describes this
+    /// exact, current pending-local predecessor.  This deliberately accepts a
+    /// single claim-free Markdown content-edit lane; every missing proof
+    /// consumes the affine artifact and follows the established full
+    /// materializer.
+    fn materialize_before_projection_for_draft(
+        &self,
+        page_id: PageId,
+        origin: BatchOrigin,
+        effect: &SemanticEffect,
+        before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
+        prepared_editor_projection: Option<&mut super::projection::PreparedEditorProjection>,
+    ) -> Result<Option<ProjectionPageState>, EngineError> {
+        let affine =
+            if origin == BatchOrigin::LocalMutation && before_projection_affine_reuse_enabled() {
+                prepared_editor_projection.and_then(|prepared| {
+                    let exact_base_matches = prepared.before_candidate_matches_exact_base();
+                    prepared
+                        .take_before_candidate()
+                        .map(|candidate| (candidate, exact_base_matches))
+                })
+            } else {
+                None
+            };
+
+        if let Some((candidate, exact_base_matches)) = affine {
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_projection_affine_attempts =
+                    detail.before_projection_affine_attempts.saturating_add(1);
+            });
+            if let Some((page, accepted_target, accepted_annotations)) =
+                candidate.into_page_and_accepted_render()
+            {
+                if let Some(state) = self.authenticate_affine_before_projection_candidate(
+                    page_id,
+                    effect,
+                    before_snapshots,
+                    page,
+                    exact_base_matches,
+                    &accepted_target,
+                    &accepted_annotations,
+                )? {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.before_projection_affine_reuses =
+                            detail.before_projection_affine_reuses.saturating_add(1);
+                        detail.before_projection_affine_snapshot_blocks = detail
+                            .before_projection_affine_snapshot_blocks
+                            .saturating_add(state.page.blocks.len());
+                    });
+                    return Ok(Some(state));
+                }
+            }
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_projection_affine_fallbacks =
+                    detail.before_projection_affine_fallbacks.saturating_add(1);
+            });
+        }
+
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.before_projection_full_materializations = detail
+                .before_projection_full_materializations
+                .saturating_add(1);
+        });
+        match self.materialize_page_for_projection(page_id) {
+            Ok(state) => Ok(Some(state)),
+            Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns a state only when the whole affine pre-state is independently
+    /// tied to the current local-overlay and engine points.  This helper never
+    /// parses source, reads Graph/SQLite, or reconstructs a page.
+    fn authenticate_affine_before_projection_candidate(
+        &self,
+        page_id: PageId,
+        effect: &SemanticEffect,
+        before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
+        page: MaterializedPage,
+        exact_base_matches: bool,
+        accepted_target: &[u8],
+        accepted_annotations: &[AnnotatedIdentity],
+    ) -> Result<Option<ProjectionPageState>, EngineError> {
+        if page.page_id != page_id
+            || !page.path.as_str().ends_with(".md")
+            || !effect.pages().is_empty()
+            || !effect.page_preambles().is_empty()
+            || !effect.memberships().is_empty()
+            || effect.blocks().is_empty()
+            || effect.blocks().iter().any(|delta| {
+                let (Some(before), Some(after)) = (&delta.before, &delta.after) else {
+                    return true;
+                };
+                before.block_id != delta.block_id
+                    || after.block_id != delta.block_id
+                    || before.home_document_id != page.home_document_id
+                    || after.home_document_id != page.home_document_id
+                    || before.owner != BlockOwner::Page(page_id)
+                    || after.owner != BlockOwner::Page(page_id)
+                    || before.logseq_uuid.is_some()
+                    || after.logseq_uuid.is_some()
+                    || before.logseq_identity_origin.is_some()
+                    || after.logseq_identity_origin.is_some()
+                    || before.content == after.content
+            })
+            || page.blocks.iter().any(|block| {
+                block.home_document_id != page.home_document_id
+                    || block.logseq_uuid.is_some()
+                    || block.logseq_identity_origin.is_some()
+            })
+            || !page_logseq_references(&page.path, page.preamble.as_deref(), &page.blocks)
+                .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(before_snapshots) = before_snapshots else {
+            return Ok(None);
+        };
+        if before_snapshots.len() != 1 || !before_snapshots.contains_key(&page.home_document_id) {
+            return Ok(None);
+        }
+        let Some(SemanticDocumentSnapshot::Shard {
+            page_id: Some(snapshot_page_id),
+            page_preamble,
+            blocks,
+            memberships,
+        }) = before_snapshots.get(&page.home_document_id)
+        else {
+            return Ok(None);
+        };
+        if *snapshot_page_id != page_id
+            || page_preamble
+                .as_ref()
+                .and_then(|preamble| preamble.preamble.as_deref())
+                != page.preamble.as_deref()
+            || blocks.len() != page.blocks.len()
+            || memberships.len() != page.blocks.len()
+            || page.blocks.iter().any(|block| {
+                let Some(state) = blocks.get(&block.block_id) else {
+                    return true;
+                };
+                let Some(membership) = memberships.get(&block.block_id) else {
+                    return true;
+                };
+                state.block_id != block.block_id
+                    || state.home_document_id != page.home_document_id
+                    || state.owner != BlockOwner::Page(page_id)
+                    || state.logseq_uuid != block.logseq_uuid
+                    || state.logseq_identity_origin != block.logseq_identity_origin
+                    || state.content != block.content
+                    || membership.home_document_id != page.home_document_id
+                    || membership.parent != block.parent
+                    || membership.order != block.order
+            })
+        {
+            return Ok(None);
+        }
+
+        let PageState::Live {
+            name,
+            path,
+            kind,
+            home_document_id,
+        } = self.current_hot_page_state(page_id)?
+        else {
+            return Ok(None);
+        };
+        if name != page.name
+            || path != page.path
+            || kind != page.kind
+            || home_document_id != page.home_document_id
+        {
+            return Ok(None);
+        }
+        let CurrentPageAtPath::ExactOwner(owner) = self.current_page_at_path(&page.path)? else {
+            return Ok(None);
+        };
+        if owner.page_id() != page_id {
+            return Ok(None);
+        }
+
+        let Some(last) = self.local_overlay.entries.last() else {
+            return Ok(None);
+        };
+        let intent = &last.projection.intent;
+        if last.batch_id != intent.source_batch_id()
+            || intent.page_id() != page_id
+            || intent.path() != &page.path
+            || intent.portable_path_index_root() != self.portable_path_root
+            || !intent.claim_evidence().is_empty()
+            || !exact_base_matches
+        {
+            return Ok(None);
+        }
+        let ManifestProjectionTarget::Present {
+            bytes, annotations, ..
+        } = intent.target()
+        else {
+            return Ok(None);
+        };
+        if bytes.as_slice() != accepted_target || annotations.as_slice() != accepted_annotations {
+            return Ok(None);
+        }
+
+        let home_dependencies =
+            self.current_hot_document_dependencies_by_id(page.home_document_id)?;
+        if !affine_before_projection_frontier_documents_are_exact(
+            intent.post_frontier(),
+            page.home_document_id,
+            self.catalog_document_id,
+        ) {
+            return Ok(None);
+        }
+        let Some(intent_home_dependencies) = intent
+            .post_frontier()
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == page.home_document_id)
+        else {
+            return Ok(None);
+        };
+        let current_catalog_dependencies =
+            self.current_hot_document_dependencies_by_id(self.catalog_document_id)?;
+        let Some(intent_catalog_dependencies) = intent
+            .post_frontier()
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == self.catalog_document_id)
+        else {
+            return Ok(None);
+        };
+        if home_dependencies.direct_dependency_heads() != [last.batch_id]
+            || intent_home_dependencies != &home_dependencies
+            || intent_catalog_dependencies != &current_catalog_dependencies
+        {
+            return Ok(None);
+        }
+        Ok(Some(ProjectionPageState {
+            page,
+            frontier: intent.post_frontier().clone(),
+            claim_evidence: Vec::new(),
+        }))
     }
 
     /// Inactive session-facing gate for local semantic authoring. The draft is
@@ -15885,6 +16727,7 @@ impl ShardedHotEngine {
             "requirement index",
         )?;
         let mut captured_inputs = Vec::with_capacity(requirement_index.len());
+        let mut sealed_pending_local_predecessor = None;
         let mut mismatches = Vec::new();
         for indexed_path in requirement_index.entries() {
             let path = indexed_path.path(&draft.requirements);
@@ -16083,6 +16926,31 @@ impl ShardedHotEngine {
                 None
             };
 
+            let requirement = &draft.requirements[roles.owner];
+            let before = roles.semantic_predecessor.and_then(|index| {
+                draft.pages[&draft.requirements[index].page_id]
+                    .before
+                    .as_ref()
+            });
+            if let Some(seal) = CaptureSealedPendingLocalPredecessor::try_mint(
+                self.workspace_id,
+                source,
+                external,
+                requirement_index.len(),
+                requirement,
+                roles,
+                before,
+                current.as_deref(),
+                prior.as_ref(),
+            )? {
+                if sealed_pending_local_predecessor.replace(seal).is_some() {
+                    return Err(EngineError::ProjectionManifest(
+                        "multiple capture-sealed managed-local predecessors are ineligible".into(),
+                    ));
+                }
+                super::projection::note_capture_sealed_pending_local_predecessor_success();
+            }
+
             let material = if let Some(observation) = external_observation {
                 let observed = external_observation_for_path(
                     external_observation_index
@@ -16175,6 +17043,7 @@ impl ShardedHotEngine {
             requirement_digest,
             requirement_index,
             captured_inputs,
+            sealed_pending_local_predecessor,
         }))
     }
 
@@ -16205,6 +17074,8 @@ impl ShardedHotEngine {
         captured: CapturedAuthorTransaction,
         receipts: &ProjectionReceiptStore,
     ) -> Result<PreparedBatch, EngineError> {
+        #[cfg(test)]
+        let authority_checks_started = Instant::now();
         let CapturedAuthorTransaction {
             mut draft,
             source,
@@ -16213,6 +17084,7 @@ impl ShardedHotEngine {
             requirement_digest,
             requirement_index,
             mut captured_inputs,
+            mut sealed_pending_local_predecessor,
         } = captured;
         let external_reconciliation =
             matches!(draft.origin, BatchOrigin::ExternalReconciliation { .. });
@@ -16310,6 +17182,14 @@ impl ShardedHotEngine {
             .into_iter()
             .map(|input| (input.path, input.material))
             .collect::<BTreeMap<_, _>>();
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.finalize_authority_checks = detail
+                .finalize_authority_checks
+                .saturating_add(authority_checks_started.elapsed());
+            detail.finalize_captured_inputs =
+                detail.finalize_captured_inputs.saturating_add(inputs.len());
+        });
 
         // This is the only consumer of editor preparation.  Any transaction
         // shape other than one existing Present -> Present requirement remains
@@ -16328,7 +17208,11 @@ impl ShardedHotEngine {
             None
         };
 
+        #[cfg(test)]
+        let base_objects_started = Instant::now();
         let mut objects = draft.prepared_core.objects().to_vec();
+        #[cfg(test)]
+        let core_object_count = objects.len();
         let mut observed_bases =
             BTreeMap::<ManagedPath, (ManifestObjectRef, AnnotatedProjectionBase)>::new();
         let mut render_bases =
@@ -16339,6 +17223,7 @@ impl ShardedHotEngine {
             let state = &inputs[path];
             let requirement = &draft.requirements[roles.owner];
             let page = &draft.pages[&requirement.page_id];
+            let mut sealed_annotations = None;
             let prior = match state {
                 CapabilityCapturedProjectionMaterial::Absent { prior }
                 | CapabilityCapturedProjectionMaterial::Present { prior, .. } => prior.as_ref(),
@@ -16369,21 +17254,38 @@ impl ShardedHotEngine {
                         "captured path {path} completion is not its intended semantic predecessor"
                     )));
                 }
-                super::projection::note_finalizer_predecessor_replay_render();
-                let replay = super::projection::plan_projection_with_layout_annotations(
-                    self.workspace_id,
-                    before,
-                    Some(&prior.bytes),
-                    Some(prior.intent.annotations()),
-                )
-                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                if replay.target() != prior.bytes
-                    || (prior.receipt_backed_live_authority
-                        && replay.intent().annotations() != prior.intent.annotations())
+                let (prior_annotations, used_seal) = if sealed_pending_local_predecessor
+                    .as_ref()
+                    .is_some_and(|seal| seal.path == *path)
                 {
-                    return Err(EngineError::ProjectionManifest(format!(
-                        "captured path {path} prior bytes are not the exact semantic pre-state"
-                    )));
+                    let seal = sealed_pending_local_predecessor
+                        .take()
+                        .expect("checked capture-sealed predecessor remains available");
+                    let annotations =
+                        seal.verify_and_take_annotations(self, source, path, before, prior)?;
+                    super::projection::note_finalizer_sealed_pending_local_predecessor_use();
+                    (annotations, true)
+                } else {
+                    super::projection::note_finalizer_predecessor_replay_render();
+                    let replay = super::projection::plan_projection_with_layout_annotations(
+                        self.workspace_id,
+                        before,
+                        Some(&prior.bytes),
+                        Some(prior.intent.annotations()),
+                    )
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                    if replay.target() != prior.bytes
+                        || (prior.receipt_backed_live_authority
+                            && replay.intent().annotations() != prior.intent.annotations())
+                    {
+                        return Err(EngineError::ProjectionManifest(format!(
+                            "captured path {path} prior bytes are not the exact semantic pre-state"
+                        )));
+                    }
+                    (replay.intent().annotations().to_vec(), false)
+                };
+                if used_seal {
+                    sealed_annotations = Some(prior_annotations.clone());
                 }
                 let prior_semantic_layout_required = roles.render_base_owner.is_some_and(|owner| {
                     matches!(
@@ -16400,7 +17302,7 @@ impl ShardedHotEngine {
                         prior.logical_completion_id(),
                         before.frontier.clone(),
                         prior.bytes.clone(),
-                        replay.intent().annotations().to_vec(),
+                        prior_annotations.clone(),
                         before.claim_evidence.clone(),
                     )
                     .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -16447,7 +17349,7 @@ impl ShardedHotEngine {
                         .and_then(CapabilityCapturedPriorProjection::logical_completion_id),
                     prior_frontier,
                     bytes.clone(),
-                    annotations.clone(),
+                    sealed_annotations.unwrap_or_else(|| annotations.clone()),
                     prior_claim_evidence,
                 )
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -16469,6 +17371,26 @@ impl ShardedHotEngine {
             }
         }
 
+        if sealed_pending_local_predecessor.is_some() {
+            return Err(EngineError::ProjectionManifest(
+                "capture-sealed managed-local predecessor did not match a finalized path".into(),
+            ));
+        }
+
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            let base_objects = &objects[core_object_count..];
+            detail.finalize_base_objects = detail
+                .finalize_base_objects
+                .saturating_add(base_objects_started.elapsed());
+            detail.finalize_base_objects_count = detail
+                .finalize_base_objects_count
+                .saturating_add(base_objects.len());
+        });
+        #[cfg(test)]
+        let projection_intents_started = Instant::now();
+        #[cfg(test)]
+        let projection_intent_start = objects.len();
         for requirement in &draft.requirements {
             let page = &draft.pages[&requirement.page_id];
             let precondition = match &inputs[&requirement.path] {
@@ -16620,6 +17542,25 @@ impl ShardedHotEngine {
             )?;
             objects.push(object);
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            let intents = &objects[projection_intent_start..];
+            detail.finalize_projection_intents = detail
+                .finalize_projection_intents
+                .saturating_add(projection_intents_started.elapsed());
+            detail.finalize_projection_intents_count = detail
+                .finalize_projection_intents_count
+                .saturating_add(intents.len());
+            detail.finalize_projection_intent_bytes =
+                detail.finalize_projection_intent_bytes.saturating_add(
+                    intents
+                        .iter()
+                        .map(|object| object.payload().len())
+                        .sum::<usize>(),
+                );
+        });
+        #[cfg(test)]
+        let seal_pending_started = Instant::now();
         objects.sort_unstable_by_key(|object| {
             object
                 .descriptor()
@@ -16666,6 +17607,16 @@ impl ShardedHotEngine {
             });
         }
         let _ = draft.semantic_effect;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.finalize_seal_pending = detail
+                .finalize_seal_pending
+                .saturating_add(seal_pending_started.elapsed());
+            detail.finalize_final_objects = detail
+                .finalize_final_objects
+                .saturating_add(prepared.objects().len());
+            detail.finalize_calls = detail.finalize_calls.saturating_add(1);
+        });
         Ok(prepared)
     }
 
@@ -16677,6 +17628,10 @@ impl ShardedHotEngine {
         capture: TransactionCapture,
         observation: Option<ExternalImportObservationMaterial>,
     ) -> Result<PreparedTransactionParts, EngineError> {
+        #[cfg(test)]
+        let core_started = Instant::now();
+        #[cfg(test)]
+        let preflight_started = Instant::now();
         self.begin_point_operation();
         // A pending author buffer is only an optimization for the immediately
         // following stage of that exact prepared batch. Starting any later
@@ -16762,19 +17717,42 @@ impl ShardedHotEngine {
                     .set_peer_id(author.crdt_peer_id.as_u64())
                     .map_err(loro_error)?;
                 before_vectors.insert(document_id, document.document().oplog_vv());
-                before_snapshots.insert(
+                #[cfg(test)]
+                let before_snapshot_started = Instant::now();
+                let snapshot = snapshot_document(
+                    self.catalog_document_id,
                     document_id,
-                    snapshot_document(
-                        self.catalog_document_id,
-                        document_id,
-                        document.document(),
-                        false,
-                    )?,
-                );
+                    document.document(),
+                    false,
+                )?;
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.before_semantic_snapshots_child = detail
+                        .before_semantic_snapshots_child
+                        .saturating_add(before_snapshot_started.elapsed());
+                    detail.before_snapshot_documents =
+                        detail.before_snapshot_documents.saturating_add(1);
+                    detail.before_snapshot_blocks = detail
+                        .before_snapshot_blocks
+                        .saturating_add(semantic_snapshot_block_count(&snapshot));
+                });
+                before_snapshots.insert(document_id, snapshot);
                 authenticated_direct_heads.insert(document_id, direct_heads);
                 working.insert(document_id, document);
             }
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.core_preflight = detail
+                .core_preflight
+                .saturating_add(preflight_started.elapsed());
+            detail.core_calls = detail.core_calls.saturating_add(1);
+            detail.operation_count = detail
+                .operation_count
+                .saturating_add(transaction.operations.len());
+        });
+        #[cfg(test)]
+        let author_operations_started = Instant::now();
         for operation in &transaction.operations {
             self.apply_author_operation(
                 &mut working,
@@ -16786,7 +17764,21 @@ impl ShardedHotEngine {
                 operation,
             )?;
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.author_operations_inclusive = detail
+                .author_operations_inclusive
+                .saturating_add(author_operations_started.elapsed());
+        });
+        #[cfg(test)]
+        let identity_triggers_started = Instant::now();
         self.validate_logseq_identity_triggers(transaction, &working, &mut read_only_catalog)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.identity_trigger_validation = detail
+                .identity_trigger_validation
+                .saturating_add(identity_triggers_started.elapsed());
+        });
 
         let affected: Vec<DocumentId> = working.keys().copied().collect();
         if matches!(origin, BatchOrigin::ExternalReconciliation { .. })
@@ -16796,10 +17788,37 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::CrdtPeerCollision(author.crdt_peer_id));
         }
+        #[cfg(test)]
+        let after_snapshots_started = Instant::now();
         let after_snapshots = snapshot_engine_documents(self.catalog_document_id, &working, true)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.after_semantic_snapshots = detail
+                .after_semantic_snapshots
+                .saturating_add(after_snapshots_started.elapsed());
+            detail.after_snapshot_documents = detail
+                .after_snapshot_documents
+                .saturating_add(after_snapshots.len());
+            detail.after_snapshot_blocks = detail
+                .after_snapshot_blocks
+                .saturating_add(semantic_snapshot_blocks(&after_snapshots));
+        });
+        #[cfg(test)]
+        let effect_derive_started = Instant::now();
         let effect = derive_effect_from_snapshots(&before_snapshots, &after_snapshots)?;
         let effect_bytes = effect.encode()?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.effect_derive_encode = detail
+                .effect_derive_encode
+                .saturating_add(effect_derive_started.elapsed());
+            detail.effect_block_deltas = detail
+                .effect_block_deltas
+                .saturating_add(effect.blocks().len());
+        });
 
+        #[cfg(test)]
+        let dependencies_started = Instant::now();
         let mut frontier_documents = Vec::with_capacity(affected.len());
         let mut affected_heads = BTreeMap::new();
         let mut batch_dependency_heads = BTreeSet::new();
@@ -16838,7 +17857,17 @@ impl ShardedHotEngine {
         }
         let frontier = FrontierV2::new(frontier_documents)?;
         let batch_dependency_heads: Vec<_> = batch_dependency_heads.into_iter().collect();
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.dependencies_frontier = detail
+                .dependencies_frontier
+                .saturating_add(dependencies_started.elapsed());
+            detail.affected_documents = detail.affected_documents.saturating_add(affected.len());
+            detail.affected_heads = detail.affected_heads.saturating_add(affected_heads.len());
+        });
 
+        #[cfg(test)]
+        let delta_export_started = Instant::now();
         let mut objects = Vec::with_capacity(working.len() + 1);
         objects.push(OperationObject::new(
             self.workspace_id,
@@ -16895,6 +17924,28 @@ impl ShardedHotEngine {
                 )?,
             )?);
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.delta_export_object_construction = detail
+                .delta_export_object_construction
+                .saturating_add(delta_export_started.elapsed());
+            detail.delta_exports = detail.delta_exports.saturating_add(working.len());
+            detail.delta_export_bytes = detail.delta_export_bytes.saturating_add(
+                objects
+                    .iter()
+                    .skip(1)
+                    .map(|object| object.payload().len())
+                    .sum::<usize>(),
+            );
+            detail.constructed_object_bytes = detail.constructed_object_bytes.saturating_add(
+                objects
+                    .iter()
+                    .map(|object| object.payload().len())
+                    .sum::<usize>(),
+            );
+        });
+        #[cfg(test)]
+        let manifest_path_authority_started = Instant::now();
         let descriptors = objects
             .iter()
             .map(OperationObject::descriptor)
@@ -17084,7 +18135,16 @@ impl ShardedHotEngine {
             )?;
         }
         let prepared = PreparedBatch::new(manifest, objects).map_err(EngineError::from)?;
-        let (prospective_documents, detached_bootstrap) = match capture {
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.manifest_path_authority = detail
+                .manifest_path_authority
+                .saturating_add(manifest_path_authority_started.elapsed());
+        });
+        #[cfg(test)]
+        let prospective_capture_started = Instant::now();
+        let (prospective_documents, detached_bootstrap, projection_before_snapshots) = match capture
+        {
             TransactionCapture::Projection => (
                 working
                     .iter()
@@ -17093,6 +18153,7 @@ impl ShardedHotEngine {
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?,
                 None,
+                Some(before_snapshots),
             ),
             TransactionCapture::DetachedBootstrap => (
                 BTreeMap::new(),
@@ -17103,6 +18164,7 @@ impl ShardedHotEngine {
                     before_vectors,
                     dependency_heads: affected_heads,
                 }),
+                None,
             ),
             TransactionCapture::None => {
                 if self.scratch.is_none() {
@@ -17123,13 +18185,24 @@ impl ShardedHotEngine {
                         projection_pages: BTreeMap::new(),
                     });
                 }
-                (BTreeMap::new(), None)
+                (BTreeMap::new(), None, None)
             }
         };
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.prospective_document_capture = detail
+                .prospective_document_capture
+                .saturating_add(prospective_capture_started.elapsed());
+            detail.captured_documents = detail
+                .captured_documents
+                .saturating_add(prospective_documents.len());
+            detail.core_total = detail.core_total.saturating_add(core_started.elapsed());
+        });
         Ok(PreparedTransactionParts {
             prepared,
             semantic_effect: effect,
             prospective_documents,
+            projection_before_snapshots,
             detached_bootstrap,
             portable_path_root,
             external_observation,
@@ -25865,15 +26938,26 @@ impl ShardedHotEngine {
                 EngineDocument::InMemory(document)
             };
             before_vectors.insert(document_id, document.document().oplog_vv());
-            before_snapshots.insert(
+            #[cfg(test)]
+            let before_snapshot_started = Instant::now();
+            let snapshot = snapshot_document(
+                self.catalog_document_id,
                 document_id,
-                snapshot_document(
-                    self.catalog_document_id,
-                    document_id,
-                    document.document(),
-                    false,
-                )?,
-            );
+                document.document(),
+                false,
+            )?;
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_semantic_snapshots_child = detail
+                    .before_semantic_snapshots_child
+                    .saturating_add(before_snapshot_started.elapsed());
+                detail.before_snapshot_documents =
+                    detail.before_snapshot_documents.saturating_add(1);
+                detail.before_snapshot_blocks = detail
+                    .before_snapshot_blocks
+                    .saturating_add(semantic_snapshot_block_count(&snapshot));
+            });
+            before_snapshots.insert(document_id, snapshot);
             entry.insert(document);
         }
         Ok(working
@@ -29107,6 +30191,19 @@ enum SemanticDocumentSnapshot {
 }
 
 #[cfg(test)]
+fn semantic_snapshot_block_count(snapshot: &SemanticDocumentSnapshot) -> usize {
+    match snapshot {
+        SemanticDocumentSnapshot::Catalog(_) => 0,
+        SemanticDocumentSnapshot::Shard { blocks, .. } => blocks.len(),
+    }
+}
+
+#[cfg(test)]
+fn semantic_snapshot_blocks(snapshots: &BTreeMap<DocumentId, SemanticDocumentSnapshot>) -> usize {
+    snapshots.values().map(semantic_snapshot_block_count).sum()
+}
+
+#[cfg(test)]
 thread_local! {
     static OWNED_SEMANTIC_SNAPSHOT_ENTRIES: Cell<usize> = const { Cell::new(0) };
 }
@@ -30676,6 +31773,10 @@ pub enum EngineError {
     /// At least one member of the exact canonical dependency sequence bound by
     /// this commitment was rejected. Appended to preserve prior enum tags.
     RejectedDependencySet(ContentDigest),
+    /// A late read from the exact retained run adopted at open failed in a
+    /// reconstructible accelerator.  The promoted-runtime boundary may rotate
+    /// once to a fresh retained run and replay immutable history.
+    RetainedScratchResumeFailure(RetainedScratchResumeFailure),
 }
 
 impl fmt::Display for EngineError {
@@ -30824,6 +31925,9 @@ impl fmt::Display for EngineError {
                 f,
                 "at least one member of dependency set {commitment} was rejected"
             ),
+            Self::RetainedScratchResumeFailure(failure) => {
+                write!(f, "immutable archive error: {failure}")
+            }
         }
     }
 }
