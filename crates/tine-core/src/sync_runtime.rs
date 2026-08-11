@@ -27015,7 +27015,8 @@ mod tests {
     }
 
     #[test]
-    fn prepared_editor_projection_reuses_one_511_block_crlf_markdown_save() {
+    fn prepared_editor_projection_seals_the_pending_local_predecessor_for_two_511_block_crlf_saves()
+    {
         let fixture = ActivationFixture::empty("prepared-editor-projection-crlf", 0xa13d);
         let runtime_request = reopen_request(&fixture.request);
         let source = (0..MAX_SYNC_EDITOR_BLOCKS)
@@ -27049,8 +27050,13 @@ mod tests {
         assert_eq!(counters.finalizer_post_state_render, 0);
         assert_eq!(
             counters.finalizer_predecessor_replay_render, 1,
-            "the retained predecessor replay remains a separately counted safety render"
+            "fail-before: the first save has no pending managed-local predecessor to seal"
         );
+        assert_eq!(
+            counters.capture_sealed_pending_local_predecessor_success, 0,
+            "fail-before: the first save must retain the complete generic predecessor replay"
+        );
+        assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 0);
         assert_eq!(
             instrumentation.guarded_graph_validation_parse_pairs, 1,
             "reuse must still execute Graph's guarded base/target validation parse pair"
@@ -27067,20 +27073,80 @@ mod tests {
             serde_json::to_value(&fresh).unwrap(),
             "reused target must match the ordinary exact parser DTO"
         );
+        let first_target = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
+
+        let mut second_page = saved.clone();
+        second_page.blocks[0].raw = "after capture-sealed pending-local predecessor".into();
+        let second_saved = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: second_page.path.clone(),
+                    revision: saved_revision.clone(),
+                },
+                page: second_page,
+            })
+            .unwrap();
+        let instrumentation = handle
+            .managed_application_save_instrumentation()
+            .expect("consecutive save exposes capture-sealed instrumentation");
+        let counters = instrumentation.prepared_editor_projection;
+        assert_eq!(counters.created, 1);
+        assert_eq!(counters.reused, 1);
+        assert_eq!(counters.fallback, 0);
+        assert_eq!(counters.finalizer_post_state_render, 0);
+        assert_eq!(
+            counters.finalizer_predecessor_replay_render, 0,
+            "pass-after: finalization must consume the capture-sealed predecessor instead of replaying it"
+        );
+        assert_eq!(
+            counters.capture_sealed_pending_local_predecessor_success, 1,
+            "pass-after: the fresh exact pending managed-local predecessor is sealed at capture"
+        );
+        assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 1);
+        assert_eq!(
+            instrumentation.guarded_graph_validation_parse_pairs, 1,
+            "the sealed fast path preserves Graph's guarded base/target validation parse pair"
+        );
+        let (second_saved, second_revision) = match second_saved {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("capture-sealed consecutive save was not durable: {other:?}"),
+        };
+        let (fresh, fresh_revision) = load_application_exact(&handle, &second_saved.path);
+        assert_eq!(second_revision, fresh_revision);
+        assert_eq!(
+            serde_json::to_value(&second_saved).unwrap(),
+            serde_json::to_value(&fresh).unwrap(),
+            "the capture-sealed target must match the immediate exact parser DTO"
+        );
 
         let frames = managed_local_journal_frames(&runtime_request);
         assert_eq!(
             frames.len(),
-            1,
-            "one durable foreground save appends one frame"
+            2,
+            "two consecutive undrained foreground saves append two ordered frames"
         );
-        let record = decode_managed_local_record(&frames[0]).unwrap();
-        assert_eq!(record.projection().intent().path().as_str(), saved.path);
+        let first_record = decode_managed_local_record(&frames[0]).unwrap();
+        let second_record = decode_managed_local_record(&frames[1]).unwrap();
+        assert_eq!(first_record.sequence(), 0);
+        assert_eq!(second_record.sequence(), 1);
+        assert_eq!(
+            first_record.projection().intent().path().as_str(),
+            saved.path
+        );
+        assert_eq!(
+            second_record.projection().intent().path().as_str(),
+            second_saved.path
+        );
         let journal_target = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
         assert_eq!(
-            record.projection().intent().target().bytes(),
+            first_record.projection().intent().target().bytes(),
+            Some(first_target.as_slice()),
+            "the first frame retains its exact predecessor target"
+        );
+        assert_eq!(
+            second_record.projection().intent().target().bytes(),
             Some(journal_target.as_slice()),
-            "the journal records the exact reused projection target"
+            "the second frame records the exact capture-sealed target"
         );
 
         drain_managed_local(&handle);
@@ -27091,12 +27157,13 @@ mod tests {
 
         let reopened = active_handle(SyncRuntimeHandle::open(runtime_request));
         drive_initial_feed(&reopened);
-        let (clean_reopen, clean_reopen_revision) = load_application_exact(&reopened, &saved.path);
-        assert_eq!(clean_reopen_revision, saved_revision);
+        let (clean_reopen, clean_reopen_revision) =
+            load_application_exact(&reopened, &second_saved.path);
+        assert_eq!(clean_reopen_revision, second_revision);
         assert_eq!(
             serde_json::to_value(&clean_reopen).unwrap(),
-            serde_json::to_value(&saved).unwrap(),
-            "a clean reopen must retain the same complete reused DTO"
+            serde_json::to_value(&second_saved).unwrap(),
+            "Safe drain and clean reopen retain the capture-sealed DTO"
         );
         assert!(matches!(
             reopened.clean_shutdown().unwrap(),

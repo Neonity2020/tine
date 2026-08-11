@@ -783,10 +783,17 @@ mod tests {
 
     use super::*;
     use crate::fast_commit::{forbidden_commit_work, graph_wide_commit_work, GraphWideCommitWork};
+    use crate::oplog::hot_engine::{
+        force_generic_pending_local_predecessor_replay_for_test, LocalAuthorCapture,
+    };
     use crate::oplog::hot_engine_integration_tests::hot_overlay_tests::OverlayFixture;
     use crate::oplog::local_active::LocalRuntimeAdmission;
     use crate::oplog::operational_coordinator::{
         OperationalCoordinator, PreparedLocalMutationState,
+    };
+    use crate::oplog::projection::{
+        prepared_editor_projection_instrumentation,
+        reset_prepared_editor_projection_instrumentation,
     };
     use crate::oplog::{
         BlockLocation, DocumentId, LogicalPageName, LogseqIdentityMutation, LogseqIdentityTrigger,
@@ -1074,6 +1081,137 @@ mod tests {
         let managed = fixture.engine.managed_local_work().since(managed_before);
         assert_eq!(managed.accepted_base_documents_loaded, 0);
         assert_eq!(managed.retained_author_candidates_used, 12);
+    }
+
+    #[test]
+    fn capture_sealed_pending_local_predecessor_matches_forced_generic_prepared_and_journal_bytes()
+    {
+        let mut fixture = OverlayFixture::new("capture-sealed-byte-equivalence", "md", 32);
+        let (_, mut journal) = fixture.journal("sealed-byte-equivalence");
+        let first = commit_edit(&mut fixture, &mut journal, 1_211_000, 1);
+        assert!(matches!(first, TrustedLocalCommitOutcome::Committed(_)));
+        assert_eq!(
+            fixture.engine.managed_local_prefix_state().records_applied,
+            1
+        );
+
+        reset_prepared_editor_projection_instrumentation();
+        force_generic_pending_local_predecessor_replay_for_test(true);
+        let generic = prepared_edit(&mut fixture, 1_211_100, 2)
+            .prepared_batch()
+            .clone();
+        force_generic_pending_local_predecessor_replay_for_test(false);
+        let generic_counters = prepared_editor_projection_instrumentation();
+        assert_eq!(generic_counters.finalizer_predecessor_replay_render, 1);
+        assert_eq!(
+            generic_counters.capture_sealed_pending_local_predecessor_success,
+            0
+        );
+        assert_eq!(
+            generic_counters.finalizer_sealed_pending_local_predecessor_use,
+            0
+        );
+
+        reset_prepared_editor_projection_instrumentation();
+        let sealed = prepared_edit(&mut fixture, 1_211_100, 2)
+            .prepared_batch()
+            .clone();
+        let sealed_counters = prepared_editor_projection_instrumentation();
+        assert_eq!(sealed_counters.finalizer_predecessor_replay_render, 0);
+        assert_eq!(
+            sealed_counters.capture_sealed_pending_local_predecessor_success,
+            1
+        );
+        assert_eq!(
+            sealed_counters.finalizer_sealed_pending_local_predecessor_use,
+            1
+        );
+
+        assert_eq!(
+            generic.manifest().encode().unwrap(),
+            sealed.manifest().encode().unwrap()
+        );
+        let object_bytes = |prepared: &crate::oplog::PreparedBatch| {
+            prepared
+                .objects()
+                .iter()
+                .map(|object| object.encode().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(object_bytes(&generic), object_bytes(&sealed));
+        let sequence = fixture.engine.managed_local_prefix_state().next_sequence;
+        let generic_record = fixture
+            .engine
+            .prepare_managed_local_record(generic, sequence)
+            .unwrap();
+        let sealed_record = fixture
+            .engine
+            .prepare_managed_local_record(sealed, sequence)
+            .unwrap();
+        assert_eq!(
+            generic_record.journal_payload(),
+            sealed_record.journal_payload(),
+            "the capture-only seal cannot alter durable managed-local journal bytes"
+        );
+    }
+
+    #[test]
+    fn capture_sealed_pending_local_predecessor_refuses_changed_overlay_endpoint_before_append() {
+        let mut fixture = OverlayFixture::new("capture-sealed-overlay-removal", "md", 32);
+        let (_, mut journal) = fixture.journal("capture-sealed-overlay-removal");
+        let first = commit_edit(&mut fixture, &mut journal, 1_211_200, 1);
+        let TrustedLocalCommitOutcome::Committed(first) = first else {
+            panic!("first pending managed-local record was not durable");
+        };
+        let graph_before = fs::read(fixture.graph_path.join(fixture.page_path.as_str())).unwrap();
+        let frames_before = journal.stats().frames_appended;
+        let draft = fixture
+            .engine
+            .draft_author_transaction(
+                fixture.local_author(1_211_300),
+                crate::oplog::BatchOrigin::LocalMutation,
+                &fixture.content_edit(2),
+            )
+            .unwrap();
+
+        reset_prepared_editor_projection_instrumentation();
+        let captured = match fixture
+            .engine
+            .capture_local_author_transaction(
+                draft,
+                &fixture.graph,
+                &fixture.receipts,
+                fixture.binding,
+                None,
+            )
+            .unwrap()
+        {
+            LocalAuthorCapture::Captured(captured) => captured,
+            LocalAuthorCapture::ReconciliationNeeded(_) => {
+                panic!("fresh pending managed-local predecessor unexpectedly reconciled")
+            }
+        };
+        assert!(fixture
+            .engine
+            .rewrite_managed_local_authority_endpoint_for_test(first.sequence(), first.batch_id()));
+
+        assert!(matches!(
+            fixture
+                .engine
+                .finalize_captured_author_transaction(captured, &fixture.receipts),
+            Err(crate::oplog::EngineError::ProjectionManifest(message))
+                if message.contains("authority") || message.contains("binding")
+        ));
+        let counters = prepared_editor_projection_instrumentation();
+        assert_eq!(counters.capture_sealed_pending_local_predecessor_success, 1);
+        assert_eq!(counters.finalizer_predecessor_replay_render, 0);
+        assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 0);
+        assert_eq!(journal.stats().frames_appended, frames_before);
+        assert_eq!(
+            fs::read(fixture.graph_path.join(fixture.page_path.as_str())).unwrap(),
+            graph_before,
+            "a failed sealed finalization must not append or overwrite the graph"
+        );
     }
 
     #[test]

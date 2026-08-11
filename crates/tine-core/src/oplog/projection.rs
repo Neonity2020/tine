@@ -70,6 +70,8 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) fallback: usize,
     pub(crate) finalizer_post_state_render: usize,
     pub(crate) finalizer_predecessor_replay_render: usize,
+    pub(crate) capture_sealed_pending_local_predecessor_success: usize,
+    pub(crate) finalizer_sealed_pending_local_predecessor_use: usize,
 }
 
 #[cfg(test)]
@@ -80,6 +82,8 @@ impl PreparedEditorProjectionInstrumentation {
         fallback: 0,
         finalizer_post_state_render: 0,
         finalizer_predecessor_replay_render: 0,
+        capture_sealed_pending_local_predecessor_success: 0,
+        finalizer_sealed_pending_local_predecessor_use: 0,
     };
 }
 
@@ -120,6 +124,24 @@ pub(crate) fn note_finalizer_predecessor_replay_render() {
     note_prepared_editor_projection(|instrumentation| {
         instrumentation.finalizer_predecessor_replay_render = instrumentation
             .finalizer_predecessor_replay_render
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_capture_sealed_pending_local_predecessor_success() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.capture_sealed_pending_local_predecessor_success = instrumentation
+            .capture_sealed_pending_local_predecessor_success
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_finalizer_sealed_pending_local_predecessor_use() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.finalizer_sealed_pending_local_predecessor_use = instrumentation
+            .finalizer_sealed_pending_local_predecessor_use
             .saturating_add(1);
     });
 }
@@ -3547,6 +3569,8 @@ mod tests {
                 fallback: 9,
                 finalizer_post_state_render: 0,
                 finalizer_predecessor_replay_render: 0,
+                capture_sealed_pending_local_predecessor_success: 0,
+                finalizer_sealed_pending_local_predecessor_use: 0,
             }
         );
     }

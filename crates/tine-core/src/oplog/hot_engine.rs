@@ -78,9 +78,9 @@ use super::{
     ManifestedProjectionIntent, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
     PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
-    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionReceiptStore,
-    ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget, SemanticEffect,
-    SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
+    ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
+    ProjectionReceiptStore, ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget,
+    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -3832,6 +3832,179 @@ pub(crate) struct CapturedAuthorTransaction {
     requirement_digest: ContentDigest,
     requirement_index: AuthorRequirementIndex,
     captured_inputs: Vec<CapabilityCapturedProjectionInput>,
+    sealed_pending_local_predecessor: Option<CaptureSealedPendingLocalPredecessor>,
+}
+
+/// One-process evidence that an exact pending managed-local predecessor was
+/// completely rendered during capture.  This is deliberately affine and
+/// private: it can only be consumed by the captured transaction finalizer and
+/// never reaches a prepared batch, journal record, overlay, receipt, or
+/// recovery state.
+struct CaptureSealedPendingLocalPredecessor {
+    workspace_id: WorkspaceId,
+    endpoint: ProjectionEndpointBinding,
+    page_id: PageId,
+    path: ManagedPath,
+    pre_frontier: FrontierV2,
+    claim_evidence: Vec<ProjectionClaimEvidence>,
+    prior_intent: ProjectionIntent,
+    prior_intent_id: ProjectionIntentId,
+    target: BlobDescription,
+    bytes: Vec<u8>,
+    annotations: Vec<AnnotatedIdentity>,
+    sequence: u64,
+    batch_id: BatchId,
+}
+
+impl CaptureSealedPendingLocalPredecessor {
+    #[allow(clippy::too_many_arguments)]
+    fn try_mint(
+        workspace_id: WorkspaceId,
+        endpoint: ProjectionEndpointBinding,
+        external: bool,
+        requirement_count: usize,
+        requirement: &ProjectionRequirement,
+        roles: AuthorRequirementPathRoles,
+        before: Option<&ProjectionPageState>,
+        current: Option<&[u8]>,
+        prior: Option<&CapabilityCapturedPriorProjection>,
+    ) -> Result<Option<Self>, EngineError> {
+        if external
+            || requirement_count != 1
+            || requirement.precondition != ProjectionRequirementState::Present
+            || requirement.target != ProjectionRequirementState::Present
+            || roles.semantic_predecessor != Some(roles.owner)
+            || !capture_sealed_pending_local_predecessor_enabled()
+        {
+            return Ok(None);
+        }
+        let (Some(before), Some(prior)) = (before, prior) else {
+            return Ok(None);
+        };
+        let Some((sequence, batch_id)) = prior.managed_local_authority else {
+            return Ok(None);
+        };
+        if prior.completion.is_some()
+            || prior.bootstrap_owner_binding.is_some()
+            || prior.receipt_backed_live_authority
+            || before.page.page_id != requirement.page_id
+            || before.page.path != requirement.path
+            || current != Some(prior.bytes.as_slice())
+            || prior.intent.workspace_id() != workspace_id
+            || prior.intent.page_id() != requirement.page_id
+            || prior.intent.path() != &requirement.path
+            || prior.intent.frontier() != &before.frontier
+            || prior.intent.claim_evidence() != before.claim_evidence
+            || prior.intent.target() != BlobDescription::of(&prior.bytes)
+        {
+            return Ok(None);
+        }
+        let prior_intent_id = prior
+            .intent
+            .id()
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        Ok(Some(Self {
+            workspace_id,
+            endpoint,
+            page_id: requirement.page_id,
+            path: requirement.path.clone(),
+            pre_frontier: before.frontier.clone(),
+            claim_evidence: before.claim_evidence.clone(),
+            prior_intent: prior.intent.clone(),
+            prior_intent_id,
+            target: prior.intent.target(),
+            bytes: prior.bytes.clone(),
+            annotations: prior.intent.annotations().to_vec(),
+            sequence,
+            batch_id,
+        }))
+    }
+
+    fn verify_and_take_annotations(
+        self,
+        engine: &ShardedHotEngine,
+        source: ProjectionEndpointBinding,
+        path: &ManagedPath,
+        before: &ProjectionPageState,
+        prior: &CapabilityCapturedPriorProjection,
+    ) -> Result<Vec<AnnotatedIdentity>, EngineError> {
+        if self.workspace_id != engine.workspace_id
+            || self.endpoint != source
+            || self.page_id != before.page.page_id
+            || self.path != *path
+            || self.pre_frontier != before.frontier
+            || self.claim_evidence != before.claim_evidence
+            || self.prior_intent_id
+                != self
+                    .prior_intent
+                    .id()
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+            || self.prior_intent != prior.intent
+            || self.target != BlobDescription::of(&self.bytes)
+            || self.target != self.prior_intent.target()
+            || self.bytes != prior.bytes
+            || self.annotations != self.prior_intent.annotations()
+            || self.annotations != prior.intent.annotations()
+            || prior.managed_local_authority != Some((self.sequence, self.batch_id))
+        {
+            return Err(EngineError::ProjectionManifest(
+                "capture-sealed managed-local predecessor binding changed before finalization"
+                    .into(),
+            ));
+        }
+        let entry = engine
+            .local_overlay
+            .entries
+            .iter()
+            .find(|entry| entry.sequence == self.sequence && entry.batch_id == self.batch_id)
+            .ok_or_else(|| {
+                EngineError::ProjectionManifest(
+                    "capture-sealed managed-local predecessor authority was removed before finalization"
+                        .into(),
+                )
+            })?;
+        let intent = &entry.projection.intent;
+        let target = intent.target();
+        if intent.workspace_id() != self.workspace_id
+            || intent.source_endpoint_id() != source.endpoint_id
+            || intent.source_batch_id() != self.batch_id
+            || intent.page_id() != self.page_id
+            || intent.path() != path
+            || intent.post_frontier() != &self.pre_frontier
+            || intent.claim_evidence() != self.claim_evidence
+            || target.bytes() != Some(self.bytes.as_slice())
+            || target.description() != Some(self.target)
+            || target.annotations() != self.annotations.as_slice()
+        {
+            return Err(EngineError::ProjectionManifest(
+                "capture-sealed managed-local predecessor authority no longer binds the captured target"
+                    .into(),
+            ));
+        }
+        Ok(self.annotations)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_generic_pending_local_predecessor_replay_for_test(force: bool) {
+    FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY.with(|enabled| enabled.set(force));
+}
+
+fn capture_sealed_pending_local_predecessor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY.with(|force| !force.get());
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 
 impl AuthorTransactionDraft {
@@ -10090,6 +10263,40 @@ impl ShardedHotEngine {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn rewrite_managed_local_authority_endpoint_for_test(
+        &mut self,
+        sequence: u64,
+        batch_id: BatchId,
+    ) -> bool {
+        let Some(entry) = self
+            .local_overlay
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence && entry.batch_id == batch_id)
+        else {
+            return false;
+        };
+        let intent = &entry.projection.intent;
+        entry.projection.intent = ManifestedProjectionIntent::new(
+            intent.workspace_id(),
+            intent.source_batch_id(),
+            intent.source_author_device_id(),
+            intent.source_author_session_id(),
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(0xfeed_face)),
+            intent.page_id(),
+            intent.path().clone(),
+            intent.portable_path_index_root(),
+            intent.precondition().clone(),
+            intent.render_base().cloned(),
+            intent.target().clone(),
+            intent.post_frontier().clone(),
+            intent.claim_evidence().to_vec(),
+        )
+        .expect("test-only endpoint rewrite retains a valid manifested projection intent");
+        true
+    }
+
     /// Materialize one exact current path from accepted state plus the
     /// journal-committed local overlay, without SQLite or a graph reload.
     pub fn materialize_current_page_at_path(
@@ -16035,6 +16242,7 @@ impl ShardedHotEngine {
             "requirement index",
         )?;
         let mut captured_inputs = Vec::with_capacity(requirement_index.len());
+        let mut sealed_pending_local_predecessor = None;
         let mut mismatches = Vec::new();
         for indexed_path in requirement_index.entries() {
             let path = indexed_path.path(&draft.requirements);
@@ -16233,6 +16441,31 @@ impl ShardedHotEngine {
                 None
             };
 
+            let requirement = &draft.requirements[roles.owner];
+            let before = roles.semantic_predecessor.and_then(|index| {
+                draft.pages[&draft.requirements[index].page_id]
+                    .before
+                    .as_ref()
+            });
+            if let Some(seal) = CaptureSealedPendingLocalPredecessor::try_mint(
+                self.workspace_id,
+                source,
+                external,
+                requirement_index.len(),
+                requirement,
+                roles,
+                before,
+                current.as_deref(),
+                prior.as_ref(),
+            )? {
+                if sealed_pending_local_predecessor.replace(seal).is_some() {
+                    return Err(EngineError::ProjectionManifest(
+                        "multiple capture-sealed managed-local predecessors are ineligible".into(),
+                    ));
+                }
+                super::projection::note_capture_sealed_pending_local_predecessor_success();
+            }
+
             let material = if let Some(observation) = external_observation {
                 let observed = external_observation_for_path(
                     external_observation_index
@@ -16325,6 +16558,7 @@ impl ShardedHotEngine {
             requirement_digest,
             requirement_index,
             captured_inputs,
+            sealed_pending_local_predecessor,
         }))
     }
 
@@ -16365,6 +16599,7 @@ impl ShardedHotEngine {
             requirement_digest,
             requirement_index,
             mut captured_inputs,
+            mut sealed_pending_local_predecessor,
         } = captured;
         let external_reconciliation =
             matches!(draft.origin, BatchOrigin::ExternalReconciliation { .. });
@@ -16503,6 +16738,7 @@ impl ShardedHotEngine {
             let state = &inputs[path];
             let requirement = &draft.requirements[roles.owner];
             let page = &draft.pages[&requirement.page_id];
+            let mut sealed_annotations = None;
             let prior = match state {
                 CapabilityCapturedProjectionMaterial::Absent { prior }
                 | CapabilityCapturedProjectionMaterial::Present { prior, .. } => prior.as_ref(),
@@ -16533,21 +16769,38 @@ impl ShardedHotEngine {
                         "captured path {path} completion is not its intended semantic predecessor"
                     )));
                 }
-                super::projection::note_finalizer_predecessor_replay_render();
-                let replay = super::projection::plan_projection_with_layout_annotations(
-                    self.workspace_id,
-                    before,
-                    Some(&prior.bytes),
-                    Some(prior.intent.annotations()),
-                )
-                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                if replay.target() != prior.bytes
-                    || (prior.receipt_backed_live_authority
-                        && replay.intent().annotations() != prior.intent.annotations())
+                let (prior_annotations, used_seal) = if sealed_pending_local_predecessor
+                    .as_ref()
+                    .is_some_and(|seal| seal.path == *path)
                 {
-                    return Err(EngineError::ProjectionManifest(format!(
-                        "captured path {path} prior bytes are not the exact semantic pre-state"
-                    )));
+                    let seal = sealed_pending_local_predecessor
+                        .take()
+                        .expect("checked capture-sealed predecessor remains available");
+                    let annotations =
+                        seal.verify_and_take_annotations(self, source, path, before, prior)?;
+                    super::projection::note_finalizer_sealed_pending_local_predecessor_use();
+                    (annotations, true)
+                } else {
+                    super::projection::note_finalizer_predecessor_replay_render();
+                    let replay = super::projection::plan_projection_with_layout_annotations(
+                        self.workspace_id,
+                        before,
+                        Some(&prior.bytes),
+                        Some(prior.intent.annotations()),
+                    )
+                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                    if replay.target() != prior.bytes
+                        || (prior.receipt_backed_live_authority
+                            && replay.intent().annotations() != prior.intent.annotations())
+                    {
+                        return Err(EngineError::ProjectionManifest(format!(
+                            "captured path {path} prior bytes are not the exact semantic pre-state"
+                        )));
+                    }
+                    (replay.intent().annotations().to_vec(), false)
+                };
+                if used_seal {
+                    sealed_annotations = Some(prior_annotations.clone());
                 }
                 let prior_semantic_layout_required = roles.render_base_owner.is_some_and(|owner| {
                     matches!(
@@ -16564,7 +16817,7 @@ impl ShardedHotEngine {
                         prior.logical_completion_id(),
                         before.frontier.clone(),
                         prior.bytes.clone(),
-                        replay.intent().annotations().to_vec(),
+                        prior_annotations.clone(),
                         before.claim_evidence.clone(),
                     )
                     .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -16611,7 +16864,7 @@ impl ShardedHotEngine {
                         .and_then(CapabilityCapturedPriorProjection::logical_completion_id),
                     prior_frontier,
                     bytes.clone(),
-                    annotations.clone(),
+                    sealed_annotations.unwrap_or_else(|| annotations.clone()),
                     prior_claim_evidence,
                 )
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -16631,6 +16884,12 @@ impl ShardedHotEngine {
                 observed_bases.insert(path.clone(), (reference, base));
                 objects.push(object);
             }
+        }
+
+        if sealed_pending_local_predecessor.is_some() {
+            return Err(EngineError::ProjectionManifest(
+                "capture-sealed managed-local predecessor did not match a finalized path".into(),
+            ));
         }
 
         #[cfg(test)]
