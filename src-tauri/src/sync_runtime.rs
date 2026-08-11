@@ -283,13 +283,6 @@ impl SparseV2Availability {
                 detail,
             },
             SyncLocalActivationStatus::Blocked { reason_code } => Self::Blocked { reason_code },
-            SyncLocalActivationStatus::LegacyV1Refused => Self::Refused {
-                reason_code: "legacy_v1_present".into(),
-                detail: Some(
-                    "Tine-managed storage will not alter incompatible existing storage data."
-                        .into(),
-                ),
-            },
             SyncLocalActivationStatus::UnsupportedOrIncompatible(component) => Self::Refused {
                 reason_code: format!("unsupported_{}", component_name(component)),
                 detail: None,

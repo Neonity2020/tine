@@ -1560,7 +1560,6 @@ pub enum SyncLocalActivationStatus {
     Blocked {
         reason_code: String,
     },
-    LegacyV1Refused,
     UnsupportedOrIncompatible(SyncRuntimeComponent),
     CorruptOrUnreadable(SyncRuntimeComponent),
     AmbiguousOrForeignResidue(SyncAmbiguousEvidence),
@@ -3386,12 +3385,6 @@ impl SyncRuntimeHandle {
                 );
             }
         };
-        if legacy_v1_namespace_present(&request.graph_root) {
-            return SyncLocalActivationResult {
-                status: SyncLocalActivationStatus::LegacyV1Refused,
-                handle: None,
-            };
-        }
         if let Err(detail) = validate_activation_paths(&request, &request.graph_root) {
             return activation_retryable(SyncLocalActivationStage::Absent, detail);
         }
@@ -5846,10 +5839,6 @@ fn validate_editor_key(
         }
     }
     Ok(())
-}
-
-fn legacy_v1_namespace_present(graph_root: &Path) -> bool {
-    fs::symlink_metadata(graph_root.join(".tine-sync").join("v1")).is_ok()
 }
 
 fn validate_activation_paths(
@@ -48152,26 +48141,66 @@ mod tests {
     }
 
     #[test]
-    fn explicit_local_activation_refuses_legacy_v1_without_opening_or_rewriting_it() {
-        let fixture = ActivationFixture::nested_unicode("legacy-v1", 0xa800);
+    fn explicit_local_activation_ignores_inert_legacy_v1_and_preserves_exact_bytes() {
+        let control = ActivationFixture::nested_unicode("activation-without-v1", 0xa800);
+        let control_result = SyncRuntimeHandle::activate_or_resume_local(control.request.clone());
+        assert_eq!(control_result.status, SyncLocalActivationStatus::Active);
+        let control_handle = control_result
+            .handle
+            .expect("a graph without retired v1 bytes activates normally");
+        drive_initial_feed(&control_handle);
+        assert!(matches!(
+            control_handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+
+        let fixture = ActivationFixture::nested_unicode("activation-with-inert-v1", 0xa801);
         let legacy = fixture.graph_root.join(".tine-sync/v1");
-        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(legacy.join("devices/old-device/sessions/old-session")).unwrap();
         fs::write(
-            legacy.join("experimental.bin"),
-            b"legacy experimental bytes",
+            legacy.join("devices/old-device/sessions/old-session/0001.chunk"),
+            b"legacy experimental bytes\n",
         )
         .unwrap();
+        fs::write(legacy.join("pre-release-receipt"), b"retired v1 receipt\n").unwrap();
+        let graph_before = user_graph_bytes(&fixture.graph_root);
+        let legacy_before = recursive_file_bytes(&legacy);
 
         let result = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(result.status, SyncLocalActivationStatus::LegacyV1Refused);
-        assert!(result.handle.is_none());
         assert_eq!(
-            fs::read(legacy.join("experimental.bin")).unwrap(),
-            b"legacy experimental bytes"
+            result.status,
+            SyncLocalActivationStatus::Active,
+            "inert v1 bytes must have the same valid activation outcome as no-v1"
         );
+        let handle = result
+            .handle
+            .expect("v2 activation must retain the active runtime handle");
+        assert_eq!(user_graph_bytes(&fixture.graph_root), graph_before);
+        assert_eq!(recursive_file_bytes(&legacy), legacy_before);
         assert!(
-            !fixture.request.archive_root.exists(),
-            "v2 archive must not be created while legacy v1 evidence is present"
+            fixture.graph_root.join(".tine-sync/v2/shared").is_dir(),
+            "explicit activation writes only the sparse-v2 graph namespace"
         );
+        let graph_sync_entries = fs::read_dir(fixture.graph_root.join(".tine-sync"))
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|entry| entry.file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            graph_sync_entries,
+            BTreeSet::from([
+                std::ffi::OsString::from("v1"),
+                std::ffi::OsString::from("v2")
+            ]),
+            "activation must retain the legacy child and create only sparse-v2 graph state"
+        );
+        assert!(fixture.request.archive_root.is_dir());
+        drive_initial_feed(&handle);
+        assert_eq!(user_graph_bytes(&fixture.graph_root), graph_before);
+        assert_eq!(recursive_file_bytes(&legacy), legacy_before);
+        assert!(matches!(
+            handle.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
     }
 }

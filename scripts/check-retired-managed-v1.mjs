@@ -66,21 +66,13 @@ for (const relative of sourceFiles) {
     }
   }
 
-  // A sole transitional U2c no-follow validation remains in Graph::open_checked.
-  // It is not an engine root and U2c removes it; all other compiled legacy-path
-  // references are forbidden. Comments are excluded because documentation of
-  // the retirement is useful and cannot activate a protocol.
+  // Comments are excluded because documentation of the retirement is useful and
+  // cannot activate a protocol. All compiled legacy-path references are
+  // forbidden; test fixtures live below Rust's end-of-file test modules.
   for (const [index, line] of source.split("\n").entries()) {
     if (line.trimStart().startsWith("//")) continue;
     if (!line.includes(".tine-sync/v1")) continue;
-    const u2cValidation =
-      relative === "crates/tine-core/src/model.rs" &&
-      line.includes('validate_managed_dir(&graph.root, ".tine-sync/v1", "managed sync store")?;');
-    if (!u2cValidation) {
-      problems.push(
-        `legacy v1 path is compiled outside inert fixture/U2c transition: ${relative}:${index + 1}`,
-      );
-    }
+    problems.push(`legacy v1 path is compiled outside inert fixture: ${relative}:${index + 1}`);
   }
 }
 

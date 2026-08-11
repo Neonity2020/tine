@@ -1328,6 +1328,8 @@ mod tests {
         let recovery_before = std::fs::read(&recovery).unwrap();
         let graph_before = tree_bytes(&dir);
 
+        Graph::open_checked(&dir)
+            .expect("inert legacy-v1 bytes must not reject a checked Direct Files open");
         let root_key = std::fs::canonicalize(&dir).unwrap();
         let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |_| (0, false)).unwrap();
         assert_eq!(loaded.meta.root, dir.display().to_string());
@@ -1368,6 +1370,38 @@ mod tests {
             "ordinary Direct Files publishing must not create or activate v1"
         );
         assert_eq!(tree_bytes(&no_v1), no_v1_before);
+
+        // A pre-release v1 prototype could also have stopped before it had
+        // created a directory-shaped store.  The retired child is never
+        // traversed, so this malformed-but-inert shape must be just as harmless
+        // to the checked Direct Files path as a representative directory tree.
+        let v1_file = scratch("direct-publish-with-inert-v1-file");
+        let v1_file_path = v1_file.join(".tine-sync/v1");
+        std::fs::write(
+            v1_file.join("pages/representative.md"),
+            b"- direct with old v1 file\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(v1_file_path.parent().unwrap()).unwrap();
+        std::fs::write(&v1_file_path, b"incomplete retired v1 bytes\n").unwrap();
+        let v1_file_before = tree_bytes(&v1_file);
+        Graph::open_checked(&v1_file)
+            .expect("an inert non-directory v1 child must not reject Direct Files");
+        let v1_file_root = std::fs::canonicalize(&v1_file).unwrap();
+        let loaded = open_graph_for_load(v1_file.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        let (slot, _) =
+            publish_direct_files_slot(&state, "inert-v1-file", loaded.graph, v1_file_root).unwrap();
+        assert!(
+            !slot.is_sparse_v2() && slot.legacy_graph().is_ok(),
+            "the malformed legacy child still installs an ordinary Direct Files slot"
+        );
+        assert_eq!(
+            tree_bytes(&v1_file),
+            v1_file_before,
+            "Direct Files must neither inspect nor rewrite inert malformed v1 bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&v1_file);
         let _ = std::fs::remove_dir_all(&no_v1);
         let _ = std::fs::remove_dir_all(&dir);
     }

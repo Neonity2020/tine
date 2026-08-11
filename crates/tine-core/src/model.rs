@@ -5324,7 +5324,6 @@ impl Graph {
         validate_managed_dir(&graph.root, "logseq", "logseq")?;
         validate_managed_dir(&graph.root, "publish", "publish")?;
         validate_managed_dir(&graph.root, ".tine-sync", "managed sync")?;
-        validate_managed_dir(&graph.root, ".tine-sync/v1", "managed sync store")?;
         if let Some(resolved) = Self::external_assets_target(&graph.root)? {
             let approved = approved_assets.ok_or_else(|| {
                 io::Error::new(
