@@ -27019,6 +27019,26 @@ mod tests {
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
         let handle = activated.handle.expect("activation retains a runtime");
         drive_initial_feed(&handle);
+        // The capability deliberately applies to a settled completed receipt,
+        // not the initial bootstrap baseline.  Prime and drain one ordinary
+        // save so the measured 511-block save below has the same completed
+        // immutable predecessor route used after normal runtime settling.
+        let (mut settled, settled_revision) =
+            load_application_logical(&handle, "Tine", SyncPageKind::Page);
+        settled.blocks[0].raw = "settled immutable predecessor".into();
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: settled.path.clone(),
+                        revision: settled_revision,
+                    },
+                    page: settled,
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Saved { .. }
+        ));
+        drain_managed_local(&handle);
 
         let (mut page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
         page.blocks[0].raw = "after retained CRLF layout".into();
@@ -27038,10 +27058,19 @@ mod tests {
         assert_eq!(counters.created, 1);
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
+        assert_eq!(
+            counters.capture_sealed_predecessor_success, 1,
+            "ordinary existing-page save must mint one capture-sealed predecessor"
+        );
+        assert_eq!(counters.capture_sealed_predecessor_fallback, 0);
+        assert_eq!(
+            counters.capture_predecessor_replay_render, 0,
+            "capture must consume the exact accepted predecessor capability without replaying it"
+        );
         assert_eq!(counters.finalizer_post_state_render, 0);
         assert_eq!(
-            counters.finalizer_predecessor_replay_render, 1,
-            "the retained predecessor replay remains a separately counted safety render"
+            counters.finalizer_predecessor_replay_render, 0,
+            "the capture-sealed predecessor provides the exact retained annotations"
         );
         assert_eq!(
             instrumentation.guarded_graph_validation_parse_pairs, 1,
@@ -27063,10 +27092,15 @@ mod tests {
         let frames = managed_local_journal_frames(&runtime_request);
         assert_eq!(
             frames.len(),
-            1,
-            "one durable foreground save appends one frame"
+            2,
+            "the settled priming save and the measured foreground save each append one frame"
         );
-        let record = decode_managed_local_record(&frames[0]).unwrap();
+        let record = decode_managed_local_record(
+            frames
+                .last()
+                .expect("the measured foreground save retains the last journal frame"),
+        )
+        .unwrap();
         assert_eq!(record.projection().intent().path().as_str(), saved.path);
         let journal_target = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
         assert_eq!(
