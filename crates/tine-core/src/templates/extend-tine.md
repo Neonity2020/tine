@@ -4,6 +4,7 @@ icon:: 🔌
   - Add a plugin or a theme in a few minutes, know exactly what authority you granted, and take it back cleanly. This page is the hands-on path; the detailed rulebook stays on [[Features/Plugins]].
 - ## Know what a plugin can touch before you install one
   - Tine plugins are capability-limited WebAssembly guests. They are **not** Logseq or Obsidian plugins, and plugins written for those apps do not run here.
+  - The plugin API is experimental. An app update may leave an incompatible plugin installed but disabled; it must not make your graph unreadable or discard the plugin's local settings.
   - A plugin declares capabilities from a short, closed list, and Tine performs each one on its behalf: command-palette actions, slash commands, small block decorations (thread lines, badges), declarative settings, and narrowly preconditioned edits to a focused block.
   - A plugin cannot access the DOM, Tauri, the network, files, processes, or your graph directly, and it cannot inject HTML or CSS — everything it shows is drawn by Tine. The one capability that can change your text is `graph.write.block`, and even it may edit only the block Tine handed the plugin, recording normal undo and saving through the same conflict-checked path your own edits use.
 - ## Install one — it starts disabled
@@ -23,7 +24,7 @@ icon:: 🔌
   - Your own `logseq/custom.css` outranks every theme: themes recolor Tine through Logseq's `--ls-*` variables, and your CSS loads last. Uninstalling a theme package leaves it untouched, too.
 - ## Platform and distribution lines
   - Desktop and Android share the same plugin and theme lifecycle; a package that did not declare your platform shows as unavailable rather than failing later.
-  - The F-Droid build ships without the network community catalogue, because that store forbids downloading code at runtime. The plugin host, your already-installed plugins and themes, local `manifest.json` + `.wasm` and theme packages, and the built-in gallery all keep working.
-  - There is no iOS build of Tine today, so plugins and themes reach desktop and Android only.
+  - The F-Droid build ships without the network community catalogue to comply with its runtime-code-download policy. The plugin host, your already-installed plugins and themes, local `manifest.json` + `.wasm` and theme packages, and the built-in gallery all keep working.
+  - Current public releases do not include an iOS app, and the iOS plugin host is not enabled. The platform reference in this Guide carries the full map.
 - ## Where next
   - [[Features/Plugins]] keeps the detailed reference, including the safety-report fields and the cascade order — and links the authoring, packaging, and registry guide used by plugin developers.
