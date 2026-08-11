@@ -572,6 +572,24 @@ impl ParsedExternalDocument {
             accepted,
         )
     }
+
+    /// Consume one already parsed exact managed-text target into the ordinary
+    /// application DTO.  This is deliberately the same projection used by
+    /// [`Graph::parse_exact_page_dto`], but lets a caller that has already
+    /// consumed the parser result for response preparation avoid parsing its
+    /// requested target a second time.
+    pub(crate) fn into_exact_page_dto(
+        self,
+        path: &ManagedPath,
+        content: &str,
+    ) -> io::Result<PageDto> {
+        let mut dto = page_dto_checked(&self.effective, &self.parsed.document)?;
+        dto.read_only =
+            self.format == Format::Org && !crate::org::org_editable_parsed(content, &self.parsed);
+        dto.rev = Some(self.revision);
+        dto.path = path.as_str().to_owned();
+        Ok(dto)
+    }
 }
 
 pub(crate) fn resolve_external_document_identity(
@@ -6872,6 +6890,10 @@ impl Graph {
         path: &ManagedPath,
         bytes: &[u8],
     ) -> io::Result<PageDto> {
+        #[cfg(test)]
+        EXACT_PAGE_DTO_PARSE_ATTEMPTS.with(|attempts| {
+            attempts.set(attempts.get().saturating_add(1));
+        });
         let content = std::str::from_utf8(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -6879,11 +6901,7 @@ impl Graph {
             )
         })?;
         let parsed = self.parse_external_document(path, bytes, false)?;
-        let mut dto = page_dto_checked(&parsed.effective, &parsed.parsed.document)?;
-        dto.read_only = read_only_org(Path::new(path.as_str()), content);
-        dto.rev = Some(parsed.revision);
-        dto.path = path.as_str().to_owned();
-        Ok(dto)
+        parsed.into_exact_page_dto(path, content)
     }
 
     fn decode_present_graph_text(
@@ -22947,7 +22965,18 @@ thread_local! {
     static GRAPH_TEXT_INVENTORY_ENTRY_VISITS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_CONTENT_READS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_PARSE_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static EXACT_PAGE_DTO_PARSE_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_VALIDATION_TARGET_READS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_exact_page_dto_parse_attempts() {
+    EXACT_PAGE_DTO_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn exact_page_dto_parse_attempts() -> usize {
+    EXACT_PAGE_DTO_PARSE_ATTEMPTS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -35638,6 +35667,97 @@ mod tests {
         fs::create_dir_all(dir.join("journals")).unwrap();
         fs::create_dir_all(dir.join("pages")).unwrap();
         dir
+    }
+
+    #[test]
+    fn consumed_external_document_dto_matches_exact_parse_across_formats_and_identity() {
+        let dir = scratch("consumed-exact-page-dto");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            br#"{:journal/file-name-format "dd-MM-yyyy"
+            :journal/page-title-format "yyyy-MM-dd"}"#,
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let cases = [
+            (
+                "markdown",
+                "pages/Plain.md",
+                "- ordinary markdown\n",
+                "Plain",
+                PageKind::Page,
+                false,
+            ),
+            (
+                "org-editable-properties",
+                "pages/Editable Org.org",
+                "#+TITLE: Editable Org\n\n* TODO Buy milk\nSCHEDULED: <2026-06-25 Thu>\n:PROPERTIES:\n:id: 6679-abc\n:END:\n",
+                "Editable Org",
+                PageKind::Page,
+                false,
+            ),
+            (
+                "org-read-only",
+                "pages/Read Only.org",
+                "* root\n*** child\n",
+                "Read Only",
+                PageKind::Page,
+                true,
+            ),
+            (
+                "explicit-title",
+                "pages/Physical title.md",
+                "title:: Explicit title\n\n- titled body\n",
+                "Explicit title",
+                PageKind::Page,
+                false,
+            ),
+            (
+                "journal-title",
+                "pages/Physical journal.md",
+                "title:: 25-07-2026\n\n- journal body\n",
+                "2026-07-25",
+                PageKind::Journal,
+                false,
+            ),
+        ];
+
+        for (label, relative, source, expected_name, expected_kind, expected_read_only) in cases {
+            let path = ManagedPath::parse(relative.to_owned()).unwrap();
+            let consumed = graph
+                .parse_external_document(&path, source.as_bytes(), false)
+                .unwrap()
+                .into_exact_page_dto(&path, source)
+                .unwrap();
+            let exact = graph
+                .parse_exact_page_dto(&path, source.as_bytes())
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&consumed).unwrap(),
+                serde_json::to_value(&exact).unwrap(),
+                "{label}: consumed parser result must preserve exact DTO semantics"
+            );
+            assert_eq!(consumed.name, expected_name, "{label}");
+            assert_eq!(consumed.kind, expected_kind, "{label}");
+            assert_eq!(consumed.read_only, expected_read_only, "{label}");
+            if label == "org-editable-properties" {
+                assert_eq!(consumed.format, Format::Org);
+                assert_eq!(consumed.path, relative);
+                assert!(consumed.rev.is_some());
+                assert_eq!(
+                    consumed.pre_block.as_deref(),
+                    Some("#+TITLE: Editable Org\n")
+                );
+                assert!(!consumed.blocks[0].id.is_empty());
+                assert!(consumed.blocks[0]
+                    .properties
+                    .iter()
+                    .any(|(key, value)| key.eq_ignore_ascii_case("id") && value == "6679-abc"));
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

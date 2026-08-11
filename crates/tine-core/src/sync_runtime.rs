@@ -476,6 +476,9 @@ struct ManagedApplicationSaveStageTimings {
     editor_transaction_build: Duration,
     promoted_mutation_admission: Duration,
     application_outcome: Duration,
+    response_target_parses: usize,
+    response_target_dto_conversions: usize,
+    response_target_exact_dto_reparses: usize,
 }
 
 #[cfg(test)]
@@ -491,6 +494,9 @@ thread_local! {
             editor_transaction_build: Duration::ZERO,
             promoted_mutation_admission: Duration::ZERO,
             application_outcome: Duration::ZERO,
+            response_target_parses: 0,
+            response_target_dto_conversions: 0,
+            response_target_exact_dto_reparses: 0,
         });
 }
 
@@ -6854,6 +6860,8 @@ fn run_actor_loop(
                 #[cfg(test)]
                 note_application_save_stage(|timings| {
                     timings.actor_total = started.elapsed();
+                    timings.response_target_exact_dto_reparses =
+                        crate::model::exact_page_dto_parse_attempts();
                 });
                 let _ = reply.send(result);
                 false
@@ -12820,7 +12828,10 @@ impl RuntimeActor {
         request: SyncApplicationPageSaveRequest,
     ) -> Result<SyncApplicationPageSaveOutcome, SyncApplicationPageRequestError> {
         #[cfg(test)]
-        reset_application_save_stage_timings();
+        {
+            reset_application_save_stage_timings();
+            crate::model::reset_exact_page_dto_parse_attempts();
+        }
         #[cfg(test)]
         let prepare_started = Instant::now();
         let readiness = self.prepare_editor_turn();
@@ -14359,6 +14370,11 @@ impl RuntimeActor {
                                 "parsing the requested page edit",
                             )
                         })?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.response_target_parses =
+                            timings.response_target_parses.saturating_add(1);
+                    });
                     let identity =
                         parsed.resolve_identity(Some(AcceptedExternalDocumentIdentity {
                             name: current.page.name.as_str(),
@@ -14374,9 +14390,18 @@ impl RuntimeActor {
                         )
                     })?;
                     let final_kind = model_sync_page_kind(identity.kind);
-                    let mut trusted_target_page = self
-                        .graph
-                        .parse_exact_page_dto(&current.page.path, &target)
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.response_target_dto_conversions =
+                            timings.response_target_dto_conversions.saturating_add(1);
+                    });
+                    let target_text = std::str::from_utf8(&target).map_err(|_| {
+                        SyncEditorRequestError::ActorRefusedAt(
+                            "constructing the accepted application page",
+                        )
+                    })?;
+                    let mut trusted_target_page = parsed
+                        .into_exact_page_dto(&current.page.path, target_text)
                         .map_err(|_| {
                             SyncEditorRequestError::ActorRefusedAt(
                                 "constructing the accepted application page",
@@ -31671,6 +31696,27 @@ mod tests {
                     trusted_local_response_parse_fallbacks(),
                     0,
                     "{label}: immediate response must reuse parser-owned exact-target evidence"
+                );
+                let parse_census = handle
+                    .managed_application_save_instrumentation()
+                    .expect("managed save exposes exact-target parser census");
+                assert_eq!(
+                    parse_census.application_stages.response_target_parses, 1,
+                    "{label}: response preparation must parse the requested target once"
+                );
+                assert_eq!(
+                    parse_census
+                        .application_stages
+                        .response_target_dto_conversions,
+                    1,
+                    "{label}: response preparation must convert that retained parse once"
+                );
+                assert_eq!(
+                    parse_census
+                        .application_stages
+                        .response_target_exact_dto_reparses,
+                    0,
+                    "{label}: response preparation must not enter Graph::parse_exact_page_dto"
                 );
                 assert_eq!(saved.name, expected_name, "{label}");
                 assert_eq!(saved.kind, sync_model_page_kind(expected_kind), "{label}");
