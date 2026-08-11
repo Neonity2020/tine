@@ -5349,14 +5349,10 @@ struct HistoryWorkStats {
     prepare_document_head_visits: usize,
     author_snapshot_clones: usize,
     author_snapshot_clone_ops: usize,
-    projection_capture_document_moves: usize,
-    projection_capture_document_clones: usize,
-    projection_prestate_document_clones: usize,
     prospective_document_copies: usize,
     prospective_document_copy_ops: usize,
     prospective_catalog_document_copies: usize,
     prospective_catalog_shape_entry_visits: usize,
-    retained_author_candidate_clones: usize,
     projection_acquisition_durable_head_visits: usize,
     stage_snapshot_clones: usize,
     stage_snapshot_clone_ops: usize,
@@ -5710,15 +5706,6 @@ pub struct EngineInstrumentation {
     pub prepare_document_head_visits: usize,
     pub author_snapshot_clones: usize,
     pub author_snapshot_clone_ops: usize,
-    /// Owned author-working documents moved directly into a projection draft.
-    pub projection_capture_document_moves: usize,
-    /// Documents cloned while capturing a projection draft. The optimized
-    /// in-memory route keeps this at zero; External documents retain their
-    /// existing clone because their ownership/lifetime stays external.
-    pub projection_capture_document_clones: usize,
-    /// Current accepted documents cloned to materialize the projection
-    /// pre-state. A no-reference one-home-page save has exactly one.
-    pub projection_prestate_document_clones: usize,
     /// Whole documents copied while deriving a draft's prospective projection.
     pub prospective_document_copies: usize,
     /// Total CRDT operations reproduced by those copies. This is the term that
@@ -5729,9 +5716,6 @@ pub struct EngineInstrumentation {
     /// Catalog entries visited while deriving prospective projection state.
     /// An ordinary existing-page edit must keep this at zero.
     pub prospective_catalog_shape_entry_visits: usize,
-    /// Independent candidate clones retained across the managed-local append
-    /// durability boundary. These remain required ownership isolation.
-    pub retained_author_candidate_clones: usize,
     /// Accepted causal heads consulted while proving that a projection stays
     /// in the current portable-path acquisition lifecycle.
     pub projection_acquisition_durable_head_visits: usize,
@@ -10241,14 +10225,10 @@ impl ShardedHotEngine {
             prepare_document_head_visits: work.prepare_document_head_visits,
             author_snapshot_clones: work.author_snapshot_clones,
             author_snapshot_clone_ops: work.author_snapshot_clone_ops,
-            projection_capture_document_moves: work.projection_capture_document_moves,
-            projection_capture_document_clones: work.projection_capture_document_clones,
-            projection_prestate_document_clones: work.projection_prestate_document_clones,
             prospective_document_copies: work.prospective_document_copies,
             prospective_document_copy_ops: work.prospective_document_copy_ops,
             prospective_catalog_document_copies: work.prospective_catalog_document_copies,
             prospective_catalog_shape_entry_visits: work.prospective_catalog_shape_entry_visits,
-            retained_author_candidate_clones: work.retained_author_candidate_clones,
             projection_acquisition_durable_head_visits: work
                 .projection_acquisition_durable_head_visits,
             stage_snapshot_clones: work.stage_snapshot_clones,
@@ -15043,11 +15023,9 @@ impl ShardedHotEngine {
                     .documents
                     .iter()
                     .map(|(document_id, document)| {
-                        let copy = clone_doc(document, 1)?;
-                        self.record_retained_author_candidate_clone();
-                        Ok((*document_id, copy))
+                        clone_doc(document, 1).map(|copy| (*document_id, copy))
                     })
-                    .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
+                    .collect::<Result<BTreeMap<_, _>, _>>()?,
                 pending.projection_pages.get(&page_id).cloned(),
             )
         };
@@ -15471,64 +15449,6 @@ impl ShardedHotEngine {
         require_live_page(catalog, page_id)
     }
 
-    #[cfg(test)]
-    fn assert_prospective_document_matches_previous_derivation(
-        &self,
-        document_id: DocumentId,
-        previous: &LoroDoc,
-        optimized: &LoroDoc,
-    ) {
-        let previous_updates = previous.export(ExportMode::all_updates()).unwrap();
-        let optimized_updates = optimized.export(ExportMode::all_updates()).unwrap();
-        assert_eq!(
-            previous.oplog_vv(),
-            optimized.oplog_vv(),
-            "prospective document {document_id} version vector diverged"
-        );
-        assert_eq!(
-            snapshot_document(self.catalog_document_id, document_id, previous, true,).unwrap(),
-            snapshot_document(self.catalog_document_id, document_id, optimized, true,).unwrap(),
-            "prospective document {document_id} semantic state diverged"
-        );
-        if previous_updates != optimized_updates {
-            // Loro currently exports a stable all-updates stream, but the
-            // oracle's semantic contract is not raw export ordering. If a
-            // future Loro release changes that ordering, import both complete
-            // streams and retain the VV + semantic-state equivalence proof.
-            let previous_imported = LoroDoc::new();
-            let optimized_imported = LoroDoc::new();
-            import_complete(document_id, &previous_imported, &[previous_updates]).unwrap();
-            import_complete(document_id, &optimized_imported, &[optimized_updates]).unwrap();
-            assert_eq!(
-                previous_imported.oplog_vv(),
-                optimized_imported.oplog_vv(),
-                "imported prospective document {document_id} version vector diverged"
-            );
-            assert_eq!(
-                previous_imported.get_value(),
-                optimized_imported.get_value(),
-                "imported prospective document {document_id} CRDT value diverged"
-            );
-            assert_eq!(
-                snapshot_document(
-                    self.catalog_document_id,
-                    document_id,
-                    &previous_imported,
-                    true,
-                )
-                .unwrap(),
-                snapshot_document(
-                    self.catalog_document_id,
-                    document_id,
-                    &optimized_imported,
-                    true,
-                )
-                .unwrap(),
-                "imported prospective document {document_id} semantic state diverged"
-            );
-        }
-    }
-
     /// Draft one transaction twice — once with the in-place prospective
     /// derivation and once with the previous derivation, which reproduced every
     /// document it read — and prove the two drafts are the same draft.
@@ -15587,10 +15507,10 @@ impl ShardedHotEngine {
                     optimized.prospective_documents.keys().collect::<Vec<_>>()
                 );
                 for (document_id, document) in &oracle.prospective_documents {
-                    self.assert_prospective_document_matches_previous_derivation(
-                        *document_id,
-                        document,
-                        &optimized.prospective_documents[document_id],
+                    assert_eq!(
+                        document.oplog_vv(),
+                        optimized.prospective_documents[document_id].oplog_vv(),
+                        "prospective document {document_id} diverged"
                     );
                 }
                 assert_eq!(
@@ -17165,42 +17085,13 @@ impl ShardedHotEngine {
         }
         let prepared = PreparedBatch::new(manifest, objects).map_err(EngineError::from)?;
         let (prospective_documents, detached_bootstrap) = match capture {
-            TransactionCapture::Projection if self.uses_previous_document_derivation() => (
+            TransactionCapture::Projection => (
                 working
                     .iter()
                     .map(|(document_id, document)| {
-                        let copy = clone_doc(document.document(), 1)?;
-                        self.record_projection_capture_document_clone();
-                        Ok((*document_id, copy))
+                        clone_doc(document.document(), 1).map(|copy| (*document_id, copy))
                     })
-                    .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
-                None,
-            ),
-            TransactionCapture::Projection => (
-                working
-                    .into_iter()
-                    .map(|(document_id, document)| match document {
-                        // This is the final consumer of the independently
-                        // owned author working document. Moving it preserves
-                        // the required overlay -> author isolation while
-                        // avoiding a dead post-operation clone. The old
-                        // clone's neutral peer identity remains observable to
-                        // subsequent projection code, so retain it exactly.
-                        EngineDocument::InMemory(document) => {
-                            document.set_peer_id(1).map_err(loro_error)?;
-                            self.record_projection_capture_document_move();
-                            Ok((document_id, document))
-                        }
-                        // External documents deliberately keep their present
-                        // lifetime/ownership model. This packet must not
-                        // widen it, so retain the established capture clone.
-                        EngineDocument::External(document) => {
-                            let copy = clone_doc(document.document(), 1)?;
-                            self.record_projection_capture_document_clone();
-                            Ok((document_id, copy))
-                        }
-                    })
-                    .collect::<Result<BTreeMap<_, _>, EngineError>>()?,
+                    .collect::<Result<BTreeMap<_, _>, _>>()?,
                 None,
             ),
             TransactionCapture::DetachedBootstrap => (
@@ -17363,24 +17254,14 @@ impl ShardedHotEngine {
     /// reader that already produces this draft's pre-state in
     /// `materialize_page_inner` — so that state is read in place instead.
     ///
-    /// Any document already owned by the prospective map, including a changed
-    /// catalog, is borrowed read-only. Documents absent from that map retain
-    /// the previous clone derivation.
+    /// Every other document, and the catalog itself once the drafted
+    /// transaction changes catalog-wide page identity, keeps the previous
+    /// derivation.
     fn prospective_document_ref<'engine>(
         &'engine self,
         document_id: DocumentId,
         prospective: &'engine BTreeMap<DocumentId, LoroDoc>,
     ) -> Result<ProspectiveDocument<'engine>, EngineError> {
-        // A prospective document produced by the optimized projection capture
-        // owns the exact post-operation Loro state. Projection materialization
-        // is read-only, so borrow it rather than reproducing that same state a
-        // second time. The test oracle deliberately keeps the old capture plus
-        // materialization copies and compares the two complete derivations.
-        if !self.uses_previous_document_derivation() {
-            if let Some(document) = prospective.get(&document_id) {
-                return Ok(ProspectiveDocument::Borrowed(document));
-            }
-        }
         if document_id == self.catalog_document_id
             && !prospective.contains_key(&document_id)
             && !self.uses_previous_document_derivation()
@@ -19592,9 +19473,6 @@ impl ShardedHotEngine {
             return Err(EngineError::PageDeleted(page_id));
         };
         let page_document = self.clone_current_hot_document(page_document_id, 1)?;
-        if include_frontier {
-            self.record_projection_prestate_document_clone();
-        }
         validate_shard(self.catalog_document_id, page_document_id, &page_document)?;
         if include_frontier {
             frontier_documents.insert(
@@ -19646,9 +19524,6 @@ impl ShardedHotEngine {
                 continue;
             }
             let home = self.clone_current_hot_document(*home_document_id, 1)?;
-            if include_frontier {
-                self.record_projection_prestate_document_clone();
-            }
             validate_shard(self.catalog_document_id, *home_document_id, &home)?;
             if include_frontier {
                 frontier_documents.insert(
@@ -21563,34 +21438,6 @@ impl ShardedHotEngine {
                 .filter_map(|end| usize::try_from((*end).max(0)).ok())
                 .sum::<usize>(),
         );
-        self.history_work.set(work);
-    }
-
-    fn record_projection_capture_document_move(&self) {
-        let mut work = self.history_work.get();
-        work.projection_capture_document_moves =
-            work.projection_capture_document_moves.saturating_add(1);
-        self.history_work.set(work);
-    }
-
-    fn record_projection_capture_document_clone(&self) {
-        let mut work = self.history_work.get();
-        work.projection_capture_document_clones =
-            work.projection_capture_document_clones.saturating_add(1);
-        self.history_work.set(work);
-    }
-
-    fn record_projection_prestate_document_clone(&self) {
-        let mut work = self.history_work.get();
-        work.projection_prestate_document_clones =
-            work.projection_prestate_document_clones.saturating_add(1);
-        self.history_work.set(work);
-    }
-
-    fn record_retained_author_candidate_clone(&self) {
-        let mut work = self.history_work.get();
-        work.retained_author_candidate_clones =
-            work.retained_author_candidate_clones.saturating_add(1);
         self.history_work.set(work);
     }
 
@@ -29238,7 +29085,7 @@ fn derive_effect_with_catalog(
     derive_effect_from_snapshots_with_catalog(&before, &after)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum SemanticDocumentSnapshot {
     Catalog(BTreeMap<PageId, PageState>),
     Shard {

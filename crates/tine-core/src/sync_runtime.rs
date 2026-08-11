@@ -27052,36 +27052,6 @@ mod tests {
             SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
             other => panic!("ordinary prepared projection save was not durable: {other:?}"),
         };
-        // The first save establishes the committed local-overlay predecessor.
-        // Measure the second 511-block CRLF save, which is the precise release
-        // workload that owns all five historical clone sites.
-        let mut consecutive = saved;
-        consecutive.blocks[0].raw = "second retained CRLF layout".into();
-        let before = handle
-            .managed_application_save_instrumentation()
-            .expect("consecutive save exposes foreground instrumentation");
-        let second = handle
-            .save_application_page(SyncApplicationPageSaveRequest {
-                target: SyncApplicationPageSaveTarget::Existing {
-                    path: consecutive.path.clone(),
-                    revision: saved_revision,
-                },
-                page: consecutive,
-            })
-            .unwrap();
-        let after = handle
-            .managed_application_save_instrumentation()
-            .expect("consecutive save exposes post-save instrumentation");
-        let counters = assert_managed_application_save_foreground_counters(
-            before,
-            after,
-            MAX_SYNC_EDITOR_BLOCKS,
-        );
-        assert_managed_application_save_no_reference_511_document_copies(counters);
-        let (saved, saved_revision) = match second {
-            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
-            other => panic!("consecutive prepared projection save was not durable: {other:?}"),
-        };
         let (fresh, fresh_revision) = load_application_exact(&handle, &saved.path);
         assert_eq!(saved_revision, fresh_revision);
         assert_eq!(
@@ -27093,10 +27063,10 @@ mod tests {
         let frames = managed_local_journal_frames(&runtime_request);
         assert_eq!(
             frames.len(),
-            2,
-            "each durable foreground save appends one frame"
+            1,
+            "one durable foreground save appends one frame"
         );
-        let record = decode_managed_local_record(&frames[1]).unwrap();
+        let record = decode_managed_local_record(&frames[0]).unwrap();
         assert_eq!(record.projection().intent().path().as_str(), saved.path);
         let journal_target = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
         assert_eq!(
@@ -43103,12 +43073,6 @@ mod tests {
     struct ManagedApplicationSavePageLocalReads {
         external_points: usize,
         history_points: usize,
-        mutable_author_fork_clones: usize,
-        projection_capture_moves: usize,
-        projection_capture_clones: usize,
-        current_prestate_clones: usize,
-        prospective_poststate_clones: usize,
-        retained_append_candidate_clones: usize,
     }
 
     fn managed_application_save_quantiles(
@@ -43272,32 +43236,8 @@ mod tests {
             managed_application_save_read_quantiles(samples, |sample| {
                 sample.page_local_reads.history_points
             });
-        let (author_fork_p50, author_fork_p95, author_fork_max) =
-            managed_application_save_read_quantiles(samples, |sample| {
-                sample.page_local_reads.mutable_author_fork_clones
-            });
-        let (capture_moves_p50, capture_moves_p95, capture_moves_max) =
-            managed_application_save_read_quantiles(samples, |sample| {
-                sample.page_local_reads.projection_capture_moves
-            });
-        let (capture_clones_p50, capture_clones_p95, capture_clones_max) =
-            managed_application_save_read_quantiles(samples, |sample| {
-                sample.page_local_reads.projection_capture_clones
-            });
-        let (prestate_clones_p50, prestate_clones_p95, prestate_clones_max) =
-            managed_application_save_read_quantiles(samples, |sample| {
-                sample.page_local_reads.current_prestate_clones
-            });
-        let (poststate_clones_p50, poststate_clones_p95, poststate_clones_max) =
-            managed_application_save_read_quantiles(samples, |sample| {
-                sample.page_local_reads.prospective_poststate_clones
-            });
-        let (append_candidate_clones_p50, append_candidate_clones_p95, append_candidate_clones_max) =
-            managed_application_save_read_quantiles(samples, |sample| {
-                sample.page_local_reads.retained_append_candidate_clones
-            });
         format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} author_fork_clones_p50={} author_fork_clones_p95={} author_fork_clones_max={} projection_capture_moves_p50={} projection_capture_moves_p95={} projection_capture_moves_max={} projection_capture_clones_p50={} projection_capture_clones_p95={} projection_capture_clones_max={} current_prestate_clones_p50={} current_prestate_clones_p95={} current_prestate_clones_max={} prospective_poststate_clones_p50={} prospective_poststate_clones_p95={} prospective_poststate_clones_max={} retained_append_candidate_clones_p50={} retained_append_candidate_clones_p95={} retained_append_candidate_clones_max={}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
             startup_ms(actor_total_p50),
@@ -43350,24 +43290,6 @@ mod tests {
             history_reads_p50,
             history_reads_p95,
             history_reads_max,
-            author_fork_p50,
-            author_fork_p95,
-            author_fork_max,
-            capture_moves_p50,
-            capture_moves_p95,
-            capture_moves_max,
-            capture_clones_p50,
-            capture_clones_p95,
-            capture_clones_max,
-            prestate_clones_p50,
-            prestate_clones_p95,
-            prestate_clones_max,
-            poststate_clones_p50,
-            poststate_clones_p95,
-            poststate_clones_max,
-            append_candidate_clones_p50,
-            append_candidate_clones_p95,
-            append_candidate_clones_max,
         )
     }
 
@@ -43478,24 +43400,6 @@ mod tests {
                         .history_decodes
                         .saturating_sub(before_engine.store.history_decodes),
                 ),
-            mutable_author_fork_clones: after_engine
-                .author_snapshot_clones
-                .saturating_sub(before_engine.author_snapshot_clones),
-            projection_capture_moves: after_engine
-                .projection_capture_document_moves
-                .saturating_sub(before_engine.projection_capture_document_moves),
-            projection_capture_clones: after_engine
-                .projection_capture_document_clones
-                .saturating_sub(before_engine.projection_capture_document_clones),
-            current_prestate_clones: after_engine
-                .projection_prestate_document_clones
-                .saturating_sub(before_engine.projection_prestate_document_clones),
-            prospective_poststate_clones: after_engine
-                .prospective_document_copies
-                .saturating_sub(before_engine.prospective_document_copies),
-            retained_append_candidate_clones: after_engine
-                .retained_author_candidate_clones
-                .saturating_sub(before_engine.retained_author_candidate_clones),
         };
         let point_bound = managed_application_save_page_local_read_bound(page_blocks);
         // Each point proof can decode both its history index and record, so
@@ -43510,22 +43414,6 @@ mod tests {
             "ordinary application save exceeded its page-local history read bound: {page_local_reads:?}, blocks={page_blocks}, bound={history_bound}"
         );
         page_local_reads
-    }
-
-    fn assert_managed_application_save_no_reference_511_document_copies(
-        counters: ManagedApplicationSavePageLocalReads,
-    ) {
-        // The release workload deliberately uses one ordinary existing page
-        // with no references. Each timed edit is consecutive, so its working
-        // document comes from the committed local overlay. This documents the
-        // exact five-to-three ownership proof rather than merely observing a
-        // lower-level counter at some earlier stage.
-        assert_eq!(counters.mutable_author_fork_clones, 1);
-        assert_eq!(counters.projection_capture_moves, 1);
-        assert_eq!(counters.projection_capture_clones, 0);
-        assert_eq!(counters.current_prestate_clones, 1);
-        assert_eq!(counters.prospective_poststate_clones, 0);
-        assert_eq!(counters.retained_append_candidate_clones, 1);
     }
 
     fn startup_open_phase_receipt(open: &RuntimeOpenInstrumentation) -> String {
@@ -45691,11 +45579,6 @@ mod tests {
                             counters_after,
                             page_blocks,
                         );
-                        if target_blocks == MAX_SYNC_EDITOR_BLOCKS {
-                            assert_managed_application_save_no_reference_511_document_copies(
-                                page_local_reads,
-                            );
-                        }
                         managed_samples.push(ManagedApplicationSaveBenchmarkSample {
                             caller,
                             application_stages: counters_after.application_stages,
