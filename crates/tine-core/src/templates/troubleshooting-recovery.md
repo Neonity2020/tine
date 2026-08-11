@@ -28,6 +28,13 @@ icon:: 🛟
 	- 2. Tine prints the log path on startup. By default it is `tine-debug.log` in your platform's temporary folder; `TINE_DEBUG_LOG=/path` overrides it.
 	- 3. What you should see: a timestamped trace covering the environment, startup milestones, and any panic with a backtrace. It records no note content — send that file with your report.
 	- 4. On Linux, if the window never appears at all, run `TINE_GPU=0 tine` once: a rare GPU/WebKitGTK rendering failure then falls back to software rendering.
+- ## A graph will not finish opening
+	- Meaning: Tine started, but the open itself is stuck or has failed. Once it takes longer than a moment you get a card naming the current phase and the elapsed time; if the open cannot complete, the same card becomes **Tine needs help opening this workspace** with actions.
+	- 1. **Retry lookup** — attempt the same open again. This is safe to repeat.
+	- 2. **Open another graph…** — pick a different folder and leave this one untouched.
+	- 3. **Return … to Direct Files…** — offered only for a graph you enrolled in experimental Tine-managed storage; it puts that graph back on plain files.
+	- 4. **Copy details** — copies the phase and error text for an issue report. Use this before anything else if you plan to report it.
+	- 5. What you should see: no managed-storage data has been discarded by the failure. Retrying, choosing another graph, or closing and relaunching Tine are all safe to try before any manual recovery.
 - ## Something parses or renders wrong
 	- 1. Open Settings → **Help improve Tine**: Tine runs its own parser and Logseq's parser over your graph, locally, and lists every place they disagree plus a parse-speed comparison.
 	- 2. Copy the report shown there — every snippet is anonymized (page names and words are scrubbed, markup shape kept) and re-verified to still reproduce the divergence before it is shown. Nothing is uploaded.
