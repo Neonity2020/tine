@@ -25,6 +25,7 @@ import { onGraphRebound } from "./modeHooks";
 import { markConflict, clearConflict, isConflicted, conflicts, bumpDataRev, bumpPageInventoryRev, pushToast } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
+import { recordClipboardAcceptedSaveForTest } from "./clipboardWorkProbe";
 
 // ---------------------------------------------------------------------------
 // Guard state (owned here; mutated only through the accessors below)
@@ -951,6 +952,9 @@ async function doSave(
     // the page behind a warning about a change that is now written.
     if (isConflicted(name)) clearConflict(name);
     releaseSourcesFor(name); // if this was a cross-page dest, its sources can save now
+    if (import.meta.env.MODE === "test") {
+      recordClipboardAcceptedSaveForTest(expectedCutSource ? "source" : "target", name);
+    }
     return true;
   } catch (e) {
     if (saveFailureDisposition(e) === "append_outcome_unknown") {

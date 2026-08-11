@@ -60,7 +60,12 @@ import { sheetConfigFromRaw } from "./sheet/config";
 import { clearMatrixDimensionCache, invalidateAllMatrixDimensions } from "./sheet/matrix";
 import { applyMarkerTransition } from "./logbook";
 import { cycleMarkerSmart } from "./editor/repeat";
-import { recordClipboardWorkForTest } from "./clipboardWorkProbe";
+import {
+  recordClipboardDirtyPageForTest,
+  recordClipboardPhaseForTest,
+  recordClipboardUndoSnapshotForTest,
+  recordClipboardWorkForTest,
+} from "./clipboardWorkProbe";
 import {
   markDirty as markDirtyInner,
   isDirty,
@@ -105,6 +110,7 @@ export function __setStoreMutationObserverForTest(
 export const markDirty: typeof markDirtyInner = import.meta.env.MODE === "test"
   ? ((...args: Parameters<typeof markDirtyInner>) => {
       storeMutationObserverForTest?.({ kind: "dirty", page: args[0] });
+      recordClipboardDirtyPageForTest(args[0]);
       return markDirtyInner(...args);
     }) as typeof markDirtyInner
   : markDirtyInner;
@@ -2026,6 +2032,12 @@ function snapEntry(affected?: string[] | null, preservedIds?: readonly string[])
     if (nameSet.has(p.name)) for (const r of p.roots) visit(r);
   }
   const pageObjs = clonePages(pages.filter((p) => nameSet.has(p.name)));
+  if (import.meta.env.MODE === "test") {
+    recordClipboardUndoSnapshotForTest(
+      Object.keys(nodes).length,
+      Object.values(nodes).reduce((total, node) => total + new TextEncoder().encode(node.raw).byteLength, 0),
+    );
+  }
   return {
     kind: "snap",
     pages: affected ?? null,
@@ -2812,7 +2824,10 @@ function insertClipboardBlocksSync(
   const pageName = target.page;
   let lastId: string | null = null;
 
-  if (import.meta.env.MODE === "test") recordClipboardWorkForTest("target_insertion_phases");
+  if (import.meta.env.MODE === "test") {
+    recordClipboardWorkForTest("target_insertion_phases");
+    recordClipboardPhaseForTest("target-insertion");
+  }
   pushUndo("clipboard-paste", [pageName], preserveIds ? preservedIds : []);
   setDoc(produce((state) => {
     const create = (block: typeof prepared[number], blockParent: string | null): string => {
@@ -2875,13 +2890,19 @@ export function pasteClipboardPayload(
       && slot.graph === authority.root;
 
     if (preserveIds) {
-      if (import.meta.env.MODE === "test") recordClipboardWorkForTest("source_retirement_phases");
+      if (import.meta.env.MODE === "test") {
+        recordClipboardWorkForTest("source_retirement_phases");
+        recordClipboardPhaseForTest("source-retirement");
+      }
       preserveIds = await flushCutSourcePages(grant!.sourcePages);
       if (preserveIds && !clipboardPasteAuthorityCurrent(authority)) return null;
     }
     if (preserveIds) {
       try {
-        if (import.meta.env.MODE === "test") recordClipboardWorkForTest("resolve_blocks_phases");
+        if (import.meta.env.MODE === "test") {
+          recordClipboardWorkForTest("resolve_blocks_phases");
+          recordClipboardPhaseForTest("resolve-blocks");
+        }
         const resolved = await backend().resolveBlocks(normalizedIds);
         preserveIds = resolved.length === normalizedIds.length && resolved.every((block) => block === null);
       } catch {
@@ -2893,7 +2914,10 @@ export function pasteClipboardPayload(
     // synchronous and insertion follows immediately with no await boundary.
     if (!clipboardPasteAuthorityCurrent(authority)) return null;
     if (preserveIds) {
-      if (import.meta.env.MODE === "test") recordClipboardWorkForTest("final_identity_guard_phases");
+      if (import.meta.env.MODE === "test") {
+        recordClipboardWorkForTest("final_identity_guard_phases");
+        recordClipboardPhaseForTest("final-identity-guard");
+      }
       preserveIds = cutSourcePagesRetired(grant!.sourcePages)
         && !hasLoadedIdentityCollision(normalizedIds);
     }
