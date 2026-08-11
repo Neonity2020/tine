@@ -32,6 +32,7 @@ use super::{
 };
 use crate::doc::{DocBlock, Document, SerializeOpts, StructuralLayoutIdentity};
 use crate::model::ProjectionRecoveryCleanup;
+use crate::oplog::hot_engine::PendingLocalAcceptedProjectionEvidence;
 use crate::oplog::projection_store::MAX_PENDING_PROJECTION_CLEANUP_PER_PASS;
 use crate::Graph;
 
@@ -72,6 +73,13 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) finalizer_predecessor_replay_render: usize,
     pub(crate) capture_sealed_pending_local_predecessor_success: usize,
     pub(crate) finalizer_sealed_pending_local_predecessor_use: usize,
+    pub(crate) accepted_projection_full_renders: usize,
+    pub(crate) accepted_projection_affine_attempts: usize,
+    pub(crate) accepted_projection_affine_reuses: usize,
+    pub(crate) accepted_projection_affine_fallbacks: usize,
+    pub(crate) accepted_projection_selector_hot_materializations: usize,
+    pub(crate) accepted_projection_affine_target_bytes: usize,
+    pub(crate) accepted_projection_affine_annotation_count: usize,
     /// The two renders are separate evidence obligations.  Keep their timing
     /// separate so the managed-save receipt never presents the pair as one
     /// opaque "projection" cost.
@@ -91,6 +99,13 @@ impl PreparedEditorProjectionInstrumentation {
         finalizer_predecessor_replay_render: 0,
         capture_sealed_pending_local_predecessor_success: 0,
         finalizer_sealed_pending_local_predecessor_use: 0,
+        accepted_projection_full_renders: 0,
+        accepted_projection_affine_attempts: 0,
+        accepted_projection_affine_reuses: 0,
+        accepted_projection_affine_fallbacks: 0,
+        accepted_projection_selector_hot_materializations: 0,
+        accepted_projection_affine_target_bytes: 0,
+        accepted_projection_affine_annotation_count: 0,
         accepted_render: std::time::Duration::ZERO,
         target_render: std::time::Duration::ZERO,
         accepted_blocks_visited: 0,
@@ -153,6 +168,37 @@ pub(crate) fn note_finalizer_sealed_pending_local_predecessor_use() {
     note_prepared_editor_projection(|instrumentation| {
         instrumentation.finalizer_sealed_pending_local_predecessor_use = instrumentation
             .finalizer_sealed_pending_local_predecessor_use
+            .saturating_add(1);
+    });
+}
+
+/// Test-only accounting for the accepted-render selector.  These calls belong
+/// at selection, rather than at preparation: a candidate rejected before
+/// preparation is a real attempted fallback, while an absent/different
+/// overlay is not an attempt at all.
+pub(crate) fn note_accepted_projection_affine_attempt() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.accepted_projection_affine_attempts = instrumentation
+            .accepted_projection_affine_attempts
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_accepted_projection_affine_fallback() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.accepted_projection_affine_fallbacks = instrumentation
+            .accepted_projection_affine_fallbacks
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_accepted_projection_selector_hot_materialization() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.accepted_projection_selector_hot_materializations = instrumentation
+            .accepted_projection_selector_hot_materializations
             .saturating_add(1);
     });
 }
@@ -292,6 +338,9 @@ struct RenderedProjection {
 pub(crate) struct PreparedEditorProjectionBeforeCandidate {
     accepted_page: Option<MaterializedPage>,
     accepted_rendered: RenderedProjection,
+    /// One-request proof that the accepted render was selected from the exact
+    /// last pending-local projection. `hot_engine` rechecks it when drafting.
+    accepted_pending_local_evidence: Option<PendingLocalAcceptedProjectionEvidence>,
 }
 
 impl PreparedEditorProjectionBeforeCandidate {
@@ -302,12 +351,18 @@ impl PreparedEditorProjectionBeforeCandidate {
 
     pub(crate) fn into_page_and_accepted_render(
         self,
-    ) -> Option<(MaterializedPage, Vec<u8>, Vec<AnnotatedIdentity>)> {
+    ) -> Option<(
+        MaterializedPage,
+        Vec<u8>,
+        Vec<AnnotatedIdentity>,
+        Option<PendingLocalAcceptedProjectionEvidence>,
+    )> {
         self.accepted_page.map(|accepted_page| {
             (
                 accepted_page,
                 self.accepted_rendered.target,
                 self.accepted_rendered.annotations,
+                self.accepted_pending_local_evidence,
             )
         })
     }
@@ -336,11 +391,65 @@ impl PreparedEditorProjection {
         accepted_page: &MaterializedPage,
         exact_base: Vec<u8>,
     ) -> Result<Self, ProjectionError> {
-        #[cfg(test)]
-        let accepted_started = std::time::Instant::now();
-        let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
-        #[cfg(test)]
-        let accepted_elapsed = accepted_started.elapsed();
+        Self::prepare_with_pending_local_accepted_projection(
+            requested_page,
+            accepted_page,
+            exact_base,
+            None,
+        )
+    }
+
+    pub(crate) fn prepare_with_pending_local_accepted_projection(
+        requested_page: MaterializedPage,
+        accepted_page: &MaterializedPage,
+        exact_base: Vec<u8>,
+        accepted_pending_local_evidence: Option<PendingLocalAcceptedProjectionEvidence>,
+    ) -> Result<Self, ProjectionError> {
+        let (accepted, accepted_pending_local_evidence) =
+            if let Some(evidence) = accepted_pending_local_evidence {
+                let target = evidence.target().to_vec();
+                let annotations = evidence.annotations().to_vec();
+                #[cfg(test)]
+                note_prepared_editor_projection(|instrumentation| {
+                    instrumentation.accepted_projection_affine_reuses = instrumentation
+                        .accepted_projection_affine_reuses
+                        .saturating_add(1);
+                    instrumentation.accepted_projection_affine_target_bytes = instrumentation
+                        .accepted_projection_affine_target_bytes
+                        .saturating_add(target.len());
+                    instrumentation.accepted_projection_affine_annotation_count = instrumentation
+                        .accepted_projection_affine_annotation_count
+                        .saturating_add(annotations.len());
+                });
+                (
+                    RenderedProjection {
+                        target,
+                        annotations,
+                        base_layout_identities: Vec::new(),
+                        generated_anchors: Vec::new(),
+                    },
+                    Some(evidence),
+                )
+            } else {
+                #[cfg(test)]
+                let accepted_started = std::time::Instant::now();
+                let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
+                #[cfg(test)]
+                let accepted_elapsed = accepted_started.elapsed();
+                #[cfg(test)]
+                note_prepared_editor_projection(|instrumentation| {
+                    instrumentation.accepted_projection_full_renders = instrumentation
+                        .accepted_projection_full_renders
+                        .saturating_add(1);
+                    instrumentation.accepted_render = instrumentation
+                        .accepted_render
+                        .saturating_add(accepted_elapsed);
+                    instrumentation.accepted_blocks_visited = instrumentation
+                        .accepted_blocks_visited
+                        .saturating_add(accepted_page.blocks.len());
+                });
+                (accepted, None)
+            };
         let candidate_base_layout = structural_layout_identities(&accepted.annotations);
         #[cfg(test)]
         let target_started = std::time::Instant::now();
@@ -354,14 +463,8 @@ impl PreparedEditorProjection {
         #[cfg(test)]
         note_prepared_editor_projection(|instrumentation| {
             instrumentation.created = instrumentation.created.saturating_add(1);
-            instrumentation.accepted_render = instrumentation
-                .accepted_render
-                .saturating_add(accepted_elapsed);
             instrumentation.target_render =
                 instrumentation.target_render.saturating_add(target_elapsed);
-            instrumentation.accepted_blocks_visited = instrumentation
-                .accepted_blocks_visited
-                .saturating_add(accepted_page.blocks.len());
             instrumentation.target_blocks_visited = instrumentation
                 .target_blocks_visited
                 .saturating_add(requested_page.blocks.len());
@@ -376,6 +479,7 @@ impl PreparedEditorProjection {
                 // page for all ordinary request construction.
                 accepted_page: None,
                 accepted_rendered: accepted,
+                accepted_pending_local_evidence,
             }),
             rendered,
         })
@@ -459,7 +563,7 @@ impl PreparedEditorProjection {
     }
 }
 
-fn materialized_page_projection_identity_equal(
+pub(crate) fn materialized_page_projection_identity_equal(
     left: &MaterializedPage,
     right: &MaterializedPage,
 ) -> bool {
@@ -3563,6 +3667,62 @@ mod tests {
             org_after,
             org_base.as_bytes(),
         );
+    }
+
+    #[test]
+    fn prepared_editor_projection_does_not_carry_an_accepted_generated_anchor_into_the_plan() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_096));
+        let generated_id = LogseqUuid::from_uuid(Uuid::from_u128(80_097));
+        let mut accepted = structural_layout_state(
+            "pages/generated-before-anchor.md",
+            vec![(80_098, None, "a", "before".into(), Some(generated_id))],
+        );
+        accepted.page.blocks[0].logseq_identity_origin =
+            Some(LogseqIdentityOrigin::PolicyGenerated {
+                reason: crate::oplog::PolicyGeneratedAnchorReason::BlockReference,
+            });
+        let base = b"- before\n".to_vec();
+        let captured = plan_projection(workspace, &accepted, Some(&base)).unwrap();
+
+        let mut requested = accepted.clone();
+        requested.page.blocks[0].content = format!("after\nid:: {generated_id}");
+        let prepared =
+            PreparedEditorProjection::prepare(requested.page.clone(), &accepted.page, base.clone())
+                .unwrap();
+        assert_eq!(
+            prepared
+                .before_candidate
+                .as_ref()
+                .unwrap()
+                .accepted_rendered
+                .generated_anchors
+                .iter()
+                .map(PolicyGeneratedAnchor::block_id)
+                .collect::<Vec<_>>(),
+            vec![accepted.page.blocks[0].block_id],
+            "the accepted half did generate the policy anchor"
+        );
+        assert!(
+            prepared.rendered.generated_anchors.is_empty(),
+            "the requested raw id owns its own projection identity"
+        );
+
+        let plan = prepared
+            .into_fresh_plan(
+                workspace,
+                &requested,
+                &base,
+                captured.intent().annotations(),
+            )
+            .unwrap()
+            .expect("capture-authenticated requested render remains reusable");
+        assert!(
+            plan.generated_anchors().is_empty(),
+            "only the requested render may supply plan/journal generated anchors"
+        );
+        assert!(std::str::from_utf8(plan.target())
+            .unwrap()
+            .contains(&format!("id:: {generated_id}")));
     }
 
     #[test]

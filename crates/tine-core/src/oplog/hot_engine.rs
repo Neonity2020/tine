@@ -4014,6 +4014,115 @@ pub(crate) fn force_generic_before_projection_affine_reuse_for_test(force: bool)
     FORCE_GENERIC_BEFORE_PROJECTION_AFFINE_REUSE.with(|enabled| enabled.set(force));
 }
 
+/// A one-request proof that an editor request may reuse the accepted target
+/// retained by the exact last pending-local projection.  It is deliberately
+/// neither cloneable nor serializable: this is point authority carried only
+/// from editor request preparation to the existing affine draft path.
+pub(crate) struct PendingLocalAcceptedProjectionEvidence {
+    workspace_id: WorkspaceId,
+    endpoint: ProjectionEndpointBinding,
+    page_id: PageId,
+    path: ManagedPath,
+    portable_path_index_root: PortablePathIndexRoot,
+    occupied: PortablePathOccupied,
+    sequence: u64,
+    batch_id: BatchId,
+    target: Vec<u8>,
+    annotations: Vec<AnnotatedIdentity>,
+    post_frontier: FrontierV2,
+    claim_evidence: Vec<ProjectionClaimEvidence>,
+}
+
+/// One deliberately narrow mutation of the selector's authenticated
+/// pending-local binding.  This exists only to prove that the selector rejects
+/// each field before a test can accidentally turn an implementation detail
+/// into authority.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingLocalAcceptedProjectionBindingMutation {
+    Endpoint,
+    Path,
+    PortablePathRoot,
+    OverlaySequence,
+    SourceBatch,
+    Frontier,
+    Claims,
+    TargetBytes,
+    Annotations,
+}
+
+impl PendingLocalAcceptedProjectionEvidence {
+    pub(crate) fn target(&self) -> &[u8] {
+        &self.target
+    }
+
+    pub(crate) fn annotations(&self) -> &[AnnotatedIdentity] {
+        &self.annotations
+    }
+
+    pub(crate) fn still_binds(
+        &self,
+        engine: &ShardedHotEngine,
+        before: &ProjectionPageState,
+    ) -> bool {
+        if self.workspace_id != engine.workspace_id
+            || engine.projection_endpoint_binding() != Some(self.endpoint)
+            || before.page.page_id != self.page_id
+            || before.page.path != self.path
+            || engine.portable_path_root != self.portable_path_index_root
+            || before.frontier != self.post_frontier
+            || before.claim_evidence != self.claim_evidence
+        {
+            return false;
+        }
+        let Some(last) = engine.local_overlay.entries.last() else {
+            return false;
+        };
+        let Some(next_sequence) = last.sequence.checked_add(1) else {
+            return false;
+        };
+        if last.sequence != self.sequence
+            || last.batch_id != self.batch_id
+            || next_sequence != engine.local_overlay.next_sequence
+        {
+            return false;
+        }
+        let intent = &last.projection.intent;
+        let occupied = match engine.current_page_at_path(&self.path) {
+            Ok(CurrentPageAtPath::ExactOwner(occupied)) => occupied,
+            Ok(
+                CurrentPageAtPath::Released(_)
+                | CurrentPageAtPath::Unowned
+                | CurrentPageAtPath::PortableCollision(_)
+                | CurrentPageAtPath::ReleasedPortableCollision(_),
+            )
+            | Err(_) => return false,
+        };
+        let target = intent.target();
+        intent.workspace_id() == self.workspace_id
+            && intent.source_endpoint_id() == self.endpoint.endpoint_id
+            && intent.source_batch_id() == self.batch_id
+            && intent.page_id() == self.page_id
+            && intent.path() == &self.path
+            && intent.portable_path_index_root() == self.portable_path_index_root
+            && intent.post_frontier() == &self.post_frontier
+            && intent.claim_evidence() == self.claim_evidence
+            && occupied == self.occupied
+            && target.bytes() == Some(self.target.as_slice())
+            && target.annotations() == self.annotations.as_slice()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_occupied_acquisition_for_test(&mut self, acquisition_batch: BatchId) {
+        self.occupied = PortablePathOccupied::new(
+            self.occupied.page_id(),
+            self.occupied.exact_path().clone(),
+            acquisition_batch,
+            self.occupied.causal_dot(),
+        );
+    }
+}
+
 fn before_projection_affine_reuse_enabled() -> bool {
     #[cfg(test)]
     {
@@ -10271,6 +10380,125 @@ impl ShardedHotEngine {
         self.projection_endpoint
     }
 
+    /// Select one existing accepted rendering only after proving that the
+    /// caller's supplied page equals this request's current hot page.  The
+    /// supplied page may have been rebased from SQLite/source, so it is never
+    /// itself authority for this shortcut.
+    pub(crate) fn pending_local_accepted_projection_evidence(
+        &self,
+        supplied_page: &MaterializedPage,
+        exact_graph_base: &[u8],
+    ) -> Result<Option<PendingLocalAcceptedProjectionEvidence>, EngineError> {
+        if !before_projection_affine_reuse_enabled() {
+            return Ok(None);
+        }
+        let Some(endpoint) = self.projection_endpoint_binding() else {
+            return Ok(None);
+        };
+        let Some(last) = self.local_overlay.entries.last() else {
+            return Ok(None);
+        };
+        let Some(next_sequence) = last.sequence.checked_add(1) else {
+            return Ok(None);
+        };
+        let intent = &last.projection.intent;
+        let ManifestProjectionTarget::Present {
+            bytes, annotations, ..
+        } = intent.target()
+        else {
+            return Ok(None);
+        };
+        if next_sequence != self.local_overlay.next_sequence
+            || last.batch_id != intent.source_batch_id()
+            || intent.workspace_id() != self.workspace_id
+            || intent.source_endpoint_id() != endpoint.endpoint_id
+            || intent.page_id() != supplied_page.page_id
+            || intent.path() != &supplied_page.path
+            || bytes.as_slice() != exact_graph_base
+        {
+            return Ok(None);
+        }
+
+        #[cfg(test)]
+        super::projection::note_accepted_projection_affine_attempt();
+
+        if intent.portable_path_index_root() != self.portable_path_root {
+            #[cfg(test)]
+            super::projection::note_accepted_projection_affine_fallback();
+            return Ok(None);
+        }
+        let CurrentPageAtPath::ExactOwner(occupied) =
+            self.current_page_at_path(&supplied_page.path)?
+        else {
+            #[cfg(test)]
+            super::projection::note_accepted_projection_affine_fallback();
+            return Ok(None);
+        };
+        if occupied.page_id() != supplied_page.page_id {
+            #[cfg(test)]
+            super::projection::note_accepted_projection_affine_fallback();
+            return Ok(None);
+        }
+        let home_dependencies =
+            self.current_hot_document_dependencies_by_id(supplied_page.home_document_id)?;
+        let Some(intent_home_dependencies) = intent
+            .post_frontier()
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == supplied_page.home_document_id)
+        else {
+            #[cfg(test)]
+            super::projection::note_accepted_projection_affine_fallback();
+            return Ok(None);
+        };
+        let current_catalog_dependencies =
+            self.current_hot_document_dependencies_by_id(self.catalog_document_id)?;
+        let Some(intent_catalog_dependencies) = intent
+            .post_frontier()
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == self.catalog_document_id)
+        else {
+            #[cfg(test)]
+            super::projection::note_accepted_projection_affine_fallback();
+            return Ok(None);
+        };
+        if home_dependencies.direct_dependency_heads() != [last.batch_id]
+            || intent_home_dependencies != &home_dependencies
+            || intent_catalog_dependencies != &current_catalog_dependencies
+        {
+            #[cfg(test)]
+            super::projection::note_accepted_projection_affine_fallback();
+            return Ok(None);
+        }
+
+        #[cfg(test)]
+        super::projection::note_accepted_projection_selector_hot_materialization();
+        let hot = self.materialize_page_for_projection(supplied_page.page_id)?;
+        if !super::projection::materialized_page_projection_identity_equal(&hot.page, supplied_page)
+            || hot.frontier != *intent.post_frontier()
+            || hot.claim_evidence != intent.claim_evidence()
+        {
+            #[cfg(test)]
+            super::projection::note_accepted_projection_affine_fallback();
+            return Ok(None);
+        }
+        Ok(Some(PendingLocalAcceptedProjectionEvidence {
+            workspace_id: self.workspace_id,
+            endpoint,
+            page_id: hot.page.page_id,
+            path: hot.page.path,
+            portable_path_index_root: intent.portable_path_index_root(),
+            occupied,
+            sequence: last.sequence,
+            batch_id: last.batch_id,
+            target: bytes.clone(),
+            annotations: annotations.clone(),
+            post_frontier: hot.frontier,
+            claim_evidence: hot.claim_evidence,
+        }))
+    }
+
     pub(crate) const fn projection_receipt_store_id(
         &self,
     ) -> Option<super::ProjectionReceiptStoreId> {
@@ -10338,6 +10566,213 @@ impl ShardedHotEngine {
         )
         .expect("test-only endpoint rewrite retains a valid manifested projection intent");
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_local_accepted_projection_rejects_rewritten_root_for_test(
+        &mut self,
+        supplied_page: &MaterializedPage,
+        exact_graph_base: &[u8],
+    ) -> Result<bool, EngineError> {
+        let Some(original) = self
+            .local_overlay
+            .entries
+            .last()
+            .map(|entry| entry.projection.intent.clone())
+        else {
+            return Ok(false);
+        };
+        let rewritten_root = PortablePathIndexRoot::empty();
+        if original.portable_path_index_root() == rewritten_root {
+            return Ok(false);
+        }
+        let rewritten = ManifestedProjectionIntent::new(
+            original.workspace_id(),
+            original.source_batch_id(),
+            original.source_author_device_id(),
+            original.source_author_session_id(),
+            original.source_endpoint_id(),
+            original.page_id(),
+            original.path().clone(),
+            rewritten_root,
+            original.precondition().clone(),
+            original.render_base().cloned(),
+            original.target().clone(),
+            original.post_frontier().clone(),
+            original.claim_evidence().to_vec(),
+        )
+        .expect("test-only root rewrite retains a valid manifested projection intent");
+        self.local_overlay
+            .entries
+            .last_mut()
+            .expect("test-only root rewrite retains the selected overlay entry")
+            .projection
+            .intent = rewritten;
+        let selected =
+            self.pending_local_accepted_projection_evidence(supplied_page, exact_graph_base);
+        self.local_overlay
+            .entries
+            .last_mut()
+            .expect("test-only root rewrite retains the selected overlay entry")
+            .projection
+            .intent = original;
+        selected.map(|evidence| evidence.is_none())
+    }
+
+    /// Mutate exactly one authenticated selector field, run the real selector,
+    /// and restore the overlay before returning.  The mutation deliberately
+    /// stays at the hot-engine test seam: application tests must not gain a
+    /// way to manufacture pending-local authority through a public request.
+    #[cfg(test)]
+    pub(crate) fn pending_local_accepted_projection_rejects_binding_mutation_for_test(
+        &mut self,
+        supplied_page: &MaterializedPage,
+        exact_graph_base: &[u8],
+        mutation: PendingLocalAcceptedProjectionBindingMutation,
+    ) -> Result<(bool, bool), EngineError> {
+        let Some((original_intent, original_sequence)) = self
+            .local_overlay
+            .entries
+            .last()
+            .map(|entry| (entry.projection.intent.clone(), entry.sequence))
+        else {
+            return Ok((false, false));
+        };
+        let before = self.materialize_page_for_projection(supplied_page.page_id)?;
+        let Some(evidence) =
+            self.pending_local_accepted_projection_evidence(supplied_page, exact_graph_base)?
+        else {
+            return Ok((false, false));
+        };
+
+        let mut endpoint = original_intent.source_endpoint_id();
+        let mut path = original_intent.path().clone();
+        let mut root = original_intent.portable_path_index_root();
+        let mut batch = original_intent.source_batch_id();
+        let mut target = original_intent.target().clone();
+        let mut frontier = original_intent.post_frontier().clone();
+        let mut claims = original_intent.claim_evidence().to_vec();
+        let mut sequence = original_sequence;
+
+        match mutation {
+            PendingLocalAcceptedProjectionBindingMutation::Endpoint => {
+                endpoint = ProjectionEndpointId::from_uuid(Uuid::from_u128(0xfeed_face));
+            }
+            PendingLocalAcceptedProjectionBindingMutation::Path => {
+                path = ManagedPath::parse("other-selector-binding.md")
+                    .expect("test-only path is valid");
+            }
+            PendingLocalAcceptedProjectionBindingMutation::PortablePathRoot => {
+                root = PortablePathIndexRoot::empty();
+            }
+            PendingLocalAcceptedProjectionBindingMutation::OverlaySequence => {
+                sequence = original_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| EngineError::ProjectionWork("test sequence overflow".into()))?;
+            }
+            PendingLocalAcceptedProjectionBindingMutation::SourceBatch => {
+                batch = BatchId::from_uuid(Uuid::from_u128(0xfeed_ba7c));
+            }
+            PendingLocalAcceptedProjectionBindingMutation::Frontier => {
+                let foreign_document_id = DocumentId::from_uuid(Uuid::from_u128(0xfeed_f00d));
+                let mut documents = frontier.documents().to_vec();
+                documents.push(
+                    DocumentDependencies::new(foreign_document_id, Vec::new(), vec![batch])
+                        .expect("test-only foreign frontier document is well formed"),
+                );
+                frontier = FrontierV2::new(documents)
+                    .expect("test-only foreign frontier remains canonically ordered");
+            }
+            PendingLocalAcceptedProjectionBindingMutation::Claims => {
+                let block = supplied_page
+                    .blocks
+                    .first()
+                    .ok_or_else(|| EngineError::ProjectionWork("test page has no block".into()))?;
+                claims = vec![ProjectionClaimEvidence::new(
+                    LogseqUuid::from_uuid(Uuid::from_u128(0xfeed_c1a1)),
+                    vec![ProjectionClaimParticipant::new(
+                        block.block_id,
+                        block.home_document_id,
+                    )],
+                )
+                .expect("test-only claim is canonical")];
+            }
+            PendingLocalAcceptedProjectionBindingMutation::TargetBytes => {
+                let ManifestProjectionTarget::Present {
+                    bytes, annotations, ..
+                } = &target
+                else {
+                    return Ok((false, false));
+                };
+                // Retain all existing annotation spans while changing the
+                // immutable target digest.  This isolates the target-byte
+                // binding from annotation validation.
+                let mut bytes = bytes.clone();
+                bytes.push(b' ');
+                target = ManifestProjectionTarget::present(bytes, annotations.clone())
+                    .expect("test-only target remains well formed");
+            }
+            PendingLocalAcceptedProjectionBindingMutation::Annotations => {
+                let ManifestProjectionTarget::Present {
+                    bytes, annotations, ..
+                } = &target
+                else {
+                    return Ok((false, false));
+                };
+                let Some(first) = annotations.first() else {
+                    return Ok((false, false));
+                };
+                let mut annotations = annotations.clone();
+                annotations[0] = AnnotatedIdentity::new(
+                    first.locator().clone(),
+                    first.span(),
+                    BlockId::from_uuid(Uuid::from_u128(0xfeed_a110)),
+                    first.logseq_uuid(),
+                );
+                target = ManifestProjectionTarget::present(bytes.clone(), annotations)
+                    .expect("test-only annotation mutation remains well formed");
+            }
+        }
+
+        let rewritten = ManifestedProjectionIntent::new(
+            original_intent.workspace_id(),
+            batch,
+            original_intent.source_author_device_id(),
+            original_intent.source_author_session_id(),
+            endpoint,
+            original_intent.page_id(),
+            path,
+            root,
+            original_intent.precondition().clone(),
+            original_intent.render_base().cloned(),
+            target,
+            frontier,
+            claims,
+        )
+        .expect("test-only selector mutation retains a valid manifested intent");
+
+        {
+            let entry = self
+                .local_overlay
+                .entries
+                .last_mut()
+                .expect("test-only selector entry remains present");
+            entry.sequence = sequence;
+            entry.projection.intent = rewritten;
+        }
+        let selected =
+            self.pending_local_accepted_projection_evidence(supplied_page, exact_graph_base);
+        let evidence_rejected = !evidence.still_binds(self, &before);
+        {
+            let entry = self
+                .local_overlay
+                .entries
+                .last_mut()
+                .expect("test-only selector entry remains present for restore");
+            entry.sequence = original_sequence;
+            entry.projection.intent = original_intent;
+        }
+        selected.map(|evidence| (evidence.is_none(), evidence_rejected))
     }
 
     #[cfg(test)]
@@ -16155,7 +16590,7 @@ impl ShardedHotEngine {
                 detail.before_projection_affine_attempts =
                     detail.before_projection_affine_attempts.saturating_add(1);
             });
-            if let Some((page, accepted_target, accepted_annotations)) =
+            if let Some((page, accepted_target, accepted_annotations, pending_local_evidence)) =
                 candidate.into_page_and_accepted_render()
             {
                 if let Some(state) = self.authenticate_affine_before_projection_candidate(
@@ -16166,6 +16601,7 @@ impl ShardedHotEngine {
                     exact_base_matches,
                     &accepted_target,
                     &accepted_annotations,
+                    pending_local_evidence,
                 )? {
                     #[cfg(test)]
                     note_local_mutation_detail(|detail| {
@@ -16210,6 +16646,7 @@ impl ShardedHotEngine {
         exact_base_matches: bool,
         accepted_target: &[u8],
         accepted_annotations: &[AnnotatedIdentity],
+        pending_local_evidence: Option<PendingLocalAcceptedProjectionEvidence>,
     ) -> Result<Option<ProjectionPageState>, EngineError> {
         if page.page_id != page_id
             || !page.path.as_str().ends_with(".md")
@@ -16366,11 +16803,17 @@ impl ShardedHotEngine {
         {
             return Ok(None);
         }
-        Ok(Some(ProjectionPageState {
+        let state = ProjectionPageState {
             page,
             frontier: intent.post_frontier().clone(),
             claim_evidence: Vec::new(),
-        }))
+        };
+        if let Some(evidence) = pending_local_evidence {
+            if !evidence.still_binds(self, &state) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(state))
     }
 
     /// Inactive session-facing gate for local semantic authoring. The draft is

@@ -2826,6 +2826,11 @@ impl PromotedLocalRuntime {
         &self.engine
     }
 
+    #[cfg(test)]
+    pub(crate) fn engine_mut_for_test(&mut self) -> &mut ShardedHotEngine {
+        &mut self.engine
+    }
+
     pub(crate) const fn database(&self) -> &SqliteFrontier {
         self.projection.database()
     }
