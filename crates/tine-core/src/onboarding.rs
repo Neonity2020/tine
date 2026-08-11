@@ -259,6 +259,9 @@ fn bind_copied_page_title(markdown: String, copied_name: &str) -> String {
 
 pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopyResult> {
     let plan = guide_copy_plan(title)?;
+    // Name-only creation needs one current parsed identity snapshot. App-open
+    // graphs already have it; keep this public operation correct for cold callers.
+    graph.with_pages(|_| ());
     let mut created_pages = Vec::new();
     let mut skipped_pages = Vec::new();
     for planned in plan.pages {
