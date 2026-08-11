@@ -17,6 +17,7 @@ use tine_core::model::{
 };
 use tine_core::sync_runtime::{
     SyncApplicationGraphMutationRequest, SyncApplicationGuideCopyOutcome,
+    SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
     SyncApplicationNavigationOutcome, SyncApplicationNavigationReply,
     SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
     SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
@@ -24,6 +25,13 @@ use tine_core::sync_runtime::{
     SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome, SyncApplicationUnitOutcome,
     SyncRuntimeHandle,
 };
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ManagedApplicationMoveSubtreesResult {
+    pub(crate) binding_generation: u64,
+    pub(crate) application_page_admission: crate::state::ApplicationPageAdmission,
+    pub(crate) outcome: SyncApplicationMoveSubtreesOutcome,
+}
 
 #[tauri::command]
 pub(crate) fn load_workspaces(
@@ -1091,6 +1099,39 @@ pub(crate) async fn save_page(
             );
         }
         result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// X1-only native bridge for one actor-owned managed cross-page move. No
+/// production gesture calls this command until X2 installs the queue, busy
+/// lease, save hold, authoritative DTO publication, and semantic history.
+#[tauri::command]
+pub(crate) async fn move_managed_application_subtrees(
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+    state: GraphContext<'_>,
+) -> Result<ManagedApplicationMoveSubtreesResult, String> {
+    let (app, label, context_generation) = owned_graph_context(state)?;
+    if context_generation != binding_generation {
+        return Err("managed cross-page move belongs to a stale graph binding".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let handle = sparse_application_handle(&slot)?
+            .ok_or_else(|| "managed cross-page move requires managed storage".to_owned())?;
+        let outcome = handle
+            .move_application_subtrees(request)
+            .map_err(|error| error.to_string())?;
+        let result = ManagedApplicationMoveSubtreesResult {
+            binding_generation,
+            application_page_admission: slot.application_page_admission(),
+            outcome,
+        };
+        crate::state::poke_watcher(&state);
+        Ok(result)
     })
     .await
     .map_err(|error| error.to_string())?

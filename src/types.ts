@@ -271,6 +271,114 @@ export type ApplicationPageAdmission =
     }
   | { binding_generation: number; authority: "managed_unavailable" };
 
+export interface ManagedApplicationMoveRawRewrite {
+  expected_raw: string;
+  desired_raw: string;
+}
+
+export interface ManagedApplicationMoveRoot {
+  identity: string;
+  raw_rewrite: ManagedApplicationMoveRawRewrite | null;
+}
+
+export type ManagedApplicationMovePlacement =
+  | { placement: "root"; position: number }
+  | { placement: "child"; parent_identity: string; position: number };
+
+export interface ManagedApplicationMoveSubtreesRequest {
+  episode_id: string;
+  source_path: string;
+  source_revision: string;
+  destination_path: string;
+  destination_revision: string;
+  roots: ManagedApplicationMoveRoot[];
+  placement: ManagedApplicationMovePlacement;
+  admission: {
+    application_save_page_blocks: number;
+    application_page_request_text_bytes: number;
+    application_page_max_depth: number;
+  };
+}
+
+export type ManagedApplicationMoveConflict =
+  | "stale_source"
+  | "stale_destination"
+  | "missing_source"
+  | "missing_destination"
+  | "ambiguous_source"
+  | "ambiguous_destination"
+  | "same_page"
+  | "read_only"
+  | "missing_or_foreign_root"
+  | "duplicate_root"
+  | "nested_root"
+  | "missing_or_foreign_parent"
+  | "invalid_placement"
+  | "expected_raw_changed"
+  | "admission_changed"
+  | "destination_too_large"
+  | "destination_too_deep"
+  | "destination_text_too_large"
+  | "episode_mismatch"
+  | "episode_not_committed";
+
+export interface ManagedApplicationMovedPage {
+  page: PageDto;
+  revision: string;
+}
+
+export type ManagedApplicationMovePhase =
+  | "bindings"
+  | "planning"
+  | "draft"
+  | "capture"
+  | "finalize"
+  | "tail_reservation"
+  | "publication"
+  | "archive_stage"
+  | "tail_admission"
+  | "sqlite_drain"
+  | "projection_drain";
+
+export type ManagedApplicationMoveDeferred =
+  | { status: "retryable_external_work" }
+  | {
+      status: "retryable_retained_publication";
+      batch_id: string;
+      phase: ManagedApplicationMovePhase;
+    }
+  | {
+      status: "blocked_recovery";
+      batch_id: string | null;
+      phase: ManagedApplicationMovePhase;
+      retained_publication: boolean;
+    }
+  | {
+      status: "revoked";
+      batch_id: string | null;
+      phase: ManagedApplicationMovePhase;
+    };
+
+export type ManagedApplicationMoveSubtreesOutcome =
+  | {
+      status: "committed";
+      episode_id: string;
+      batch_id: string;
+      recovered: boolean;
+      source: ManagedApplicationMovedPage;
+      destination: ManagedApplicationMovedPage;
+    }
+  | { status: "no_commit"; episode_id: string; reason: ManagedApplicationMoveConflict }
+  | { status: "deferred"; episode_id: string; state: ManagedApplicationMoveDeferred };
+
+/** Binding-tagged X1 result. X2 may install it only if this generation and its
+ * page instances still own the busy episode. */
+export interface ManagedApplicationMoveSubtreesResult {
+  binding_generation: number;
+  application_page_admission: ApplicationPageAdmission;
+  outcome: ManagedApplicationMoveSubtreesOutcome;
+}
+
 export type SparseV2Status = SparseV2Availability & {
   runtime: SparseV2RuntimeStatus | null;
   can_activate: boolean;

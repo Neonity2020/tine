@@ -7,6 +7,8 @@ import type {
   ActivationExpectedRevision,
   ActivationIntent,
   ApplicationPageAdmission,
+  ManagedApplicationMoveSubtreesRequest,
+  ManagedApplicationMoveSubtreesResult,
   AdvancedQueryResult,
   BacklinkFilterContext,
   BacklinkFilterTarget,
@@ -274,6 +276,12 @@ export interface Backend {
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
+  /** X1 native bridge only. Production gesture routing remains disabled until
+   * X2 owns quiescence, leases, publication, and semantic history. */
+  moveManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ): Promise<ManagedApplicationMoveSubtreesResult>;
   sparseV2Status(): Promise<SparseV2Status>;
   onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
   onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
@@ -829,6 +837,15 @@ class TauriBackend implements Backend {
         managedConflictObservation,
       })
     );
+  }
+  moveManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ) {
+    return this.call<ManagedApplicationMoveSubtreesResult>("move_managed_application_subtrees", {
+      bindingGeneration,
+      request,
+    });
   }
   sparseV2Status() {
     return this.call<SparseV2Status>("sparse_v2_status");

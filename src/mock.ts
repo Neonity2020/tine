@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -896,6 +896,20 @@ export function mockBackend(): Backend {
     },
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
       return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
+    },
+    async moveManagedApplicationSubtrees(
+      bindingGeneration: number,
+      request: ManagedApplicationMoveSubtreesRequest,
+    ): Promise<ManagedApplicationMoveSubtreesResult> {
+      return {
+        binding_generation: bindingGeneration,
+        application_page_admission: { binding_generation: bindingGeneration, authority: "direct" },
+        outcome: {
+          status: "no_commit",
+          episode_id: request.episode_id,
+          reason: "admission_changed",
+        },
+      };
     },
     async sparseV2Status() {
       return sparseV2;
