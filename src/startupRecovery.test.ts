@@ -252,6 +252,82 @@ describe("cold-start recovery controller", () => {
     controller.dispose();
   });
 
+  it("restarts an invalidated managed open when cold Return confirmation is declined", async () => {
+    vi.useFakeTimers();
+    const firstOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();
+    const replacementOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();
+    const confirmation = deferred<boolean>();
+    const openGraph = vi.fn()
+      .mockImplementationOnce(() => firstOpen.promise)
+      .mockImplementationOnce(() => replacementOpen.promise);
+    const deps = dependencies({
+      openGraph,
+      confirmColdReturn: vi.fn(() => confirmation.promise),
+    });
+    const controller = createStartupRecoveryController(deps);
+    controller.start();
+    await settle();
+    expect(controller.snapshot()).toMatchObject({
+      mode: "working",
+      operation: "graph_open",
+      attempt: 1,
+    });
+
+    const returning = controller.returnToDirectFiles();
+    confirmation.resolve(false);
+    await settle();
+    expect(openGraph).toHaveBeenCalledTimes(2);
+    expect(controller.snapshot()).toMatchObject({
+      mode: "working",
+      operation: "graph_open",
+      attempt: 2,
+    });
+
+    firstOpen.resolve({ kind: "loaded", root: "/graphs/alpha" });
+    await settle();
+    expect(deps.completeFirstLoad).not.toHaveBeenCalled();
+
+    replacementOpen.resolve({ kind: "already_current", root: "/graphs/alpha" });
+    await returning;
+    expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
+    expect(controller.snapshot().mode).toBe("idle");
+    expect(vi.getTimerCount()).toBe(0);
+    controller.dispose();
+  });
+
+  it("restarts an invalidated managed open when a timed-out confirmation later declines", async () => {
+    vi.useFakeTimers();
+    const firstOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();
+    const confirmation = deferred<boolean>();
+    const openGraph = vi.fn()
+      .mockImplementationOnce(() => firstOpen.promise)
+      .mockResolvedValueOnce({ kind: "already_current", root: "/graphs/alpha" });
+    const deps = dependencies({
+      openGraph,
+      confirmColdReturn: vi.fn(() => confirmation.promise),
+      actionWatchdogMs: 500,
+    });
+    const controller = createStartupRecoveryController(deps);
+    controller.start();
+    await settle();
+
+    const returning = controller.returnToDirectFiles();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(controller.snapshot()).toMatchObject({ mode: "recovery", phase: "native.unavailable" });
+
+    confirmation.resolve(false);
+    await returning;
+    expect(openGraph).toHaveBeenCalledTimes(2);
+    expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
+    expect(controller.snapshot().mode).toBe("idle");
+    expect(vi.getTimerCount()).toBe(0);
+
+    firstOpen.resolve({ kind: "loaded", root: "/graphs/alpha" });
+    await settle();
+    expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
   it("uses the privacy-safe native phase vocabulary without accepting it as an outcome", async () => {
     vi.useFakeTimers();
     const lookup = deferred<string | null>();

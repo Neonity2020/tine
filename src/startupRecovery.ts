@@ -338,6 +338,10 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
     const approved = await deps.confirmColdReturn(startupGraphName(previous.target));
     if (attempt !== sequence || disposed) return;
     if (!approved) {
+      if (previous.mode === "working" && previous.operation === "graph_open") {
+        await completeOpen(attempt, previous.target, previous.startedAt);
+        return;
+      }
       if (watchdog !== undefined) clearTimeout(watchdog);
       watchdog = undefined;
       setSnapshot({ ...previous, attempt, startedAt, elapsedMs: Math.max(0, now() - startedAt) });
