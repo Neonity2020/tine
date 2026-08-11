@@ -66,8 +66,6 @@ use crate::oplog::enrollment::{
 use crate::oplog::exact_external_feed::{
     ExactExternalFeedDrain, ExactExternalFeedObserveError, ExactExternalFeedState,
 };
-#[cfg(test)]
-use crate::oplog::hot_engine::PendingLocalAcceptedProjectionBindingMutation;
 use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
 use crate::oplog::import::{
     prepare_inactive_bootstrap_import_with_progress, publish_install_verify_inactive_bootstrap,
@@ -105,8 +103,8 @@ use crate::oplog::object_store::{
 };
 #[cfg(test)]
 use crate::oplog::operational_coordinator::{
-    act_once_at, fail_repeatedly_at, last_trusted_local_preparation_stage_timings,
-    OperationalFaultPoint, TrustedLocalPreparationStageTimings,
+    fail_repeatedly_at, last_trusted_local_preparation_stage_timings, OperationalFaultPoint,
+    TrustedLocalPreparationStageTimings,
 };
 use crate::oplog::operational_coordinator::{
     LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
@@ -4004,85 +4002,6 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
-    fn save_editor_page_from_projected_source_rebase_for_test(
-        &self,
-        page_id: PageId,
-        block_index: usize,
-        content: String,
-    ) -> Result<Result<SyncEditorSaveOutcome, SyncEditorRequestError>, SyncRuntimeRequestError>
-    {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(
-            ActorRequest::SaveEditorPageFromProjectedSourceRebaseForTest {
-                page_id,
-                block_index,
-                content,
-                reply: reply_sender,
-            },
-        )?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
-    fn pending_local_evidence_rejects_rewritten_root_for_test(
-        &self,
-        page_id: PageId,
-    ) -> Result<bool, SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(
-            ActorRequest::PendingLocalEvidenceRejectsRewrittenRootForTest {
-                page_id,
-                reply: reply_sender,
-            },
-        )?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
-    fn pending_local_evidence_rejects_rewritten_acquisition_for_test(
-        &self,
-        page_id: PageId,
-    ) -> Result<bool, SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(
-            ActorRequest::PendingLocalEvidenceRejectsRewrittenAcquisitionForTest {
-                page_id,
-                reply: reply_sender,
-            },
-        )?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
-    fn pending_local_evidence_rejects_binding_mutation_for_test(
-        &self,
-        page_id: PageId,
-        mutation: PendingLocalAcceptedProjectionBindingMutation,
-    ) -> Result<(bool, bool), SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(
-            ActorRequest::PendingLocalEvidenceRejectsBindingMutationForTest {
-                page_id,
-                mutation,
-                reply: reply_sender,
-            },
-        )?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
     fn reset_managed_application_query_instrumentation(
         &self,
     ) -> Result<(), SyncRuntimeRequestError> {
@@ -4210,24 +4129,6 @@ impl SyncRuntimeHandle {
         self.send(ActorRequest::InstallRepeatedOperationalFault {
             point,
             failures,
-            reply: reply_sender,
-        })?;
-        reply_receiver
-            .recv()
-            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
-    }
-
-    #[cfg(test)]
-    fn install_operational_action_for_test(
-        &self,
-        point: OperationalFaultPoint,
-        action: impl FnOnce() + Send + 'static,
-    ) -> Result<(), SyncRuntimeRequestError> {
-        let _operation = self.inner.operation.lock().unwrap();
-        let (reply_sender, reply_receiver) = mpsc::channel();
-        self.send(ActorRequest::InstallOperationalActionForTest {
-            point,
-            action: Box::new(action),
             reply: reply_sender,
         })?;
         reply_receiver
@@ -7016,29 +6917,6 @@ enum ActorRequest {
         reply: mpsc::Sender<()>,
     },
     #[cfg(test)]
-    SaveEditorPageFromProjectedSourceRebaseForTest {
-        page_id: PageId,
-        block_index: usize,
-        content: String,
-        reply: mpsc::Sender<Result<SyncEditorSaveOutcome, SyncEditorRequestError>>,
-    },
-    #[cfg(test)]
-    PendingLocalEvidenceRejectsRewrittenRootForTest {
-        page_id: PageId,
-        reply: mpsc::Sender<bool>,
-    },
-    #[cfg(test)]
-    PendingLocalEvidenceRejectsRewrittenAcquisitionForTest {
-        page_id: PageId,
-        reply: mpsc::Sender<bool>,
-    },
-    #[cfg(test)]
-    PendingLocalEvidenceRejectsBindingMutationForTest {
-        page_id: PageId,
-        mutation: PendingLocalAcceptedProjectionBindingMutation,
-        reply: mpsc::Sender<(bool, bool)>,
-    },
-    #[cfg(test)]
     ResetManagedApplicationQueryInstrumentation { reply: mpsc::Sender<()> },
     #[cfg(test)]
     ManagedApplicationQueryInstrumentation {
@@ -7071,12 +6949,6 @@ enum ActorRequest {
     InstallRepeatedOperationalFault {
         point: OperationalFaultPoint,
         failures: u8,
-        reply: mpsc::Sender<()>,
-    },
-    #[cfg(test)]
-    InstallOperationalActionForTest {
-        point: OperationalFaultPoint,
-        action: Box<dyn FnOnce() + Send>,
         reply: mpsc::Sender<()>,
     },
     #[cfg(test)]
@@ -7366,138 +7238,6 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
-            ActorRequest::SaveEditorPageFromProjectedSourceRebaseForTest {
-                page_id,
-                block_index,
-                content,
-                reply,
-            } => {
-                let result = (|| {
-                    let runtime = actor
-                        .runtime
-                        .as_ref()
-                        .ok_or(SyncEditorRequestError::ActorUnavailable)?;
-                    let current = load_projected_source_rebased_application_page(
-                        runtime,
-                        &actor.graph,
-                        page_id,
-                    )?
-                    .ok_or(SyncEditorRequestError::ActorRefused)?;
-                    let mut blocks = current.editor.dto.blocks.clone();
-                    let block = blocks.get_mut(block_index).ok_or(
-                        SyncEditorRequestError::InvalidRequest(
-                            SyncEditorInvalidRequest::InvalidExistingId,
-                        ),
-                    )?;
-                    block.content = content;
-                    let request = SyncEditorSaveRequest {
-                        target: SyncEditorSaveTarget::Existing {
-                            page_id: current.editor.page.page_id.to_string(),
-                            revision: current.editor.dto.revision.clone(),
-                        },
-                        preamble: current.editor.dto.preamble.clone(),
-                        blocks,
-                    };
-                    actor.save_editor_page_with_existing_application(request, Some(current))
-                })();
-                let _ = reply.send(result);
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::PendingLocalEvidenceRejectsRewrittenRootForTest { page_id, reply } => {
-                reset_prepared_editor_projection_instrumentation();
-                let rejected = (|| {
-                    let runtime = actor.runtime.as_ref()?;
-                    let before = runtime
-                        .engine()
-                        .materialize_page_for_projection(page_id)
-                        .ok()?;
-                    let base = actor
-                        .graph
-                        .read_projection_input(&before.page.path)
-                        .ok()??;
-                    actor
-                        .runtime
-                        .as_mut()?
-                        .engine_mut_for_test()
-                        .pending_local_accepted_projection_rejects_rewritten_root_for_test(
-                            &before.page,
-                            &base,
-                        )
-                        .ok()
-                })()
-                .unwrap_or(false);
-                let _ = reply.send(rejected);
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::PendingLocalEvidenceRejectsRewrittenAcquisitionForTest {
-                page_id,
-                reply,
-            } => {
-                reset_prepared_editor_projection_instrumentation();
-                let rejected = (|| {
-                    let runtime = actor.runtime.as_ref()?;
-                    let before = runtime
-                        .engine()
-                        .materialize_page_for_projection(page_id)
-                        .ok()?;
-                    let base = actor
-                        .graph
-                        .read_projection_input(&before.page.path)
-                        .ok()??;
-                    let mut evidence = runtime
-                        .engine()
-                        .pending_local_accepted_projection_evidence(&before.page, &base)
-                        .ok()??;
-                    if !evidence.still_binds(runtime.engine(), &before) {
-                        return Some(false);
-                    }
-                    evidence.replace_occupied_acquisition_for_test(BatchId::from_uuid(
-                        Uuid::from_u128(0xa142_a000),
-                    ));
-                    Some(!evidence.still_binds(runtime.engine(), &before))
-                })()
-                .unwrap_or(false);
-                let _ = reply.send(rejected);
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::PendingLocalEvidenceRejectsBindingMutationForTest {
-                page_id,
-                mutation,
-                reply,
-            } => {
-                reset_prepared_editor_projection_instrumentation();
-                let rejected = (|| {
-                    let (before, base) = {
-                        let runtime = actor.runtime.as_ref()?;
-                        let before = runtime
-                            .engine()
-                            .materialize_page_for_projection(page_id)
-                            .ok()?;
-                        let base = actor
-                            .graph
-                            .read_projection_input(&before.page.path)
-                            .ok()??;
-                        Some((before, base))
-                    }?;
-                    actor
-                        .runtime
-                        .as_mut()?
-                        .engine_mut_for_test()
-                        .pending_local_accepted_projection_rejects_binding_mutation_for_test(
-                            &before.page,
-                            &base,
-                            mutation,
-                        )
-                        .ok()
-                })()
-                .unwrap_or((false, false));
-                let _ = reply.send(rejected);
-                false
-            }
-            #[cfg(test)]
             ActorRequest::ResetManagedApplicationQueryInstrumentation { reply } => {
                 actor.reset_managed_application_query_instrumentation();
                 let _ = reply.send(());
@@ -7556,19 +7296,6 @@ fn run_actor_loop(
                 reply,
             } => {
                 fail_repeatedly_at(point, failures);
-                let _ = reply.send(());
-                false
-            }
-            #[cfg(test)]
-            ActorRequest::InstallOperationalActionForTest {
-                point,
-                action,
-                reply,
-            } => {
-                // The coordinator's action slot is thread-local by design, so
-                // install this test-only race on the actor that will execute
-                // the real capture/finalization boundary.
-                act_once_at(point, action);
                 let _ = reply.send(());
                 false
             }
@@ -14886,26 +14613,13 @@ impl RuntimeActor {
                             .editor_exact_base_read
                             .saturating_add(exact_base_started.elapsed());
                     });
-                    let accepted_pending_local_evidence = runtime
-                        .engine()
-                        .pending_local_accepted_projection_evidence(&current.page, &base)
-                        .map_err(|_| {
-                            SyncEditorRequestError::ActorRefusedAt(
-                                "authenticating the accepted page baseline",
-                            )
-                        })?;
                     let prepared_editor_projection =
-                        PreparedEditorProjection::prepare_with_pending_local_accepted_projection(
-                            requested_page,
-                            &current.page,
-                            base,
-                            accepted_pending_local_evidence,
-                        )
-                        .map_err(|_| {
-                            SyncEditorRequestError::ActorRefusedAt(
-                                "rendering the requested page edit",
-                            )
-                        })?;
+                        PreparedEditorProjection::prepare(requested_page, &current.page, base)
+                            .map_err(|_| {
+                                SyncEditorRequestError::ActorRefusedAt(
+                                    "rendering the requested page edit",
+                                )
+                            })?;
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
                         let projection = prepared_editor_projection_instrumentation();
@@ -14915,9 +14629,8 @@ impl RuntimeActor {
                         timings.editor_target_projection_render = timings
                             .editor_target_projection_render
                             .saturating_add(projection.target_render);
-                        timings.editor_accepted_renders = timings
-                            .editor_accepted_renders
-                            .saturating_add(projection.accepted_projection_full_renders);
+                        timings.editor_accepted_renders =
+                            timings.editor_accepted_renders.saturating_add(1);
                         timings.editor_accepted_rendered_blocks = timings
                             .editor_accepted_rendered_blocks
                             .saturating_add(projection.accepted_blocks_visited);
@@ -27920,14 +27633,6 @@ mod tests {
             .expect("ordinary save exposes prepared-projection instrumentation");
         let counters = instrumentation.prepared_editor_projection;
         assert_eq!(counters.created, 1);
-        assert_eq!(counters.accepted_projection_full_renders, 1);
-        assert_eq!(counters.accepted_projection_affine_attempts, 0);
-        assert_eq!(counters.accepted_projection_affine_reuses, 0);
-        assert_eq!(counters.accepted_projection_affine_fallbacks, 0);
-        assert_eq!(
-            counters.accepted_projection_selector_hot_materializations,
-            0
-        );
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
         assert_eq!(counters.finalizer_post_state_render, 0);
@@ -27994,19 +27699,6 @@ mod tests {
         );
         let counters = instrumentation.prepared_editor_projection;
         assert_eq!(counters.created, 1);
-        assert_eq!(counters.accepted_projection_full_renders, 0);
-        assert_eq!(counters.accepted_projection_affine_attempts, 1);
-        assert_eq!(counters.accepted_projection_affine_reuses, 1);
-        assert_eq!(counters.accepted_projection_affine_fallbacks, 0);
-        assert_eq!(
-            counters.accepted_projection_selector_hot_materializations,
-            1
-        );
-        assert!(
-            counters.accepted_projection_affine_target_bytes > 0
-                && counters.accepted_projection_affine_annotation_count > 0,
-            "the reused accepted half retains real exact bytes and annotations"
-        );
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
         assert_eq!(counters.finalizer_post_state_render, 0);
@@ -28094,24 +27786,8 @@ mod tests {
     #[ignore = "GH #310: one non-round-tripping Org file makes activation fail for the whole graph"]
     #[test]
     fn affine_before_projection_matches_forced_generic_application_save() {
-        #[derive(Debug)]
-        struct Run {
-            page: PageDto,
-            target: Vec<u8>,
-            frames: Vec<LocalJournalFrame<ManagedLocalJournalPayloadKind>>,
-            records: Vec<crate::oplog::hot_engine::ManagedLocalRecord>,
-            graph: BTreeMap<String, Vec<u8>>,
-            archive: BTreeMap<String, Vec<u8>>,
-            receipts: BTreeMap<String, Vec<u8>>,
-            drained: PageDto,
-            reopened: PageDto,
-            detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
-            prepared: crate::oplog::projection::PreparedEditorProjectionInstrumentation,
-        }
-
         let run = |label: &str, force_generic: bool| {
             let fixture = ActivationFixture::empty(label, 0xa13f);
-            let runtime_request = reopen_request(&fixture.request);
             let source = (0..4)
                 .map(|index| format!("- before {index}\r\n"))
                 .collect::<String>();
@@ -28161,731 +27837,31 @@ mod tests {
             let (second, _) =
                 accepted_application_save(&handle, second.unwrap(), "Tine", SyncPageKind::Page);
             let target = fs::read(fixture.graph_root.join(&second.path)).unwrap();
-            let instrumentation = handle
+            let detail = handle
                 .managed_application_save_instrumentation()
-                .expect("second save reports local mutation detail");
-            let detail = instrumentation.local_mutation_detail;
-            let prepared = instrumentation.prepared_editor_projection;
-            let frames = managed_local_journal_frames(&runtime_request);
-            let records = frames
-                .iter()
-                .map(|frame| decode_managed_local_record(frame).unwrap())
-                .collect();
+                .expect("second save reports local mutation detail")
+                .local_mutation_detail;
 
             drain_managed_local(&handle);
-            let drained = load_application_exact(&handle, &second.path).0;
-            let graph = user_graph_bytes(&fixture.graph_root);
-            let archive = file_tree_bytes(&runtime_request.archive_root);
-            let receipts = file_tree_bytes(&runtime_request.receipt_root);
             assert!(matches!(
                 handle.clean_shutdown().unwrap(),
                 SyncShutdownOutcome::Safe(_)
             ));
-            let reopened = active_handle(SyncRuntimeHandle::open(runtime_request));
-            drive_initial_feed(&reopened);
-            let clean_reopen = load_application_exact(&reopened, &second.path).0;
-            assert!(matches!(
-                reopened.clean_shutdown().unwrap(),
-                SyncShutdownOutcome::Safe(_)
-            ));
-            Run {
-                page: second,
-                target,
-                frames,
-                records,
-                graph,
-                archive,
-                receipts,
-                drained,
-                reopened: clean_reopen,
-                detail,
-                prepared,
-            }
+            (second, target, detail)
         };
 
         let generic = run("before-projection-generic", true);
         let affine = run("before-projection-affine", false);
 
-        assert_parser_dto_semantics(&generic.page, &affine.page);
-        assert_eq!(generic.target, affine.target);
-        assert_eq!(generic.graph, affine.graph, "drained graph projection");
-        assert_parser_dto_semantics(&generic.drained, &affine.drained);
-        assert_parser_dto_semantics(&generic.reopened, &affine.reopened);
-        assert_eq!(generic.records.len(), affine.records.len());
-        assert_eq!(
-            generic
-                .frames
-                .iter()
-                .map(|frame| (frame.device_id(), frame.sequence(), frame.payload_kind()))
-                .collect::<Vec<_>>(),
-            affine
-                .frames
-                .iter()
-                .map(|frame| (frame.device_id(), frame.sequence(), frame.payload_kind()))
-                .collect::<Vec<_>>(),
-            "journal append order"
-        );
-        for run in [&generic, &affine] {
-            // New batches deliberately mint fresh causal and batch IDs. Thus
-            // raw payload equality across two independent authoring runs is
-            // not a meaningful oracle. Decode each physical frame instead:
-            // `PreparedBatch::new` authenticates the complete manifest/object
-            // set, and `ManifestedProjectionIntent::new` authenticates its
-            // target, annotation, frontier, and claim evidence.
-            assert_eq!(run.frames.len(), run.records.len());
-            assert!(!run.archive.is_empty(), "drain published archive authority");
-            assert!(
-                !run.receipts.is_empty(),
-                "drain published receipt authority"
-            );
-            for (frame, record) in run.frames.iter().zip(&run.records) {
-                assert_eq!(frame.sequence(), record.sequence());
-                assert_eq!(
-                    frame.payload_kind(),
-                    ManagedLocalJournalPayloadKind::RecordV1
-                );
-                assert!(
-                    !frame.payload().is_empty(),
-                    "complete retained frame payload"
-                );
-                assert!(!record.prepared_batch().objects().is_empty());
-            }
-            let last = run.records.last().expect("second save retained a record");
-            let intent = last.projection().intent();
-            assert_eq!(intent.target().bytes(), Some(run.target.as_slice()));
-            assert_eq!(intent.path().as_str(), run.page.path);
-            assert_eq!(intent.target().annotations().len(), run.page.blocks.len());
-            assert!(!intent.post_frontier().documents().is_empty());
-        }
-        assert_eq!(generic.detail.before_projection_full_materializations, 1);
-        assert_eq!(generic.detail.before_projection_affine_attempts, 0);
-        assert_eq!(generic.detail.before_projection_affine_reuses, 0);
-        assert_eq!(generic.prepared.accepted_projection_full_renders, 1);
-        assert_eq!(generic.prepared.accepted_projection_affine_attempts, 0);
-        assert_eq!(generic.prepared.accepted_projection_affine_reuses, 0);
-        assert_eq!(
-            generic
-                .prepared
-                .accepted_projection_selector_hot_materializations,
-            0
-        );
-        assert_eq!(affine.detail.before_projection_full_materializations, 0);
-        assert_eq!(affine.detail.before_projection_affine_attempts, 1);
-        assert_eq!(affine.detail.before_projection_affine_reuses, 1);
-        assert_eq!(affine.detail.before_projection_affine_fallbacks, 0);
-        assert_eq!(affine.prepared.accepted_projection_full_renders, 0);
-        assert_eq!(affine.prepared.accepted_projection_affine_attempts, 1);
-        assert_eq!(affine.prepared.accepted_projection_affine_reuses, 1);
-        assert_eq!(
-            affine
-                .prepared
-                .accepted_projection_selector_hot_materializations,
-            1
-        );
-    }
-
-    #[test]
-    fn sqlite_rebased_stale_order_falls_back_without_refusing_the_next_application_save() {
-        let fixture = ActivationFixture::empty("accepted-render-rebased-stale-order", 0xa140);
-        let runtime_request = reopen_request(&fixture.request);
-        let source = b"- first\n- second\n- third\n";
-        fs::write(fixture.graph_root.join("Tine.md"), source).unwrap();
-
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
-
-        let (mut reordered, revision) =
-            load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        reordered.blocks.swap(0, 1);
-        let (_reordered, _revision) = accepted_application_save(
-            &handle,
-            handle
-                .save_application_page(SyncApplicationPageSaveRequest {
-                    target: SyncApplicationPageSaveTarget::Existing {
-                        path: reordered.path.clone(),
-                        revision,
-                    },
-                    page: reordered,
-                })
-                .unwrap(),
-            "Tine",
-            SyncPageKind::Page,
-        );
-
-        let page_id =
-            parse_editor_page_id(&load_editor_named(&handle, "Tine", SyncPageKind::Page).page_id)
-                .unwrap();
-        // SQLite still presents its pre-reorder rows here, while Graph and the
-        // hot engine contain the pending-local order. Feed that exact
-        // source-rebased SQLite preparation through the editor save seam. We
-        // edit the unaffected third root, so the test isolates eligibility
-        // rather than asking stale order metadata to choose a different block.
-        let outcome = handle
-            .save_editor_page_from_projected_source_rebase_for_test(
-                page_id,
-                2,
-                "after stale-order rebase".into(),
-            )
-            .unwrap()
-            .unwrap();
-        let SyncEditorSaveOutcome::Durable { page, .. } = outcome else {
-            panic!("ineligible accepted-render reuse must use the generic editor save, not refuse")
-        };
-        assert_eq!(page.blocks[2].content, "after stale-order rebase");
-        let expected_root_order = page
-            .blocks
-            .iter()
-            .map(|block| block.content.clone())
-            .collect::<Vec<_>>();
-
-        let prepared = handle
-            .managed_application_save_instrumentation()
-            .expect("stale rebase save exposes projection instrumentation")
-            .prepared_editor_projection;
-        assert_eq!(prepared.accepted_projection_full_renders, 1);
-        assert_eq!(prepared.accepted_projection_affine_attempts, 1);
-        assert_eq!(prepared.accepted_projection_affine_reuses, 0);
-        assert_eq!(prepared.accepted_projection_affine_fallbacks, 1);
-        assert_eq!(
-            prepared.accepted_projection_selector_hot_materializations,
-            1
-        );
-        assert_eq!(managed_local_journal_frames(&runtime_request).len(), 2);
-
-        drain_managed_local(&handle);
-        let (drained, _) = load_application_exact(&handle, &page.path);
-        assert_eq!(
-            drained
-                .blocks
-                .iter()
-                .map(|block| block.raw.clone())
-                .collect::<Vec<_>>(),
-            expected_root_order,
-            "the pending sibling order survives publication into SQLite"
-        );
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-        let reopened = active_handle(SyncRuntimeHandle::open(runtime_request));
-        drive_initial_feed(&reopened);
-        let (recovered, _) = load_application_exact(&reopened, &page.path);
-        assert_eq!(
-            recovered
-                .blocks
-                .iter()
-                .map(|block| block.raw.clone())
-                .collect::<Vec<_>>(),
-            expected_root_order,
-            "the fallback result and sibling order survive clean reopen"
-        );
-        assert!(matches!(
-            reopened.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn sqlite_source_rebase_equal_to_hot_state_reuses_the_accepted_render() {
-        let fixture = ActivationFixture::empty("accepted-render-rebased-equal", 0xa141);
-        fs::write(
-            fixture.graph_root.join("Tine.md"),
-            b"- first\n- second\n- third\n",
-        )
-        .unwrap();
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        let (_saved, _revision) =
-            save_application_block_text(&handle, page, revision, "first pending-local change");
-        let page_id =
-            parse_editor_page_id(&load_editor_named(&handle, "Tine", SyncPageKind::Page).page_id)
-                .unwrap();
-
-        // The SQLite identity map is older than the first local mutation, but
-        // rebasing it onto the exact Graph source produces the same complete
-        // materialized page as the hot engine.  That is eligible evidence.
-        let outcome = handle
-            .save_editor_page_from_projected_source_rebase_for_test(
-                page_id,
-                2,
-                "after equal source rebase".into(),
-            )
-            .unwrap()
-            .unwrap();
-        let SyncEditorSaveOutcome::Durable { page, .. } = outcome else {
-            panic!("equal source rebase must remain a durable editor save")
-        };
-        assert_eq!(page.blocks[2].content, "after equal source rebase");
-
-        let prepared = handle
-            .managed_application_save_instrumentation()
-            .expect("equal rebase save exposes projection instrumentation")
-            .prepared_editor_projection;
-        assert_eq!(prepared.accepted_projection_full_renders, 0);
-        assert_eq!(prepared.accepted_projection_affine_attempts, 1);
-        assert_eq!(prepared.accepted_projection_affine_reuses, 1);
-        assert_eq!(prepared.accepted_projection_affine_fallbacks, 0);
-        assert_eq!(
-            prepared.accepted_projection_selector_hot_materializations,
-            1
-        );
-        drain_managed_local(&handle);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn accepted_render_reuse_keeps_claimed_cross_home_block_references_on_the_generic_before_state_path(
-    ) {
-        let fixture = ActivationFixture::empty("accepted-render-claimed-cross-home", 0xa145);
-        let local_uuid = "11111111-1111-4111-8111-111111111111";
-        let remote_uuid = "22222222-2222-4222-8222-222222222222";
-        fs::write(
-            fixture.graph_root.join("Other.md"),
-            format!("- remote UUID authority\n  id:: {remote_uuid}\n"),
-        )
-        .unwrap();
-        fs::write(
-            fixture.graph_root.join("Tine.md"),
-            format!("- local UUID authority references (({remote_uuid}))\n  id:: {local_uuid}\n"),
-        )
-        .unwrap();
-        let runtime_request = reopen_request(&fixture.request);
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        let (first, first_revision) = save_application_block_text(
-            &handle,
-            page,
-            revision,
-            &format!("first claimed local edit references (({remote_uuid}))\nid:: {local_uuid}"),
-        );
-        let (second, second_revision) = save_application_block_text(
-            &handle,
-            first,
-            first_revision,
-            &format!("second claimed local edit references (({remote_uuid}))\nid:: {local_uuid}"),
-        );
-
-        let instrumentation = handle
-            .managed_application_save_instrumentation()
-            .expect("claimed cross-home successor exposes projection instrumentation");
-        let prepared = instrumentation.prepared_editor_projection;
-        assert_eq!(prepared.accepted_projection_full_renders, 0);
-        assert_eq!(prepared.accepted_projection_affine_attempts, 1);
-        assert_eq!(prepared.accepted_projection_affine_reuses, 1);
-        assert_eq!(prepared.accepted_projection_affine_fallbacks, 0);
-        assert_eq!(
-            prepared.accepted_projection_selector_hot_materializations, 1,
-            "the selector authenticates the complete hot state before it reuses the accepted bytes"
-        );
-        let detail = instrumentation.local_mutation_detail;
-        assert_eq!(detail.before_projection_affine_attempts, 1);
-        assert_eq!(detail.before_projection_affine_reuses, 0);
-        assert_eq!(detail.before_projection_affine_fallbacks, 1);
-        assert_eq!(detail.before_projection_full_materializations, 1);
-
-        let frames = managed_local_journal_frames(&runtime_request);
-        assert_eq!(frames.len(), 2);
-        let successor = decode_managed_local_record(frames.last().unwrap()).unwrap();
-        assert!(
-            successor.projection().intent().claim_evidence().len() >= 2,
-            "the successor retains both the local UUID claim and its cross-home referenced UUID"
-        );
-        assert!(
-            successor
-                .projection()
-                .intent()
-                .post_frontier()
-                .documents()
-                .len()
-                >= 3,
-            "the successor frontier retains local home, remote reference home, and catalog authority"
-        );
-        let SyncApplicationNavigationOutcome::Loaded {
-            reply: SyncApplicationNavigationReply::BlockReferrers(referrers),
-        } = handle
-            .application_navigation(SyncApplicationNavigationRequest::BlockReferrers {
-                uuid: remote_uuid.into(),
-                max_rows: 64,
-                max_bytes: 64 * 1024,
-            })
-            .unwrap()
-        else {
-            panic!("claimed successor did not produce a block-referrer reply")
-        };
-        assert_eq!(referrers.total, 1);
-        assert!(referrers.groups[0].blocks[0]
-            .raw
-            .contains("second claimed local edit"));
-
-        drain_managed_local(&handle);
-        let (drained, drained_revision) = load_application_exact(&handle, &second.path);
-        assert_eq!(drained_revision, second_revision);
-        assert!(drained.blocks[0].raw.contains(remote_uuid));
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-        let reopened = active_handle(SyncRuntimeHandle::open(runtime_request));
-        drive_initial_feed(&reopened);
-        let (reopened_page, reopened_revision) = load_application_exact(&reopened, &second.path);
-        assert_eq!(reopened_revision, second_revision);
-        assert_eq!(
-            serde_json::to_value(reopened_page).unwrap(),
-            serde_json::to_value(drained).unwrap(),
-            "the accepted-render shortcut must leave the drained/reopened user page unchanged"
-        );
-        assert!(matches!(
-            reopened.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn accepted_render_reuse_keeps_external_writes_before_and_after_capture_out_of_the_journal() {
-        for (label, point) in [
-            ("before-capture", OperationalFaultPoint::AfterDraft),
-            ("after-capture", OperationalFaultPoint::AfterCapture),
-        ] {
-            let fixture = ActivationFixture::empty(
-                &format!("accepted-render-external-{label}"),
-                if point == OperationalFaultPoint::AfterDraft {
-                    0xa143
-                } else {
-                    0xa144
-                },
-            );
-            let runtime_request = reopen_request(&fixture.request);
-            let path = fixture.graph_root.join("Tine.md");
-            fs::write(&path, b"- first\n").unwrap();
-            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-            let handle = activated.handle.expect("activation retains a runtime");
-            drive_initial_feed(&handle);
-
-            let (page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
-            let (_saved, _revision) =
-                save_application_block_text(&handle, page, revision, "first pending-local change");
-            let frames_before = managed_local_journal_frames(&runtime_request);
-            let foreign = format!("- external {label} write\n").into_bytes();
-            let (written, observed) = mpsc::channel();
-            let write_path = path.clone();
-            handle
-                .install_operational_action_for_test(point, move || {
-                    fs::write(write_path, &foreign).unwrap();
-                    written.send(()).unwrap();
-                })
-                .unwrap();
-
-            let (mut page, revision) =
-                load_application_logical(&handle, "Tine", SyncPageKind::Page);
-            page.blocks[0].raw = "attempted local successor".into();
-            let outcome = handle.save_application_page(SyncApplicationPageSaveRequest {
-                target: SyncApplicationPageSaveTarget::Existing {
-                    path: page.path.clone(),
-                    revision,
-                },
-                page,
-            });
-            observed
-                .recv()
-                .expect("actor executed the requested external-write race");
-            assert!(
-                !matches!(outcome, Ok(SyncApplicationPageSaveOutcome::Saved { .. })),
-                "{label}: a captured external write must not produce a durable local response: {outcome:?}"
-            );
-            assert_eq!(
-                fs::read(&path).unwrap(),
-                format!("- external {label} write\n").into_bytes(),
-                "{label}: the local save must not overwrite the external source"
-            );
-            assert_eq!(
-                managed_local_journal_frames(&runtime_request),
-                frames_before,
-                "{label}: refusal occurs before a successor journal append"
-            );
-            drop(handle);
-        }
-    }
-
-    #[test]
-    fn accepted_render_selector_rejects_a_rewritten_portable_path_root_before_hot_materialization()
-    {
-        let fixture = ActivationFixture::empty("accepted-render-root-selector", 0xa142);
-        fs::write(fixture.graph_root.join("Tine.md"), b"- first\n").unwrap();
-
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        let (_saved, _revision) = save_application_block_text(
-            &handle,
-            page,
-            revision,
-            "first content change establishes the pending-local predecessor",
-        );
-        let page_id =
-            parse_editor_page_id(&load_editor_named(&handle, "Tine", SyncPageKind::Page).page_id)
-                .unwrap();
-        assert!(handle
-            .pending_local_evidence_rejects_rewritten_root_for_test(page_id)
-            .unwrap());
-
-        let prepared = handle
-            .managed_application_save_instrumentation()
-            .expect("root selector check exposes projection instrumentation")
-            .prepared_editor_projection;
-        assert_eq!(prepared.accepted_projection_full_renders, 0);
-        assert_eq!(prepared.accepted_projection_affine_attempts, 1);
-        assert_eq!(prepared.accepted_projection_affine_reuses, 0);
-        assert_eq!(prepared.accepted_projection_affine_fallbacks, 1);
-        assert_eq!(
-            prepared.accepted_projection_selector_hot_materializations,
-            0
-        );
-
-        drain_managed_local(&handle);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn accepted_render_evidence_rejects_a_different_exact_occupied_acquisition() {
-        let fixture = ActivationFixture::empty("accepted-render-acquisition-evidence", 0xa143);
-        fs::write(fixture.graph_root.join("Tine.md"), b"- first\n").unwrap();
-
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        let (_saved, _revision) = save_application_block_text(
-            &handle,
-            page,
-            revision,
-            "first content change establishes the pending-local predecessor",
-        );
-        let page_id =
-            parse_editor_page_id(&load_editor_named(&handle, "Tine", SyncPageKind::Page).page_id)
-                .unwrap();
-        assert!(handle
-            .pending_local_evidence_rejects_rewritten_acquisition_for_test(page_id)
-            .unwrap());
-
-        let prepared = handle
-            .managed_application_save_instrumentation()
-            .expect("acquisition evidence check exposes projection instrumentation")
-            .prepared_editor_projection;
-        assert_eq!(prepared.accepted_projection_full_renders, 0);
-        assert_eq!(prepared.accepted_projection_affine_attempts, 1);
-        assert_eq!(prepared.accepted_projection_affine_reuses, 0);
-        assert_eq!(prepared.accepted_projection_affine_fallbacks, 0);
-        assert_eq!(
-            prepared.accepted_projection_selector_hot_materializations,
-            1
-        );
-
-        drain_managed_local(&handle);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn accepted_render_selector_and_evidence_bind_every_pending_local_field() {
-        let fixture = ActivationFixture::empty("accepted-render-binding-matrix", 0xa144);
-        let runtime_request = reopen_request(&fixture.request);
-        fs::write(fixture.graph_root.join("Tine.md"), b"- first\n").unwrap();
-
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        let (_saved, _revision) = save_application_block_text(
-            &handle,
-            page,
-            revision,
-            "first content change establishes the pending-local predecessor",
-        );
-        let page_id =
-            parse_editor_page_id(&load_editor_named(&handle, "Tine", SyncPageKind::Page).page_id)
-                .unwrap();
-        let graph_before = user_graph_bytes(&fixture.graph_root);
-        let journal_before = managed_local_tuple_bytes_for_test(&runtime_request);
-
-        // A mutation made before selection must make the selector decline. An
-        // annotation-only rewrite is special: a fresh selector has no external
-        // annotation oracle, but already-issued evidence must still fail its
-        // exact rebind before the draft can use it.
-        for (label, mutation, selector_rejected) in [
-            (
-                "endpoint",
-                PendingLocalAcceptedProjectionBindingMutation::Endpoint,
-                true,
-            ),
-            (
-                "path",
-                PendingLocalAcceptedProjectionBindingMutation::Path,
-                true,
-            ),
-            (
-                "portable path root",
-                PendingLocalAcceptedProjectionBindingMutation::PortablePathRoot,
-                true,
-            ),
-            (
-                "overlay sequence",
-                PendingLocalAcceptedProjectionBindingMutation::OverlaySequence,
-                true,
-            ),
-            (
-                "source batch",
-                PendingLocalAcceptedProjectionBindingMutation::SourceBatch,
-                true,
-            ),
-            (
-                "frontier",
-                PendingLocalAcceptedProjectionBindingMutation::Frontier,
-                true,
-            ),
-            (
-                "claims",
-                PendingLocalAcceptedProjectionBindingMutation::Claims,
-                true,
-            ),
-            (
-                "target bytes",
-                PendingLocalAcceptedProjectionBindingMutation::TargetBytes,
-                true,
-            ),
-            (
-                "annotations",
-                PendingLocalAcceptedProjectionBindingMutation::Annotations,
-                false,
-            ),
-        ] {
-            let (selection_rejected, evidence_rejected) = handle
-                .pending_local_evidence_rejects_binding_mutation_for_test(page_id, mutation)
-                .unwrap();
-            assert_eq!(
-                selection_rejected, selector_rejected,
-                "{label} selector disposition"
-            );
-            assert!(
-                evidence_rejected,
-                "{label} mutation must invalidate already-issued accepted-render evidence"
-            );
-        }
-
-        // The occupied acquisition is a separate index-owned record rather
-        // than an intent field; retain its focused proof alongside the full
-        // intent matrix above.
-        assert!(handle
-            .pending_local_evidence_rejects_rewritten_acquisition_for_test(page_id)
-            .unwrap());
-        assert_eq!(user_graph_bytes(&fixture.graph_root), graph_before);
-        assert_eq!(
-            managed_local_tuple_bytes_for_test(&runtime_request),
-            journal_before,
-            "selector/evidence negatives never append or rewrite Graph"
-        );
-
-        drain_managed_local(&handle);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
-    }
-
-    #[test]
-    fn selected_accepted_render_falls_back_for_a_reorder_without_refusing_the_save() {
-        let fixture = ActivationFixture::empty("accepted-render-reorder-fallback", 0xa141);
-        let runtime_request = reopen_request(&fixture.request);
-        fs::write(
-            fixture.graph_root.join("Tine.md"),
-            b"- first\n- second\n- third\n",
-        )
-        .unwrap();
-
-        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
-        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
-        let handle = activated.handle.expect("activation retains a runtime");
-        drive_initial_feed(&handle);
-
-        let (page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        let (_first, _first_revision) = save_application_block_text(
-            &handle,
-            page,
-            revision,
-            "first content change establishes the pending-local predecessor",
-        );
-
-        let (mut reordered, revision) =
-            load_application_logical(&handle, "Tine", SyncPageKind::Page);
-        reordered.blocks.swap(0, 1);
-        let (saved, _revision) = accepted_application_save(
-            &handle,
-            handle
-                .save_application_page(SyncApplicationPageSaveRequest {
-                    target: SyncApplicationPageSaveTarget::Existing {
-                        path: reordered.path.clone(),
-                        revision,
-                    },
-                    page: reordered,
-                })
-                .unwrap(),
-            "Tine",
-            SyncPageKind::Page,
-        );
-        assert_eq!(saved.blocks[0].raw, "second");
-
-        let prepared = handle
-            .managed_application_save_instrumentation()
-            .expect("reorder save exposes projection instrumentation")
-            .prepared_editor_projection;
-        assert_eq!(prepared.accepted_projection_full_renders, 0);
-        assert_eq!(prepared.accepted_projection_affine_attempts, 1);
-        assert_eq!(prepared.accepted_projection_affine_reuses, 1);
-        assert_eq!(prepared.accepted_projection_affine_fallbacks, 0);
-        assert_eq!(
-            prepared.accepted_projection_selector_hot_materializations,
-            1
-        );
-        let detail = handle
-            .managed_application_save_instrumentation()
-            .expect("reorder save exposes local-mutation instrumentation")
-            .local_mutation_detail;
-        assert_eq!(detail.before_projection_full_materializations, 1);
-        assert_eq!(detail.before_projection_affine_attempts, 1);
-        assert_eq!(detail.before_projection_affine_reuses, 0);
-        assert_eq!(detail.before_projection_affine_fallbacks, 1);
-        assert_eq!(managed_local_journal_frames(&runtime_request).len(), 2);
-
-        drain_managed_local(&handle);
-        assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Safe(_)
-        ));
+        assert_parser_dto_semantics(&generic.0, &affine.0);
+        assert_eq!(generic.1, affine.1);
+        assert_eq!(generic.2.before_projection_full_materializations, 1);
+        assert_eq!(generic.2.before_projection_affine_attempts, 0);
+        assert_eq!(generic.2.before_projection_affine_reuses, 0);
+        assert_eq!(affine.2.before_projection_full_materializations, 0);
+        assert_eq!(affine.2.before_projection_affine_attempts, 1);
+        assert_eq!(affine.2.before_projection_affine_reuses, 1);
+        assert_eq!(affine.2.before_projection_affine_fallbacks, 0);
     }
 
     #[test]
@@ -44103,32 +43079,6 @@ mod tests {
                 if entry.file_name() == ".tine-sync" {
                     continue;
                 }
-                if entry.file_type().unwrap().is_dir() {
-                    pending.push(entry.path());
-                } else {
-                    let relative = entry
-                        .path()
-                        .strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    files.insert(relative, fs::read(entry.path()).unwrap());
-                }
-            }
-        }
-        files
-    }
-
-    fn file_tree_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
-        let mut files = BTreeMap::new();
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(directory) = pending.pop() {
-            let mut entries = fs::read_dir(directory)
-                .unwrap()
-                .map(Result::unwrap)
-                .collect::<Vec<_>>();
-            entries.sort_by_key(std::fs::DirEntry::file_name);
-            for entry in entries {
                 if entry.file_type().unwrap().is_dir() {
                     pending.push(entry.path());
                 } else {
