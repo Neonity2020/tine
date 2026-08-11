@@ -482,11 +482,78 @@ struct ManagedApplicationSaveStageTimings {
     editor_prepare_turn: Duration,
     editor_total: Duration,
     editor_transaction_build: Duration,
+    editor_current_page_admission: Duration,
+    editor_page_id_and_block_id_resolution: Duration,
+    editor_requested_page_build: Duration,
+    editor_exact_base_read: Duration,
+    editor_accepted_projection_render: Duration,
+    editor_target_projection_render: Duration,
+    editor_target_byte_clone: Duration,
+    editor_accepted_baseline_parse: Duration,
+    editor_requested_target_parse: Duration,
+    editor_identity_and_rename_kind_checks: Duration,
+    editor_target_dto_and_response_evidence: Duration,
+    editor_affine_artifact_and_reply_assembly: Duration,
+    transaction_current_map_and_existing_validation: Duration,
+    transaction_desired_memberships: Duration,
+    transaction_outline_depths: Duration,
+    transaction_create_scan_sort_emit: Duration,
+    transaction_edit_scan_emit: Duration,
+    transaction_reorder_scan_sort_emit: Duration,
+    transaction_preamble_check_emit: Duration,
+    transaction_delete_sets_scan_sort_emit: Duration,
+    transaction_inner_finish_validate: Duration,
+    transaction_outer_merge_finish_validate: Duration,
+    editor_request_remainder: Duration,
     promoted_mutation_admission: Duration,
     application_outcome: Duration,
     response_target_parses: usize,
     response_target_dto_conversions: usize,
     response_target_exact_dto_reparses: usize,
+    editor_block_id_resolution_passes: usize,
+    editor_block_ids_visited: usize,
+    editor_requested_current_map_builds: usize,
+    editor_requested_current_map_entries: usize,
+    editor_requested_membership_derivations: usize,
+    editor_requested_membership_entries: usize,
+    editor_accepted_renders: usize,
+    editor_accepted_rendered_blocks: usize,
+    editor_target_renders: usize,
+    editor_target_rendered_blocks: usize,
+    editor_accepted_parses: usize,
+    editor_accepted_parse_bytes: usize,
+    editor_target_parses: usize,
+    editor_target_parse_bytes: usize,
+    editor_target_dto_converted_blocks: usize,
+    transaction_current_map_builds: usize,
+    transaction_current_map_entries: usize,
+    transaction_membership_derivations: usize,
+    transaction_membership_entries: usize,
+    transaction_outline_depth_derivations: usize,
+    transaction_outline_depth_entries: usize,
+    transaction_create_scan_passes: usize,
+    transaction_create_scan_entries: usize,
+    transaction_edit_scan_passes: usize,
+    transaction_edit_scan_entries: usize,
+    transaction_reorder_scan_passes: usize,
+    transaction_reorder_scan_entries: usize,
+    transaction_delete_desired_set_scans: usize,
+    transaction_delete_desired_set_entries: usize,
+    transaction_delete_current_set_scans: usize,
+    transaction_delete_current_set_entries: usize,
+    transaction_delete_root_scans: usize,
+    transaction_delete_root_entries: usize,
+    transaction_emitted_create: usize,
+    transaction_emitted_edit: usize,
+    transaction_emitted_reorder: usize,
+    transaction_emitted_delete: usize,
+    transaction_emitted_preamble: usize,
+    transaction_emitted_rename: usize,
+    transaction_emitted_kind: usize,
+    transaction_inner_validations: usize,
+    transaction_inner_validation_operations: usize,
+    transaction_outer_validations: usize,
+    transaction_outer_validation_operations: usize,
 }
 
 #[cfg(test)]
@@ -500,11 +567,78 @@ thread_local! {
             editor_prepare_turn: Duration::ZERO,
             editor_total: Duration::ZERO,
             editor_transaction_build: Duration::ZERO,
+            editor_current_page_admission: Duration::ZERO,
+            editor_page_id_and_block_id_resolution: Duration::ZERO,
+            editor_requested_page_build: Duration::ZERO,
+            editor_exact_base_read: Duration::ZERO,
+            editor_accepted_projection_render: Duration::ZERO,
+            editor_target_projection_render: Duration::ZERO,
+            editor_target_byte_clone: Duration::ZERO,
+            editor_accepted_baseline_parse: Duration::ZERO,
+            editor_requested_target_parse: Duration::ZERO,
+            editor_identity_and_rename_kind_checks: Duration::ZERO,
+            editor_target_dto_and_response_evidence: Duration::ZERO,
+            editor_affine_artifact_and_reply_assembly: Duration::ZERO,
+            transaction_current_map_and_existing_validation: Duration::ZERO,
+            transaction_desired_memberships: Duration::ZERO,
+            transaction_outline_depths: Duration::ZERO,
+            transaction_create_scan_sort_emit: Duration::ZERO,
+            transaction_edit_scan_emit: Duration::ZERO,
+            transaction_reorder_scan_sort_emit: Duration::ZERO,
+            transaction_preamble_check_emit: Duration::ZERO,
+            transaction_delete_sets_scan_sort_emit: Duration::ZERO,
+            transaction_inner_finish_validate: Duration::ZERO,
+            transaction_outer_merge_finish_validate: Duration::ZERO,
+            editor_request_remainder: Duration::ZERO,
             promoted_mutation_admission: Duration::ZERO,
             application_outcome: Duration::ZERO,
             response_target_parses: 0,
             response_target_dto_conversions: 0,
             response_target_exact_dto_reparses: 0,
+            editor_block_id_resolution_passes: 0,
+            editor_block_ids_visited: 0,
+            editor_requested_current_map_builds: 0,
+            editor_requested_current_map_entries: 0,
+            editor_requested_membership_derivations: 0,
+            editor_requested_membership_entries: 0,
+            editor_accepted_renders: 0,
+            editor_accepted_rendered_blocks: 0,
+            editor_target_renders: 0,
+            editor_target_rendered_blocks: 0,
+            editor_accepted_parses: 0,
+            editor_accepted_parse_bytes: 0,
+            editor_target_parses: 0,
+            editor_target_parse_bytes: 0,
+            editor_target_dto_converted_blocks: 0,
+            transaction_current_map_builds: 0,
+            transaction_current_map_entries: 0,
+            transaction_membership_derivations: 0,
+            transaction_membership_entries: 0,
+            transaction_outline_depth_derivations: 0,
+            transaction_outline_depth_entries: 0,
+            transaction_create_scan_passes: 0,
+            transaction_create_scan_entries: 0,
+            transaction_edit_scan_passes: 0,
+            transaction_edit_scan_entries: 0,
+            transaction_reorder_scan_passes: 0,
+            transaction_reorder_scan_entries: 0,
+            transaction_delete_desired_set_scans: 0,
+            transaction_delete_desired_set_entries: 0,
+            transaction_delete_current_set_scans: 0,
+            transaction_delete_current_set_entries: 0,
+            transaction_delete_root_scans: 0,
+            transaction_delete_root_entries: 0,
+            transaction_emitted_create: 0,
+            transaction_emitted_edit: 0,
+            transaction_emitted_reorder: 0,
+            transaction_emitted_delete: 0,
+            transaction_emitted_preamble: 0,
+            transaction_emitted_rename: 0,
+            transaction_emitted_kind: 0,
+            transaction_inner_validations: 0,
+            transaction_inner_validation_operations: 0,
+            transaction_outer_validations: 0,
+            transaction_outer_validation_operations: 0,
         });
 }
 
@@ -525,6 +659,48 @@ fn note_application_save_stage(update: impl FnOnce(&mut ManagedApplicationSaveSt
 #[cfg(test)]
 fn last_application_save_stage_timings() -> ManagedApplicationSaveStageTimings {
     LAST_APPLICATION_SAVE_STAGE_TIMINGS.get()
+}
+
+#[cfg(test)]
+fn checked_editor_request_remainder(timings: &ManagedApplicationSaveStageTimings) -> Duration {
+    let leaves = [
+        timings.editor_current_page_admission,
+        timings.editor_page_id_and_block_id_resolution,
+        timings.editor_requested_page_build,
+        timings.editor_exact_base_read,
+        timings.editor_accepted_projection_render,
+        timings.editor_target_projection_render,
+        timings.editor_target_byte_clone,
+        timings.editor_accepted_baseline_parse,
+        timings.editor_requested_target_parse,
+        timings.editor_identity_and_rename_kind_checks,
+        timings.editor_target_dto_and_response_evidence,
+        timings.editor_affine_artifact_and_reply_assembly,
+        timings.transaction_current_map_and_existing_validation,
+        timings.transaction_desired_memberships,
+        timings.transaction_outline_depths,
+        timings.transaction_create_scan_sort_emit,
+        timings.transaction_edit_scan_emit,
+        timings.transaction_reorder_scan_sort_emit,
+        timings.transaction_preamble_check_emit,
+        timings.transaction_delete_sets_scan_sort_emit,
+        timings.transaction_inner_finish_validate,
+        timings.transaction_outer_merge_finish_validate,
+    ];
+    let accounted = leaves
+        .into_iter()
+        .try_fold(Duration::ZERO, |sum, leaf| {
+            sum.checked_add(leaf)
+                .ok_or("managed editor request timing leaves overflow")
+        })
+        .expect("managed editor request timing leaves overflow");
+    timings
+        .editor_transaction_build
+        .checked_sub(accounted)
+        .unwrap_or_else(|| panic!(
+            "managed editor request timing leaves exceed parent: parent={:?} accounted={accounted:?}",
+            timings.editor_transaction_build,
+        ))
 }
 
 #[cfg(test)]
@@ -14337,7 +14513,17 @@ impl RuntimeActor {
         let (page_id, transaction, affected_page_ids, existing_application, trusted_target) =
             match &request.target {
                 SyncEditorSaveTarget::Existing { page_id, revision } => {
+                    #[cfg(test)]
+                    let page_id_started = Instant::now();
                     let page_id = parse_editor_page_id(page_id)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_page_id_and_block_id_resolution = timings
+                            .editor_page_id_and_block_id_resolution
+                            .saturating_add(page_id_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let current_page_admission_started = Instant::now();
                     let runtime = self
                         .runtime
                         .as_ref()
@@ -14378,9 +14564,38 @@ impl RuntimeActor {
                             reason: SyncEditorConflict::StaleBase,
                         });
                     }
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_current_page_admission = timings
+                            .editor_current_page_admission
+                            .saturating_add(current_page_admission_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let block_id_resolution_started = Instant::now();
                     let resolved = resolve_editor_block_ids(&request.blocks)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_page_id_and_block_id_resolution = timings
+                            .editor_page_id_and_block_id_resolution
+                            .saturating_add(block_id_resolution_started.elapsed());
+                        timings.editor_block_id_resolution_passes =
+                            timings.editor_block_id_resolution_passes.saturating_add(1);
+                        timings.editor_block_ids_visited = timings
+                            .editor_block_ids_visited
+                            .saturating_add(resolved.len());
+                    });
+                    #[cfg(test)]
+                    let requested_page_started = Instant::now();
                     let requested_page =
                         requested_existing_editor_page(&current, &request, &resolved)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_requested_page_build = timings
+                            .editor_requested_page_build
+                            .saturating_add(requested_page_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let exact_base_started = Instant::now();
                     let base = self
                         .graph
                         .read_projection_input(&current.page.path)
@@ -14392,6 +14607,12 @@ impl RuntimeActor {
                         .ok_or(SyncEditorRequestError::ActorRefusedAt(
                             "reading the current Markdown or Org projection",
                         ))?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_exact_base_read = timings
+                            .editor_exact_base_read
+                            .saturating_add(exact_base_started.elapsed());
+                    });
                     let prepared_editor_projection =
                         PreparedEditorProjection::prepare(requested_page, &current.page, base)
                             .map_err(|_| {
@@ -14399,8 +14620,38 @@ impl RuntimeActor {
                                     "rendering the requested page edit",
                                 )
                             })?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        let projection = prepared_editor_projection_instrumentation();
+                        timings.editor_accepted_projection_render = timings
+                            .editor_accepted_projection_render
+                            .saturating_add(projection.accepted_render);
+                        timings.editor_target_projection_render = timings
+                            .editor_target_projection_render
+                            .saturating_add(projection.target_render);
+                        timings.editor_accepted_renders =
+                            timings.editor_accepted_renders.saturating_add(1);
+                        timings.editor_accepted_rendered_blocks = timings
+                            .editor_accepted_rendered_blocks
+                            .saturating_add(projection.accepted_blocks_visited);
+                        timings.editor_target_renders =
+                            timings.editor_target_renders.saturating_add(1);
+                        timings.editor_target_rendered_blocks = timings
+                            .editor_target_rendered_blocks
+                            .saturating_add(projection.target_blocks_visited);
+                    });
+                    #[cfg(test)]
+                    let target_clone_started = Instant::now();
                     let target = prepared_editor_projection.target().to_vec();
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_target_byte_clone = timings
+                            .editor_target_byte_clone
+                            .saturating_add(target_clone_started.elapsed());
+                    });
                     let accepted_target = prepared_editor_projection.accepted_target();
+                    #[cfg(test)]
+                    let accepted_parse_started = Instant::now();
                     let accepted_source = self
                         .graph
                         .parse_external_document(&current.page.path, &accepted_target, false)
@@ -14409,6 +14660,19 @@ impl RuntimeActor {
                                 "parsing the accepted page baseline",
                             )
                         })?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_accepted_baseline_parse = timings
+                            .editor_accepted_baseline_parse
+                            .saturating_add(accepted_parse_started.elapsed());
+                        timings.editor_accepted_parses =
+                            timings.editor_accepted_parses.saturating_add(1);
+                        timings.editor_accepted_parse_bytes = timings
+                            .editor_accepted_parse_bytes
+                            .saturating_add(accepted_target.len());
+                    });
+                    #[cfg(test)]
+                    let target_parse_started = Instant::now();
                     let parsed = self
                         .graph
                         .parse_external_document(&current.page.path, &target, false)
@@ -14419,9 +14683,19 @@ impl RuntimeActor {
                         })?;
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
+                        timings.editor_requested_target_parse = timings
+                            .editor_requested_target_parse
+                            .saturating_add(target_parse_started.elapsed());
+                        timings.editor_target_parses =
+                            timings.editor_target_parses.saturating_add(1);
+                        timings.editor_target_parse_bytes = timings
+                            .editor_target_parse_bytes
+                            .saturating_add(target.len());
                         timings.response_target_parses =
                             timings.response_target_parses.saturating_add(1);
                     });
+                    #[cfg(test)]
+                    let identity_and_kind_started = Instant::now();
                     let identity =
                         parsed.resolve_identity(Some(AcceptedExternalDocumentIdentity {
                             name: current.page.name.as_str(),
@@ -14437,6 +14711,14 @@ impl RuntimeActor {
                         )
                     })?;
                     let final_kind = model_sync_page_kind(identity.kind);
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_identity_and_rename_kind_checks = timings
+                            .editor_identity_and_rename_kind_checks
+                            .saturating_add(identity_and_kind_started.elapsed());
+                    });
+                    #[cfg(test)]
+                    let target_dto_started = Instant::now();
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
                         timings.response_target_dto_conversions =
@@ -14472,6 +14754,18 @@ impl RuntimeActor {
                         parsed_target_revision,
                     );
                     trusted_target_page.rev = current_application.page.rev.clone();
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_target_dto_and_response_evidence = timings
+                            .editor_target_dto_and_response_evidence
+                            .saturating_add(target_dto_started.elapsed());
+                        timings.editor_target_dto_converted_blocks =
+                            timings.editor_target_dto_converted_blocks.saturating_add(
+                                flatten_application_blocks(&trusted_target_page.blocks).len(),
+                            );
+                    });
+                    #[cfg(test)]
+                    let identity_rename_kind_started = Instant::now();
                     if final_name != current.page.name {
                         match runtime
                             .engine()
@@ -14514,17 +14808,78 @@ impl RuntimeActor {
                             kind: final_kind,
                         });
                     }
-                    if let Some(content) = build_existing_editor_transaction(
-                        &current, &request, &resolved,
-                    )
-                    .map_err(|error| {
-                        editor_refusal_at(error, "building the semantic page transaction")
-                    })? {
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_identity_and_rename_kind_checks = timings
+                            .editor_identity_and_rename_kind_checks
+                            .saturating_add(identity_rename_kind_started.elapsed());
+                    });
+                    let content = build_existing_editor_transaction(&current, &request, &resolved)
+                        .map_err(|error| {
+                            editor_refusal_at(error, "building the semantic page transaction")
+                        })?;
+                    #[cfg(test)]
+                    let outer_transaction_started = Instant::now();
+                    if let Some(content) = content {
                         // Requested page bytes are authoritative over any stale
                         // target-page snapshot carried by the rename planner.
                         operations.extend(content.operations);
                     }
                     let transaction = finish_editor_transaction(operations)?;
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.transaction_outer_merge_finish_validate = timings
+                            .transaction_outer_merge_finish_validate
+                            .saturating_add(outer_transaction_started.elapsed());
+                        timings.transaction_outer_validations =
+                            timings.transaction_outer_validations.saturating_add(1);
+                        timings.transaction_outer_validation_operations = timings
+                            .transaction_outer_validation_operations
+                            .saturating_add(
+                                transaction
+                                    .as_ref()
+                                    .map_or(0, |transaction| transaction.operations.len()),
+                            );
+                        if let Some(transaction) = transaction.as_ref() {
+                            for operation in &transaction.operations {
+                                match operation {
+                                    SemanticOperation::CreateBlock { .. } => {
+                                        timings.transaction_emitted_create =
+                                            timings.transaction_emitted_create.saturating_add(1)
+                                    }
+                                    SemanticOperation::EditBlockContent { .. } => {
+                                        timings.transaction_emitted_edit =
+                                            timings.transaction_emitted_edit.saturating_add(1)
+                                    }
+                                    SemanticOperation::ReorderBlock { .. } => {
+                                        timings.transaction_emitted_reorder =
+                                            timings.transaction_emitted_reorder.saturating_add(1)
+                                    }
+                                    SemanticOperation::DeleteSubtree { .. } => {
+                                        timings.transaction_emitted_delete =
+                                            timings.transaction_emitted_delete.saturating_add(1)
+                                    }
+                                    SemanticOperation::SetPagePreamble { .. } => {
+                                        timings.transaction_emitted_preamble =
+                                            timings.transaction_emitted_preamble.saturating_add(1)
+                                    }
+                                    SemanticOperation::RenamePagesAndRewriteReferrers {
+                                        ..
+                                    } => {
+                                        timings.transaction_emitted_rename =
+                                            timings.transaction_emitted_rename.saturating_add(1)
+                                    }
+                                    SemanticOperation::SetPageKind { .. } => {
+                                        timings.transaction_emitted_kind =
+                                            timings.transaction_emitted_kind.saturating_add(1)
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
+                    #[cfg(test)]
+                    let affine_artifact_started = Instant::now();
                     // This transaction consumes the existing application
                     // snapshot. Move its already authenticated materialized
                     // pre-page into the affine editor artifact rather than
@@ -14537,6 +14892,12 @@ impl RuntimeActor {
                     } = editor;
                     let prepared_editor_projection =
                         prepared_editor_projection.bind_accepted_page(accepted_page);
+                    #[cfg(test)]
+                    note_application_save_stage(|timings| {
+                        timings.editor_affine_artifact_and_reply_assembly = timings
+                            .editor_affine_artifact_and_reply_assembly
+                            .saturating_add(affine_artifact_started.elapsed());
+                    });
                     (
                         page_id,
                         transaction,
@@ -14649,6 +15010,7 @@ impl RuntimeActor {
         #[cfg(test)]
         note_application_save_stage(|timings| {
             timings.editor_transaction_build = transaction_started.elapsed();
+            timings.editor_request_remainder = checked_editor_request_remainder(timings);
         });
 
         let Some(transaction) = transaction else {
@@ -21571,6 +21933,8 @@ fn requested_existing_editor_page(
         .iter()
         .map(|block| (block.block_id, block))
         .collect::<HashMap<_, _>>();
+    #[cfg(test)]
+    let current_map_entries = current_by_id.len();
     if resolved
         .iter()
         .zip(&request.blocks)
@@ -21583,7 +21947,25 @@ fn requested_existing_editor_page(
             SyncEditorInvalidRequest::InvalidExistingId,
         ));
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.editor_requested_current_map_builds = timings
+            .editor_requested_current_map_builds
+            .saturating_add(1);
+        timings.editor_requested_current_map_entries = timings
+            .editor_requested_current_map_entries
+            .saturating_add(current_map_entries);
+    });
     let desired = desired_editor_memberships(&request.blocks, resolved)?;
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.editor_requested_membership_derivations = timings
+            .editor_requested_membership_derivations
+            .saturating_add(1);
+        timings.editor_requested_membership_entries = timings
+            .editor_requested_membership_entries
+            .saturating_add(desired.len());
+    });
     let blocks = request
         .blocks
         .iter()
@@ -21671,11 +22053,15 @@ fn build_existing_editor_transaction(
     request: &SyncEditorSaveRequest,
     resolved: &[BlockId],
 ) -> Result<Option<OperationTransaction>, SyncEditorRequestError> {
+    #[cfg(test)]
+    let current_map_started = Instant::now();
     let current_by_id = current
         .blocks
         .iter()
         .map(|block| (block.block_id, block))
         .collect::<HashMap<_, _>>();
+    #[cfg(test)]
+    let current_map_entries = current_by_id.len();
     if resolved
         .iter()
         .zip(&request.blocks)
@@ -21688,10 +22074,50 @@ fn build_existing_editor_transaction(
             SyncEditorInvalidRequest::InvalidExistingId,
         ));
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_current_map_and_existing_validation = timings
+            .transaction_current_map_and_existing_validation
+            .saturating_add(current_map_started.elapsed());
+        timings.transaction_current_map_builds =
+            timings.transaction_current_map_builds.saturating_add(1);
+        timings.transaction_current_map_entries = timings
+            .transaction_current_map_entries
+            .saturating_add(current_map_entries);
+    });
+    #[cfg(test)]
+    let desired_started = Instant::now();
     let desired = desired_editor_memberships(&request.blocks, resolved)?;
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_desired_memberships = timings
+            .transaction_desired_memberships
+            .saturating_add(desired_started.elapsed());
+        timings.transaction_membership_derivations =
+            timings.transaction_membership_derivations.saturating_add(1);
+        timings.transaction_membership_entries = timings
+            .transaction_membership_entries
+            .saturating_add(desired.len());
+    });
+    #[cfg(test)]
+    let outline_depths_started = Instant::now();
     let depths = editor_outline_depths(&request.blocks);
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_outline_depths = timings
+            .transaction_outline_depths
+            .saturating_add(outline_depths_started.elapsed());
+        timings.transaction_outline_depth_derivations = timings
+            .transaction_outline_depth_derivations
+            .saturating_add(1);
+        timings.transaction_outline_depth_entries = timings
+            .transaction_outline_depth_entries
+            .saturating_add(depths.len());
+    });
     let mut operations = Vec::new();
 
+    #[cfg(test)]
+    let create_started = Instant::now();
     let mut new_indexes = request
         .blocks
         .iter()
@@ -21714,7 +22140,20 @@ fn build_existing_editor_transaction(
             content: block.content.clone(),
         });
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_create_scan_sort_emit = timings
+            .transaction_create_scan_sort_emit
+            .saturating_add(create_started.elapsed());
+        timings.transaction_create_scan_passes =
+            timings.transaction_create_scan_passes.saturating_add(1);
+        timings.transaction_create_scan_entries = timings
+            .transaction_create_scan_entries
+            .saturating_add(request.blocks.len());
+    });
 
+    #[cfg(test)]
+    let edit_started = Instant::now();
     for (index, block) in request.blocks.iter().enumerate() {
         let SyncEditorBlockKey::Existing(_) = &block.key else {
             continue;
@@ -21735,7 +22174,20 @@ fn build_existing_editor_transaction(
             });
         }
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_edit_scan_emit = timings
+            .transaction_edit_scan_emit
+            .saturating_add(edit_started.elapsed());
+        timings.transaction_edit_scan_passes =
+            timings.transaction_edit_scan_passes.saturating_add(1);
+        timings.transaction_edit_scan_entries = timings
+            .transaction_edit_scan_entries
+            .saturating_add(request.blocks.len());
+    });
 
+    #[cfg(test)]
+    let reorder_started = Instant::now();
     let mut reorder_indexes = request
         .blocks
         .iter()
@@ -21758,14 +22210,35 @@ fn build_existing_editor_transaction(
             order: desired[index].1.clone(),
         });
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_reorder_scan_sort_emit = timings
+            .transaction_reorder_scan_sort_emit
+            .saturating_add(reorder_started.elapsed());
+        timings.transaction_reorder_scan_passes =
+            timings.transaction_reorder_scan_passes.saturating_add(1);
+        timings.transaction_reorder_scan_entries = timings
+            .transaction_reorder_scan_entries
+            .saturating_add(request.blocks.len());
+    });
 
+    #[cfg(test)]
+    let preamble_started = Instant::now();
     if current.page.preamble != request.preamble {
         operations.push(SemanticOperation::SetPagePreamble {
             page_id: current.page.page_id,
             preamble: request.preamble.clone(),
         });
     }
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_preamble_check_emit = timings
+            .transaction_preamble_check_emit
+            .saturating_add(preamble_started.elapsed());
+    });
 
+    #[cfg(test)]
+    let delete_started = Instant::now();
     let desired_existing = request
         .blocks
         .iter()
@@ -21796,7 +22269,57 @@ fn build_existing_editor_transaction(
         });
     }
 
-    finish_editor_transaction(operations)
+    #[cfg(test)]
+    let delete_desired_entries = request.blocks.len();
+    #[cfg(test)]
+    let delete_current_entries = current_by_id.len();
+    #[cfg(test)]
+    let delete_root_entries = current.blocks.len();
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_delete_sets_scan_sort_emit = timings
+            .transaction_delete_sets_scan_sort_emit
+            .saturating_add(delete_started.elapsed());
+        timings.transaction_delete_desired_set_scans = timings
+            .transaction_delete_desired_set_scans
+            .saturating_add(1);
+        timings.transaction_delete_desired_set_entries = timings
+            .transaction_delete_desired_set_entries
+            .saturating_add(delete_desired_entries);
+        timings.transaction_delete_current_set_scans = timings
+            .transaction_delete_current_set_scans
+            .saturating_add(1);
+        timings.transaction_delete_current_set_entries = timings
+            .transaction_delete_current_set_entries
+            .saturating_add(delete_current_entries);
+        timings.transaction_delete_root_scans =
+            timings.transaction_delete_root_scans.saturating_add(1);
+        timings.transaction_delete_root_entries = timings
+            .transaction_delete_root_entries
+            .saturating_add(delete_root_entries);
+    });
+
+    #[cfg(test)]
+    let inner_finish_started = Instant::now();
+    let transaction = finish_editor_transaction(operations);
+    #[cfg(test)]
+    note_application_save_stage(|timings| {
+        timings.transaction_inner_finish_validate = timings
+            .transaction_inner_finish_validate
+            .saturating_add(inner_finish_started.elapsed());
+        timings.transaction_inner_validations =
+            timings.transaction_inner_validations.saturating_add(1);
+        timings.transaction_inner_validation_operations = timings
+            .transaction_inner_validation_operations
+            .saturating_add(
+                transaction
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(0, |transaction| transaction.operations.len()),
+            );
+    });
+    transaction
 }
 
 fn build_new_editor_transaction(
@@ -43543,6 +44066,159 @@ mod tests {
         }
     }
 
+    fn assert_managed_application_save_editor_request_accounting(
+        stages: ManagedApplicationSaveStageTimings,
+        page_blocks: usize,
+        detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
+        prepared: PreparedEditorProjectionInstrumentation,
+    ) {
+        assert_save_detail_remainder_bounded(
+            stages.editor_transaction_build,
+            stages.editor_request_remainder,
+            "editor request",
+        );
+        assert_eq!(
+            (
+                stages.editor_block_id_resolution_passes,
+                stages.editor_block_ids_visited
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_requested_current_map_builds,
+                stages.editor_requested_current_map_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_requested_membership_derivations,
+                stages.editor_requested_membership_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_accepted_renders,
+                stages.editor_accepted_rendered_blocks
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.editor_target_renders,
+                stages.editor_target_rendered_blocks
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(stages.editor_accepted_parses, 1);
+        assert_eq!(stages.editor_target_parses, 1);
+        assert!(stages.editor_accepted_parse_bytes > 0);
+        assert!(stages.editor_target_parse_bytes > 0);
+        assert_eq!(stages.editor_target_dto_converted_blocks, page_blocks);
+        assert_eq!(
+            (
+                stages.transaction_current_map_builds,
+                stages.transaction_current_map_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_membership_derivations,
+                stages.transaction_membership_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_outline_depth_derivations,
+                stages.transaction_outline_depth_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_create_scan_passes,
+                stages.transaction_create_scan_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_edit_scan_passes,
+                stages.transaction_edit_scan_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_reorder_scan_passes,
+                stages.transaction_reorder_scan_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_delete_desired_set_scans,
+                stages.transaction_delete_desired_set_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_delete_current_set_scans,
+                stages.transaction_delete_current_set_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_delete_root_scans,
+                stages.transaction_delete_root_entries
+            ),
+            (1, page_blocks)
+        );
+        assert_eq!(
+            (
+                stages.transaction_emitted_create,
+                stages.transaction_emitted_edit,
+                stages.transaction_emitted_reorder,
+                stages.transaction_emitted_delete,
+                stages.transaction_emitted_preamble,
+                stages.transaction_emitted_rename,
+                stages.transaction_emitted_kind,
+            ),
+            (0, 1, 0, 0, 0, 0, 0),
+        );
+        assert_eq!(
+            (
+                stages.transaction_inner_validations,
+                stages.transaction_inner_validation_operations
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                stages.transaction_outer_validations,
+                stages.transaction_outer_validation_operations
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            (prepared.created, prepared.reused, prepared.fallback),
+            (1, 1, 0)
+        );
+        assert_eq!(detail.before_projection_full_materializations, 0);
+        assert_eq!(detail.before_projection_affine_attempts, 1);
+        assert_eq!(detail.before_projection_affine_reuses, 1);
+        assert_eq!(detail.before_projection_affine_fallbacks, 0);
+        assert_eq!(prepared.capture_sealed_pending_local_predecessor_success, 1);
+        assert_eq!(prepared.finalizer_sealed_pending_local_predecessor_use, 1);
+        assert_eq!(prepared.finalizer_predecessor_replay_render, 0);
+    }
+
     fn managed_application_save_detail_phase_receipt(
         samples: &[ManagedApplicationSaveBenchmarkSample],
     ) -> String {
@@ -43714,6 +44390,120 @@ mod tests {
         )
     }
 
+    fn managed_application_save_editor_request_receipt(
+        samples: &[ManagedApplicationSaveBenchmarkSample],
+    ) -> String {
+        macro_rules! duration {
+            ($field:ident) => {{
+                let (p50, p95) = managed_application_save_quantiles(samples, |sample| {
+                    sample.application_stages.$field
+                });
+                format!(
+                    concat!(
+                        stringify!($field),
+                        "_p50_ms={:.3} ",
+                        stringify!($field),
+                        "_p95_ms={:.3}"
+                    ),
+                    startup_ms(p50),
+                    startup_ms(p95)
+                )
+            }};
+        }
+        macro_rules! count {
+            ($field:ident) => {{
+                let mut values = samples
+                    .iter()
+                    .map(|sample| sample.application_stages.$field)
+                    .collect::<Vec<_>>();
+                values.sort_unstable();
+                format!(
+                    concat!(
+                        stringify!($field),
+                        "_min={} ",
+                        stringify!($field),
+                        "_median={} ",
+                        stringify!($field),
+                        "_max={}"
+                    ),
+                    values[0],
+                    values[values.len() / 2],
+                    values[values.len() - 1]
+                )
+            }};
+        }
+        [
+            duration!(editor_current_page_admission),
+            duration!(editor_page_id_and_block_id_resolution),
+            duration!(editor_requested_page_build),
+            duration!(editor_exact_base_read),
+            duration!(editor_accepted_projection_render),
+            duration!(editor_target_projection_render),
+            duration!(editor_target_byte_clone),
+            duration!(editor_accepted_baseline_parse),
+            duration!(editor_requested_target_parse),
+            duration!(editor_identity_and_rename_kind_checks),
+            duration!(editor_target_dto_and_response_evidence),
+            duration!(editor_affine_artifact_and_reply_assembly),
+            duration!(transaction_current_map_and_existing_validation),
+            duration!(transaction_desired_memberships),
+            duration!(transaction_outline_depths),
+            duration!(transaction_create_scan_sort_emit),
+            duration!(transaction_edit_scan_emit),
+            duration!(transaction_reorder_scan_sort_emit),
+            duration!(transaction_preamble_check_emit),
+            duration!(transaction_delete_sets_scan_sort_emit),
+            duration!(transaction_inner_finish_validate),
+            duration!(transaction_outer_merge_finish_validate),
+            duration!(editor_request_remainder),
+            count!(editor_block_id_resolution_passes),
+            count!(editor_block_ids_visited),
+            count!(editor_requested_current_map_builds),
+            count!(editor_requested_current_map_entries),
+            count!(editor_requested_membership_derivations),
+            count!(editor_requested_membership_entries),
+            count!(editor_accepted_renders),
+            count!(editor_accepted_rendered_blocks),
+            count!(editor_target_renders),
+            count!(editor_target_rendered_blocks),
+            count!(editor_accepted_parses),
+            count!(editor_accepted_parse_bytes),
+            count!(editor_target_parses),
+            count!(editor_target_parse_bytes),
+            count!(editor_target_dto_converted_blocks),
+            count!(transaction_current_map_builds),
+            count!(transaction_current_map_entries),
+            count!(transaction_membership_derivations),
+            count!(transaction_membership_entries),
+            count!(transaction_outline_depth_derivations),
+            count!(transaction_outline_depth_entries),
+            count!(transaction_create_scan_passes),
+            count!(transaction_create_scan_entries),
+            count!(transaction_edit_scan_passes),
+            count!(transaction_edit_scan_entries),
+            count!(transaction_reorder_scan_passes),
+            count!(transaction_reorder_scan_entries),
+            count!(transaction_delete_desired_set_scans),
+            count!(transaction_delete_desired_set_entries),
+            count!(transaction_delete_current_set_scans),
+            count!(transaction_delete_current_set_entries),
+            count!(transaction_delete_root_scans),
+            count!(transaction_delete_root_entries),
+            count!(transaction_emitted_create),
+            count!(transaction_emitted_edit),
+            count!(transaction_emitted_reorder),
+            count!(transaction_emitted_delete),
+            count!(transaction_emitted_preamble),
+            count!(transaction_emitted_rename),
+            count!(transaction_emitted_kind),
+            count!(transaction_inner_validations),
+            count!(transaction_inner_validation_operations),
+            count!(transaction_outer_validations),
+            count!(transaction_outer_validation_operations),
+        ]
+        .join(" ")
+    }
+
     fn managed_application_save_phase_receipt(
         samples: &[ManagedApplicationSaveBenchmarkSample],
     ) -> String {
@@ -43796,8 +44586,9 @@ mod tests {
                 sample.page_local_reads.history_points
             });
         let detail = managed_application_save_detail_phase_receipt(samples);
+        let editor_request = managed_application_save_editor_request_receipt(samples);
         format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} local_mutation_detail: {}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} editor_request: {} local_mutation_detail: {}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
             startup_ms(actor_total_p50),
@@ -43850,6 +44641,7 @@ mod tests {
             history_reads_p50,
             history_reads_p95,
             history_reads_max,
+            editor_request,
             detail,
         )
     }
@@ -46148,6 +46940,12 @@ mod tests {
                                 counters_after.local_mutation_detail,
                                 page_blocks,
                             );
+                        assert_managed_application_save_editor_request_accounting(
+                            counters_after.application_stages,
+                            page_blocks,
+                            counters_after.local_mutation_detail,
+                            counters_after.prepared_editor_projection,
+                        );
                         let sample = ManagedApplicationSaveBenchmarkSample {
                             caller,
                             application_stages: counters_after.application_stages,

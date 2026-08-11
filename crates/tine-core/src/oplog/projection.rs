@@ -72,6 +72,13 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) finalizer_predecessor_replay_render: usize,
     pub(crate) capture_sealed_pending_local_predecessor_success: usize,
     pub(crate) finalizer_sealed_pending_local_predecessor_use: usize,
+    /// The two renders are separate evidence obligations.  Keep their timing
+    /// separate so the managed-save receipt never presents the pair as one
+    /// opaque "projection" cost.
+    pub(crate) accepted_render: std::time::Duration,
+    pub(crate) target_render: std::time::Duration,
+    pub(crate) accepted_blocks_visited: usize,
+    pub(crate) target_blocks_visited: usize,
 }
 
 #[cfg(test)]
@@ -84,6 +91,10 @@ impl PreparedEditorProjectionInstrumentation {
         finalizer_predecessor_replay_render: 0,
         capture_sealed_pending_local_predecessor_success: 0,
         finalizer_sealed_pending_local_predecessor_use: 0,
+        accepted_render: std::time::Duration::ZERO,
+        target_render: std::time::Duration::ZERO,
+        accepted_blocks_visited: 0,
+        target_blocks_visited: 0,
     };
 }
 
@@ -325,16 +336,35 @@ impl PreparedEditorProjection {
         accepted_page: &MaterializedPage,
         exact_base: Vec<u8>,
     ) -> Result<Self, ProjectionError> {
+        #[cfg(test)]
+        let accepted_started = std::time::Instant::now();
         let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
+        #[cfg(test)]
+        let accepted_elapsed = accepted_started.elapsed();
         let candidate_base_layout = structural_layout_identities(&accepted.annotations);
+        #[cfg(test)]
+        let target_started = std::time::Instant::now();
         let rendered = render_projection_page_with_layout_identities(
             &requested_page,
             Some(&exact_base),
             &candidate_base_layout,
         )?;
         #[cfg(test)]
+        let target_elapsed = target_started.elapsed();
+        #[cfg(test)]
         note_prepared_editor_projection(|instrumentation| {
             instrumentation.created = instrumentation.created.saturating_add(1);
+            instrumentation.accepted_render = instrumentation
+                .accepted_render
+                .saturating_add(accepted_elapsed);
+            instrumentation.target_render =
+                instrumentation.target_render.saturating_add(target_elapsed);
+            instrumentation.accepted_blocks_visited = instrumentation
+                .accepted_blocks_visited
+                .saturating_add(accepted_page.blocks.len());
+            instrumentation.target_blocks_visited = instrumentation
+                .target_blocks_visited
+                .saturating_add(requested_page.blocks.len());
         });
         Ok(Self {
             requested_page,
@@ -3624,18 +3654,22 @@ mod tests {
             );
         }
 
+        let instrumentation = prepared_editor_projection_instrumentation();
+        assert_eq!(instrumentation.created, 10);
+        assert_eq!(instrumentation.reused, 1);
+        assert_eq!(instrumentation.fallback, 9);
+        assert_eq!(instrumentation.finalizer_post_state_render, 0);
+        assert_eq!(instrumentation.finalizer_predecessor_replay_render, 0);
         assert_eq!(
-            prepared_editor_projection_instrumentation(),
-            PreparedEditorProjectionInstrumentation {
-                created: 10,
-                reused: 1,
-                fallback: 9,
-                finalizer_post_state_render: 0,
-                finalizer_predecessor_replay_render: 0,
-                capture_sealed_pending_local_predecessor_success: 0,
-                finalizer_sealed_pending_local_predecessor_use: 0,
-            }
+            instrumentation.capture_sealed_pending_local_predecessor_success,
+            0
         );
+        assert_eq!(
+            instrumentation.finalizer_sealed_pending_local_predecessor_use,
+            0
+        );
+        assert!(instrumentation.accepted_render > std::time::Duration::ZERO);
+        assert!(instrumentation.target_render > std::time::Duration::ZERO);
     }
 
     /// Planning the same state over the same bytes must yield the same intent
