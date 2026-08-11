@@ -2,6 +2,33 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-BLOCK-SELECTION-ACTION-OWNERSHIP-240",
+      "title": "An active block selection owns heading commands and bullet drag even when the pointer is on another block",
+      "family": "block-selection",
+      "sources": {
+        "issues": [
+          240
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "linux",
+        "windows",
+        "macos"
+      ],
+      "layer": "render",
+      "status": "reproduced",
+      "coverage": {
+        "tests": [
+          "src/components/ContextMenu.test.tsx",
+          "src/components/Block.selectionDrag.test.tsx"
+        ],
+        "scenario": "block-selection.heading-and-drag-own-active-selection",
+        "failBefore": "proven"
+      },
+      "notes": "GH #240. Fail-before on exact base d1ad0f2c38120de8c88247f7d6062edf8a6ac812: writable pointer changed C and left selected A raw as 'A' instead of '## A'; read-only pointer hid Heading 2 entirely; dragging A's bullet with B+C selected produced B,C,D,E,A instead of A,D,E,B,C. Scope is heading and pointer bullet drag only; adjacent context actions remain pointer-owned."
+    },
+    {
       "id": "UI-MANAGED-ANDROID-ROOT-SHUTDOWN-001",
       "title": "Android root Back verifies every managed runtime can stop before activity exit and preserves the safe transition if exit must retry",
       "family": "window-lifecycle",

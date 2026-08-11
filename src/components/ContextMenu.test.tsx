@@ -3,7 +3,17 @@ import { render } from "solid-js/web";
 import type { JSX } from "solid-js";
 import { ContextMenu, deletePageMenuLabel, pageMenuAvailability } from "./ContextMenu";
 import { initParser } from "../render/parse";
-import { blockProperty, doc, markDirty, resetStore, setDoc, type Node as StoreNode } from "../store";
+import {
+  blockProperty,
+  doc,
+  extendSelectionTo,
+  markDirty,
+  resetStore,
+  selectBlock,
+  selectedIds,
+  setDoc,
+  type Node as StoreNode,
+} from "../store";
 import {
   clearConflict,
   closeContextMenu,
@@ -289,6 +299,39 @@ describe("BlockMenu — convert an outline into a grid (Show children as →)", 
     expect(blockProperty("leaf", "heading")).toBe("true");
     dispose();
   });
+
+  it.each([false, true])(
+    "applies a heading to the active selection when the pointer block is %s read-only (GH #240)",
+    (pointerReadOnly) => {
+      setDoc({
+        byId: {
+          a: { ...node("a", "A", null, []), page: "Selected" },
+          b: { ...node("b", "B", null, []), page: "Selected" },
+          c: { ...node("c", "C", null, []), page: "Pointer" },
+        },
+        pages: [
+          { name: "Selected", kind: "page", title: "Selected", preBlock: null, roots: ["a", "b"], format: "md", readOnly: false, guide: false },
+          { name: "Pointer", kind: "page", title: "Pointer", preBlock: null, roots: ["c"], format: "md", readOnly: pointerReadOnly, guide: false },
+        ],
+        feed: ["Selected", "Pointer"],
+        loaded: true,
+      });
+      selectBlock("a");
+      extendSelectionTo("b");
+      const dispose = mount(() => <ContextMenu />);
+
+      openContextMenu(10, 10, "c");
+      const h2 = document.querySelector<HTMLButtonElement>('[title="Heading 2"]');
+      expect(h2).not.toBeNull();
+      h2!.click();
+
+      expect(doc.byId.a.raw).toBe("## A");
+      expect(doc.byId.b.raw).toBe("## B");
+      expect(doc.byId.c.raw).toBe("C");
+      expect(selectedIds()).toEqual(["a", "b"]);
+      dispose();
+    },
+  );
 
   it("offers only view/copy actions on a read-only page", () => {
     load(true);
