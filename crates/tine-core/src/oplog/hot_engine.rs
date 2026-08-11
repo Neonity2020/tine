@@ -3715,10 +3715,6 @@ pub(crate) struct CapturedAuthorTransaction {
     requirement_digest: ContentDigest,
     requirement_index: AuthorRequirementIndex,
     captured_inputs: Vec<CapabilityCapturedProjectionInput>,
-    /// A process-local predecessor capability minted at the same exact graph
-    /// capture as `captured_inputs`.  It is not journal/overlay/recovery
-    /// authority; finalization must still rebind it to this captured input.
-    capture_sealed_predecessor: Option<super::projection::CaptureSealedPreparedPredecessor>,
 }
 
 impl AuthorTransactionDraft {
@@ -15724,7 +15720,6 @@ impl ShardedHotEngine {
                 "managed-local predecessor is not the current semantic page state".into(),
             ));
         }
-        super::projection::note_capture_predecessor_replay_render();
         let replay = super::projection::plan_projection_with_layout_annotations(
             self.workspace_id,
             before,
@@ -15891,7 +15886,6 @@ impl ShardedHotEngine {
         )?;
         let mut captured_inputs = Vec::with_capacity(requirement_index.len());
         let mut mismatches = Vec::new();
-        let mut capture_sealed_predecessor = None;
         for indexed_path in requirement_index.entries() {
             let path = indexed_path.path(&draft.requirements);
             let roles = indexed_path.roles();
@@ -15923,67 +15917,9 @@ impl ShardedHotEngine {
                 })
                 .transpose()?
                 .flatten();
-            let capture_seal_eligible = !external
-                && capture_sealed_predecessor.is_none()
-                && requirement_index.len() == 1
-                && roles.semantic_predecessor == Some(roles.owner)
-                && matches!(
-                    draft.requirements[roles.owner].precondition,
-                    ProjectionRequirementState::Present
-                )
-                && matches!(
-                    draft.requirements[roles.owner].target,
-                    ProjectionRequirementState::Present
-                )
-                && managed_prior.is_none();
-            let sealed_receipt_predecessor = if capture_seal_eligible {
-                match (
-                    draft.prepared_editor_projection.as_ref(),
-                    roles.semantic_predecessor.and_then(|requirement_index| {
-                        let requirement = &draft.requirements[requirement_index];
-                        draft.pages[&requirement.page_id].before.as_ref()
-                    }),
-                    current.as_deref(),
-                ) {
-                    (Some(prepared), Some(before), Some(live_bytes)) => prepared
-                        .capture_seal_receipt_backed_predecessor(
-                            self.workspace_id,
-                            source,
-                            receipts,
-                            &completed,
-                            before,
-                            live_bytes,
-                        )
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?,
-                    _ => None,
-                }
-            } else {
-                None
-            };
             let prior = if let Some(prior) = managed_prior {
                 authority_matches = true;
                 Some(prior)
-            } else if let Some(sealed_receipt_predecessor) = sealed_receipt_predecessor {
-                let (sealed, intent, completion) = sealed_receipt_predecessor.into_parts();
-                charge_preauthoring_receipt_bytes(
-                    &mut retained_bytes,
-                    &intent,
-                    &completion,
-                    "capture-sealed live semantic predecessor receipt",
-                )?;
-                let bytes = current
-                    .as_ref()
-                    .expect("capture-sealed predecessor requires a present graph file")
-                    .clone();
-                capture_sealed_predecessor = Some(sealed);
-                Some(CapabilityCapturedPriorProjection {
-                    bytes,
-                    intent,
-                    completion: Some(completion),
-                    bootstrap_owner_binding: None,
-                    managed_local_authority: None,
-                    receipt_backed_live_authority: true,
-                })
             } else if let Some(requirement_index) = roles.semantic_predecessor {
                 let requirement = &draft.requirements[requirement_index];
                 let before = draft.pages[&requirement.page_id]
@@ -15993,7 +15929,6 @@ impl ShardedHotEngine {
                 let receipt_backed_live = current
                     .as_deref()
                     .map(|live_bytes| {
-                        super::projection::note_capture_predecessor_replay_render();
                         super::projection::receipt_backed_live_projection_predecessor(
                             self.workspace_id,
                             source,
@@ -16048,7 +15983,6 @@ impl ShardedHotEngine {
                     let base = receipts
                         .load_base(&intent)
                         .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-                    super::projection::note_capture_predecessor_replay_render();
                     let replay = super::projection::plan_projection(
                         self.workspace_id,
                         before,
@@ -16106,7 +16040,6 @@ impl ShardedHotEngine {
                                 "aggregate bootstrap predecessor for {path} is stale or mismatched"
                             )));
                         } else {
-                            super::projection::note_capture_predecessor_replay_render();
                             let replay = baseline
                                 .rebind_semantic_successor(self.workspace_id, before)
                                 .map_err(|error| {
@@ -16242,7 +16175,6 @@ impl ShardedHotEngine {
             requirement_digest,
             requirement_index,
             captured_inputs,
-            capture_sealed_predecessor,
         }))
     }
 
@@ -16281,7 +16213,6 @@ impl ShardedHotEngine {
             requirement_digest,
             requirement_index,
             mut captured_inputs,
-            capture_sealed_predecessor,
         } = captured;
         let external_reconciliation =
             matches!(draft.origin, BatchOrigin::ExternalReconciliation { .. });
@@ -16438,48 +16369,22 @@ impl ShardedHotEngine {
                         "captured path {path} completion is not its intended semantic predecessor"
                     )));
                 }
-                let sealed_annotations = capture_sealed_predecessor.as_ref().and_then(|sealed| {
-                    sealed.finalizer_annotations(
-                        source,
-                        before,
-                        &prior.bytes,
-                        &prior.intent,
-                        prior
-                            .completion
-                            .as_ref()
-                            .expect("capture-sealed predecessor has completed receipt authority"),
-                    )
-                });
-                let replay = if sealed_annotations.is_none() {
-                    super::projection::note_finalizer_predecessor_replay_render();
-                    Some(
-                        super::projection::plan_projection_with_layout_annotations(
-                            self.workspace_id,
-                            before,
-                            Some(&prior.bytes),
-                            Some(prior.intent.annotations()),
-                        )
-                        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?,
-                    )
-                } else {
-                    None
-                };
-                let prior_annotations = if let Some(annotations) = sealed_annotations {
-                    annotations
-                } else {
-                    let replay = replay
-                        .as_ref()
-                        .expect("generic predecessor replay was just constructed");
-                    if replay.target() != prior.bytes
-                        || (prior.receipt_backed_live_authority
-                            && replay.intent().annotations() != prior.intent.annotations())
-                    {
-                        return Err(EngineError::ProjectionManifest(format!(
-                            "captured path {path} prior bytes are not the exact semantic pre-state"
-                        )));
-                    }
-                    replay.intent().annotations()
-                };
+                super::projection::note_finalizer_predecessor_replay_render();
+                let replay = super::projection::plan_projection_with_layout_annotations(
+                    self.workspace_id,
+                    before,
+                    Some(&prior.bytes),
+                    Some(prior.intent.annotations()),
+                )
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                if replay.target() != prior.bytes
+                    || (prior.receipt_backed_live_authority
+                        && replay.intent().annotations() != prior.intent.annotations())
+                {
+                    return Err(EngineError::ProjectionManifest(format!(
+                        "captured path {path} prior bytes are not the exact semantic pre-state"
+                    )));
+                }
                 let prior_semantic_layout_required = roles.render_base_owner.is_some_and(|owner| {
                     matches!(
                         inputs[&draft.requirements[owner].path],
@@ -16495,7 +16400,7 @@ impl ShardedHotEngine {
                         prior.logical_completion_id(),
                         before.frontier.clone(),
                         prior.bytes.clone(),
-                        prior_annotations.to_vec(),
+                        replay.intent().annotations().to_vec(),
                         before.claim_evidence.clone(),
                     )
                     .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
@@ -30950,7 +30855,6 @@ mod validation_tests {
     use crate::oplog::external_import::{
         ExternalImportObservationEntry, ExternalImportObservationState,
     };
-    use crate::oplog::projection;
     use crate::oplog::projection_work_index::ProjectionExpectedPathReadBudget;
     use crate::oplog::reconciliation_scan::{
         scan_graph_text, AuthenticatedExpectedPath, AuthenticatedExpectedPathSource,
@@ -33438,37 +33342,6 @@ mod validation_tests {
                 .unwrap()
         }
 
-        /// Attach the same affine editor projection that the application path
-        /// creates, while keeping this fixture's ordinary receipt-backed
-        /// predecessor and exact graph source.  The helper is test-only proof
-        /// plumbing; production construction remains in `sync_runtime`.
-        fn prepared_editor_draft(&self, seed: u128, content: &str) -> AuthorTransactionDraft {
-            let mut draft = self.draft_edits(seed, &[(0, content)]);
-            let page_id = self.pages[0].0;
-            let page = draft
-                .pages
-                .get(&page_id)
-                .expect("single-page draft retains its projection states");
-            let before = page
-                .before
-                .as_ref()
-                .expect("existing-page edit has a semantic predecessor");
-            let after = page
-                .after
-                .as_ref()
-                .expect("existing-page edit has a semantic successor");
-            let base = std::fs::read(self.graph_path(&self.pages[0].3)).unwrap();
-            draft.prepared_editor_projection = Some(
-                projection::PreparedEditorProjection::prepare(
-                    after.page.clone(),
-                    &before.page,
-                    base,
-                )
-                .unwrap(),
-            );
-            draft
-        }
-
         fn graph_path(&self, path: &ManagedPath) -> std::path::PathBuf {
             self.root.join("graph").join(path.as_str())
         }
@@ -34909,104 +34782,6 @@ mod validation_tests {
     }
 
     #[test]
-    fn capture_sealed_predecessor_falls_back_on_pre_capture_exact_byte_mismatch() {
-        let fixture = preauthor_gate_fixture(90_250);
-        projection::reset_prepared_editor_projection_instrumentation();
-        let draft = fixture.prepared_editor_draft(90_251, "local prepared edit");
-        let external = b"- external bytes after preparation\n";
-        std::fs::write(fixture.graph_path(&fixture.pages[0].3), external).unwrap();
-        let committed_before = fixture.writer.committed_manifests().unwrap();
-
-        assert!(matches!(
-            fixture
-                .engine
-                .capture_local_author_transaction(
-                    draft,
-                    &fixture.graph,
-                    &fixture.receipts,
-                    fixture.endpoint,
-                    None,
-                )
-                .unwrap(),
-            LocalAuthorCapture::ReconciliationNeeded(_)
-        ));
-        let counters = projection::prepared_editor_projection_instrumentation();
-        assert_eq!(counters.created, 1);
-        assert_eq!(counters.capture_sealed_predecessor_success, 0);
-        assert_eq!(counters.capture_sealed_predecessor_fallback, 1);
-        assert!(
-            counters.capture_predecessor_replay_render >= 1,
-            "the failed seal must enter the generic receipt-backed capture path"
-        );
-        assert_eq!(counters.finalizer_predecessor_replay_render, 0);
-        assert_eq!(
-            fixture.writer.committed_manifests().unwrap(),
-            committed_before
-        );
-        assert_eq!(
-            std::fs::read(fixture.graph_path(&fixture.pages[0].3)).unwrap(),
-            external,
-            "a pre-capture exact-byte mismatch must not append or overwrite the external edit"
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn capture_sealed_predecessor_falls_back_on_durable_claim_evidence_mismatch() {
-        let fixture = preauthor_gate_fixture(90_300);
-        projection::reset_prepared_editor_projection_instrumentation();
-        let mut draft = fixture.prepared_editor_draft(90_301, "local prepared claim edit");
-        let before = draft
-            .pages
-            .get_mut(&fixture.pages[0].0)
-            .expect("existing-page draft retains its projection state")
-            .before
-            .as_mut()
-            .expect("existing-page draft has a predecessor");
-        before.claim_evidence = vec![ProjectionClaimEvidence::new(
-            LogseqUuid::from_uuid(Uuid::from_u128(90_302)),
-            vec![ProjectionClaimParticipant::new(
-                fixture.pages[0].2,
-                fixture.pages[0].1,
-            )],
-        )
-        .unwrap()];
-        let bytes_before = std::fs::read(fixture.graph_path(&fixture.pages[0].3)).unwrap();
-        let committed_before = fixture.writer.committed_manifests().unwrap();
-
-        assert!(matches!(
-            fixture
-                .engine
-                .capture_local_author_transaction(
-                    draft,
-                    &fixture.graph,
-                    &fixture.receipts,
-                    fixture.endpoint,
-                    None,
-                )
-                .unwrap(),
-            LocalAuthorCapture::ReconciliationNeeded(_)
-        ));
-        let counters = projection::prepared_editor_projection_instrumentation();
-        assert_eq!(counters.capture_sealed_predecessor_success, 0);
-        assert_eq!(counters.capture_sealed_predecessor_fallback, 1);
-        assert!(
-            counters.capture_predecessor_replay_render >= 1,
-            "durable claim evidence mismatch must use the generic capture refusal path"
-        );
-        assert_eq!(
-            fixture.writer.committed_manifests().unwrap(),
-            committed_before
-        );
-        assert_eq!(
-            std::fs::read(fixture.graph_path(&fixture.pages[0].3)).unwrap(),
-            bytes_before,
-            "durable evidence mismatch must not append or write"
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
     fn preauthor_gate_exact_match_returns_finalizable_sealed_token() {
         let fixture = preauthor_gate_fixture(90_500);
         let batch_id = BatchId::from_uuid(Uuid::from_u128(90_600));
@@ -35465,69 +35240,6 @@ mod validation_tests {
         assert_eq!(
             std::fs::read(fixture.graph_path(&fixture.pages[0].3)).unwrap(),
             external
-        );
-        finish_preauthor_gate_fixture(fixture);
-    }
-
-    #[test]
-    fn capture_sealed_predecessor_still_preserves_post_capture_graph_race_guard() {
-        let mut fixture = preauthor_gate_fixture(94_250);
-        projection::reset_prepared_editor_projection_instrumentation();
-        let draft = fixture.prepared_editor_draft(94_251, "local after sealed capture");
-        let captured = match fixture
-            .engine
-            .capture_local_author_transaction(
-                draft,
-                &fixture.graph,
-                &fixture.receipts,
-                fixture.endpoint,
-                None,
-            )
-            .unwrap()
-        {
-            LocalAuthorCapture::Captured(captured) => captured,
-            LocalAuthorCapture::ReconciliationNeeded(_) => {
-                panic!("exact receipt-backed prepared predecessor did not seal")
-            }
-        };
-        let captured_counters = projection::prepared_editor_projection_instrumentation();
-        assert_eq!(captured_counters.capture_sealed_predecessor_success, 1);
-        assert_eq!(captured_counters.capture_sealed_predecessor_fallback, 0);
-        assert_eq!(captured_counters.capture_predecessor_replay_render, 0);
-
-        let external = b"- post-capture external after sealed predecessor\n";
-        std::fs::write(fixture.graph_path(&fixture.pages[0].3), external).unwrap();
-        let prepared = fixture
-            .engine
-            .finalize_captured_author_transaction(captured, &fixture.receipts)
-            .unwrap();
-        let finalizer_counters = projection::prepared_editor_projection_instrumentation();
-        assert_eq!(finalizer_counters.finalizer_predecessor_replay_render, 0);
-        assert_eq!(finalizer_counters.finalizer_post_state_render, 0);
-
-        let batch_id = prepared.manifest().batch_id();
-        fixture.writer.publish_prepared(&prepared).unwrap();
-        fixture.engine.stage_archive_batch(batch_id).unwrap();
-        let work = fixture
-            .engine
-            .projection_work_index()
-            .unwrap()
-            .pending_for_path(&fixture.pages[0].3)
-            .unwrap()
-            .into_iter()
-            .find(|work| work.batch_id() == batch_id)
-            .expect("captured batch retains one pending projection work item");
-        assert!(crate::oplog::execute_manifested_projection_work(
-            &fixture.graph,
-            &fixture.receipts,
-            &mut fixture.engine,
-            &work,
-        )
-        .is_err());
-        assert_eq!(
-            std::fs::read(fixture.graph_path(&fixture.pages[0].3)).unwrap(),
-            external,
-            "the guarded Graph precondition must reject publication over the later external bytes"
         );
         finish_preauthor_gate_fixture(fixture);
     }

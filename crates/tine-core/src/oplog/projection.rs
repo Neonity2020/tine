@@ -68,17 +68,6 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) created: usize,
     pub(crate) reused: usize,
     pub(crate) fallback: usize,
-    /// A capture-time predecessor replay.  This is deliberately distinct
-    /// from finalizer work: it proves the current completed receipt still
-    /// explains the on-disk predecessor.
-    pub(crate) capture_predecessor_replay_render: usize,
-    /// The strictly local capture proof accepted the retained predecessor
-    /// render and minted its affine, capture-sealed capability.
-    pub(crate) capture_sealed_predecessor_success: usize,
-    /// An otherwise eligible capture attempted the sealed route but one exact
-    /// equality/binding check failed and it deliberately used the generic
-    /// predecessor proof instead.
-    pub(crate) capture_sealed_predecessor_fallback: usize,
     pub(crate) finalizer_post_state_render: usize,
     pub(crate) finalizer_predecessor_replay_render: usize,
 }
@@ -89,9 +78,6 @@ impl PreparedEditorProjectionInstrumentation {
         created: 0,
         reused: 0,
         fallback: 0,
-        capture_predecessor_replay_render: 0,
-        capture_sealed_predecessor_success: 0,
-        capture_sealed_predecessor_fallback: 0,
         finalizer_post_state_render: 0,
         finalizer_predecessor_replay_render: 0,
     };
@@ -135,27 +121,6 @@ pub(crate) fn note_finalizer_predecessor_replay_render() {
         instrumentation.finalizer_predecessor_replay_render = instrumentation
             .finalizer_predecessor_replay_render
             .saturating_add(1);
-    });
-}
-
-pub(crate) fn note_capture_predecessor_replay_render() {
-    #[cfg(test)]
-    note_prepared_editor_projection(|instrumentation| {
-        instrumentation.capture_predecessor_replay_render = instrumentation
-            .capture_predecessor_replay_render
-            .saturating_add(1);
-    });
-}
-
-#[cfg(test)]
-fn note_capture_sealed_predecessor(success: bool) {
-    note_prepared_editor_projection(|instrumentation| {
-        let counter = if success {
-            &mut instrumentation.capture_sealed_predecessor_success
-        } else {
-            &mut instrumentation.capture_sealed_predecessor_fallback
-        };
-        *counter = counter.saturating_add(1);
     });
 }
 
@@ -293,42 +258,10 @@ struct RenderedProjection {
 /// value can mint a fresh final projection plan.
 pub(crate) struct PreparedEditorProjection {
     requested_page: MaterializedPage,
-    /// Complete pre-state evidence retained only for a same-attempt capture
-    /// proof.  It is not a durable predecessor and cannot cross recovery.
-    accepted_page: MaterializedPage,
     exact_base: Vec<u8>,
     candidate_base_layout: Vec<StructuralLayoutIdentity>,
     accepted_target: Vec<u8>,
-    accepted_annotations: Vec<AnnotatedIdentity>,
     rendered: RenderedProjection,
-}
-
-/// Affine capability minted only after capture has rebound the retained
-/// accepted predecessor rendering to the exact completed receipt and fresh
-/// graph bytes.  It is intentionally neither serializable nor cloneable.  It
-/// grants finalization permission to use the already authenticated durable
-/// annotations from the separately retained immutable intent; it is never
-/// durable authority by itself.
-pub(crate) struct CaptureSealedPreparedPredecessor {
-    endpoint: ProjectionEndpointBinding,
-    intent_id: super::ProjectionIntentId,
-    logical_completion_id: super::LogicalCompletionId,
-    workspace_id: WorkspaceId,
-    page_id: PageId,
-    path: super::ManagedPath,
-    frontier: super::FrontierV2,
-    claim_evidence: Vec<super::ProjectionClaimEvidence>,
-    target: super::BlobDescription,
-    annotations: Vec<AnnotatedIdentity>,
-}
-
-/// The immutable receipt material reloaded while minting a capture-sealed
-/// predecessor.  This is an affine transport only between capture and the
-/// private captured-transaction token; callers cannot construct it.
-pub(crate) struct CaptureSealedReceiptBackedPredecessor {
-    sealed: CaptureSealedPreparedPredecessor,
-    intent: ProjectionIntent,
-    completion: ProjectionCompletion,
 }
 
 impl PreparedEditorProjection {
@@ -344,7 +277,6 @@ impl PreparedEditorProjection {
         let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
         let candidate_base_layout = structural_layout_identities(&accepted.annotations);
         let accepted_target = accepted.target;
-        let accepted_annotations = accepted.annotations;
         let rendered = render_projection_page_with_layout_identities(
             &requested_page,
             Some(&exact_base),
@@ -356,11 +288,9 @@ impl PreparedEditorProjection {
         });
         Ok(Self {
             requested_page,
-            accepted_page: accepted_page.clone(),
             exact_base,
             candidate_base_layout,
             accepted_target,
-            accepted_annotations,
             rendered,
         })
     }
@@ -371,85 +301,6 @@ impl PreparedEditorProjection {
 
     pub(crate) fn accepted_target(&self) -> &[u8] {
         &self.accepted_target
-    }
-
-    /// Rebind the retained accepted rendering to one exact, completed
-    /// receipt-backed graph predecessor.  `None` is an ordinary mismatch: the
-    /// caller must run the established generic replay/reconciliation path.
-    /// This deliberately does not validate a managed-local, bootstrap,
-    /// external-reconciliation, absent, move, rename, multi-page, pending, or
-    /// recovery predecessor.
-    pub(crate) fn capture_seal_receipt_backed_predecessor(
-        &self,
-        workspace_id: WorkspaceId,
-        endpoint: ProjectionEndpointBinding,
-        receipts: &ProjectionReceiptStore,
-        completed: &[ProjectionCompletedReceipt],
-        state: &ProjectionPageState,
-        live_bytes: &[u8],
-    ) -> Result<Option<CaptureSealedReceiptBackedPredecessor>, ProjectionError> {
-        let result = (|| {
-            if receipts.workspace_id() != workspace_id
-                || receipts.endpoint_binding() != Some(endpoint)
-                || !materialized_page_projection_identity_equal(&self.accepted_page, &state.page)
-                || self.exact_base != live_bytes
-                || self.accepted_target != live_bytes
-            {
-                return Ok(None);
-            }
-
-            let [completed] = completed else {
-                return Ok(None);
-            };
-            let ProjectionWorkTarget::Present(completed_target) = completed.target() else {
-                return Ok(None);
-            };
-            if completed.page_id() != state.page.page_id
-                || completed.path() != &state.page.path
-                || completed.frontier() != &state.frontier
-                || completed_target != super::BlobDescription::of(live_bytes)
-            {
-                return Ok(None);
-            }
-
-            // This is an authenticated immutable reread, not an index hint.
-            // `load_completed_receipt` also validates the completion's intent
-            // binding and logical completion identity.
-            let (intent, completion) = receipts.load_completed_receipt(completed)?;
-            if intent.workspace_id() != workspace_id
-                || intent.page_id() != state.page.page_id
-                || intent.path() != &state.page.path
-                || intent.frontier() != &state.frontier
-                || intent.claim_evidence() != state.claim_evidence
-                || intent.target() != super::BlobDescription::of(live_bytes)
-                || intent.annotations() != self.accepted_annotations.as_slice()
-                || completion.logical_completion_id() != completed.logical_completion_id()
-            {
-                return Ok(None);
-            }
-
-            Ok(Some(CaptureSealedReceiptBackedPredecessor {
-                sealed: CaptureSealedPreparedPredecessor {
-                    endpoint,
-                    intent_id: intent.id()?,
-                    logical_completion_id: completion.logical_completion_id(),
-                    workspace_id,
-                    page_id: state.page.page_id,
-                    path: state.page.path.clone(),
-                    frontier: state.frontier.clone(),
-                    claim_evidence: state.claim_evidence.clone(),
-                    target: intent.target(),
-                    annotations: self.accepted_annotations.clone(),
-                },
-                intent,
-                completion,
-            }))
-        })();
-        #[cfg(test)]
-        if let Ok(sealed) = &result {
-            note_capture_sealed_predecessor(sealed.is_some());
-        }
-        result
     }
 
     /// Consume the artifact only after final capture proves that its accepted
@@ -490,51 +341,6 @@ impl PreparedEditorProjection {
         note_prepared_editor_projection(|instrumentation| {
             instrumentation.fallback = instrumentation.fallback.saturating_add(1);
         });
-    }
-}
-
-impl CaptureSealedReceiptBackedPredecessor {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        CaptureSealedPreparedPredecessor,
-        ProjectionIntent,
-        ProjectionCompletion,
-    ) {
-        (self.sealed, self.intent, self.completion)
-    }
-}
-
-impl CaptureSealedPreparedPredecessor {
-    /// Return the immutable intent annotations only when finalization is still
-    /// consuming the exact predecessor this capture sealed.  Any mismatch
-    /// deliberately falls through to the old replay path.
-    pub(crate) fn finalizer_annotations<'a>(
-        &self,
-        endpoint: ProjectionEndpointBinding,
-        before: &ProjectionPageState,
-        prior_bytes: &[u8],
-        intent: &'a ProjectionIntent,
-        completion: &ProjectionCompletion,
-    ) -> Option<&'a [AnnotatedIdentity]> {
-        (self.endpoint == endpoint
-            && self.workspace_id == intent.workspace_id()
-            && self.page_id == before.page.page_id
-            && self.path == before.page.path
-            && self.frontier == before.frontier
-            && self.claim_evidence == before.claim_evidence
-            && self.page_id == intent.page_id()
-            && self.path == *intent.path()
-            && self.frontier == *intent.frontier()
-            && self.claim_evidence == intent.claim_evidence()
-            && self.target == intent.target()
-            && self.target == super::BlobDescription::of(prior_bytes)
-            && intent.id().ok() == Some(self.intent_id)
-            && completion.intent_id() == self.intent_id
-            && completion.logical_completion_id() == self.logical_completion_id
-            && completion.validate_against(intent).is_ok()
-            && self.annotations == intent.annotations())
-        .then_some(intent.annotations())
     }
 }
 
@@ -3739,9 +3545,6 @@ mod tests {
                 created: 10,
                 reused: 1,
                 fallback: 9,
-                capture_predecessor_replay_render: 0,
-                capture_sealed_predecessor_success: 0,
-                capture_sealed_predecessor_fallback: 0,
                 finalizer_post_state_render: 0,
                 finalizer_predecessor_replay_render: 0,
             }
