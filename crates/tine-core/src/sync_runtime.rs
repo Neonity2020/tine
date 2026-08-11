@@ -43137,6 +43137,88 @@ mod tests {
         files
     }
 
+    fn recursive_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        if !root.is_dir() {
+            return files;
+        }
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let mut entries = fs::read_dir(directory)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    files.insert(relative, fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    fn immutable_archive_bytes(archive_root: &Path) -> BTreeMap<String, Vec<u8>> {
+        recursive_file_bytes(archive_root)
+            .into_iter()
+            .filter(|(path, _)| {
+                ["objects/", "batches/", "bootstrap-v1/"]
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    fn immutable_engine_history_bytes(archive_root: &Path) -> BTreeMap<String, Vec<u8>> {
+        recursive_file_bytes(&archive_root.join("engine-history"))
+            .into_iter()
+            .filter(|(path, _)| {
+                !path.contains("/resume-points/")
+                    && !path.ends_with("/engine-history.head")
+                    && !path.ends_with("/engine-history.transition.lock")
+            })
+            .collect()
+    }
+
+    fn immutable_projection_receipt_bytes(receipt_root: &Path) -> BTreeMap<String, Vec<u8>> {
+        recursive_file_bytes(receipt_root)
+            .into_iter()
+            .filter(|(path, _)| {
+                path == "projection-receipts.claim"
+                    || path == "projection-receipts.init"
+                    || ["bases/", "intents/", "completions/"]
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix))
+            })
+            .collect()
+    }
+
+    fn assert_byte_map_is_strict_extension(
+        before: &BTreeMap<String, Vec<u8>>,
+        after: &BTreeMap<String, Vec<u8>>,
+        label: &str,
+    ) {
+        for (path, bytes) in before {
+            assert_eq!(
+                after.get(path),
+                Some(bytes),
+                "{label} rewrote or removed accepted bytes at {path}"
+            );
+        }
+        assert!(
+            after.len() > before.len(),
+            "{label} did not append durable evidence for the accepted save"
+        );
+    }
+
     /// Resolve the run named by the newest concrete resume-point record, rather
     /// than choosing an arbitrary retained directory.  The runtime itself
     /// makes the same record selection before it tries to adopt the run.
@@ -45503,6 +45585,12 @@ mod tests {
         drop(handle);
 
         let expected_graph = user_graph_bytes(&fixture.graph_root);
+        let immutable_archive_before_recovery =
+            immutable_archive_bytes(&fixture.request.archive_root);
+        let immutable_history_before_recovery =
+            immutable_engine_history_bytes(&fixture.request.archive_root);
+        let immutable_receipts_before_recovery =
+            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
 
         let (selected_run_id, selected_run) =
             selected_retained_scratch_run_for_test(&fixture.request.archive_root);
@@ -45548,6 +45636,21 @@ mod tests {
             .handle
             .expect("typed retained-scratch failure replays into an active runtime");
         assert_eq!(
+            immutable_archive_bytes(&fixture.request.archive_root),
+            immutable_archive_before_recovery,
+            "cache-only retained-scratch recovery must not alter immutable archive authority"
+        );
+        assert_eq!(
+            immutable_engine_history_bytes(&fixture.request.archive_root),
+            immutable_history_before_recovery,
+            "cache-only retained-scratch recovery must not alter immutable engine history"
+        );
+        assert_eq!(
+            immutable_projection_receipt_bytes(&fixture.request.receipt_root),
+            immutable_receipts_before_recovery,
+            "cache-only retained-scratch recovery must not alter immutable projection receipts"
+        );
+        assert_eq!(
             user_graph_bytes(&fixture.graph_root),
             expected_graph,
             "replay recovery must not rewrite direct graph bytes"
@@ -45568,6 +45671,65 @@ mod tests {
             "recovery must leave the abandoned selected run {selected_run_id} byte-for-byte intact"
         );
         assert_ne!(selected_corrupted, selected_before);
+
+        let (recovered_page, recovered_revision) = load_application_exact(&reopened, "Root.md");
+        assert!(
+            recovered_page.blocks.iter().any(|block| block
+                .raw
+                .contains("accepted before retained scratch corruption")),
+            "the recovered public application page must contain the last accepted edit"
+        );
+        let _ = save_application_block_text(
+            &reopened,
+            recovered_page,
+            recovered_revision,
+            "accepted after retained scratch recovery",
+        );
+        let (saved_page, _) = load_application_exact(&reopened, "Root.md");
+        assert!(
+            saved_page.blocks.iter().any(|block| block
+                .raw
+                .contains("accepted after retained scratch recovery")),
+            "a public application save after recovery must be immediately readable"
+        );
+        drain_managed_local(&reopened);
+
+        let immutable_archive_after_save = immutable_archive_bytes(&fixture.request.archive_root);
+        let immutable_history_after_save =
+            immutable_engine_history_bytes(&fixture.request.archive_root);
+        let immutable_receipts_after_save =
+            immutable_projection_receipt_bytes(&fixture.request.receipt_root);
+        assert_byte_map_is_strict_extension(
+            &immutable_archive_before_recovery,
+            &immutable_archive_after_save,
+            "immutable archive",
+        );
+        assert_byte_map_is_strict_extension(
+            &immutable_history_before_recovery,
+            &immutable_history_after_save,
+            "immutable engine history",
+        );
+        assert_byte_map_is_strict_extension(
+            &immutable_receipts_before_recovery,
+            &immutable_receipts_after_save,
+            "immutable projection receipts",
+        );
+        let graph_after_save = user_graph_bytes(&fixture.graph_root);
+        assert_ne!(
+            graph_after_save, expected_graph,
+            "the accepted post-recovery save must update the direct graph projection"
+        );
+        assert!(
+            graph_after_save.values().any(|bytes| bytes
+                .windows(b"accepted after retained scratch recovery".len())
+                .any(|window| window == b"accepted after retained scratch recovery")),
+            "the direct graph projection must contain the accepted post-recovery edit"
+        );
+        let selected_after_save = recursive_file_bytes(&selected_run);
+        assert_eq!(
+            selected_after_save, selected_corrupted,
+            "the accepted post-recovery save must not reuse or alter abandoned run {selected_run_id}"
+        );
         assert!(matches!(
             reopened.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
