@@ -552,16 +552,22 @@ fn restore_from_backup_source(
         }
         Ok(current_root.join(rel))
     };
-    let restore_journals = safe_dir(&manifest.journals_dir)?;
-    let restore_pages = safe_dir(&manifest.pages_dir)?;
+    let legacy_restore_roots = (manifest.schema == LEGACY_SNAPSHOT_SCHEMA)
+        .then(|| {
+            Ok::<_, String>((
+                safe_dir(&manifest.journals_dir)?,
+                safe_dir(&manifest.pages_dir)?,
+            ))
+        })
+        .transpose()?;
     let validate_live_layout = || -> Result<(), String> {
-        for (label, path) in [
-            ("journals", &restore_journals),
-            ("pages", &restore_pages),
-            ("config", &cfg_dest),
-        ] {
-            ensure_target_within_root(&current_root, path)
-                .map_err(|e| format!("unsafe live {label} path: {e}"))?;
+        ensure_target_within_root(&current_root, &cfg_dest)
+            .map_err(|e| format!("unsafe live config path: {e}"))?;
+        if let Some((journals, pages)) = &legacy_restore_roots {
+            for (label, path) in [("journals", journals), ("pages", pages)] {
+                ensure_target_within_root(&current_root, path)
+                    .map_err(|e| format!("unsafe live {label} path: {e}"))?;
+            }
         }
         // Assets have a separate, explicitly-approved capability and therefore
         // validate against their own canonical root. For ordinary graphs this is
@@ -633,16 +639,19 @@ fn restore_from_backup_source(
     // either the original or a recoverable copy.
     match manifest.schema {
         LEGACY_SNAPSHOT_SCHEMA => {
+            let (restore_journals, restore_pages) = legacy_restore_roots
+                .as_ref()
+                .expect("legacy restore roots were validated");
             restore_md_dir(
                 &src.join("journals"),
-                &restore_journals,
+                restore_journals,
                 &graph_recovery,
                 std::path::Path::new("journals"),
             )
             .map_err(|e| format!("restore journals failed: {e}"))?;
             restore_md_dir(
                 &src.join("pages"),
-                &restore_pages,
+                restore_pages,
                 &graph_recovery,
                 std::path::Path::new("pages"),
             )
@@ -2309,8 +2318,10 @@ mod tests {
             &SnapshotManifest {
                 schema: SNAPSHOT_SCHEMA,
                 root: std::fs::canonicalize(&graph).unwrap().display().to_string(),
-                journals_dir: "journals".into(),
-                pages_dir: "pages".into(),
+                // Schema 3 paths are carried by graph/, not these schema-2
+                // compatibility fields.
+                journals_dir: "../unused-legacy-root".into(),
+                pages_dir: "/unused-legacy-root".into(),
                 graph_text_policy: Some(SnapshotGraphTextPolicy {
                     version: GRAPH_TEXT_SCOPE_VERSION,
                     hidden: Vec::new(),
