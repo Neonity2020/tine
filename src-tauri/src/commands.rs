@@ -7,7 +7,7 @@ use crate::state::{
     slot_for_context, with_config_graph, with_filesystem_graph, with_trash_graph, AppState,
     GraphContext,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State, WebviewWindow};
@@ -26,11 +26,69 @@ use tine_core::sync_runtime::{
     SyncRuntimeHandle,
 };
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ManagedApplicationMoveSubtreesResult {
     pub(crate) binding_generation: u64,
     pub(crate) application_page_admission: crate::state::ApplicationPageAdmission,
     pub(crate) outcome: SyncApplicationMoveSubtreesOutcome,
+}
+
+#[cfg(test)]
+mod managed_application_move_wire_tests {
+    use super::ManagedApplicationMoveSubtreesResult;
+    use crate::state::{ApplicationPageAdmission, ApplicationPageAdmissionAuthority};
+    use tine_core::model::{Format, PageDto, PageKind};
+    use tine_core::sync_runtime::{SyncApplicationMoveSubtreesOutcome, SyncApplicationMovedPage};
+
+    #[test]
+    fn bounded_tauri_move_result_json_round_trips() {
+        let page = |name: &str| PageDto {
+            activation: None,
+            name: name.into(),
+            kind: PageKind::Page,
+            title: name.into(),
+            pre_block: None,
+            blocks: Vec::new(),
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: format!("pages/{name}.md"),
+            guide: false,
+        };
+        let source = page("Source");
+        let destination = page("Destination");
+        let result = ManagedApplicationMoveSubtreesResult {
+            binding_generation: 17,
+            application_page_admission: ApplicationPageAdmission {
+                binding_generation: 17,
+                authority: ApplicationPageAdmissionAuthority::ManagedWritable {
+                    application_save_page_blocks: 511,
+                    application_page_request_text_bytes: 1_048_576,
+                    application_page_max_depth: 128,
+                },
+            },
+            outcome: SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id: "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1".into(),
+                batch_id: "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a2".into(),
+                recovered: true,
+                source: SyncApplicationMovedPage {
+                    page: source,
+                    revision: "source-revision".into(),
+                },
+                destination: SyncApplicationMovedPage {
+                    page: destination,
+                    revision: "destination-revision".into(),
+                },
+            },
+        };
+        let bytes = serde_json::to_vec(&result).unwrap();
+        assert!(bytes.len() < 16 * 1024);
+        let decoded: ManagedApplicationMoveSubtreesResult = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(result).unwrap()
+        );
+    }
 }
 
 #[tauri::command]

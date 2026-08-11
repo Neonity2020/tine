@@ -320,7 +320,8 @@ export type ManagedApplicationMoveConflict =
   | "destination_too_deep"
   | "destination_text_too_large"
   | "episode_mismatch"
-  | "episode_not_committed";
+  | "episode_not_committed"
+  | "batch_collision";
 
 export interface ManagedApplicationMovedPage {
   page: PageDto;

@@ -17,14 +17,14 @@ static NEXT_BINDING: AtomicU64 = AtomicU64::new(1);
 /// The bounded application-page envelope the current graph binding can accept.
 /// This is an advisory frontend wire record only: the actor remains the final
 /// authority for every managed application save.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ApplicationPageAdmission {
     pub(crate) binding_generation: u64,
     #[serde(flatten)]
     pub(crate) authority: ApplicationPageAdmissionAuthority,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "authority", rename_all = "snake_case")]
 pub(crate) enum ApplicationPageAdmissionAuthority {
     Direct,
