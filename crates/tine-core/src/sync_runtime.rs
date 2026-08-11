@@ -22469,7 +22469,6 @@ mod tests {
             "TrustedLocalMissingBaseRevision",
             "trusted_local_preparation_refusal",
             "TrustedLocalEngineAuthority",
-            "trusted_local_commit_refusal",
         ] {
             assert!(
                 prepare.contains(code),
@@ -22482,7 +22481,17 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn finish_trusted_local_editor_outcome("))
             .map(|(body, _)| body)
             .expect("editor transaction has a narrow source boundary");
-        for code in ["FallbackReadmission", "PostCommitCurrentPageLookup"] {
+        // `trusted_local_commit_refusal` sits here rather than with preparation:
+        // centralizing actor dispatch moved the `CommitRefused` arm out of
+        // `prepare_trusted_local_runtime_commit` and into the execution step,
+        // which is where the commit it refuses actually happens. The slice this
+        // test closes over is unchanged — only which of the two windows owns
+        // this member.
+        for code in [
+            "FallbackReadmission",
+            "PostCommitCurrentPageLookup",
+            "trusted_local_commit_refusal",
+        ] {
             assert!(
                 execute.contains(code),
                 "transaction omits refusal code {code}"
@@ -24168,7 +24177,11 @@ mod tests {
                     .map(|(body, _)| body)
             })
             .expect("editor transaction retains a narrow boundary");
-        assert!(editor.contains("Some(target_page)"));
+        // The Some-branch now destructures a tuple: carrying exact response
+        // evidence and the prepared editor projection alongside the page is what
+        // lets the reply be built without a second lookup. The branch, and the
+        // Declined arm opposite it, are what this pins — not the arity.
+        assert!(editor.contains("Some((target_page"));
         assert!(editor.contains("None => TrustedLocalRuntimeAttempt::Declined"));
 
         let unit = production

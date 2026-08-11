@@ -14179,7 +14179,7 @@ mod tests {
         let (existing, existing_proof) =
             SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
                 .unwrap();
-        assert_eq!(existing_proof, expected);
+        assert_eq!(existing_proof.evidence_only(), expected.evidence_only());
         assert!(matches!(
             existing.recovery,
             ProjectionRecovery::RebuiltPreservingEvidence { .. }
@@ -14196,14 +14196,14 @@ mod tests {
         let (deleted, deleted_proof) =
             SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
                 .unwrap();
-        assert_eq!(deleted_proof, expected);
+        assert_eq!(deleted_proof.evidence_only(), expected.evidence_only());
         drop(deleted);
 
         fs::write(&path, b"corrupt sqlite projection").unwrap();
         let (corrupt, corrupt_proof) =
             SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
                 .unwrap();
-        assert_eq!(corrupt_proof, expected);
+        assert_eq!(corrupt_proof.evidence_only(), expected.evidence_only());
         drop(corrupt);
 
         let interrupted_path = root.path().join("interrupted.sqlite");
@@ -14222,7 +14222,7 @@ mod tests {
             &authority,
         )
         .unwrap();
-        assert_eq!(retried_proof, expected);
+        assert_eq!(retried_proof.evidence_only(), expected.evidence_only());
         assert_eq!(
             retried_proof.bootstrap_rebuild().bootstrap_part_reads,
             prepared.aggregate().parts().len()
@@ -14356,7 +14356,7 @@ mod tests {
             let (rebuilt, proof) =
                 SqliteFrontier::open_or_rebuild_inactive_bootstrap(&path, &runtime, &authority)
                     .unwrap();
-            assert_eq!(proof, expected, "{label}");
+            assert_eq!(proof.evidence_only(), expected.evidence_only(), "{label}");
             assert!(
                 matches!(
                     rebuilt.recovery,

@@ -1939,6 +1939,16 @@ pub(crate) struct VerifiedBootstrapSqliteProjection {
 }
 
 impl VerifiedBootstrapSqliteProjection {
+    /// This proof with its wall-clock instrumentation zeroed, for comparing two
+    /// rebuilds of one authority. See
+    /// [`BootstrapSqliteRebuildInstrumentation::without_timings`].
+    #[cfg(test)]
+    pub(crate) fn evidence_only(&self) -> Self {
+        let mut copy = self.clone();
+        copy.bootstrap_rebuild = copy.bootstrap_rebuild.without_timings();
+        copy
+    }
+
     pub(crate) const fn claim(&self) -> ProjectionClaim {
         self.claim
     }
@@ -2031,6 +2041,28 @@ pub(crate) struct BootstrapSqliteRebuildInstrumentation {
     /// One when retained terminal material was present but refused, so this
     /// activation discarded the private candidate and replayed the archive.
     pub(crate) terminal_construction_refusals: usize,
+}
+
+impl BootstrapSqliteRebuildInstrumentation {
+    /// The same instrumentation with every wall-clock measurement zeroed.
+    ///
+    /// The counters beside them are evidence — how many parts were read, how
+    /// many materializations ran — and two rebuilds of one authority must agree
+    /// on every one of them. The `_micros` fields are measurements of the
+    /// machine, and two runs never agree on those, so a test comparing whole
+    /// instrumentation for equality is asserting something that cannot hold.
+    /// Zero them explicitly rather than dropping the comparison: every count
+    /// stays compared.
+    #[cfg(test)]
+    pub(crate) const fn without_timings(mut self) -> Self {
+        self.terminal_materialization_micros = 0;
+        self.terminal_reference_micros = 0;
+        self.terminal_lowering_micros = 0;
+        self.terminal_insert_micros = 0;
+        self.terminal_catalog_cursor_micros = 0;
+        self.terminal_finish_micros = 0;
+        self
+    }
 }
 
 impl BootstrapSqliteRebuildInstrumentation {
