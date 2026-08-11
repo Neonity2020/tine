@@ -977,8 +977,22 @@ describe("F3 batched loaded identity collision receipt", () => {
       clear: () => setRaw("collision", "owner"),
     },
     {
-      label: "setRaw-introduced ownership",
+      label: "Markdown-declared outside-drawer Org-looking ownership",
       ownerFormat: "md",
+      introduce: (id: string) => setRaw("collision", `owner\r\n :id: ${id.toLowerCase()}\r\ntext`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\r\n :id: ${id.toLowerCase()}\r\ntext`),
+      clear: () => setRaw("collision", "owner"),
+    },
+    {
+      label: "Markdown-declared optional-space ownership",
+      ownerFormat: "md",
+      introduce: (id: string) => setRaw("collision", `owner\nid :: ${id.toLowerCase()}`),
+      introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\nid :: ${id.toLowerCase()}`),
+      clear: () => setRaw("collision", "owner"),
+    },
+    {
+      label: "Org-declared Markdown-looking optional-space ownership",
+      ownerFormat: "org",
       introduce: (id: string) => setRaw("collision", `owner\nid :: ${id.toLowerCase()}`),
       introduceRedo: (id: string) => setDoc("byId", "collision", "raw", `owner\nid :: ${id.toLowerCase()}`),
       clear: () => setRaw("collision", "owner"),

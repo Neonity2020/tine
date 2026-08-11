@@ -33,8 +33,10 @@ export type ClipboardWorkPhase =
 
 type MutableClipboardWorkForTest = Omit<ClipboardWorkForTest, "distinct_dirty_pages">;
 
-let work: MutableClipboardWorkForTest = emptyClipboardWork(null);
-let dirtyPageNames = new Set<string>();
+// No eager state: production call sites are compile-time-eliminated, allowing
+// Rollup to tree-shake this entire module (including every metric/phase string).
+let work: MutableClipboardWorkForTest | null = null;
+let dirtyPageNames: Set<string> | null = null;
 
 function emptyClipboardWork(label: string | null): MutableClipboardWorkForTest {
   return {
@@ -58,6 +60,16 @@ function emptyClipboardWork(label: string | null): MutableClipboardWorkForTest {
   };
 }
 
+function currentWork(): MutableClipboardWorkForTest {
+  work ??= emptyClipboardWork(null);
+  return work;
+}
+
+function currentDirtyPageNames(): Set<string> {
+  dirtyPageNames ??= new Set<string>();
+  return dirtyPageNames;
+}
+
 /** Begin a labelled test receipt. Production callers never enable one. */
 export function __resetClipboardWorkForTest(label: string | null = null): void {
   work = emptyClipboardWork(label);
@@ -66,12 +78,13 @@ export function __resetClipboardWorkForTest(label: string | null = null): void {
 
 /** Read the current labelled clipboard work receipt. */
 export function __clipboardWorkForTest(): ClipboardWorkForTest {
+  const current = currentWork();
   return {
-    ...work,
-    distinct_dirty_pages: [...dirtyPageNames].sort(),
-    accepted_source_saves: [...work.accepted_source_saves],
-    accepted_target_saves: [...work.accepted_target_saves],
-    phase_order: [...work.phase_order],
+    ...current,
+    distinct_dirty_pages: [...currentDirtyPageNames()].sort(),
+    accepted_source_saves: [...current.accepted_source_saves],
+    accepted_target_saves: [...current.accepted_target_saves],
+    phase_order: [...current.phase_order],
   };
 }
 
@@ -88,29 +101,31 @@ export function recordClipboardWorkForTest(
     | "target_insertion_phases",
   count = 1,
 ): void {
-  work[metric] += count;
+  currentWork()[metric] += count;
 }
 
 export function recordClipboardDirtyPageForTest(name: string): void {
-  dirtyPageNames.add(name);
+  currentDirtyPageNames().add(name);
 }
 
 export function recordClipboardUndoSnapshotForTest(nodes: number, rawBytes: number): void {
-  work.undo_snapshots++;
-  work.undo_snapshot_nodes += nodes;
-  work.undo_snapshot_raw_bytes += rawBytes;
+  const current = currentWork();
+  current.undo_snapshots++;
+  current.undo_snapshot_nodes += nodes;
+  current.undo_snapshot_raw_bytes += rawBytes;
 }
 
 export function recordClipboardPhaseForTest(phase: ClipboardWorkPhase): void {
-  work.phase_order.push(phase);
+  currentWork().phase_order.push(phase);
 }
 
 export function recordClipboardAcceptedSaveForTest(kind: "source" | "target", name: string): void {
+  const current = currentWork();
   if (kind === "source") {
-    work.accepted_source_saves.push(name);
+    current.accepted_source_saves.push(name);
     recordClipboardPhaseForTest("accepted-source-save");
   } else {
-    work.accepted_target_saves.push(name);
+    current.accepted_target_saves.push(name);
     recordClipboardPhaseForTest("accepted-target-save");
   }
 }
