@@ -320,6 +320,14 @@ jobs:
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
       - name: Android core compiles against Android libc declarations
         run: cargo check -p tine-core --target aarch64-linux-android
+      # tine-core alone cannot see `#[cfg(target_os = "android")]` code in the
+      # app crate. On 2026-08-11 a missing `use tauri::Manager` in
+      # android_safe_back.rs compiled everywhere except Android, passed this
+      # job, and only surfaced in release packaging — after full CI was green
+      # on the exact candidate. Check the app crate here so an Android-only
+      # break fails the release gate instead of the release.
+      - name: Android app crate compiles (Android-only cfg paths)
+        run: cargo check -p tine --target aarch64-linux-android
 
   # Focused, signed APK proof for the frozen sync candidate. This remains outside
   # full CI: it is manually dispatched only with scope=android and never releases.
