@@ -128,6 +128,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Workflows/Keep context visible",
         markdown: include_str!("templates/keep-context-visible.md"),
     },
+    GuideTemplate {
+        title: "Workflows/Extend Tine",
+        markdown: include_str!("templates/extend-tine.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -1131,6 +1135,49 @@ mod tests {
             .expect("keep-context-visible workflow was copied");
         assert!(copied_markdown.contains("[[tine-guide/Start/Where things are]]"));
         assert!(copied_markdown.contains("[[tine-guide/Workflows/Find and revisit]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extend_tine_workflow_is_registered_linked_and_copyable() {
+        let title = "Workflows/Extend Tine";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("extend-tine workflow is registered");
+        assert!(page.markdown.contains("- # Extend Tine"));
+        assert!(page.markdown.contains("Install a local package"));
+        assert!(page.markdown.contains("**installed disabled**"));
+        assert!(page.markdown.contains("Unavailable on"));
+        assert!(page.markdown.contains("graph.write.block"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("[[Features/Plugins]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index.markdown.contains("[[Workflows/Extend Tine]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("extend-tine workflow is available in the read-only Guide");
+        assert_eq!(virtual_page.page.name, "Tine-guide/Workflows/Extend Tine");
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-extend-tine-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Workflows/Extend Tine"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("extend-tine workflow was copied");
+        assert!(copied_markdown.contains("[[tine-guide/Features/Plugins]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

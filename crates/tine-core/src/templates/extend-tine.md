@@ -1,0 +1,29 @@
+icon:: 🔌
+
+- # Extend Tine
+  - Add a plugin or a theme in a few minutes, know exactly what authority you granted, and take it back cleanly. This page is the hands-on path; the detailed rulebook stays on [[Features/Plugins]].
+- ## Know what a plugin can touch before you install one
+  - Tine plugins are capability-limited WebAssembly guests. They are **not** Logseq or Obsidian plugins, and plugins written for those apps do not run here.
+  - A plugin declares capabilities from a short, closed list, and Tine performs each one on its behalf: command-palette actions, slash commands, small block decorations (thread lines, badges), declarative settings, and narrowly preconditioned edits to a focused block.
+  - A plugin cannot access the DOM, Tauri, the network, files, processes, or your graph directly, and it cannot inject HTML or CSS — everything it shows is drawn by Tine. The one capability that can change your text is `graph.write.block`, and even it may edit only the block Tine handed the plugin, recording normal undo and saving through the same conflict-checked path your own edits use.
+- ## Install one — it starts disabled
+  - 1. Open Settings (**t s**) → **Plugins** → **Browse**. Each community-catalogue entry lists its source, license, supported platforms, and declared capabilities, plus a safety verdict — from "Low-risk automated pass" up to "Human-reviewed before publication" (Tine holds every plugin that can edit text for human review). Open its **Safety report** for the digest-verified detail, and keep the reminder under it in mind: *automated review is evidence, not a guarantee.*
+  - 2. Choose **Install**. Nothing runs yet — every plugin version is **installed disabled**, and Tine takes you to the **Installed** tab with its details open.
+  - 3. Review what it claims: name, version, author, license, platforms, capabilities. If they match what you expected, flip the toggle to enable it.
+  - 4. Developing or sideloading instead? **Install a local package** takes a `manifest.json` and its `.wasm` file together — with the same installed-disabled rule.
+  - What you should see: exactly the contribution the plugin declared — a command-palette entry, a slash command, or a decoration — and nothing else. If the package does not support your device, its button reads **Unavailable on …** instead of Install.
+- ## Change its settings — Tine's controls, your device
+  - A plugin that declares settings gets a **Settings** section on its details page, but Tine draws the controls — toggles, dropdowns, numbers, text — from the plugin's declared schema. Values are validated scalars, **stored on this device only** and never written into your graph. A changed key offers **Reset**; **Reset all settings** restores the schema defaults.
+- ## Disable it, or take it out
+  - Flip the same toggle to disable: the behavior stops, the package stays installed, and your pages remain exactly as readable as before — a plugin may not invent a format your graph would depend on.
+  - **Uninstall…** removes only that package version from this device. Tine asks first and states the boundary: it does not change your graph or notes.
+  - Behind the scenes, cached signed revocations are checked before a saved plugin starts, so a version revoked as unsafe stays disabled even while you are offline.
+- ## Themes recolor; they never run
+  - Themes live separately under Settings → **Appearance**: pick a built-in gallery theme (Default, Nord, Solarized, Gruvbox), or install a **token theme** from the Theme packages list or a local `.json` file — packages of validated color values with no scripts, selectors, imports, or remote assets. One theme is selected at a time, the choice stays on this device, and no theme ever writes to your graph.
+  - Your own `logseq/custom.css` outranks every theme: themes recolor Tine through Logseq's `--ls-*` variables, and your CSS loads last. Uninstalling a theme package leaves it untouched, too.
+- ## Platform and distribution lines
+  - Desktop and Android share the same plugin and theme lifecycle; a package that did not declare your platform shows as unavailable rather than failing later.
+  - The F-Droid build ships without the network community catalogue, because that store forbids downloading code at runtime. The plugin host, your already-installed plugins and themes, local `manifest.json` + `.wasm` and theme packages, and the built-in gallery all keep working.
+  - There is no iOS build of Tine today, so plugins and themes reach desktop and Android only.
+- ## Where next
+  - [[Features/Plugins]] keeps the detailed reference, including the safety-report fields and the cascade order — and links the authoring, packaging, and registry guide used by plugin developers.

@@ -14,6 +14,7 @@ icon:: 🧭
   - [[Workflows/Capture and plan your day]] — journal-first daily flow: tasks, priorities, dates, the agenda, and carrying leftovers forward.
   - [[Workflows/Find and revisit]] — jump back to anything with Ctrl+K, follow links and reference panels, and keep a search as an ordinary page.
   - [[Workflows/Research a document]] — bring in a PDF, highlight it, and tie the highlights into your notes beside the source.
+  - [[Workflows/Extend Tine]] — install a plugin or theme, see exactly what authority it receives, and disable or remove it safely.
   - [[Features/Sheets]] — create grids, tables, boards, queries, and formulas over ordinary bullets.
   - [[Features/Formulas]] — build read-only computed columns with the visual formula editor.
   - [[Features/Quick capture]] — set up a global capture box that files notes into your graph.
