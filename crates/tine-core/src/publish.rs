@@ -2034,7 +2034,26 @@ pub fn page_print_html(graph: &Graph, name: &str, opts: PrintOpts) -> io::Result
     };
     let content = fs::read_to_string(&entry.path)?;
     let parsed = doc::parse(&content);
-    let slug = slug(&entry.name);
+    Ok(Some(page_print_html_document(
+        graph,
+        &entry.name,
+        &parsed,
+        opts,
+    )))
+}
+
+/// Render one already-authoritative page document. Managed storage uses this
+/// after loading the exact current page through its actor, so printing an edit
+/// does not wait for the filesystem projection or construct the Direct Files
+/// parsed graph. Direct Files enters through [`page_print_html`] and therefore
+/// shares this renderer byte-for-byte.
+pub(crate) fn page_print_html_document(
+    graph: &Graph,
+    name: &str,
+    parsed: &doc::Document,
+    opts: PrintOpts,
+) -> String {
+    let slug = slug(name);
     let mut refs = RefIndex::new();
     collect_block_refs(&parsed.roots, &slug, &mut refs);
     let print_asset_budget = RefCell::new(PrintAssetBudget::standard());
@@ -2060,19 +2079,15 @@ pub fn page_print_html(graph: &Graph, name: &str, opts: PrintOpts) -> io::Result
             &mut body,
             &ctx,
             &slug,
-            &entry.name,
+            name,
             &mut counter,
             &mut blocks,
             opts,
         );
     }
     body.push_str("</ul>");
-    let heading = format!("<h1 class=\"page\">{}</h1>", esc(&entry.name));
-    Ok(Some(print_shell(
-        &entry.name,
-        &format!("{heading}{body}"),
-        opts,
-    )))
+    let heading = format!("<h1 class=\"page\">{}</h1>", esc(name));
+    print_shell(name, &format!("{heading}{body}"), opts)
 }
 
 /// Options for the single-page print/PDF export, chosen in the pre-export dialog.
@@ -2695,6 +2710,32 @@ fn commit_publish_stage(graph: &Graph, stage: PublishStage, out: &Path) -> io::R
 /// Only pages with `public:: true` are published, unless
 /// `:publishing/all-pages-public?` is set in config (matching Logseq).
 pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
+    let mut pages = Vec::new();
+    for entry in graph.list_pages() {
+        let content = fs::read_to_string(&entry.path)?;
+        let mut document = if entry
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("org"))
+        {
+            crate::org::parse_org(&content)
+        } else {
+            doc::parse(&content)
+        };
+        crate::model::assign_doc_runtime_ids(&mut document.roots, &entry.rel_path);
+        pages.push((entry, document));
+    }
+    publish_graph_documents(graph, pages)
+}
+
+/// Publish one already-authoritative graph snapshot. Managed storage obtains
+/// these documents in a single actor turn; Direct Files parses its fresh files
+/// immediately before entering the same renderer.
+pub(crate) fn publish_graph_documents(
+    graph: &Graph,
+    pages: Vec<(crate::model::PageEntry, doc::Document)>,
+) -> io::Result<(String, usize)> {
     let out = graph.root.join("publish");
     graph.ensure_write_target(&out)?;
     let stage = reserve_publish_stage(graph)?;
@@ -2711,20 +2752,23 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     let all_public = graph.config.all_pages_public;
     let favorites: HashSet<&str> = graph.config.favorites.iter().map(|s| s.as_str()).collect();
 
-    let pages = graph.list_pages();
+    let snapshot_pages = pages
+        .into_iter()
+        .map(|(entry, document)| (entry, Arc::new(document)))
+        .collect::<Vec<_>>();
     // Query/reference DTOs currently identify their source by logical page name.
     // If two physical files claim that identity, a name-only authorization check
     // cannot prove which file produced a result. Fail closed for that identity:
     // publish neither twin rather than let a private twin borrow the public
     // capability. Ordinary unique pages retain the exact one-file capability.
     let mut source_identity_counts: HashMap<String, usize> = HashMap::new();
-    for page in &pages {
+    for (page, _) in &snapshot_pages {
         *source_identity_counts
             .entry(crate::refs::page_key(&page.name))
             .or_default() += 1;
     }
-    let mut entries: Vec<_> = pages.iter().collect();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut entries = snapshot_pages.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
 
     // Pass 1: parse every page into one immutable query snapshot, while keeping
     // only authorized pages in the publication projection. `entries` is already
@@ -2733,23 +2777,8 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     // the renderer can honestly count matches omitted by the public capability;
     // result hydration still comes exclusively from `public` below.
     let mut public: Vec<(&str, PageKind, Arc<doc::Document>)> = Vec::new();
-    let mut snapshot_pages = Vec::new();
-    for e in entries {
-        let content = fs::read_to_string(&e.path)?;
-        let mut parsed = if e
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("org"))
-        {
-            crate::org::parse_org(&content)
-        } else {
-            doc::parse(&content)
-        };
+    for (e, parsed) in entries {
         let is_public = all_public || page_is_public(parsed.pre_block.as_deref());
-        crate::model::assign_doc_runtime_ids(&mut parsed.roots, &e.rel_path);
-        let parsed = Arc::new(parsed);
-        snapshot_pages.push((e.clone(), Arc::clone(&parsed)));
         if !is_public {
             continue;
         }
@@ -2765,7 +2794,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
             );
             continue;
         }
-        public.push((e.name.as_str(), e.kind, Arc::clone(&parsed)));
+        public.push((e.name.as_str(), e.kind, Arc::clone(parsed)));
     }
 
     // Every downstream resolver gets the same exact document revision as the
@@ -2773,7 +2802,7 @@ pub fn publish_graph(graph: &Graph) -> io::Result<(String, usize)> {
     // list, so a query cannot fall through to the live graph or a stale
     // pre-export cache. The render context's public-page map remains the sole
     // capability for hydrating any query/embed/namespace result into HTML.
-    let snapshot = PublicationGraphSnapshot::new(snapshot_pages)?;
+    let snapshot = PublicationGraphSnapshot::new(snapshot_pages.clone())?;
 
     // ONE source of truth: a unique, nonempty name→slug map for the exported set.
     // Every filename, cross-page link, block-ref target, and search-index entry is
@@ -3768,6 +3797,25 @@ mod tests {
             .page_print_html("Report", PrintOpts::default())
             .unwrap()
             .expect("page exists");
+        let page = g
+            .load_named("Report", PageKind::Page)
+            .unwrap()
+            .expect("page DTO exists");
+        assert_eq!(
+            g.page_print_html_page(&page, PrintOpts::default()).unwrap(),
+            html,
+            "actor-owned DTO and Direct Files source must share one renderer"
+        );
+        let mut current = page;
+        current.blocks[1].raw = "Actor-current text".into();
+        let current_html = g
+            .page_print_html_page(&current, PrintOpts::default())
+            .unwrap();
+        assert!(current_html.contains("Actor-current text"));
+        assert!(
+            !current_html.contains("Some <strong>bold</strong> text"),
+            "printing an actor-owned edit must not fall back to projected disk bytes"
+        );
 
         // Self-contained: inlined stylesheet + inlined image, no sidebar / app scripts /
         // external style.css.

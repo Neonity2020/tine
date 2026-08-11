@@ -5502,7 +5502,7 @@ dependencies = [
 
 [[package]]
 name = "tine"
-version = "0.6.91"
+version = "0.6.92"
 dependencies = [
  "base64 0.22.1",
  "cap-std",
@@ -5536,7 +5536,7 @@ dependencies = [
 
 [[package]]
 name = "tine-core"
-version = "0.6.91"
+version = "0.6.92"
 dependencies = [
  "ahash",
  "ammonia",
@@ -5544,6 +5544,7 @@ dependencies = [
  "cap-std",
  "caseless",
  "chrono",
+ "crc32fast",
  "dirs",
  "fs2",
  "libc",
@@ -5569,7 +5570,7 @@ dependencies = [
 
 [[package]]
 name = "tine-ios-folder-picker-native"
-version = "0.6.91"
+version = "0.6.92"
 dependencies = [
  "tauri",
  "tauri-plugin",
@@ -5585,7 +5586,8 @@ dependencies = [
 
 [[package]]
 name = "tine-storage"
-version = "0.6.91"
+version = "0.3.0"
+source = "git+https://github.com/martinkoutecky/tine-storage?tag=v0.3.0#f537665eb518e833829002146d384fb2b1d3d364"
 dependencies = [
  "cap-fs-ext",
  "cap-std",

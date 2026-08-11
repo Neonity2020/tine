@@ -50,6 +50,7 @@ import {
   pageByName,
   carryUnfinished,
   ensurePageLoaded,
+  installCaptureScratchPage,
   loadGuidePages,
   exportNodesFor,
   prevVisible,
@@ -674,7 +675,7 @@ describe("cross-day move (journal feed as one list)", () => {
   it("moves a root block up into the day above (feed order), keeping content", async () => {
     const today = journal("Today", [blk("t1")]);
     const older = journal("Older", [blk("o1"), blk("o2")]);
-    loadFeed([today, older]); // today on top, older below
+    await loadFeed([today, older]); // today on top, older below
     const o1 = older.blocks[0].id;
     const res = await moveBlockFeed(o1, -1); // up → end of the day above
     expect(res).toBe("crossed");
@@ -686,7 +687,7 @@ describe("cross-day move (journal feed as one list)", () => {
   it("moves a root block down into the day below (prepended)", async () => {
     const today = journal("Today", [blk("t1"), blk("t2")]);
     const older = journal("Older", [blk("o1")]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const t2 = today.blocks[1].id;
     const res = await moveBlockFeed(t2, 1); // down → start of the day below
     expect(res).toBe("crossed");
@@ -697,7 +698,7 @@ describe("cross-day move (journal feed as one list)", () => {
   it("carries a block's subtree across with it", async () => {
     const today = journal("Today", [blk("t1")]);
     const older = journal("Older", [blk("o1", [blk("o1a")])]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const o1 = older.blocks[0].id;
     const o1a = older.blocks[0].children[0].id;
     await moveBlockFeed(o1, -1);
@@ -707,7 +708,7 @@ describe("cross-day move (journal feed as one list)", () => {
 
   it("can't move up past the top of the feed (today)", async () => {
     const today = journal("Today", [blk("t1")]);
-    loadFeed([today]);
+    await loadFeed([today]);
     const res = await moveBlockFeed(today.blocks[0].id, -1);
     expect(res).toBe("none");
     expect(raws("Today")).toEqual(["t1"]);
@@ -864,11 +865,11 @@ describe("cross-page duplicate id::", () => {
     name, kind: "page", title: name, pre_block: null, blocks, path,
   });
 
-  it("re-keys a duplicate id:: on a second page so the two blocks stay distinct", () => {
+  it("re-keys a duplicate id:: on a second page so the two blocks stay distinct", async () => {
     // Two files carrying the SAME persisted id (e.g. copy-pasted raw, or a sync
     // hiccup) — the global byId must not collapse them into one node.
-    ensurePageLoaded(page("A", [{ id: "dup", raw: "alpha\nid:: dup", collapsed: false, children: [] }]));
-    ensurePageLoaded(page("B", [{ id: "dup", raw: "beta\nid:: dup", collapsed: false, children: [] }]));
+    await ensurePageLoaded(page("A", [{ id: "dup", raw: "alpha\nid:: dup", collapsed: false, children: [] }]));
+    await ensurePageLoaded(page("B", [{ id: "dup", raw: "beta\nid:: dup", collapsed: false, children: [] }]));
 
     const aRoot = pageByName("A")!.roots[0];
     const bRoot = pageByName("B")!.roots[0];
@@ -884,10 +885,10 @@ describe("cross-page duplicate id::", () => {
     expect(doc.byId[bRoot].page).toBe("B");
   });
 
-  it("resolves a durable UUID only within its declared page, kind, and path", () => {
+  it("resolves a durable UUID only within its declared page, kind, and path", async () => {
     const uuid = "12345678-1234-4234-8234-123456789abc";
-    ensurePageLoaded(page("A", [{ id: uuid, raw: `alpha\nid:: ${uuid}`, collapsed: false, children: [] }]));
-    ensurePageLoaded(page(
+    await ensurePageLoaded(page("A", [{ id: uuid, raw: `alpha\nid:: ${uuid}`, collapsed: false, children: [] }]));
+    await ensurePageLoaded(page(
       "B",
       [{ id: uuid, raw: `beta\nid:: ${uuid}`, collapsed: false, children: [] }],
       "pages/client-b/B.md",
@@ -920,8 +921,8 @@ describe("reloadDisposition (watcher reload guard)", () => {
   const j = (name: string, blocks: BlockDto[]): PageDto => ({
     name, kind: "journal", title: name, pre_block: null, blocks,
   });
-  it("reload when clean; skip while editing a block on it or mid block-move", () => {
-    loadFeed([j("Today", [blk("t1")])]);
+  it("reload when clean; skip while editing a block on it or mid block-move", async () => {
+    await loadFeed([j("Today", [blk("t1")])]);
     expect(reloadDisposition("Today")).toBe("reload");
     setBlockMoving(true);
     expect(reloadDisposition("Today")).toBe("skip"); // a move is mid-flight
@@ -930,8 +931,8 @@ describe("reloadDisposition (watcher reload guard)", () => {
     startEditing(pageByName("Today")!.roots[0], 0, null);
     expect(reloadDisposition("Today")).toBe("skip"); // a block on it is focused
   });
-  it("conflict when the page has unsaved edits (never clobber)", () => {
-    loadFeed([j("D", [blk("d1")])]);
+  it("conflict when the page has unsaved edits (never clobber)", async () => {
+    await loadFeed([j("D", [blk("d1")])]);
     markDirty("D");
     expect(reloadDisposition("D")).toBe("conflict");
   });
@@ -943,10 +944,10 @@ describe("page-scoped structural undo", () => {
   });
   const raws = (name: string) => pageByName(name)!.roots.map((id) => doc.byId[id].raw);
 
-  it("undo of a single-page edit restores that page and leaves other loaded pages untouched", () => {
+  it("undo of a single-page edit restores that page and leaves other loaded pages untouched", async () => {
     const today = journal("Today", [blk("t1")]);
     const older = journal("Older", [blk("o1"), blk("o2")]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const olderIds = pageByName("Older")!.roots.slice();
 
     splitBlock(today.blocks[0].id, 1); // edit ONLY Today: "t1" -> "t","1"
@@ -963,7 +964,7 @@ describe("page-scoped structural undo", () => {
     expect(raws("Older")).toEqual(["o1", "o2"]);
   });
 
-  it("undo preserves a path-pinned page's `path` (a #21 stray must not misroute its save)", () => {
+  it("undo preserves a path-pinned page's `path` (a #21 stray must not misroute its save)", async () => {
     // `path` pins the save to the exact file the page came from (a duplicate-day
     // stray). The undo clone used to drop it, so undoing an edit re-routed the
     // next save to the CANONICAL file. Snapshot → edit → undo must keep `path`.
@@ -971,7 +972,7 @@ describe("page-scoped structural undo", () => {
       name: "Today", kind: "journal", title: "Today", pre_block: null,
       blocks: [blk("t1")], path: "journals/Friday, 26-06-2026.md",
     };
-    loadFeed([stray]);
+    await loadFeed([stray]);
     expect(pageByName("Today")!.path).toBe("journals/Friday, 26-06-2026.md");
     splitBlock(stray.blocks[0].id, 1); // structural op → snapshots this page
     undo();
@@ -980,7 +981,7 @@ describe("page-scoped structural undo", () => {
     expect(pageByName("Today")!.path).toBe("journals/Friday, 26-06-2026.md");
   });
 
-  it("an exact path load replaces a same-name canonical page instead of editing the wrong file", () => {
+  it("an exact path load replaces a same-name canonical page instead of editing the wrong file", async () => {
     const canonical: PageDto = {
       name: "Today", kind: "journal", title: "Today", pre_block: null,
       blocks: [blk("canonical")], path: "journals/2026_06_26.md",
@@ -990,15 +991,15 @@ describe("page-scoped structural undo", () => {
       blocks: [blk("stray")], path: "journals/Friday, 26-06-2026.md",
     };
     loadSingle(canonical);
-    ensurePageLoaded(stray);
+    await ensurePageLoaded(stray);
     expect(pageByName("Today")!.path).toBe("journals/Friday, 26-06-2026.md");
     expect(doc.byId[pageByName("Today")!.roots[0]].raw).toBe("stray");
     expect(pageToDto("Today")!.path).toBe("journals/Friday, 26-06-2026.md");
   });
 
-  it("undo removes an op-added node from byId entirely (root-walk purge, no leak)", () => {
+  it("undo removes an op-added node from byId entirely (root-walk purge, no leak)", async () => {
     const today = journal("Today", [blk("t1")]);
-    loadFeed([today]);
+    await loadFeed([today]);
     splitBlock(today.blocks[0].id, 1); // adds a new node on Today
     const addedId = pageByName("Today")!.roots[1];
     expect(doc.byId[addedId]).toBeTruthy();
@@ -1013,10 +1014,10 @@ describe("page-scoped structural undo", () => {
   it("cross-day move undo leaves an unrelated loaded page intact", async () => {
     const today = journal("Today", [blk("t1")]);
     const older = journal("Older", [blk("o1")]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     // A separate page in the working set (e.g. open in the sidebar), loaded after
     // the move's snapshot would be taken.
-    ensurePageLoaded({ name: "Side", kind: "page", title: "Side", pre_block: null, blocks: [blk("s1")] });
+    await ensurePageLoaded({ name: "Side", kind: "page", title: "Side", pre_block: null, blocks: [blk("s1")] });
     const sideId = pageByName("Side")!.roots[0];
 
     await moveBlockFeed(older.blocks[0].id, -1); // cross-day move (scoped to Today+Older)
@@ -1032,7 +1033,7 @@ describe("page-scoped structural undo", () => {
   it("undo of a cross-page move restores both pages (full-snapshot fallback)", async () => {
     const today = journal("Today", [blk("t1")]);
     const older = journal("Older", [blk("o1"), blk("o2")]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const o1 = older.blocks[0].id;
     await moveBlockFeed(o1, -1); // o1 crosses up into Today
     expect(raws("Today")).toEqual(["t1", "o1"]);
@@ -1052,7 +1053,7 @@ describe("carry unfinished tasks → today", () => {
   });
   const raws = (name: string) => pageByName(name)!.roots.map((id) => doc.byId[id].raw);
 
-  it("keepContext: moves whole top-level blocks containing an open task; leaves the rest", () => {
+  it("keepContext: moves whole top-level blocks containing an open task; leaves the rest", async () => {
     const today = journal(TODAY, [blk("")]); // synthetic empty today
     const older = journal("Older", [
       blk("TODO A", [blk("DONE A1")]), // open task with done child → moves whole
@@ -1060,7 +1061,7 @@ describe("carry unfinished tasks → today", () => {
       blk("note C"), // plain note → stays
       blk("note D", [blk("TODO D1")]), // note containing an open task → moves whole (context)
     ]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const moved = carryUnfinished(["Older"], true, null);
     expect(moved).toBe(2);
     expect(raws(TODAY)).toEqual(["TODO A", "note D"]); // empty placeholder dropped
@@ -1070,10 +1071,10 @@ describe("carry unfinished tasks → today", () => {
     expect(doc.byId[a].children.map((id) => doc.byId[id].raw)).toEqual(["DONE A1"]);
   });
 
-  it("pull-out (keepContext off): extracts just the open-task subtrees, leaving scaffolding", () => {
+  it("pull-out (keepContext off): extracts just the open-task subtrees, leaving scaffolding", async () => {
     const today = journal(TODAY, [blk("existing")]);
     const older = journal("Older", [blk("note D", [blk("TODO D1", [blk("DONE D1a")])])]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const moved = carryUnfinished(["Older"], false, null);
     expect(moved).toBe(1);
     expect(raws(TODAY)).toEqual(["existing", "TODO D1"]); // pulled out; note D stays
@@ -1082,24 +1083,24 @@ describe("carry unfinished tasks → today", () => {
     expect(doc.byId[t].children.map((id) => doc.byId[id].raw)).toEqual(["DONE D1a"]);
   });
 
-  it("processes days in order (newest first ends up on top) and can add a header", () => {
+  it("processes days in order (newest first ends up on top) and can add a header", async () => {
     const today = journal(TODAY, [blk("")]);
     const d1 = journal("D1", [blk("TODO from-d1")]);
     const d2 = journal("D2", [blk("TODO from-d2")]);
-    loadFeed([today, d1, d2]);
+    await loadFeed([today, d1, d2]);
     carryUnfinished(["D1", "D2"], true, "Carried over");
     expect(raws(TODAY)).toEqual(["Carried over", "TODO from-d1", "TODO from-d2"]);
   });
 
-  it("is a no-op when there are no open tasks", () => {
+  it("is a no-op when there are no open tasks", async () => {
     const today = journal(TODAY, [blk("")]);
     const older = journal("Older", [blk("DONE x"), blk("just a note")]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     expect(carryUnfinished(["Older"], true, null)).toBe(0);
     expect(raws("Older")).toEqual(["DONE x", "just a note"]);
   });
 
-  it("removes the carried tasks and leaves finished tasks AND blank spacer bullets untouched", () => {
+  it("removes the carried tasks and leaves finished tasks AND blank spacer bullets untouched", async () => {
     const today = journal(TODAY, [blk("")]);
     // The reported case: open tasks interleaved with a finished task and a blank
     // spacer bullet. Carrying must remove ONLY the open tasks; the spacer stays.
@@ -1111,15 +1112,15 @@ describe("carry unfinished tasks → today", () => {
       blk(""), // intentional spacer — must survive the carry
       blk("DONE another thing"),
     ]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     expect(carryUnfinished(["Older"], false, null)).toBe(3);
     expect(raws("Older")).toEqual(["DONE something else", "", "DONE another thing"]);
   });
 
-  it("leaves a blank parent that only held a carried task (no-task blocks are never touched)", () => {
+  it("leaves a blank parent that only held a carried task (no-task blocks are never touched)", async () => {
     const today = journal(TODAY, [blk("")]);
     const older = journal("Older", [blk("", [blk("TODO a")])]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     carryUnfinished(["Older"], false, null);
     expect(raws("Older")).toEqual([""]); // the empty parent stays — it had no task marker
   });
@@ -1223,7 +1224,7 @@ describe("merge (Backspace at 0)", () => {
   // prevVisible/nextVisible must fall back to the block's own page — otherwise
   // Backspace-merge and Up/Down nav are dead in the capture window.
   it("merges + navigates on a detached page absent from the main view", () => {
-    ensurePageLoaded({
+    installCaptureScratchPage({
       name: "·capture·",
       kind: "page",
       title: "·capture·",
@@ -1301,16 +1302,67 @@ describe("working-set eviction", () => {
     blocks: [blk(`${name} body`)],
   });
 
-  it("pins every pane's active page route", () => {
+  it("pins every pane's active page route", async () => {
     resetPaneLayoutToSingle({
       tabs: [{ history: [{ kind: "page", name: "Pinned", pageKind: "page" }], pos: 0, pinned: false }],
       activeIndex: 0,
     });
-    ensurePageLoaded(page("Pinned"));
+    await ensurePageLoaded(page("Pinned"));
 
-    for (let i = 0; i < 90; i++) ensurePageLoaded(page(`Page ${i}`));
+    for (let i = 0; i < 90; i++) await ensurePageLoaded(page(`Page ${i}`));
 
     expect(pageByName("Pinned")).toBeTruthy();
+  });
+
+  // GH #305. Eviction deliberately keeps undo history, but the entry it keeps
+  // describes the instance that was evicted. Re-opening the page installs a
+  // FRESH instance carrying whatever the file says now — so replaying that entry
+  // would restore pre-eviction text and mark the page dirty, and the next save
+  // would submit it under the new file's revision, which the base-revision guard
+  // accepts because that baseline genuinely matches disk. No conflict is raised.
+  it("refuses an undo entry recorded before the page was evicted (GH #305)", async () => {
+    const saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-victim");
+    await ensurePageLoaded({
+      name: "Victim",
+      kind: "page",
+      title: "Victim",
+      pre_block: null,
+      blocks: [blk("keep me"), blk("delete me")],
+    });
+    // A STRUCTURAL edit: its undo entry is a whole-page snapshot, which is what
+    // can resurrect pre-eviction content wholesale.
+    const doomed = pageByName("Victim")!.roots[1];
+    deleteBlock(doomed);
+    expect(pageByName("Victim")!.roots).toHaveLength(1);
+    // A dirty page is pinned against eviction, which is correct — the bug needs
+    // a page the user has FINISHED with, so settle the edit first.
+    await flushAll();
+    expect(isDirty("Victim")).toBe(false);
+
+    // Browse far enough that Victim ages out of the working set.
+    for (let i = 0; i < 90; i++) await ensurePageLoaded(page(`Filler ${i}`));
+    expect(pageByName("Victim")).toBeFalsy();
+
+    // The file changed elsewhere while we were away; re-opening reads it fresh.
+    await ensurePageLoaded({
+      name: "Victim",
+      kind: "page",
+      title: "Victim",
+      pre_block: null,
+      blocks: [blk("changed by another device")],
+    });
+    const after = pageByName("Victim")!.roots;
+    expect(after.map((id) => doc.byId[id].raw)).toEqual(["changed by another device"]);
+
+    undo();
+
+    // The external content must survive, and the page must not be left dirty
+    // with pre-eviction content queued for the next save.
+    expect(pageByName("Victim")!.roots.map((id) => doc.byId[id].raw)).toEqual([
+      "changed by another device",
+    ]);
+    expect(isDirty("Victim")).toBe(false);
+    saveSpy.mockRestore();
   });
 });
 
@@ -1505,15 +1557,15 @@ describe("undo / redo", () => {
 });
 
 describe("journals feed (multi-page)", () => {
-  function feed() {
-    loadFeed([
+  async function feed() {
+    await loadFeed([
       { name: "Today", kind: "journal", title: "Today", pre_block: null, blocks: [blk("today a"), blk("today b")] },
       { name: "Yesterday", kind: "journal", title: "Yesterday", pre_block: null, blocks: [blk("yest a")] },
     ]);
   }
 
-  it("visible order spans all pages in feed order", () => {
-    feed();
+  it("visible order spans all pages in feed order", async () => {
+    await feed();
     expect(visibleOrder().map((id) => doc.byId[id].raw)).toEqual([
       "today a",
       "today b",
@@ -1521,16 +1573,16 @@ describe("journals feed (multi-page)", () => {
     ]);
   });
 
-  it("does not merge a block into the previous page's block", () => {
-    feed();
+  it("does not merge a block into the previous page's block", async () => {
+    await feed();
     const yestFirst = doc.pages[1].roots[0];
     // prevVisible(yestFirst) is "today b" on a different page — merge must no-op.
     expect(mergeWithPrev(yestFirst)).toBe(false);
     expect(doc.pages[1].roots.length).toBe(1);
   });
 
-  it("splitting keeps the new block on the same page", () => {
-    feed();
+  it("splitting keeps the new block on the same page", async () => {
+    await feed();
     const todayA = doc.pages[0].roots[0];
     splitBlock(todayA, "today a".length);
     const newId = editingId()!;
@@ -1544,12 +1596,12 @@ describe("stale undo is dropped on external reload / forget (ds8-1)", () => {
     name, kind: "page", title: name, pre_block: null, blocks,
   });
 
-  it("undo after an external reload can't clobber the reloaded content", () => {
+  it("undo after an external reload can't clobber the reloaded content", async () => {
     loadSingle(page("P", [blk("original")]));
     splitBlock(doc.pages[0].roots[0], 4); // structural op → undo entry for P exists
     expect(doc.pages[0].roots.length).toBe(2);
     // External edit lands on disk; we reload P with new content + rev.
-    reloadPage({
+    await reloadPage({
       name: "P", kind: "page", title: "P", pre_block: null, rev: "r2",
       blocks: [{ id: "x", raw: "external version", collapsed: false, children: [] }],
     });
@@ -1578,7 +1630,7 @@ describe("root-to-root drop across pages targets the drop page (#38)", () => {
   it("a root block dropped onto another day's root lands on that day, not the source", async () => {
     const today = journal("Today", [blk("t1")]);
     const older = journal("Older", [blk("o1")]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const t1 = today.blocks[0].id;
     // Drop t1 (a root) after o1 (a root on Older): newParent=null, targetPage=Older.
     await moveBlock(t1, null, 1, "Older");
@@ -1593,10 +1645,10 @@ describe("selection indent is single-page (ds8-2)", () => {
     name, kind: "journal", title: name, pre_block: null, blocks,
   });
 
-  it("indenting a cross-day selection leaves the other day's block in place", () => {
+  it("indenting a cross-day selection leaves the other day's block in place", async () => {
     const today = journal("Today", [blk("t1"), blk("t2")]);
     const older = journal("Older", [blk("o1")]);
-    loadFeed([today, older]);
+    await loadFeed([today, older]);
     const t1 = today.blocks[0].id, t2 = today.blocks[1].id, o1 = older.blocks[0].id;
     selectBlock(t2); // anchor on Today
     moveSelection(1, true); // extend down across the day boundary to o1
@@ -1650,6 +1702,74 @@ describe("save engine (persistence)", () => {
     markDirty("Test");
     await flushPage("Test");
     expect(saveSpy.mock.calls[1][1]).toBe("rev2");
+  });
+
+  it("delete drains an edit injected into its first save before tombstoning", async () => {
+    load([blk("first accepted draft")]);
+    let finishFirstSave!: (revision: string) => void;
+    saveSpy
+      .mockImplementationOnce(() => new Promise<string>((resolve) => { finishFirstSave = resolve; }))
+      .mockResolvedValueOnce("rev2");
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
+
+    markDirty("Test");
+    const firstSave = flushPage("Test");
+    await vi.advanceTimersByTimeAsync(0); // let savePage enter its first await
+    const firstBlock = doc.pages[0].roots[0];
+    setRaw(firstBlock, "second accepted draft"); // typed while the first save is in flight
+    const deleting = deletePage("Test", "page");
+    finishFirstSave("rev1");
+
+    await expect(firstSave).resolves.toBe(true);
+    await expect(deleting).resolves.toBe(true);
+    expect(saveSpy).toHaveBeenCalledTimes(2);
+    expect((saveSpy.mock.calls[1][0] as PageDto).blocks[0].raw).toBe("second accepted draft");
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    deleteSpy.mockRestore();
+  });
+
+  it("refuses an edit injected after the quiescence helper resolves but before tombstoning", async () => {
+    load([blk("clean before delete")]);
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
+
+    const deleting = deletePage("Test", "page");
+    // flushPageToQuiescence has synchronously found the page clean and returned
+    // a resolved promise; deletePage is suspended on its await continuation.
+    setRaw(doc.pages[0].roots[0], "typed in the quiescence handoff");
+
+    await expect(deleting).resolves.toBe(false);
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect(pageByName("Test")).toBeDefined();
+    expect(doc.byId[doc.pages[0].roots[0]].raw).toBe("typed in the quiescence handoff");
+    expect(isDirty("Test")).toBe(true);
+    // The refused delete retained a normal writable draft which can still land.
+    await expect(flushPage("Test")).resolves.toBe(true);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    deleteSpy.mockRestore();
+  });
+
+  it("retains the loaded draft when the delete quiescence barrier cannot save it", async () => {
+    load([blk("must remain editable")]);
+    saveSpy.mockRejectedValueOnce(new Error("write refused"));
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
+
+    markDirty("Test");
+    await expect(deletePage("Test", "page")).resolves.toBe(false);
+    expect(pageByName("Test")).toBeDefined();
+    expect(doc.byId[doc.pages[0].roots[0]].raw).toBe("must remain editable");
+    expect(deleteSpy).not.toHaveBeenCalled();
+    deleteSpy.mockRestore();
+  });
+
+  it("retains the captured draft when the managed delete is deferred", async () => {
+    load([blk("still present after deferred delete")]);
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockRejectedValue(new Error("managed delete deferred"));
+
+    await expect(deletePage("Test", "page")).resolves.toBe(false);
+    expect(pageByName("Test")).toBeDefined();
+    expect(doc.byId[doc.pages[0].roots[0]].raw).toBe("still present after deferred delete");
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    deleteSpy.mockRestore();
   });
 
   it("gives a fresh Markdown block one durable identity for persistent references and Copy block ref", async () => {
@@ -1710,6 +1830,37 @@ describe("save engine (persistence)", () => {
     saveSpy.mockRejectedValueOnce(new Error("conflict"));
     expect(await flushAll()).toBe(false);
     expect(isConflicted("Test")).toBe(true);
+  });
+
+  it("mints a snapshot-less save fallback so a diverged editor raises an answerable conflict", async () => {
+    loadSingle({
+      name: "Fallback",
+      kind: "page",
+      title: "Fallback",
+      pre_block: null,
+      path: "pages/Fallback.md",
+      rev: "loaded-revision",
+      blocks: [blk("retained draft")],
+    });
+    markDirty("Fallback");
+    const activate = vi.spyOn(backend(), "activateEditor").mockResolvedValue({
+      activation: 7001,
+      target: "pages/Fallback.md",
+      prospective: false,
+    });
+    saveSpy.mockRejectedValueOnce(new Error("conflict:77"));
+
+    expect(await flushPage("Fallback")).toBe(false);
+    expect(activate).toHaveBeenCalledWith("pages/Fallback.md", "replace", null);
+    expect(saveSpy.mock.calls[0][0]).toMatchObject({ activation: 7001 });
+    expect(saveSpy.mock.calls[0][1]).toBe("loaded-revision");
+    expect(conflicts()).toContain("Fallback");
+
+    saveSpy.mockResolvedValueOnce("winner-replaced");
+    expect(await forceSave("Fallback")).toBe(true);
+    expect(saveSpy.mock.calls[1][0]).toMatchObject({ activation: 7001 });
+    expect(saveSpy.mock.calls[1][2]).toBe(true);
+    expect(saveSpy.mock.calls[1][3]).toBe(77);
   });
 
   it("a transient error retries automatically before showing a save failure", async () => {
@@ -1775,7 +1926,7 @@ describe("save engine (persistence)", () => {
   });
 
   it("deletePage removes journal feed entries plus sidebar favorites and recents", async () => {
-    loadFeed([
+    await loadFeed([
       { name: "Today", kind: "journal", title: "Today", pre_block: null, blocks: [blk("today")] },
       { name: "Older", kind: "journal", title: "Older", pre_block: null, blocks: [blk("older")] },
     ]);
@@ -1859,14 +2010,14 @@ describe("save engine (persistence)", () => {
 
   it("restores today's empty journal at the top of the feed after deleting today in place (#17)", async () => {
     const today = journalTitle(new Date());
-    loadFeed([
+    await loadFeed([
       { name: today, kind: "journal", title: today, pre_block: null, blocks: [blk("today content")] },
       { name: "Older", kind: "journal", title: "Older", pre_block: null, blocks: [blk("older")] },
     ]);
 
     expect(await deletePage(today, "journal")).toBe(true);
     expect(doc.feed).toEqual(["Older"]); // deletePage alone drops today from the feed
-    restoreTodayJournalInFeed(); // ContextMenu re-runs this on the journals feed
+    await restoreTodayJournalInFeed(); // ContextMenu re-runs this on the journals feed
 
     expect(doc.feed).toEqual([today, "Older"]); // today back on top…
     const page = pageByName(today)!;
@@ -1884,13 +2035,13 @@ describe("save engine (persistence)", () => {
 
   it("keeps today untouched when an OLDER day is deleted from the feed (#17 no-op)", async () => {
     const today = journalTitle(new Date());
-    loadFeed([
+    await loadFeed([
       { name: today, kind: "journal", title: today, pre_block: null, blocks: [blk("today content")] },
       { name: "Older", kind: "journal", title: "Older", pre_block: null, blocks: [blk("older")] },
     ]);
 
     expect(await deletePage("Older", "journal")).toBe(true);
-    restoreTodayJournalInFeed(); // called on every journals-feed delete; must not disturb today
+    await restoreTodayJournalInFeed(); // called on every journals-feed delete; must not disturb today
 
     expect(doc.feed).toEqual([today]); // today's real content still there, not replaced
     expect(doc.byId[pageByName(today)!.roots[0]].raw).toBe("today content");
@@ -1899,25 +2050,44 @@ describe("save engine (persistence)", () => {
   it("forceSave overwrites even a conflicted page (force=true)", async () => {
     load([blk("x")]);
     markDirty("Test");
-    saveSpy.mockRejectedValueOnce(new Error("conflict"));
+    saveSpy.mockRejectedValueOnce(new Error("conflict:11"));
     await flushPage("Test");
     expect(isConflicted("Test")).toBe(true);
     saveSpy.mockResolvedValue("rev3");
     expect(await forceSave("Test")).toBe(true);
     expect(saveSpy.mock.calls.at(-1)![2]).toBe(true); // force flag
+    expect(saveSpy.mock.calls.at(-1)![3]).toBe(11); // exact observed winner
   });
 
-  it("deletes a CONFLICTED page rather than leaving it undeletable", async () => {
+  it("deletes a CONFLICTED page through the backend without flushing its retained draft", async () => {
     load([blk("x")]);
     markDirty("Test");
     saveSpy.mockRejectedValueOnce(new Error("conflict"));
     await flushPage("Test"); // the save is now refused until the conflict is resolved
     expect(isConflicted("Test")).toBe(true);
-    // Regression: deletePage used to flush-first and abort on the (impossible) flush,
-    // so a conflicted page could be neither saved nor deleted. Delete IS a resolution;
-    // the on-disk version still goes to .tine-trash (recoverable).
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockResolvedValue();
+
     expect(await deletePage("Test", "page")).toBe(true);
+    expect(saveSpy).toHaveBeenCalledTimes(1); // conflicted retained draft is never flushed
+    expect(deleteSpy).toHaveBeenCalledTimes(1); // actor preserves its accepted winner in typed trash
     expect(pageByName("Test")).toBeUndefined();
+    deleteSpy.mockRestore();
+  });
+
+  it("retains a CONFLICTED draft when its backend delete fails", async () => {
+    load([blk("retained conflict draft")]);
+    markDirty("Test");
+    saveSpy.mockRejectedValueOnce(new Error("conflict"));
+    await flushPage("Test");
+    expect(isConflicted("Test")).toBe(true);
+    const deleteSpy = vi.spyOn(backend(), "deletePage").mockRejectedValue(new Error("delete deferred"));
+
+    expect(await deletePage("Test", "page")).toBe(false);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(pageByName("Test")).toBeDefined();
+    expect(doc.byId[doc.pages[0].roots[0]].raw).toBe("retained conflict draft");
+    deleteSpy.mockRestore();
   });
 
   it("bumps dataRev on delete so live queries drop the deleted page's rows", async () => {
@@ -1939,22 +2109,22 @@ describe("undo survives a self-write reload echo (Ctrl+Z of a delete)", () => {
     blocks,
   });
 
-  it("keeps the delete-undo entry when a reload's content matches memory", () => {
+  it("keeps the delete-undo entry when a reload's content matches memory", async () => {
     load([blk("keep"), blk("victim")]);
     deleteBlock(doc.pages[0].roots[1]);
     expect(shape()).toEqual([["keep"]]);
     // The watcher re-reports our OWN just-saved content (identical) — this must NOT
     // drop the undo entry we pushed for the delete.
-    reloadPage(echo([{ id: "x", raw: "keep", collapsed: false, children: [] }]));
+    await reloadPage(echo([{ id: "x", raw: "keep", collapsed: false, children: [] }]));
     undo();
     expect(shape()).toEqual([["keep"], ["victim"]]); // deletion undone
   });
 
-  it("still invalidates undo on a GENUINE external change", () => {
+  it("still invalidates undo on a GENUINE external change", async () => {
     load([blk("keep"), blk("victim")]);
     deleteBlock(doc.pages[0].roots[1]);
     // Different content on disk → a real external edit → undo is (correctly) dropped.
-    reloadPage(echo([{ id: "x", raw: "changed elsewhere", collapsed: false, children: [] }]));
+    await reloadPage(echo([{ id: "x", raw: "changed elsewhere", collapsed: false, children: [] }]));
     undo();
     expect(shape()).toEqual([["changed elsewhere"]]); // undo was a no-op; external content kept
   });
@@ -2186,7 +2356,7 @@ describe("a watcher reload re-checks safety at the moment it applies", () => {
     blocks: [{ id: `${name}-disk`, raw, collapsed: false, children: [] }],
   });
 
-  it("declines when the page went dirty while the DTO was in flight", () => {
+  it("declines when the page went dirty while the DTO was in flight", async () => {
     loadSingle({
       name: "Raced",
       kind: "page",
@@ -2199,11 +2369,11 @@ describe("a watcher reload re-checks safety at the moment it applies", () => {
     // ...then the user typed while getPage was in flight.
     setRaw("raced-1", "the user typed this");
 
-    expect(reloadPageIfStillSafe("Raced", disk("Raced", "what the disk says"))).toBe(false);
+    expect(await reloadPageIfStillSafe("Raced", disk("Raced", "what the disk says"))).toBe(false);
     expect(doc.byId["raced-1"].raw).toBe("the user typed this");
   });
 
-  it("still applies an ordinary reload of a clean page", () => {
+  it("still applies an ordinary reload of a clean page", async () => {
     // Necessity guard: the re-check must not disable watcher reloads outright.
     loadSingle({
       name: "Clean",
@@ -2212,7 +2382,27 @@ describe("a watcher reload re-checks safety at the moment it applies", () => {
       pre_block: null,
       blocks: [{ id: "clean-1", raw: "original", collapsed: false, children: [] }],
     });
-    expect(reloadPageIfStillSafe("Clean", disk("Clean", "from disk"))).toBe(true);
+    expect(await reloadPageIfStillSafe("Clean", disk("Clean", "from disk"))).toBe(true);
     expect(pageByName("Clean")!.roots.map((id) => doc.byId[id].raw)).toEqual(["from disk"]);
+  });
+
+  it("does not install a DTO whose exact read snapshot changed before activation", async () => {
+    const stale = {
+      ...disk("Stale", "bytes from the completed read"),
+      path: "pages/Stale.md",
+      rev: "revision-from-the-read",
+    };
+    const activate = vi.spyOn(backend(), "activateEditor").mockImplementation(
+      async (_path, _intent, expected) => {
+        if (expected === stale.rev) throw new Error("activation.snapshot_changed");
+        return { activation: 4001, target: stale.path, prospective: false };
+      },
+    );
+
+    const refusal = await ensurePageLoaded(stale);
+
+    expect(refusal).toEqual({ reason: "activation-failed", page: "Stale" });
+    expect(activate).toHaveBeenCalledWith(stale.path, "replace", stale.rev);
+    expect(pageByName("Stale")).toBeUndefined();
   });
 });

@@ -20,6 +20,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
 regex = "1"
 ring = "0.17"
+crc32fast = "1"
 loro = { path = "../../vendor/loro-1.13.6", version = "=1.13.6" }
 libc = "0.2"
 cap-std = "4.0.2"
@@ -28,7 +29,7 @@ fs2 = "0.4.3"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 unicode-normalization = "=0.1.25"
 unicode-segmentation = "1"
-tine-storage = { path = "../tine-storage" }
+tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.3.0" }
 
 [target.'cfg(windows)'.dependencies]
 cap-fs-ext = "=4.0.2"
@@ -41,4 +42,4 @@ windows-sys = { version = "0.61.2", features = [
 
 [dev-dependencies]
 pretty_assertions = "1"
-tine-storage = { path = "../tine-storage", features = ["test-support"] }
+tine-storage = { git = "https://github.com/martinkoutecky/tine-storage", tag = "v0.3.0", features = ["test-support"] }

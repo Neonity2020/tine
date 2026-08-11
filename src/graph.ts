@@ -2,6 +2,7 @@
 // persisting the choice so it reopens next launch.
 
 import { backend } from "./backend";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
@@ -106,6 +107,11 @@ export async function loadGraphPath(
   }
 
   let result;
+  // Native graph replacement is asynchronous. Stop accepting watcher events
+  // from the retired binding before its completion can publish a new generation;
+  // otherwise an old runtime error can race the successful switch response.
+  const clearedManagedRuntime = hadGraph && (switching || options.forceRefresh === true);
+  if (clearedManagedRuntime) managedStorageRuntime.clear();
   try {
     result = await backend().loadGraph(path);
   } catch (error) {
@@ -113,12 +119,15 @@ export async function loadGraphPath(
     // local generation for the still-bound old graph; the retired viewer stays
     // closed, so no callback can regain its former authority.
     if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     throw error;
   }
   if (result.kind === "focused_existing") {
     if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
+    if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     return { kind: "focused_existing" };
   }
+  managedStorageRuntime.bind(result.binding_generation);
   const meta = result.meta;
   if (result.kind === "already_current" && hadGraph && !options.forceRefresh) {
     return { kind: "already_current", root: meta.root };

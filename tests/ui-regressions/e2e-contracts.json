@@ -31,7 +31,8 @@
    "nonRequirements": [
     "Exact indentation pixels or disclosure-icon artwork."
    ],
-   "stability": "stable"
+   "stability": "quarantined",
+   "quarantineReason": "2026-08-11 (v0.6.92 candidate e7c73bcf): the journey has no readiness predicate for embedded content, so its failure point moves with timing. A DOM probe right after openTestPage found the exact failing selector matching (1 element, data-block-ref 66666666-... present inside the rendered embed), and a separate dump at the same point found the cross-page embed with its children not yet rendered. Two full-suite runs failed at exerciseArrowAndDelete; an instrumented run with one added await failed earlier instead, at exerciseDisclosure(CROSS) on .collapse-toggle.has-children. Embeds resolve their content asynchronously and the scenario clicks straight into it. That is a missing wait, not a lost user outcome. Keep running it for artifacts; restore release blocking only once it waits on a test-visible embed-content-ready boundary. Harness debt: GH #315."
   },
   "scripts/e2e-block-ref-count.mjs": {
    "contracts": [
@@ -640,6 +641,12 @@
      "class": "core-operation",
      "userOutcome": "Users can edit an existing UTF-named page and create a new page in sparse v2, then reopen both saved edits after restart and after returning to standard Markdown mode.",
      "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "A managed save conflict keeps the editor draft, refuses Keep mine after a newer winner, resolves against the re-observed exact revision, and also resolves a concurrent new-page creator by the winner's exact path without losing the retained draft.",
+     "blocking": true,
+     "authority": "Tine managed application save, Tauri IPC, serialized actor conflict-resolution, and durable Markdown continuity contract"
     }
    ],
    "acceptableVariations": [
@@ -796,40 +803,56 @@
    "stability": "stable"
   },
   "scripts/e2e-windows-direct-large-open.mjs": {
-    "contracts": [
-      {
-        "class": "core-operation",
-        "userOutcome": "A reporter-scale Direct Files graph opens through the real Windows WebView2 and native backend without the severe 45-second load-call delay.",
-        "blocking": true
-      }
-    ],
-    "acceptableVariations": [
-      "Hosted Windows storage throughput and individual phase timings may vary below the severe-regression ceiling."
-    ],
-    "nonRequirements": [
-      "Matching the reporter's physical disk, antivirus configuration, or 24.6 GB of asset payload bytes."
-    ],
-    "stability": "burn-in"
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A reporter-scale Direct Files graph opens through the real Windows WebView2 and native backend without the severe 45-second load-call delay.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Hosted Windows storage throughput and individual phase timings may vary below the severe-regression ceiling."
+   ],
+   "nonRequirements": [
+    "Matching the reporter's physical disk, antivirus configuration, or 24.6 GB of asset payload bytes."
+   ],
+   "stability": "burn-in"
   },
   "scripts/e2e-windows-managed-storage.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "On Windows, explicit managed-storage activation and return to Direct Files preserve every captured Markdown and Org source byte.",
+     "blocking": true,
+     "authority": "Tine managed-storage authority transition and Direct Files interoperability contract"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after managed-storage activation and after returning to Direct Files.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Hosted Windows filesystem speed, WebView2 startup timing, and managed-storage activation duration may vary."
+   ],
+   "nonRequirements": [
+    "Exact native confirmation-dialog appearance, internal private-storage layout, or exact progress wording."
+   ],
+   "stability": "burn-in"
+  },
+  "scripts/e2e-windows-page-reference-latency.mjs": {
     "contracts": [
       {
-        "class": "exact-safety-interoperability",
-        "userOutcome": "On Windows, explicit managed-storage activation and return to Direct Files preserve every captured Markdown and Org source byte.",
-        "blocking": true,
-        "authority": "Tine managed-storage authority transition and Direct Files interoperability contract"
-      },
-      {
         "class": "core-operation",
-        "userOutcome": "A reporter-scale Windows graph with nested Unicode paths remains readable after managed-storage activation and after returning to Direct Files.",
+        "userOutcome": "On the reporter-scale Windows fixture, literal page-reference typing reaches the editor and paints autocomplete candidates while collecting per-key and backend timing evidence.",
         "blocking": true
       }
     ],
     "acceptableVariations": [
-      "Hosted Windows filesystem speed, WebView2 startup timing, and managed-storage activation duration may vary."
+      "Hosted Windows scheduling, WebView2 startup, disk throughput, and individual timing samples may vary."
     ],
     "nonRequirements": [
-      "Exact native confirmation-dialog appearance, internal private-storage layout, or exact progress wording."
+      "Exact popup geometry, candidate styling, or equality to one machine's millisecond timings."
     ],
     "stability": "burn-in"
   },
@@ -909,6 +932,72 @@
    ],
    "stability": "stable",
    "notes": "Added 2026-08-09 after a generated graph linked 29 papers by filename while every file declared a different title::; every link opened a blank page with nothing on screen to explain it. Logseq does NOT dim unresolved links (components/block.cljs:548 dims only untitled-page?, meaning a page existing under a uuid name), so the dimming is a deliberate, Martin-approved divergence and this journey is its contract."
+  },
+  "scripts/e2e-dirty-editor-replacement.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "GH #254 increment 3 spec v24, contract rule 2 (Preservation): a loaded instance holding unsaved work is never replaced. Losing it is silent data loss in the user's own graph.",
+     "userOutcome": "Unsaved edits survive when a different file with the same page name is opened; the edit is never destroyed to show the other file.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "The user is told which page's unsaved changes are holding the requested file back, rather than being left on a blank or unchanged surface.",
+     "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "After resolving the incumbent, the originally requested file actually arrives — refusal is never a dead end.",
+     "blocking": true
+    },
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "GH #254 increment 3 spec v24, contract rule 1 (Authority): a save belongs to the file its editor was activated for. Writing it elsewhere corrupts a file the user never edited.",
+     "userOutcome": "The unsaved edit is written to the file it belonged to, never to the file that was requested instead.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "How the message is presented (toast, inline banner, empty-state text) and its exact wording, as long as it names the page holding the unsaved changes.",
+    "Whether the incumbent is resolved by saving, discarding, or answering a conflict banner — any of them must release the requested file.",
+    "Whether the requested file arrives on re-navigation or automatically once the incumbent is clean."
+   ],
+   "nonRequirements": [
+    "Exact toast styling, position, duration, or DOM nesting.",
+    "The precise number of ticks between resolving the incumbent and the requested file appearing.",
+    "Which of the two same-named files the router treats as canonical."
+   ],
+   "stability": "quarantined",
+   "quarantineReason": "Harness debt, not a product defect. No user gesture opens a chosen file by path: the Quick Switcher row renders kind and name only, so two files sharing a page name are indistinguishable, and positional selection would be the brittle oracle the semantic-E2E contract forbids. See notes for the source-level confirmation.",
+   "notes": "GH #304, fixed in GH #254 increment 3. Two files legitimately share one page name (the duplicate-day stray of #21, or same-titled pages in different folders). Replacing the loaded instance destroyed the unsaved edit, and the dirty mark SURVIVED to describe the replacement's content, so the next save wrote the wrong file's bytes under the user's intent. The journey deliberately continues past 'the edit survived' to prove the refusal is not a trap: a survival-only assertion would pass on an implementation that never shows the requested file at all, which is why the non-wedging half is blocking rather than advisory. QUARANTINED 2026-08-10, harness debt. The first two assertions run green against the branch binary — the unsaved edit survives — but the journey drives the second file through an invented `#/page-path/...` hash route that the router does not implement, so the navigation never happens and the survival assertion passes VACUOUSLY. It is quarantined rather than deleted because the journey shape is right; what is missing is a real UI affordance for opening a same-named file by path (the duplicate-day journal conflicts list is the honest candidate). ROOT CAUSE CONFIRMED AT SOURCE 2026-08-10: no user gesture opens a chosen file by path. The router does support a path-pinned route (Page.tsx uses r.path -> getPageByPath), and the Quick Switcher is the only UI carrying a per-file path into openFile, but its row renders kind and name ONLY (QuickSwitcher.tsx Row), so two files sharing a page name are visually identical and a user cannot choose between them; selecting positionally would be exactly the brittle oracle the semantic-E2E contract forbids. No duplicates/conflicts list exists, and the router is not exposed on window, so browser.execute cannot reach openFile without adding a production test hook. The journey stays quarantined until such an affordance exists - which is itself the product gap GH #304's scenario implies. Until then the composition-level regressions in src/instanceReplacement.test.ts carry this contract; they drive the real store and both fail against the pre-fix code."
+  },
+  "scripts/e2e-conflict-keep-mine.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "authority": "GH #254 increment 2, conflict-override authority: an override is bound to the exact bytes the user was shown. Discarding an unseen external write is irrecoverable loss of another writer's work.",
+     "userOutcome": "Clicking \"Keep mine\" cannot overwrite an external write that landed after the banner appeared — bytes the user was never shown are never discarded by a click answering an older conflict.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "When that click is refused, a live banner returns for the conflict the user now actually has, so they are never left holding an unsaved edit with nothing to act on.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Banner wording, styling, and whether it re-renders in place or is replaced.",
+    "How long the refused override takes to surface the fresh banner.",
+    "Whether the second external write is delivered by the watcher or by a save-time re-read."
+   ],
+   "nonRequirements": [
+    "Exact banner DOM nesting, button order, or CSS classes beyond the ones this journey selects.",
+    "The precise observation-epoch numbering."
+   ],
+   "stability": "quarantined",
+   "quarantineReason": "Harness debt, not a product defect. The forbidden shape is a force that RACES the watcher re-observation; this journey waits 8s first, so it observes increment 2's designed outcome instead. Constructing the race needs a deterministic hook the harness lacks; gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers it at the core boundary.",
+   "notes": "GH #254. This is the sequence increment 2's adversarial rounds 3 and 4 each found broken in different places, and which nothing outside a mocked backend has ever driven. The failure is silent: \"Keep mine\" appears to work, and what is lost is someone else's write that the user cannot see was ever there. The non-wedging half is blocking because a refusal that leaves no live banner strands the edit — a conflicted page is skipped by the ordinary save path, so the user has no route back. QUARANTINED 2026-08-10, harness debt, NOT a product defect. Run against the branch binary it reproducibly showed \"Keep mine\" overwriting the second external winner. That is increment 2's DESIGNED outcome for this timing: a conflicted page is skipped by the ordinary save path, so the only thing that mints authority for a newer winner is the watcher's re-observation — and once that runs, the banner is re-armed and the click legitimately answers the CURRENT conflict. The harm the contract actually forbids is answering with authority minted for a DIFFERENT winner, i.e. a click that RACES the re-observation, which this journey does not construct: it waits 8s first. Fixing it means driving the stale-click shape (issue the force while a re-observation is in flight), which needs a deterministic hook the harness does not have. gh254_a_second_force_under_one_banner_cannot_spend_authority_for_an_unseen_winner covers that shape at the core boundary meanwhile."
   }
  }
 }

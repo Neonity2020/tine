@@ -15,6 +15,7 @@ use std::fmt;
 use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use tine_storage::sqlite as storage;
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{
@@ -1566,6 +1567,7 @@ pub(crate) fn lower_validated_change(
 }
 
 fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, MaterializationError> {
+    let normalized_searchable_text = normalized_searchable_text(&page.searchable_text)?;
     Ok(storage::PhysicalPage {
         page_id: page.page_id.as_uuid().into_bytes(),
         home_document_id: page.home_document_id.as_uuid().into_bytes(),
@@ -1575,6 +1577,7 @@ fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, Mat
         text_kind: text_kind_to_sql(page.kind),
         preamble: page.preamble.clone(),
         searchable_text: page.searchable_text.clone(),
+        normalized_searchable_text,
         references: page.references.iter().map(lower_reference).collect(),
         properties: page.properties.iter().map(lower_property).collect(),
         tags: page.tags.clone(),
@@ -1589,6 +1592,7 @@ fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, Mat
 fn lower_block(
     block: &MaterializedBlockInput,
 ) -> Result<storage::PhysicalBlock, MaterializationError> {
+    let normalized_searchable_text = normalized_searchable_text(&block.searchable_text)?;
     Ok(storage::PhysicalBlock {
         block_id: block.block_id.as_uuid().into_bytes(),
         home_document_id: block.home_document_id.as_uuid().into_bytes(),
@@ -1596,6 +1600,7 @@ fn lower_block(
         order: block.order.clone(),
         content: block.content.clone(),
         searchable_text: block.searchable_text.clone(),
+        normalized_searchable_text,
         heading_level: block.heading_level,
         collapsed: block.collapsed,
         logseq_uuid: block.logseq_uuid.map(|id| id.as_uuid().into_bytes()),
@@ -1612,6 +1617,18 @@ fn lower_block(
     })
 }
 
+fn normalized_searchable_text(value: &str) -> Result<String, MaterializationError> {
+    let normalized = value.to_lowercase().nfc().collect::<String>();
+    if normalized.len() > MAX_MATERIALIZATION_FIELD_BYTES {
+        return Err(MaterializationError::ResourceLimit {
+            resource: "normalized searchable text bytes",
+            found: normalized.len(),
+            maximum: MAX_MATERIALIZATION_FIELD_BYTES,
+        });
+    }
+    Ok(normalized)
+}
+
 fn lower_reference(reference: &MaterializedReference) -> storage::PhysicalReference {
     storage::PhysicalReference {
         target: lower_entity(reference.target),
@@ -1622,6 +1639,7 @@ fn lower_reference(reference: &MaterializedReference) -> storage::PhysicalRefere
 fn lower_property(property: &MaterializedProperty) -> storage::PhysicalProperty {
     storage::PhysicalProperty {
         name: property.name.clone(),
+        normalized_name: crate::doc::property_key_norm(&property.name),
         value: property.value.clone(),
     }
 }
@@ -1885,6 +1903,32 @@ pub struct MaterializedPageInventoryRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNavigationPageRow {
+    pub page_id: PageId,
+    pub name: String,
+    pub name_key: String,
+    pub path: ManagedPath,
+    pub kind: ManagedTextKind,
+    pub preamble: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNavigationAliasRow {
+    pub source_page_id: PageId,
+    pub owner_name: String,
+    pub owner_path: ManagedPath,
+    pub normalized_alias: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNavigationReferenceNameRow {
+    pub source_page_id: PageId,
+    pub owner_path: ManagedPath,
+    pub raw_name: String,
+    pub normalized_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializedBlockRow {
     pub block_id: BlockId,
     pub page_id: PageId,
@@ -1904,6 +1948,76 @@ pub struct MaterializedReferrerRow {
     pub source: MaterializedEntityId,
     pub source_page_id: PageId,
     pub kind: MaterializedReferenceKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockReferenceCountRow {
+    pub raw_uuid_claim: LogseqUuid,
+    pub distinct_source_blocks: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockReferrerCandidateRow {
+    pub source_page_id: PageId,
+    pub source_block_id: BlockId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedPageReferrerCandidateRow {
+    pub source_page_id: PageId,
+    pub source: MaterializedEntityId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedPlainTextCandidatePageRow {
+    pub page_id: PageId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockPropertyCandidateRow {
+    pub page_id: PageId,
+    pub block_id: BlockId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedPropertyFacetRow {
+    pub owner: MaterializedEntityId,
+    pub page_id: PageId,
+    pub source_name: String,
+    pub normalized_name: String,
+    pub value: String,
+    pub ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedTaskCandidatePageRow {
+    pub page_id: PageId,
+}
+
+/// One physical task-index candidate, converted at Tine's managed-storage
+/// boundary. The raw block text deliberately remains parser-owned input; task
+/// facets are not accepted from SQLite as query semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedTaskCandidateBlockRow {
+    pub block_id: BlockId,
+    pub page_id: PageId,
+    pub parent: Option<BlockId>,
+    pub order: String,
+    pub content: String,
+    pub logseq_uuid: Option<LogseqUuid>,
+    pub page_name: String,
+    pub page_path: ManagedPath,
+    pub page_kind: ManagedTextKind,
+}
+
+/// The deliberately text-free structural record used for a bounded ancestor
+/// walk by a caller that already owns the candidate's parser input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedBlockStructureRow {
+    pub block_id: BlockId,
+    pub page_id: PageId,
+    pub parent: Option<BlockId>,
+    pub order: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1986,6 +2100,16 @@ impl<'a> SqliteMaterializedRead<'a> {
     ) -> Result<Option<MaterializedBlockRow>, MaterializationError> {
         self.inner
             .block(block_id.as_uuid().into_bytes())?
+            .map(block_row_from_storage)
+            .transpose()
+    }
+
+    pub fn block_by_logseq_uuid(
+        &self,
+        logseq_uuid: LogseqUuid,
+    ) -> Result<Option<MaterializedBlockRow>, MaterializationError> {
+        self.inner
+            .block_by_logseq_uuid(logseq_uuid.as_uuid().into_bytes())?
             .map(block_row_from_storage)
             .transpose()
     }
@@ -2087,6 +2211,59 @@ impl<'a> SqliteMaterializedRead<'a> {
         )
     }
 
+    pub fn navigation_pages_after(
+        &self,
+        after: Option<(&ManagedPath, PageId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationPageRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner.navigation_pages_after_with_header_validation(
+                after.map(|(path, _)| path.as_str()),
+                after_page_id.as_ref(),
+                limit,
+                validate_storage_page_header,
+            )?,
+            navigation_page_row_from_storage,
+        )
+    }
+
+    pub fn navigation_aliases_after(
+        &self,
+        after: Option<(&ManagedPath, &str, PageId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationAliasRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, _, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner.navigation_aliases_after(
+                after
+                    .zip(after_page_id.as_ref())
+                    .map(|((path, alias, _), page_id)| (path.as_str(), alias, page_id)),
+                limit,
+            )?,
+            navigation_alias_row_from_storage,
+        )
+    }
+
+    pub fn navigation_reference_names_after(
+        &self,
+        after: Option<(&ManagedPath, &str, &str, PageId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedNavigationReferenceNameRow>, MaterializationError> {
+        let after_page_id = after.map(|(_, _, _, page_id)| page_id.as_uuid().into_bytes());
+        convert_rows(
+            self.inner.navigation_reference_names_after(
+                after
+                    .zip(after_page_id.as_ref())
+                    .map(|((path, raw, normalized, _), page_id)| {
+                        (path.as_str(), raw, normalized, page_id)
+                    }),
+                limit,
+            )?,
+            navigation_reference_name_row_from_storage,
+        )
+    }
+
     pub fn blocks_on_page(
         &self,
         page_id: PageId,
@@ -2108,6 +2285,124 @@ impl<'a> SqliteMaterializedRead<'a> {
             self.inner.referrers_to(lower_entity(target), limit)?,
             referrer_row_from_storage,
         )
+    }
+
+    pub fn block_reference_counts_after(
+        &self,
+        after: Option<LogseqUuid>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockReferenceCountRow>, MaterializationError> {
+        self.inner
+            .block_reference_counts_after(after.map(|uuid| uuid.as_uuid().into_bytes()), limit)?
+            .into_iter()
+            .map(block_reference_count_row_from_storage)
+            .collect()
+    }
+
+    pub fn block_reference_counts_for_source_page_after(
+        &self,
+        source_page_id: PageId,
+        after: Option<LogseqUuid>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockReferenceCountRow>, MaterializationError> {
+        self.inner
+            .block_reference_counts_for_source_page_after(
+                source_page_id.as_uuid().into_bytes(),
+                after.map(|uuid| uuid.as_uuid().into_bytes()),
+                limit,
+            )?
+            .into_iter()
+            .map(block_reference_count_row_from_storage)
+            .collect()
+    }
+
+    pub fn block_referrer_candidates_after(
+        &self,
+        raw_uuid_claim: LogseqUuid,
+        after: Option<(PageId, BlockId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockReferrerCandidateRow>, MaterializationError> {
+        self.inner
+            .block_referrer_candidates_after(
+                raw_uuid_claim.as_uuid().into_bytes(),
+                after.map(|(page, block)| {
+                    (page.as_uuid().into_bytes(), block.as_uuid().into_bytes())
+                }),
+                limit,
+            )?
+            .into_iter()
+            .map(block_referrer_candidate_row_from_storage)
+            .collect()
+    }
+
+    pub fn page_referrer_candidates_after(
+        &self,
+        normalized_name: &str,
+        after: Option<(PageId, MaterializedEntityId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPageReferrerCandidateRow>, MaterializationError> {
+        self.inner
+            .page_referrer_candidates_after(
+                normalized_name,
+                after.map(|(page, source)| (page.as_uuid().into_bytes(), lower_entity(source))),
+                limit,
+            )?
+            .into_iter()
+            .map(page_referrer_candidate_row_from_storage)
+            .collect()
+    }
+
+    pub fn plain_text_candidate_pages_after(
+        &self,
+        normalized_phrase: &str,
+        after: Option<PageId>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPlainTextCandidatePageRow>, MaterializationError> {
+        self.inner
+            .plain_text_candidate_pages_after(
+                normalized_phrase,
+                after.map(|page| page.as_uuid().into_bytes()),
+                limit,
+            )?
+            .into_iter()
+            .map(plain_text_candidate_page_row_from_storage)
+            .collect()
+    }
+
+    pub fn block_property_candidates_after(
+        &self,
+        normalized_name: &str,
+        after: Option<(PageId, BlockId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedBlockPropertyCandidateRow>, MaterializationError> {
+        self.inner
+            .block_property_candidates_after(
+                normalized_name,
+                after.map(|(page, block)| {
+                    (page.as_uuid().into_bytes(), block.as_uuid().into_bytes())
+                }),
+                limit,
+            )?
+            .into_iter()
+            .map(block_property_candidate_row_from_storage)
+            .collect()
+    }
+
+    pub fn property_facet_rows_after(
+        &self,
+        block_owners_only: bool,
+        after: Option<(MaterializedEntityId, String, u32)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedPropertyFacetRow>, MaterializationError> {
+        self.inner
+            .property_facet_rows_after(
+                block_owners_only,
+                after.map(|(owner, name, ordinal)| (lower_entity(owner), name, ordinal)),
+                limit,
+            )?
+            .into_iter()
+            .map(property_facet_row_from_storage)
+            .collect()
     }
 
     pub fn properties(
@@ -2147,6 +2442,57 @@ impl<'a> SqliteMaterializedRead<'a> {
         limit: usize,
     ) -> Result<Vec<MaterializedTaskRow>, MaterializationError> {
         convert_rows(self.inner.tasks(marker, limit)?, task_row_from_storage)
+    }
+
+    pub fn task_candidate_pages_after(
+        &self,
+        marker: &str,
+        after: Option<PageId>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedTaskCandidatePageRow>, MaterializationError> {
+        self.inner
+            .task_candidate_pages_after(
+                marker,
+                after.map(|page| page.as_uuid().into_bytes()),
+                limit,
+            )?
+            .into_iter()
+            .map(|row| {
+                Ok(MaterializedTaskCandidatePageRow {
+                    page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+                })
+            })
+            .collect()
+    }
+
+    pub fn task_candidate_blocks_after(
+        &self,
+        marker: &str,
+        after: Option<(PageId, BlockId)>,
+        limit: usize,
+    ) -> Result<Vec<MaterializedTaskCandidateBlockRow>, MaterializationError> {
+        convert_rows(
+            self.inner
+                .task_candidate_blocks_after_with_header_validation(
+                    marker,
+                    after.map(|(page, block)| {
+                        (page.as_uuid().into_bytes(), block.as_uuid().into_bytes())
+                    }),
+                    limit,
+                    validate_storage_page_header,
+                )?,
+            task_candidate_block_row_from_storage,
+        )
+    }
+
+    pub fn block_structure(
+        &self,
+        block_id: BlockId,
+    ) -> Result<Option<MaterializedBlockStructureRow>, MaterializationError> {
+        self.inner
+            .block_structure(block_id.as_uuid().into_bytes())?
+            .map(block_structure_row_from_storage)
+            .transpose()
     }
 
     pub fn search(
@@ -2203,6 +2549,41 @@ fn page_inventory_row_from_storage(
     })
 }
 
+fn navigation_page_row_from_storage(
+    row: storage::PhysicalNavigationPageRow,
+) -> Result<MaterializedNavigationPageRow, MaterializationError> {
+    Ok(MaterializedNavigationPageRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        name: row.name,
+        name_key: row.name_key,
+        path: ManagedPath::parse(row.path).map_err(typed_sql_decode_error)?,
+        kind: text_kind_from_sql(row.text_kind).map_err(typed_sql_decode_error)?,
+        preamble: row.preamble,
+    })
+}
+
+fn navigation_alias_row_from_storage(
+    row: storage::PhysicalNavigationAliasRow,
+) -> Result<MaterializedNavigationAliasRow, MaterializationError> {
+    Ok(MaterializedNavigationAliasRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        owner_name: row.owner_name,
+        owner_path: ManagedPath::parse(row.owner_path).map_err(typed_sql_decode_error)?,
+        normalized_alias: row.normalized_alias,
+    })
+}
+
+fn navigation_reference_name_row_from_storage(
+    row: storage::PhysicalNavigationReferenceNameRow,
+) -> Result<MaterializedNavigationReferenceNameRow, MaterializationError> {
+    Ok(MaterializedNavigationReferenceNameRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        owner_path: ManagedPath::parse(row.owner_path).map_err(typed_sql_decode_error)?,
+        raw_name: row.raw_name,
+        normalized_name: row.normalized_name,
+    })
+}
+
 fn block_row_from_storage(
     row: storage::PhysicalBlockRow,
 ) -> Result<MaterializedBlockRow, MaterializationError> {
@@ -2250,6 +2631,63 @@ fn referrer_row_from_storage(
     })
 }
 
+fn block_reference_count_row_from_storage(
+    row: storage::PhysicalBlockReferenceCountRow,
+) -> Result<MaterializedBlockReferenceCountRow, MaterializationError> {
+    Ok(MaterializedBlockReferenceCountRow {
+        raw_uuid_claim: LogseqUuid::from_uuid(Uuid::from_bytes(row.raw_uuid_claim)),
+        distinct_source_blocks: row.distinct_source_blocks,
+    })
+}
+
+fn block_referrer_candidate_row_from_storage(
+    row: storage::PhysicalBlockReferrerCandidateRow,
+) -> Result<MaterializedBlockReferrerCandidateRow, MaterializationError> {
+    Ok(MaterializedBlockReferrerCandidateRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        source_block_id: BlockId::from_uuid(Uuid::from_bytes(row.source_block_id)),
+    })
+}
+
+fn page_referrer_candidate_row_from_storage(
+    row: storage::PhysicalPageReferrerCandidateRow,
+) -> Result<MaterializedPageReferrerCandidateRow, MaterializationError> {
+    Ok(MaterializedPageReferrerCandidateRow {
+        source_page_id: PageId::from_uuid(Uuid::from_bytes(row.source_page_id)),
+        source: entity_from_storage(row.source),
+    })
+}
+
+fn plain_text_candidate_page_row_from_storage(
+    row: storage::PhysicalPlainTextCandidatePageRow,
+) -> Result<MaterializedPlainTextCandidatePageRow, MaterializationError> {
+    Ok(MaterializedPlainTextCandidatePageRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+    })
+}
+
+fn block_property_candidate_row_from_storage(
+    row: storage::PhysicalBlockPropertyCandidateRow,
+) -> Result<MaterializedBlockPropertyCandidateRow, MaterializationError> {
+    Ok(MaterializedBlockPropertyCandidateRow {
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+    })
+}
+
+fn property_facet_row_from_storage(
+    row: storage::PhysicalPropertyFacetRow,
+) -> Result<MaterializedPropertyFacetRow, MaterializationError> {
+    Ok(MaterializedPropertyFacetRow {
+        owner: entity_from_storage(row.owner),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        source_name: row.source_name,
+        normalized_name: row.normalized_name,
+        value: row.value,
+        ordinal: row.ordinal,
+    })
+}
+
 fn property_row_from_storage(
     row: storage::PhysicalPropertyRow,
 ) -> Result<MaterializedPropertyRow, MaterializationError> {
@@ -2281,6 +2719,39 @@ fn task_row_from_storage(
         priority: row.priority,
         scheduled: row.scheduled,
         deadline: row.deadline,
+    })
+}
+
+fn task_candidate_block_row_from_storage(
+    row: storage::PhysicalTaskCandidateBlockRow,
+) -> Result<MaterializedTaskCandidateBlockRow, MaterializationError> {
+    Ok(MaterializedTaskCandidateBlockRow {
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        parent: row
+            .parent
+            .map(|id| BlockId::from_uuid(Uuid::from_bytes(id))),
+        order: row.order,
+        content: row.content,
+        logseq_uuid: row
+            .logseq_uuid
+            .map(|id| LogseqUuid::from_uuid(Uuid::from_bytes(id))),
+        page_name: row.page_name,
+        page_path: ManagedPath::parse(row.page_path).map_err(typed_sql_decode_error)?,
+        page_kind: text_kind_from_sql(row.page_text_kind).map_err(typed_sql_decode_error)?,
+    })
+}
+
+fn block_structure_row_from_storage(
+    row: storage::PhysicalBlockStructureRow,
+) -> Result<MaterializedBlockStructureRow, MaterializationError> {
+    Ok(MaterializedBlockStructureRow {
+        block_id: BlockId::from_uuid(Uuid::from_bytes(row.block_id)),
+        page_id: PageId::from_uuid(Uuid::from_bytes(row.page_id)),
+        parent: row
+            .parent
+            .map(|id| BlockId::from_uuid(Uuid::from_bytes(id))),
+        order: row.order,
     })
 }
 
@@ -2500,6 +2971,67 @@ mod tests {
             ContentDigest::of(b"external UUID authority"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn task_candidate_and_structure_rows_keep_typed_authority_boundaries() {
+        let page = page_id(1);
+        let parent = block_id(2);
+        let block = block_id(3);
+        let uuid = LogseqUuid::from_uuid(Uuid::from_u128(4));
+        let candidate = storage::PhysicalTaskCandidateBlockRow {
+            block_id: block.as_uuid().into_bytes(),
+            page_id: page.as_uuid().into_bytes(),
+            parent: Some(parent.as_uuid().into_bytes()),
+            order: "a".into(),
+            content: "TODO parser-owned semantics".into(),
+            logseq_uuid: Some(uuid.as_uuid().into_bytes()),
+            page_name: "Task page".into(),
+            page_path: "nested/task.md".into(),
+            page_text_kind: 0,
+        };
+        assert_eq!(
+            task_candidate_block_row_from_storage(candidate).unwrap(),
+            MaterializedTaskCandidateBlockRow {
+                block_id: block,
+                page_id: page,
+                parent: Some(parent),
+                order: "a".into(),
+                content: "TODO parser-owned semantics".into(),
+                logseq_uuid: Some(uuid),
+                page_name: "Task page".into(),
+                page_path: ManagedPath::parse("nested/task.md").unwrap(),
+                page_kind: ManagedTextKind::Page,
+            }
+        );
+        assert_eq!(
+            block_structure_row_from_storage(storage::PhysicalBlockStructureRow {
+                block_id: block.as_uuid().into_bytes(),
+                page_id: page.as_uuid().into_bytes(),
+                parent: Some(parent.as_uuid().into_bytes()),
+                order: "a".into(),
+            })
+            .unwrap(),
+            MaterializedBlockStructureRow {
+                block_id: block,
+                page_id: page,
+                parent: Some(parent),
+                order: "a".into(),
+            }
+        );
+
+        let invalid_header = storage::PhysicalTaskCandidateBlockRow {
+            block_id: block.as_uuid().into_bytes(),
+            page_id: page.as_uuid().into_bytes(),
+            parent: None,
+            order: "a".into(),
+            content: String::new(),
+            logseq_uuid: None,
+            page_name: "Task page".into(),
+            page_path: "/not-a-managed-path.md".into(),
+            page_text_kind: 99,
+        };
+        assert!(task_candidate_block_row_from_storage(invalid_header).is_err());
     }
 
     #[test]

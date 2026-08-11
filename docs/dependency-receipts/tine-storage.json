@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "package": "tine-storage",
+  "repository": "https://github.com/martinkoutecky/tine-storage",
+  "version": "0.3.0",
+  "tag": "v0.3.0",
+  "commit": "f537665eb518e833829002146d384fb2b1d3d364",
+  "certificationRun": "https://github.com/martinkoutecky/tine-storage/actions/runs/31438306530",
+  "release": "https://github.com/martinkoutecky/tine-storage/releases/tag/v0.3.0",
+  "receiptFile": "tine-storage-v0.3.0.txt",
+  "receiptUrl": "https://github.com/martinkoutecky/tine-storage/releases/download/v0.3.0/certification-receipt.txt",
+  "receiptSha256": "ccad4b7ca2fb00e3553767d5d4cb03af9e2d3f09ad4aa2c69aa7dfdbd7319c69",
+  "formatManifestSha256": "9949dd33cd3a473b0c5fe3907d4ad18cd9cbc19180acf8d3a2001faf328a196e",
+  "attestation": "https://github.com/martinkoutecky/tine-storage/attestations/39920520"
+}

@@ -1010,6 +1010,90 @@ impl ReferenceCatalogStore {
             .transpose()
     }
 
+    fn posting_from_digest(
+        &self,
+        page_id: PageId,
+        digest: ContentDigest,
+    ) -> Result<ReferenceSourcePostingV2, ReferenceCatalogError> {
+        let reference = self.posting_reference(page_id, digest)?;
+        self.read_posting(&reference)
+    }
+
+    fn posting_digest_index(
+        &self,
+        root: &ReferenceCatalogRootV2,
+    ) -> Result<ReferenceCatalogPostingDigestIndex, ReferenceCatalogError> {
+        let facts_root = PatriciaIndexRoot::from_digest(root.facts_root);
+        let mut digests = BTreeMap::new();
+        let mut validation_error = None;
+        self.patricia
+            .visit_all(facts_root, |key, value| {
+                let result = (|| {
+                    let page_id = page_id_key(key)?;
+                    let digest = digest_value(value)?;
+                    if digests.insert(page_id, digest).is_some() {
+                        return Err(ReferenceCatalogError::MalformedRoot);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    validation_error = Some(error);
+                    false
+                } else {
+                    true
+                }
+            })
+            .map_err(store_error)?;
+        if let Some(error) = validation_error {
+            return Err(error);
+        }
+        if digests.len() as u64 != root.source_count {
+            return Err(ReferenceCatalogError::MalformedRoot);
+        }
+        Ok(ReferenceCatalogPostingDigestIndex {
+            root: root.clone(),
+            digests,
+        })
+    }
+
+    fn posting_digest_index_constructed(
+        &self,
+        root: &ReferenceCatalogRootV2,
+        construction: &PatriciaIndexConstruction,
+    ) -> Result<ReferenceCatalogPostingDigestIndex, ReferenceCatalogError> {
+        let facts_root = PatriciaIndexRoot::from_digest(root.facts_root);
+        let mut digests = BTreeMap::new();
+        let mut validation_error = None;
+        self.patricia
+            .construction_visit_all(construction, facts_root, |key, value| {
+                let result = (|| {
+                    let page_id = page_id_key(key)?;
+                    let digest = digest_value(value)?;
+                    if digests.insert(page_id, digest).is_some() {
+                        return Err(ReferenceCatalogError::MalformedRoot);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    validation_error = Some(error);
+                    false
+                } else {
+                    true
+                }
+            })
+            .map_err(store_error)?;
+        if let Some(error) = validation_error {
+            return Err(error);
+        }
+        if digests.len() as u64 != root.source_count {
+            return Err(ReferenceCatalogError::MalformedRoot);
+        }
+        Ok(ReferenceCatalogPostingDigestIndex {
+            root: root.clone(),
+            digests,
+        })
+    }
+
     fn reverse_candidates(
         &self,
         root: &ReferenceCatalogRootV2,
@@ -1366,6 +1450,28 @@ pub(crate) struct AuthenticatedReferenceCatalogRootNodes {
     root: ReferenceCatalogRootV2,
 }
 
+/// Process-local index of the immutable posting objects named by one exact
+/// authenticated reference-catalog root.
+///
+/// Terminal projection construction consumes every source posting. Walking the
+/// Patricia tree once and retaining only `(page id, posting digest)` avoids an
+/// independent root-to-leaf traversal per page without retaining the posting
+/// facts themselves or creating another durable cache.
+pub(crate) struct ReferenceCatalogPostingDigestIndex {
+    root: ReferenceCatalogRootV2,
+    digests: BTreeMap<PageId, ContentDigest>,
+}
+
+impl ReferenceCatalogPostingDigestIndex {
+    pub(crate) fn len(&self) -> usize {
+        self.digests.len()
+    }
+
+    fn digest(&self, page_id: PageId) -> Option<ContentDigest> {
+        self.digests.get(&page_id).copied()
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ReferenceCatalogConstructionWorkStats {
@@ -1623,6 +1729,71 @@ impl ReferenceCatalogStateV2 {
             ReferenceCatalogBackend::Memory(memory) if root == &self.root => {
                 Ok(memory.postings.get(&page_id).cloned())
             }
+            ReferenceCatalogBackend::Memory(_) => Err(ReferenceCatalogError::StoreRequired),
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                Err(ReferenceCatalogError::RecoveryRequired)
+            }
+        }
+    }
+
+    /// Traverse the facts tree once for a caller that will consume the complete
+    /// catalog. The returned value retains only immutable posting digests; each
+    /// posting object is still read and digest-checked when consumed.
+    pub(crate) fn posting_digest_index_at_root(
+        &self,
+        root: &ReferenceCatalogRootV2,
+    ) -> Result<ReferenceCatalogPostingDigestIndex, ReferenceCatalogError> {
+        root.validate()?;
+        match &self.backend {
+            ReferenceCatalogBackend::Store(store) => store.posting_digest_index(root),
+            ReferenceCatalogBackend::Construction {
+                store, patricia, ..
+            } => store.posting_digest_index_constructed(root, &patricia.borrow()),
+            ReferenceCatalogBackend::Memory(memory) if root == &self.root => {
+                let digests = memory
+                    .postings
+                    .iter()
+                    .map(|(page_id, posting)| posting.digest().map(|digest| (*page_id, digest)))
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                if digests.len() as u64 != root.source_count {
+                    return Err(ReferenceCatalogError::MalformedRoot);
+                }
+                Ok(ReferenceCatalogPostingDigestIndex {
+                    root: root.clone(),
+                    digests,
+                })
+            }
+            ReferenceCatalogBackend::Memory(_) => Err(ReferenceCatalogError::StoreRequired),
+            ReferenceCatalogBackend::RecoveryRequired(_) => {
+                Err(ReferenceCatalogError::RecoveryRequired)
+            }
+        }
+    }
+
+    pub(crate) fn posting_from_digest_index(
+        &self,
+        index: &ReferenceCatalogPostingDigestIndex,
+        page_id: PageId,
+    ) -> Result<Option<ReferenceSourcePostingV2>, ReferenceCatalogError> {
+        let Some(digest) = index.digest(page_id) else {
+            return Ok(None);
+        };
+        match &self.backend {
+            ReferenceCatalogBackend::Store(store)
+            | ReferenceCatalogBackend::Construction { store, .. } => {
+                store.posting_from_digest(page_id, digest).map(Some)
+            }
+            ReferenceCatalogBackend::Memory(memory) if index.root == self.root => memory
+                .postings
+                .get(&page_id)
+                .cloned()
+                .ok_or(ReferenceCatalogError::MalformedRoot)
+                .and_then(|posting| {
+                    if posting.digest()? != digest {
+                        return Err(ReferenceCatalogError::MalformedRoot);
+                    }
+                    Ok(Some(posting))
+                }),
             ReferenceCatalogBackend::Memory(_) => Err(ReferenceCatalogError::StoreRequired),
             ReferenceCatalogBackend::RecoveryRequired(_) => {
                 Err(ReferenceCatalogError::RecoveryRequired)

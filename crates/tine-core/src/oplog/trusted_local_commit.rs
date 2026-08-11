@@ -14,19 +14,18 @@ use std::cell::Cell;
 #[cfg(test)]
 use std::time::{Duration, Instant};
 
-use tine_storage::{LocalJournalAppend, LocalJournalSegment};
-
 use crate::model::{
     content_rev, CommittedPendingJournalPageProjection, DurableJournalPageProjection, Format,
-    JournalPageProjectionOutcome, JournalPageProjectionTarget,
+    JournalPageCommitError, JournalPageProjectionOutcome, JournalPageProjectionTarget,
 };
 use crate::{Graph, PageDto, PageKind};
 
 use super::operational_coordinator::PreparedLocalMutation;
 use super::{
-    append_managed_local_record, BatchId, ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind,
-    ManagedLocalRecord, ManagedLocalRecordError, ManagedTextKind, MaterializedPage,
-    PreparedManagedLocalRecord, ShardedHotEngine,
+    append_managed_local_record, BatchId, ManagedLocalAppendError, ManagedLocalAppendProof,
+    ManagedLocalApplyOutcome, ManagedLocalJournalAppend, ManagedLocalRecord,
+    ManagedLocalRecordError, ManagedTextKind, MaterializedPage, PreparedManagedLocalRecord,
+    ShardedHotEngine,
 };
 
 pub(crate) struct TrustedLocalCommitCoordinator;
@@ -126,6 +125,7 @@ pub(crate) enum TrustedLocalCommitError {
     InvalidPreparedInput(String),
     ManagedRecord(ManagedLocalRecordError),
     PrecommitGraph(io::Error),
+    JournalAppend(ManagedLocalAppendError),
 }
 
 impl fmt::Display for TrustedLocalCommitError {
@@ -134,6 +134,7 @@ impl fmt::Display for TrustedLocalCommitError {
             Self::InvalidPreparedInput(detail) => formatter.write_str(detail),
             Self::ManagedRecord(error) => error.fmt(formatter),
             Self::PrecommitGraph(error) => error.fmt(formatter),
+            Self::JournalAppend(error) => error.fmt(formatter),
         }
     }
 }
@@ -147,13 +148,35 @@ pub(crate) enum TrustedLocalCommitOutcome {
     CommittedRecoveryRequired(TrustedLocalCommittedRecovery),
 }
 
+/// Parser-owned application response evidence, created at the same boundary
+/// that parses the requested exact target.  It is intentionally crate-private
+/// and may be retained only by an immediately durable trusted commit.
+pub(crate) struct TrustedLocalResponseEvidence {
+    page: PageDto,
+    parsed_target_revision: String,
+}
+
+impl TrustedLocalResponseEvidence {
+    pub(crate) fn new(page: PageDto, parsed_target_revision: String) -> Self {
+        Self {
+            page,
+            parsed_target_revision,
+        }
+    }
+}
+
 /// Journal-committed operation whose exact graph target is durable and whose
 /// semantic overlay is already visible. Its fields are private so callers can
 /// observe, but cannot construct, committed evidence.
 pub(crate) struct TrustedLocalCommitted {
     prepared: PreparedManagedLocalRecord,
-    graph: DurableJournalPageProjection<LocalJournalAppend>,
+    graph: DurableJournalPageProjection<ManagedLocalAppendProof>,
     post_page: MaterializedPage,
+    /// Parser-owned DTO for the exact target that this foreground commit made
+    /// durable.  This stays inside the nonconstructible committed outcome: it
+    /// is never persisted or used by retry/recovery, which must retain the
+    /// established exact-byte parser fallback.
+    trusted_target_page: Option<PageDto>,
 }
 
 impl TrustedLocalCommitted {
@@ -169,7 +192,7 @@ impl TrustedLocalCommitted {
         self.prepared.record()
     }
 
-    pub(crate) fn append(&self) -> &LocalJournalAppend {
+    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
         self.graph.append_proof()
     }
 
@@ -185,6 +208,14 @@ impl TrustedLocalCommitted {
         self.graph.target().revision()
     }
 
+    /// The one-shot parser-owned response DTO carried only by an immediately
+    /// durable foreground commit.  A projection/overlay retry deliberately
+    /// has no process-local DTO and therefore takes the established parser
+    /// fallback when it eventually becomes durable.
+    pub(crate) fn trusted_target_page(&self) -> Option<&PageDto> {
+        self.trusted_target_page.as_ref()
+    }
+
     pub(crate) const fn post_page(&self) -> &MaterializedPage {
         &self.post_page
     }
@@ -198,7 +229,7 @@ impl TrustedLocalCommitted {
 /// retry without accepting an append callback or a semantic transaction.
 pub(crate) struct TrustedLocalCommittedPendingProjection {
     prepared: PreparedManagedLocalRecord,
-    graph: CommittedPendingJournalPageProjection<LocalJournalAppend>,
+    graph: CommittedPendingJournalPageProjection<ManagedLocalAppendProof>,
     post_page: MaterializedPage,
 }
 
@@ -211,7 +242,7 @@ impl TrustedLocalCommittedPendingProjection {
         self.prepared.sequence()
     }
 
-    pub(crate) fn append(&self) -> &LocalJournalAppend {
+    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
         self.graph.append_proof()
     }
 
@@ -237,8 +268,8 @@ impl TrustedLocalCommittedPendingProjection {
 }
 
 enum CommittedGraphState {
-    Durable(DurableJournalPageProjection<LocalJournalAppend>),
-    Pending(CommittedPendingJournalPageProjection<LocalJournalAppend>),
+    Durable(DurableJournalPageProjection<ManagedLocalAppendProof>),
+    Pending(CommittedPendingJournalPageProjection<ManagedLocalAppendProof>),
 }
 
 /// The append crossed the commit boundary but hot application could not be
@@ -259,7 +290,7 @@ impl TrustedLocalCommittedRecovery {
         self.prepared.sequence()
     }
 
-    pub(crate) fn append(&self) -> &LocalJournalAppend {
+    pub(crate) fn append(&self) -> &ManagedLocalAppendProof {
         match &self.graph {
             CommittedGraphState::Durable(graph) => graph.append_proof(),
             CommittedGraphState::Pending(graph) => graph.append_proof(),
@@ -280,11 +311,31 @@ impl TrustedLocalCommittedRecovery {
 }
 
 impl TrustedLocalCommitCoordinator {
-    pub(crate) fn commit(
+    pub(crate) fn commit<J: ManagedLocalJournalAppend>(
         graph: &Graph,
-        journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+        journal: &mut J,
         engine: &mut ShardedHotEngine,
         page: &PageDto,
+        base_revision: &str,
+        prepared: PreparedLocalMutation,
+    ) -> Result<TrustedLocalCommitOutcome, TrustedLocalCommitError> {
+        Self::commit_with_response_evidence(
+            graph,
+            journal,
+            engine,
+            page,
+            None,
+            base_revision,
+            prepared,
+        )
+    }
+
+    pub(crate) fn commit_with_response_evidence<J: ManagedLocalJournalAppend>(
+        graph: &Graph,
+        journal: &mut J,
+        engine: &mut ShardedHotEngine,
+        page: &PageDto,
+        response_evidence: Option<TrustedLocalResponseEvidence>,
         base_revision: &str,
         prepared: PreparedLocalMutation,
     ) -> Result<TrustedLocalCommitOutcome, TrustedLocalCommitError> {
@@ -317,7 +368,7 @@ impl TrustedLocalCommitCoordinator {
         let prepared_started = Instant::now();
         let batch = prepared.into_trusted_batch();
         let sequence = engine.managed_local_prefix_state().next_sequence;
-        let prepared = match engine.prepare_managed_local_record(&batch, sequence) {
+        let prepared = match engine.prepare_managed_local_record(batch, sequence) {
             Ok(prepared) => prepared,
             Err(ManagedLocalRecordError::Unsupported(reason)) => {
                 return Ok(TrustedLocalCommitOutcome::Declined {
@@ -338,6 +389,7 @@ impl TrustedLocalCommitCoordinator {
                 "eligible prepared record unexpectedly has an absent target".into(),
             )
         })?;
+        let response_evidence = response_evidence_for_exact_target(response_evidence, exact_target);
         if content_rev(std::str::from_utf8(expected_base).map_err(|_| {
             TrustedLocalCommitError::InvalidPreparedInput(
                 "prepared existing-page base is not valid UTF-8".into(),
@@ -354,21 +406,29 @@ impl TrustedLocalCommitCoordinator {
 
         #[cfg(test)]
         let graph_started = Instant::now();
-        let graph_outcome = graph
-            .commit_existing_page_with_journal(
-                page,
-                base_revision,
-                expected_base,
-                exact_target,
-                || {
-                    append_managed_local_record(journal, &prepared)
-                        .map_err(|error| io::Error::other(error.to_string()))
-                },
-            )
-            .map_err(TrustedLocalCommitError::PrecommitGraph)?;
+        let graph_outcome = match graph.commit_existing_page_with_journal(
+            page,
+            base_revision,
+            expected_base,
+            exact_target,
+            || append_managed_local_record(journal, &prepared),
+        ) {
+            Ok(outcome) => outcome,
+            Err(JournalPageCommitError::Precommit(error)) => {
+                return Err(TrustedLocalCommitError::PrecommitGraph(error));
+            }
+            Err(JournalPageCommitError::Append(error)) => {
+                return Err(TrustedLocalCommitError::JournalAppend(error));
+            }
+        };
         #[cfg(test)]
         note_commit_stage(|timings| timings.graph_total = graph_started.elapsed());
-        Ok(finish_committed_graph(engine, prepared, graph_outcome))
+        Ok(finish_committed_graph(
+            engine,
+            prepared,
+            graph_outcome,
+            response_evidence,
+        ))
     }
 
     /// Retry only graph publication for an already applied committed record.
@@ -388,6 +448,7 @@ impl TrustedLocalCommitCoordinator {
                     prepared,
                     graph,
                     post_page,
+                    trusted_target_page: None,
                 })
             }
             JournalPageProjectionOutcome::CommittedPending(graph) => {
@@ -413,7 +474,7 @@ impl TrustedLocalCommitCoordinator {
             graph,
             last_error: _,
         } = recovery;
-        finish_committed_state(engine, prepared, graph)
+        finish_committed_state(engine, prepared, graph, None)
     }
 
     pub(crate) fn restart_projection_input(
@@ -517,24 +578,57 @@ fn prepared_page_mismatch(
     None
 }
 
+fn materialized_page_semantics_equal(left: &MaterializedPage, right: &MaterializedPage) -> bool {
+    left.page_id == right.page_id
+        && left.home_document_id == right.home_document_id
+        && left.name == right.name
+        && left.path == right.path
+        && left.kind == right.kind
+        && left.preamble == right.preamble
+        && left.blocks == right.blocks
+}
+
 fn finish_committed_graph(
     engine: &mut ShardedHotEngine,
     prepared: PreparedManagedLocalRecord,
-    graph: JournalPageProjectionOutcome<LocalJournalAppend>,
+    graph: JournalPageProjectionOutcome<ManagedLocalAppendProof>,
+    response_evidence: Option<TrustedLocalResponseEvidence>,
 ) -> TrustedLocalCommitOutcome {
-    let graph = match graph {
-        JournalPageProjectionOutcome::Durable(graph) => CommittedGraphState::Durable(graph),
+    let (graph, trusted_target_page) = match graph {
+        JournalPageProjectionOutcome::Durable(graph) => {
+            // The evidence was accepted only when its parser-time revision
+            // matched the prepared exact target.  Graph now proves that same
+            // target durable; update only the response revision.
+            let trusted_target_page = response_evidence
+                .filter(|evidence| evidence.parsed_target_revision == graph.target().revision())
+                .map(|evidence| {
+                    let mut page = evidence.page;
+                    page.rev = Some(graph.target().revision().to_owned());
+                    page
+                });
+            (CommittedGraphState::Durable(graph), trusted_target_page)
+        }
         JournalPageProjectionOutcome::CommittedPending(graph) => {
-            CommittedGraphState::Pending(graph)
+            (CommittedGraphState::Pending(graph), None)
         }
     };
-    finish_committed_state(engine, prepared, graph)
+    finish_committed_state(engine, prepared, graph, trusted_target_page)
+}
+
+fn response_evidence_for_exact_target(
+    response_evidence: Option<TrustedLocalResponseEvidence>,
+    exact_target: &[u8],
+) -> Option<TrustedLocalResponseEvidence> {
+    let response_evidence = response_evidence?;
+    let target = std::str::from_utf8(exact_target).ok()?;
+    (response_evidence.parsed_target_revision == content_rev(target)).then_some(response_evidence)
 }
 
 fn finish_committed_state(
     engine: &mut ShardedHotEngine,
-    prepared: PreparedManagedLocalRecord,
+    mut prepared: PreparedManagedLocalRecord,
     graph: CommittedGraphState,
+    trusted_target_page: Option<PageDto>,
 ) -> TrustedLocalCommitOutcome {
     let append = match &graph {
         CommittedGraphState::Durable(graph) => graph.append_proof(),
@@ -543,13 +637,16 @@ fn finish_committed_state(
     #[cfg(test)]
     let overlay_started = Instant::now();
     let applied = before_overlay_hook()
-        .and_then(|()| engine.apply_appended_managed_local_record(append, &prepared));
+        .and_then(|()| engine.apply_appended_managed_local_record(append, &mut prepared));
     #[cfg(test)]
     note_commit_stage(|timings| timings.hot_overlay_apply = overlay_started.elapsed());
     let post_page = match applied {
         Ok(ManagedLocalApplyOutcome::Applied { batch_id, page }) => {
             debug_assert_eq!(batch_id, prepared.batch_id());
-            debug_assert_eq!(&page, prepared.post_page());
+            debug_assert!(materialized_page_semantics_equal(
+                &page,
+                prepared.post_page()
+            ));
             page
         }
         Err(last_error) => {
@@ -570,6 +667,7 @@ fn finish_committed_state(
                 prepared,
                 graph,
                 post_page,
+                trusted_target_page,
             })
         }
         CommittedGraphState::Pending(graph) => {
@@ -755,7 +853,7 @@ mod tests {
 
     fn commit_edit(
         fixture: &mut OverlayFixture,
-        journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+        journal: &mut impl ManagedLocalJournalAppend,
         seed: u128,
         generation: usize,
     ) -> TrustedLocalCommitOutcome {
@@ -848,12 +946,13 @@ mod tests {
                 fast.graph.read_projection_input(&fast.page_path).unwrap(),
                 Some(committed.exact_target().to_vec())
             );
-            assert_eq!(
-                fast.engine
+            assert_page_semantics(
+                &fast
+                    .engine
                     .materialize_current_page_at_path(&fast.page_path)
                     .unwrap()
                     .unwrap(),
-                *committed.post_page()
+                committed.post_page(),
             );
             assert!(forbidden_commit_work().since(forbidden_before).is_none());
             assert_eq!(
@@ -875,6 +974,44 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn mismatched_parser_evidence_commits_and_defers_to_exact_byte_response_fallback() {
+        let mut fixture = OverlayFixture::new("trusted-local-response-evidence-mismatch", "md", 8);
+        let (_, mut journal) = fixture.journal("mismatch");
+        let (page, base_revision) = edited_page(&fixture, 1);
+        let prepared = prepared_edit(&mut fixture, 1_200_110, 1);
+        let evidence = TrustedLocalResponseEvidence::new(
+            page.clone(),
+            "deliberately-not-the-prepared-target-revision".into(),
+        );
+
+        let outcome = TrustedLocalCommitCoordinator::commit_with_response_evidence(
+            &fixture.graph,
+            &mut journal,
+            &mut fixture.engine,
+            &page,
+            Some(evidence),
+            &base_revision,
+            prepared,
+        )
+        .expect("digest mismatch must not reject the already valid commit");
+        let TrustedLocalCommitOutcome::Committed(committed) = outcome else {
+            panic!("valid commit with mismatched response evidence was not durable")
+        };
+        assert!(
+            committed.trusted_target_page().is_none(),
+            "mismatched parser evidence must use the exact-byte response fallback"
+        );
+        assert_eq!(journal.stats().frames_appended, 1);
+        assert_eq!(
+            fixture
+                .graph
+                .read_projection_input(&fixture.page_path)
+                .unwrap(),
+            Some(committed.exact_target().to_vec())
+        );
     }
 
     #[test]
@@ -936,7 +1073,7 @@ mod tests {
         );
         let managed = fixture.engine.managed_local_work().since(managed_before);
         assert_eq!(managed.accepted_base_documents_loaded, 0);
-        assert_eq!(managed.retained_author_candidates_used, 24);
+        assert_eq!(managed.retained_author_candidates_used, 12);
     }
 
     #[test]
@@ -1015,7 +1152,11 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(TrustedLocalCommitError::PrecommitGraph(_))
+            Err(TrustedLocalCommitError::JournalAppend(
+                ManagedLocalAppendError::DefinitelyNotAppended(
+                    ManagedLocalRecordError::WrongDurabilityProof
+                )
+            ))
         ));
         assert_eq!(wrong_journal.stats().frames_appended, 0);
         assert_eq!(
@@ -1028,6 +1169,24 @@ mod tests {
         assert_eq!(
             append.engine.managed_local_prefix_state().records_applied,
             0
+        );
+        let (_, mut right_journal) = append.journal("right-device");
+        let later_prepared = prepared_edit(&mut append, 1_220_040, 1);
+        assert!(matches!(
+            TrustedLocalCommitCoordinator::commit(
+                &append.graph,
+                &mut right_journal,
+                &mut append.engine,
+                &page,
+                &base_revision,
+                later_prepared,
+            ),
+            Ok(TrustedLocalCommitOutcome::Committed(_))
+        ));
+        assert_eq!(right_journal.stats().frames_appended, 1);
+        assert_eq!(
+            append.engine.managed_local_prefix_state().records_applied,
+            1
         );
     }
 
@@ -1091,6 +1250,10 @@ mod tests {
         let TrustedLocalCommitOutcome::Committed(committed) = outcome else {
             panic!("in-process retry did not reprove the exact recovered target");
         };
+        assert!(
+            committed.trusted_target_page().is_none(),
+            "recovered projection must retain the exact-byte parser fallback"
+        );
         assert_eq!(journal.stats().frames_appended, 1);
         assert_eq!(
             fixture
@@ -1384,7 +1547,7 @@ mod tests {
             assert_eq!(managed.commits_applied, edits);
             assert_eq!(managed.documents_imported, edits);
             assert_eq!(managed.accepted_base_documents_loaded, 0);
-            assert_eq!(managed.retained_author_candidates_used, edits * 2);
+            assert_eq!(managed.retained_author_candidates_used, edits);
             let total_p50 = p50(totals);
             eprintln!(
                 "trusted-local bounded probe: pages={pages} samples={} total_p50_ms={:.6} prepared_p50_ms={:.6} graph_p50_ms={:.6} graph_validation_p50_ms={:.6} append_p50_ms={:.6} graph_publication_p50_ms={:.6} graph_cache_p50_ms={:.6} overlay_p50_ms={:.6} response_p50_ms={:.6} managed_work={managed:?} graph_work={:?}",

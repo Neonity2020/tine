@@ -66,8 +66,8 @@ function page(
   };
 }
 
-function seed(pages: PageDto[]): void {
-  loadFeed(pages);
+async function seed(pages: PageDto[]): Promise<void> {
+  await loadFeed(pages);
   setGraphMeta({ root: "/graph" } as any);
 }
 
@@ -108,7 +108,7 @@ afterEach(() => {
 
 describe("clipboard payload insertion and identity validation", () => {
   it("retires an immediate cut before the debounce and preserves identity", async () => {
-    seed([page("Paste", [
+    await seed([page("Paste", [
       block(ID1, `source\nid:: ${ID1}`),
       block(HOST, ""),
     ])]);
@@ -126,7 +126,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("retires every page in a multi-page cut before preserving all ids", async () => {
-    seed([
+    await seed([
       page("One", [block(ID1, `one\nid:: ${ID1}`)], { path: "pages/one.md" }),
       page("Two", [block(ID2, `two\nid:: ${ID2}`)], { path: "pages/two.md" }),
       page("Target", [block(HOST, "")], { path: "pages/target.md" }),
@@ -143,7 +143,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("strips identity when an unsaved raw acquires the cut id during validation", async () => {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
       page("Collision", [block("collision", "other")]),
       page("Target", [block(HOST, "")]),
@@ -179,7 +179,7 @@ describe("clipboard payload insertion and identity validation", () => {
       vi.mocked(backend().resolveBlocks).mockRejectedValue(new Error("offline"));
     }],
   ])("strips every id on %s", async (_label, expectedIds, arrange) => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -201,7 +201,7 @@ describe("clipboard payload insertion and identity validation", () => {
     for (const [index, sample] of cases.entries()) {
       resetStore();
       clearClipboardSlot();
-      seed([page("Source", [block(ID1, `old\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+      await seed([page("Source", [block(ID1, `old\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
       const payload = buildClipboardPayload([ID1])!;
       payload.blocks = [{ raw: sample.raw, sourceFormat: "md", children: sample.child ? [sample.child] : [] }];
       await record("cut", `- root ${index}`, payload);
@@ -219,7 +219,7 @@ describe("clipboard payload insertion and identity validation", () => {
     const run = async (arrange: () => void | Promise<void>) => {
       resetStore();
       clearClipboardSlot();
-      seed([
+      await seed([
         page("Source", [block(ID1, `source\nid:: ${ID1}`)], { path: "pages/source.md" }),
         page("Target", [block(HOST, "")]),
       ]);
@@ -234,15 +234,15 @@ describe("clipboard payload insertion and identity validation", () => {
     vi.mocked(backend().savePage).mockRejectedValueOnce(new Error("disk full"));
     await run(() => {});
     await run(() => forgetPage("Source"));
-    await run(() => {
+    await run(async () => {
       forgetPage("Source");
-      reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
+      await reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
     });
   });
 
   it("strips all ids after the actual working-set cap evicts the cut source", async () => {
     loadSingle(page("Target", [block(HOST, "")]));
-    ensurePageLoaded(page("Source", [
+    await ensurePageLoaded(page("Source", [
       block(ID1, `source\nid:: ${ID1}`, [block(ID2, `child\nid:: ${ID2}`)]),
     ]));
     setGraphMeta({ root: "/graph" } as any);
@@ -252,7 +252,7 @@ describe("clipboard payload insertion and identity validation", () => {
     expect(await flushPage("Source")).toBe(true);
 
     for (let i = 0; i < 79; i++) {
-      ensurePageLoaded(page(`Eviction ${i}`, [block(`eviction-${i}`, String(i))]));
+      await ensurePageLoaded(page(`Eviction ${i}`, [block(`eviction-${i}`, String(i))]));
     }
     expect(pageByName("Source")).toBeUndefined();
 
@@ -268,7 +268,7 @@ describe("clipboard payload insertion and identity validation", () => {
   it("strips the whole multi-page payload when only one source flush fails", async () => {
     resetStore();
     clearClipboardSlot();
-    seed([
+    await seed([
       page("One", [block(ID1, `one\nid:: ${ID1}`)]),
       page("Two", [block(ID2, `two\nid:: ${ID2}`)]),
       page("Target", [block(HOST, "")]),
@@ -290,7 +290,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("fails retirement when a source is rebound while its save is in flight", async () => {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)], { path: "pages/source.md" }),
       page("Target", [block(HOST, "")]),
     ]);
@@ -302,7 +302,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
     const pending = paste();
     await vi.waitFor(() => expect(backend().savePage).toHaveBeenCalled());
-    reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
+    await reloadPage(page("Source", [block("replacement", "replacement")], { path: "pages/rebound.md" }));
     finishSave("stale-rev");
 
     await pending;
@@ -311,7 +311,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("consumes a cut grant up front and makes a second paste structural-only", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -328,7 +328,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("strips identity when undo restores the cut originals before paste", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -344,7 +344,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("copy-paste strips every id while preserving exact structure, raws, and collapse", async () => {
-    seed([page("Target", [block(HOST, "")])]);
+    await seed([page("Target", [block(HOST, "")])]);
     await record("copy", "- root", {
       blocks: [{
         raw: `root line\nsecond line\ncollapsed:: true\nid:: ${ID1}`,
@@ -367,7 +367,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
   it("keeps a same-format preserved raw byte-exact, including blank lines and trailing spaces", async () => {
     const exact = `first line  \n\nsecond line\t\nid:: ${ID1}`;
-    seed([page("Source", [block(ID1, exact)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, exact)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- first line", payload);
     deleteBlock(ID1);
@@ -380,7 +380,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("does not replace an empty host carrying identity or an incoming reference", async () => {
-    seed([page("Target", [
+    await seed([page("Target", [
       block(HOST, `id:: ${HOST}`),
       block("referrer", `((${ID2}))`),
       block(ID2, ""),
@@ -402,7 +402,7 @@ describe("clipboard payload insertion and identity validation", () => {
     ["md", "org", `body\nalpha:: one\nid:: ${ID1}\ncollapsed:: true`, `body\n:PROPERTIES:\n:alpha: one\n:id: ${ID1}\n:collapsed: true\n:END:`],
     ["org", "md", `body\n:PROPERTIES:\n:alpha: one\n:id: ${ID1}\n:collapsed: true\n:END:`, `body\nalpha:: one\nid:: ${ID1}\ncollapsed:: true`],
   ] as const)("translates ordered properties for %s → %s while preserving cut identity", async (sourceFormat, targetFormat, raw, expected) => {
-    seed([
+    await seed([
       page("Source", [block(ID1, raw)], { format: sourceFormat }),
       page("Target", [block(HOST, "")], { format: targetFormat }),
     ]);
@@ -417,7 +417,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("aborts entirely when graph authority changes during validation", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -435,7 +435,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("aborts when the target page instance reloads during validation", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -444,7 +444,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
     const pending = paste();
     await vi.waitFor(() => expect(backend().resolveBlocks).toHaveBeenCalled());
-    reloadPage(page("Target", [block(HOST, "reloaded")]))
+    await reloadPage(page("Target", [block(HOST, "reloaded")]));
     release([null]);
 
     await expect(pending).resolves.toBeNull();
@@ -453,7 +453,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("repeats the source clean-state check in the final no-await section", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -471,7 +471,7 @@ describe("clipboard payload insertion and identity validation", () => {
   });
 
   it("rechecks the live doc after backend absence validation and strips on an in-app conflict", async () => {
-    seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
+    await seed([page("Source", [block(ID1, `source\nid:: ${ID1}`)]), page("Target", [block(HOST, "")])]);
     const payload = buildClipboardPayload([ID1])!;
     await record("cut", "- source", payload);
     deleteBlock(ID1);
@@ -501,7 +501,7 @@ describe("clipboard payload insertion and identity validation", () => {
 
 describe("identity-tagged redo", () => {
   async function preservedPaste(): Promise<void> {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
       page("Target", [block(HOST, "")]),
       page("Other", [block("other", "old")]),
@@ -563,7 +563,7 @@ describe("identity-tagged redo", () => {
   });
 
   it("clears mixed page-only redo entries when the tagged prerequisite is selected from the middle", async () => {
-    seed([
+    await seed([
       page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
       page("Target", [block(HOST, "")]),
       page("Other", [block("other", "old")]),

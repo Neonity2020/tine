@@ -4,8 +4,8 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_config_graph, with_graph, with_read_graph, with_trash_graph, AppState,
-    GraphContext,
+    slot_for_context, with_config_graph, with_filesystem_graph, with_graph, with_trash_graph,
+    AppState, GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -16,9 +16,13 @@ use tine_core::model::{
     BacklinkFilterContext, BacklinkFilterTarget, BlockDto, PageDto, PageEntry, PageKind, RefGroup,
 };
 use tine_core::sync_runtime::{
-    SyncApplicationPageInventoryOutcome, SyncApplicationPageLoadOutcome,
-    SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
-    SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncRuntimeHandle,
+    SyncApplicationGraphMutationRequest, SyncApplicationGuideCopyOutcome,
+    SyncApplicationNavigationOutcome, SyncApplicationNavigationReply,
+    SyncApplicationNavigationRequest, SyncApplicationPageInventoryOutcome,
+    SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest, SyncApplicationPageSaveOutcome,
+    SyncApplicationPageSaveRequest, SyncApplicationPageSaveTarget, SyncApplicationPageSelector,
+    SyncApplicationPdfOpenOutcome, SyncApplicationPublishOutcome, SyncApplicationUnitOutcome,
+    SyncRuntimeHandle,
 };
 
 #[tauri::command]
@@ -66,6 +70,25 @@ fn validate_query_source(query: &str) -> Result<(), String> {
 fn enforce_result_bridge_budget(groups: &[RefGroup]) -> Result<(), String> {
     let rows = groups.iter().map(|group| group.blocks.len()).sum::<usize>();
     let bytes = tine_core::model::ref_groups_estimated_bytes(groups);
+    if rows > RESULT_BRIDGE_MAX_ROWS || bytes > RESULT_BRIDGE_MAX_BYTES {
+        return Err(format!(
+            "result-too-large: {rows} matching blocks (~{bytes} bytes); narrow the query or add (sample N) (limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)"
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_optional_result_bridge_budget(groups: &[Option<RefGroup>]) -> Result<(), String> {
+    let rows = groups
+        .iter()
+        .flatten()
+        .map(|group| group.blocks.len())
+        .sum::<usize>();
+    let bytes = groups
+        .iter()
+        .flatten()
+        .map(|group| tine_core::model::ref_groups_estimated_bytes(std::slice::from_ref(group)))
+        .sum::<usize>();
     if rows > RESULT_BRIDGE_MAX_ROWS || bytes > RESULT_BRIDGE_MAX_BYTES {
         return Err(format!(
             "result-too-large: {rows} matching blocks (~{bytes} bytes); narrow the query or add (sample N) (limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)"
@@ -133,8 +156,8 @@ fn enforce_query_execution_budget(
 #[cfg(test)]
 mod result_bridge_budget_tests {
     use super::{
-        enforce_result_bridge_budget, validate_query_source, RESULT_BRIDGE_MAX_BYTES,
-        RESULT_BRIDGE_MAX_ROWS,
+        enforce_optional_result_bridge_budget, enforce_result_bridge_budget, validate_query_source,
+        RESULT_BRIDGE_MAX_BYTES, RESULT_BRIDGE_MAX_ROWS,
     };
     use tine_core::{BlockDto, PageKind, RefGroup};
 
@@ -151,6 +174,17 @@ mod result_bridge_budget_tests {
     fn rejects_oversized_result_count_before_ipc() {
         let groups = [group(vec![BlockDto::default(); RESULT_BRIDGE_MAX_ROWS + 1])];
         assert!(enforce_result_bridge_budget(&groups)
+            .unwrap_err()
+            .starts_with("result-too-large:"));
+    }
+
+    #[test]
+    fn optional_results_are_budgeted_without_cloning_present_groups() {
+        let groups = [
+            None,
+            Some(group(vec![BlockDto::default(); RESULT_BRIDGE_MAX_ROWS + 1])),
+        ];
+        assert!(enforce_optional_result_bridge_budget(&groups)
             .unwrap_err()
             .starts_with("result-too-large:"));
     }
@@ -245,11 +279,55 @@ fn sparse_application_handle(
     }
 }
 
+fn map_managed_graph_mutation(
+    outcome: Result<
+        SyncApplicationUnitOutcome,
+        tine_core::sync_runtime::SyncApplicationPageRequestError,
+    >,
+) -> Result<(), String> {
+    match outcome.map_err(|error| error.to_string())? {
+        SyncApplicationUnitOutcome::Applied => Ok(()),
+        SyncApplicationUnitOutcome::Deferred { .. } => Err(
+            "Tine-managed storage is updating pages. Try the operation again when it finishes."
+                .into(),
+        ),
+    }
+}
+
+fn map_managed_sync_conflict_resolution(
+    outcome: Result<
+        SyncApplicationUnitOutcome,
+        tine_core::sync_runtime::SyncApplicationPageRequestError,
+    >,
+) -> Result<(), String> {
+    match outcome {
+        Err(tine_core::sync_runtime::SyncApplicationPageRequestError::ActorRefusedAt(
+            "sync_conflict_changed",
+        )) => Err("conflict".into()),
+        other => map_managed_graph_mutation(other),
+    }
+}
+
 fn sparse_page_inventory(handle: &SyncRuntimeHandle) -> Result<Vec<PageEntry>, String> {
     let outcome = handle
         .application_page_inventory()
         .map_err(|error| error.to_string())?;
     map_sparse_page_inventory(outcome)
+}
+
+fn sparse_navigation(
+    handle: &SyncRuntimeHandle,
+    request: SyncApplicationNavigationRequest,
+) -> Result<SyncApplicationNavigationReply, String> {
+    match handle
+        .application_navigation(request)
+        .map_err(|error| error.to_string())?
+    {
+        SyncApplicationNavigationOutcome::Loaded { reply } => Ok(reply),
+        SyncApplicationNavigationOutcome::Deferred { state: _ } => Err(
+            "Tine-managed storage is updating page navigation. Try again when it finishes.".into(),
+        ),
+    }
 }
 
 fn map_sparse_page_inventory(
@@ -295,20 +373,44 @@ fn load_sparse_page(
     map_sparse_page_load(outcome)
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedConflictObservation {
+    path: String,
+    revision: String,
+}
+
+/// Save transport result. Direct Files includes the activation at its resolved
+/// target when an absent editor successfully becomes present. Managed storage
+/// preserves its existing revision semantics and returns no activation.
+#[derive(Serialize)]
+pub(crate) struct SavePageResult {
+    revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation: Option<tine_core::EditorActivationHandle>,
+}
+
 fn sparse_save_request(
     page: PageDto,
     base_rev: Option<String>,
     force: bool,
+    managed_conflict_observation: Option<ManagedConflictObservation>,
 ) -> Result<SyncApplicationPageSaveRequest, String> {
-    if force {
-        return Err("Force save is unavailable while Tine-managed storage is active. Reload the page and resolve the conflict.".into());
-    }
-    let target = match base_rev {
-        Some(revision) => SyncApplicationPageSaveTarget::Existing {
+    let target = match (force, base_rev) {
+        (true, _) => {
+            let observation = managed_conflict_observation.ok_or_else(|| {
+                "managed.conflict_unobserved: Keep mine needs an identifiable current managed page. Use current or wait for the page to become identifiable.".to_owned()
+            })?;
+            SyncApplicationPageSaveTarget::ResolveConflict {
+                path: observation.path,
+                observed_revision: observation.revision,
+            }
+        }
+        (false, Some(revision)) => SyncApplicationPageSaveTarget::Existing {
             path: page.path.clone(),
             revision,
         },
-        None => SyncApplicationPageSaveTarget::New {
+        (false, None) => SyncApplicationPageSaveTarget::New {
             name: page.name.clone(),
             page_kind: page.kind.into(),
         },
@@ -320,27 +422,13 @@ fn map_sparse_page_save(outcome: SyncApplicationPageSaveOutcome) -> Result<Strin
     match outcome {
         SyncApplicationPageSaveOutcome::Saved { revision, .. }
         | SyncApplicationPageSaveOutcome::Unchanged { revision, .. } => Ok(revision),
-        // NOT the bare `"conflict"` the frontend matches to raise the keep-mine
-        // banner, and deliberately so: `save_sparse_page_with` hard-refuses
-        // `force` while managed storage is active, so that banner's "Keep mine"
-        // button cannot do anything here. Offering it would repeat the Direct
-        // mode trap of a prompt whose only working option discards the user's
-        // edits.
-        //
-        // What this DOES fix is the silent loop. `"conflict: {reason}"` matched
-        // neither the banner (which compares exactly) nor any bounded code, so
-        // it landed in the transient-retry path and retried forever without
-        // ever telling the user their save was refused — they could quit
-        // believing the page was written. A managed conflict is permanent until
-        // the page is reloaded, so it now carries a code the frontend knows is
-        // not worth retrying, and says what to do.
-        //
-        // Giving managed mode a real resolution path is a product decision
-        // (what "keep mine" means when the oplog is the source of truth) and is
-        // tracked as audit M2's remaining half.
+        // This bounded family tells the frontend to retain the draft, observe
+        // the exact current managed page through the actor, and raise the same
+        // explicit resolution surface as Direct Files. No revision is embedded
+        // in this error: the follow-up exact-path load is the observation, and
+        // the actor re-proves its revision in the replacement turn.
         SyncApplicationPageSaveOutcome::Conflict { reason } => Err(format!(
-            "managed.conflict: this page changed in Tine-managed storage ({reason:?}). \
-             Reload the page to see the current version, then reapply your edit."
+            "managed.conflict: this page changed in Tine-managed storage ({reason:?})"
         )),
         SyncApplicationPageSaveOutcome::Deferred { state: _ } => Err(
             "Tine-managed storage is updating this page. Try saving again when it finishes.".into(),
@@ -352,12 +440,13 @@ fn save_sparse_page_with<E>(
     page: PageDto,
     base_rev: Option<String>,
     force: bool,
+    managed_conflict_observation: Option<ManagedConflictObservation>,
     save: impl FnOnce(SyncApplicationPageSaveRequest) -> Result<SyncApplicationPageSaveOutcome, E>,
 ) -> Result<String, String>
 where
     E: std::fmt::Display,
 {
-    let request = sparse_save_request(page, base_rev, force)?;
+    let request = sparse_save_request(page, base_rev, force, managed_conflict_observation)?;
     let outcome = save(request).map_err(|error| error.to_string())?;
     map_sparse_page_save(outcome)
 }
@@ -390,13 +479,29 @@ pub(crate) async fn list_pages(state: GraphContext<'_>) -> Result<Vec<PageEntry>
 }
 
 #[tauri::command]
-pub(crate) fn referenced_page_names(
+pub(crate) async fn referenced_page_names(
     known_digest: Option<u64>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::ReferencedPageNames, String> {
-    with_read_graph(&state, |g| {
-        Ok(g.referenced_page_names_versioned(known_digest))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ReferencedPageNames { known_digest },
+            )? {
+                SyncApplicationNavigationReply::ReferencedPageNames(answer) => Ok(answer),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot
+                .legacy_graph()?
+                .referenced_page_names_versioned(known_digest)),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Serialize)]
@@ -738,7 +843,7 @@ pub(crate) fn graph_source_files(
     state: GraphContext<'_>,
 ) -> Result<Vec<GraphSourceFile>, String> {
     const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         let mut out: Vec<GraphSourceFile> = Vec::new();
         let mut roots = vec![g.pages_path()];
         if include_journals {
@@ -888,8 +993,11 @@ pub(crate) async fn save_page(
     // consume whatever authority happens to be current (GH #254 increment 2,
     // adversarial implementation verification, finding 1).
     conflict_epoch: Option<u64>,
+    // Exact managed owner observed after a conflict refusal. Direct Files
+    // ignores this; managed Keep mine cannot proceed without both path and rev.
+    managed_conflict_observation: Option<ManagedConflictObservation>,
     state: GraphContext<'_>,
-) -> Result<String, String> {
+) -> Result<SavePageResult, String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
         let benchmark_started = std::env::var_os("TINE_ISSUE248_BENCH").map(|_| Instant::now());
@@ -898,8 +1006,12 @@ pub(crate) async fn save_page(
             let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
             match sparse_application_handle(&slot)? {
                 Some(handle) => {
-                    let result =
-                        save_sparse_page_with(page, base_rev, force.unwrap_or(false), |request| {
+                    let result = save_sparse_page_with(
+                        page,
+                        base_rev,
+                        force.unwrap_or(false),
+                        managed_conflict_observation,
+                        |request| {
                             let saved = handle.save_application_page(request);
                             if crate::debug::debug_enabled() {
                                 if let Err(error) = &saved {
@@ -909,17 +1021,26 @@ pub(crate) async fn save_page(
                                 }
                             }
                             saved
-                        });
+                        },
+                    );
                     // A successful managed save has already made its exact user
                     // projection durable, but archive/checkpoint derivatives are
                     // intentionally drained by actor ticks. Wake the watcher even
                     // when the OS coalesces Tine's own file event; otherwise that
                     // derivative queue can remain pending until unrelated I/O.
                     crate::state::poke_watcher(&state);
-                    result
+                    result.map(|revision| SavePageResult {
+                        revision,
+                        activation: None,
+                    })
                 }
                 None => {
                     let graph = slot.legacy_graph()?;
+                    let first_save_activation = base_rev
+                        .is_none()
+                        .then_some(page.activation)
+                        .flatten()
+                        .map(tine_core::EditorActivation::from_u64);
                     // Always timed, not just under the issue-248 benchmark env
                     // var. A save that takes minutes is the thing users report,
                     // and a measurement that only exists when someone thought to
@@ -950,7 +1071,15 @@ pub(crate) async fn save_page(
                         );
                     }
                     report_direct_save_diagnostics(&graph, elapsed, result.as_ref().err());
-                    result.map_err(direct_save_error_message)
+                    result.map_err(direct_save_error_message).map(|revision| {
+                        let activation = first_save_activation.and_then(|activation| {
+                            graph.finish_saved_editor_activation(activation)
+                        });
+                        SavePageResult {
+                            revision,
+                            activation,
+                        }
+                    })
                 }
             }
         };
@@ -1012,14 +1141,34 @@ pub(crate) fn guide_pages() -> Result<Vec<tine_core::onboarding::GuidePage>, Str
 }
 
 #[tauri::command]
-pub(crate) fn copy_guide_into_graph(
+pub(crate) async fn copy_guide_into_graph(
     title: String,
     state: GraphContext<'_>,
 ) -> Result<tine_core::onboarding::GuideCopyResult, String> {
-    let result: Result<tine_core::onboarding::GuideCopyResult, String> = with_graph(&state, |g| {
-        tine_core::onboarding::copy_guide_into_graph(g, &title).map_err(|e| e.to_string())
-    });
-    result
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .copy_application_guide(title)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationGuideCopyOutcome::Copied { result } => Ok(result),
+                SyncApplicationGuideCopyOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating pages. Try copying the guide again when it finishes."
+                        .into(),
+                ),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                tine_core::onboarding::copy_guide_into_graph(&graph, &title)
+                    .map_err(|error| error.to_string())
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1027,13 +1176,37 @@ pub(crate) async fn get_backlinks(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        bounded_groups_or_error(graph.backlinks_bounded(
-            &name,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::Backlinks {
+                    name,
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::Backlinks(result) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                _ => Err("managed backlinks returned the wrong reply kind".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.backlinks_bounded(
+                &name,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1051,11 +1224,25 @@ pub(crate) async fn get_backlink_filter_context(
             targets.len()
         ));
     }
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        Ok(tine_core::query::backlink_filter_context(
-            &graph, &name, &targets,
-        ))
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BacklinkFilterContext { name, targets },
+            )? {
+                SyncApplicationNavigationReply::BacklinkFilterContext(context) => Ok(context),
+                _ => Err("managed backlink filter context returned the wrong reply kind".into()),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                Ok(tine_core::query::backlink_filter_context(
+                    &graph, &name, &targets,
+                ))
+            }
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1066,13 +1253,37 @@ pub(crate) async fn get_unlinked_refs(
     name: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        bounded_groups_or_error(graph.unlinked_refs_bounded(
-            &name,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::UnlinkedReferences {
+                    name,
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::UnlinkedReferences(result) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                _ => Err("managed unlinked references returned the wrong reply kind".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.unlinked_refs_bounded(
+                &name,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1085,27 +1296,71 @@ pub(crate) async fn get_unlinked_refs(
 pub(crate) async fn block_ref_counts(
     state: GraphContext<'_>,
 ) -> Result<Arc<std::collections::HashMap<String, usize>>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
-    tauri::async_runtime::spawn_blocking(move || graph.block_ref_counts())
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BlockReferenceCounts,
+            )? {
+                SyncApplicationNavigationReply::BlockReferenceCounts(counts) => {
+                    Ok(Arc::new(counts))
+                }
+                _ => Err("managed block-reference counts returned the wrong reply kind".into()),
+            },
+            None => slot
+                .legacy_graph()?
+                .block_ref_counts()
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// The blocks that reference block `uuid`, grouped by page (the badge's referrers
 /// panel). Lazy: called only when a badge is clicked open.
 #[tauri::command]
-pub(crate) fn block_referrers(
+pub(crate) async fn block_referrers(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
-    with_read_graph(&state, |g| {
-        bounded_groups_or_error(g.block_referrers_bounded(
-            &uuid,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BlockReferrers {
+                    uuid,
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::BlockReferrers(result) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                _ => Err("managed block referrers returned the wrong reply kind".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.block_referrers_bounded(
+                &uuid,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Deleting one page is graph-wide work: it re-derives the page inventory and
@@ -1121,11 +1376,23 @@ pub(crate) async fn delete_page(
     expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        graph
-            .delete_page_expected(&name, kind, expected_path.as_deref())
-            .map_err(|e| e.to_string())
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::DeletePage {
+                    name,
+                    page_kind: kind.into(),
+                    expected_path,
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .delete_page_expected(&name, kind, expected_path.as_deref())
+                .map_err(|e| e.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1138,11 +1405,23 @@ pub(crate) async fn rename_page(
     expected_path: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let graph = slot_for_context(&state)?.legacy_graph_cloned()?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
     tauri::async_runtime::spawn_blocking(move || {
-        graph
-            .rename_page_expected(&old, &new, expected_path.as_deref())
-            .map_err(|e| e.to_string())
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::RenamePage {
+                    old,
+                    new,
+                    expected_path,
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .rename_page_expected(&old, &new, expected_path.as_deref())
+                .map_err(|e| e.to_string()),
+        }
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1158,8 +1437,26 @@ mod graph_wide_command_boundary_tests {
         for name in [
             "get_backlinks",
             "get_unlinked_refs",
+            "block_ref_counts",
+            "block_referrers",
+            "get_backlink_filter_context",
+            "list_templates",
+            "query_facets",
+            "run_query",
+            "run_advanced_query",
+            "export_query_subtrees",
+            "list_orphan_assets",
+            "open_pdf",
+            "page_print_html",
+            "run_graph_search",
+            "search",
+            "write_pdf_view_state",
             "rename_page",
             "delete_page",
+            "merge_pages",
+            "rename_file_to_page",
+            "trash_journal_file",
+            "resolve_sync_conflict",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source.find(&signature).expect("command stays async");
@@ -1180,11 +1477,36 @@ mod managed_actor_command_boundary_tests {
         let source = include_str!("commands.rs");
         for name in [
             "list_pages",
+            "referenced_page_names",
             "journal_feed_page",
             "get_page",
             "save_page",
             "journal_content_days",
             "get_page_by_path",
+            "page_aliases",
+            "page_icons",
+            "existing_page_names",
+            "quick_switch",
+            "resolve_block",
+            "resolve_blocks",
+            "preview_block",
+            "block_ref_counts",
+            "block_referrers",
+            "get_backlinks",
+            "get_backlink_filter_context",
+            "get_unlinked_refs",
+            "list_templates",
+            "query_facets",
+            "run_query",
+            "run_advanced_query",
+            "export_query_subtrees",
+            "list_orphan_assets",
+            "open_pdf",
+            "open_page_file",
+            "page_print_html",
+            "run_graph_search",
+            "search",
+            "write_pdf_view_state",
         ] {
             let signature = format!("pub(crate) async fn {name}(");
             let start = source
@@ -1208,49 +1530,171 @@ mod managed_actor_command_boundary_tests {
             );
         }
     }
+
+    #[test]
+    fn managed_semantic_read_commands_never_fall_back_to_the_broad_parsed_cache() {
+        let source = include_str!("commands.rs");
+        for name in [
+            "referenced_page_names",
+            "page_aliases",
+            "page_icons",
+            "existing_page_names",
+            "quick_switch",
+            "resolve_block",
+            "resolve_blocks",
+            "preview_block",
+            "block_ref_counts",
+            "block_referrers",
+            "get_backlinks",
+            "get_backlink_filter_context",
+            "get_unlinked_refs",
+            "list_templates",
+            "query_facets",
+            "run_query",
+            "run_advanced_query",
+            "export_query_subtrees",
+            "list_orphan_assets",
+            "open_pdf",
+            "open_page_file",
+            "page_print_html",
+            "run_graph_search",
+            "search",
+            "write_pdf_view_state",
+        ] {
+            let signature = format!("pub(crate) async fn {name}(");
+            let start = source.find(&signature).expect("navigation command remains");
+            let tail = &source[start..];
+            let end = tail.find("\n#[tauri::command]").unwrap_or(tail.len());
+            let command = &tail[..end];
+            assert!(
+                command.contains("sparse_application_handle("),
+                "{name} must dispatch through an exact managed actor boundary"
+            );
+            assert!(
+                !command.contains("with_read_graph(") && !command.contains("read_graph_cloned("),
+                "{name} must not touch the managed broad parsed cache"
+            );
+        }
+    }
 }
 
 #[tauri::command]
-pub(crate) fn publish_html(state: GraphContext<'_>) -> Result<(String, usize), String> {
-    with_graph(&state, |g| g.publish_html().map_err(|e| e.to_string()))
+pub(crate) async fn publish_html(state: GraphContext<'_>) -> Result<(String, usize), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .publish_application_html()
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationPublishOutcome::Published { path, pages } => Ok((path, pages)),
+                SyncApplicationPublishOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating pages. Try publishing again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .publish_html()
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Render one page to a self-contained HTML document (assets inlined, no sidebar)
 /// for the print-to-PDF export, with the dialog's options. `Err("no-page")` if the
 /// page doesn't exist.
 #[tauri::command]
-pub(crate) fn page_print_html(
+pub(crate) async fn page_print_html(
     name: String,
     opts: tine_core::publish::PrintOpts,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_read_graph(&state, |g| {
-        g.page_print_html(&name, opts)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "no-page".to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let entry = sparse_page_inventory(handle)?
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| "no-page".to_string())?;
+                let page = load_sparse_page(
+                    handle,
+                    SyncApplicationPageSelector::ExactPath {
+                        path: entry.rel_path,
+                    },
+                )?
+                .ok_or_else(|| "no-page".to_string())?;
+                slot.with_filesystem_graph(|graph| {
+                    graph
+                        .page_print_html_page(&page, opts)
+                        .map_err(|error| error.to_string())
+                })
+            }
+            None => slot
+                .legacy_graph()?
+                .page_print_html(&name, opts)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "no-page".to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn run_query(
+pub(crate) async fn run_query(
     query: String,
     state: GraphContext<'_>,
 ) -> Result<Arc<Vec<RefGroup>>, String> {
     validate_query_source(&query)?;
-    with_read_graph(&state, |g| {
-        bounded_groups_or_error(g.run_query_bounded(
-            &query,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        ))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::SimpleQuery {
+                    query: query.clone(),
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::SimpleQuery(result) => {
+                    if result.exceeded {
+                        Err(format!(
+                            "result-too-large: {} matching blocks; narrow the query or add (sample N) (construction limits: {RESULT_BRIDGE_MAX_ROWS} blocks / {RESULT_BRIDGE_MAX_BYTES} bytes)",
+                            result.total
+                        ))
+                    } else {
+                        Ok(Arc::new(result.groups))
+                    }
+                }
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => bounded_groups_or_error(slot.legacy_graph()?.run_query_bounded(
+                &query,
+                RESULT_BRIDGE_MAX_ROWS,
+                RESULT_BRIDGE_MAX_BYTES,
+            )),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Resolve every query macro in one Copy / Export session under one cumulative
 /// construction budget. Unlike `get_page`, this returns only selected subtrees;
 /// unrelated page content is never cloned across IPC or retained by the WebView.
 #[tauri::command]
-pub(crate) fn export_query_subtrees(
+pub(crate) async fn export_query_subtrees(
     specs: Vec<tine_core::query::QueryExportSpec>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query::QueryExportBatch, String> {
@@ -1270,15 +1714,36 @@ pub(crate) fn export_query_subtrees(
             QUERY_EXPORT_MAX_QUERIES,
         ));
     }
-    with_read_graph(&state, |graph| {
-        let batch = tine_core::query::export_query_subtrees(
-            graph,
-            &specs,
-            QUERY_EXPORT_MAX_QUERIES,
-            QUERY_EXPORT_MAX_ROOTS,
-            QUERY_EXPORT_MAX_NODES,
-            QUERY_EXPORT_MAX_BYTES,
-        );
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let batch = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ExportQuerySubtrees {
+                    specs,
+                    max_queries: QUERY_EXPORT_MAX_QUERIES,
+                    max_roots: QUERY_EXPORT_MAX_ROOTS,
+                    max_nodes: QUERY_EXPORT_MAX_NODES,
+                    max_bytes: QUERY_EXPORT_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::ExportQuerySubtrees(batch) => batch,
+                _ => return Err("managed navigation returned the wrong reply".into()),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                tine_core::query::export_query_subtrees(
+                    &graph,
+                    &specs,
+                    QUERY_EXPORT_MAX_QUERIES,
+                    QUERY_EXPORT_MAX_ROOTS,
+                    QUERY_EXPORT_MAX_NODES,
+                    QUERY_EXPORT_MAX_BYTES,
+                )
+            }
+        };
         let bytes = batch
             .results
             .iter()
@@ -1303,6 +1768,8 @@ pub(crate) fn export_query_subtrees(
         }
         Ok(batch)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1315,100 +1782,237 @@ pub(crate) async fn run_graph_search(
     scope: Option<tine_core::query_plan::QueryPageScope>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query_plan::QueryExecution, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let page_limit = page_limit.min(RESULT_BRIDGE_MAX_ROWS);
     let block_limit = block_limit.min(RESULT_BRIDGE_MAX_ROWS - page_limit);
-    // QueryExecution carries backward-defaulted per-category `has_more` bits;
-    // returning it directly preserves those bits on the Tauri wire.
-    let execution = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
-        Some(lane) => graph.run_graph_search_latest_scoped(
-            lane,
-            &source,
-            page_limit,
-            block_limit,
-            scope,
-            explain,
-        ),
-        None => graph.run_graph_search_scoped(&source, page_limit, block_limit, scope, explain),
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    let execution = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::GraphSearch {
+                    source,
+                    page_limit,
+                    block_limit,
+                    lane,
+                    explain,
+                    scope,
+                },
+            )? {
+                SyncApplicationNavigationReply::GraphSearch(execution) => Ok(execution),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(match lane.as_deref() {
+                Some(lane) => slot.legacy_graph()?.run_graph_search_latest_scoped(
+                    lane,
+                    &source,
+                    page_limit,
+                    block_limit,
+                    scope,
+                    explain,
+                ),
+                None => slot.legacy_graph()?.run_graph_search_scoped(
+                    &source,
+                    page_limit,
+                    block_limit,
+                    scope,
+                    explain,
+                ),
+            }),
+        }
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     enforce_query_execution_budget(&execution)?;
     Ok(execution)
 }
 
 #[tauri::command]
-pub(crate) fn run_advanced_query(
+pub(crate) async fn run_advanced_query(
     query: String,
     current_page: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<tine_core::query::AdvancedResult, String> {
     validate_query_source(&query)?;
-    with_read_graph(&state, |g| {
-        let (result, exceeded, total) = g.run_advanced_query_bounded_cached(
-            &query,
-            current_page.as_deref(),
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        );
-        if exceeded {
-            return Err(format!(
-                "result-too-large: {total} advanced-query matches; narrow the query"
-            ));
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let bounded = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::AdvancedQuery {
+                    query: query.clone(),
+                    current_page: current_page.clone(),
+                    max_rows: RESULT_BRIDGE_MAX_ROWS,
+                    max_bytes: RESULT_BRIDGE_MAX_BYTES,
+                },
+            )? {
+                SyncApplicationNavigationReply::AdvancedQuery(result) => result,
+                _ => return Err("managed navigation returned the wrong reply".into()),
+            },
+            None => {
+                let (result, exceeded, total) =
+                    slot.legacy_graph()?.run_advanced_query_bounded_cached(
+                        &query,
+                        current_page.as_deref(),
+                        RESULT_BRIDGE_MAX_ROWS,
+                        RESULT_BRIDGE_MAX_BYTES,
+                    );
+                tine_core::sync_runtime::SyncApplicationBoundedAdvancedResult {
+                    result,
+                    total,
+                    exceeded,
+                }
+            }
+        };
+        if bounded.exceeded {
+            Err(format!(
+                "result-too-large: {} advanced-query matches; narrow the query",
+                bounded.total
+            ))
+        } else {
+            Ok(bounded.result)
         }
-        Ok(result)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn query_facets(
+pub(crate) async fn query_facets(
     state: GraphContext<'_>,
     autocomplete: Option<bool>,
 ) -> Result<Vec<(String, Vec<String>)>, String> {
-    with_read_graph(&state, |g| {
-        if autocomplete.unwrap_or(false) {
-            // The editor's OG policy intentionally differs from query-builder
-            // facets; use a separately bounded collector without changing the
-            // default command behavior.
-            return Ok(tine_core::query::autocomplete_property_facets_bounded(
-                g,
-                AUTOCOMPLETE_FACET_MAX_ITEMS,
-                AUTOCOMPLETE_FACET_MAX_BYTES,
-            )
-            .0);
-        }
-        let (facets, exceeded) = tine_core::query::property_facets_bounded(
-            g,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        );
-        if exceeded {
-            Err("result-too-large: property facets exceed the construction budget".into())
-        } else {
-            Ok(facets)
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let autocomplete = autocomplete.unwrap_or(false);
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let meta = slot.graph_meta();
+                let (max_items, max_bytes) = if autocomplete {
+                    (AUTOCOMPLETE_FACET_MAX_ITEMS, AUTOCOMPLETE_FACET_MAX_BYTES)
+                } else {
+                    (RESULT_BRIDGE_MAX_ROWS, RESULT_BRIDGE_MAX_BYTES)
+                };
+                match sparse_navigation(
+                    handle,
+                    SyncApplicationNavigationRequest::PropertyFacets {
+                        autocomplete,
+                        hidden_properties: meta.block_hidden_properties,
+                        max_items,
+                        max_bytes,
+                    },
+                )? {
+                    SyncApplicationNavigationReply::PropertyFacets { facets, exceeded } => {
+                        if exceeded && !autocomplete {
+                            Err(
+                                "result-too-large: property facets exceed the construction budget"
+                                    .into(),
+                            )
+                        } else {
+                            Ok(facets)
+                        }
+                    }
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => {
+                let graph = slot.legacy_graph()?;
+                if autocomplete {
+                    return Ok(tine_core::query::autocomplete_property_facets_bounded(
+                        &graph,
+                        AUTOCOMPLETE_FACET_MAX_ITEMS,
+                        AUTOCOMPLETE_FACET_MAX_BYTES,
+                    )
+                    .0);
+                }
+                let (facets, exceeded) = tine_core::query::property_facets_bounded(
+                    &graph,
+                    RESULT_BRIDGE_MAX_ROWS,
+                    RESULT_BRIDGE_MAX_BYTES,
+                );
+                if exceeded {
+                    Err("result-too-large: property facets exceed the construction budget".into())
+                } else {
+                    Ok(facets)
+                }
+            }
         }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn page_aliases(state: GraphContext<'_>) -> Result<Vec<(String, String)>, String> {
-    with_read_graph(&state, |g| Ok(g.page_aliases()))
+pub(crate) async fn page_aliases(state: GraphContext<'_>) -> Result<Vec<(String, String)>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                match sparse_navigation(handle, SyncApplicationNavigationRequest::PageAliases)? {
+                    SyncApplicationNavigationReply::PageAliases(aliases) => Ok(aliases),
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => Ok(slot.legacy_graph()?.page_aliases()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn page_icons(
+pub(crate) async fn page_icons(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    with_read_graph(&state, |g| Ok(g.page_icons(&names)))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::PageIcons { names },
+            )? {
+                SyncApplicationNavigationReply::PageIcons(icons) => Ok(icons),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot.legacy_graph()?.page_icons(&names)),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn existing_page_names(
+pub(crate) async fn existing_page_names(
     names: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<String>, String> {
-    with_read_graph(&state, |g| Ok(g.existing_page_names(&names)))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ExistingPageNames { names },
+            )? {
+                SyncApplicationNavigationReply::ExistingPageNames(names) => Ok(names),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot.legacy_graph()?.existing_page_names(&names)),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1532,7 +2136,7 @@ pub(crate) fn set_journal_title_format(
 
 #[tauri::command]
 pub(crate) fn read_custom_css(state: GraphContext<'_>) -> Result<String, String> {
-    with_read_graph(&state, |g| Ok(g.custom_css()))
+    with_filesystem_graph(&state, |g| Ok(g.custom_css()))
 }
 
 #[tauri::command]
@@ -1542,25 +2146,54 @@ pub(crate) async fn search(
     lane: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<RefGroup>, String> {
-    let graph = slot_for_context(&state)?.read_graph_cloned()?;
     let limit = limit.min(RESULT_BRIDGE_MAX_ROWS);
-    let groups = tauri::async_runtime::spawn_blocking(move || match lane.as_deref() {
-        Some(lane) => graph.search_latest(lane, &query, limit),
-        None => graph.search(&query, limit),
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    let groups = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::BlockSearch { query, limit, lane },
+            )? {
+                SyncApplicationNavigationReply::BlockSearch(groups) => Ok(groups),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(match lane.as_deref() {
+                Some(lane) => slot.legacy_graph()?.search_latest(lane, &query, limit),
+                None => slot.legacy_graph()?.search(&query, limit),
+            }),
+        }
     })
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())??;
     enforce_result_bridge_budget(&groups)?;
     Ok(groups)
 }
 
 #[tauri::command]
-pub(crate) fn quick_switch(
+pub(crate) async fn quick_switch(
     query: String,
     limit: usize,
     state: GraphContext<'_>,
 ) -> Result<Vec<PageEntry>, String> {
-    with_read_graph(&state, |g| Ok(g.quick_switch(&query, limit)))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::QuickSwitch { query, limit },
+            )? {
+                SyncApplicationNavigationReply::QuickSwitch(pages) => Ok(pages),
+                _ => Err("managed navigation returned the wrong reply".into()),
+            },
+            None => Ok(slot.legacy_graph()?.quick_switch(&query, limit)),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn capture_quick_switch_for(
@@ -1701,10 +2334,25 @@ mod capture_quick_switch_tests {
 }
 
 #[tauri::command]
-pub(crate) fn list_templates(
+pub(crate) async fn list_templates(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::TemplateDto>, String> {
-    with_read_graph(&state, |g| Ok(g.templates()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                match sparse_navigation(handle, SyncApplicationNavigationRequest::ListTemplates)? {
+                    SyncApplicationNavigationReply::Templates(templates) => Ok(templates),
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => Ok(slot.legacy_graph()?.templates()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 fn application_property_line(line: &str) -> bool {
@@ -1767,21 +2415,37 @@ pub(crate) async fn journal_content_days(state: GraphContext<'_>) -> Result<Vec<
 }
 
 #[tauri::command]
-pub(crate) fn resolve_block(
+pub(crate) async fn resolve_block(
     uuid: String,
     state: GraphContext<'_>,
 ) -> Result<Option<RefGroup>, String> {
-    with_read_graph(&state, |g| {
-        let group = g.resolve_block(&uuid);
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let group = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ResolveBlocks {
+                    uuids: vec![uuid.clone()],
+                },
+            )? {
+                SyncApplicationNavigationReply::ResolveBlocks(mut groups) => groups.pop().flatten(),
+                _ => return Err("managed block resolution returned the wrong reply kind".into()),
+            },
+            None => slot.legacy_graph()?.resolve_block(&uuid),
+        };
         if let Some(group) = &group {
             enforce_result_bridge_budget(std::slice::from_ref(group))?;
         }
         Ok(group)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn resolve_blocks(
+pub(crate) async fn resolve_blocks(
     uuids: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<Vec<Option<RefGroup>>, String> {
@@ -1791,44 +2455,80 @@ pub(crate) fn resolve_blocks(
             uuids.len()
         ));
     }
-    with_read_graph(&state, |g| {
-        let (groups, exceeded, total) = tine_core::query::resolve_blocks_bounded(
-            g,
-            &uuids,
-            RESULT_BRIDGE_MAX_ROWS,
-            RESULT_BRIDGE_MAX_BYTES,
-        );
-        if exceeded {
-            Err(format!("result-too-large: {total} resolved block-reference rows exceed the construction budget"))
-        } else {
-            Ok(groups)
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::ResolveBlocks { uuids },
+            )? {
+                SyncApplicationNavigationReply::ResolveBlocks(groups) => {
+                    enforce_optional_result_bridge_budget(&groups)?;
+                    Ok(groups)
+                }
+                _ => Err("managed block resolution returned the wrong reply kind".into()),
+            },
+            None => {
+                let graph = slot.legacy_graph()?;
+                let (groups, exceeded, total) = tine_core::query::resolve_blocks_bounded(
+                    &graph,
+                    &uuids,
+                    RESULT_BRIDGE_MAX_ROWS,
+                    RESULT_BRIDGE_MAX_BYTES,
+                );
+                if exceeded {
+                    Err(format!("result-too-large: {total} resolved block-reference rows exceed the construction budget"))
+                } else {
+                    Ok(groups)
+                }
+            }
         }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Explicit, bounded subtree resolution for hover previews. Ordinary
 /// `resolve_block(s)` stays shallow so a page containing nested references
 /// cannot multiply the same descendants across the IPC bridge.
 #[tauri::command]
-pub(crate) fn preview_block(
+pub(crate) async fn preview_block(
     uuid: String,
     max_nodes: usize,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::BlockPreview>, String> {
     const MAX_PREVIEW_NODES: usize = 2_000;
-    with_read_graph(&state, |g| {
-        // Leave room for RefGroup/page/serializer overhead, then assert the
-        // shared bridge invariant as a second line of defense.
-        let preview = g.preview_block_with_budget(
-            &uuid,
-            max_nodes.clamp(1, MAX_PREVIEW_NODES),
-            RESULT_BRIDGE_MAX_BYTES.saturating_sub(4 * 1024),
-        );
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        let max_nodes = max_nodes.clamp(1, MAX_PREVIEW_NODES);
+        let max_bytes = RESULT_BRIDGE_MAX_BYTES.saturating_sub(4 * 1024);
+        let preview = match sparse_application_handle(&slot)? {
+            Some(handle) => match sparse_navigation(
+                handle,
+                SyncApplicationNavigationRequest::PreviewBlock {
+                    uuid,
+                    max_nodes,
+                    max_bytes,
+                },
+            )? {
+                SyncApplicationNavigationReply::PreviewBlock(preview) => preview,
+                _ => return Err("managed block preview returned the wrong reply kind".into()),
+            },
+            None => slot
+                .legacy_graph()?
+                .preview_block_with_budget(&uuid, max_nodes, max_bytes),
+        };
         if let Some(preview) = &preview {
             enforce_result_bridge_budget(std::slice::from_ref(&preview.group))?;
         }
         Ok(preview)
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1840,7 +2540,7 @@ pub(crate) fn read_asset(
     // Return RAW bytes (not a JSON number[]), so a multi-MB PDF/image isn't
     // serialized element-by-element and re-parsed on the JS side — the frontend
     // receives an ArrayBuffer directly.
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         max_bytes
             .map_or_else(
                 || g.read_asset(&name),
@@ -1857,26 +2557,88 @@ pub(crate) fn read_asset(
 #[tauri::command]
 pub(crate) fn stream_asset_path(name: String, state: GraphContext<'_>) -> Result<String, String> {
     let slot = slot_for_context(&state)?;
-    slot.legacy_graph()?
-        .stream_asset_path(&name)
-        .map_err(|e| e.to_string())?;
+    slot.with_filesystem_graph(|graph| graph.stream_asset_path(&name).map_err(|e| e.to_string()))?;
     Ok(format!("{}/{}", slot.binding_generation, name))
 }
 
-/// Quit the app cleanly. On Linux, first SIGKILL WebKitGTK's helper subprocesses so
-/// they don't run their buggy GL-driver atexit teardown and dump a SIGABRT core on
-/// exit (GH #28). The JS close handler calls this only AFTER `flushAll()`/
-/// `flushSession()` have resolved, so tearing the web process down hard loses no
-/// edits. Then hand off to Tauri's normal exit (the main process still tears down
-/// the way it always has — no dump there). On non-Linux this is just `app.exit(0)`.
+/// The process-wide managed-shutdown result. `Partial` is intentionally a
+/// successful IPC response: native preparation has made durable progress, so
+/// Android must keep its editor shielded and retry only preparation rather than
+/// treating it as an ordinary refusal and replaying the frontend flush.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum TineQuitPreparation {
+    Safe,
+    Refused {
+        detail: String,
+    },
+    Partial {
+        safe_slots: Vec<String>,
+        detail: String,
+    },
+}
+
+/// Snapshot labels before invoking any actor, sort them so the observed partial
+/// prefix is stable, then stop at the first refusal. The cleaner is injected so
+/// the sequencing contract has a small deterministic test independent of the
+/// real actor setup.
+fn prepare_tine_quit_slots<S, F>(mut slots: Vec<(String, S)>, mut clean: F) -> TineQuitPreparation
+where
+    F: FnMut(&S) -> Result<crate::sync_runtime::CleanShutdownSlot, String>,
+{
+    slots.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut safe_slots = Vec::new();
+    for (label, slot) in slots {
+        match clean(&slot) {
+            // Direct Files needs no managed shutdown proof and must not be
+            // represented as a managed safe slot.
+            Ok(crate::sync_runtime::CleanShutdownSlot::Direct) => {}
+            Ok(crate::sync_runtime::CleanShutdownSlot::Safe) => safe_slots.push(label),
+            Err(error) => {
+                let detail = format!("sparse-v2-shutdown-refused: {error}");
+                return if safe_slots.is_empty() {
+                    TineQuitPreparation::Refused { detail }
+                } else {
+                    TineQuitPreparation::Partial { safe_slots, detail }
+                };
+            }
+        }
+    }
+    TineQuitPreparation::Safe
+}
+
+/// The native half of a process-wide clean quit. Kept separate from actually
+/// exiting so Android can prove every managed slot is safe before handing the
+/// final activity exit to its native SafeBack owner.
+fn prepare_tine_quit_all_slots(state: &crate::state::AppState) -> TineQuitPreparation {
+    let slots = state.graphs.read().unwrap().entries();
+    prepare_tine_quit_slots(slots, |slot| crate::sync_runtime::clean_shutdown_slot(slot))
+}
+
+/// Verify that every managed runtime has stopped safely, without exiting the
+/// process. Android follows this with its SafeBack-owned activity exit.
+#[tauri::command]
+pub(crate) fn prepare_tine_quit(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> TineQuitPreparation {
+    prepare_tine_quit_all_slots(&state)
+}
+
+/// Quit the app cleanly. After every managed slot has stopped safely, Linux
+/// first SIGKILLs WebKitGTK's helper subprocesses so they do not run their
+/// buggy GL-driver atexit teardown and dump a SIGABRT core on exit (GH #28).
+/// The JS close handler calls this only after `flushAll()`/`flushSession()`
+/// resolve, so tearing the web process down hard loses no edits.
 #[tauri::command]
 pub(crate) fn tine_quit(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<(), String> {
-    for (_, slot) in state.graphs.read().unwrap().entries() {
-        crate::sync_runtime::clean_shutdown_slot(&slot)
-            .map_err(|error| format!("sparse-v2-shutdown-refused: {error}"))?;
+    match prepare_tine_quit_all_slots(&state) {
+        TineQuitPreparation::Safe => {}
+        TineQuitPreparation::Refused { detail } | TineQuitPreparation::Partial { detail, .. } => {
+            return Err(detail);
+        }
     }
     #[cfg(target_os = "linux")]
     crate::platform::kill_webkit_children();
@@ -1903,6 +2665,79 @@ pub(crate) fn close_graph_window(
         return Ok(());
     }
     window.destroy().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod prepare_tine_quit_tests {
+    use super::*;
+    use crate::sync_runtime::CleanShutdownSlot;
+    use std::cell::RefCell;
+
+    #[test]
+    fn partial_shutdown_is_sorted_stops_at_refusal_and_never_becomes_safe() {
+        let calls = RefCell::new(Vec::new());
+        let result = prepare_tine_quit_slots(
+            vec![
+                ("B".into(), "refuse"),
+                ("direct".into(), "direct"),
+                ("A".into(), "safe"),
+            ],
+            |outcome| {
+                calls.borrow_mut().push(*outcome);
+                match *outcome {
+                    "safe" => Ok(CleanShutdownSlot::Safe),
+                    "direct" => Ok(CleanShutdownSlot::Direct),
+                    "refuse" => Err("retained local publication".into()),
+                    other => panic!("unexpected fixture outcome {other}"),
+                }
+            },
+        );
+
+        assert_eq!(calls.into_inner(), vec!["safe", "refuse"]);
+        assert_eq!(
+            result,
+            TineQuitPreparation::Partial {
+                safe_slots: vec!["A".into()],
+                detail: "sparse-v2-shutdown-refused: retained local publication".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn retry_accepts_an_already_safe_slot_once_every_slot_is_safe() {
+        let first =
+            prepare_tine_quit_slots(vec![("A".into(), true), ("B".into(), false)], |safe| {
+                safe.then_some(CleanShutdownSlot::Safe)
+                    .ok_or_else(|| "B refused".into())
+            });
+        assert!(matches!(first, TineQuitPreparation::Partial { .. }));
+
+        let retry = prepare_tine_quit_slots(vec![("B".into(), true), ("A".into(), true)], |safe| {
+            safe.then_some(CleanShutdownSlot::Safe)
+                .ok_or_else(|| "B refused".into())
+        });
+        assert_eq!(retry, TineQuitPreparation::Safe);
+    }
+
+    #[test]
+    fn zero_progress_refusal_is_typed_and_serializable() {
+        let result = prepare_tine_quit_slots(vec![("B".into(), false)], |safe| {
+            safe.then_some(CleanShutdownSlot::Safe)
+                .ok_or_else(|| "terminal runtime".into())
+        });
+        assert_eq!(
+            result,
+            TineQuitPreparation::Refused {
+                detail: "sparse-v2-shutdown-refused: terminal runtime".into(),
+            }
+        );
+        let encoded = serde_json::to_value(result).unwrap();
+        assert_eq!(encoded["status"], "refused");
+        assert_eq!(
+            encoded["detail"],
+            "sparse-v2-shutdown-refused: terminal runtime"
+        );
+    }
 }
 
 /// Toggle the WebView developer tools (WebKit Web Inspector) for theme/CSS
@@ -2004,7 +2839,7 @@ pub(crate) fn import_asset(
     name: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<String, String> {
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.import_asset(std::path::Path::new(&path), name.as_deref())
             .map_err(|e| e.to_string())
     })
@@ -2078,7 +2913,7 @@ pub(crate) fn import_native_capture(
         ));
     }
     let mut capture = capture.into_std();
-    let stored = with_read_graph(&state, |graph| {
+    let stored = with_filesystem_graph(&state, |graph| {
         graph
             .import_asset_file(&mut capture, &name, max_bytes)
             .map_err(|error| error.to_string())
@@ -2128,7 +2963,7 @@ pub(crate) fn read_text_file(path: String) -> Result<String, String> {
 /// (canonicalized) so a crafted name can't open a file outside the graph.
 #[tauri::command]
 pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    let target = with_read_graph(&state, |g| {
+    let target = with_filesystem_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -2161,18 +2996,41 @@ pub(crate) fn open_asset(name: String, state: GraphContext<'_>) -> Result<(), St
 /// and canonicalizes the graph-relative identity; the WebView never supplies an
 /// arbitrary absolute path.
 #[tauri::command]
-pub(crate) fn open_page_file(
+pub(crate) async fn open_page_file(
     name: String,
     kind: PageKind,
     path: Option<String>,
     reveal: bool,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_read_graph(&state, |graph| {
-        graph
-            .page_source_file(&name, kind, path.as_deref())
-            .map_err(|error| error.to_string())
-    })?;
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    let target = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                let page = load_sparse_page(
+                    handle,
+                    SyncApplicationPageSelector::Logical {
+                        name,
+                        page_kind: kind.into(),
+                    },
+                )?
+                .ok_or_else(|| "no-page".to_string())?;
+                slot.with_filesystem_graph(|graph| {
+                    graph
+                        .page_source_file(&page.name, page.kind, Some(&page.path))
+                        .map_err(|error| error.to_string())
+                })
+            }
+            None => slot
+                .legacy_graph()?
+                .page_source_file(&name, kind, path.as_deref())
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     #[cfg(desktop)]
     {
         if reveal {
@@ -2206,7 +3064,7 @@ pub(crate) fn edit_asset_external(
     command: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    let target = with_read_graph(&state, |g| {
+    let target = with_filesystem_graph(&state, |g| {
         g.asset_file_for_read(&name).map_err(|e| e.to_string())
     })?;
     #[cfg(desktop)]
@@ -2544,10 +3402,25 @@ mod editor_argv_tests {
 
 /// Orphaned `assets/` files (no block references them) for the cleanup UI.
 #[tauri::command]
-pub(crate) fn list_orphan_assets(
+pub(crate) async fn list_orphan_assets(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::AssetInfo>, String> {
-    with_read_graph(&state, |g| Ok(g.orphan_assets()))
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => {
+                match sparse_navigation(handle, SyncApplicationNavigationRequest::OrphanAssets)? {
+                    SyncApplicationNavigationReply::OrphanAssets(assets) => Ok(assets),
+                    _ => Err("managed navigation returned the wrong reply".into()),
+                }
+            }
+            None => Ok(slot.legacy_graph()?.orphan_assets()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Move an orphaned asset to the recoverable trash.
@@ -2561,7 +3434,7 @@ pub(crate) fn trash_asset(name: String, state: GraphContext<'_>) -> Result<(), S
 pub(crate) fn asset_trash_stats(
     state: GraphContext<'_>,
 ) -> Result<tine_core::model::TrashStats, String> {
-    with_read_graph(&state, |g| Ok(g.asset_trash_stats()))
+    with_filesystem_graph(&state, |g| Ok(g.asset_trash_stats()))
 }
 
 /// Permanently delete everything in the asset trash; returns files removed.
@@ -2576,7 +3449,7 @@ pub(crate) fn empty_asset_trash(state: GraphContext<'_>) -> Result<u64, String> 
 pub(crate) fn list_journal_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::JournalConflict>, String> {
-    with_read_graph(&state, |g| Ok(g.journal_conflicts()))
+    with_filesystem_graph(&state, |g| Ok(g.journal_conflicts()))
 }
 
 /// Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
@@ -2585,7 +3458,7 @@ pub(crate) fn list_journal_conflicts(
 pub(crate) fn list_sync_conflicts(
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::model::SyncConflict>, String> {
-    with_read_graph(&state, |g| Ok(g.list_sync_conflicts()))
+    with_filesystem_graph(&state, |g| Ok(g.list_sync_conflicts()))
 }
 
 /// Block-level diff of a sync-conflict copy against its winner (both graph-root-
@@ -2596,7 +3469,7 @@ pub(crate) fn sync_conflict_diff(
     conflict: String,
     state: GraphContext<'_>,
 ) -> Result<Option<tine_core::sync_diff::SyncConflictDiff>, String> {
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.sync_conflict_diff(&winner, &conflict)
             .map_err(|e| e.to_string())
     })
@@ -2607,7 +3480,7 @@ pub(crate) fn sync_conflict_diff(
 /// trash the conflict copy. `base_rev` guards against the winner changing under
 /// the merge; returns "conflict" if it did. `pre_choice`: "mine"/"theirs"/"union".
 #[tauri::command]
-pub(crate) fn resolve_sync_conflict(
+pub(crate) async fn resolve_sync_conflict(
     winner: String,
     conflict: String,
     decisions: std::collections::HashMap<String, String>,
@@ -2616,47 +3489,82 @@ pub(crate) fn resolve_sync_conflict(
     pre_choice: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.resolve_sync_conflict(
-            &winner,
-            &conflict,
-            &decisions,
-            &base_rev,
-            &conflict_rev,
-            pre_choice.as_deref().unwrap_or("union"),
-        )
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                "conflict".to_string()
-            } else {
-                e.to_string()
-            }
-        })
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_sync_conflict_resolution(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::ResolveSyncConflict {
+                    winner_path: winner,
+                    conflict_path: conflict,
+                    decisions,
+                    base_revision: base_rev,
+                    conflict_revision: conflict_rev,
+                    pre_choice: pre_choice.unwrap_or_else(|| "union".into()),
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .resolve_sync_conflict(
+                    &winner,
+                    &conflict,
+                    &decisions,
+                    &base_rev,
+                    &conflict_rev,
+                    pre_choice.as_deref().unwrap_or("union"),
+                )
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        "conflict".to_string()
+                    } else {
+                        error.to_string()
+                    }
+                }),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Discard a sync-conflict copy without merging (move it to the recoverable
 /// trash). Refuses anything that isn't a conflict copy.
 #[tauri::command]
 pub(crate) fn trash_sync_conflict(conflict: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
+    with_trash_graph(&state, |g| {
         g.trash_sync_conflict(&conflict).map_err(|e| e.to_string())
     })
 }
 
 /// Move one journal file (by exact filename) to the recoverable trash.
 #[tauri::command]
-pub(crate) fn trash_journal_file(name: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.trash_journal_file(&name).map_err(|e| e.to_string())
+pub(crate) async fn trash_journal_file(
+    name: String,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::TrashJournalFile { name },
+            )),
+            None => slot
+                .legacy_graph()?
+                .trash_journal_file(&name)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Raw contents of one journal file (by exact filename) — for inspecting a
 /// duplicate day's files before reconciling.
 #[tauri::command]
 pub(crate) fn read_journal_file(name: String, state: GraphContext<'_>) -> Result<String, String> {
-    with_read_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.read_journal_file(&name).map_err(|e| e.to_string())
     })
 }
@@ -2682,6 +3590,112 @@ pub(crate) async fn get_page_by_path(
                 .load_by_path(&path)
                 .map_err(|error| error.to_string()),
         }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Activate an editor over an existing file.
+///
+/// Deliberately separate from `get_page`/`get_page_by_path`. Those are
+/// mixed-purpose reads — some results become store editors, others are read-only,
+/// export, transient, or dropped because the page is already loaded — so minting
+/// there would hand an identity to things that are not editors. An activation
+/// exists exactly when a live editor does. (GH #254 increment 3.)
+#[tauri::command]
+pub(crate) async fn activate_editor(
+    path: String,
+    intent: tine_core::ActivationIntent,
+    expected_revision: Option<String>,
+    state: GraphContext<'_>,
+) -> Result<Option<tine_core::EditorActivationHandle>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(_) => Ok(None),
+            None => slot
+                .legacy_graph()?
+                .activate_editor(&path, intent, expected_revision.as_deref())
+                .map(Some)
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Activate an editor for a page that has no file yet, returning the prospective
+/// target it is live for. Reserves nothing on disk.
+#[tauri::command]
+pub(crate) async fn activate_absent_editor(
+    name: String,
+    kind: PageKind,
+    state: GraphContext<'_>,
+) -> Result<Option<tine_core::EditorActivationHandle>, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(_) => Ok(None),
+            None => slot
+                .legacy_graph()?
+                .activate_absent_editor(&name, kind)
+                .map(Some)
+                .map_err(|error| error.to_string()),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Present a conflict observation and learn its fate WITHOUT writing.
+///
+/// The "Use disk version" half of the authority contract. The frontend cannot
+/// decide this locally: an observation can be revoked with no page event to react
+/// to, so every local value still compares equal while the authority is already
+/// gone. (GH #254 increment 3.)
+#[tauri::command]
+pub(crate) async fn present_conflict_override(
+    path: String,
+    base_rev: Option<String>,
+    activation: u64,
+    conflict_epoch: u64,
+    state: GraphContext<'_>,
+) -> Result<tine_core::ConflictPresentation, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        slot.legacy_graph()?
+            .present_conflict_override(&path, base_rev.as_deref(), activation, conflict_epoch)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Retire an activation, but only if it is still the live one.
+///
+/// Compare-and-retire, never a bare "retire this path": a fire-and-forget
+/// retirement can arrive after a newer activation was installed and would revoke
+/// the wrong editor. Returns whether anything was retired, so a caller racing a
+/// newer activation learns it was superseded instead of silently destroying it.
+#[tauri::command]
+pub(crate) async fn retire_editor_activation(
+    path: String,
+    activation: u64,
+    state: GraphContext<'_>,
+) -> Result<bool, String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        Ok(slot
+            .legacy_graph()?
+            .retire_editor_activation(&path, tine_core::EditorActivation::from_u64(activation)))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2794,6 +3808,7 @@ mod application_page_authority_tests {
             page("Crème brûlée", PageKind::Page, nested_utf_path, "- edited"),
             Some("actor-base".into()),
             false,
+            None,
         )
         .unwrap();
         match existing.target {
@@ -2804,9 +3819,13 @@ mod application_page_authority_tests {
             other => panic!("expected exact existing target, got {other:?}"),
         }
 
-        let new_page =
-            sparse_save_request(page("New page", PageKind::Page, "", "- new"), None, false)
-                .unwrap();
+        let new_page = sparse_save_request(
+            page("New page", PageKind::Page, "", "- new"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         match &new_page.target {
             SyncApplicationPageSaveTarget::New { name, page_kind } => {
                 assert_eq!(name, "New page");
@@ -2820,7 +3839,7 @@ mod application_page_authority_tests {
     }
 
     #[test]
-    fn sparse_save_maps_saved_unchanged_conflict_and_refuses_force_before_actor() {
+    fn sparse_save_maps_saved_unchanged_conflict_and_routes_observed_force_to_actor() {
         let saved = map_sparse_page_save(SyncApplicationPageSaveOutcome::Saved {
             batch_id: "batch".into(),
             page: page("Saved", PageKind::Page, "pages/Saved.md", "- body"),
@@ -2841,18 +3860,71 @@ mod application_page_authority_tests {
         assert!(conflict.contains("conflict"));
 
         let called = Cell::new(false);
-        let refused = save_sparse_page_with(
+        let replaced = save_sparse_page_with(
             page("Saved", PageKind::Page, "pages/Saved.md", "- body"),
             Some("stale".into()),
             true,
-            |_request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
+            Some(ManagedConflictObservation {
+                path: "pages/Saved.md".into(),
+                revision: "observed-current".into(),
+            }),
+            |request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
                 called.set(true);
-                unreachable!("force must be refused before actor invocation")
+                assert!(matches!(
+                    request.target,
+                    SyncApplicationPageSaveTarget::ResolveConflict {
+                        ref path,
+                        ref observed_revision,
+                    } if path == "pages/Saved.md" && observed_revision == "observed-current"
+                ));
+                Ok(SyncApplicationPageSaveOutcome::Saved {
+                    batch_id: "replacement".into(),
+                    page: request.page,
+                    revision: "replacement-revision".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(replaced, "replacement-revision");
+        assert!(called.get());
+
+        let new_page_replaced = save_sparse_page_with(
+            page("Raced new", PageKind::Page, "", "- retained draft"),
+            None,
+            true,
+            Some(ManagedConflictObservation {
+                path: "pages/Raced new.md".into(),
+                revision: "created-winner".into(),
+            }),
+            |request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
+                assert!(matches!(
+                    request.target,
+                    SyncApplicationPageSaveTarget::ResolveConflict {
+                        ref path,
+                        ref observed_revision,
+                    } if path == "pages/Raced new.md" && observed_revision == "created-winner"
+                ));
+                Ok(SyncApplicationPageSaveOutcome::Saved {
+                    batch_id: "new-page-replacement".into(),
+                    page: request.page,
+                    revision: "new-page-replacement-revision".into(),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(new_page_replaced, "new-page-replacement-revision");
+
+        let unobserved = save_sparse_page_with(
+            page("Saved", PageKind::Page, "pages/Saved.md", "- body"),
+            Some("stale".into()),
+            true,
+            None,
+            |_request| -> Result<SyncApplicationPageSaveOutcome, &'static str> {
+                unreachable!("an unobserved replacement must fail before actor invocation")
             },
         )
         .unwrap_err();
-        assert!(refused.contains("Force save is unavailable"));
-        assert!(!called.get());
+        assert!(unobserved.contains("managed.conflict_unobserved"));
     }
 
     #[test]
@@ -2974,6 +4046,32 @@ mod application_page_authority_tests {
     }
 
     #[test]
+    fn save_response_keeps_managed_compatibility_and_serializes_direct_activation() {
+        let managed = serde_json::to_value(SavePageResult {
+            revision: "managed-revision".into(),
+            activation: None,
+        })
+        .unwrap();
+        assert_eq!(
+            managed,
+            serde_json::json!({ "revision": "managed-revision" })
+        );
+
+        let direct = serde_json::to_value(SavePageResult {
+            revision: "direct-revision".into(),
+            activation: Some(tine_core::EditorActivationHandle {
+                activation: tine_core::EditorActivation::from_u64(41),
+                target: "pages/New.md".into(),
+                prospective: false,
+            }),
+        })
+        .unwrap();
+        assert_eq!(direct["activation"]["activation"], 41);
+        assert_eq!(direct["activation"]["target"], "pages/New.md");
+        assert_eq!(direct["activation"]["prospective"], false);
+    }
+
+    #[test]
     fn legacy_page_load_and_unchanged_save_helpers_retain_their_contract() {
         let (_temp, graph) = graph_with_files(&[("pages/legacy.md", "- unchanged legacy body\n")]);
         let loaded = graph.load_named("legacy", PageKind::Page).unwrap().unwrap();
@@ -2991,24 +4089,56 @@ mod application_page_authority_tests {
 /// `src` (both graph-root-relative paths). The merged `dst` is written through the
 /// normal round-tripping save path (#21).
 #[tauri::command]
-pub(crate) fn merge_pages(src: String, dst: String, state: GraphContext<'_>) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.merge_pages(&src, &dst).map_err(|e| e.to_string())
+pub(crate) async fn merge_pages(
+    src: String,
+    dst: String,
+    state: GraphContext<'_>,
+) -> Result<(), String> {
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::MergePages {
+                    source_path: src,
+                    destination_path: dst,
+                },
+            )),
+            None => slot
+                .legacy_graph()?
+                .merge_pages(&src, &dst)
+                .map_err(|e| e.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Rescue a duplicate-day stray by moving it to a uniquely-named page
 /// (`pages/<new_name>`), so it stops colliding and becomes normally navigable (#21).
 #[tauri::command]
-pub(crate) fn rename_file_to_page(
+pub(crate) async fn rename_file_to_page(
     path: String,
     new_name: String,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.rename_file_to_page(&path, &new_name)
-            .map_err(|e| e.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => map_managed_graph_mutation(handle.mutate_application_graph(
+                SyncApplicationGraphMutationRequest::RenameFileToPage { path, new_name },
+            )),
+            None => slot
+                .legacy_graph()?
+                .rename_file_to_page(&path, &new_name)
+                .map_err(|e| e.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -3018,7 +4148,7 @@ pub(crate) fn save_asset(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
-    with_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.save_asset(&name, &bytes).map_err(|e| e.to_string())
     })
 }
@@ -3028,45 +4158,103 @@ pub(crate) fn read_highlights(
     pdf: String,
     state: GraphContext<'_>,
 ) -> Result<Vec<tine_core::pdf::Highlight>, String> {
-    with_graph(&state, |g| Ok(g.read_highlights(&pdf)))
+    with_filesystem_graph(&state, |g| Ok(g.read_highlights(&pdf)))
 }
 
 #[tauri::command]
-pub(crate) fn open_pdf(
+pub(crate) async fn open_pdf(
     pdf: String,
     label: String,
     state: GraphContext<'_>,
 ) -> Result<tine_core::pdf::PdfState, String> {
-    with_graph(&state, |g| {
-        g.open_pdf(&pdf, &label).map_err(|e| e.to_string())
+    let (app, window_label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &window_label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .open_application_pdf(pdf, label)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationPdfOpenOutcome::Ready { state } => Ok(state),
+                SyncApplicationPdfOpenOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating PDF notes. Try again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .open_pdf(&pdf, &label)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn write_highlights(
+pub(crate) async fn write_highlights(
     pdf: String,
     label: String,
     highlights: Vec<tine_core::pdf::Highlight>,
     base_ids: Vec<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.write_highlights(&pdf, &label, &highlights, &base_ids)
-            .map_err(|e| e.to_string())
+    let (app, window_label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &window_label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .write_application_pdf_highlights(pdf, label, highlights, base_ids)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationUnitOutcome::Applied => Ok(()),
+                SyncApplicationUnitOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating PDF notes. Try again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .write_highlights(&pdf, &label, &highlights, &base_ids)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn write_pdf_view_state(
+pub(crate) async fn write_pdf_view_state(
     pdf: String,
     page: i64,
     scale: f64,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
-    with_graph(&state, |g| {
-        g.write_pdf_view_state(&pdf, page, scale)
-            .map_err(|e| e.to_string())
+    let (app, label, binding_generation) = owned_graph_context(state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let slot = slot_for_bound_window(&state, &label, Some(binding_generation))?;
+        match sparse_application_handle(&slot)? {
+            Some(handle) => match handle
+                .write_application_pdf_view_state(pdf, page, scale)
+                .map_err(|error| error.to_string())?
+            {
+                SyncApplicationUnitOutcome::Applied => Ok(()),
+                SyncApplicationUnitOutcome::Deferred { .. } => Err(
+                    "Tine-managed storage is updating PDF state. Try again when it finishes."
+                        .into(),
+                ),
+            },
+            None => slot
+                .legacy_graph()?
+                .write_pdf_view_state(&pdf, page, scale)
+                .map_err(|error| error.to_string()),
+        }
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -3079,7 +4267,7 @@ pub(crate) fn save_pdf_area_image(
     state: GraphContext<'_>,
 ) -> Result<String, String> {
     let bytes = decode_asset_b64(&bytes_b64)?;
-    with_graph(&state, |g| {
+    with_filesystem_graph(&state, |g| {
         g.write_pdf_area_image(&pdf, page, &id, stamp, &bytes)
             .map_err(|e| e.to_string())
     })

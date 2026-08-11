@@ -1015,12 +1015,21 @@ mod tests {
             "the journal spine must do identical work at every graph size"
         );
         assert_eq!(
-            small_index.0, 1,
-            "the lazy complete build runs exactly once"
+            small_index.0, 0,
+            "managed fast commits must not build the whole-graph cache"
         );
-        assert_eq!(large_index.0, 1, "graph size cannot change build count");
-        assert_eq!(small_index.1, 3, "each Tine save advances one exact delta");
-        assert_eq!(large_index.1, 3, "exact delta count is size-independent");
+        assert_eq!(
+            large_index.0, 0,
+            "graph size cannot introduce a whole-graph cache build"
+        );
+        assert_eq!(
+            small_index.1, 0,
+            "managed saves must not maintain a whole-graph cache delta index"
+        );
+        assert_eq!(
+            large_index.1, 0,
+            "graph size cannot introduce whole-graph cache delta work"
+        );
         assert!(small_work.iter().all(|(forbidden, graph_wide)| {
             forbidden.is_none() && *graph_wide == GraphWideCommitWork::default()
         }));
@@ -1162,6 +1171,19 @@ mod tests {
         );
     }
 
+    // QUARANTINED (GH #308, Martin's call 2026-08-11). This asserts the journal
+    // contract as it stood when the reader lived here: a partially declared
+    // final frame is a torn tail, discard it and open. tine-storage v0.1.0 did
+    // exactly that; by v0.3.0 the same condition is `CorruptSegment`, because
+    // `specs/notes/2026-08-10-storage-journal-v2-frontier-spec.md` requires a
+    // partially declared frame to fail closed byte-for-byte rather than let a
+    // damaged length field silently erase a durable commit. The migration that
+    // reconciles the two — non-mutating v1 inspection, then rollover to v2 — is
+    // the in-flight lane. Un-ignore it there; do not "fix" it by loosening the
+    // dependency. This particular caller is the unwired latency prototype, so
+    // nothing a user can run depends on the answer today.
+    #[ignore = "GH #308: v1 torn-tail contract superseded by the journal-v2 fail-closed spec; \
+                un-ignore with the v2 migration"]
     #[test]
     fn a_torn_final_append_is_recovered_without_losing_earlier_commits() {
         let fixture = GraphFixture::build(

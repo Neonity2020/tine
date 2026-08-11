@@ -15,6 +15,7 @@ import {
   renamePageInNavigation,
   registerRightSidebarClosePreparation,
   moveRightSidebarItem,
+  pushToast,
   type SidebarItem,
 } from "../ui";
 import { beginRowReorderDrag, rowReorderClickSuppressed, type RowDropTarget } from "./rowReorder";
@@ -24,12 +25,13 @@ import { MobileDrawerPanel, dismissDrawerAndRestore } from "./MobileDrawerShell"
 import { openPageTarget, openPageAtBlock } from "../router";
 import { EmojiText } from "../render/emoji";
 import { backend } from "../backend";
-import { doc, ensurePageLoaded, pageByName, resolveBlockRef } from "../store";
+import { doc, ensurePageLoaded, onPageBecameReplaceable, pageByName, resolveBlockRef } from "../store";
 import { visibleBody } from "../render/block";
 import { Block, SurfaceContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
 import { endEditForSurface } from "../editorController";
+import { graphBinding } from "../persistence";
 
 function surfaceKey(item: SidebarItem): string {
   return `sidebar:${sidebarItemKey(item)}`;
@@ -218,25 +220,104 @@ function useEnsurePage(
   createEffect(() => {
     if (!enabled()) return;
     const epoch = graphEpoch();
+    const binding = graphBinding();
     const n = name();
     const k = kind();
     const p = path();
     const loaded = pageByName(n);
     if (n && (!loaded || (p && loaded.path !== p))) {
       let active = true;
-      onCleanup(() => { active = false; });
+      // Registered from the SYNCHRONOUS effect body, never from an awaited
+      // `.then`: an `onCleanup` created outside the Solid owner never runs, so a
+      // disposed refusal would leak a permanently inactive listener.
+      let stopRetry: (() => void) | null = null;
+      onCleanup(() => {
+        active = false;
+        stopRetry?.();
+      });
+      // DURABLE, not one-shot: the retry can itself be refused again — a lease
+      // taken during its awaited read is enough — and a listener that
+      // unsubscribed before that read would strand the item on an empty body.
+      // One read at a time. Two sweeps landing while a retry read is pending
+      // otherwise fan out into several reads of the same target; the refusal gate
+      // still keeps them SAFE, but they are wasted work on a path that can be
+      // driven by any unrelated save.
+      let retryInFlight = false;
+      const retryWhenFreed = (pageName: string) => {
+        stopRetry?.();
+        stopRetry = onPageBecameReplaceable(pageName, () => {
+          if (!active || epoch !== graphEpoch() || binding !== graphBinding()) {
+            stopRetry?.();
+            stopRetry = null;
+            return;
+          }
+          if (retryInFlight) return;
+          retryInFlight = true;
+          void (p ? backend().getPageByPath(p) : backend().getPage(n, k))
+            .then(async (fresh) => {
+              if (!active || epoch !== graphEpoch() || binding !== graphBinding() || !fresh) return;
+              if (!(await ensurePageLoaded(fresh, {
+                expectedGraphBinding: binding,
+                isRequestLive: () => active
+                  && epoch === graphEpoch()
+                  && binding === graphBinding(),
+              }))) {
+                stopRetry?.();
+                stopRetry = null;
+              }
+            })
+            .catch(() => {})
+            .finally(() => {
+              retryInFlight = false;
+            });
+        });
+      };
       const request = p ? backend().getPageByPath(p) : backend().getPage(n, k);
       void request
-        .then((dto) => {
+        .then(async (dto) => {
           // Drop a load that resolved after a graph switch — otherwise it would
           // insert an old-graph page into the new graph's working set.
-          if (!active || epoch !== graphEpoch()) return;
+          if (!active || epoch !== graphEpoch() || binding !== graphBinding()) return;
           if (dto) {
             // Alias-map warmup usually canonicalizes before the item is created.
             // A restored/early mixed-case item can race it; adopt the backend's
             // canonical page name before the exact-keyed store renders the body.
             if (!p && k === "page" && dto.name !== n) renamePageInNavigation(n, dto.name);
-            ensurePageLoaded(dto);
+            // A refusal must not leave this item on an empty loading body with
+            // nothing observing the incumbent's save lifecycle — collapsing and
+            // re-expanding happening to retrigger it is not a contract. Say what
+            // is holding the file, so the user can resolve it and re-open.
+            // (GH #254 increment 3.)
+            const refusal = await ensurePageLoaded(dto, {
+              expectedGraphBinding: binding,
+              isRequestLive: () => active
+                && epoch === graphEpoch()
+                && binding === graphBinding(),
+            });
+            if (refusal) {
+              // Say why, AND resume automatically. Relying on the user collapsing
+              // and re-expanding happened to work but was never a contract; the
+              // item otherwise sits on an empty loading body observing nothing.
+              // (GH #254 increment 3, acceptance row E2.)
+              if (refusal.reason === "unsaved-changes") {
+                pushToast(
+                  `“${refusal.page}” has unsaved changes, so the other file with that name ` +
+                    `can't be shown in the sidebar yet. It will appear once that is resolved.`,
+                  "error",
+                );
+              } else if (refusal.reason === "activation-failed") {
+                pushToast(
+                  `“${refusal.page}” could not be activated for editing in the sidebar. ` +
+                    `Close and reopen it to retry.`,
+                  "error",
+                );
+              }
+              // DURABLE, not one-shot: the retry can itself be refused again —
+              // a lease taken during its awaited read is enough — and a listener
+              // that unsubscribed before that read would strand the item on an
+              // empty body. It stops only when the load actually succeeds.
+              if (refusal.reason === "unsaved-changes") retryWhenFreed(refusal.page);
+            }
           }
         })
         .catch(() => {

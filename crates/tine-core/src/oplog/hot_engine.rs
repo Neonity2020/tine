@@ -13,7 +13,10 @@ use loro::{
     UpdateOptions, ValueOrContainer, VersionVector,
 };
 use serde::{Deserialize, Serialize};
-use tine_storage::{LocalJournalAppend, LocalJournalError, LocalJournalFrame, LocalJournalSegment};
+use tine_storage::{
+    LocalJournalAppend, LocalJournalAppendError, LocalJournalError, LocalJournalFrame,
+    LocalJournalSegment,
+};
 use uuid::Uuid;
 
 use super::authenticated_patricia::{
@@ -67,9 +70,10 @@ use super::shadow_projection::BootstrapProjectionAuthority;
 use super::uuid_claim_index::{LogseqClaimIndexRoot, LogseqClaimIndexStore};
 use super::{
     AnnotatedIdentity, AnnotatedProjectionBase, BatchCausalDot, BatchId, BatchInspection,
-    BatchOrigin, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId, ContentDigest,
-    CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest, DocumentDependencies, DocumentId,
-    FrontierV2, LineageDigest, LogicalPageName, LogseqUuid, ManagedPath, ManagedTextKind,
+    BatchOrigin, BlobDescription, BlockDelta, BlockId, BlockOwner, BlockState, CausalPeerId,
+    ContentDigest, CrdtPeerCounter, CrdtPeerId, DeviceId, DocumentCausalDigest,
+    DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogicalPageName, LogseqUuid,
+    ManagedLocalJournal, ManagedLocalJournalProtocol, ManagedPath, ManagedTextKind,
     ManifestObjectRef, ManifestProjectionPrecondition, ManifestProjectionTarget,
     ManifestedProjectionIntent, MembershipClaim, MembershipDelta, ObjectKind, ObjectStore,
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
@@ -433,6 +437,7 @@ struct PendingAuthorDocuments {
     generation: u64,
     mutation_token: u64,
     documents: BTreeMap<DocumentId, LoroDoc>,
+    projection_pages: BTreeMap<PageId, ProjectionPageState>,
 }
 
 struct PreparedTransactionParts {
@@ -3407,6 +3412,14 @@ pub enum CurrentPageAtPath {
     ReleasedPortableCollision(PortablePathReleased),
 }
 
+pub(crate) enum ProjectedReleaseAuthority {
+    Completed(ProjectionCompletedReceipt),
+    GuardedConflict {
+        work: ProjectionWork,
+        intent_id: super::ProjectionIntentId,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectionStorageBinding {
     pub(crate) endpoint: ProjectionEndpointBinding,
@@ -3667,6 +3680,9 @@ pub struct AuthorTransactionDraft {
     requirements: Vec<ProjectionRequirement>,
     pages: BTreeMap<PageId, DraftProjectionPage>,
     external_observation: Option<ExternalImportObservationMaterial>,
+    /// Process-local editor work.  This remains affine and never crosses a
+    /// draft/capture/finalize failure, journal, overlay, or recovery boundary.
+    prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
 }
 
 /// Complete exact-path evidence required before retrying a local semantic
@@ -6441,7 +6457,6 @@ impl ManagedLocalWork {
 /// object envelope from the finalized batch. The decoded view is therefore the
 /// same input the later archive expander publishes, while its CRDT updates and
 /// projection objects directly drive hot replay and graph recovery.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedManagedLocalRecord {
     batch_id: BatchId,
     sequence: u64,
@@ -6449,6 +6464,7 @@ pub struct PreparedManagedLocalRecord {
     record: ManagedLocalRecord,
     post_page: MaterializedPage,
     retained_author_mutation_token: Option<u64>,
+    retained_author_candidate: Option<ValidatedManagedLocalCandidate>,
 }
 
 impl PreparedManagedLocalRecord {
@@ -6608,27 +6624,224 @@ pub struct ManagedLocalPrefixState {
     pub commitment: ContentDigest,
 }
 
+/// Protocol-bound evidence that one managed-local record became durable.
+///
+/// This is crate-owned evidence: only managed-journal adapters may construct
+/// it. Keeping the physical protocol in the proof lets the v2 rollover
+/// adapter produce the same evidence without teaching the coordinator a
+/// numeric sync count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedLocalAppendProof {
+    protocol: ManagedLocalJournalProtocol,
+    receipt: LocalJournalAppend,
+}
+
+impl ManagedLocalAppendProof {
+    pub(crate) const fn protocol(&self) -> ManagedLocalJournalProtocol {
+        self.protocol
+    }
+
+    pub(crate) const fn receipt(&self) -> &LocalJournalAppend {
+        &self.receipt
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_data_durability_syncs_for_test(mut self, syncs: u64) -> Self {
+        self.receipt.data_durability_syncs = syncs;
+        self
+    }
+}
+
+fn managed_local_append_proof(
+    protocol: ManagedLocalJournalProtocol,
+    receipt: LocalJournalAppend,
+) -> ManagedLocalAppendProof {
+    ManagedLocalAppendProof { protocol, receipt }
+}
+
+/// Whether a managed-local append is proven not to have started or may have
+/// crossed the physical journal boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedLocalAppendError {
+    DefinitelyNotAppended(ManagedLocalRecordError),
+    DefinitelyNotAppendedStorage(LocalJournalError),
+    AppendOutcomeUnknown(LocalJournalError),
+}
+
+impl fmt::Display for ManagedLocalAppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DefinitelyNotAppended(_) | Self::DefinitelyNotAppendedStorage(_) => {
+                formatter.write_str("managed-local append was refused before storage")
+            }
+            Self::AppendOutcomeUnknown(_) => {
+                formatter.write_str("managed-local append outcome is unknown")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManagedLocalAppendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DefinitelyNotAppended(error) => Some(error),
+            Self::DefinitelyNotAppendedStorage(error) | Self::AppendOutcomeUnknown(error) => {
+                Some(error)
+            }
+        }
+    }
+}
+
+/// The only physical journal shapes that may reach the managed-local append
+/// adapter. Production owns the enum form; the legacy implementation remains
+/// available only to focused lower-level fixtures that establish its retained
+/// recovery behaviour.
+pub(crate) trait ManagedLocalJournalAppend {
+    fn managed_local_device_id(&self) -> Uuid;
+    fn managed_local_next_sequence(&self) -> u64;
+    fn append_managed_local_payload(
+        &mut self,
+        payload_kind: ManagedLocalJournalPayloadKind,
+        payload: &[u8],
+    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError>;
+}
+
+impl ManagedLocalJournalAppend for LocalJournalSegment<ManagedLocalJournalPayloadKind> {
+    fn managed_local_device_id(&self) -> Uuid {
+        self.device_id()
+    }
+
+    fn managed_local_next_sequence(&self) -> u64 {
+        self.next_sequence()
+    }
+
+    fn append_managed_local_payload(
+        &mut self,
+        payload_kind: ManagedLocalJournalPayloadKind,
+        payload: &[u8],
+    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
+        let receipt = self
+            .append(payload_kind, payload)
+            .map_err(ManagedLocalAppendError::AppendOutcomeUnknown)?;
+        Ok(managed_local_append_proof(
+            ManagedLocalJournalProtocol::LegacyV1,
+            receipt,
+        ))
+    }
+}
+
+impl ManagedLocalJournalAppend for ManagedLocalJournal<ManagedLocalJournalPayloadKind> {
+    fn managed_local_device_id(&self) -> Uuid {
+        self.device_id()
+    }
+
+    fn managed_local_next_sequence(&self) -> u64 {
+        self.next_sequence()
+    }
+
+    fn append_managed_local_payload(
+        &mut self,
+        payload_kind: ManagedLocalJournalPayloadKind,
+        payload: &[u8],
+    ) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
+        match self {
+            // The inspector deliberately has no mutating append API. A
+            // legacy journal reaching this boundary is a runtime bug; saves
+            // must be deferred until the rollover actor swaps in v2.
+            ManagedLocalJournal::LegacyV1(_) => {
+                Err(ManagedLocalAppendError::DefinitelyNotAppended(
+                    ManagedLocalRecordError::Unsupported(
+                        "managed-local legacy journal is pending schema-2 rollover".into(),
+                    ),
+                ))
+            }
+            ManagedLocalJournal::V2 { segment, .. } => {
+                let receipt =
+                    segment
+                        .append(payload_kind, payload)
+                        .map_err(|error| match error {
+                            LocalJournalAppendError::DefinitelyNotAppended(error) => {
+                                ManagedLocalAppendError::DefinitelyNotAppendedStorage(error)
+                            }
+                            LocalJournalAppendError::AppendOutcomeUnknown(error) => {
+                                ManagedLocalAppendError::AppendOutcomeUnknown(error)
+                            }
+                        })?;
+                Ok(managed_local_append_proof(
+                    ManagedLocalJournalProtocol::V2,
+                    receipt,
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedLocalAppendFault {
+    BeforePhysicalAppend,
+    AfterPhysicalAppend,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MANAGED_LOCAL_APPEND_FAULT: std::cell::Cell<Option<ManagedLocalAppendFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_managed_local_append_fault_for_test(fault: ManagedLocalAppendFault) {
+    // This must run on the owning runtime actor thread. The test handle sends
+    // an actor request before the next save, so parallel runtime tests never
+    // share a fault and the adapter consumes it exactly once.
+    MANAGED_LOCAL_APPEND_FAULT.set(Some(fault));
+}
+
+#[cfg(test)]
+fn take_managed_local_append_fault_for_test() -> Option<ManagedLocalAppendFault> {
+    MANAGED_LOCAL_APPEND_FAULT.take()
+}
+
 /// Append one prepared record to its device-owned segment.
 ///
 /// Binding and sequence are checked before the durable write begins. The
-/// returned storage receipt names the actual segment device and sequence,
-/// payload digest, and its single data-durability barrier.
-pub fn append_managed_local_record(
-    segment: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
+/// returned proof names the active protocol and its receipt. Any error after
+/// the physical append call begins is conservatively uncertain: legacy-v1 does
+/// not expose the exact write cut to this caller.
+pub(crate) fn append_managed_local_record<J: ManagedLocalJournalAppend>(
+    segment: &mut J,
     prepared: &PreparedManagedLocalRecord,
-) -> Result<LocalJournalAppend, ManagedLocalRecordError> {
+) -> Result<ManagedLocalAppendProof, ManagedLocalAppendError> {
     let author_device = prepared
         .record
         .prepared_batch
         .manifest()
         .author_device_id()
         .as_uuid();
-    if segment.device_id() != author_device || segment.next_sequence() != prepared.sequence {
-        return Err(ManagedLocalRecordError::WrongDurabilityProof);
+    if segment.managed_local_device_id() != author_device
+        || segment.managed_local_next_sequence() != prepared.sequence
+    {
+        return Err(ManagedLocalAppendError::DefinitelyNotAppended(
+            ManagedLocalRecordError::WrongDurabilityProof,
+        ));
     }
-    segment
-        .append(prepared.payload_kind(), prepared.journal_payload())
-        .map_err(ManagedLocalRecordError::from)
+    #[cfg(test)]
+    let test_fault = take_managed_local_append_fault_for_test();
+    #[cfg(test)]
+    if test_fault == Some(ManagedLocalAppendFault::BeforePhysicalAppend) {
+        return Err(ManagedLocalAppendError::AppendOutcomeUnknown(
+            LocalJournalError::Io("injected unknown outcome before physical append".into()),
+        ));
+    }
+    let receipt = segment
+        .append_managed_local_payload(prepared.payload_kind(), prepared.journal_payload())?;
+    #[cfg(test)]
+    if test_fault == Some(ManagedLocalAppendFault::AfterPhysicalAppend) {
+        return Err(ManagedLocalAppendError::AppendOutcomeUnknown(
+            LocalJournalError::Io("injected unknown outcome after physical append".into()),
+        ));
+    }
+    Ok(receipt)
 }
 
 /// Decode and authenticate the complete canonical record represented by one
@@ -6726,6 +6939,20 @@ fn decode_managed_local_payload(
         ));
     }
 
+    managed_local_record_from_prepared(payload.sequence, prepared_batch)
+}
+
+/// Construct the typed live record from an already validated prepared batch.
+///
+/// Live authoring owns the exact `PreparedBatch` that produced the canonical
+/// journal bytes, so decoding and canonically re-encoding those same bytes
+/// before the append proves nothing additional. Recovery still enters through
+/// `decode_managed_local_payload` and retains every byte-level canonicality and
+/// binding check above.
+fn managed_local_record_from_prepared(
+    sequence: u64,
+    prepared_batch: PreparedBatch,
+) -> Result<ManagedLocalRecord, ManagedLocalRecordError> {
     let projection_objects = super::projection_manifest::validate_projection_object_set(
         prepared_batch.manifest(),
         prepared_batch.objects(),
@@ -6810,7 +7037,7 @@ fn decode_managed_local_payload(
         ));
     }
     Ok(ManagedLocalRecord {
-        sequence: payload.sequence,
+        sequence,
         prepared_batch,
         projection: ManagedLocalProjection {
             intent: intent.clone(),
@@ -8534,15 +8761,23 @@ impl ShardedHotEngine {
         plan: &BootstrapRecoveryPlan,
         ordinal: usize,
     ) -> Result<StageOutcome, EngineError> {
-        let expected = plan
+        let descriptor = plan
             .publication
             .aggregate()
             .parts()
             .get(ordinal)
             .ok_or_else(|| {
                 EngineError::Archive("retained bootstrap publication lost a part ordinal".into())
-            })?
-            .batch_id();
+            })?;
+        let expected = descriptor.batch_id();
+        // Detached bootstrap authoring may defer every graph-wide index until
+        // the terminal part. Full archive replay must select that same
+        // authenticated construction profile before it derives this part's
+        // candidate roots; otherwise the first intermediate part is compared
+        // against a durable record that deliberately commits the deferred
+        // root, and the unconditional predecessor-refusal fallback cannot
+        // reproduce its existing authority.
+        self.configure_detached_bootstrap_reference_catalog(descriptor.evidence())?;
         let loaded = self.bootstrap_residency.own_loaded_part(
             plan.store
                 .load_bootstrap_part(&plan.publication, ordinal)
@@ -11924,6 +12159,27 @@ impl ShardedHotEngine {
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
     }
 
+    pub(crate) fn reference_source_posting_index_at(
+        &self,
+        root: &ReferenceCatalogRootV2,
+    ) -> Result<super::reference_catalog::ReferenceCatalogPostingDigestIndex, EngineError> {
+        self.ensure_not_blocked()?;
+        self.reference_catalog
+            .posting_digest_index_at_root(root)
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+    }
+
+    pub(crate) fn reference_source_posting_from_index(
+        &self,
+        index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
+        page_id: PageId,
+    ) -> Result<Option<super::ReferenceSourcePostingV2>, EngineError> {
+        self.ensure_not_blocked()?;
+        self.reference_catalog
+            .posting_from_digest_index(index, page_id)
+            .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))
+    }
+
     pub(crate) fn reference_candidates_at(
         &self,
         root: &ReferenceCatalogRootV2,
@@ -14302,6 +14558,7 @@ impl ShardedHotEngine {
         &self,
         authority: &super::local_active::AdmittedLocalAuthorAuthority<'_>,
         transaction: &OperationTransaction,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         if authority.workspace_id() != self.workspace_id
             || authority.generation().generation != self.history_generation
@@ -14310,6 +14567,7 @@ impl ShardedHotEngine {
             return Err(EngineError::AuthorDraftStale);
         }
         let batch_id = BatchId::new();
+        let mut prepared_editor_projection = prepared_editor_projection;
         for attempt in 0..LOCAL_AUTHOR_PEER_PROBE_BUDGET {
             let crdt_peer_id = CrdtPeerId::local_mutation_candidate(
                 self.workspace_id,
@@ -14332,6 +14590,7 @@ impl ShardedHotEngine {
                 BatchOrigin::LocalMutation,
                 transaction,
                 None,
+                prepared_editor_projection.take(),
             ) {
                 Ok(draft) => {
                     #[cfg(test)]
@@ -14365,7 +14624,7 @@ impl ShardedHotEngine {
                 "raw local author identity is unavailable on a promoted production runtime".into(),
             ));
         }
-        self.draft_author_transaction_with_observation(author, origin, transaction, None)
+        self.draft_author_transaction_with_observation(author, origin, transaction, None, None)
     }
 
     /// Prepare one canonical managed-local record from the exact finalized
@@ -14375,7 +14634,7 @@ impl ShardedHotEngine {
     /// its manifested projection intent and exact annotated existing base.
     pub fn prepare_managed_local_record(
         &self,
-        prepared: &PreparedBatch,
+        prepared: PreparedBatch,
         sequence: u64,
     ) -> Result<PreparedManagedLocalRecord, ManagedLocalRecordError> {
         if sequence != self.local_overlay.next_sequence {
@@ -14403,11 +14662,7 @@ impl ShardedHotEngine {
         };
         let journal_payload = postcard::to_allocvec(&payload)
             .map_err(|error| ManagedLocalRecordError::CorruptPayload(error.to_string()))?;
-        let record = decode_managed_local_payload(
-            prepared.manifest().author_device_id().as_uuid(),
-            sequence,
-            &journal_payload,
-        )?;
+        let record = managed_local_record_from_prepared(sequence, prepared)?;
         let retained = self.pending_author_managed_local_candidate(&record, false)?;
         let (candidate, retained_author_mutation_token) = match retained {
             Some((candidate, mutation_token)) => (candidate, Some(mutation_token)),
@@ -14418,44 +14673,50 @@ impl ShardedHotEngine {
             sequence,
             journal_payload,
             record,
-            post_page: candidate.page,
+            post_page: candidate.page.clone(),
             retained_author_mutation_token,
+            retained_author_candidate: retained_author_mutation_token.map(|_| candidate),
         })
     }
 
     /// Advance visible state only after the append receipt proves this exact
-    /// record crossed the owning segment's one data-durability barrier.
-    pub fn apply_appended_managed_local_record(
+    /// record crossed the exact data-durability barrier for its protocol.
+    pub(crate) fn apply_appended_managed_local_record(
         &mut self,
-        append: &LocalJournalAppend,
-        prepared: &PreparedManagedLocalRecord,
+        append: &ManagedLocalAppendProof,
+        prepared: &mut PreparedManagedLocalRecord,
     ) -> Result<ManagedLocalApplyOutcome, ManagedLocalRecordError> {
-        if append.device_id
+        let receipt = append.receipt();
+        if receipt.device_id
             != prepared
                 .record
                 .prepared_batch
                 .manifest()
                 .author_device_id()
                 .as_uuid()
-            || append.sequence != prepared.sequence
-            || append.payload_digest != ContentDigest::of(prepared.journal_payload())
-            || append.data_durability_syncs != 1
+            || receipt.sequence != prepared.sequence
+            || receipt.payload_digest != ContentDigest::of(prepared.journal_payload())
+            || receipt.data_durability_syncs
+                != append.protocol().expected_successful_append_data_syncs()
         {
             return Err(ManagedLocalRecordError::WrongDurabilityProof);
         }
         if let Some(expected_mutation_token) = prepared.retained_author_mutation_token {
-            if self.author_mutation_generation() == expected_mutation_token {
-                if let Some((candidate, retained_mutation_token)) =
-                    self.pending_author_managed_local_candidate(&prepared.record, true)?
-                {
-                    if retained_mutation_token == expected_mutation_token {
-                        return self.apply_validated_managed_local_record(
-                            prepared.record.clone(),
-                            prepared.journal_payload(),
-                            candidate,
-                        );
-                    }
-                }
+            if self.author_mutation_generation() == expected_mutation_token
+                && self.consume_prevalidated_pending_author_candidate(
+                    &prepared.record,
+                    expected_mutation_token,
+                )
+            {
+                let candidate = prepared
+                    .retained_author_candidate
+                    .take()
+                    .expect("retained author token owns a validated candidate");
+                return self.apply_validated_managed_local_record(
+                    prepared.record.clone(),
+                    prepared.journal_payload(),
+                    candidate,
+                );
             }
         }
         self.apply_managed_local_record(prepared.record.clone(), prepared.journal_payload())
@@ -14745,23 +15006,28 @@ impl ShardedHotEngine {
             ));
         }
 
-        let documents = if consume {
-            self.pending_author_documents
+        let (documents, retained_projection) = if consume {
+            let mut pending = self
+                .pending_author_documents
                 .borrow_mut()
                 .take()
-                .expect("matching pending author evidence exists")
-                .documents
+                .expect("matching pending author evidence exists");
+            (pending.documents, pending.projection_pages.remove(&page_id))
         } else {
-            self.pending_author_documents
-                .borrow()
+            let pending = self.pending_author_documents.borrow();
+            let pending = pending
                 .as_ref()
-                .expect("matching pending author evidence exists")
-                .documents
-                .iter()
-                .map(|(document_id, document)| {
-                    clone_doc(document, 1).map(|copy| (*document_id, copy))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?
+                .expect("matching pending author evidence exists");
+            (
+                pending
+                    .documents
+                    .iter()
+                    .map(|(document_id, document)| {
+                        clone_doc(document, 1).map(|copy| (*document_id, copy))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?,
+                pending.projection_pages.get(&page_id).cloned(),
+            )
         };
         let expected_batch_heads = manifest
             .dependency_frontier()
@@ -14826,22 +15092,66 @@ impl ShardedHotEngine {
                 },
             ));
         }
-        let page = self.materialize_hot_page_with_overrides(page_id, &documents)?;
-        let candidate = self.validate_managed_local_projection_candidate(
-            record,
-            ValidatedManagedLocalCandidate {
-                page,
-                documents,
-                document_heads,
-                block_claims,
-                update_bytes,
-            },
-        )?;
+        let retained_projection = retained_projection.ok_or_else(|| {
+            ManagedLocalRecordError::CorruptPayload(
+                "retained author evidence has no exact post-projection page".into(),
+            )
+        })?;
+        if retained_projection.page.page_id != page_id
+            || retained_projection.page.path != *record.projection.intent.path()
+            || retained_projection.frontier != *record.projection.intent.post_frontier()
+            || retained_projection.claim_evidence != record.projection.intent.claim_evidence()
+        {
+            return Err(ManagedLocalRecordError::CorruptPayload(
+                "retained author projection differs from its finalized intent".into(),
+            ));
+        }
+        // The finalizer produced the intent target from this exact retained
+        // projection state and the prepared-batch fingerprint binds that
+        // intent to these documents. Re-rendering the same page here would be
+        // a repeated proof of established private state; recovered or foreign
+        // records still take the full validation path.
+        let candidate = ValidatedManagedLocalCandidate {
+            page: retained_projection.page,
+            documents,
+            document_heads,
+            block_claims,
+            update_bytes,
+        };
         let mut work = self.local_overlay.work.get();
         work.retained_author_candidates_used =
             work.retained_author_candidates_used.saturating_add(1);
         self.local_overlay.work.set(work);
         Ok(Some((candidate, current_mutation_token)))
+    }
+
+    /// Consume the retained author documents after the durable append when
+    /// the engine generation is exactly the one already validated while the
+    /// record was prepared. This is deliberately only an ownership transfer:
+    /// any intervening engine transition advances the mutation token and
+    /// forces the ordinary full validation path instead.
+    fn consume_prevalidated_pending_author_candidate(
+        &self,
+        record: &ManagedLocalRecord,
+        expected_mutation_token: u64,
+    ) -> bool {
+        let manifest = record.prepared_batch.manifest();
+        let fingerprint = prepared_manifest_fingerprint(&record.prepared_batch);
+        let matches = self
+            .pending_author_documents
+            .borrow()
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.batch_id == manifest.batch_id()
+                    && pending.manifest_fingerprint == fingerprint
+                    && pending.generation == self.history_generation
+                    && pending.mutation_token == expected_mutation_token
+                    && pending.documents.keys().eq(record.crdt_updates.keys())
+            });
+        if matches {
+            self.pending_author_documents.borrow_mut().take();
+        }
+        matches
     }
 
     fn apply_managed_local_record(
@@ -15159,7 +15469,7 @@ impl ShardedHotEngine {
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(true);
         let oracle =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None);
+            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
         let oracle_copies = self.prospective_catalog_document_copies() - oracle_copies;
         let oracle_shape_visits = self
             .history_work
@@ -15174,7 +15484,7 @@ impl ShardedHotEngine {
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(false);
         let optimized =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None);
+            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
         let optimized_copies = self.prospective_catalog_document_copies() - optimized_copies;
         let optimized_shape_visits = self
             .history_work
@@ -15274,6 +15584,7 @@ impl ShardedHotEngine {
             BatchOrigin::ExternalReconciliation { import_id },
             &transaction,
             Some(observation),
+            None,
         )
     }
 
@@ -15283,6 +15594,7 @@ impl ShardedHotEngine {
         origin: BatchOrigin,
         transaction: &OperationTransaction,
         observation: Option<ExternalImportObservationMaterial>,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
         if origin == BatchOrigin::BootstrapImport {
             return Err(EngineError::InvalidTransaction(
@@ -15348,6 +15660,7 @@ impl ShardedHotEngine {
             requirements,
             pages,
             external_observation: parts.external_observation,
+            prepared_editor_projection,
         })
     }
 
@@ -15498,6 +15811,7 @@ impl ShardedHotEngine {
         external: bool,
         bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<Result<CapturedAuthorTransaction, ReconciliationNeeded>, EngineError> {
+        let mut draft = draft;
         self.ensure_not_blocked()?;
         if source.device_id != draft.author.author_device_id {
             return Err(EngineError::ProjectionManifest(
@@ -15848,6 +16162,9 @@ impl ShardedHotEngine {
         drop(external_observation_index);
         if !mismatches.is_empty() {
             debug_assert!(mismatches.windows(2).all(|pair| pair[0] < pair[1]));
+            if let Some(prepared_editor_projection) = draft.prepared_editor_projection.take() {
+                prepared_editor_projection.record_fallback();
+            }
             return Ok(Err(ReconciliationNeeded { paths: mismatches }));
         }
         Ok(Ok(CapturedAuthorTransaction {
@@ -15889,7 +16206,7 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
     ) -> Result<PreparedBatch, EngineError> {
         let CapturedAuthorTransaction {
-            draft,
+            mut draft,
             source,
             receipt_store_id,
             graph_scope,
@@ -15994,6 +16311,23 @@ impl ShardedHotEngine {
             .map(|input| (input.path, input.material))
             .collect::<BTreeMap<_, _>>();
 
+        // This is the only consumer of editor preparation.  Any transaction
+        // shape other than one existing Present -> Present requirement remains
+        // on the established complete planner.
+        let mut prepared_editor_projection = if !external_reconciliation
+            && requirement_index.len() == 1
+            && matches!(
+                draft.requirements[requirement_index.entries()[0].roles().owner].target,
+                ProjectionRequirementState::Present
+            ) {
+            draft.prepared_editor_projection.take()
+        } else {
+            if let Some(prepared_editor_projection) = draft.prepared_editor_projection.take() {
+                prepared_editor_projection.record_fallback();
+            }
+            None
+        };
+
         let mut objects = draft.prepared_core.objects().to_vec();
         let mut observed_bases =
             BTreeMap::<ManagedPath, (ManifestObjectRef, AnnotatedProjectionBase)>::new();
@@ -16035,6 +16369,7 @@ impl ShardedHotEngine {
                         "captured path {path} completion is not its intended semantic predecessor"
                     )));
                 }
+                super::projection::note_finalizer_predecessor_replay_render();
                 let replay = super::projection::plan_projection_with_layout_annotations(
                     self.workspace_id,
                     before,
@@ -16213,13 +16548,37 @@ impl ShardedHotEngine {
                             } => (Some(bytes.as_slice()), Some(annotations.as_slice())),
                             CapabilityCapturedProjectionMaterial::Absent { .. } => (None, None),
                         });
-                    let plan = super::projection::plan_projection_with_layout_annotations(
-                        self.workspace_id,
-                        after,
-                        render_bytes,
-                        render_annotations,
-                    )
-                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                    let prepared_plan = match prepared_editor_projection.take() {
+                        Some(prepared_editor_projection) => match &inputs[&requirement.path] {
+                            CapabilityCapturedProjectionMaterial::Present {
+                                bytes,
+                                annotations,
+                                ..
+                            } => prepared_editor_projection
+                                .into_fresh_plan(self.workspace_id, after, bytes, annotations)
+                                .map_err(|error| {
+                                    EngineError::ProjectionManifest(error.to_string())
+                                })?,
+                            CapabilityCapturedProjectionMaterial::Absent { .. } => {
+                                prepared_editor_projection.record_fallback();
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    let plan = match prepared_plan {
+                        Some(plan) => plan,
+                        None => {
+                            super::projection::note_finalizer_post_state_render();
+                            super::projection::plan_projection_with_layout_annotations(
+                                self.workspace_id,
+                                after,
+                                render_bytes,
+                                render_annotations,
+                            )
+                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                        }
+                    };
                     ManifestProjectionTarget::present(
                         plan.target().to_vec(),
                         plan.intent().annotations().to_vec(),
@@ -16290,12 +16649,20 @@ impl ShardedHotEngine {
         )?;
         let prepared = PreparedBatch::new(manifest, objects)?;
         if draft.origin == BatchOrigin::LocalMutation {
+            let projection_pages = draft
+                .pages
+                .iter()
+                .filter_map(|(page_id, draft_page)| {
+                    draft_page.after.clone().map(|state| (*page_id, state))
+                })
+                .collect();
             *self.pending_author_documents.borrow_mut() = Some(PendingAuthorDocuments {
                 batch_id: draft.author.batch_id,
                 manifest_fingerprint: prepared_manifest_fingerprint(&prepared),
                 generation: draft.generation,
                 mutation_token: draft.mutation_token,
                 documents: draft.prospective_documents,
+                projection_pages,
             });
         }
         let _ = draft.semantic_effect;
@@ -16753,6 +17120,7 @@ impl ShardedHotEngine {
                                 (document_id, document)
                             })
                             .collect(),
+                        projection_pages: BTreeMap::new(),
                     });
                 }
                 (BTreeMap::new(), None)
@@ -17979,7 +18347,11 @@ impl ShardedHotEngine {
         &self,
         index: &ProjectionWorkIndex,
         release: &PortablePathReleased,
-    ) -> Result<super::ProjectionCompletedReceipt, EngineError> {
+        // `None` when the released path is absent. Only the guarded-conflict
+        // route needs bytes to authenticate against; an absent completion — an
+        // ordinary deletion — is authorized without any observation.
+        observed: Option<BlobDescription>,
+    ) -> Result<ProjectedReleaseAuthority, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
         let endpoint = self.projection_endpoint.ok_or_else(|| {
@@ -18049,22 +18421,56 @@ impl ShardedHotEngine {
                 && receipt.path() == release.prior_exact_path()
                 && receipt.target() == ProjectionWorkTarget::Absent
         });
-        let completed = exact.next().ok_or_else(|| {
-            EngineError::ProjectionWork(
-                "projection release has no authenticated absent completion".into(),
-            )
-        })?;
-        if exact.next().is_some()
-            || !self.projection_frontier_contains_path_acquisition(
-                completed.frontier(),
-                release.release_batch(),
-            )?
-        {
+        let completed = exact.next();
+        if exact.next().is_some() {
             return Err(EngineError::ProjectionWork(
                 "projection release completion is not exact".into(),
             ));
         }
-        Ok(completed)
+        if let Some(completed) = completed {
+            if !self.projection_frontier_contains_path_acquisition(
+                completed.frontier(),
+                release.release_batch(),
+            )? {
+                return Err(EngineError::ProjectionWork(
+                    "projection release completion is not exact".into(),
+                ));
+            }
+            return Ok(ProjectedReleaseAuthority::Completed(completed));
+        }
+        let observed = observed.ok_or_else(|| {
+            EngineError::ProjectionWork(
+                "projection release has no absent completion, and no replacement bytes to \
+                 authenticate a guarded conflict against"
+                    .into(),
+            )
+        })?;
+        let blocked = index
+            .blocked_release_for_observation(
+                release.release_batch(),
+                release.prior_page_id(),
+                release.prior_exact_path(),
+                observed,
+            )
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+            .ok_or_else(|| {
+                EngineError::ProjectionWork(
+                    "projection release has neither an absent completion nor an exact guarded conflict"
+                        .into(),
+                )
+            })?;
+        if !self.projection_frontier_contains_path_acquisition(
+            blocked.0.post_frontier(),
+            release.release_batch(),
+        )? {
+            return Err(EngineError::ProjectionWork(
+                "guarded projection conflict is not exact for the release".into(),
+            ));
+        }
+        Ok(ProjectedReleaseAuthority::GuardedConflict {
+            work: blocked.0,
+            intent_id: blocked.1,
+        })
     }
 
     fn projection_frontier_dominates(
@@ -40319,38 +40725,50 @@ mod validation_tests {
     }
 
     #[test]
-    fn no_store_local_page_name_duplicates_never_produce_a_prepared_batch() {
+    fn no_store_local_page_name_duplicates_are_rejected_without_mutation_at_acceptance() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(8_300));
         let catalog = DocumentId::from_uuid(Uuid::from_u128(8_301));
         let lineage = LineageDigest::of(b"no-store-page-name-author-preflight");
-        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
+        let mut intra_engine = ShardedHotEngine::new(workspace, lineage, catalog);
 
-        let intra_batch = engine.prepare_bootstrap_transaction(
-            test_author(8_310, 8_310),
-            &OperationTransaction::new(vec![
-                SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(8_311)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(8_312)),
-                    name: LogicalPageName::parse("Duplicate").unwrap(),
-                    path: ManagedPath::parse("pages/left.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                },
-                SemanticOperation::CreatePage {
-                    page_id: PageId::from_uuid(Uuid::from_u128(8_313)),
-                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(8_314)),
-                    name: LogicalPageName::parse("duplicate").unwrap(),
-                    path: ManagedPath::parse("pages/right.md").unwrap(),
-                    kind: ManagedTextKind::Page,
-                },
-            ])
-            .unwrap(),
-        );
+        let intra_batch = intra_engine
+            .prepare_bootstrap_transaction(
+                test_author(8_310, 8_310),
+                &OperationTransaction::new(vec![
+                    SemanticOperation::CreatePage {
+                        page_id: PageId::from_uuid(Uuid::from_u128(8_311)),
+                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(8_312)),
+                        name: LogicalPageName::parse("Duplicate").unwrap(),
+                        path: ManagedPath::parse("pages/left.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                    SemanticOperation::CreatePage {
+                        page_id: PageId::from_uuid(Uuid::from_u128(8_313)),
+                        home_document_id: DocumentId::from_uuid(Uuid::from_u128(8_314)),
+                        name: LogicalPageName::parse("duplicate").unwrap(),
+                        path: ManagedPath::parse("pages/right.md").unwrap(),
+                        kind: ManagedTextKind::Page,
+                    },
+                ])
+                .unwrap(),
+            )
+            .unwrap();
+        let prior_page_names = intra_engine.ephemeral_page_names.clone();
         assert!(matches!(
-            intra_batch,
-            Err(EngineError::InvalidTransaction(_))
+            intra_engine
+                .stage_ready(ValidatedBatch::new(intra_batch))
+                .disposition(),
+            BatchDisposition::Rejected {
+                error: EngineError::InvalidTransaction(_),
+            }
         ));
-        assert_eq!(engine.ephemeral_page_names.record_count(), 0);
+        assert_eq!(intra_engine.ephemeral_page_names, prior_page_names);
+        assert_eq!(
+            intra_engine.workspace_status(),
+            WorkspaceStatus::Operational
+        );
 
+        let mut engine = ShardedHotEngine::new(workspace, lineage, catalog);
         let first = engine
             .prepare_bootstrap_transaction(
                 test_author(8_320, 8_320),
@@ -40370,19 +40788,29 @@ mod validation_tests {
         ));
         assert_eq!(engine.ephemeral_page_names.record_count(), 1);
         let prior_page_names = engine.ephemeral_page_names.clone();
-        let duplicate = engine.prepare_bootstrap_transaction(
-            test_author(8_323, 8_323),
-            &OperationTransaction::new(vec![SemanticOperation::CreatePage {
-                page_id: PageId::from_uuid(Uuid::from_u128(8_324)),
-                home_document_id: DocumentId::from_uuid(Uuid::from_u128(8_325)),
-                name: LogicalPageName::parse("OWNED").unwrap(),
-                path: ManagedPath::parse("pages/other.md").unwrap(),
-                kind: ManagedTextKind::Page,
-            }])
-            .unwrap(),
-        );
-        assert!(matches!(duplicate, Err(EngineError::InvalidTransaction(_))));
+        let duplicate = engine
+            .prepare_bootstrap_transaction(
+                test_author(8_323, 8_323),
+                &OperationTransaction::new(vec![SemanticOperation::CreatePage {
+                    page_id: PageId::from_uuid(Uuid::from_u128(8_324)),
+                    home_document_id: DocumentId::from_uuid(Uuid::from_u128(8_325)),
+                    name: LogicalPageName::parse("OWNED").unwrap(),
+                    path: ManagedPath::parse("pages/other.md").unwrap(),
+                    kind: ManagedTextKind::Page,
+                }])
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine
+                .stage_ready(ValidatedBatch::new(duplicate))
+                .disposition(),
+            BatchDisposition::Rejected {
+                error: EngineError::InvalidTransaction(_),
+            }
+        ));
         assert_eq!(engine.ephemeral_page_names, prior_page_names);
+        assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
     }
 
     #[test]
@@ -40619,7 +41047,7 @@ mod validation_tests {
                 current: 0,
             }
         );
-        assert!(engine
+        let refused = engine
             .prepare_bootstrap_transaction(
                 test_author(8_516, 8_510),
                 &OperationTransaction::new(vec![
@@ -40631,12 +41059,25 @@ mod validation_tests {
                         }],
                         block_rewrites: Vec::new(),
                         page_preamble_rewrites: Vec::new(),
-                    }
+                    },
                 ])
                 .unwrap(),
             )
-            .is_err());
+            .unwrap();
+        writer
+            .publish_bootstrap_prepared_for_test(&refused)
+            .unwrap();
+        assert!(matches!(
+            engine
+                .stage_archive_batch(refused.manifest().batch_id())
+                .unwrap()
+                .disposition(),
+            BatchDisposition::Rejected {
+                error: EngineError::Archive(_),
+            }
+        ));
         assert_eq!(engine.page_name_root, authoritative_root);
+        assert_eq!(engine.workspace_status(), WorkspaceStatus::Operational);
         engine.scratch_roots.external_document_state_root = exact_root;
 
         drop(engine);
@@ -40778,7 +41219,8 @@ mod validation_tests {
         assert_eq!(ENGINE_HISTORY_SCHEMA_VERSION, 13);
         assert_eq!(
             super::super::page_name_index::PAGE_NAME_OWNERSHIP_ROOT_SCHEMA_VERSION,
-            1
+            2,
+            "the delivery-order evidence deliberately pins the current page-name root schema"
         );
         let reopened = ShardedHotEngine::with_archive_store(
             ObjectStore::open(&archive_path, workspace).unwrap(),

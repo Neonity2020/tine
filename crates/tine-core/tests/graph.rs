@@ -1,7 +1,22 @@
 //! Integration tests against the on-disk demo graph (standard layout).
 
 use std::path::PathBuf;
-use tine_core::Graph;
+use tine_core::{ActivationIntent, Graph, PageDto};
+
+/// Make `dto` an EDITOR's DTO, the way the frontend does.
+///
+/// Since GH #254 increment 3 a loaded page and a live editor are different
+/// things: reading alone mints no identity, so a read for export, preview or
+/// hydration cannot inherit an editor's override authority. A test that
+/// force-saves is modelling a user answering a conflict banner, so it has to
+/// activate like one. Works for an absent page too — activation resolves a
+/// prospective target and writes nothing.
+fn as_editor(graph: &Graph, dto: &mut PageDto) {
+    let handle = graph
+        .activate_editor(&dto.path, ActivationIntent::Replace, dto.rev.as_deref())
+        .expect("the target is inside the graph");
+    dto.activation = Some(handle.activation.as_u64());
+}
 
 fn demo_graph() -> Graph {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/demo-graph");
@@ -280,10 +295,15 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
             .unwrap()
             .unwrap();
         identity_bound.blocks[0].raw = "keep mine over a republished inode".into();
+        as_editor(&graph, &mut identity_bound);
         std::fs::write(&path, "- shown conflict\n").unwrap();
         graph
             .save_page(&identity_bound, identity_bound.rev.as_deref())
             .unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&identity_bound)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
 
         // A syncer republishes the SAME bytes by temp+rename: new inode, state
         // the user was shown unchanged. "Keep mine" must go through. Refusing
@@ -292,7 +312,9 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
         let replacement = root.join("external/deep/.replacement.markdown");
         std::fs::write(&replacement, "- shown conflict\n").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
-        graph.force_save_page(&identity_bound).unwrap();
+        graph
+            .force_save_page_at_revision(&identity_bound, identity_bound.rev.as_deref(), shown)
+            .unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("keep mine over a republished inode"));
@@ -304,14 +326,24 @@ fn external_graph_text_save_keeps_exact_path_extension_and_rejects_stale_bytes()
             .unwrap()
             .unwrap();
         second.blocks[0].raw = "must not replace a different winner".into();
+        // A live editor too, so the refusal below is the byte-binding refusal
+        // this test is about and not merely a missing activation.
+        as_editor(&graph, &mut second);
         std::fs::write(&path, "- second shown conflict\n").unwrap();
         graph.save_page(&second, second.rev.as_deref()).unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&second)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
         let foreign = root.join("external/deep/.foreign.markdown");
         std::fs::write(&foreign, "- different winner\n").unwrap();
         std::fs::rename(&foreign, &path).unwrap();
         let before = std::fs::read(&path).unwrap();
         assert_eq!(
-            graph.force_save_page(&second).unwrap_err().kind(),
+            graph
+                .force_save_page_at_revision(&second, second.rev.as_deref(), shown)
+                .unwrap_err()
+                .kind(),
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -960,6 +992,7 @@ fn search_cache_reflects_saves_and_deletes() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap();
@@ -1006,6 +1039,7 @@ fn journal_template_bytes_survive_reopen_and_idempotent_resave() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
 
@@ -1059,6 +1093,7 @@ fn search_ignores_hidden_property_metadata() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap();
@@ -1248,7 +1283,8 @@ fn save_refuses_to_clobber_external_change() {
     let g = Graph::open(&root);
     // Build the cache (Tine now "knows" N = "- one"), then load it for editing.
     g.search("one", 10);
-    let dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
+    let mut dto = g.load_named("N", PageKind::Page).unwrap().unwrap();
+    as_editor(&g, &mut dto);
 
     // An external writer (another app / Syncthing) changes the file.
     std::fs::write(&path, "- EXTERNAL EDIT").unwrap();
@@ -1259,7 +1295,12 @@ fn save_refuses_to_clobber_external_change() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "- EXTERNAL EDIT");
 
     // "Keep mine" force-saves over it.
-    g.force_save_page(&dto).unwrap();
+    let shown = g
+        .outstanding_conflict_override(&dto)
+        .unwrap()
+        .expect("the refused save names the conflict shown to this editor");
+    g.force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+        .unwrap();
     assert!(std::fs::read_to_string(&path).unwrap().contains("one"));
 
     std::fs::remove_dir_all(&root).ok();
@@ -1341,6 +1382,7 @@ fn consecutive_self_saves_do_not_conflict() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     // 1) date picker inserts a SCHEDULED line (page is new — no baseline yet).
@@ -1425,6 +1467,7 @@ fn noop_save_does_not_bump_cache_generation() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     let r1 = g.save_page(&mk("hello"), None).unwrap();
@@ -1475,6 +1518,7 @@ fn self_write_marker_does_not_outlive_its_save() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap(); // sets, then self-removes, the marker
@@ -1518,6 +1562,7 @@ fn disk_rev_fast_path_is_fresh_and_detects_external_change() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap(); // populates disk_revs[R] (marker self-removed)
@@ -1576,6 +1621,7 @@ fn self_write_is_not_reported_as_external_change() {
         format: Default::default(),
         read_only: false,
         path: String::new(),
+        activation: None,
         guide: false,
     };
     g.save_page(&page, None).unwrap();
@@ -3374,6 +3420,7 @@ mod external_atomic_replacement {
         let root = scratch("deleted");
         let (graph, mut page) = open_with(&root, "- original\n");
         let base = page.rev.clone();
+        as_editor(&graph, &mut page);
 
         std::fs::remove_file(root.join("pages/Note.md")).unwrap();
 
@@ -3387,7 +3434,13 @@ mod external_atomic_replacement {
             !root.join("pages/Note.md").exists(),
             "a deleted page must not be silently resurrected"
         );
-        graph.force_save_page(&page).unwrap();
+        let shown = graph
+            .outstanding_conflict_override(&page)
+            .unwrap()
+            .expect("the refused save names the conflict shown to this editor");
+        graph
+            .force_save_page_at_revision(&page, base.as_deref(), shown)
+            .unwrap();
         assert!(std::fs::read_to_string(root.join("pages/Note.md"))
             .unwrap()
             .contains("mine"));

@@ -3,14 +3,17 @@ use std::time::Instant;
 use std::{collections::BTreeMap, fs};
 
 use cap_std::{ambient_authority, fs::Dir};
-use tine_storage::{LocalJournalFrame, LocalJournalSegment};
+use tine_storage::{
+    LocalJournalFrame, LocalJournalSegment, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
+};
 
 use super::*;
 use crate::fast_commit::forbidden_commit_work;
 use crate::oplog::{
     append_managed_local_record, decode_managed_local_record, ApplicationRuntimeRoot,
-    ManagedLocalApplyOutcome, ManagedLocalJournalPayloadKind, ManagedLocalRecordError,
-    MaterializedPage, ProjectionClaim, RebuildSource, SqliteFrontier,
+    ManagedLocalAppendError, ManagedLocalAppendProof, ManagedLocalApplyOutcome,
+    ManagedLocalJournal, ManagedLocalJournalPayloadKind, ManagedLocalJournalProtocol,
+    ManagedLocalRecordError, MaterializedPage, ProjectionClaim, RebuildSource, SqliteFrontier,
 };
 
 const ENDPOINT: u128 = 980_000;
@@ -245,7 +248,7 @@ impl OverlayFixture {
     fn prepare_record(&self, prepared: &PreparedBatch) -> crate::oplog::PreparedManagedLocalRecord {
         self.engine
             .prepare_managed_local_record(
-                prepared,
+                prepared.clone(),
                 self.engine.managed_local_prefix_state().next_sequence,
             )
             .unwrap()
@@ -275,8 +278,8 @@ impl OverlayFixture {
     fn append_and_apply(
         &mut self,
         journal: &mut LocalJournalSegment<ManagedLocalJournalPayloadKind>,
-        prepared: &crate::oplog::PreparedManagedLocalRecord,
-    ) -> (tine_storage::LocalJournalAppend, MaterializedPage) {
+        prepared: &mut crate::oplog::PreparedManagedLocalRecord,
+    ) -> (ManagedLocalAppendProof, MaterializedPage) {
         let append = append_managed_local_record(journal, prepared).unwrap();
         let page = match self
             .engine
@@ -544,10 +547,10 @@ fn markdown_and_org_record_application_matches_the_exact_accepted_engine_and_sql
         let mut local =
             OverlayFixture::new(&format!("managed-record-local-{extension}"), extension, 8);
         let (_, mut journal) = local.journal("semantic");
-        let prepared = local.prepare_record(&batches[0]);
+        let mut prepared = local.prepare_record(&batches[0]);
         let forbidden_before = forbidden_commit_work();
         let stats_before = journal.stats();
-        let (_, response) = local.append_and_apply(&mut journal, &prepared);
+        let (_, response) = local.append_and_apply(&mut journal, &mut prepared);
         let direct = local
             .engine
             .materialize_current_page_at_path(&local.page_path)
@@ -596,6 +599,8 @@ fn record_reconstructs_exact_prepared_batch_and_projection_material() {
     let prepared = fixture.prepare_record(&batches[0]);
     let decoded = decode_managed_local_record(&frame(&prepared)).unwrap();
 
+    assert_eq!(prepared.record(), &decoded);
+
     assert_eq!(
         decoded.prepared_batch().manifest().encode().unwrap(),
         batches[0].manifest().encode().unwrap()
@@ -641,8 +646,8 @@ fn consecutive_records_replay_into_a_fresh_engine_like_uninterrupted_execution()
     let (_, mut journal) = uninterrupted.journal("chain");
     let mut frames = Vec::new();
     for prepared_batch in &batches {
-        let prepared = uninterrupted.prepare_record(prepared_batch);
-        uninterrupted.append_and_apply(&mut journal, &prepared);
+        let mut prepared = uninterrupted.prepare_record(prepared_batch);
+        uninterrupted.append_and_apply(&mut journal, &mut prepared);
         frames.push(frame(&prepared));
     }
     let live = uninterrupted
@@ -804,10 +809,10 @@ fn corrupt_binding_order_and_stale_base_are_refused_before_visible_change() {
 }
 
 #[test]
-fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
+fn append_refuses_wrong_device_before_writing_and_proof_binds_legacy_one_barrier() {
     let (_, batches) = finalized_edit_chain("managed-record-append-source", "md", 8, 1);
     let mut fixture = OverlayFixture::new("managed-record-append-local", "md", 8);
-    let prepared = fixture.prepare_record(&batches[0]);
+    let mut prepared = fixture.prepare_record(&batches[0]);
     let wrong_root = fixture._dir.path().join("journal-wrong-device");
     std::fs::create_dir_all(&wrong_root).unwrap();
     let wrong_dir = Dir::open_ambient_dir(wrong_root, ambient_authority()).unwrap();
@@ -816,26 +821,31 @@ fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
         .0;
     assert_eq!(
         append_managed_local_record(&mut wrong, &prepared),
-        Err(ManagedLocalRecordError::WrongDurabilityProof)
+        Err(ManagedLocalAppendError::DefinitelyNotAppended(
+            ManagedLocalRecordError::WrongDurabilityProof
+        ))
     );
     assert_eq!(wrong.next_sequence(), 0);
     assert_eq!(wrong.stats().frames_appended, 0);
 
     let (_, mut correct) = fixture.journal("correct-device");
     let append = append_managed_local_record(&mut correct, &prepared).unwrap();
-    assert_eq!(append.device_id, uuid(DEVICE));
-    assert_eq!(append.sequence, 0);
+    assert_eq!(append.protocol(), ManagedLocalJournalProtocol::LegacyV1);
+    assert_eq!(append.receipt().device_id, uuid(DEVICE));
+    assert_eq!(append.receipt().sequence, 0);
     assert_eq!(
-        append.payload_digest,
+        append.receipt().payload_digest,
         ContentDigest::of(prepared.journal_payload())
     );
-    assert_eq!(append.data_durability_syncs, 1);
-    let mut wrong_receipt = append;
-    wrong_receipt.data_durability_syncs = 0;
+    assert_eq!(
+        append.receipt().data_durability_syncs,
+        append.protocol().expected_successful_append_data_syncs()
+    );
+    let wrong_proof = append.with_data_durability_syncs_for_test(0);
     assert_eq!(
         fixture
             .engine
-            .apply_appended_managed_local_record(&wrong_receipt, &prepared),
+            .apply_appended_managed_local_record(&wrong_proof, &mut prepared),
         Err(ManagedLocalRecordError::WrongDurabilityProof)
     );
     assert_eq!(
@@ -844,8 +854,63 @@ fn append_refuses_wrong_device_before_writing_and_receipt_binds_one_barrier() {
     );
     fixture
         .engine
-        .apply_appended_managed_local_record(&append, &prepared)
+        .apply_appended_managed_local_record(&append, &mut prepared)
         .unwrap();
+}
+
+#[test]
+fn fresh_schema2_append_proof_requires_two_syncs_and_applies_once() {
+    let (_, batches) = finalized_edit_chain("managed-record-append-v2-source", "md", 8, 1);
+    let mut fixture = OverlayFixture::new("managed-record-append-v2-local", "md", 8);
+    let mut prepared = fixture.prepare_record(&batches[0]);
+    let root = fixture._dir.path().join("journal-v2");
+    std::fs::create_dir_all(&root).unwrap();
+    let directory = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
+    let selection =
+        LocalJournalSegmentV2Selection::random("managed-local-v2.journal", uuid(DEVICE), 0)
+            .unwrap();
+    LocalJournalSegmentV2::<ManagedLocalJournalPayloadKind>::prepare(&directory, &selection)
+        .unwrap();
+    let (segment, recovery) = LocalJournalSegmentV2::open_selected(&directory, &selection).unwrap();
+    assert_eq!(recovery.frames_recovered, 0);
+    let mut journal = ManagedLocalJournal::from_open_v2(1, segment);
+
+    let append = append_managed_local_record(&mut journal, &prepared).unwrap();
+    assert_eq!(append.protocol(), ManagedLocalJournalProtocol::V2);
+    assert_eq!(append.receipt().data_durability_syncs, 2);
+    assert_eq!(
+        append.receipt().data_durability_syncs,
+        append.protocol().expected_successful_append_data_syncs()
+    );
+    fixture
+        .engine
+        .apply_appended_managed_local_record(&append, &mut prepared)
+        .unwrap();
+    assert_eq!(
+        fixture.engine.managed_local_prefix_state().records_applied,
+        1
+    );
+}
+
+#[test]
+fn managed_local_append_proof_uses_the_protocol_exact_sync_count() {
+    assert_eq!(
+        ManagedLocalJournalProtocol::LegacyV1.expected_successful_append_data_syncs(),
+        1
+    );
+    assert_eq!(
+        ManagedLocalJournalProtocol::V2.expected_successful_append_data_syncs(),
+        2
+    );
+    let source = include_str!("../hot_engine.rs")
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap();
+    assert!(source.contains("expected_successful_append_data_syncs"));
+    assert!(!source.contains("data_durability_syncs != 1 | 2"));
+    assert!(source.contains("fn managed_local_append_proof"));
+    assert!(!source.contains("ManagedLocalAppendProof::new"));
+    assert!(!source.contains("pub(crate) const fn new("));
 }
 
 #[test]
@@ -856,7 +921,7 @@ fn intervening_engine_mutation_refuses_retained_managed_candidate_before_visibil
         .prepare_bootstrap_transaction(fixture.local_author(1_120_000), &fixture.content_edit(9))
         .unwrap();
     let prepared_batch = fixture.finalize_edit(1_120_010, 1);
-    let prepared = fixture.prepare_record(&prepared_batch);
+    let mut prepared = fixture.prepare_record(&prepared_batch);
     let (_, mut journal) = fixture.journal("retained-stale");
     let append = append_managed_local_record(&mut journal, &prepared).unwrap();
 
@@ -877,7 +942,7 @@ fn intervening_engine_mutation_refuses_retained_managed_candidate_before_visibil
     assert!(matches!(
         fixture
             .engine
-            .apply_appended_managed_local_record(&append, &prepared),
+            .apply_appended_managed_local_record(&append, &mut prepared),
         Err(ManagedLocalRecordError::StaleBase)
     ));
     assert_eq!(
@@ -890,16 +955,25 @@ fn intervening_engine_mutation_refuses_retained_managed_candidate_before_visibil
     );
 }
 
+// QUARANTINED (GH #308, Martin's call 2026-08-11). Same cause as the
+// fast-commit torn-tail test: tine-storage's v1 reader now refuses a partially
+// declared final frame instead of discarding it, per the journal-v2 fail-closed
+// spec. Unlike that one this IS the managed local journal, so until the v2
+// migration lands a crash during an append leaves a managed journal that will
+// not open. Managed storage is off by default and marked testing-only, which is
+// why this is tracked rather than release-blocking — see GH #308.
+#[ignore = "GH #308: v1 torn-tail contract superseded by the journal-v2 fail-closed spec; \
+            un-ignore with the v2 migration"]
 #[test]
 fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
     let (_, batches) = finalized_edit_chain("managed-record-torn-source", "org", 8, 2);
     let mut live = OverlayFixture::new("managed-record-torn-live", "org", 8);
     let (journal_root, mut journal) = live.journal("torn");
-    let first = live.prepare_record(&batches[0]);
-    live.append_and_apply(&mut journal, &first);
+    let mut first = live.prepare_record(&batches[0]);
+    live.append_and_apply(&mut journal, &mut first);
     let expected_prefix = live.engine.materialize_page(live.page_id).unwrap();
-    let second = live.prepare_record(&batches[1]);
-    let (second_append, _) = live.append_and_apply(&mut journal, &second);
+    let mut second = live.prepare_record(&batches[1]);
+    let (second_append, _) = live.append_and_apply(&mut journal, &mut second);
     let committed = journal.committed_bytes();
     drop(journal);
 
@@ -908,7 +982,7 @@ fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
         .write(true)
         .open(&segment_path)
         .unwrap();
-    file.set_len(committed - second_append.frame_bytes / 2)
+    file.set_len(committed - second_append.receipt().frame_bytes / 2)
         .unwrap();
     file.sync_data().unwrap();
     drop(file);
@@ -945,10 +1019,10 @@ fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
 fn accepted_catchup_collapses_prefix_without_semantic_change_and_sequence_stays_monotonic() {
     let mut fixture = OverlayFixture::new("managed-record-collapse", "md", 12);
     let prepared_batch = fixture.finalize_edit(1_110_000, 1);
-    let prepared = fixture.prepare_record(&prepared_batch);
+    let mut prepared = fixture.prepare_record(&prepared_batch);
     let (_, mut journal) = fixture.journal("collapse");
     let before_frontier = fixture.engine.accepted_frontier_root().unwrap();
-    fixture.append_and_apply(&mut journal, &prepared);
+    fixture.append_and_apply(&mut journal, &mut prepared);
     assert!(matches!(
         fixture
             .engine

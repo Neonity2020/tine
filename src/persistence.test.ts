@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { dirtyPages, flushAll, isRetryableSaveFailure, markDirty, resetSaveState, trackAssetWrite } from "./persistence";
+import {
+  dirtyPages,
+  flushAll,
+  isRetryableSaveFailure,
+  markDirty,
+  resetSaveState,
+  saveFailureDisposition,
+  trackAssetWrite,
+} from "./persistence";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
   let resolve!: (value: T) => void;
@@ -54,6 +62,7 @@ describe("save failure classification", () => {
       // retried silently forever and the user could quit believing the page
       // had been written.
       "managed.conflict",
+      "trusted_local.append_outcome_unknown",
     ]) {
       expect(isRetryableSaveFailure(`${code}: something specific`)).toBe(false);
     }
@@ -70,6 +79,27 @@ describe("save failure classification", () => {
     ).toBe(true);
     expect(isRetryableSaveFailure("unknown: disk full")).toBe(true);
     expect(isRetryableSaveFailure(new Error("EBUSY"))).toBe(true);
+  });
+
+  it("classifies append uncertainty from the actor reason-code envelope before retry policy", () => {
+    expect(
+      saveFailureDisposition("trusted_local.append_outcome_unknown: storage receipt did not escape")
+    ).toBe("append_outcome_unknown");
+    const actorFailure =
+      "sync actor refused application page intent at committing the semantic page transaction "
+      + "(reason code: trusted_local.append_outcome_unknown)";
+    expect(saveFailureDisposition(actorFailure)).toBe("append_outcome_unknown");
+    expect(saveFailureDisposition(new Error(actorFailure))).toBe("append_outcome_unknown");
+    expect(isRetryableSaveFailure(new Error(actorFailure))).toBe(false);
+    expect(
+      saveFailureDisposition("ordinary failure mentions trusted_local.append_outcome_unknown in prose")
+    ).toBe("ordinary");
+    expect(
+      saveFailureDisposition("ordinary prose (reason code: trusted_local.append_outcome_unknown)")
+    ).toBe("ordinary");
+    expect(
+      isRetryableSaveFailure("ordinary failure mentions trusted_local.append_outcome_unknown in prose")
+    ).toBe(true);
   });
 });
 

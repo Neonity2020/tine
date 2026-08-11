@@ -4,6 +4,7 @@
 
 mod android_folder_picker;
 mod android_media;
+mod android_safe_back;
 mod android_system_bars;
 mod backup;
 mod commands;
@@ -31,23 +32,25 @@ mod watcher;
 
 use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
-    asset_trash_stats, block_ref_counts, block_referrers, capture_quick_switch, close_graph_window,
-    copy_guide_into_graph, delete_page, detect_media_editor, edit_asset_external,
-    empty_asset_trash, enable_managed_sync, existing_page_names, export_query_subtrees,
-    get_backlink_filter_context, get_backlinks, get_page, get_page_by_path, get_unlinked_refs,
-    graph_source_files, guide_pages, import_asset, import_native_capture, journal_content_days,
-    journal_feed_page, list_journal_conflicts, list_orphan_assets, list_pages, list_sync_conflicts,
-    list_templates, load_workspaces, managed_sync_identity_plan, managed_sync_status, merge_pages,
-    open_asset, open_page_file, open_pdf, page_aliases, page_icons, page_print_html, preview_block,
-    publish_html, query_facets, quick_switch, read_asset, read_custom_css, read_highlights,
-    read_journal_file, read_local_image, read_text_file, referenced_page_names,
-    rename_file_to_page, rename_page, resolve_block, resolve_blocks, resolve_sync_conflict,
-    run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
-    save_workspaces, search, set_default_journal_template, set_doc_mode_enter_for_new_block,
-    set_favorites, set_guide_announced, set_journal_title_format, set_logical_outdenting,
-    set_preferred_format, set_preferred_workflow, set_show_brackets, set_start_of_week,
-    set_timetracking_enabled, stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit,
-    trash_asset, trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
+    activate_absent_editor, activate_editor, asset_trash_stats, block_ref_counts, block_referrers,
+    capture_quick_switch, close_graph_window, copy_guide_into_graph, delete_page,
+    detect_media_editor, edit_asset_external, empty_asset_trash, enable_managed_sync,
+    existing_page_names, export_query_subtrees, get_backlink_filter_context, get_backlinks,
+    get_page, get_page_by_path, get_unlinked_refs, graph_source_files, guide_pages, import_asset,
+    import_native_capture, journal_content_days, journal_feed_page, list_journal_conflicts,
+    list_orphan_assets, list_pages, list_sync_conflicts, list_templates, load_workspaces,
+    managed_sync_identity_plan, managed_sync_status, merge_pages, open_asset, open_page_file,
+    open_pdf, page_aliases, page_icons, page_print_html, prepare_tine_quit,
+    present_conflict_override, preview_block, publish_html, query_facets, quick_switch, read_asset,
+    read_custom_css, read_highlights, read_journal_file, read_local_image, read_text_file,
+    referenced_page_names, rename_file_to_page, rename_page, resolve_block, resolve_blocks,
+    resolve_sync_conflict, retire_editor_activation, run_advanced_query, run_graph_search,
+    run_query, save_asset, save_page, save_pdf_area_image, save_workspaces, search,
+    set_default_journal_template, set_doc_mode_enter_for_new_block, set_favorites,
+    set_guide_announced, set_journal_title_format, set_logical_outdenting, set_preferred_format,
+    set_preferred_workflow, set_show_brackets, set_start_of_week, set_timetracking_enabled,
+    stream_asset_path, sync_conflict_diff, tine_open_devtools, tine_quit, trash_asset,
+    trash_journal_file, trash_sync_conflict, write_highlights, write_pdf_view_state,
 };
 use debug::{debug_header, debug_info, debug_init, debug_log, diag, install_panic_logger};
 use graph::{
@@ -590,6 +593,8 @@ pub fn run() {
     let builder = builder.plugin(android_media::init());
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_system_bars::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android_safe_back::init());
     #[cfg(target_os = "ios")]
     let builder = builder.plugin(ios_folder_picker::init());
     // Mobile has no xdg-open/open/explorer, so `open_external` routes URL opens
@@ -786,6 +791,10 @@ pub fn run() {
             trash_journal_file,
             read_journal_file,
             get_page_by_path,
+            activate_editor,
+            activate_absent_editor,
+            retire_editor_activation,
+            present_conflict_override,
             merge_pages,
             rename_file_to_page,
             search,
@@ -845,6 +854,7 @@ pub fn run() {
             list_spellcheck_dictionaries,
             debug_info,
             debug_log,
+            prepare_tine_quit,
             tine_quit,
             close_graph_window,
             tine_open_devtools

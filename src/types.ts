@@ -74,10 +74,49 @@ export interface PageDto {
    *  SPECIFIC file (a duplicate-day stray, #21) saves to its own file rather than
    *  being re-resolved by name to the canonical one. Empty for a brand-new page. */
   path?: string;
+  /** Which live editor instance is issuing this save.
+   *
+   *  Stamped from the activation registry when the DTO is built, NOT carried on
+   *  `FeedPage` — a token on the page object is copied by every clone and history
+   *  snapshot, and the copy would then claim an identity it does not have.
+   *  Absent for an editor-less writer; legal on the ordinary save path, refused on
+   *  the override path. (GH #254 increment 3.) */
+  activation?: number;
   /** Bundled in-app Guide page: read-only, ephemeral, and excluded from normal
    *  graph persistence/search/reference surfaces. */
   guide?: boolean;
 }
+
+/** What an activation request means for a path that already has a live editor. */
+export type ActivationIntent = "reuse" | "replace";
+
+/** The exact revision of a DTO being installed, or null only for the mounted
+ * save fallback whose ordinary base-revision guard remains the write authority. */
+export type ActivationExpectedRevision = string | null;
+
+/** The outcome of activating an editor. */
+export interface EditorActivationHandle {
+  activation: number;
+  /** The exact path this activation is live for. For an absent editor this is the
+   *  prospective target resolved at activation time. */
+  target: string;
+  /** True when no file existed at activation time. */
+  prospective: boolean;
+}
+
+/** Result of saving an editor page.
+ *
+ * Direct Files may return the activation that now owns a successful first
+ * creation (including its resolved target). Managed storage keeps its existing
+ * revision-only semantics and therefore omits `activation`. The string arm is
+ * retained for compatibility with older/mock managed backends during the
+ * transport transition. */
+export type SavePageResult =
+  | string
+  | {
+      revision: string;
+      activation?: EditorActivationHandle;
+    };
 
 /** One authoritative Journals-feed transaction.  Cursor fields are ordinal
  * journal days, never counts of returned DTOs (a selected file may vanish). */
@@ -211,6 +250,18 @@ export interface SparseV2Tick {
   epoch: number | null;
 }
 
+/** A watcher update scoped to the graph binding that produced it. */
+export interface SparseV2TickEvent {
+  binding_generation: number;
+  tick: SparseV2Tick;
+}
+
+/** A watcher failure scoped to the graph binding that produced it. */
+export interface SparseV2ErrorEvent {
+  binding_generation: number;
+  message: string;
+}
+
 export interface SparseV2RuntimeStatus {
   lifecycle: "active" | "terminal" | "stopped_safe" | "stopped_crashed";
   recovery: "first_promotion" | "resumed_own_unsafe" | "adopted_safe_handoff" | "took_over_crashed_unsafe" | null;
@@ -238,6 +289,12 @@ export type SparseV2Status = SparseV2Availability & {
   cancel_reason: string | null;
   binding_generation: number;
 };
+
+/** A status snapshot scoped to the graph binding that produced it. */
+export interface SparseV2RuntimeStatusEvent {
+  binding_generation: number;
+  runtime: SparseV2RuntimeStatus;
+}
 
 export interface SparseV2CancelResult {
   status: SparseV2Status;

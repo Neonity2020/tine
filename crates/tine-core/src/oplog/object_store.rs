@@ -8275,6 +8275,9 @@ pub(crate) fn filesystem_error_without_collision(
 ) -> StoreError {
     match error {
         tine_storage::FilesystemError::Io(error) => StoreError::Io(error),
+        tine_storage::FilesystemError::DurableNameOperationUnavailable(message) => {
+            StoreError::Io(std::io::Error::new(ErrorKind::Unsupported, message))
+        }
         tine_storage::FilesystemError::UnsafeEntry(message) => StoreError::UnsafeEntry(message),
         tine_storage::FilesystemError::StoredLengthMismatch {
             path,
@@ -11534,52 +11537,27 @@ mod bootstrap_store_tests {
             assert_absent();
         }
         for part in &fixture.parts {
-            for object in &part.object_bytes {
-                store.publish_bootstrap_object_bytes(object).unwrap();
-                store.publish_bootstrap_object_bytes(object).unwrap();
-                assert_absent();
-            }
-
-            let part_name = hex_bytes(part.descriptor.part_id().as_bytes());
-            let parts = store
-                .bootstrap_namespace(BOOTSTRAP_PARTS_DIR, true)
+            store
+                .publish_bootstrap_part_pack_for_test(part.descriptor, &part.object_bytes)
                 .unwrap();
-            publish_bootstrap_immutable(
-                &parts,
-                &part_name,
-                &part.manifest_bytes,
-                "bootstrap part manifest",
-                part_name.clone(),
-            )
-            .unwrap();
+            store
+                .publish_bootstrap_part_pack_for_test(part.descriptor, &part.object_bytes)
+                .unwrap();
             assert_absent();
-
-            let evidence = part.descriptor.evidence();
-            let evidence_name = hex_bytes(evidence.evidence_digest().as_bytes());
-            let evidence_dir = store
-                .bootstrap_namespace(BOOTSTRAP_EVIDENCE_DIR, true)
+            store
+                .publish_bootstrap_part_artifacts(
+                    part.descriptor,
+                    &part.manifest_bytes,
+                    &part.spans,
+                )
                 .unwrap();
-            publish_bootstrap_immutable(
-                &evidence_dir,
-                &evidence_name,
-                &evidence.encode().unwrap(),
-                "bootstrap part evidence",
-                evidence_name.clone(),
-            )
-            .unwrap();
-            assert_absent();
-
-            let spans = store
-                .bootstrap_namespace(BOOTSTRAP_PART_SPANS_DIR, true)
+            store
+                .publish_bootstrap_part_artifacts(
+                    part.descriptor,
+                    &part.manifest_bytes,
+                    &part.spans,
+                )
                 .unwrap();
-            publish_bootstrap_immutable(
-                &spans,
-                &part_name,
-                &part.spans.encode().unwrap(),
-                "bootstrap part span index",
-                part_name.clone(),
-            )
-            .unwrap();
             assert_absent();
         }
 

@@ -2,6 +2,57 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "UI-MANAGED-ANDROID-ROOT-SHUTDOWN-001",
+      "title": "Android root Back verifies every managed runtime can stop before activity exit and preserves the safe transition if exit must retry",
+      "family": "window-lifecycle",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/androidBack.test.ts",
+          "src/safeClose.test.ts",
+          "src-tauri/src/managed_command_surface.rs",
+          "crates/tine-core/src/sync_runtime.rs"
+        ],
+        "scenario": "managed-android.root-back-prepares-before-activity-exit",
+        "failBefore": "proven"
+      },
+      "notes": "Android root Back first runs the shared frontend safe-close transaction, then the registered prepare_tine_quit all-slot native gate, then the existing AppPlugin activity exit. Frontend or native preparation refusal resets the transition and a later Back repeats the full sequence. Once native preparation resolves, the UI remains noneditable even if AppPlugin exit rejects; the next Back retries only the exit. Unit/source guards prove ordering and registration; a real Android hardware-Back run remains unverified locally."
+    },
+    {
+      "id": "UI-MANAGED-SAVE-CONFLICT-RESOLUTION-001",
+      "title": "Managed save conflicts retain the editor draft and offer a revision-bound Keep mine or Use current choice",
+      "family": "edit-render-boundary",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs",
+          "src-tauri/src/commands.rs",
+          "src/persistenceConflictRetry.test.ts",
+          "src/components/ConflictBar.test.tsx",
+          "scripts/e2e-sparse-v2-recovery.mjs"
+        ],
+        "scenario": "managed-save.conflict-resolution-is-explicit-and-revision-bound",
+        "failBefore": "proven"
+      },
+      "notes": "Necessity gate proven: the managed native gateway rejected every force before actor invocation and mapped stale saves to a permanent toast, so the retained draft had no in-app authoring path. The covered path observes the exact pinned managed path and revision without loading it into the editor, binds Keep mine to that observation, serializes the replacement through one actor turn, re-conflicts after a second accepted change, recreates remotely deleted retained blocks under fresh durable IDs, and disables replacement for missing, renamed, ambiguous, or otherwise unobservable owners. A baseRev-null draft that loses a concurrent create observes the winner independently by logical name and kind, then resolves against that exact winner path and revision. Use current does not reload or discard the retained draft until the user explicitly selects it."
+    },
+    {
       "id": "UI-MANAGED-CRASH-STARTUP-RECOVERY-001",
       "title": "Restarting after interrupted managed-storage activation reveals the app and reports bounded recovery progress without weakening validation",
       "family": "window-lifecycle",
@@ -6174,7 +6225,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/components/Block.mathBlockEnter.test.tsx"
@@ -6200,7 +6251,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/router.revealBlock.test.tsx"
@@ -6226,7 +6277,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/components/LinkedReferences.test.tsx",
@@ -6253,7 +6304,7 @@
         "macos"
       ],
       "layer": "unit",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/editor/nearestLink.test.ts",
@@ -6263,6 +6314,57 @@
         "failBefore": "proven"
       },
       "notes": "OG parity gap: OG binds :editor/follow-link to mod+o and :editor/open-link-in-sidebar to mod+shift+o (frontend/modules/shortcut/config.cljs:214/:217); Tine had no mod+o at all. The 'which link' rule is transcribed from OG's thingatpt.cljs extract-nearest-link-from-text, including its surprising part: OG collects EVERY candidate in the block and picks the one nearest the caret, so a caret anywhere in a block with one link still follows it. URLs are included for follow and deliberately excluded for the sidebar, matching OG's two call sites. Block refs are best-effort: a bare ((uuid)) in raw text carries no page, so a block outside the loaded working set is not found - the same give-up OG's open-link-in-sidebar! does when db/get-page misses. FAIL-BEFORE is an absence (no mod+o binding existed), verified by grep."
+    },
+    {
+      "id": "UI-ANDROID-SAFE-BACK-SHUTDOWN-001",
+      "title": "Android Back never exits after an unverified managed shutdown and remains owned before JavaScript is ready",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [
+          161
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/androidBack.test.ts",
+          "src/safeClose.test.ts",
+          "src-tauri/src/sync_runtime.rs",
+          "src-tauri/src/commands.rs",
+          "src-tauri/gen/android/app/src/main/java/page/tine/app/SafeBackPlugin.kt"
+        ],
+        "scenario": "android.safe-back-typed-managed-shutdown-owner",
+        "failBefore": "proven"
+      },
+      "notes": "An Android AppPlugin listener could fall back to WebView history or activity finish before JavaScript subscribed, while the process-wide managed shutdown helper collapsed terminal and safe outcomes and could exit after a terminal runtime. The repair introduces a native SafeBack owner that consumes all Back events unless its own listener is ready, and a typed process preparation result: only Safe may exit; Refused reopens the editor only when no managed slot was verified; Partial or an unknown transport result remains shielded and retries native preparation alone. JS tests cover listener lifecycle and the zero-progress/partial/unknown retry matrix; Rust tests cover sorted stop-at-first-refusal aggregation, terminal rejection and Safe retry. Physical Android compilation and hardware Back remain hosted-CI/device gates."
+    },
+    {
+      "id": "UI-MANAGED-RUNTIME-EVENT-BRIDGE-001",
+      "title": "Managed-storage runtime status, progress and failure reasons update the app and open Storage & sync panel for the current graph only",
+      "family": "managed-storage",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/managedStorageRuntime.test.ts",
+          "src/components/Settings.test.tsx"
+        ],
+        "scenario": "managed-storage.runtime-event-status-and-error-bridge",
+        "failBefore": "reconstructed"
+      },
+      "notes": "Confirmed UI audit H1 at dc82d0c4: watcher.rs emitted sparse-v2-status, sparse-v2-tick and sparse-v2-error, but the frontend subscribed only to sparse-v2-changed. The Settings panel therefore retained its open-time status snapshot and the runtime's explicit failure reason was invisible. A single app-owned typed bridge now updates both surfaces, preserves the native reason text, and accepts an event only when its binding generation matches the currently bound graph. Direct-file managed-sync-error and graph-watch-error listeners remain unchanged."
     }
   ]
 }

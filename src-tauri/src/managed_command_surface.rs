@@ -30,18 +30,19 @@ pub(crate) enum ManagedRouting {
     /// Requires the legacy write authority: refused outright under a managed
     /// binding, with `SPARSE_V2_UNSUPPORTED`. This is the list M5 tracks.
     LegacyOnly,
-    /// Reads the graph, served from the managed read-only view.
-    ReadOnly,
     /// Writes `logseq/config.edn`, which is outside the oplog's document domain.
     ConfigWrite,
     /// Writes the recoverable trash tree, which is outside it too.
     TrashWrite,
+    /// Point-addressed filesystem/config/asset service with no retained parsed
+    /// page cache and no graph-text write authority.
+    Filesystem,
     /// Never touches a graph slot (app settings, platform, plugins, the sparse
     /// runtime's own lifecycle commands).
     NoGraphSlot,
 }
 
-use ManagedRouting::{ConfigWrite, LegacyOnly, ManagedRouted, NoGraphSlot, ReadOnly, TrashWrite};
+use ManagedRouting::{ConfigWrite, Filesystem, LegacyOnly, ManagedRouted, NoGraphSlot, TrashWrite};
 
 /// The sources whose commands can reach a graph slot. The Android media,
 /// folder-picker and system-bar commands are deliberately outside this list;
@@ -72,6 +73,7 @@ const UNSCANNED_SOURCES: &[(&str, &str)] = &[
         include_str!("android_folder_picker.rs"),
     ),
     ("android_media.rs", include_str!("android_media.rs")),
+    ("android_safe_back.rs", include_str!("android_safe_back.rs")),
     (
         "android_system_bars.rs",
         include_str!("android_system_bars.rs"),
@@ -83,13 +85,15 @@ const UNSCANNED_SOURCES: &[(&str, &str)] = &[
 /// Sorted by name. Keep it that way; the tests compare sorted sets and the
 /// diff is the point.
 const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
+    ("activate_absent_editor", ManagedRouted),
+    ("activate_editor", ManagedRouted),
     ("activate_sparse_v2", NoGraphSlot),
     ("app_platform", NoGraphSlot),
     ("apply_spellcheck", NoGraphSlot),
     ("approve_external_assets", NoGraphSlot),
-    ("asset_trash_stats", ReadOnly),
-    ("block_ref_counts", ReadOnly),
-    ("block_referrers", ReadOnly),
+    ("asset_trash_stats", Filesystem),
+    ("block_ref_counts", ManagedRouted),
+    ("block_referrers", ManagedRouted),
     ("cancel_sparse_v2", NoGraphSlot),
     ("capture_frontend_ready", NoGraphSlot),
     ("capture_graph_binding", NoGraphSlot),
@@ -97,37 +101,37 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("capture_target", NoGraphSlot),
     ("clipboard_files", NoGraphSlot),
     ("close_graph_window", NoGraphSlot),
-    ("copy_guide_into_graph", LegacyOnly),
+    ("copy_guide_into_graph", ManagedRouted),
     ("copy_image_to_clipboard", NoGraphSlot),
     ("create_graph", NoGraphSlot),
     ("debug_info", NoGraphSlot),
     ("debug_log", NoGraphSlot),
     ("default_graph_parent", NoGraphSlot),
-    ("delete_page", LegacyOnly),
+    ("delete_page", ManagedRouted),
     ("detect_media_editor", NoGraphSlot),
-    ("edit_asset_external", ReadOnly),
+    ("edit_asset_external", Filesystem),
     ("empty_asset_trash", TrashWrite),
     ("enable_managed_sync", LegacyOnly),
-    ("existing_page_names", ReadOnly),
-    ("export_query_subtrees", ReadOnly),
+    ("existing_page_names", ManagedRouted),
+    ("export_query_subtrees", ManagedRouted),
     ("forget_known_graph", NoGraphSlot),
     ("get_app_bool", NoGraphSlot),
     ("get_app_string", NoGraphSlot),
-    ("get_backlink_filter_context", ReadOnly),
-    ("get_backlinks", ReadOnly),
+    ("get_backlink_filter_context", ManagedRouted),
+    ("get_backlinks", ManagedRouted),
     ("get_backup_keep", NoGraphSlot),
     ("get_capture_enter_files", NoGraphSlot),
     ("get_link_first_match", NoGraphSlot),
     ("get_page", ManagedRouted),
     ("get_page_by_path", ManagedRouted),
     ("get_smooth_scroll", NoGraphSlot),
-    ("get_unlinked_refs", ReadOnly),
+    ("get_unlinked_refs", ManagedRouted),
     ("get_watch_mode", NoGraphSlot),
     ("gpu_env", NoGraphSlot),
-    ("graph_source_files", ReadOnly),
+    ("graph_source_files", Filesystem),
     ("guide_pages", NoGraphSlot),
-    ("import_asset", ReadOnly),
-    ("import_native_capture", ReadOnly),
+    ("import_asset", Filesystem),
+    ("import_native_capture", Filesystem),
     ("inspect_graph_access", NoGraphSlot),
     ("install_plugin", NoGraphSlot),
     ("join_sparse_v2_shared", NoGraphSlot),
@@ -135,56 +139,59 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("journal_feed_page", ManagedRouted),
     ("list_backups", LegacyOnly),
     ("list_installed_plugins", NoGraphSlot),
-    ("list_journal_conflicts", ReadOnly),
+    ("list_journal_conflicts", Filesystem),
     ("list_known_graphs", NoGraphSlot),
-    ("list_orphan_assets", ReadOnly),
+    ("list_orphan_assets", ManagedRouted),
     ("list_pages", ManagedRouted),
     ("list_spellcheck_dictionaries", NoGraphSlot),
-    ("list_sync_conflicts", ReadOnly),
-    ("list_templates", ReadOnly),
+    ("list_sync_conflicts", Filesystem),
+    ("list_templates", ManagedRouted),
     ("load_graph", NoGraphSlot),
     ("load_plugin_registry_cache", NoGraphSlot),
     ("load_session", NoGraphSlot),
     ("load_workspaces", NoGraphSlot),
     ("managed_sync_identity_plan", LegacyOnly),
     ("managed_sync_status", LegacyOnly),
-    ("merge_pages", LegacyOnly),
-    ("open_asset", ReadOnly),
+    ("merge_pages", ManagedRouted),
+    ("open_asset", Filesystem),
     ("open_external", NoGraphSlot),
     ("open_graph_window", NoGraphSlot),
-    ("open_page_file", ReadOnly),
-    ("open_pdf", LegacyOnly),
-    ("page_aliases", ReadOnly),
-    ("page_icons", ReadOnly),
-    ("page_print_html", ReadOnly),
+    ("open_page_file", ManagedRouted),
+    ("open_pdf", ManagedRouted),
+    ("page_aliases", ManagedRouted),
+    ("page_icons", ManagedRouted),
+    ("page_print_html", ManagedRouted),
+    ("prepare_tine_quit", NoGraphSlot),
     ("prepare_sparse_v2_share", NoGraphSlot),
-    ("preview_block", ReadOnly),
-    ("publish_html", LegacyOnly),
-    ("query_facets", ReadOnly),
-    ("quick_switch", ReadOnly),
-    ("read_asset", ReadOnly),
-    ("read_custom_css", ReadOnly),
-    ("read_highlights", LegacyOnly),
-    ("read_journal_file", ReadOnly),
+    ("present_conflict_override", LegacyOnly),
+    ("preview_block", ManagedRouted),
+    ("publish_html", ManagedRouted),
+    ("query_facets", ManagedRouted),
+    ("quick_switch", ManagedRouted),
+    ("read_asset", Filesystem),
+    ("read_custom_css", Filesystem),
+    ("read_highlights", Filesystem),
+    ("read_journal_file", Filesystem),
     ("read_local_image", NoGraphSlot),
     ("read_plugin_entry", NoGraphSlot),
     ("read_text_file", NoGraphSlot),
-    ("referenced_page_names", ReadOnly),
-    ("rename_file_to_page", LegacyOnly),
-    ("rename_page", LegacyOnly),
-    ("resolve_block", ReadOnly),
-    ("resolve_blocks", ReadOnly),
-    ("resolve_sync_conflict", LegacyOnly),
+    ("referenced_page_names", ManagedRouted),
+    ("rename_file_to_page", ManagedRouted),
+    ("rename_page", ManagedRouted),
+    ("resolve_block", ManagedRouted),
+    ("resolve_blocks", ManagedRouted),
+    ("resolve_sync_conflict", ManagedRouted),
     ("restore_backup", LegacyOnly),
-    ("run_advanced_query", ReadOnly),
-    ("run_graph_search", ReadOnly),
-    ("run_query", ReadOnly),
-    ("save_asset", LegacyOnly),
+    ("retire_editor_activation", LegacyOnly),
+    ("run_advanced_query", ManagedRouted),
+    ("run_graph_search", ManagedRouted),
+    ("run_query", ManagedRouted),
+    ("save_asset", Filesystem),
     ("save_page", ManagedRouted),
-    ("save_pdf_area_image", LegacyOnly),
+    ("save_pdf_area_image", Filesystem),
     ("save_session", NoGraphSlot),
     ("save_workspaces", NoGraphSlot),
-    ("search", ReadOnly),
+    ("search", ManagedRouted),
     ("set_app_bool", NoGraphSlot),
     ("set_app_string", NoGraphSlot),
     ("set_backup_keep", LegacyOnly),
@@ -212,20 +219,20 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("sparse_v2_tick", NoGraphSlot),
     ("startup_graph_path", NoGraphSlot),
     ("store_plugin_registry_cache", NoGraphSlot),
-    ("stream_asset_path", LegacyOnly),
-    ("sync_conflict_diff", ReadOnly),
+    ("stream_asset_path", Filesystem),
+    ("sync_conflict_diff", Filesystem),
     ("take_data_home_fallback_notice", NoGraphSlot),
     ("take_identifier_migration_notice", NoGraphSlot),
     ("tine_open_devtools", NoGraphSlot),
     ("tine_quit", NoGraphSlot),
     ("trash_asset", TrashWrite),
-    ("trash_journal_file", LegacyOnly),
-    ("trash_sync_conflict", LegacyOnly),
+    ("trash_journal_file", ManagedRouted),
+    ("trash_sync_conflict", TrashWrite),
     ("uninstall_plugin", NoGraphSlot),
     ("verify_plugin_registry", NoGraphSlot),
     ("warm_done", NoGraphSlot),
-    ("write_highlights", LegacyOnly),
-    ("write_pdf_view_state", LegacyOnly),
+    ("write_highlights", ManagedRouted),
+    ("write_pdf_view_state", ManagedRouted),
 ];
 
 /// Every command that a managed binding refuses outright, with the reason it
@@ -234,11 +241,6 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
 ///
 /// Each entry says what the command needs before it can come back.
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
-    (
-        "copy_guide_into_graph",
-        "creates guide pages: oplog transaction",
-    ),
-    ("delete_page", "multi-page mutation: oplog transaction"),
     (
         "enable_managed_sync",
         "legacy-only by construction: it is the migration into managed storage",
@@ -255,60 +257,21 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
         "managed_sync_status",
         "legacy-only by construction: reports the migration",
     ),
-    ("merge_pages", "multi-page mutation: oplog transaction"),
     (
-        "open_pdf",
-        "asset-domain write, still on the legacy authority",
-    ),
-    (
-        "publish_html",
-        "writes publish/, outside the oplog's domain, still on the legacy authority",
-    ),
-    (
-        "read_highlights",
-        "asset-domain sidecar, still on the legacy authority",
-    ),
-    ("rename_file_to_page", "rename: oplog transaction"),
-    ("rename_page", "rename: oplog transaction"),
-    (
-        "resolve_sync_conflict",
-        "rewrites graph text: oplog transaction",
+        "present_conflict_override",
+        "managed conflicts use actor-issued observations, not Direct Files editor activations",
     ),
     (
         "restore_backup",
         "legacy zip backups have no managed analogue",
     ),
     (
-        "save_asset",
-        "asset-domain write, still on the legacy authority",
-    ),
-    (
-        "save_pdf_area_image",
-        "asset-domain write, still on the legacy authority",
+        "retire_editor_activation",
+        "managed editors receive no Direct Files activation to retire",
     ),
     (
         "set_backup_keep",
         "legacy zip backups have no managed analogue",
-    ),
-    (
-        "stream_asset_path",
-        "asset-domain read, still on the legacy authority",
-    ),
-    (
-        "trash_journal_file",
-        "graph-text deletion: oplog transaction",
-    ),
-    (
-        "trash_sync_conflict",
-        "graph-text deletion: oplog transaction",
-    ),
-    (
-        "write_highlights",
-        "asset-domain sidecar, still on the legacy authority",
-    ),
-    (
-        "write_pdf_view_state",
-        "asset-domain sidecar, still on the legacy authority",
     ),
 ];
 
@@ -322,12 +285,16 @@ const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("legacy_graph_cloned(", LegacyOnly),
     ("with_config_graph(", ConfigWrite),
     ("with_trash_graph(", TrashWrite),
-    ("with_read_graph(", ReadOnly),
-    ("read_graph_cloned(", ReadOnly),
+    ("with_filesystem_graph(", Filesystem),
 ];
 
-const MARKER_PRECEDENCE: &[ManagedRouting] =
-    &[ManagedRouted, LegacyOnly, ConfigWrite, TrashWrite, ReadOnly];
+const MARKER_PRECEDENCE: &[ManagedRouting] = &[
+    ManagedRouted,
+    LegacyOnly,
+    ConfigWrite,
+    TrashWrite,
+    Filesystem,
+];
 
 /// Read every `#[tauri::command]` out of one source and classify it by the
 /// routing helper its body uses.
@@ -490,11 +457,11 @@ mod tests {
         }
     }
 
-    /// Settings and the orphaned-asset cleanup are the slice M5-A restored; if
+    /// Settings and excluded-source trash cleanup are the slice M5-A restored; if
     /// they ever go back onto the legacy authority the diff above would say so,
     /// but name them here too so the regression reads as a sentence.
     #[test]
-    fn settings_and_asset_trash_are_not_refused_under_managed_storage() {
+    fn settings_and_excluded_source_trash_are_not_refused_under_managed_storage() {
         let scanned = scanned_surface();
         for command in [
             "set_favorites",
@@ -515,7 +482,7 @@ mod tests {
                 "{command} must persist through the configuration capability"
             );
         }
-        for command in ["trash_asset", "empty_asset_trash"] {
+        for command in ["trash_asset", "empty_asset_trash", "trash_sync_conflict"] {
             assert_eq!(
                 scanned.get(command),
                 Some(&TrashWrite),

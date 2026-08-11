@@ -4450,8 +4450,30 @@ fn coordinator_projection_fault_can_be_consumed_repeatedly_without_residue() {
     simulator.run().unwrap();
 }
 
+/// Run one body on a stack the size production actually gives these paths.
+///
+/// The simulator drives the managed engine, which in production runs on the
+/// sync actor's 16 MiB stack (`ACTOR_STACK_BYTES`), and 32 MiB under Tauri.
+/// libtest's worker threads get 2 MiB, and replaying every crash boundary now
+/// needs slightly more than that — measured: it passes at 4 MiB. The overflow
+/// is libtest's constraint, not a product limit. `tine_core::test_support`
+/// does the same for unit tests but is crate-private.
+fn run_on_actor_sized_stack(body: impl FnOnce() + Send + 'static) {
+    const ACTOR_SIZED_STACK_BYTES: usize = 16 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(ACTOR_SIZED_STACK_BYTES)
+        .spawn(body)
+        .expect("the simulator test thread spawns")
+        .join()
+        .expect("the simulator body must not panic");
+}
+
 #[test]
 fn coordinator_v5_crash_reopen_reconstructs_every_durable_boundary_idempotently() {
+    run_on_actor_sized_stack(coordinator_v5_crash_reopen_reconstructs_every_durable_boundary);
+}
+
+fn coordinator_v5_crash_reopen_reconstructs_every_durable_boundary() {
     let boundaries = std::iter::once((CoordinatorFault::AfterObjects, false))
         .chain(
             [

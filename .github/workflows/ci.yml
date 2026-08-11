@@ -62,6 +62,8 @@ jobs:
 
       - name: Release and offline-source contract fixtures
         run: |
+          node scripts/test-storage-pin.mjs
+          node scripts/check-storage-pin.mjs
           node scripts/check-flatpak-node-sources.mjs
           node scripts/check-flatpak-cargo-sources.mjs
           node scripts/test-release-readiness-lib.mjs
@@ -122,8 +124,12 @@ jobs:
       - name: Flatpak offline Cargo sources are current
         run: node scripts/check-flatpak-cargo-sources.mjs
 
+      - name: Certified tine-storage pin is current
+        run: node scripts/check-storage-pin.mjs
+
       - name: Release pipeline contract fixtures
         run: |
+          node scripts/test-storage-pin.mjs
           node scripts/test-release-readiness-lib.mjs
           node scripts/test-release-pipeline.mjs
           node scripts/test-tine-core-nextest-contract.mjs
@@ -218,37 +224,13 @@ jobs:
       - name: Linux tine-core nextest / deterministic hash shard ${{ matrix.shard }}/4
         run: cargo nextest run --profile ci --package tine-core --partition hash:${{ matrix.shard }}/4
 
-  # tine-storage owns the physical durability layer, and until 2026-08-07 no job
-  # on any platform executed its suite: Linux ran only `--package tine-core`, and
-  # Windows compiled the storage targets with `--no-run` plus a deliberately
-  # bounded six-test smoke. `scripts/tine-core-nextest-contract.mjs` already said
-  # "Linux is the complete tine-storage semantic suite" — this is that sentence
-  # made true. The package is small enough to run unpartitioned; when it becomes
-  # an independently versioned package this job is what its certification runs.
-  linux-storage-nextest:
-    name: Full CI / Linux tine-storage nextest
-    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'full'
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ". -> target"
-      - name: Install cargo-nextest 0.9.143
-        uses: taiki-e/install-action@v2
-        with:
-          tool: nextest@0.9.143
-      - name: Linux tine-storage nextest / complete semantic suite
-        run: cargo nextest run --profile ci --package tine-storage
-
   # Linux host tests do not see either platform branch: Windows has its own cfg
   # implementation, while Android's libc declarations differ from desktop Linux.
-  # Windows compiles every tine-core and tine-storage test target, then executes
-  # declared parity/durability smoke selections in isolated processes.
-  # Full tine-core Windows parity remains deliberately deferred; see docs/CI.md.
+  # The independently certified tine-storage package is not retested here.
+  # Windows compiles every tine-core target against the exact pin and executes
+  # declared cross-layer durability/lifecycle smokes in isolated processes.
   windows-compile:
-    name: Full CI / Windows compile + storage smoke + core smoke
+    name: Full CI / Windows core compile + integration smoke
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'windows' || (inputs.scope == 'full' && inputs.windows_test_name == ''))
     runs-on: windows-latest
     steps:
@@ -270,10 +252,7 @@ jobs:
       - name: Windows core test targets compile (all; release gate)
         if: inputs.windows_test_name == ''
         run: cargo test -p tine-core --no-run
-      - name: Windows storage test targets compile (all; release gate)
-        if: inputs.windows_test_name == ''
-        run: cargo test -p tine-storage --no-run
-      - name: Windows core + storage smoke (isolated contract selections; release gate)
+      - name: Windows core/storage integration smoke (isolated contract selection; release gate)
         if: inputs.windows_test_name == ''
         run: node scripts/tine-core-nextest-contract.mjs --mode windows --run-smoke
       - name: Windows core test (focused exact serial) / ${{ inputs.windows_test_name }}
@@ -341,6 +320,14 @@ jobs:
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
       - name: Android core compiles against Android libc declarations
         run: cargo check -p tine-core --target aarch64-linux-android
+      # tine-core alone cannot see `#[cfg(target_os = "android")]` code in the
+      # app crate. On 2026-08-11 a missing `use tauri::Manager` in
+      # android_safe_back.rs compiled everywhere except Android, passed this
+      # job, and only surfaced in release packaging — after full CI was green
+      # on the exact candidate. Check the app crate here so an Android-only
+      # break fails the release gate instead of the release.
+      - name: Android app crate compiles (Android-only cfg paths)
+        run: cargo check -p tine --target aarch64-linux-android
 
   # Focused, signed APK proof for the frozen sync candidate. This remains outside
   # full CI: it is manually dispatched only with scope=android and never releases.

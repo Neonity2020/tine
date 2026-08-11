@@ -400,6 +400,9 @@ pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) payload_bytes_read: u64,
     pub(crate) manifest_entries: u64,
     pub(crate) projection_plans: u64,
+    /// Complete live-graph source revalidations performed while constructing
+    /// one inactive shadow proof.
+    pub(crate) source_revalidations: u64,
     pub(crate) bulk_materialization_chunks: u64,
     pub(crate) bulk_pages_materialized: u64,
     pub(crate) peak_bulk_pages: u64,
@@ -1659,12 +1662,6 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         summary,
     )?;
     let paths = publication_paths(roots, authority.binding(), publication_id)?;
-
-    // This is deliberately the last live-source action before staging.
-    capture.verify_before_inactive_bootstrap_authoring(graph)?;
-    trace_lap("pre-construction source revalidation", &mut shadow_lap);
-
-    ensure_publication_parent(roots, authority.binding(), &paths)?;
     let mut instrumentation = ShadowProjectionInstrumentation {
         catalog_rows: catalog_binding.catalog_rows(),
         source_files: summary.file_count,
@@ -1672,6 +1669,14 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         peak_owned_catalog_rows: summary.file_count.min(CATALOG_PAGE_ROWS as u64),
         ..ShadowProjectionInstrumentation::default()
     };
+
+    // Do not reread the complete live graph before private construction. The
+    // manifest is built from the sealed capture, not from live paths, and the
+    // final revalidation below rejects every pre-existing or concurrent source
+    // change before the typed proof can escape this call. A second full scan
+    // here only failed earlier while doubling graph-wide observation work.
+
+    ensure_publication_parent(roots, authority.binding(), &paths)?;
     let final_exists = path_exists(&paths.final_directory)?;
     let stage_exists = path_exists(&paths.stage)?;
     if final_exists && stage_exists {
@@ -1798,6 +1803,11 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
     // This is deliberately the final live-graph observation. No graph path is
     // opened for write anywhere in this module.
     before_final_source_verify_hook()?;
+    instrumentation.source_revalidations = checked_add(
+        instrumentation.source_revalidations,
+        1,
+        "shadow source revalidations",
+    )?;
     capture.verify_before_inactive_bootstrap_authoring(graph)?;
     trace_lap("final source revalidation", &mut shadow_lap);
 

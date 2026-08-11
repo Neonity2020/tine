@@ -112,6 +112,7 @@ import { flushAll, resetStore } from "../store";
 import { backend, isTauri, type BackupInfo } from "../backend";
 import { dbg } from "../debug";
 import type { AssetInfo, TrashStats, JournalFile, SyncConflict, SyncConflictDiff, DiffRow, MergeDecision, PageEntry, SparseV2ActivationProgress, SparseV2Status } from "../types";
+import { managedStorageRuntime } from "../managedStorageRuntime";
 import { formatJournal } from "../journal";
 import { installedPlugins, pluginManager, type ManagedPlugin } from "../plugins/manager";
 import {
@@ -2118,7 +2119,8 @@ function GraphTab(props: { publishMsg: string; doPublish: () => void }): JSX.Ele
 }
 
 function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
-  const [status, setStatus] = createSignal<SparseV2Status | null>(null);
+  const status = () => managedStorageRuntime.snapshot().status;
+  const runtimeError = () => managedStorageRuntime.snapshot().error;
   const [loading, setLoading] = createSignal(true);
   const [enabling, setEnabling] = createSignal(false);
   const [activationProgress, setActivationProgress] = createSignal<SparseV2ActivationProgress | null>(null);
@@ -2175,7 +2177,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const refresh = async () => {
     setLoading(true);
     try {
-      setStatus(await backend().sparseV2Status());
+      await managedStorageRuntime.refresh();
     } catch {
       pushToast("Couldn't read Tine-managed storage status. Try again.", "error");
     } finally {
@@ -2197,6 +2199,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const enable = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setEnabling(true);
     setActivationProgress(null);
     setGraphTransitioning(true);
@@ -2232,7 +2235,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
       dbg("managed storage setup: invoking native activation");
       const result = await backend().activateSparseV2();
       dbg(`managed storage setup: native activation returned (${result.state})`);
-      setStatus(result);
+      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
       refreshAuthorityState();
       if (result.state === "active") {
         pushToast("Tine-managed storage is active.", "success");
@@ -2250,6 +2253,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const prepareShare = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setSharing(true);
     setGraphTransitioning(true);
     try {
@@ -2262,7 +2266,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           "Tine writes sync data under this graph's existing internal directory. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
       const result = await backend().prepareSparseV2Share();
-      setStatus(result);
+      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
       refreshAuthorityState();
       pushToast(
         result.state === "active"
@@ -2279,6 +2283,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const joinShare = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setSharing(true);
     setGraphTransitioning(true);
     try {
@@ -2291,7 +2296,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           "Tine verifies that this device is joining the same graph history before it continues. Existing Markdown/Org files stay in place and remain Logseq-compatible."
       ))) return;
       const result = await backend().joinSparseV2Shared();
-      setStatus(result);
+      if (!managedStorageRuntime.transitionTo(result, expectedBinding)) return;
       refreshAuthorityState();
       pushToast(
         result.state === "active"
@@ -2308,6 +2313,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   };
 
   const cancelSparse = async () => {
+    const expectedBinding = status()?.binding_generation ?? null;
     setCancelling(true);
     setGraphTransitioning(true);
     try {
@@ -2324,7 +2330,7 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
           "Pending in-memory edits will be retried after Direct files returns."
       ))) return;
       const result = await backend().cancelSparseV2();
-      setStatus(result.status);
+      if (!managedStorageRuntime.transitionTo(result.status, expectedBinding)) return;
       let flushed = false;
       try {
         flushed = await flushAll();
@@ -2486,6 +2492,13 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                           </div>
                         </Show>
                       </>
+                    )}
+                  </Show>
+                  <Show when={runtimeError()}>
+                    {(message) => (
+                      <div class="settings-hint" role="alert" style={{ "margin-top": "6px" }}>
+                        Managed storage needs attention: {message()}
+                      </div>
                     )}
                   </Show>
                   <div class="settings-hint" style={{ "margin-top": "6px" }}>

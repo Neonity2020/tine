@@ -408,6 +408,7 @@ pub(crate) struct PromotedRuntimeOpenInstrumentation {
     /// copying three of them forces a source change every time the search moves.
     pub(crate) projection_rebuild_counters: super::sqlite::RebuildInstrumentation,
     pub(crate) engine: super::hot_engine::EnrolledProjectionOpenInstrumentation,
+    pub(crate) engine_stages: super::hot_engine::EngineOpenStageBreakdown,
 }
 
 #[cfg(test)]
@@ -3427,6 +3428,29 @@ impl PromotedLocalRuntime {
         status
     }
 
+    /// Refresh the crash-recovery accelerator at a managed-local compaction
+    /// boundary without running unrelated packed-index maintenance.
+    ///
+    /// Managed-local compaction already proves that the journal prefix is
+    /// accepted, collapsed into the hot engine, and quiescent.  Publishing at
+    /// that sparse boundary prevents an unsafe reopen from replaying the
+    /// runtime's entire lifetime of post-activation saves.  This remains a
+    /// cache operation: refusal is recorded for diagnostics and never turns a
+    /// successful save or compaction into a failure.
+    pub(crate) fn publish_compaction_resume_point(
+        &mut self,
+        authority: &LocalActiveAuthority,
+        graph: &Graph,
+    ) -> ResumePublicationStatus {
+        let status = self.publish_quiescent_resume_point_inner(
+            authority,
+            graph,
+            PackedPatriciaMaintenance::Skip,
+        );
+        self.resume_publication = Some(status.clone());
+        status
+    }
+
     fn publish_quiescent_resume_point_inner(
         &mut self,
         authority: &LocalActiveAuthority,
@@ -5438,6 +5462,10 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
     }
     let engine_open = engine_open_started.map(|started| started.elapsed());
     let engine_stages = super::hot_engine::take_engine_open_stage_breakdown();
+    #[cfg(test)]
+    {
+        timing.engine_stages = engine_stages;
+    }
     if let Some(error) = receipt.refusal.as_ref() {
         resume_candidate = "engine_refused";
         unavailable = Some(ResumeAcceleratorUnavailable::Unavailable(format!(

@@ -55,16 +55,16 @@ describe("clipboard payload builder", () => {
 });
 
 describe("page-instance generations", () => {
-  it("changes across reload/rebind/forget and never reuses a retired instance", () => {
+  it("changes across reload/rebind/forget and never reuses a retired instance", async () => {
     loadSingle(page("Page", [{ id: "a", raw: "a", collapsed: false, children: [] }]));
     const loaded = pageInstanceGeneration("Page")!;
-    reloadPage(page("Page", [{ id: "a", raw: "changed", collapsed: false, children: [] }]));
+    await reloadPage(page("Page", [{ id: "a", raw: "changed", collapsed: false, children: [] }]));
     const reloaded = pageInstanceGeneration("Page")!;
-    ensurePageLoaded(page("Page", [{ id: "b", raw: "rebound", collapsed: false, children: [] }], "pages/other.md"));
+    await ensurePageLoaded(page("Page", [{ id: "b", raw: "rebound", collapsed: false, children: [] }], "pages/other.md"));
     const rebound = pageInstanceGeneration("Page")!;
     forgetPage("Page");
     expect(pageInstanceGeneration("Page")).toBeNull();
-    ensurePageLoaded(page("Page", [{ id: "c", raw: "new", collapsed: false, children: [] }]));
+    await ensurePageLoaded(page("Page", [{ id: "c", raw: "new", collapsed: false, children: [] }]));
     const recreated = pageInstanceGeneration("Page")!;
 
     expect(reloaded).toBeGreaterThan(loaded);
@@ -72,15 +72,15 @@ describe("page-instance generations", () => {
     expect(recreated).toBeGreaterThan(rebound);
   });
 
-  it("retires an evicted page generation", () => {
+  it("retires an evicted page generation", async () => {
     loadSingle(page("Main", [{ id: "main", raw: "main", collapsed: false, children: [] }]));
-    ensurePageLoaded(page("P0", [{ id: "p0", raw: "zero", collapsed: false, children: [] }]));
+    await ensurePageLoaded(page("P0", [{ id: "p0", raw: "zero", collapsed: false, children: [] }]));
     const original = pageInstanceGeneration("P0")!;
     for (let i = 1; i <= 80; i++) {
-      ensurePageLoaded(page(`P${i}`, [{ id: `p${i}`, raw: String(i), collapsed: false, children: [] }]));
+      await ensurePageLoaded(page(`P${i}`, [{ id: `p${i}`, raw: String(i), collapsed: false, children: [] }]));
     }
     expect(pageInstanceGeneration("P0")).toBeNull();
-    ensurePageLoaded(page("P0", [{ id: "p0-new", raw: "new", collapsed: false, children: [] }]));
+    await ensurePageLoaded(page("P0", [{ id: "p0-new", raw: "new", collapsed: false, children: [] }]));
     expect(pageInstanceGeneration("P0")!).toBeGreaterThan(original);
   });
 });

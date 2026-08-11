@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -38,6 +39,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use tine_storage::{
+    ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, FilesystemError,
+};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
@@ -568,6 +572,24 @@ impl ParsedExternalDocument {
             accepted,
         )
     }
+
+    /// Consume one already parsed exact managed-text target into the ordinary
+    /// application DTO.  This is deliberately the same projection used by
+    /// [`Graph::parse_exact_page_dto`], but lets a caller that has already
+    /// consumed the parser result for response preparation avoid parsing its
+    /// requested target a second time.
+    pub(crate) fn into_exact_page_dto(
+        self,
+        path: &ManagedPath,
+        content: &str,
+    ) -> io::Result<PageDto> {
+        let mut dto = page_dto_checked(&self.effective, &self.parsed.document)?;
+        dto.read_only =
+            self.format == Format::Org && !crate::org::org_editable_parsed(content, &self.parsed);
+        dto.rev = Some(self.revision);
+        dto.path = path.as_str().to_owned();
+        Ok(dto)
+    }
 }
 
 pub(crate) fn resolve_external_document_identity(
@@ -650,7 +672,7 @@ pub struct RefGroup {
 /// co-reference facets came from the cached lsdoc projection. This is fetched
 /// only when the Linked References filter opens; ordinary backlink DTOs remain
 /// shallow so their lazy-loading and bridge cost do not change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BacklinkFilterTarget {
     pub page: String,
     pub kind: PageKind,
@@ -703,6 +725,10 @@ impl ReferencedPageNames {
             digest,
             names: (known != Some(digest)).then(|| names.to_vec()),
         }
+    }
+
+    pub(crate) fn answer_for(names: &[String], known: Option<u64>) -> Self {
+        Self::answer(referenced_names_digest(names), names, known)
     }
 }
 
@@ -901,11 +927,58 @@ pub struct PageDto {
     /// yet; then save resolves the path by name, exactly as before.
     #[serde(default)]
     pub path: String,
+    /// Which live editor instance is issuing this save, if any.
+    ///
+    /// The wire half of the editor-activation boundary. It is carried on the DTO
+    /// rather than on the frontend's `FeedPage` deliberately: a token stored in a
+    /// page value is copied by every clone, snapshot and history round-trip, and
+    /// the copy would then claim an identity it does not have. The frontend keeps
+    /// activations in a registry keyed by page identity and stamps this field when
+    /// it builds the DTO.
+    ///
+    /// `None` is an editor-less writer (managed projection, external import,
+    /// sync-id migration, PDF-highlight write) or a pre-increment-3 caller. Legal
+    /// on the ordinary path, where the base-revision guard is the authority;
+    /// refused on the override path. (GH #254 increment 3.)
+    #[serde(default)]
+    pub activation: Option<u64>,
     /// True for bundled in-app Guide pages. Guide pages are ephemeral/read-only
     /// virtual pages and must never be persisted into the user's graph by the
     /// normal save/writeback path.
     #[serde(default)]
     pub guide: bool,
+}
+
+/// Exact asset-side result of one PDF-highlight merge. The annotation page is
+/// a separate authority boundary: Direct Files commits it through the guarded
+/// file writer, while managed storage commits it through the semantic actor.
+/// Keeping the sidecar receipt typed lets either caller compensate a rejected
+/// page transaction without re-reading or guessing which bytes it published.
+pub(crate) struct PdfHighlightSidecarCommit {
+    legacy_key: String,
+    edn_path: PathBuf,
+    legacy_edn: Option<PathBuf>,
+    merged: Vec<crate::pdf::Highlight>,
+    primary_baseline: Option<String>,
+    legacy_baseline: Option<String>,
+    committed: String,
+    area_source_key: String,
+    deleted_areas: Vec<crate::pdf::Highlight>,
+}
+
+impl PdfHighlightSidecarCommit {
+    pub(crate) fn merged(&self) -> &[crate::pdf::Highlight] {
+        &self.merged
+    }
+}
+
+/// Exact excluded-file retirement staged around one managed winner merge.
+/// The actor may restore it only when it knows no semantic batch was authored;
+/// retained or ambiguous publication keeps the recoverable copy in trash.
+pub(crate) struct SyncConflictTrashCommit {
+    source: PathBuf,
+    staged: PathBuf,
+    expected: Vec<u8>,
 }
 
 /// What enabling managed sync would change in the plain-text projection.
@@ -1031,6 +1104,54 @@ pub(crate) enum JournalPageProjectionOutcome<A> {
     CommittedPending(CommittedPendingJournalPageProjection<A>),
 }
 
+/// The only failures possible while crossing the journal append boundary.
+///
+/// Validation failures occur before the append callback has been invoked.
+/// Callback failures are retained as their caller-defined type so the next
+/// layer can make an append-specific decision without recovering an error from
+/// a display string.
+#[derive(Debug)]
+pub(crate) enum JournalPageCommitError<E> {
+    Precommit(io::Error),
+    Append(E),
+}
+
+impl<E> JournalPageCommitError<E> {
+    #[allow(dead_code)] // Available to crate callers that need to inspect a pre-append failure.
+    pub(crate) const fn precommit(&self) -> Option<&io::Error> {
+        match self {
+            Self::Precommit(error) => Some(error),
+            Self::Append(_) => None,
+        }
+    }
+
+    #[allow(dead_code)] // Available to crate callers that need to inspect an append failure.
+    pub(crate) const fn append(&self) -> Option<&E> {
+        match self {
+            Self::Precommit(_) => None,
+            Self::Append(error) => Some(error),
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for JournalPageCommitError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Precommit(error) => error.fmt(formatter),
+            Self::Append(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for JournalPageCommitError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Precommit(error) => Some(error),
+            Self::Append(error) => Some(error),
+        }
+    }
+}
+
 #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 enum JournalPageProjectionRecovery {
     InProcess(JournalPageProjectionPlan),
@@ -1095,10 +1216,10 @@ struct JournalCommittedPageProjection<'a, A> {
 
 #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
 impl<'a> VerifiedJournalPageProjection<'a> {
-    fn append<A>(
+    fn append<A, E>(
         self,
-        append: impl FnOnce() -> io::Result<A>,
-    ) -> io::Result<JournalCommittedPageProjection<'a, A>> {
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalCommittedPageProjection<'a, A>, E> {
         let append_proof = append()?;
         Ok(JournalCommittedPageProjection {
             graph: self.graph,
@@ -2021,9 +2142,106 @@ enum ConflictSnapshot {
     Absent,
 }
 
+/// Identity for one LIVE editor instance over a path.
+///
+/// Opaque to the frontend: it is minted by [`Graph::activate_editor`], carried
+/// across the save transport, and compared for exact equality. It is deliberately
+/// NOT derived from the page's content, revision or path, because the defect this
+/// exists to close is precisely two different editors that agree on all three — a
+/// cloned `PageDto` with the same `base_rev` spending the live editor's epoch.
+///
+/// Values are unique within one `Graph`. The registry lives on the `Graph`, so a
+/// token minted against a different graph is simply not found: the graph binding
+/// the spec requires is structural rather than a compared field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EditorActivation(u64);
+
+impl EditorActivation {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub fn from_u64(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// What an activation request means for a path that already has a live editor.
+///
+/// Path idempotence and same-path content replacement contradict each other
+/// without this discriminator, which is why v5 of the spec was unimplementable at
+/// the same-path row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivationIntent {
+    /// Plain re-hydration: return the live activation and mint nothing. Does not
+    /// burn the incumbent's authority.
+    Reuse,
+    /// The working instance is genuinely being replaced (`reloadPage`,
+    /// `reloadPageIfStillSafe`, PDF-notes refresh). Mints a new activation; the
+    /// frontend retires the exact incumbent only after installing the replacement.
+    Replace,
+}
+
+/// What presenting a conflict observation established. No arm writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictPresentation {
+    /// This editor's observation was live and is now spent: the discard proceeds.
+    Authorised,
+    /// A newer observation exists. There is a live banner to answer, so the user
+    /// answers it again rather than being told nothing happened.
+    Superseded,
+    /// The authority is gone with no successor — typically the raw-watcher path,
+    /// which revokes without emitting any page event. The banner must be
+    /// re-observed rather than left dead.
+    Withdrawn,
+}
+
+/// A live editor instance registered against a path.
+#[derive(Clone, Debug)]
+struct ActivationRecord {
+    activation: EditorActivation,
+    /// Present editors are live for an existing file. Absent editors are live for
+    /// a prospective target that does not exist yet; the target is re-resolved and
+    /// compared at first save.
+    prospective: bool,
+}
+
+#[derive(Default)]
+struct EditorActivationState {
+    next: u64,
+    // Replacement activation is two-phase across an async frontend boundary:
+    // B must become live before A can be retired. Keep every exact activation
+    // for the path during that interval; the last record is the prospective
+    // current instance returned by idempotent Reuse.
+    live: std::collections::HashMap<PathBuf, Vec<ActivationRecord>>,
+}
+
+/// The outcome of activating an editor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EditorActivationHandle {
+    pub activation: EditorActivation,
+    /// The exact path this activation is live for. For an absent editor this is
+    /// the prospective target resolved at activation time, which first save
+    /// re-resolves and compares.
+    pub target: String,
+    /// True when the target did not exist at activation time. Holding it reserves
+    /// nothing on disk, so activation creates no unrequested write.
+    pub prospective: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConflictEditorEpisode {
     loaded_revision: Option<String>,
+    /// The editor activation that observed the conflict.
+    ///
+    /// `None` is the editor-less writer (managed projection, external import,
+    /// sync-id migration, PDF-highlight write) and the pre-increment-3 caller.
+    /// Those are legal on the ordinary path — the base-revision guard is their
+    /// authority — and refused on the override path.
+    activation: Option<EditorActivation>,
 }
 
 /// Which conflict a "Keep mine" is answering.
@@ -2249,6 +2467,13 @@ pub struct Graph {
     /// This is deliberately separate from `loaded_file_identities`: ordinary
     /// loads are evidence for ordinary saves, never permission to overwrite.
     conflict_authority: std::sync::Mutex<ConflictAuthorityState>,
+    /// Live editor activations, keyed by the exact path each is live for.
+    ///
+    /// Deliberately a registry on the `Graph` rather than a field of any page
+    /// value: a token stored inside a page object is copied by every clone,
+    /// snapshot and DTO round-trip, and a copy would then claim an identity it
+    /// does not have (see the frontend's `clonePages`/history snapshots).
+    editor_activations: std::sync::Mutex<EditorActivationState>,
     /// All page names referenced anywhere — `[[link]]`/`#tag`/`#[[..]]` plus
     /// `tags::`/`alias::` property values — in their as-written display case,
     /// keyed by `cache_gen`. Like OG, a page that is only referenced (never given
@@ -3900,7 +4125,6 @@ thread_local! {
     static PROJECTION_AFTER_RETIRE_COLLISION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_POST_PUBLISH_COLLISION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_BEFORE_RESTORE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
-    static PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_RECOVERY_RETIREMENT_AFTER_VALIDATION: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_RECOVERY_FINAL_RETIREMENT: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static PROJECTION_RECOVERY_AFTER_FINAL_REREAD: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
@@ -4288,7 +4512,6 @@ pub(crate) fn reset_projection_graph_test_hooks() {
     PROJECTION_AFTER_RETIRE_COLLISION.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_POST_PUBLISH_COLLISION.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_BEFORE_RESTORE.with(|hook| drop(hook.borrow_mut().take()));
-    PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_RECOVERY_RETIREMENT_AFTER_VALIDATION.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_RECOVERY_FINAL_RETIREMENT.with(|hook| drop(hook.borrow_mut().take()));
     PROJECTION_RECOVERY_AFTER_FINAL_REREAD.with(|hook| drop(hook.borrow_mut().take()));
@@ -4554,26 +4777,91 @@ fn projection_before_restore_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) fn set_projection_recovery_after_bound_capture_hook_for_test(
-    hook: impl FnOnce() -> io::Result<()> + 'static,
-) {
-    PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE.with(|slot| {
-        let replaced = slot.borrow_mut().replace(Box::new(hook));
-        assert!(
-            replaced.is_none(),
-            "projection bound-capture hook already armed"
-        );
-    });
+type ProjectionRecoveryAfterBoundCaptureHook = Box<dyn FnOnce() -> io::Result<()> + Send + 'static>;
+
+#[cfg(test)]
+fn projection_recovery_after_bound_capture_hooks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PathBuf, ProjectionRecoveryAfterBoundCaptureHook>,
+> {
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<PathBuf, ProjectionRecoveryAfterBoundCaptureHook>,
+        >,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 #[cfg(test)]
-fn projection_recovery_after_bound_capture_hook() -> io::Result<()> {
-    PROJECTION_RECOVERY_AFTER_BOUND_CAPTURE
-        .with(|hook| hook.borrow_mut().take().map_or(Ok(()), |hook| hook()))
+pub(crate) fn set_projection_recovery_after_bound_capture_hook_for_test(
+    path: PathBuf,
+    hook: impl FnOnce() -> io::Result<()> + Send + 'static,
+) {
+    let replaced = projection_recovery_after_bound_capture_hooks()
+        .lock()
+        .unwrap()
+        .insert(path, Box::new(hook));
+    assert!(
+        replaced.is_none(),
+        "projection bound-capture hook already armed"
+    );
+}
+
+#[cfg(test)]
+fn projection_recovery_after_bound_capture_hook(path: &Path) -> io::Result<()> {
+    let hook = projection_recovery_after_bound_capture_hooks()
+        .lock()
+        .unwrap()
+        .remove(path);
+    hook.map_or(Ok(()), |hook| hook())
 }
 
 #[cfg(not(test))]
-fn projection_recovery_after_bound_capture_hook() -> io::Result<()> {
+fn projection_recovery_after_bound_capture_hook(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+// Keep the test fault at the narrow core Result boundary rather than adding a
+// test-only control surface to tine-storage.  Keying it by the deterministic
+// ambient return path keeps parallel runtime fixtures independent.
+#[cfg(test)]
+type ProjectionTrashAfterPublicationHook = Box<dyn FnOnce() -> io::Result<()> + Send + 'static>;
+
+#[cfg(test)]
+fn projection_trash_after_publication_hooks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PathBuf, ProjectionTrashAfterPublicationHook>,
+> {
+    static HOOK: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, ProjectionTrashAfterPublicationHook>>,
+    > = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_projection_trash_after_publication_hook_for_test(
+    destination: PathBuf,
+    hook: impl FnOnce() -> io::Result<()> + Send + 'static,
+) {
+    let replaced = projection_trash_after_publication_hooks()
+        .lock()
+        .unwrap()
+        .insert(destination, Box::new(hook));
+    assert!(
+        replaced.is_none(),
+        "projection trash after-publication hook already armed"
+    );
+}
+
+#[cfg(test)]
+fn projection_trash_after_publication_hook(destination: &Path) -> io::Result<()> {
+    let hook = projection_trash_after_publication_hooks()
+        .lock()
+        .unwrap()
+        .remove(destination);
+    hook.map_or(Ok(()), |hook| hook())
+}
+
+#[cfg(not(test))]
+fn projection_trash_after_publication_hook(_destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -5200,11 +5488,11 @@ impl Graph {
     /// `logseq/.tine-trash` sits beside `assets`, `publish` and `.tine-sync` in
     /// `graph_text_scope::fixed_excluded`, so nothing under it is ever scanned,
     /// imported or projected: it is outside the oplog's document domain exactly
-    /// the way `assets/` is. Only the *destination* is covered here. Page,
-    /// journal and conflict trashing still passes through
-    /// [`Graph::admit_managed_text_writer`] because its **source** is graph
-    /// text; this capability restores the asset-side trash writes that were
-    /// refused only incidentally.
+    /// the way `assets/` is. Only the *destination* is covered here. Page and
+    /// journal trashing still passes through [`Graph::admit_managed_text_writer`]
+    /// because their sources are graph text. A recognized sync-conflict copy is
+    /// excluded from the document domain too, so its explicit discard path uses
+    /// this point capability just like an asset does.
     fn ensure_trash_write_target(&self, target: &Path) -> io::Result<()> {
         let trash = trash_root(&self.root);
         if target != trash && !target.starts_with(&trash) {
@@ -5317,6 +5605,7 @@ impl Graph {
             disk_revs: RwLock::new(std::collections::HashMap::new()),
             loaded_file_identities: RwLock::new(std::collections::HashMap::new()),
             conflict_authority: std::sync::Mutex::new(ConflictAuthorityState::default()),
+            editor_activations: std::sync::Mutex::new(EditorActivationState::default()),
             referenced_names_cache: RwLock::new(None),
             page_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             managed_sync: std::sync::Mutex::new(None),
@@ -6601,6 +6890,10 @@ impl Graph {
         path: &ManagedPath,
         bytes: &[u8],
     ) -> io::Result<PageDto> {
+        #[cfg(test)]
+        EXACT_PAGE_DTO_PARSE_ATTEMPTS.with(|attempts| {
+            attempts.set(attempts.get().saturating_add(1));
+        });
         let content = std::str::from_utf8(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -6608,11 +6901,7 @@ impl Graph {
             )
         })?;
         let parsed = self.parse_external_document(path, bytes, false)?;
-        let mut dto = page_dto_checked(&parsed.effective, &parsed.parsed.document)?;
-        dto.read_only = read_only_org(Path::new(path.as_str()), content);
-        dto.rev = Some(parsed.revision);
-        dto.path = path.as_str().to_owned();
-        Ok(dto)
+        parsed.into_exact_page_dto(path, content)
     }
 
     fn decode_present_graph_text(
@@ -8214,6 +8503,88 @@ impl Graph {
         self.ensure_projection_parent_binding(&parent, &target)?;
         self.ensure_projection_target_shape(&parent, &target)?;
         read_projection_optional(parent.final_dir(), &target.filename)
+    }
+
+    /// Preserve the actor's exact current managed projection in user-visible,
+    /// typed recovery trash before the semantic page deletion is authored.
+    /// The digest-derived name makes retries idempotent; an existing destination
+    /// is accepted only when it contains the same bytes.
+    pub(crate) fn preserve_projection_in_trash(
+        &self,
+        path: &ManagedPath,
+        kind: ManagedTextKind,
+        expected: &[u8],
+    ) -> io::Result<PathBuf> {
+        let target = self.projection_page_target(path.as_str())?;
+        if self.read_projection_input(path)?.as_deref() != Some(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed projection changed before recovery preservation",
+            ));
+        }
+        // The actor-authenticated semantic kind, not the source directory,
+        // selects the recovery namespace. Imported managed text may validly
+        // live outside the configured pages/ or journals/ roots.
+        let trash_kind = match kind {
+            ManagedTextKind::Page => TrashEntryKind::Page,
+            ManagedTextKind::Journal => TrashEntryKind::Journal,
+        };
+        let trash = typed_trash_dir(&self.root, trash_kind);
+        self.ensure_trash_write_target(&trash)?;
+        let extension = target
+            .absolute_path
+            .extension()
+            .and_then(|value| value.to_str());
+        let mut identity = Sha256::new();
+        identity.update(path.as_str().as_bytes());
+        identity.update([0]);
+        identity.update(expected);
+        // A valid near-limit source name plus a digest prefix could itself
+        // exceed portable component limits on the recovery path.
+        let destination_name = format!("managed-{:x}", identity.finalize());
+        let leaf = extension
+            .filter(|extension| !extension.is_empty())
+            .map_or_else(
+                || destination_name.clone(),
+                |extension| format!("{destination_name}.{extension}"),
+            );
+        let typed_dir = self.open_typed_projection_trash_dir(trash_kind)?;
+        let destination = trash.join(&leaf);
+        publish_projection_trash_leaf(&typed_dir, &leaf, expected, &destination)?;
+        Ok(destination)
+    }
+
+    /// Open a durable no-follow capability for one typed recovery namespace.
+    ///
+    /// The ambient path is deliberately only a user-visible return value.  The
+    /// directory creation and immutable publication themselves remain bound to
+    /// the graph's retained projection-root capability, component by component.
+    fn open_typed_projection_trash_dir(&self, kind: TrashEntryKind) -> io::Result<Dir> {
+        require_projection_platform()?;
+        self.ensure_projection_root_binding()?;
+        let mut directory = self
+            .projection_root
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "graph has no retained no-follow projection capability",
+                )
+            })?
+            .try_clone()?;
+        let kind = kind.dir_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed recovery trash requires a typed namespace",
+            )
+        })?;
+        for component in ["logseq", ".tine-trash", kind] {
+            ensure_directory_nofollow(&directory, component)
+                .map_err(managed_trash_filesystem_error)?;
+            directory =
+                open_dir_nofollow(&directory, component).map_err(managed_trash_filesystem_error)?;
+        }
+        Ok(directory)
     }
 
     /// Configured managed roots visible to the sparse importer.
@@ -11650,7 +12021,7 @@ impl Graph {
                     .map_err(crdt_io_error)?
             };
             if known {
-                self.trash_sync_conflict_with_permit(&write, &conflict.path)?;
+                self.trash_sync_conflict(&conflict.path)?;
                 changed = true;
             }
         }
@@ -12718,32 +13089,109 @@ impl Graph {
         winner_rel: &str,
         conflict_rel: &str,
     ) -> io::Result<Option<crate::sync_diff::SyncConflictDiff>> {
-        let read = self.admit_managed_text_writer()?;
-        let (Some(win), Some(conf)) = (
-            self.resolve_managed_rel(&read, winner_rel)?,
-            self.resolve_managed_rel(&read, conflict_rel)?,
-        ) else {
+        let winner = ManagedPath::parse(winner_rel.to_owned()).map_err(|_| bad_path())?;
+        let Some(win_bytes) = self.read_projection_input(&winner)? else {
             return Ok(None);
         };
-        // Provider conflict copies are deliberately outside normal graph-text
-        // discovery. This explicit conflict workflow is their only read path.
-        if !path_is_sync_conflict(&conf) {
+        let Some(conf_c) = self.read_sync_conflict_copy(conflict_rel)? else {
             return Ok(None);
-        }
-        let (win_c, conf_c) = match (
-            self.managed_read_to_string(&read, &win),
-            self.managed_read_to_string(&read, &conf),
-        ) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) | (_, Err(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            (Err(e), _) | (_, Err(e)) => return Err(e),
         };
+        let win_c = String::from_utf8(win_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "winner is not UTF-8"))?;
+        let win = self.root.join(winner_rel);
+        let conf = self.root.join(conflict_rel);
         let mine = parse_doc(&win, &win_c);
         let theirs = parse_doc(&conf, &conf_c);
         let mut diff = crate::sync_diff::diff_docs(&mine, &theirs);
         diff.base_rev = content_rev(&win_c);
         diff.conflict_rev = content_rev(&conf_c);
         Ok(Some(diff))
+    }
+
+    /// Read one explicitly recognized provider conflict copy through the same
+    /// confined, no-follow point capability used by managed projections.
+    pub(crate) fn read_sync_conflict_copy(&self, conflict_rel: &str) -> io::Result<Option<String>> {
+        let conflict = self
+            .resolve_configured_rel_lexical(conflict_rel)
+            .ok_or_else(bad_path)?;
+        if !path_is_sync_conflict(&conflict) {
+            return Ok(None);
+        }
+        let path = ManagedPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
+        self.read_projection_input(&path)?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "conflict copy is not UTF-8"))
+    }
+
+    /// Stage exact conflict bytes in typed recoverable trash. The source is
+    /// excluded from graph discovery, so this changes no oplog-owned document.
+    pub(crate) fn stage_sync_conflict_trash(
+        &self,
+        conflict_rel: &str,
+        expected: &[u8],
+    ) -> io::Result<SyncConflictTrashCommit> {
+        let source = self
+            .resolve_configured_rel_lexical(conflict_rel)
+            .ok_or_else(bad_path)?;
+        if !path_is_sync_conflict(&source) {
+            return Err(bad_path());
+        }
+        self.ensure_within_graph_root(&source)?;
+        let path = ManagedPath::parse(conflict_rel.to_owned()).map_err(|_| bad_path())?;
+        if self.read_projection_input(&path)?.as_deref() != Some(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "conflict copy changed before recoverable staging",
+            ));
+        }
+        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+        self.ensure_trash_write_target(&trash)?;
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("txt");
+        let mut identity = Sha256::new();
+        identity.update(conflict_rel.as_bytes());
+        identity.update([0]);
+        identity.update(expected);
+        let staged = trash.join(format!(
+            "{}__managed-{:x}.{extension}",
+            trash_stamp(),
+            identity.finalize()
+        ));
+        move_to_trash(&source, &staged, &trash)?;
+        if fs::read(&staged)?.as_slice() != expected {
+            let _ = move_file_noreplace(&staged, &source);
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "conflict copy changed during recoverable staging",
+            ));
+        }
+        Ok(SyncConflictTrashCommit {
+            source,
+            staged,
+            expected: expected.to_vec(),
+        })
+    }
+
+    pub(crate) fn rollback_sync_conflict_trash(
+        &self,
+        receipt: &SyncConflictTrashCommit,
+    ) -> io::Result<()> {
+        if receipt.source.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "conflict source reappeared while its recovery copy was staged",
+            ));
+        }
+        if fs::read(&receipt.staged)?.as_slice() != receipt.expected.as_slice() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "staged conflict recovery bytes changed",
+            ));
+        }
+        move_file_noreplace(&receipt.staged, &receipt.source)
     }
 
     /// Resolve a sync-conflict copy: build the merged winner from the user's
@@ -12874,31 +13322,11 @@ impl Graph {
     /// that the target actually IS a conflict copy so this can never trash a real
     /// page. Recoverable in `logseq/.tine-trash` (ADR 0007).
     pub fn trash_sync_conflict(&self, conflict_rel: &str) -> io::Result<()> {
-        let write = self.admit_managed_text_writer()?;
-        self.trash_sync_conflict_with_permit(&write, conflict_rel)
-    }
-
-    fn trash_sync_conflict_with_permit(
-        &self,
-        write: &ManagedTextWritePermit,
-        conflict_rel: &str,
-    ) -> io::Result<()> {
-        let conf = self
-            .resolve_managed_rel(write, conflict_rel)?
-            .ok_or_else(bad_path)?;
-        if !path_is_sync_conflict(&conf) {
-            return Err(bad_path()); // refuse anything that isn't a conflict copy
-        }
-        if !self.managed_exists(write, &conf)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no such conflict file",
-            ));
-        }
-        let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
-        let name = conf.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-        let dest = trash.join(format!("{}__{name}", trash_stamp()));
-        self.managed_move_to_trash(write, &conf, &dest, &trash)
+        let content = self
+            .read_sync_conflict_copy(conflict_rel)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such conflict file"))?;
+        self.stage_sync_conflict_trash(conflict_rel, content.as_bytes())
+            .map(|_| ())
     }
 
     /// Raw contents of ONE journal file (by exact filename) — lets the UI show a
@@ -13198,6 +13626,15 @@ impl Graph {
         name: &str,
         kind: PageKind,
     ) -> io::Result<ManagedPath> {
+        self.new_sparse_page_path_for_format(name, kind, self.preferred_format())
+    }
+
+    pub(crate) fn new_sparse_page_path_for_format(
+        &self,
+        name: &str,
+        kind: PageKind,
+        format: Format,
+    ) -> io::Result<ManagedPath> {
         let name = name.trim();
         if name.is_empty() {
             return Err(io::Error::new(
@@ -13205,7 +13642,7 @@ impl Graph {
                 "empty page name",
             ));
         }
-        let extension = self.preferred_format().ext();
+        let extension = format.ext();
         let absolute = match kind {
             PageKind::Page => self.pages_path().join(format!(
                 "{}.{extension}",
@@ -13837,7 +14274,12 @@ impl Graph {
     /// disk parse for a page not yet in the cache (e.g. just created externally).
     pub fn load_page(&self, entry: &PageEntry) -> io::Result<PageDto> {
         crate::fast_commit::note_application_page_load();
-        self.revoke_conflict_authority(&entry.path);
+        // A read is NOT an activation, and must not revoke one. Re-hydrating a
+        // page that is already open — which this path does constantly — would
+        // otherwise disarm a live banner the user can still see. The genuine
+        // disk-move boundaries revoke explicitly elsewhere
+        // (`observe_graph_text_external_paths`, `sync_file_checked`,
+        // `forget_file`), so nothing is lost here. (GH #254 increment 3.)
         let permit = self.admit_retained_managed_text_writer()?;
         let Some(ExactGraphLoadedPage {
             entry: effective,
@@ -13881,7 +14323,7 @@ impl Graph {
         let Some(abs) = self.resolve_rel(rel) else {
             return Ok(None);
         };
-        self.revoke_conflict_authority(&abs);
+        // A read is NOT an activation — see `load_page`. (GH #254 increment 3.)
         if self.entry_for_path(&abs).is_none() {
             return Ok(None);
         }
@@ -15068,6 +15510,23 @@ impl Graph {
         crate::publish::page_print_html(self, name, opts)
     }
 
+    /// Render an actor-owned page DTO without consulting this Graph's parsed
+    /// page cache. The Graph supplies only root/config/asset capabilities to the
+    /// shared print renderer.
+    pub fn page_print_html_page(
+        &self,
+        page: &PageDto,
+        opts: crate::publish::PrintOpts,
+    ) -> io::Result<String> {
+        let document = Document {
+            pre_block: page.pre_block.clone(),
+            roots: dto_blocks_to_doc_checked(&page.blocks, matches!(page.format, Format::Org))?,
+        };
+        Ok(crate::publish::page_print_html_document(
+            self, &page.name, &document, opts,
+        ))
+    }
+
     /// Rename a page, OG-style. Moves its file to the new name and rewrites every
     /// reference across pages AND journals — inline `[[old]]`/`#old`, the page's
     /// OWN self/sibling refs, and bare `tags:: old` property refs — and CASCADES
@@ -15095,6 +15554,7 @@ impl Graph {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty name"));
         }
         if old.is_empty() || crate::refs::same_page(old, new) {
+            self.finish_successful_rename_editor_lifecycle();
             return Ok(()); // nothing to do (case-only rename is intentionally a no-op)
         }
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
@@ -15420,6 +15880,7 @@ impl Graph {
             }
         }
         if edits.is_empty() {
+            self.finish_successful_rename_editor_lifecycle();
             return Ok(()); // page doesn't exist / nothing references it
         }
 
@@ -15642,7 +16103,20 @@ impl Graph {
         for edit in &edits {
             self.record_managed_projection(&write, &edit.dst);
         }
+        self.finish_successful_rename_editor_lifecycle();
         Ok(())
+    }
+
+    /// An ordinary rename resets the frontend's entire working set because the
+    /// transaction can rewrite references in every open page.  The Graph itself
+    /// remains bound, so its activation registry would otherwise outlive those
+    /// destroyed editor instances and a later `Reuse` could inherit a dead
+    /// editor's authority.  Burn the whole graph-wide editor generation only
+    /// after a successful rename; an error leaves the still-mounted editors and
+    /// their conflict banners intact.
+    fn finish_successful_rename_editor_lifecycle(&self) {
+        self.editor_activations.lock().unwrap().live.clear();
+        self.revoke_all_conflict_authority();
     }
 
     /// Delete a page/journal file. Rather than unlinking, the file is moved to a
@@ -15945,6 +16419,13 @@ impl Graph {
                 }
             }
         });
+        self.orphan_assets_with_references(&referenced)
+    }
+
+    pub(crate) fn orphan_assets_with_references(
+        &self,
+        referenced: &std::collections::HashSet<String>,
+    ) -> Vec<AssetInfo> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir(self.assets_path()) else {
             return out;
@@ -16425,32 +16906,7 @@ impl Graph {
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let page_lock = self.page_lock(&page_path);
         let _guard = page_lock.lock().unwrap();
-
-        fs::create_dir_all(self.assets_path())?;
-        let sidecar_path = self.pdf_sidecar_for_update(pdf_filename)?;
-        self.ensure_asset_write_target(&sidecar_path)?;
-        let mut sidecar = read_optional_text(&sidecar_path)?;
-        if let Some(raw) = &sidecar {
-            validate_highlight_edn(raw)?;
-        } else {
-            let skeleton = crate::pdf::write_highlights(&[], "");
-            // Recheck immediately before publish so an external creator wins.
-            if let Some(external) = read_optional_text(&sidecar_path)? {
-                validate_highlight_edn(&external)?;
-                sidecar = Some(external);
-            } else {
-                match atomic_write_new(&sidecar_path, skeleton.as_bytes()) {
-                    Ok(()) => sidecar = Some(skeleton),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        let external = read_optional_text(&sidecar_path)?.ok_or(error)?;
-                        validate_highlight_edn(&external)?;
-                        sidecar = Some(external);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        let state = crate::pdf::parse_pdf_state(sidecar.as_deref().unwrap_or(""));
+        let state = self.open_pdf_asset_only(pdf_filename)?;
 
         // Do not create a new-key page on top of an unmigrated legacy page: the
         // normal highlight write carries its notes forward under one guarded merge.
@@ -16484,6 +16940,41 @@ impl Graph {
         Ok(state)
     }
 
+    /// Initialize/read only OG's asset-side PDF sidecar. Managed storage calls
+    /// this inside its actor and creates the HLS graph page through the oplog.
+    pub(crate) fn open_pdf_asset_only(
+        &self,
+        pdf_filename: &str,
+    ) -> io::Result<crate::pdf::PdfState> {
+        fs::create_dir_all(self.assets_path())?;
+        let sidecar_path = self.pdf_sidecar_for_update(pdf_filename)?;
+        self.ensure_asset_write_target(&sidecar_path)?;
+        let mut sidecar = read_optional_text(&sidecar_path)?;
+        if let Some(raw) = &sidecar {
+            validate_highlight_edn(raw)?;
+        } else {
+            let skeleton = crate::pdf::write_highlights(&[], "");
+            // Recheck immediately before publish so an external creator wins.
+            if let Some(external) = read_optional_text(&sidecar_path)? {
+                validate_highlight_edn(&external)?;
+                sidecar = Some(external);
+            } else {
+                match atomic_write_new(&sidecar_path, skeleton.as_bytes()) {
+                    Ok(()) => sidecar = Some(skeleton),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let external = read_optional_text(&sidecar_path)?.ok_or(error)?;
+                        validate_highlight_edn(&external)?;
+                        sidecar = Some(external);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(crate::pdf::parse_pdf_state(
+            sidecar.as_deref().unwrap_or(""),
+        ))
+    }
+
     /// Persist only OG's last-view page/scale fields. The hls-page lock is shared
     /// with highlight writes so an in-app highlight update cannot race this
     /// read-modify-write; external writers are handled by the same bounded
@@ -16499,6 +16990,27 @@ impl Graph {
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let lock = self.page_lock(&page_path);
         let _guard = lock.lock().unwrap();
+        self.write_pdf_view_state_sidecar(pdf_filename, page, scale)
+    }
+
+    /// Managed-storage sidecar update. The application actor serializes this
+    /// with every other managed PDF operation, so it needs no graph-text writer
+    /// permit and cannot create or modify an HLS page.
+    pub(crate) fn write_pdf_view_state_asset_only(
+        &self,
+        pdf_filename: &str,
+        page: i64,
+        scale: f64,
+    ) -> io::Result<()> {
+        self.write_pdf_view_state_sidecar(pdf_filename, page, scale)
+    }
+
+    fn write_pdf_view_state_sidecar(
+        &self,
+        pdf_filename: &str,
+        page: i64,
+        scale: f64,
+    ) -> io::Result<()> {
         fs::create_dir_all(self.assets_path())?;
         let sidecar_path = self.pdf_sidecar_for_update(pdf_filename)?;
         self.ensure_asset_write_target(&sidecar_path)?;
@@ -16552,6 +17064,12 @@ impl Graph {
         })
     }
 
+    pub(crate) fn pdf_legacy_key_is_unambiguous(&self, pdf_filename: &str) -> bool {
+        let key = crate::pdf::asset_key(pdf_filename);
+        let legacy = crate::pdf::legacy_asset_key(pdf_filename);
+        legacy != key && !self.asset_key_in_use_by_pdf(&legacy)
+    }
+
     /// Read the PDF-name collision input that can select a managed HLS page from
     /// retained A as well. Internal `assets/` is enumerated through the writer's
     /// retained graph capability, so a replacement B cannot suppress or trigger
@@ -16590,6 +17108,181 @@ impl Graph {
         Ok(false)
     }
 
+    /// Merge and publish only the asset-side PDF highlight sidecar. The caller
+    /// must either commit the paired HLS page and call `finish_...`, or reject
+    /// the page transaction and call `rollback_...`. Actor serialization is the
+    /// managed-mode lock; Direct Files still holds its existing HLS page lock.
+    fn commit_highlight_sidecar_asset_only(
+        &self,
+        pdf_filename: &str,
+        highlights: &[crate::pdf::Highlight],
+        base_ids: &[String],
+        legacy_active: bool,
+    ) -> io::Result<PdfHighlightSidecarCommit> {
+        let key = crate::pdf::asset_key(pdf_filename);
+        let legacy_key = crate::pdf::legacy_asset_key(pdf_filename);
+        let legacy_edn = (legacy_active && legacy_key != key)
+            .then(|| self.assets_path().join(format!("{legacy_key}.edn")));
+        fs::create_dir_all(self.assets_path())?;
+        let edn_path = self.assets_path().join(format!("{key}.edn"));
+        self.ensure_asset_write_target(&edn_path)?;
+        let base: std::collections::HashSet<&str> = base_ids.iter().map(String::as_str).collect();
+        for _attempt in 0..4 {
+            let primary_baseline = read_optional_text(&edn_path)?;
+            let legacy_baseline = if primary_baseline.is_none() {
+                match &legacy_edn {
+                    Some(path) => read_optional_text(path)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let existing_edn = primary_baseline.as_ref().or(legacy_baseline.as_ref());
+            if let Some(raw) = existing_edn {
+                validate_highlight_edn(raw)?;
+            }
+            let disk_highlights = existing_edn
+                .map(|raw| crate::pdf::parse_highlights(raw))
+                .unwrap_or_default();
+            let have: std::collections::HashSet<&str> = highlights
+                .iter()
+                .map(|highlight| highlight.id.as_str())
+                .collect();
+            let mut merged = highlights.to_vec();
+            for highlight in &disk_highlights {
+                if !have.contains(highlight.id.as_str()) && !base.contains(highlight.id.as_str()) {
+                    merged.push(highlight.clone());
+                }
+            }
+            let merged_ids: std::collections::HashSet<&str> = merged
+                .iter()
+                .map(|highlight| highlight.id.as_str())
+                .collect();
+            let deleted_areas = disk_highlights
+                .into_iter()
+                .filter(|highlight| {
+                    highlight.image.is_some() && !merged_ids.contains(highlight.id.as_str())
+                })
+                .collect();
+            let area_source_key = if primary_baseline.is_none() && legacy_baseline.is_some() {
+                legacy_key.clone()
+            } else {
+                key.clone()
+            };
+            let committed =
+                crate::pdf::write_highlights(&merged, existing_edn.map_or("", String::as_str));
+            let primary_now = read_optional_text(&edn_path)?;
+            let legacy_now = if primary_now.is_none() && primary_baseline.is_none() {
+                match &legacy_edn {
+                    Some(path) => read_optional_text(path)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if primary_now != primary_baseline
+                || (primary_baseline.is_none() && legacy_now != legacy_baseline)
+            {
+                continue;
+            }
+            let publish = if primary_baseline.is_none() {
+                atomic_write_new(&edn_path, committed.as_bytes())
+            } else {
+                atomic_write(&edn_path, committed.as_bytes())
+            };
+            match publish {
+                Ok(()) => {
+                    return Ok(PdfHighlightSidecarCommit {
+                        legacy_key,
+                        edn_path,
+                        legacy_edn,
+                        merged,
+                        primary_baseline,
+                        legacy_baseline,
+                        committed,
+                        area_source_key,
+                        deleted_areas,
+                    })
+                }
+                Err(error)
+                    if primary_baseline.is_none()
+                        && error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "highlight sidecar changed repeatedly during update",
+        ))
+    }
+
+    pub(crate) fn commit_managed_highlight_sidecar(
+        &self,
+        pdf_filename: &str,
+        highlights: &[crate::pdf::Highlight],
+        base_ids: &[String],
+    ) -> io::Result<PdfHighlightSidecarCommit> {
+        self.commit_highlight_sidecar_asset_only(
+            pdf_filename,
+            highlights,
+            base_ids,
+            self.pdf_legacy_key_is_unambiguous(pdf_filename),
+        )
+    }
+
+    pub(crate) fn rollback_highlight_sidecar_commit(
+        &self,
+        receipt: &PdfHighlightSidecarCommit,
+    ) -> io::Result<()> {
+        self.rollback_highlight_sidecar(
+            &receipt.edn_path,
+            receipt.primary_baseline.as_deref(),
+            &receipt.committed,
+        )
+    }
+
+    pub(crate) fn finish_highlight_sidecar_commit(
+        &self,
+        receipt: &PdfHighlightSidecarCommit,
+    ) -> io::Result<()> {
+        let source_sidecar_guard = (receipt.area_source_key == receipt.legacy_key)
+            .then(|| receipt.legacy_edn.as_deref())
+            .flatten()
+            .zip(receipt.legacy_baseline.as_deref());
+        self.trash_deleted_pdf_area_images(
+            &receipt.area_source_key,
+            &receipt.edn_path,
+            &receipt.committed,
+            source_sidecar_guard,
+            &receipt.deleted_areas,
+        );
+        if let (Some(path), Some(baseline)) = (&receipt.legacy_edn, &receipt.legacy_baseline) {
+            if read_optional_text(path)?.as_ref() == Some(baseline) {
+                let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
+                self.ensure_trash_write_target(&trash)?;
+                fs::create_dir_all(&trash)?;
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("legacy.edn");
+                let destination = trash.join(format!("{}__legacy__{name}", trash_stamp()));
+                if move_file_noreplace(path, &destination).is_ok()
+                    && read_optional_text(&destination)?.as_ref() != Some(baseline)
+                {
+                    let _ = move_file_noreplace(&destination, path);
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "legacy highlight sidecar changed during migration cleanup",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Persist highlights: write `assets/<key>.edn` and the `hls__<key>` page.
     /// `base_ids` are the highlight ids the editor LOADED (its baseline) — used for
     /// a 3-way merge so a highlight the user deleted is honored while one added
@@ -16609,8 +17302,6 @@ impl Graph {
         let legacy_key = crate::pdf::legacy_asset_key(pdf_filename);
         let legacy_active =
             legacy_key != key && !self.retained_asset_key_in_use_by_pdf(&write, &legacy_key)?;
-        let legacy_edn =
-            legacy_active.then(|| self.assets_path().join(format!("{legacy_key}.edn")));
         let legacy_page = if legacy_active {
             self.existing_hls_page_path(&write, &legacy_key)?
         } else {
@@ -16623,15 +17314,6 @@ impl Graph {
         let page_path = self.hls_page_path(&write, pdf_filename, &key)?;
         let lock = self.page_lock(&page_path);
         let _guard = lock.lock().unwrap();
-        fs::create_dir_all(self.assets_path())?;
-        let edn_path = self.assets_path().join(format!("{key}.edn"));
-        self.ensure_asset_write_target(&edn_path)?;
-        // 3-way merge against the on-disk set: keep our current highlights, plus
-        // any disk highlight that is an EXTERNAL addition (id not in our baseline
-        // and not already present). A highlight we deliberately deleted (in the
-        // baseline, absent from current) is NOT resurrected. Prefer the new-key
-        // file; fall back to the legacy-key file (migrating it forward).
-        let base: std::collections::HashSet<&str> = base_ids.iter().map(|s| s.as_str()).collect();
         // Read every artifact that will participate before committing either one.
         // If the notes page (or its legacy source) is unreadable, abort while the
         // sidecar is still untouched rather than leaving a half-updated pair.
@@ -16660,101 +17342,12 @@ impl Graph {
                 "org highlight page is read-only (does not round-trip)",
             ));
         }
-        // Merge and publish the sidecar with the same external-writer guard as
-        // config updates. If Logseq/Syncthing changes either the primary or the
-        // legacy fallback after our read, retry against those new bytes instead
-        // of replacing them with a stale full-file serialization.
-        let mut committed_sidecar = None;
-        for _attempt in 0..4 {
-            let primary_baseline = read_optional_text(&edn_path)?;
-            let legacy_baseline = if primary_baseline.is_none() {
-                match &legacy_edn {
-                    Some(path) => read_optional_text(path)?,
-                    None => None,
-                }
-            } else {
-                None
-            };
-            let existing_edn = primary_baseline.as_ref().or(legacy_baseline.as_ref());
-            if let Some(raw) = existing_edn {
-                validate_highlight_edn(raw)?;
-            }
-            let disk_highlights = existing_edn
-                .map(|raw| crate::pdf::parse_highlights(raw))
-                .unwrap_or_default();
-            let have: std::collections::HashSet<&str> =
-                highlights.iter().map(|h| h.id.as_str()).collect();
-            let mut merged = highlights.to_vec();
-            for h in &disk_highlights {
-                if !have.contains(h.id.as_str()) && !base.contains(h.id.as_str()) {
-                    merged.push(h.clone());
-                }
-            }
-            let merged_ids: std::collections::HashSet<&str> =
-                merged.iter().map(|h| h.id.as_str()).collect();
-            let deleted_areas: Vec<crate::pdf::Highlight> = disk_highlights
-                .into_iter()
-                .filter(|h| h.image.is_some() && !merged_ids.contains(h.id.as_str()))
-                .collect();
-            let area_source_key = if primary_baseline.is_none() && legacy_baseline.is_some() {
-                legacy_key.as_str()
-            } else {
-                key.as_str()
-            };
-            let next =
-                crate::pdf::write_highlights(&merged, existing_edn.map_or("", String::as_str));
-            let primary_now = read_optional_text(&edn_path)?;
-            let legacy_now = if primary_now.is_none() && primary_baseline.is_none() {
-                match &legacy_edn {
-                    Some(path) => read_optional_text(path)?,
-                    None => None,
-                }
-            } else {
-                None
-            };
-            if primary_now != primary_baseline
-                || (primary_baseline.is_none() && legacy_now != legacy_baseline)
-            {
-                continue;
-            }
-            let publish = if primary_baseline.is_none() {
-                atomic_write_new(&edn_path, next.as_bytes())
-            } else {
-                atomic_write(&edn_path, next.as_bytes())
-            };
-            match publish {
-                Ok(()) => {}
-                Err(error)
-                    if primary_baseline.is_none()
-                        && error.kind() == io::ErrorKind::AlreadyExists =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-            committed_sidecar = Some((
-                merged,
-                primary_baseline,
-                legacy_baseline,
-                next,
-                area_source_key.to_string(),
-                deleted_areas,
-            ));
-            break;
-        }
-        let (
-            merged,
-            committed_primary_edn_baseline,
-            committed_legacy_edn_baseline,
-            committed_edn,
-            area_source_key,
-            deleted_areas,
-        ) = committed_sidecar.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "highlight sidecar changed repeatedly during update",
-            )
-        })?;
+        let sidecar = self.commit_highlight_sidecar_asset_only(
+            pdf_filename,
+            highlights,
+            base_ids,
+            legacy_active,
+        )?;
 
         // Upsert into the existing hls page, preserving note children by id.
         // (`page_path` + its lock were taken at the top of this fn.) Prefer the
@@ -16770,7 +17363,7 @@ impl Graph {
             existing.as_ref(),
             pdf_filename,
             label,
-            &merged,
+            sidecar.merged(),
             Format::from_path(&page_path),
         );
         // Preserve the notes page's CRLF (shared with write_page), then go through
@@ -16793,11 +17386,7 @@ impl Graph {
         ) {
             Ok(rev) => rev,
             Err(page_error) => {
-                if let Err(rollback_error) = self.rollback_highlight_sidecar(
-                    &edn_path,
-                    committed_primary_edn_baseline.as_deref(),
-                    &committed_edn,
-                ) {
+                if let Err(rollback_error) = self.rollback_highlight_sidecar_commit(&sidecar) {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!(
@@ -16823,41 +17412,13 @@ impl Graph {
         // Drop the self-write marker now the write is published + cached (see
         // write_page / drop_self_write_marker).
         self.drop_self_write_marker(&page_path, &page_rev);
-        let source_sidecar_guard = (area_source_key == legacy_key)
-            .then(|| legacy_edn.as_deref())
-            .flatten()
-            .zip(committed_legacy_edn_baseline.as_deref());
-        self.trash_deleted_pdf_area_images(
-            &area_source_key,
-            &edn_path,
-            &committed_edn,
-            source_sidecar_guard,
-            &deleted_areas,
-        );
+        self.finish_highlight_sidecar_commit(&sidecar)?;
         // Migrate-on-write cleanup is compare-and-recover: only retire a legacy
         // artifact if it still equals the exact bytes we merged. A concurrent
         // legacy update stays at its original path. Unchanged files are moved to
         // recoverable trash rather than hard-deleted.
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
         self.managed_create_dir_all(&write, &trash)?;
-        if let (Some(path), Some(baseline)) = (&legacy_edn, &committed_legacy_edn_baseline) {
-            if read_optional_text(path)?.as_ref() == Some(baseline) {
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("legacy.edn");
-                let dest = trash.join(format!("{}__legacy__{name}", trash_stamp()));
-                if move_file_noreplace(path, &dest).is_ok()
-                    && read_optional_text(&dest)?.as_ref() != Some(baseline)
-                {
-                    let _ = move_file_noreplace(&dest, path);
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "legacy highlight sidecar changed during migration cleanup",
-                    ));
-                }
-            }
-        }
         if let (Some(path), Some(baseline)) = (&legacy_page, &legacy_page_baseline) {
             if self.managed_read_optional_text(&write, path)?.as_ref() == Some(baseline) {
                 let name = path
@@ -17296,7 +17857,9 @@ impl Graph {
                                 displaced_identity,
                                 &displaced,
                             )?;
-                            projection_recovery_after_bound_capture_hook()?;
+                            projection_recovery_after_bound_capture_hook(
+                                &target_path.absolute_path,
+                            )?;
                             retire_projection_target(
                                 parent.final_dir(),
                                 &target_path.filename,
@@ -17708,7 +18271,23 @@ impl Graph {
                 displaced_identity,
                 &displaced,
             )?;
-            projection_recovery_after_bound_capture_hook()?;
+            projection_recovery_after_bound_capture_hook(&target.absolute_path)?;
+            // The opened file fixed the exact removal base, but the live path
+            // can still be atomically replaced before retirement. Re-open and
+            // bind both bytes and physical identity after that boundary so a
+            // foreign replacement remains live rather than being displaced by
+            // a tombstone authored against the old inode.
+            let (live_file, live) =
+                sync_open_and_read_projection_regular(parent.final_dir(), &target.filename)?;
+            let live_identity = canonical_projection_file_resource_id(&live_file)?;
+            if live != expected_base || live_identity != displaced_identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "projection removal base changed after exact capture",
+                ));
+            }
+            live_file.sync_all()?;
+            drop(live_file);
             retire_projection_target(parent.final_dir(), &target.filename, &retired)?;
             retirement_occurred = true;
             recovery_expected = Some((displaced.clone(), displaced_identity, captured));
@@ -19958,6 +20537,37 @@ impl Graph {
             let path = self
                 .resolve_graph_rel_with_permit(write, &page.path)?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid page path"))?;
+            // An ABSENT editor's first save re-resolves and compares, because the
+            // promise it holds can go stale underneath it: the preferred extension
+            // wins only while no configured alternate exists, so an external
+            // `.org` appearing after activation moves the answer off the `.md`
+            // this editor was promised. Landing on the stale pin would create
+            // exactly the ambiguous twin that creation admission exists to refuse.
+            if let Some(held) = self.prospective_activation_target(page) {
+                let resolved = self.managed_path_for(write, &page.name, page.kind)?;
+                if resolved != held {
+                    // Drift. Whether the new target is free or occupied, the
+                    // editor's IDENTITY moves with it: the same person is still
+                    // typing the same draft. Carrying it across is what lets the
+                    // occupied case be answerable — the ordinary baseline check
+                    // below then sees a present file against this absent editor's
+                    // `base_rev = None` and mints a normal conflict, and the
+                    // override that answers it finds its activation live at the
+                    // file it actually drifted onto.
+                    //
+                    // The alternatives were both reproduced and both wrong:
+                    // keeping `base_rev = None` strands the draft on
+                    // `AlreadyExists` forever, and adopting the existing file's
+                    // revision overwrites external bytes the user never saw.
+                    let activation = EditorActivation::from_u64(
+                        page.activation
+                            .expect("prospective_activation_target requires one"),
+                    );
+                    self.retarget_editor_activation(&held, &resolved, activation);
+                }
+                let cache = self.managed_path_is_cacheable(write, &resolved)?;
+                return Ok((resolved, cache));
+            }
             let cache = self.managed_path_is_cacheable(write, &path)?;
             return Ok((path, cache));
         }
@@ -20036,6 +20646,304 @@ impl Graph {
             .expect("per-path conflict observation epoch exhausted");
         state.tokens.remove(path);
         *epoch
+    }
+
+    /// Activate an editor over `rel`, minting or reusing an activation.
+    ///
+    /// This is deliberately NOT a read. `load_page`/`load_by_path` are
+    /// mixed-purpose: some results become store editors and others are read-only,
+    /// export, transient, or discarded because the page is already loaded. Minting
+    /// on every DTO hand-out would mint for non-editors; minting here means an
+    /// activation exists exactly when a live editor does.
+    ///
+    /// `Reuse` on a path that already has a live activation returns the newest
+    /// one unchanged and does not burn it — plain re-hydration is idempotent.
+    /// `Replace` mints a
+    /// new activation while leaving the incumbent live until the frontend
+    /// completes its compare-and-retire swap, which is what `reloadPage`,
+    /// `reloadPageIfStillSafe` and the PDF-notes refresh genuinely require.
+    ///
+    /// An **absent** page (no file at `rel` yet) activates against a prospective
+    /// target resolved now and returned to the caller. Holding it reserves nothing
+    /// on disk, so activation never performs an unrequested write. First save
+    /// re-resolves and compares, because the resolver's answer can drift when an
+    /// alternate extension appears.
+    pub fn activate_editor(
+        &self,
+        rel: &str,
+        intent: ActivationIntent,
+        expected_revision: Option<&str>,
+    ) -> io::Result<EditorActivationHandle> {
+        let abs = self.resolve_rel(rel).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "editor activation target is outside the graph",
+            )
+        })?;
+        // A present-page installer passes the exact revision of the DTO it just
+        // read. Compare it at the native activation boundary so bytes changed
+        // between read and activation cannot give a stale DTO a live editor
+        // identity. `None` is the deliberately snapshot-less save fallback: it
+        // identifies the mounted editor only; the ordinary save's base-revision
+        // guard still decides whether bytes may land and mints any conflict under
+        // this activation. Absent editors use `activate_absent_editor` instead.
+        if let Some(expected_revision) = expected_revision {
+            let permit = self.admit_retained_managed_text_writer()?;
+            match self.managed_read_optional_text(&permit, &abs)? {
+                Some(content) if content_rev(&content) == expected_revision => {}
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "activation.snapshot_changed: the file changed after the page snapshot was read",
+                    ));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "activation.snapshot_missing: the expected page no longer exists",
+                    ));
+                }
+            }
+        }
+        // A successfully matched expected revision proves presence even if a
+        // concurrently cold/stale inventory has not indexed the file yet.
+        let prospective = expected_revision.is_none() && self.entry_for_path(&abs).is_none();
+        let mut state = self.editor_activations.lock().unwrap();
+        if intent == ActivationIntent::Reuse {
+            if let Some(record) = state.live.get(&abs).and_then(|records| records.last()) {
+                return Ok(EditorActivationHandle {
+                    activation: record.activation,
+                    target: rel.to_owned(),
+                    prospective: record.prospective,
+                });
+            }
+        }
+        state.next += 1;
+        let activation = EditorActivation(state.next);
+        state.live.entry(abs).or_default().push(ActivationRecord {
+            activation,
+            prospective,
+        });
+        Ok(EditorActivationHandle {
+            activation,
+            target: rel.to_owned(),
+            prospective,
+        })
+    }
+
+    /// Activate an editor for a page that has no file yet.
+    ///
+    /// The frontend creates real editors that never receive a core DTO — a missing
+    /// routed page via `emptyPage`, quick capture, carry-to-today, the feed's
+    /// absent "today" journal. Each can take a first edit and be saved, and each
+    /// can meet an external-create conflict on that very first save, so "no token"
+    /// cannot be allowed to mean "not an editor".
+    ///
+    /// The prospective target is resolved now and returned, because
+    /// "live for that path" is otherwise undefined for a page with no path. It
+    /// reserves nothing on disk. First save re-resolves and compares, since the
+    /// resolver's answer can drift when an alternate extension appears
+    /// underneath it.
+    pub fn activate_absent_editor(
+        &self,
+        name: &str,
+        kind: PageKind,
+    ) -> io::Result<EditorActivationHandle> {
+        let permit = self.admit_managed_text_writer()?;
+        let abs = self.managed_path_for(&permit, name, kind)?;
+        let rel = self.rel_path(&abs);
+        let mut state = self.editor_activations.lock().unwrap();
+        state.next += 1;
+        let activation = EditorActivation(state.next);
+        state.live.entry(abs).or_default().push(ActivationRecord {
+            activation,
+            prospective: true,
+        });
+        Ok(EditorActivationHandle {
+            activation,
+            target: rel,
+            prospective: true,
+        })
+    }
+
+    /// Present a conflict observation WITHOUT writing anything.
+    ///
+    /// "Use disk version" is an authority-answering action just like "Keep mine",
+    /// and it has to be decided by the same single source of truth. The frontend
+    /// cannot decide it: the raw-watcher path revokes an observation with no page
+    /// event to react to, so a locally recorded epoch can be dead while every
+    /// local value still compares equal. A map maintained by eventual
+    /// notifications cannot prove live membership, so it is not asked to.
+    ///
+    /// This consumes the authority exactly as a force would — so a stale callback
+    /// cannot answer a banner twice — but performs no write at all, in every arm.
+    /// The three outcomes are what the caller needs to distinguish: the discard may
+    /// proceed, a newer observation superseded it, or the authority is simply gone.
+    /// (GH #254 increment 3.)
+    pub fn present_conflict_override(
+        &self,
+        rel: &str,
+        base_rev: Option<&str>,
+        activation: u64,
+        observation_epoch: u64,
+    ) -> io::Result<ConflictPresentation> {
+        let Some(abs) = self.resolve_rel(rel) else {
+            return Ok(ConflictPresentation::Withdrawn);
+        };
+        let activation = EditorActivation::from_u64(activation);
+        if !self.editor_activation_is_live(&abs, activation) {
+            return Ok(ConflictPresentation::Superseded);
+        }
+        let episode = ConflictEditorEpisode {
+            loaded_revision: base_rev.map(str::to_owned),
+            activation: Some(activation),
+        };
+        match self.consume_conflict_authority(
+            &abs,
+            &episode,
+            ConflictOverride { observation_epoch },
+        ) {
+            Ok(_) => Ok(ConflictPresentation::Authorised),
+            Err(error) => {
+                let message = error.to_string();
+                // A newer live token exists — there is a banner to answer.
+                if message.contains("newer than the conflict this request answers") {
+                    Ok(ConflictPresentation::Superseded)
+                } else {
+                    // Missing, already consumed, or a different episode: whatever
+                    // the banner named is gone.
+                    Ok(ConflictPresentation::Withdrawn)
+                }
+            }
+        }
+    }
+
+    /// Retire `activation` from `rel`, but only if it is still the live one.
+    ///
+    /// Compare-and-retire, never a bare "retire this path": a fire-and-forget path
+    /// retirement can arrive after a newer activation was installed and would then
+    /// revoke the wrong editor. Returns whether anything was retired, so a caller
+    /// racing a newer activation learns it was already superseded rather than
+    /// silently destroying it.
+    pub fn retire_editor_activation(&self, rel: &str, activation: EditorActivation) -> bool {
+        let Some(abs) = self.resolve_rel(rel) else {
+            return false;
+        };
+        let mut state = self.editor_activations.lock().unwrap();
+        let retired = state.live.get_mut(&abs).and_then(|records| {
+            let index = records
+                .iter()
+                .position(|record| record.activation == activation)?;
+            records.remove(index);
+            Some(records.is_empty())
+        });
+        match retired {
+            Some(empty) => {
+                if empty {
+                    state.live.remove(&abs);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Finish the absent-to-present transition after a successful first save and
+    /// return the activation at its exact resolved target.
+    ///
+    /// The save target can move after absent activation (for example when an
+    /// alternate extension appears), so the frontend cannot safely infer the
+    /// path from the request it sent. Returning the core's live record lets the
+    /// exact issuing editor adopt that result without minting on ordinary
+    /// re-saves. Managed storage never calls this legacy-graph operation.
+    pub fn finish_saved_editor_activation(
+        &self,
+        activation: EditorActivation,
+    ) -> Option<EditorActivationHandle> {
+        let (path, prospective) = {
+            let mut state = self.editor_activations.lock().unwrap();
+            let (path, record) = state.live.iter_mut().find_map(|(path, records)| {
+                records
+                    .iter_mut()
+                    .find(|record| record.activation == activation && record.prospective)
+                    .map(|record| (path, record))
+            })?;
+            record.prospective = false;
+            (path.clone(), record.prospective)
+        };
+        Some(EditorActivationHandle {
+            activation,
+            target: self.rel_path(&path),
+            prospective,
+        })
+    }
+
+    /// Is `activation` the live editor for `abs` right now?
+    fn editor_activation_is_live(&self, abs: &Path, activation: EditorActivation) -> bool {
+        let state = self.editor_activations.lock().unwrap();
+        state
+            .live
+            .get(abs)
+            .is_some_and(|records| records.iter().any(|record| record.activation == activation))
+    }
+
+    /// Is this save the FIRST one from an editor that had no file when it opened?
+    ///
+    /// An absent editor pins the prospective target it was given, so by the time
+    /// it saves it looks pinned like any other page. The two must be told apart:
+    /// a pinned path suppresses creation's semantic-owner admission today, and an
+    /// absent editor still needs that admission because it is genuinely creating.
+    /// The pin and the admission trigger therefore stop being the same signal, and
+    /// the activation's own record is what distinguishes them. (GH #254 inc 3.)
+    /// Looked up by ACTIVATION, not by path.
+    ///
+    /// A by-path lookup breaks the moment a prospective editor re-targets: the
+    /// registry moves to the new target while the DTO still names the old pin, so
+    /// the second save (typically the force answering the drift conflict) would
+    /// stop recognising its own editor and land back on the abandoned path. An
+    /// activation is unique within the graph, so identity is the reliable key.
+    fn prospective_activation_target(&self, page: &PageDto) -> Option<PathBuf> {
+        let activation = EditorActivation::from_u64(page.activation?);
+        let state = self.editor_activations.lock().unwrap();
+        state.live.iter().find_map(|(path, records)| {
+            records
+                .iter()
+                .any(|record| record.activation == activation && record.prospective)
+                .then(|| path.clone())
+        })
+    }
+
+    fn save_is_from_prospective_editor(&self, page: &PageDto, _abs: &Path) -> bool {
+        self.prospective_activation_target(page).is_some()
+    }
+
+    /// Move a live activation onto a new target, keeping its identity.
+    ///
+    /// Used when an absent editor's prospective target drifts and the new target
+    /// does not exist: the editor is the same editor, so its identity — and any
+    /// authority bound to it — must survive the re-target rather than forcing the
+    /// user through a fresh conflict for a file nobody has seen.
+    fn retarget_editor_activation(
+        &self,
+        from: &Path,
+        to: &Path,
+        activation: EditorActivation,
+    ) -> bool {
+        let mut state = self.editor_activations.lock().unwrap();
+        let Some((record, empty)) = state.live.get_mut(from).and_then(|records| {
+            let index = records
+                .iter()
+                .position(|record| record.activation == activation)?;
+            let record = records.remove(index);
+            Some((record, records.is_empty()))
+        }) else {
+            return false;
+        };
+        if empty {
+            state.live.remove(from);
+        }
+        state.live.entry(to.to_path_buf()).or_default().push(record);
+        true
     }
 
     fn revoke_conflict_authority(&self, path: &Path) {
@@ -20246,12 +21154,16 @@ impl Graph {
                 (ConflictSnapshot::Absent, None) => true,
                 _ => false,
             },
-            PinnedSaveAuthority::OrdinaryEditorSave(loaded_revision) => match loaded {
+            PinnedSaveAuthority::OrdinaryEditorSave {
+                loaded_revision,
+                prospective_editor,
+            } => match loaded {
                 Some(loaded) => loaded.entry.path == path,
                 // A pinned editor that loaded an existing file may observe its
-                // deletion and mint Absent authority. A never-loaded pinned DTO
-                // still has no creation authority of its own.
-                None => loaded_revision.is_some(),
+                // deletion and mint Absent authority. A core-minted prospective
+                // activation is the separate proof that a never-loaded pinned
+                // editor may create its exact target.
+                None => prospective_editor || loaded_revision.is_some(),
             },
             PinnedSaveAuthority::LoadedRevision(loaded_rev) => {
                 let Some(loaded) = loaded else {
@@ -20286,55 +21198,66 @@ impl Graph {
     /// exact path lock remain held from validation through the append callback
     /// and graph publication.
     ///
-    /// Validation and append failures are ordinary precommit errors.  Once the
+    /// Validation failures are [`JournalPageCommitError::Precommit`], and an
+    /// append callback failure is [`JournalPageCommitError::Append`]. Once the
     /// callback returns its opaque durable proof, every later failure is returned
     /// as [`JournalPageProjectionOutcome::CommittedPending`] and must be retried
     /// with [`Graph::retry_committed_journal_page_projection`], never redrafted or
     /// appended again.
     #[allow(dead_code)] // Consumed by the later trusted-local coordinator integration.
-    pub(crate) fn commit_existing_page_with_journal<A>(
+    pub(crate) fn commit_existing_page_with_journal<A, E>(
         &self,
         page: &PageDto,
         base_rev: &str,
         expected_base: &[u8],
         exact_target: &[u8],
-        append: impl FnOnce() -> io::Result<A>,
-    ) -> io::Result<JournalPageProjectionOutcome<A>> {
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
         #[cfg(test)]
         let validation_started = std::time::Instant::now();
         if page.guide {
-            return Err(io::Error::new(
+            return Err(JournalPageCommitError::Precommit(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "bundled Guide pages cannot be journal projected",
-            ));
+            )));
         }
         if page.path.is_empty() {
-            return Err(io::Error::new(
+            return Err(JournalPageCommitError::Precommit(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "journal projection supports only an existing exact page path",
-            ));
+            )));
         }
-        let write = self.admit_managed_text_writer()?;
-        let _identity = self.lock_graph_text_identity_mutation()?;
-        let (path, cache) = self.existing_journal_projection_target(&write, page)?;
+        let write = self
+            .admit_managed_text_writer()
+            .map_err(JournalPageCommitError::Precommit)?;
+        let _identity = self
+            .lock_graph_text_identity_mutation()
+            .map_err(JournalPageCommitError::Precommit)?;
+        let (path, cache) = self
+            .existing_journal_projection_target(&write, page)
+            .map_err(JournalPageCommitError::Precommit)?;
         let lock = self.page_lock(&path);
         let _guard = lock.lock().unwrap();
-        let verified = self.verify_existing_journal_page_projection(
-            &write,
-            page,
-            base_rev,
-            expected_base,
-            exact_target,
-            path,
-            cache,
-        )?;
+        let verified = self
+            .verify_existing_journal_page_projection(
+                &write,
+                page,
+                base_rev,
+                expected_base,
+                exact_target,
+                path,
+                cache,
+            )
+            .map_err(JournalPageCommitError::Precommit)?;
         #[cfg(test)]
         crate::oplog::trusted_local_commit::note_trusted_local_graph_validation(
             validation_started.elapsed(),
         );
         #[cfg(test)]
         let append_started = std::time::Instant::now();
-        let committed = verified.append(append)?;
+        let committed = verified
+            .append(append)
+            .map_err(JournalPageCommitError::Append)?;
         #[cfg(test)]
         crate::oplog::trusted_local_commit::note_trusted_local_journal_append(
             append_started.elapsed(),
@@ -20583,6 +21506,10 @@ impl Graph {
             self.parse_external_document(&managed_path, expected_base.as_bytes(), false)?;
         let parsed_target =
             self.parse_external_document(&managed_path, exact_target.as_bytes(), false)?;
+        #[cfg(test)]
+        JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| {
+            pairs.set(pairs.get().saturating_add(1));
+        });
         let resolved_target =
             parsed_target.resolve_identity(Some(AcceptedExternalDocumentIdentity {
                 name: &page.name,
@@ -20843,20 +21770,29 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         let editor_episode = ConflictEditorEpisode {
             loaded_revision: base_rev.map(str::to_owned),
+            activation: page.activation.map(EditorActivation::from_u64),
         };
         // Single read of the current file (the conflict baseline AND the
         // formatting source AND, with the written content, the returned rev) —
         // avoids re-reading the file 2-3× per save, which is felt on NFS.
-        let requested_identity = page
-            .path
-            .is_empty()
-            .then_some((page.kind, page.name.as_str()));
+        // Creation admission is NOT the same question as "is this page pinned".
+        // An absent editor pins the prospective target it was handed, and would
+        // otherwise skip the semantic-owner check precisely when it is creating.
+        // For an already-existing target the semantic lookup is inert, so this is
+        // safe on both writers. (GH #254 increment 3.)
+        let requested_identity = (page.path.is_empty()
+            || self.save_is_from_prospective_editor(page, &path))
+        .then_some((page.kind, page.name.as_str()));
         let validation = self.validate_graph_text_target(&write, &path, requested_identity)?;
+        let prospective_editor = self.save_is_from_prospective_editor(page, &path);
         self.require_pinned_save_owner(
             page,
             &path,
             validation.target.as_ref(),
-            PinnedSaveAuthority::OrdinaryEditorSave(base_rev),
+            PinnedSaveAuthority::OrdinaryEditorSave {
+                loaded_revision: base_rev,
+                prospective_editor,
+            },
         )?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
@@ -20987,23 +21923,18 @@ impl Graph {
         }))
     }
 
-    /// Force with whatever authority is outstanding right now.
-    ///
-    /// Deliberately NOT the production path: "whatever is current" is exactly
-    /// the assumption finding 1 exploited. Tests use it to mean "the conflict I
-    /// just caused"; the app must name its observation explicitly through
-    /// `force_save_page_at_revision`.
+    /// Compatibility symbol for callers that have not migrated to explicit
+    /// conflict authority. It deliberately fails closed: choosing whatever
+    /// observation happens to be current could spend authority for a winner the
+    /// caller was never shown.
     pub fn force_save_page(&self, page: &PageDto) -> io::Result<String> {
-        let outstanding = self.outstanding_conflict_override(page)?;
-        self.force_save_page_at_revision(
-            page,
-            page.rev.as_deref(),
-            outstanding.unwrap_or(ConflictOverride {
-                // No token: let the consume step produce its own "missing or
-                // already consumed" refusal rather than a mismatch message.
-                observation_epoch: u64::MAX,
-            }),
-        )
+        if page.guide {
+            return Ok("guide-ephemeral".into());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "conflict_authority.explicit_required: force_save_page requires an explicitly captured observation; use force_save_page_at_revision",
+        ))
     }
 
     /// Save with the exact conflict snapshot shown to this editor episode as the
@@ -21028,16 +21959,43 @@ impl Graph {
         let _guard = lock.lock().unwrap();
         let editor_episode = ConflictEditorEpisode {
             loaded_revision: base_rev.map(str::to_owned),
+            activation: page.activation.map(EditorActivation::from_u64),
         };
+        // The override path demands a LIVE editor activation. Rule 1 of the
+        // contract: an override may only be spent by the exact editor activation
+        // that was shown the conflict. A request with no activation, or one that
+        // is no longer live for this path, cannot be that editor — it is a stale
+        // callback, a cloned DTO, or an editor-less writer that has no business
+        // forcing. Checked BEFORE the atomic consume so a refusal does not burn
+        // the token the real editor still needs. (GH #254 increment 3.)
+        match editor_episode.activation {
+            Some(activation) if self.editor_activation_is_live(&path, activation) => {}
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflict_authority.superseded: the editor activation answering this conflict is no longer live",
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "conflict_authority.spent: a conflict override requires a live editor activation",
+                ));
+            }
+        }
         // Atomic take happens before every fallible validation below. A failed or
         // replayed attempt therefore cannot reuse the authority it started with.
         let authority = self.consume_conflict_authority(&path, &editor_episode, authority)?;
         // "Keep mine" resolves a content conflict, but it must not turn an I/O or
         // decoding failure into permission to overwrite unknown bytes.
-        let requested_identity = page
-            .path
-            .is_empty()
-            .then_some((page.kind, page.name.as_str()));
+        // Creation admission is NOT the same question as "is this page pinned".
+        // An absent editor pins the prospective target it was handed, and would
+        // otherwise skip the semantic-owner check precisely when it is creating.
+        // For an already-existing target the semantic lookup is inert, so this is
+        // safe on both writers. (GH #254 increment 3.)
+        let requested_identity = (page.path.is_empty()
+            || self.save_is_from_prospective_editor(page, &path))
+        .then_some((page.kind, page.name.as_str()));
         let validation = self.validate_graph_text_target(&write, &path, requested_identity)?;
         if validation.requested_identity_elsewhere {
             return Err(io::Error::new(
@@ -22011,7 +22969,32 @@ thread_local! {
     static GRAPH_TEXT_INVENTORY_ENTRY_VISITS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_CONTENT_READS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_PARSE_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static EXACT_PAGE_DTO_PARSE_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_VALIDATION_TARGET_READS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_exact_page_dto_parse_attempts() {
+    EXACT_PAGE_DTO_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn exact_page_dto_parse_attempts() -> usize {
+    EXACT_PAGE_DTO_PARSE_ATTEMPTS.with(Cell::get)
+}
+
+/// The runtime actor owns this thread-local counter.  Its save instrumentation
+/// snapshots it after a foreground attempt so a caller-side test can prove the
+/// guarded Graph base/target validation still parsed on an optimized route.
+#[cfg(test)]
+pub(crate) fn reset_journal_projection_guarded_parse_pairs_for_runtime_test() {
+    JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| pairs.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn journal_projection_guarded_parse_pairs_for_runtime_test() -> usize {
+    JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -22621,6 +23604,10 @@ fn clone_block_dtos_checked(blocks: &[BlockDto]) -> io::Result<Vec<BlockDto>> {
 
 fn clone_page_dto_checked(page: &PageDto) -> io::Result<PageDto> {
     Ok(PageDto {
+        // A CLONE is never the live editor. Copying the activation here is
+        // exactly the defect increment 3 exists to close: a cloned DTO carrying
+        // the same identity could spend the real editor's override authority.
+        activation: None,
         name: page.name.clone(),
         kind: page.kind,
         title: page.title.clone(),
@@ -23614,6 +24601,7 @@ fn page_dto_from_crdt(snapshot: &CrdtPageSnapshot) -> io::Result<PageDto> {
         runtime_owner_namespace("file-block-runtime-v1", &snapshot.path),
     )?;
     Ok(PageDto {
+        activation: None,
         name: snapshot.name.clone(),
         kind,
         title: snapshot.name.clone(),
@@ -23712,6 +24700,7 @@ fn doc_blocks_to_dto_checked(blocks: &[DocBlock]) -> io::Result<Vec<BlockDto>> {
 
 fn page_dto_checked(entry: &PageEntry, doc: &Document) -> io::Result<PageDto> {
     Ok(PageDto {
+        activation: None,
         name: entry.name.clone(),
         kind: entry.kind,
         title: entry.name.clone(),
@@ -23733,6 +24722,7 @@ pub fn markdown_page_dto(name: &str, title: &str, markdown: &str) -> io::Result<
     assign_virtual_doc_runtime_ids(&mut doc.roots, "bundled-markdown-v1", name)?;
     let blocks = doc_blocks_to_dto_checked(&doc.roots)?;
     Ok(PageDto {
+        activation: None,
         name: name.to_string(),
         kind: PageKind::Page,
         title: title.to_string(),
@@ -23746,6 +24736,62 @@ pub fn markdown_page_dto(name: &str, title: &str, markdown: &str) -> io::Result<
     })
 }
 
+/// Convert one application-generated document into a new-page DTO. Durable
+/// block identities are deliberately not selected here: the managed actor
+/// treats these runtime IDs only as temporary request labels and allocates the
+/// real identities in its semantic transaction.
+pub(crate) fn generated_document_page_dto(
+    name: &str,
+    format: Format,
+    mut document: Document,
+    identity_namespace: &str,
+) -> io::Result<PageDto> {
+    assign_virtual_doc_runtime_ids(&mut document.roots, identity_namespace, name)?;
+    Ok(PageDto {
+        activation: None,
+        name: name.to_owned(),
+        kind: PageKind::Page,
+        title: name.to_owned(),
+        pre_block: document.pre_block,
+        blocks: doc_blocks_to_dto_checked(&document.roots)?,
+        rev: None,
+        format,
+        read_only: false,
+        path: String::new(),
+        guide: false,
+    })
+}
+
+pub(crate) fn page_dto_document(page: &PageDto) -> io::Result<Document> {
+    Ok(Document {
+        pre_block: page.pre_block.clone(),
+        roots: dto_blocks_to_doc_checked(&page.blocks, page.format == Format::Org)?,
+    })
+}
+
+pub(crate) fn parse_document_source(path: &Path, content: &str) -> Document {
+    parse_doc(path, content)
+}
+
+pub(crate) fn existing_document_page_dto(
+    base: &PageDto,
+    mut document: Document,
+) -> io::Result<PageDto> {
+    assign_virtual_doc_runtime_ids(
+        &mut document.roots,
+        "managed-document-update-v1",
+        if base.path.is_empty() {
+            &base.name
+        } else {
+            &base.path
+        },
+    )?;
+    let mut page = base.clone();
+    page.pre_block = document.pre_block;
+    page.blocks = doc_blocks_to_dto_checked(&document.roots)?;
+    Ok(page)
+}
+
 /// Whether a page should load read-only: an org file whose on-disk bytes don't
 /// round-trip through Tine's org parser/serializer, so Tine must never rewrite
 /// it (lest it corrupt the user's graph). Markdown pages are always editable.
@@ -23756,7 +24802,7 @@ fn read_only_org(path: &Path, content: &str) -> bool {
 /// A page's `icon::` property value from its pre-block, handling markdown
 /// (`icon:: 🏁`), org property drawers (`:icon: 🏁`) and org `#+ICON:` directives.
 /// None if absent or blank.
-fn pre_block_icon(pre: &str) -> Option<String> {
+pub(crate) fn pre_block_icon(pre: &str) -> Option<String> {
     for line in pre.lines() {
         // Markdown `icon:: value` (single shared parser; needs the `::`).
         if let Some((k, v)) = crate::doc::parse_property_line(line) {
@@ -23978,6 +25024,24 @@ fn collect_block_asset_refs(b: &DocBlock, into: &mut std::collections::HashSet<S
     }
 }
 
+pub(crate) fn collect_application_page_asset_refs(
+    page: &PageDto,
+    into: &mut std::collections::HashSet<String>,
+) {
+    if let Some(pre_block) = page.pre_block.as_deref() {
+        collect_asset_refs(pre_block, into);
+    }
+    fn collect(block: &BlockDto, into: &mut std::collections::HashSet<String>) {
+        collect_asset_refs(&block.raw, into);
+        for child in &block.children {
+            collect(child, into);
+        }
+    }
+    for block in &page.blocks {
+        collect(block, into);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrashEntryKind {
     Asset,
@@ -23997,6 +25061,53 @@ impl TrashEntryKind {
             TrashEntryKind::Other => None,
         }
     }
+}
+
+/// Translate the storage crate's physical boundary into the Graph API's I/O
+/// boundary without losing the collision distinction needed by delete retries.
+fn managed_trash_filesystem_error(error: FilesystemError) -> io::Error {
+    match error {
+        FilesystemError::Io(error) => error,
+        FilesystemError::DurableNameOperationUnavailable(message) => {
+            io::Error::new(io::ErrorKind::Unsupported, message)
+        }
+        FilesystemError::UnsafeEntry(message) => io::Error::new(io::ErrorKind::InvalidData, message),
+        FilesystemError::StoredLengthMismatch {
+            path,
+            expected,
+            actual,
+        } => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "managed recovery stored length mismatch for {path}: expected {expected}, got {actual}"
+            ),
+        ),
+        FilesystemError::StoredFileTooLarge { path, length, limit } => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "managed recovery stored file is too large for {path}: {length} bytes exceeds {limit}"
+            ),
+        ),
+        FilesystemError::ByteCollision => io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "managed recovery destination contains different bytes",
+        ),
+    }
+}
+
+/// Publish a recovery leaf through tine-storage's exact immutable protocol.
+///
+/// On Windows that protocol retains and validates the actual directory
+/// capability.  It deliberately exposes the certified validated-directory
+/// ceiling there; it does not claim an undocumented power-loss directory fsync.
+fn publish_projection_trash_leaf(
+    typed_dir: &Dir,
+    leaf: &str,
+    expected: &[u8],
+    destination: &Path,
+) -> io::Result<()> {
+    publish_immutable_exact(typed_dir, leaf, expected).map_err(managed_trash_filesystem_error)?;
+    projection_trash_after_publication_hook(destination)
 }
 
 fn trash_root(root: &Path) -> PathBuf {
@@ -26351,7 +27462,10 @@ enum PinnedSaveAuthority<'a> {
     /// model (`specs/notes/2026-08-07-trust-model-and-threat-model-decision.md`)
     /// a byte-forging adversary is out of scope. Equal bytes therefore mean the
     /// same state regardless of which inode carries them.
-    OrdinaryEditorSave(Option<&'a str>),
+    OrdinaryEditorSave {
+        loaded_revision: Option<&'a str>,
+        prospective_editor: bool,
+    },
     /// The user was shown the conflict and chose to keep their own edits.
     ///
     /// A stale revision and a stale identity ARE the conflict being resolved —
@@ -32750,7 +33864,14 @@ mod tests {
         fn commit<A>(
             &self,
             append: impl FnOnce() -> io::Result<A>,
-        ) -> io::Result<JournalPageProjectionOutcome<A>> {
+        ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<io::Error>> {
+            self.commit_with_error(append)
+        }
+
+        fn commit_with_error<A, E>(
+            &self,
+            append: impl FnOnce() -> Result<A, E>,
+        ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
             self.graph.commit_existing_page_with_journal(
                 &self.page,
                 &self.base_rev,
@@ -32899,7 +34020,10 @@ mod tests {
             "- first\n\n- second\n",
             "edited",
         );
-        let exact_target = "- edited\n\n- second\n";
+        // The serializer preserves the fixture's one blank separator. Supply
+        // a genuinely byte-distinct authenticated layout with one additional
+        // separator while keeping every parsed block and its raw body equal.
+        let exact_target = "- edited\n\n\n- second\n";
         assert_ne!(fixture.target, exact_target);
         assert!(guarded_markdown_documents_match(
             &fixture.target,
@@ -32915,7 +34039,7 @@ mod tests {
                 exact_target.as_bytes(),
                 || {
                     calls.set(calls.get() + 1);
-                    Ok("authenticated-layout-proof")
+                    Ok::<_, ()>("authenticated-layout-proof")
                 },
             )
             .unwrap();
@@ -32939,12 +34063,15 @@ mod tests {
                     exact_target.as_bytes(),
                     || {
                         calls.set(calls.get() + 1);
-                        Ok(())
+                        Ok::<(), ()>(())
                     },
                 )
                 .err()
                 .unwrap_or_else(|| panic!("{label} semantic mismatch committed"));
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            let precommit = error
+                .precommit()
+                .unwrap_or_else(|| panic!("{label} semantic mismatch was not precommit"));
+            assert_eq!(precommit.kind(), io::ErrorKind::InvalidData, "{label}");
             assert_eq!(calls.get(), 0, "{label}");
             assert_eq!(regular_file_tree(&fixture.root), before, "{label}");
             fixture.cleanup_root = false;
@@ -33015,12 +34142,15 @@ mod tests {
                 exact_target.as_bytes(),
                 || {
                     calls.set(calls.get() + 1);
-                    Ok(())
+                    Ok::<(), ()>(())
                 },
             )
             .err()
             .expect("Org layout-only difference must remain refused before append");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.precommit().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData)
+        );
         assert_eq!(calls.get(), 0);
         assert_eq!(fs::read(&fixture.path).unwrap(), fixture.base.as_bytes());
     }
@@ -33040,13 +34170,16 @@ mod tests {
                     fixture.target.as_bytes(),
                     || {
                         calls.set(calls.get() + 1);
-                        Ok(())
+                        Ok::<(), ()>(())
                     },
                 )
                 .err()
                 .unwrap_or_else(|| panic!("{label} precommit conflict produced an outcome"));
+            let precommit = error
+                .precommit()
+                .unwrap_or_else(|| panic!("{label} error was not precommit"));
             assert!(matches!(
-                error.kind(),
+                precommit.kind(),
                 io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidInput
             ));
             assert_eq!(calls.get(), 0);
@@ -33156,7 +34289,12 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn journal_projection_append_error_is_same_precommit_error_and_changes_zero_bytes() {
+    fn journal_projection_append_error_preserves_non_io_type_and_changes_no_graph_bytes_or_cache() {
+        #[derive(Debug, Eq, PartialEq)]
+        enum AppendSentinel {
+            DurableAppendRejected,
+        }
+
         let fixture = JournalProjectionFixture::new(
             "journal-projection-append-error",
             "pages/Append.md",
@@ -33164,21 +34302,23 @@ mod tests {
             "target",
         );
         let before = regular_file_tree(&fixture.root);
+        let cache_before = fixture.graph.cache.read().unwrap().clone();
         let calls = Cell::new(0_usize);
         let error = fixture
-            .commit(|| {
+            .commit_with_error(|| {
                 calls.set(calls.get() + 1);
-                Err::<(), _>(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "durable append failed exactly",
-                ))
+                Err::<(), _>(AppendSentinel::DurableAppendRejected)
             })
             .err()
-            .expect("append error is precommit");
-        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
-        assert_eq!(error.to_string(), "durable append failed exactly");
+            .expect("append error must cross the graph boundary");
+        assert_eq!(error.append(), Some(&AppendSentinel::DurableAppendRejected));
+        assert!(matches!(
+            error,
+            JournalPageCommitError::Append(AppendSentinel::DurableAppendRejected)
+        ));
         assert_eq!(calls.get(), 1);
         assert_eq!(regular_file_tree(&fixture.root), before);
+        assert_exact_budget_cache_unchanged(&fixture.graph, &cache_before);
     }
 
     #[cfg(any(unix, windows))]
@@ -33505,7 +34645,7 @@ mod tests {
                 b"- changed\n",
                 || {
                     calls.set(calls.get() + 1);
-                    Ok(())
+                    Ok::<(), ()>(())
                 },
             )
             .is_err());
@@ -33560,7 +34700,7 @@ mod tests {
                     &revision,
                     base.as_bytes(),
                     target.as_bytes(),
-                    || Ok(index),
+                    || Ok::<_, ()>(index),
                 )
                 .unwrap();
             let JournalPageProjectionOutcome::Durable(durable) = outcome else {
@@ -34547,13 +35687,208 @@ mod tests {
         dir
     }
 
-    fn arm_present_conflict_for_force(graph: &Graph, page: &PageDto, path: &Path) {
+    #[test]
+    fn consumed_external_document_dto_matches_exact_parse_across_formats_and_identity() {
+        let dir = scratch("consumed-exact-page-dto");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            br#"{:journal/file-name-format "dd-MM-yyyy"
+            :journal/page-title-format "yyyy-MM-dd"}"#,
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        let cases = [
+            (
+                "markdown",
+                "pages/Plain.md",
+                "- ordinary markdown\n",
+                "Plain",
+                PageKind::Page,
+                false,
+            ),
+            (
+                "org-editable-properties",
+                "pages/Editable Org.org",
+                "#+TITLE: Editable Org\n\n* TODO Buy milk\nSCHEDULED: <2026-06-25 Thu>\n:PROPERTIES:\n:id: 6679-abc\n:END:\n",
+                "Editable Org",
+                PageKind::Page,
+                false,
+            ),
+            (
+                "org-read-only",
+                "pages/Read Only.org",
+                "* root\n*** child\n",
+                "Read Only",
+                PageKind::Page,
+                true,
+            ),
+            (
+                "explicit-title",
+                "pages/Physical title.md",
+                "title:: Explicit title\n\n- titled body\n",
+                "Explicit title",
+                PageKind::Page,
+                false,
+            ),
+            (
+                "journal-title",
+                "pages/Physical journal.md",
+                "title:: 25-07-2026\n\n- journal body\n",
+                "2026-07-25",
+                PageKind::Journal,
+                false,
+            ),
+        ];
+
+        for (label, relative, source, expected_name, expected_kind, expected_read_only) in cases {
+            let path = ManagedPath::parse(relative.to_owned()).unwrap();
+            let consumed = graph
+                .parse_external_document(&path, source.as_bytes(), false)
+                .unwrap()
+                .into_exact_page_dto(&path, source)
+                .unwrap();
+            let exact = graph
+                .parse_exact_page_dto(&path, source.as_bytes())
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&consumed).unwrap(),
+                serde_json::to_value(&exact).unwrap(),
+                "{label}: consumed parser result must preserve exact DTO semantics"
+            );
+            assert_eq!(consumed.name, expected_name, "{label}");
+            assert_eq!(consumed.kind, expected_kind, "{label}");
+            assert_eq!(consumed.read_only, expected_read_only, "{label}");
+            if label == "org-editable-properties" {
+                assert_eq!(consumed.format, Format::Org);
+                assert_eq!(consumed.path, relative);
+                assert!(consumed.rev.is_some());
+                assert_eq!(
+                    consumed.pre_block.as_deref(),
+                    Some("#+TITLE: Editable Org\n")
+                );
+                assert!(!consumed.blocks[0].id.is_empty());
+                assert!(consumed.blocks[0]
+                    .properties
+                    .iter()
+                    .any(|(key, value)| key.eq_ignore_ascii_case("id") && value == "6679-abc"));
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_projection_trash_publication_walks_the_typed_nofollow_chain() {
+        let root = scratch("managed-projection-trash-capability");
+        let relative = "pages/Typed Recovery.org";
+        let expected = b"#+TITLE: Typed Recovery\r\n\r\n* exact bytes\r\n";
+        fs::write(root.join(relative), expected).unwrap();
+        let graph = Graph::open(&root);
+        let path = ManagedPath::parse(relative.to_owned()).unwrap();
+
+        assert!(
+            !root.join("logseq/.tine-trash/journals").exists(),
+            "the recovery chain begins absent"
+        );
+        let destination = graph
+            .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
+            .unwrap();
+        assert_eq!(
+            destination.parent(),
+            Some(root.join("logseq/.tine-trash/journals").as_path())
+        );
+        assert_eq!(
+            destination
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("org")
+        );
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+
+        // Exact retries retain one immutable recovery leaf, while a divergent
+        // occupant is a refusal rather than an overwrite.
+        assert_eq!(
+            graph
+                .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
+                .unwrap(),
+            destination
+        );
+        fs::write(&destination, b"foreign recovery bytes").unwrap();
+        assert_eq!(
+            graph
+                .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+
+        // A malformed intermediate component is rejected through the same
+        // no-follow chain, before it can authorize a semantic deletion.
+        let malformed_root = scratch("managed-projection-trash-malformed-chain");
+        fs::write(malformed_root.join(relative), expected).unwrap();
+        fs::create_dir_all(malformed_root.join("logseq")).unwrap();
+        fs::write(
+            malformed_root.join("logseq/.tine-trash"),
+            b"not a recovery directory",
+        )
+        .unwrap();
+        let malformed = Graph::open(&malformed_root);
+        let error = malformed
+            .preserve_projection_in_trash(&path, ManagedTextKind::Journal, expected)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(malformed_root.join(relative)).unwrap(), expected);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&malformed_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_projection_trash_refuses_a_missing_typed_kind_that_cannot_be_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = scratch("managed-projection-trash-kind-create-refusal");
+        let relative = "pages/Kind Creation Refusal.md";
+        let expected = b"- source survives an unavailable recovery kind\n";
+        fs::write(root.join(relative), expected).unwrap();
+        let trash_root = root.join("logseq/.tine-trash");
+        fs::create_dir_all(&trash_root).unwrap();
+        let original_permissions = fs::metadata(&trash_root).unwrap().permissions();
+        let mut no_create_permissions = original_permissions.clone();
+        no_create_permissions.set_mode(0o555);
+        fs::set_permissions(&trash_root, no_create_permissions).unwrap();
+
+        let graph = Graph::open(&root);
+        let path = ManagedPath::parse(relative.to_owned()).unwrap();
+        let result = graph.preserve_projection_in_trash(&path, ManagedTextKind::Page, expected);
+        fs::set_permissions(&trash_root, original_permissions).unwrap();
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read(root.join(relative)).unwrap(), expected);
+        assert!(
+            !trash_root.join("pages").exists(),
+            "a failed typed-kind creation must not leave a partial namespace"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn arm_present_conflict_for_force(
+        graph: &Graph,
+        page: &PageDto,
+        path: &Path,
+    ) -> ConflictOverride {
         let bytes = fs::read_to_string(path).unwrap();
         let resource_identity =
             canonical_projection_file_resource_id(&fs::File::open(path).unwrap()).unwrap();
-        graph.mint_conflict_authority(
+        let observation_epoch = graph.mint_conflict_authority(
             path,
             &ConflictEditorEpisode {
+                // The conflict is minted FOR this editor, so it must name it —
+                // otherwise the episode equality that increment 3 strengthened
+                // would refuse the very editor the banner belongs to.
+                activation: page.activation.map(EditorActivation::from_u64),
                 loaded_revision: page.rev.clone(),
             },
             ConflictSnapshot::Present {
@@ -34562,6 +35897,7 @@ mod tests {
             },
             Some(bytes),
         );
+        ConflictOverride { observation_epoch }
     }
 
     /// The read-only view exists so managed storage can answer whole-graph
@@ -34695,13 +36031,17 @@ mod tests {
     /// `graph_text_scope::fixed_excluded`, so nothing under it is scanned,
     /// imported or projected. Trashing an orphaned asset is an asset-side write
     /// into that tree and must stay available under managed storage; trashing a
-    /// journal file is a graph-text deletion and must not.
+    /// recognized sync-conflict copy is likewise outside graph discovery and can
+    /// be discarded into that tree; trashing a journal file is a graph-text
+    /// deletion and must not.
     #[test]
     fn a_derived_read_only_graph_trashes_assets_but_not_journals() {
         let dir = scratch("derived-read-only-trash");
         fs::create_dir_all(dir.join("assets")).unwrap();
         fs::write(dir.join("assets/orphan.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         fs::write(dir.join("journals/2026_08_07.md"), "- a journal day\n").unwrap();
+        let conflict = "Alpha.sync-conflict-20260810-120000-DEVICE.md";
+        fs::write(dir.join("pages").join(conflict), "- conflict evidence\n").unwrap();
 
         let view = Graph::open_derived_read_only(&dir);
 
@@ -34721,6 +36061,22 @@ mod tests {
             .empty_asset_trash()
             .expect("emptying the asset trash is an asset-side write");
         assert_eq!(removed, 1, "the emptied entry must be counted");
+
+        let conflict_path = format!("pages/{conflict}");
+        let staged = view
+            .stage_sync_conflict_trash(&conflict_path, b"- conflict evidence\n")
+            .expect("excluded conflict evidence can be staged recoverably");
+        assert!(!dir.join("pages").join(conflict).exists());
+        view.rollback_sync_conflict_trash(&staged)
+            .expect("a definitely unauthored operation can restore its staged evidence");
+        assert_eq!(
+            fs::read_to_string(dir.join("pages").join(conflict)).unwrap(),
+            "- conflict evidence\n"
+        );
+        view.trash_sync_conflict(&conflict_path)
+            .expect("a conflict copy is excluded from the graph-text domain");
+        assert!(!dir.join("pages").join(conflict).exists());
+        assert_eq!(view.asset_trash_stats().conflicts, 1);
 
         // A journal file is graph text. Its deletion belongs to the oplog and
         // stays refused at the single graph-text admission.
@@ -35245,6 +36601,7 @@ mod tests {
         fs::write(&path, "- loaded baseline\n").unwrap();
         let graph = Graph::open(&dir);
         let mut page = graph.load_by_path("external/Exact.md").unwrap().unwrap();
+        as_editor(&graph, &mut page);
         page.blocks[0].raw = format!("{mode} editor bytes");
 
         let replacement = dir.join("external/.foreign-replacement");
@@ -35252,14 +36609,17 @@ mod tests {
         fs::write(&replacement, &foreign_bytes).unwrap();
         let foreign_identity =
             canonical_projection_file_resource_id(&fs::File::open(&replacement).unwrap()).unwrap();
-        if force {
+        let shown = if force {
             fs::write(&path, "- shown force conflict\n").unwrap();
             let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
             assert_eq!(
                 direct_save_failure_code(&conflict),
                 "conflict.save_baseline_present"
             );
-        }
+            Some(gh254_shown(&conflict))
+        } else {
+            None
+        };
         MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             let replacement = replacement.clone();
@@ -35276,7 +36636,11 @@ mod tests {
         });
 
         let error = if force {
-            graph.force_save_page(&page)
+            graph.force_save_page_at_revision(
+                &page,
+                page.rev.as_deref(),
+                shown.expect("the forced arm captured its shown observation"),
+            )
         } else {
             graph.save_page(&page, page.rev.as_deref())
         }
@@ -36732,6 +38096,7 @@ mod tests {
         let dir = scratch("guide-no-save");
         let g = Graph::open(&dir);
         let page = PageDto {
+            activation: None,
             name: "Tine-guide/Features/Sheets".into(),
             kind: PageKind::Page,
             title: "Features/Sheets".into(),
@@ -37311,6 +38676,7 @@ mod tests {
         let base_rev = dto.rev.clone().unwrap();
         assert!(!dto.path.is_empty(), "a loaded page is path-pinned");
         dto.blocks[0].raw = "mine".into();
+        as_editor(&g, &mut dto);
         // The wire shape: the working store has no revision to send.
         dto.rev = None;
         fs::write(&path, "- theirs\n").unwrap();
@@ -37336,6 +38702,7 @@ mod tests {
         let mut dto = g.load_named("A", PageKind::Page).unwrap().unwrap();
         let base_rev = dto.rev.clone().unwrap();
         dto.blocks[0].raw = "mine".into();
+        as_editor(&g, &mut dto);
         dto.rev = None;
         fs::write(&path, "- theirs\n").unwrap();
         let shown = g.save_page(&dto, Some(&base_rev)).unwrap_err();
@@ -37379,6 +38746,7 @@ mod tests {
         let g = Graph::open(&dir);
         g.warm_cache();
         let page = PageDto {
+            activation: None,
             name: "Foo".into(),
             kind: PageKind::Page,
             title: "Foo".into(),
@@ -38162,6 +39530,7 @@ mod tests {
         assert_eq!(g.preferred_format(), Format::Org);
         // Create a brand-new page via save (no baseline) — it must land as .org.
         let page = PageDto {
+            activation: None,
             name: "Fresh".into(),
             kind: PageKind::Page,
             title: "Fresh".into(),
@@ -38240,6 +39609,7 @@ mod tests {
             fs::write(&path, original).unwrap();
             let g = Graph::open(&dir);
             let mut dto = g.load_named("Property", PageKind::Page).unwrap().unwrap();
+            as_editor(&g, &mut dto);
             let normalized = original.replace("\r\n", "\n");
             let normalized = normalized.trim_end_matches('\n');
             assert_eq!(dto.pre_block.as_deref(), Some(normalized));
@@ -38258,8 +39628,10 @@ mod tests {
             assert!(err.to_string().contains("page-header property"));
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
-            arm_present_conflict_for_force(&g, &dto, &path);
-            let err = g.force_save_page(&dto).unwrap_err();
+            let shown = arm_present_conflict_for_force(&g, &dto, &path);
+            let err = g
+                .force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+                .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             assert_eq!(fs::read_to_string(&path).unwrap(), original);
             let _ = fs::remove_dir_all(&dir);
@@ -38317,6 +39689,7 @@ mod tests {
                 let g = Graph::open(&dir);
                 g.warm_cache();
                 let mut dto = g.load_named("Property", PageKind::Page).unwrap().unwrap();
+                as_editor(&g, &mut dto);
                 let cached_before = dto.clone();
                 let generation_before = g.cache_generation();
                 dto.pre_block = kept.map(str::to_string);
@@ -38335,8 +39708,9 @@ mod tests {
                 }];
 
                 let err = if forced {
-                    arm_present_conflict_for_force(&g, &dto, &path);
-                    g.force_save_page(&dto).unwrap_err()
+                    let shown = arm_present_conflict_for_force(&g, &dto, &path);
+                    g.force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+                        .unwrap_err()
                 } else {
                     g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
                 };
@@ -38404,6 +39778,7 @@ mod tests {
             fs::write(&path, original).unwrap();
             let g = Graph::open(&dir);
             let mut dto = g.load_named("Property", PageKind::Page).unwrap().unwrap();
+            as_editor(&g, &mut dto);
             dto.pre_block = Some("icon:: ★\nA:: XX\nB:: XX\nC:: XX".into());
             g.save_page(&dto, dto.rev.as_deref()).unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), expected);
@@ -38428,6 +39803,7 @@ mod tests {
         let g = Graph::open(&dir);
         g.warm_cache();
         let page = PageDto {
+            activation: None,
             name: "Property Authoring".into(),
             kind: PageKind::Page,
             title: "Property Authoring".into(),
@@ -38505,6 +39881,7 @@ mod tests {
         assert!(loaded.blocks.is_empty());
 
         let dto = PageDto {
+            activation: None,
             name: "The Nazi Mind".into(),
             kind: PageKind::Page,
             title: "The Nazi Mind".into(),
@@ -38596,10 +39973,12 @@ mod tests {
                 ..Default::default()
             },
         );
+        as_editor(&g, &mut dto);
         for forced in [false, true] {
             let err = if forced {
-                arm_present_conflict_for_force(&g, &dto, &path);
-                g.force_save_page(&dto).unwrap_err()
+                let shown = arm_present_conflict_for_force(&g, &dto, &path);
+                g.force_save_page_at_revision(&dto, dto.rev.as_deref(), shown)
+                    .unwrap_err()
             } else {
                 g.save_page(&dto, dto.rev.as_deref()).unwrap_err()
             };
@@ -38704,6 +40083,7 @@ mod tests {
             }
             let g = Graph::open(&dir);
             let page = PageDto {
+                activation: None,
                 name: format!("Negative {label}"),
                 kind: PageKind::Page,
                 title: format!("Negative {label}"),
@@ -39334,6 +40714,7 @@ mod tests {
 
     fn jdto(name: &str) -> PageDto {
         PageDto {
+            activation: None,
             name: name.into(),
             kind: PageKind::Journal,
             title: name.into(),
@@ -41774,6 +43155,7 @@ mod tests {
 
     fn direct_save_bench_new_page(name: &str) -> PageDto {
         PageDto {
+            activation: None,
             name: name.to_owned(),
             kind: PageKind::Page,
             title: name.to_owned(),
@@ -46553,6 +47935,7 @@ mod tests {
         .unwrap();
         let g = Graph::open_checked(&dir).unwrap();
         let page = PageDto {
+            activation: None,
             name: "Jul 10th, 2026".into(),
             kind: PageKind::Journal,
             title: "Jul 10th, 2026".into(),
@@ -47298,7 +48681,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn handoff_blocks_omitted_journal_migration_and_conflict_trash_entrypoints() {
+    fn handoff_blocks_journal_migration_but_not_auxiliary_conflict_trash() {
         let dir = scratch("handoff-omitted-entrypoints");
         fs::create_dir_all(dir.join("logseq")).unwrap();
         fs::write(
@@ -47334,15 +48717,17 @@ mod tests {
 
         start.wait();
         assert_handoff_blocked(migration.join().unwrap());
-        assert_handoff_blocked(trash.join().unwrap());
+        trash.join().unwrap().unwrap();
         assert!(dir.join("journals").join(title_named).exists());
-        assert!(dir.join("pages").join(conflict).exists());
+        assert!(!dir.join("pages").join(conflict).exists());
+        assert_eq!(
+            trash_stats(&trash_root(&dir)).conflicts,
+            1,
+            "the conflict copy remains recoverable while graph-text authority is retired"
+        );
 
         drop(handoff);
         assert_eq!(graph.migrate_journal_filenames_checked().unwrap(), 1);
-        assert!(graph
-            .trash_sync_conflict(&format!("pages/{conflict}"))
-            .is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -48996,6 +50381,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let probe_rev = probe_page.rev.clone().unwrap();
+        as_editor(&probe_graph, &mut probe_page);
         probe_page.blocks[0].raw = format!("after\nid:: {id}");
         if forced {
             fs::write(
@@ -49003,10 +50389,12 @@ mod tests {
                 format!("- external baseline\n  id:: {id}\n"),
             )
             .unwrap();
-            probe_graph
+            let conflict = probe_graph
                 .save_page(&probe_page, Some(&probe_rev))
                 .unwrap_err();
-            probe_graph.force_save_page(&probe_page).unwrap();
+            probe_graph
+                .force_save_page_at_revision(&probe_page, Some(&probe_rev), gh254_shown(&conflict))
+                .unwrap();
         } else {
             probe_graph
                 .save_page(&probe_page, Some(&probe_rev))
@@ -49021,6 +50409,7 @@ mod tests {
             .enable_managed_sync(Uuid::from_u128(91_050_003), Uuid::from_u128(91_050_004))
             .unwrap();
         let mut page = graph.load_named("Exact", PageKind::Page).unwrap().unwrap();
+        as_editor(&graph, &mut page);
         let rev = page.rev.clone().unwrap();
         page.blocks[0].raw = format!("after\nid:: {id}");
         if forced {
@@ -49041,7 +50430,13 @@ mod tests {
 
         set_managed_content_budget_limit(peak - 1);
         let error = if forced {
-            graph.force_save_page(&page).unwrap_err()
+            let shown = graph
+                .outstanding_conflict_override(&page)
+                .unwrap()
+                .expect("the refused save captured explicit force authority");
+            graph
+                .force_save_page_at_revision(&page, Some(&rev), shown)
+                .unwrap_err()
         } else {
             graph.save_page(&page, Some(&rev)).unwrap_err()
         };
@@ -49059,8 +50454,10 @@ mod tests {
 
         set_managed_content_budget_limit(peak);
         if forced {
-            graph.save_page(&page, Some(&rev)).unwrap_err();
-            graph.force_save_page(&page).unwrap();
+            let conflict = graph.save_page(&page, Some(&rev)).unwrap_err();
+            graph
+                .force_save_page_at_revision(&page, Some(&rev), gh254_shown(&conflict))
+                .unwrap();
         } else {
             graph.save_page(&page, Some(&rev)).unwrap();
         }
@@ -49412,6 +50809,7 @@ mod tests {
                 blocks.extend(nested_blocks(seed + breadth * 64));
             }
             PageDto {
+                activation: None,
                 name: name.to_owned(),
                 kind: PageKind::Page,
                 title: name.to_owned(),
@@ -49990,6 +51388,7 @@ mod tests {
         let graph = Graph::open(&dir);
         let mut page = graph.load_named("Target", PageKind::Page).unwrap().unwrap();
         let base_rev = page.rev.clone().unwrap();
+        as_editor(&graph, &mut page);
         page.path.clear();
         page.blocks[0].raw = "saved A".to_owned();
         MANAGED_WRITE_AFTER_ADMISSION.with(|hook| {
@@ -50556,9 +51955,21 @@ mod tests {
 
         assert_handoff_blocked(graph.create_markdown_page_if_absent("create", "- no\n"));
         assert_handoff_blocked(graph.save_page(&page, None));
-        assert_handoff_blocked(graph.force_save_page(&page));
+        assert_handoff_blocked(graph.force_save_page_at_revision(
+            &page,
+            None,
+            ConflictOverride {
+                observation_epoch: 0,
+            },
+        ));
         assert_handoff_blocked(graph.save_page(&journal, None));
-        assert_handoff_blocked(graph.force_save_page(&journal));
+        assert_handoff_blocked(graph.force_save_page_at_revision(
+            &journal,
+            None,
+            ConflictOverride {
+                observation_epoch: 0,
+            },
+        ));
         assert_handoff_blocked(graph.rename_page_expected("old", "new", None));
         assert_handoff_blocked(graph.delete_page_expected("page", PageKind::Page, None));
         assert_handoff_blocked(graph.delete_page_expected(
@@ -51289,8 +52700,34 @@ mod tests {
         let graph = Graph::open(&root);
         graph.warm_cache();
         let mut page = graph.load_by_path("pages/Note.md").unwrap().unwrap();
+        // A loaded EDITOR, which since increment 3 means an activation as well as
+        // a DTO: reading alone no longer implies one, precisely so that a read for
+        // export/preview/hydration cannot inherit an editor's override authority.
+        // The frontend does exactly this — activate, then stamp the DTO it saves.
+        let handle = graph
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
+            .unwrap();
+        page.activation = Some(handle.activation.as_u64());
         page.blocks[0].raw = "mine".into();
         (root, path, graph, page)
+    }
+
+    /// Make `dto` an EDITOR's DTO, the way the frontend does.
+    ///
+    /// Since increment 3 a loaded page and a live editor are different things: a
+    /// read alone mints no identity, precisely so a read for export, preview or
+    /// hydration cannot inherit an editor's override authority. A test that
+    /// force-saves is modelling a user answering a banner, so it has to activate
+    /// like one.
+    fn as_editor(graph: &Graph, dto: &mut PageDto) {
+        let handle = graph
+            .activate_editor(&dto.path, ActivationIntent::Replace, dto.rev.as_deref())
+            .expect("a loaded page is path-pinned and inside the graph");
+        dto.activation = Some(handle.activation.as_u64());
     }
 
     fn gh254_code(error: &io::Error) -> &'static str {
@@ -51316,9 +52753,14 @@ mod tests {
         fs::write(&path, "- external winner\n").unwrap();
         let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&conflict), "conflict.save_baseline_present");
-        graph.force_save_page(&page).unwrap();
+        let shown = gh254_shown(&conflict);
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), shown)
+            .unwrap();
         assert!(
-            graph.force_save_page(&page).is_err(),
+            graph
+                .force_save_page_at_revision(&page, page.rev.as_deref(), shown)
+                .is_err(),
             "successful force must not replay its consumed token"
         );
         let _ = fs::remove_dir_all(root);
@@ -51328,7 +52770,7 @@ mod tests {
     fn gh254_force_binds_the_shown_bytes_not_only_the_revision_or_path() {
         let (root, path, graph, page) = gh254_loaded("substituted-baseline");
         fs::write(&path, "- shown winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         // Preserve the inode while changing its bytes. Revision-only force used
         // to overwrite this unseen second winner.
         EDITOR_COMMIT_BEFORE_RECHECK.with(|hook| {
@@ -51337,7 +52779,9 @@ mod tests {
                 fs::write(path, "- unseen second winner\n")
             }));
         });
-        let error = graph.force_save_page(&page).unwrap_err();
+        let error = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
+            .unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.commit_recheck");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -51352,22 +52796,24 @@ mod tests {
         fs::remove_file(&path).unwrap();
         let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&conflict), "conflict.save_baseline_absent");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
+            .unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("mine"));
         assert!(graph.force_save_page(&page).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn gh254_reload_watcher_and_forget_each_revoke_authority() {
-        for action in ["reload", "watcher", "forget"] {
+    fn gh254_watcher_and_forget_each_revoke_authority() {
+        // The disk-move boundaries. These keep their original assertions: the file
+        // underneath the editor genuinely moved, so the snapshot the banner
+        // described is gone and its authority must go with it.
+        for action in ["watcher", "forget"] {
             let (root, path, graph, page) = gh254_loaded(action);
             fs::write(&path, "- external winner\n").unwrap();
             graph.save_page(&page, page.rev.as_deref()).unwrap_err();
             match action {
-                "reload" => {
-                    graph.load_by_path("pages/Note.md").unwrap().unwrap();
-                }
                 "watcher" => {
                     graph.sync_file_checked(&path).unwrap();
                 }
@@ -51385,11 +52831,422 @@ mod tests {
         }
     }
 
+    /// The other half of the split (GH #254 increment 3).
+    ///
+    /// A plain read is NOT an activation and must no longer revoke. Re-hydrating
+    /// an already-open page happens constantly — the sidebar, live references,
+    /// query hydration — and revoking there disarms a banner the user can still
+    /// see, leaving them a conflict whose only working button destroys their edit.
+    ///
+    /// This asserts the read is inert, NOT that the force then succeeds: under
+    /// increment 3 a force also needs a live editor activation, which this
+    /// read-only path deliberately never mints. The two conditions are separate
+    /// and `gh254_override_requires_a_live_editor_activation` covers the other.
+    #[test]
+    fn gh254_a_plain_read_does_not_revoke_authority() {
+        let (root, path, graph, page) = gh254_loaded("reload");
+        fs::write(&path, "- external winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let before = graph.outstanding_conflict_override(&page).unwrap();
+        assert!(
+            before.is_some(),
+            "the refused save must have minted authority for this test to mean anything"
+        );
+
+        graph.load_by_path("pages/Note.md").unwrap().unwrap();
+
+        let after = graph.outstanding_conflict_override(&page).unwrap();
+        assert_eq!(
+            before, after,
+            "a plain read must leave the live observation exactly as it found it"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- external winner\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Rule 1 of the increment-3 contract: an override may only be spent by the
+    /// exact editor activation that was shown the conflict.
+    ///
+    /// The reproduced defect this closes is a *clone*. Two DTOs agreeing on path,
+    /// name and `base_rev` were indistinguishable to the old episode equality, so
+    /// a copy could spend the live editor's one-shot authority and overwrite the
+    /// external winner the real editor still had a banner for. Identity therefore
+    /// cannot be derived from content, revision or path — the copy matches on all
+    /// three — which is why the activation is minted, opaque, and compared exactly.
+    #[test]
+    fn gh254_override_requires_a_live_editor_activation() {
+        let (root, path, graph, page) = gh254_loaded("activation");
+        fs::write(&path, "- external winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&page)
+            .unwrap()
+            .expect("the refused save mints the authority the banner shows");
+
+        // (a) No activation at all — an editor-less writer, or a pre-increment-3
+        // caller. Legal on the ordinary path; never authority to overwrite.
+        let mut tokenless = page.clone();
+        tokenless.activation = None;
+        let refused = graph
+            .force_save_page_at_revision(&tokenless, page.rev.as_deref(), shown)
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("conflict_authority."),
+            "refusal must carry a bounded authority code, got: {refused}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "- external winner\n",
+            "a refused override must not write"
+        );
+
+        // (b) The live editor that was shown this conflict may spend it. Without
+        // this arm the test would pass on a build that refuses every override.
+        let mut mine = page.clone();
+        mine.blocks[0].raw = "mine wins".into();
+        graph
+            .force_save_page_at_revision(&mine, page.rev.as_deref(), shown)
+            .expect("the live editor shown the conflict must be able to answer it");
+        assert!(fs::read_to_string(&path).unwrap().contains("mine wins"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// An absent editor's prospective target can go stale, and first save must
+    /// notice.
+    ///
+    /// The resolver prefers the configured format only while no alternate exists,
+    /// so an external `.org` appearing after activation moves the answer off the
+    /// `.md` this editor was promised. Landing on the stale pin would create the
+    /// ambiguous twin that creation admission exists to refuse; both naive routes
+    /// were reproduced and are worse (keeping `base_rev = None` strands the draft
+    /// on `AlreadyExists` forever, adopting the existing revision silently
+    /// overwrites bytes the user never saw). So the drift becomes an ordinary
+    /// conflict, answerable with the two buttons the user already understands.
+    #[test]
+    fn gh254_absent_editor_first_save_re_resolves_its_drifted_target() {
+        // (a) Drift onto a target nobody occupies: same editor, new target.
+        let root = scratch("gh254-inc3-drift-free");
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let handle = graph
+            .activate_absent_editor("Prospective", PageKind::Page)
+            .unwrap();
+        assert!(handle.target.ends_with(".md"), "got {}", handle.target);
+        assert!(
+            !root.join(&handle.target).exists(),
+            "activation must reserve nothing on disk"
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        // (b) Drift onto a target that EXISTS is a conflict, not a re-target.
+        let root = scratch("gh254-inc3-drift-occupied");
+        fs::create_dir_all(root.join("pages")).unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let handle = graph
+            .activate_absent_editor("Prospective", PageKind::Page)
+            .unwrap();
+        let promised = handle.target.clone();
+
+        // The external winner appears at the alternate extension AFTER activation.
+        let occupied = root.join("pages/Prospective.org");
+        fs::write(&occupied, "- external winner\n").unwrap();
+        graph.sync_file_checked(&occupied).unwrap();
+
+        let mut page = PageDto {
+            activation: Some(handle.activation.as_u64()),
+            name: "Prospective".into(),
+            kind: PageKind::Page,
+            title: "Prospective".into(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                raw: "my draft".into(),
+                ..Default::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: promised,
+            guide: false,
+        };
+        page.blocks[0].raw = "my draft".into();
+
+        let error = graph.save_page(&page, None).unwrap_err();
+        assert!(
+            gh254_code(&error).starts_with("conflict."),
+            "drift onto an existing file must be an ordinary conflict, got: {}",
+            gh254_code(&error)
+        );
+        assert_eq!(
+            fs::read_to_string(&occupied).unwrap(),
+            "- external winner\n",
+            "the external bytes must survive until the user answers"
+        );
+        assert!(
+            !root.join("pages/Prospective.md").exists(),
+            "the stale pin must not be created as an ambiguous twin"
+        );
+
+        // The part that actually distinguishes the re-resolve from merely refusing
+        // the save: the user must be able to ANSWER this conflict. That requires
+        // the editor's identity to have moved with its target — if the activation
+        // were still registered against the abandoned `.md` pin, the override would
+        // be refused as not-live and the draft would be stranded, which is the
+        // failure mode the naive routes produced.
+        let shown = graph
+            .outstanding_conflict_override(&page)
+            .unwrap()
+            .expect("the drift conflict must mint answerable authority");
+        graph
+            .force_save_page_at_revision(&page, None, shown)
+            .expect("the absent editor must be able to answer the conflict it hit");
+        assert!(
+            fs::read_to_string(&occupied).unwrap().contains("my draft"),
+            "\"Keep mine\" must land on the file the editor actually drifted onto"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// "Use disk version" is an authority-answering action, decided by the same
+    /// source of truth as "Keep mine" — and it must decide without writing.
+    ///
+    /// The frontend cannot make this decision itself. The raw-watcher path revokes
+    /// an observation with no page event to react to, so a locally recorded epoch
+    /// can be dead while every local value still compares equal; a map maintained
+    /// by eventual notifications cannot prove live membership. Presenting is the
+    /// only way to learn the truth, and the three outcomes are exactly what the
+    /// caller must tell apart: proceed, answer a newer banner, or re-observe a
+    /// dead one.
+    #[test]
+    fn gh254_presenting_an_observation_decides_without_writing() {
+        for arm in ["authorised", "superseded", "withdrawn"] {
+            let (root, path, graph, page) = gh254_loaded(arm);
+            fs::write(&path, "- external winner\n").unwrap();
+            graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+            let shown = graph
+                .outstanding_conflict_override(&page)
+                .unwrap()
+                .expect("the refused save mints the banner's authority");
+            let before = fs::read_to_string(&path).unwrap();
+
+            let presented = match arm {
+                "authorised" => shown.observation_epoch,
+                // A stale callback naming the observation it was shown, while a
+                // newer winner has been observed since.
+                "superseded" => {
+                    fs::write(&path, "- newer external winner\n").unwrap();
+                    graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+                    shown.observation_epoch
+                }
+                // The raw-watcher shape: authority revoked with no page event.
+                "withdrawn" => {
+                    graph.revoke_conflict_authority(&path);
+                    shown.observation_epoch
+                }
+                _ => unreachable!(),
+            };
+            let before = if arm == "superseded" {
+                fs::read_to_string(&path).unwrap()
+            } else {
+                before
+            };
+
+            let outcome = graph
+                .present_conflict_override(
+                    "pages/Note.md",
+                    page.rev.as_deref(),
+                    page.activation.unwrap(),
+                    presented,
+                )
+                .unwrap();
+
+            let expected = match arm {
+                "authorised" => ConflictPresentation::Authorised,
+                "superseded" => ConflictPresentation::Superseded,
+                _ => ConflictPresentation::Withdrawn,
+            };
+            assert_eq!(outcome, expected, "arm {arm}");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                before,
+                "presenting must never write, in any arm ({arm})"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// The stale-callback shape: a well-formed token naming a real editor that has
+    /// since been retired. It must be refused even though every other field —
+    /// path, name, revision, observation epoch — still matches.
+    #[test]
+    fn gh254_a_retired_activation_cannot_answer_its_old_conflict() {
+        let (root, path, graph, page) = gh254_loaded("retired");
+        fs::write(&path, "- external winner\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let shown = graph
+            .outstanding_conflict_override(&page)
+            .unwrap()
+            .expect("the refused save mints the authority the banner shows");
+
+        // Retire the exact editor the conflict was minted under — what clean
+        // eviction, `forgetPage` and a genuine replacement each do.
+        let activation = EditorActivation::from_u64(page.activation.unwrap());
+        assert!(graph.retire_editor_activation("pages/Note.md", activation));
+
+        assert!(
+            graph
+                .force_save_page_at_revision(&page, page.rev.as_deref(), shown)
+                .is_err(),
+            "a retired activation is no longer the live editor"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "- external winner\n",
+            "a refused override must not write"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_successful_first_save_finishes_the_exact_activation_without_churn() {
+        let root = scratch("gh254-inc3-first-save-activation");
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let prospective = graph
+            .activate_absent_editor("First save", PageKind::Page)
+            .unwrap();
+        let mut page = PageDto {
+            activation: Some(prospective.activation.as_u64()),
+            name: "First save".into(),
+            kind: PageKind::Page,
+            title: "First save".into(),
+            pre_block: None,
+            blocks: vec![BlockDto {
+                raw: "created".into(),
+                ..Default::default()
+            }],
+            rev: None,
+            format: Format::Md,
+            read_only: false,
+            path: prospective.target.clone(),
+            guide: false,
+        };
+
+        let revision = graph.save_page(&page, None).unwrap();
+        let finished = graph
+            .finish_saved_editor_activation(prospective.activation)
+            .expect("the successful first save must resolve its issuing activation");
+        assert_eq!(finished.activation, prospective.activation);
+        assert_eq!(finished.target, prospective.target);
+        assert!(!finished.prospective);
+        assert!(graph
+            .finish_saved_editor_activation(prospective.activation)
+            .is_none());
+
+        page.rev = Some(revision);
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        let reused = graph
+            .activate_editor(
+                &finished.target,
+                ActivationIntent::Reuse,
+                page.rev.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(reused.activation, prospective.activation);
+        assert!(
+            !reused.prospective,
+            "an ordinary re-save must not churn or re-prospect the activation"
+        );
+        assert!(graph
+            .finish_saved_editor_activation(EditorActivation::from_u64(
+                prospective.activation.as_u64() + 1,
+            ))
+            .is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Reuse is idempotent; replace mints a second identity for a two-phase swap.
+    ///
+    /// Both halves are load-bearing. Without idempotence, ordinary re-hydration of
+    /// an open page would burn the live editor's identity. Without replacement,
+    /// `reloadPage` would hand the disk snapshot the outgoing editor's identity.
+    #[test]
+    fn gh254_activation_reuse_is_idempotent_and_replace_is_not() {
+        let (root, _path, graph, _page) = gh254_loaded("intent");
+        let first = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
+            .unwrap();
+        let reused = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Reuse, None)
+            .unwrap();
+        assert_eq!(
+            first.activation, reused.activation,
+            "plain re-hydration must return the live activation, not mint one"
+        );
+
+        let replaced = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
+            .unwrap();
+        assert_ne!(
+            first.activation, replaced.activation,
+            "a genuine content replacement is a new editor instance"
+        );
+        assert!(
+            graph.retire_editor_activation("pages/Note.md", first.activation),
+            "A must remain live until the frontend installs B"
+        );
+        let reused_after_retiring_a = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Reuse, None)
+            .unwrap();
+        assert_eq!(
+            reused_after_retiring_a.activation, replaced.activation,
+            "compare-retiring A must not destroy the concurrently live B"
+        );
+        assert!(graph.retire_editor_activation("pages/Note.md", replaced.activation));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_present_activation_refuses_a_snapshot_that_changed_after_read() {
+        let (root, path, graph, page) = gh254_loaded("activation-expected-snapshot");
+        fs::write(&path, "- winner after the DTO read\n").unwrap();
+
+        let error = graph
+            .activate_editor(
+                "pages/Note.md",
+                ActivationIntent::Replace,
+                page.rev.as_deref(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let reused = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Reuse, None)
+            .unwrap();
+        assert_eq!(reused.activation.as_u64(), page.activation.unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gh254_implicit_force_cannot_spend_a_newer_observation_the_caller_never_named() {
+        let (root, path, graph, page) = gh254_loaded("implicit-force-fails-closed");
+        fs::write(&path, "- shown winner e1\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+
+        fs::write(&path, "- unseen winner e2\n").unwrap();
+        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+
+        let error = graph.force_save_page(&page).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "- unseen winner e2\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn gh254_token_cannot_cross_graph_instance_or_editor_episode() {
         let (root, path, graph, page) = gh254_loaded("scope");
         fs::write(&path, "- external winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
 
         let reopened = Graph::open(&root);
         reopened.warm_cache();
@@ -51397,10 +53254,15 @@ mod tests {
         transplanted.blocks[0].raw = "transplanted mine".into();
         assert!(reopened.force_save_page(&transplanted).is_err());
 
-        // Loading again in the original Graph starts a newer editor episode and
-        // revokes the earlier episode's token even when the path is unchanged.
+        // Re-reading the same path no longer revokes, and that is the point of
+        // increment 3's read/activation split: re-hydration happens constantly
+        // (sidebar, live references, query hydration) and used to disarm a banner
+        // the user could still see. The editor that was shown the conflict is
+        // still live, so it can still answer it.
         graph.load_by_path("pages/Note.md").unwrap().unwrap();
-        assert!(graph.force_save_page(&page).is_err());
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
+            .expect("an unrelated read must not cost the live editor its answer");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51430,6 +53292,57 @@ mod tests {
         graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         graph.rename_page("Note", "Renamed").unwrap();
         assert!(graph.force_save_page(&page).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Rename resets the frontend's whole working set: reference rewrites can
+    /// make every mounted page stale, not only the page whose file moved.  The
+    /// backend Graph remains the same object, so it must explicitly burn every
+    /// activation after success rather than relying on Graph destruction.
+    #[test]
+    fn gh254_successful_rename_burns_all_editor_activations_but_failure_does_not() {
+        let root = scratch("gh254-inc3-rename-activation-lifecycle");
+        let note_path = root.join("pages/Note.md");
+        let other_path = root.join("pages/Other.md");
+        fs::write(&note_path, "- [[Other]]\n").unwrap();
+        fs::write(&other_path, "- other\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+
+        let note = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
+            .unwrap();
+        let other = graph
+            .activate_editor("pages/Other.md", ActivationIntent::Replace, None)
+            .unwrap();
+
+        assert!(graph.rename_page("Note", "").is_err());
+        assert!(graph.retire_editor_activation("pages/Note.md", note.activation));
+        assert!(graph.retire_editor_activation("pages/Other.md", other.activation));
+
+        let note = graph
+            .activate_editor("pages/Note.md", ActivationIntent::Replace, None)
+            .unwrap();
+        let other = graph
+            .activate_editor("pages/Other.md", ActivationIntent::Replace, None)
+            .unwrap();
+        graph.rename_page("Note", "Renamed").unwrap();
+
+        assert!(
+            !graph.retire_editor_activation("pages/Note.md", note.activation),
+            "the moved page's destroyed editor must be retired"
+        );
+        assert!(
+            !graph.retire_editor_activation("pages/Other.md", other.activation),
+            "a reference-rewritten satellite editor must be retired too"
+        );
+        let reopened = graph
+            .activate_editor("pages/Other.md", ActivationIntent::Reuse, None)
+            .unwrap();
+        assert_ne!(
+            reopened.activation, other.activation,
+            "Reuse after the reset must mint for the new editor instance"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51485,12 +53398,14 @@ mod tests {
     fn gh254_force_accepts_a_same_byte_republication_and_targets_the_live_inode() {
         let (root, path, graph, page) = gh254_loaded("force-identity");
         fs::write(&path, "- shown winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let conflict = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         let replacement = path.with_file_name(".same-byte-new-inode");
         fs::write(&replacement, "- shown winner\n").unwrap();
         gh254_replace(&path, &replacement).unwrap();
 
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&conflict))
+            .unwrap();
         assert!(
             fs::read_to_string(&path).unwrap().contains("mine"),
             "keep-mine did not land on the republished inode"
@@ -51621,12 +53536,14 @@ mod tests {
     fn gh254_force_refuses_a_different_byte_winner_on_a_new_inode() {
         let (root, path, graph, page) = gh254_loaded("force-identity-diff");
         fs::write(&path, "- shown winner\n").unwrap();
-        graph.save_page(&page, page.rev.as_deref()).unwrap_err();
+        let shown = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         let replacement = path.with_file_name(".different-byte-new-inode");
         fs::write(&replacement, "- a newer winner nobody saw\n").unwrap();
         gh254_replace(&path, &replacement).unwrap();
 
-        let error = graph.force_save_page(&page).unwrap_err();
+        let error = graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&shown))
+            .unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.save_baseline_present");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -51635,7 +53552,9 @@ mod tests {
         );
         // The refusal minted a fresh conflict over the winner the user can now
         // actually see, so the second click resolves it deliberately.
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51646,7 +53565,9 @@ mod tests {
         fs::write(&path, "- s1 winner\n").unwrap();
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.save_baseline_present");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51656,7 +53577,9 @@ mod tests {
         fs::remove_file(path).unwrap();
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.save_baseline_absent");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51669,7 +53592,9 @@ mod tests {
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.commit_recheck");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51685,7 +53610,9 @@ mod tests {
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.replace_pre_retirement");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51699,7 +53626,9 @@ mod tests {
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.replace_retired_mismatch");
         assert_eq!(fs::read_to_string(&path).unwrap(), "- s5 winner\n");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51731,7 +53660,9 @@ mod tests {
                     "- s6 transient\n"
                 }
             );
-            graph.force_save_page(&page).unwrap();
+            graph
+                .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+                .unwrap();
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -51741,7 +53672,8 @@ mod tests {
         let root = scratch("gh254-increment2-s7");
         let path = root.join("pages/New.md");
         let graph = Graph::open(&root);
-        let page = PageDto {
+        let mut page = PageDto {
+            activation: None,
             name: "New".into(),
             kind: PageKind::Page,
             title: "New".into(),
@@ -51756,13 +53688,21 @@ mod tests {
             path: String::new(),
             guide: false,
         };
+        // An ABSENT editor: no file, no revision. Increment 3 gives it a real
+        // activation anyway, because it can meet an external-create conflict on
+        // its very first save — which is exactly what this test then does.
+        let handle = graph.activate_absent_editor("New", PageKind::Page).unwrap();
+        assert!(handle.prospective, "no file exists for New yet");
+        page.activation = Some(handle.activation.as_u64());
         MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
             let path = path.clone();
             *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "- s7 winner\n")));
         });
         let error = graph.save_page(&page, None).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.create_publication_collision");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, None, gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -51793,7 +53733,9 @@ mod tests {
                     "conflict.final_reread_present"
                 }
             );
-            graph.force_save_page(&page).unwrap();
+            graph
+                .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+                .unwrap();
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -51812,7 +53754,9 @@ mod tests {
         });
         let error = graph.save_page(&page, page.rev.as_deref()).unwrap_err();
         assert_eq!(gh254_code(&error), "conflict.replace_post_publication");
-        graph.force_save_page(&page).unwrap();
+        graph
+            .force_save_page_at_revision(&page, page.rev.as_deref(), gh254_shown(&error))
+            .unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

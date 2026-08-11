@@ -743,18 +743,26 @@ fn local_active_shape_fixtures(label: &str) -> [Fixture; 4] {
     for ordinal in 0..4096 {
         multipart_bytes.extend_from_slice(format!("- operation {ordinal:04}\n").as_bytes());
     }
+    let zero = Fixture::new(&format!("{label}-zero"), None, Vec::new());
+    let one = Fixture::new(
+        &format!("{label}-one"),
+        None,
+        vec![("pages/one.md".into(), b"- one\n".to_vec())],
+    );
+    // Production's page/manifest cap grew beyond this deliberately compact
+    // fixture. Keep the semantic matrix genuinely multipart through the
+    // existing one-shot test hook rather than manufacturing thousands more
+    // source files and slowing every lifecycle test that uses it.
+    force_next_bootstrap_part_operation_limit(4_096);
+    let multipart = Fixture::new(
+        &format!("{label}-multipart-4096"),
+        None,
+        vec![("pages/multipart.md".into(), multipart_bytes)],
+    );
     [
-        Fixture::new(&format!("{label}-zero"), None, Vec::new()),
-        Fixture::new(
-            &format!("{label}-one"),
-            None,
-            vec![("pages/one.md".into(), b"- one\n".to_vec())],
-        ),
-        Fixture::new(
-            &format!("{label}-multipart-4096"),
-            None,
-            vec![("pages/multipart.md".into(), multipart_bytes)],
-        ),
+        zero,
+        one,
+        multipart,
         rich_fixture(&format!("{label}-rich-nested-unicode")),
     ]
 }
@@ -2030,29 +2038,30 @@ fn one_accepted_pending_page_uses_authenticated_work_without_touching_bootstrap_
 
 #[test]
 fn corrupt_bootstrap_payload_is_refused_without_crdt_fallback() {
-    let mut fixture = Fixture::new(
+    let fixture = Fixture::new(
         "corrupt-bootstrap-reconciliation",
         None,
         vec![("pages/corrupt.md".into(), b"- exact bootstrap\n".to_vec())],
     );
-    let payload = fixture.shadow.directory().join("payload/pages/corrupt.md");
-    let root = fixture.enrollment_root("corrupt-bootstrap-reconciliation");
-    let paths = PromotedPaths::new(&fixture, "corrupt-bootstrap-reconciliation");
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, SessionId::new(), &paths);
-    fs::write(payload, b"- unauthenticated replacement\n").unwrap();
+    let pack_name = fixture.prepared.aggregate().parts()[0]
+        .part_id()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let payload = fixture
+        .archive_root
+        .join("bootstrap-v1/part-object-packs")
+        .join(pack_name);
+    fs::write(payload, b"unauthenticated replacement pack").unwrap();
 
-    let mut window = runtime
-        .admit_promoted_mutation(&mut authority, &fixture.graph)
-        .unwrap();
-    let (_admission, engine, database, _tail, bootstrap) = window.parts_with_bootstrap().unwrap();
-    engine.reconcile_expected_path_history().unwrap();
-    let projection = engine.projection_work_index().unwrap();
-    let source = JoinedAuthenticatedExpectedPathSource::with_bootstrap(
-        engine, projection, bootstrap, database,
-    );
     take_bootstrap_page_materializations_for_test();
-    assert!(scan_graph_text(&fixture.graph, &source, GraphTextScanLimits::default()).is_err());
+    assert!(
+        reopen_inactive_bootstrap_accepted_authority(&fixture.verified, fixture.archive(),)
+            .is_err()
+    );
     assert_eq!(take_bootstrap_page_materializations_for_test(), 0);
+    fixture.assert_graph_unchanged();
 }
 
 #[test]
@@ -3458,6 +3467,7 @@ fn a_non_empty_bootstrap_catalog_root_opens_from_a_fresh_archive_before_and_afte
         // catalog walk here is not an accidental 4096-target benchmark.
         multipart.push_str(&format!("- operation {ordinal:04}\n"));
     }
+    force_next_bootstrap_part_operation_limit(4_096);
     let mut fixture = Fixture::new(
         "promote-catalog-root",
         None,
@@ -4607,6 +4617,13 @@ impl HelperProcess {
             .arg("--nocapture")
             .env(HELPER_MODE, mode)
             .env(HELPER_WORLD, serde_json::to_string(world).unwrap())
+            // The parent runs lifecycle tests on this same deep stack. A
+            // re-exec helper instead enters through libtest's default worker,
+            // so configure that process before libtest creates its worker.
+            .env(
+                "RUST_MIN_STACK",
+                crate::test_support::TEST_DEEP_STACK_BYTES.to_string(),
+            )
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
         if let Some(profile) = profile {
@@ -9044,7 +9061,7 @@ fn an_ephemeral_bootstrap_predecessor_refusal_falls_back_without_retained_mutati
             vec![
                 (
                     "pages/refusal.md".into(),
-                    b"- refusal one\n- refusal two\n".to_vec(),
+                    b"- refusal one [[refusal-other]]\n- refusal two\n".to_vec(),
                 ),
                 (
                     "pages/refusal-other.md".into(),
@@ -9126,6 +9143,31 @@ fn an_ephemeral_bootstrap_predecessor_refusal_falls_back_without_retained_mutati
                         .bootstrap_part_reads,
                     fixture.verified.part_count() as usize,
                     "the fallback must reread each immutable bootstrap part"
+                );
+                let read = runtime.database().materialized_read().unwrap();
+                let pages = read.pages(None, 16).unwrap();
+                assert_eq!(
+                    pages.len(),
+                    runtime.engine().canonical_snapshot().unwrap().pages.len(),
+                    "the fallback must install every page from the terminal engine view"
+                );
+                let reference_names = read.navigation_reference_names_after(None, 16).unwrap();
+                assert!(
+                    reference_names.iter().any(|reference| {
+                        reference.owner_path.as_str() == "pages/refusal.md"
+                            && reference.normalized_name == "refusal-other"
+                    }),
+                    "the fallback must install the terminal reference-source view: {reference_names:?}"
+                );
+                let sqlite_reference_root = runtime
+                    .database()
+                    .authenticated_reference_catalog_root()
+                    .unwrap();
+                assert_eq!(sqlite_reference_root.source_count(), pages.len() as u64);
+                assert_eq!(
+                    &sqlite_reference_root,
+                    runtime.engine().reference_catalog_root().unwrap(),
+                    "SQLite and the fallback engine must expose one terminal reference authority"
                 );
                 assert_eq!(
                     runtime.publish_quiescent_resume_point(authority, &fixture.graph),
@@ -9497,14 +9539,23 @@ fn first_mutation_refuses_when_deferred_catalog_bytes_are_missing() {
                     error,
                     RuntimePromotionError::Engine(EngineError::Archive(_))
                 ));
-                assert!(
-                    runtime.engine().instrumentation().catalog_hot_state_loads > 1,
-                    "the refused deferred read must be followed by ordinary replay"
-                );
+                // Outcome first, probe second: the durable retirement is what a
+                // user is protected by, the load count is only how we witness
+                // the replay that produced it.
                 assert!(
                     !retained_run_directories(&fixture.archive_root).contains(&runs[0]),
                     "the refused adopted run must be durably retired after full replay"
                 );
+                // The recovery this is really about: having refused once and
+                // retired the bad run, the runtime must be usable again rather
+                // than stuck refusing. Asserted directly, because the count that
+                // used to stand in for it no longer witnesses the replay —
+                // reads became run-local, so recovery reaches the same state
+                // without loading the catalog hot state a second time. A proxy
+                // that a pure optimization can silence was never the invariant.
+                runtime
+                    .admit_promoted_mutation(authority, &fixture.graph)
+                    .expect("the runtime recovers and admits a mutation after the refusal");
             },
         );
 
@@ -10017,6 +10068,7 @@ mod terminal_construction {
         let replay = build_projection(fixture, "replay", None);
 
         assert_eq!(terminal.bootstrap.terminal_constructions, 1);
+        assert_eq!(terminal.bootstrap.terminal_archive_replays, 0);
         assert_eq!(terminal.bootstrap.terminal_construction_refusals, 0);
         assert_eq!(terminal.bootstrap.bootstrap_part_reads, 0);
         assert_eq!(terminal.bootstrap.bootstrap_object_reads, 0);
@@ -10034,21 +10086,79 @@ mod terminal_construction {
             .bootstrap
             .assert_catalog_authority_is_window_bounded();
 
-        // The replay path is exercised separately and keeps reporting the work
-        // terminal construction deleted.
+        // Durable replay authenticates every part but materializes only the
+        // exact terminal profile, just like the same-process construction.
         assert_eq!(replay.bootstrap.terminal_constructions, 0);
+        assert_eq!(replay.bootstrap.terminal_archive_replays, 1);
         assert_eq!(
             replay.bootstrap.bootstrap_part_reads,
             replay.observation.accepted_batch_count
         );
+        assert_eq!(replay.bootstrap.intermediate_page_materializations, 0);
+        assert_eq!(replay.bootstrap.terminal_materializations, 1);
         assert_eq!(
-            replay.bootstrap.intermediate_page_materializations,
-            replay.observation.accepted_batch_count
+            replay.bootstrap.terminal_pages_materialized,
+            replay.observation.pages.len()
         );
-        assert_eq!(replay.bootstrap.terminal_materializations, 0);
+        assert_eq!(replay.bootstrap.terminal_frontier_bulk_seeds, 1);
+        assert_eq!(
+            replay.bootstrap.max_live_bootstrap_parts,
+            usize::from(replay.bootstrap.bootstrap_part_reads != 0)
+        );
+        replay
+            .bootstrap
+            .assert_catalog_authority_is_window_bounded();
 
         // One candidate transaction and one durability barrier on both paths.
         for built in [&terminal, &replay] {
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_hits,
+                built.bootstrap.terminal_accepted_frontier_session_hits
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_misses,
+                built.bootstrap.terminal_accepted_frontier_session_misses
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_evictions,
+                built.bootstrap.terminal_accepted_frontier_session_evictions
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_oversize,
+                built.bootstrap.terminal_accepted_frontier_session_oversize
+            );
+            assert_eq!(
+                built.rebuild.accepted_frontier_session_peak_resident_bytes,
+                built
+                    .bootstrap
+                    .terminal_accepted_frontier_session_peak_resident_bytes
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_hits,
+                built.bootstrap.terminal_external_exact_session_hits
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_misses,
+                built.bootstrap.terminal_external_exact_session_misses
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_evictions,
+                built.bootstrap.terminal_external_exact_session_evictions
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_oversize,
+                built.bootstrap.terminal_external_exact_session_oversize
+            );
+            assert_eq!(
+                built.rebuild.external_exact_session_peak_resident_bytes,
+                built
+                    .bootstrap
+                    .terminal_external_exact_session_peak_resident_bytes
+            );
+            assert!(
+                built.rebuild.exact_document_loads >= built.observation.pages.len(),
+                "terminal materialization did not report its exact document loads"
+            );
             assert_eq!(built.rebuild.physical_candidate_transactions, 1);
             assert_eq!(built.rebuild.physical_candidate_durability_barriers, 1);
             assert_eq!(built.rebuild.physical_ordinary_transactions, 0);
@@ -10084,6 +10194,7 @@ mod terminal_construction {
         for ordinal in 0..3_000 {
             blocks.push_str(&format!("- split {ordinal:04} [[Target {ordinal:04}]]\n"));
         }
+        force_next_bootstrap_part_operation_limit(2_048);
         let mut fixture = Fixture::new(
             "terminal-huge-page-split",
             None,
@@ -10232,6 +10343,7 @@ mod terminal_construction_interruption {
                 "{cut:?} must be recorded as a discarded private candidate"
             );
             assert_eq!(interrupted.bootstrap().terminal_constructions, 0);
+            assert_eq!(interrupted.bootstrap().terminal_archive_replays, 1);
             assert_eq!(
                 interrupted.bootstrap().bootstrap_part_reads,
                 interrupted.observation().accepted_batch_count,
@@ -10331,6 +10443,7 @@ mod terminal_construction_interruption {
         let substituted = build_projection(&fixture, "substituted", Some(&foreign));
         assert_eq!(substituted.bootstrap().terminal_construction_refusals, 1);
         assert_eq!(substituted.bootstrap().terminal_constructions, 0);
+        assert_eq!(substituted.bootstrap().terminal_archive_replays, 1);
         let clean = build_projection(&fixture, "clean", None);
         assert_eq!(substituted.observation(), clean.observation());
         assert!(candidate_residue(fixture.root.path()).is_empty());
@@ -10366,6 +10479,7 @@ mod terminal_construction_interruption {
 
         let rebuilt = build_projection_at(&fixture, &path, "rebuild", None);
         assert_eq!(rebuilt.bootstrap().terminal_constructions, 0);
+        assert_eq!(rebuilt.bootstrap().terminal_archive_replays, 1);
         assert_eq!(
             rebuilt.bootstrap().bootstrap_part_reads,
             rebuilt.observation().accepted_batch_count

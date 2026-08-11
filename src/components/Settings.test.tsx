@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { Settings } from "./Settings";
 import { closeSettings, openSettings, setToasts, toasts } from "../ui";
 import { backend } from "../backend";
+import { managedStorageRuntime } from "../managedStorageRuntime";
 import * as store from "../store";
 import type { SparseV2ActivationProgress, SparseV2Status } from "../types";
 
@@ -27,6 +28,7 @@ afterEach(() => {
   document.body.innerHTML = "";
   localStorage.clear();
   setToasts([]);
+  managedStorageRuntime.clear();
   vi.restoreAllMocks();
 });
 
@@ -150,6 +152,28 @@ describe("Settings storage transitions", () => {
     expect(root.textContent).toContain("Retry setup");
     expect(root.textContent).toContain("Setup paused. You can retry setup when you are ready.");
     expect(root.textContent).toContain("Return to Direct files");
+    dispose();
+  });
+
+  it("shows the live managed-runtime reason from the shared watcher bridge", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    managedStorageRuntime.bind(11);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    managedStorageRuntime.receiveTick({
+      binding_generation: 11,
+      tick: { state: "blocked", detail: "missing trusted recovery receipt", epoch: null },
+    });
+    managedStorageRuntime.receiveError({
+      binding_generation: 11,
+      message: 'Blocked("missing trusted recovery receipt")',
+    });
+    await tick();
+
+    expect(root.textContent).toContain('Managed storage needs attention: Blocked("missing trusted recovery receipt")');
     dispose();
   });
 

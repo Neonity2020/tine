@@ -2,8 +2,9 @@
 // outside Tauri (browser dev / Playwright screenshots). Mirrors the real
 // backend's shape so the UI behaves identically.
 
+import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SparseV2Status } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -643,6 +644,9 @@ function cloneGuideBlockForCopy(block: BlockDto, copied: Map<string, string>): B
   };
 }
 
+let mockActivationSeq = 0;
+const mockActivations = new Map<string, number>();
+
 export function mockBackend(): Backend {
   const all = [...PAGES, ...NAMED];
   let managedSync: ManagedSyncStatus | null = null;
@@ -822,6 +826,10 @@ export function mockBackend(): Backend {
     async quit(): Promise<void> {
       // No-op in the mock/screenshot harness — there's no process to exit.
     },
+    async prepareQuit() {
+      // No-op in the mock/screenshot harness — there is no managed runtime.
+      return { status: "safe" as const };
+    },
     async closeGraphWindow(): Promise<void> {
       // No-op in the mock/screenshot harness.
     },
@@ -879,8 +887,8 @@ export function mockBackend(): Backend {
       }
       return files.map((f) => ({ ...f, bytes: new TextEncoder().encode(f.text).length }));
     },
-    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<string> {
-      return "mock-rev"; // no-op in mock
+    async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
+      return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
     },
     async managedSyncStatus() {
       return managedSync;
@@ -905,6 +913,15 @@ export function mockBackend(): Backend {
     },
     async sparseV2Status() {
       return sparseV2;
+    },
+    async onSparseV2Status() {
+      return () => {};
+    },
+    async onSparseV2Tick() {
+      return () => {};
+    },
+    async onSparseV2Error() {
+      return () => {};
     },
     async onSparseV2ActivationProgress() {
       return () => {};
@@ -1032,6 +1049,7 @@ export function mockBackend(): Backend {
     },
     async setGuideAnnounced(announced: boolean): Promise<void> {
       mockGuideAnnounced = announced;
+      notifyGraphRebound(); // reaches refresh_graph in the real backend
     },
     async createGraph(_dir: string): Promise<string> {
       return "/mock/new-graph"; // no real scaffolding in the browser mock
@@ -1249,23 +1267,27 @@ export function mockBackend(): Backend {
     async setPreferredWorkflow(): Promise<void> {
       // no-op in the browser mock
     },
+    // These settings reach `refresh_graph` in the real backend, which installs a
+    // FRESH Graph with an empty editor-activation registry. Not a no-op even
+    // here: a mock that silently omits a contract lets every test that uses it
+    // prove the wrong thing. (GH #254 increment 3, round 15.)
     async setTimetrackingEnabled(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async setShowBrackets(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async setDocModeEnterForNewBlock(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async setLogicalOutdenting(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async setPreferredFormat(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async setJournalTitleFormat(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async setDefaultJournalTemplate(): Promise<void> {
       // no-op in the browser mock
@@ -1559,6 +1581,37 @@ export function mockBackend(): Backend {
         ? "* something something\n*\n"
         : "* Tried out the Org demo graph in Tine today\n* TODO follow up on the [[kitchen-sink]] feature tour\nSCHEDULED: <2026-06-27 Sat>\n* DONE loaded the graph and clicked around\n";
     },
+    // Activation is a real identity in the app; the mock backend hands out
+    // monotonic ones so store code that stamps and retires them behaves the same
+    // way here. (GH #254 increment 3.)
+    async activateEditor(path: string, intent: "reuse" | "replace", _expectedRevision: ActivationExpectedRevision) {
+      const live = mockActivations.get(path);
+      if (intent === "reuse" && live !== undefined) {
+        return { activation: live, target: path, prospective: false };
+      }
+      const activation = ++mockActivationSeq;
+      mockActivations.set(path, activation);
+      return { activation, target: path, prospective: false };
+    },
+    async activateAbsentEditor(name: string, kind: PageDto["kind"]) {
+      const target = kind === "journal" ? `journals/${name}.md` : `pages/${name}.md`;
+      const activation = ++mockActivationSeq;
+      mockActivations.set(target, activation);
+      return { activation, target, prospective: true };
+    },
+    async presentConflictOverride(
+      _path: string,
+      _baseRev: string | null,
+      _activation: number,
+      _conflictEpoch: number,
+    ): Promise<"authorised" | "superseded" | "withdrawn"> {
+      return "authorised";
+    },
+    async retireEditorActivation(path: string, activation: number) {
+      if (mockActivations.get(path) !== activation) return false;
+      mockActivations.delete(path);
+      return true;
+    },
     async getPageByPath(path: string): Promise<PageDto | null> {
       const page = all.find((p) => mockPagePath(p) === path);
       if (page) return { ...page, path };
@@ -1709,7 +1762,7 @@ export function mockBackend(): Backend {
       return [];
     },
     async restoreBackup(): Promise<void> {
-      // no-op in the browser mock
+      notifyGraphRebound();
     },
     async loadSession(): Promise<string | null> {
       return mockSession;

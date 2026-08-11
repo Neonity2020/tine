@@ -13,27 +13,54 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // the transient retry refuses to run while a page is conflicted, and the only
 // live button — "Use disk version" — discards their unsaved edits.
 
-const calls: { name: string; force: boolean }[] = [];
+const calls: {
+  name: string;
+  force: boolean;
+  conflictEpoch: number | null;
+  managedConflictObservation: { path: string; revision: string } | null;
+}[] = [];
 let nextResult: (() => Promise<string>) | null = null;
+let observedManagedPage: { rev: string; path: string } | null = null;
+let draftPath = "pages/Notes.md";
 
 vi.mock("./store", () => ({
   doc: { loaded: true, pages: [] },
-  pageByName: (name: string) => ({ name }),
+  // The save path acquires the editor's activation before building the DTO
+  // (GH #254 increment 3). These stubs say "this editor already holds one", so
+  // these tests keep exercising the conflict/barrier behaviour they are about.
+  editorActivationFor: () => 1,
+  setEditorActivation: () => {},
+  setProspectiveTarget: () => {},
+  bumpEditGeneration: () => {},
+  peekPageInstanceGeneration: () => 1,
+  retryPendingBlockRefStamps: () => {},
+  notifyPageBecameReplaceable: () => {},
+  sweepReplaceable: () => {},
+  pageByName: (name: string) => ({ name, kind: "page", path: draftPath }),
   pageInstanceGeneration: () => 1,
   pageToDto: (name: string) => ({
     name, kind: "page", title: name, pre_block: null, blocks: [],
-    format: "markdown", path: `pages/${name}.md`, guide: false, read_only: false,
+    format: "markdown", path: draftPath, guide: false, read_only: false,
+    activation: 1,
   }),
 }));
 
 vi.mock("./backend", () => ({
   backend: () => ({
-    savePage: (page: { name: string }, _baseRev: string | null, force: boolean) => {
-      calls.push({ name: page.name, force });
+    savePage: (
+      page: { name: string },
+      _baseRev: string | null,
+      force: boolean,
+      conflictEpoch: number | null,
+      managedConflictObservation: { path: string; revision: string } | null,
+    ) => {
+      calls.push({ name: page.name, force, conflictEpoch, managedConflictObservation });
       const result = nextResult;
       nextResult = null;
       return result ? result() : Promise.resolve("rev-after");
     },
+    getPageByPath: () => Promise.resolve(observedManagedPage),
+    getPage: () => Promise.resolve(observedManagedPage),
   }),
 }));
 
@@ -49,7 +76,14 @@ vi.mock("./ui", () => ({
   pushToast: (message: string) => toasts.push(message),
 }));
 
-const { forceSave, markDirty, resetSaveState } = await import("./persistence");
+const {
+  canForceSave,
+  flushPage,
+  forceSave,
+  markDirty,
+  resetSaveState,
+  setBaseRev,
+} = await import("./persistence");
 
 // GH #254 increment 2, fourth correction-delta re-verification, HIGH. A Direct
 // save error is "{bounded code}: {raw error}", and raw errors carry graph
@@ -65,6 +99,8 @@ describe("a failure is classified by its code, not by the page's name", () => {
     toasts.length = 0;
     conflicted.clear();
     nextResult = null;
+    observedManagedPage = null;
+    draftPath = "pages/Notes.md";
     resetSaveState();
   });
 
@@ -112,6 +148,8 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     toasts.length = 0;
     conflicted.clear();
     nextResult = null;
+    observedManagedPage = null;
+    draftPath = "pages/Notes.md";
     resetSaveState();
   });
 
@@ -128,7 +166,7 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     // …and the retry actually calls the backend, which the conflicted gate
     // would otherwise forbid.
     await vi.waitFor(() => expect(calls.length).toBe(2));
-    expect(calls[0]).toEqual({ name: "Notes", force: true });
+    expect(calls[0]).toMatchObject({ name: "Notes", force: true });
     expect(calls[1].force).toBe(false);
   });
 
@@ -154,6 +192,106 @@ describe("a tokenless force does not strand the page behind a spent banner", () 
     expect(await forceSave("Notes")).toBe(false);
 
     expect(conflicted.has("Notes")).toBe(true);
+    expect(canForceSave("Notes")).toBe(false);
     expect(calls.length).toBe(1);
+  });
+});
+
+describe("managed save conflict resolution", () => {
+  beforeEach(() => {
+    calls.length = 0;
+    toasts.length = 0;
+    conflicted.clear();
+    nextResult = null;
+    observedManagedPage = null;
+    draftPath = "pages/Notes.md";
+    resetSaveState();
+  });
+
+  it("retains the draft and binds Keep mine to the exact managed revision it observed", async () => {
+    observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
+    nextResult = () => Promise.reject(new Error("managed.conflict: stale_base"));
+    setBaseRev("Notes", "managed-editor-base");
+    markDirty("Notes");
+
+    expect(await flushPage("Notes")).toBe(false);
+    expect(conflicted.has("Notes")).toBe(true);
+    expect(canForceSave("Notes")).toBe(true);
+
+    nextResult = () => Promise.resolve("managed-mine");
+    expect(await forceSave("Notes")).toBe(true);
+    expect(calls[1]).toMatchObject({
+      force: true,
+      conflictEpoch: null,
+      managedConflictObservation: {
+        path: "pages/Notes.md",
+        revision: "managed-winner-a",
+      },
+    });
+  });
+
+  it("re-observes after a second managed winner and never upgrades an earlier click", async () => {
+    observedManagedPage = { rev: "managed-winner-a", path: "pages/Notes.md" };
+    nextResult = () => Promise.reject(new Error("managed.conflict: stale_base"));
+    setBaseRev("Notes", "managed-editor-base");
+    markDirty("Notes");
+    await flushPage("Notes");
+
+    observedManagedPage = { rev: "managed-winner-b", path: "pages/Notes.md" };
+    nextResult = () => Promise.reject(new Error("managed.conflict: stale_base"));
+    expect(await forceSave("Notes")).toBe(false);
+    expect(calls[1]).toMatchObject({
+      force: true,
+      managedConflictObservation: {
+        path: "pages/Notes.md",
+        revision: "managed-winner-a",
+      },
+    });
+
+    nextResult = () => Promise.resolve("managed-mine");
+    expect(await forceSave("Notes")).toBe(true);
+    expect(calls[2]).toMatchObject({
+      force: true,
+      managedConflictObservation: {
+        path: "pages/Notes.md",
+        revision: "managed-winner-b",
+      },
+    });
+  });
+
+  it("binds a losing new-page draft to the identifiable winner's exact path and revision", async () => {
+    draftPath = "";
+    observedManagedPage = { rev: "managed-created-winner", path: "pages/Notes.md" };
+    nextResult = () => Promise.reject(new Error("managed.conflict: page_already_exists"));
+    markDirty("Notes");
+
+    expect(await flushPage("Notes")).toBe(false);
+    expect(conflicted.has("Notes")).toBe(true);
+    expect(canForceSave("Notes")).toBe(true);
+
+    nextResult = () => Promise.resolve("managed-new-draft-won");
+    expect(await forceSave("Notes")).toBe(true);
+    expect(calls[1]).toMatchObject({
+      force: true,
+      conflictEpoch: null,
+      managedConflictObservation: {
+        path: "pages/Notes.md",
+        revision: "managed-created-winner",
+      },
+    });
+  });
+
+  it("fails closed when the exact managed owner was deleted or renamed", async () => {
+    observedManagedPage = null;
+    nextResult = () => Promise.reject(new Error("managed.conflict: missing_page"));
+    setBaseRev("Notes", "managed-editor-base");
+    markDirty("Notes");
+
+    await flushPage("Notes");
+    expect(conflicted.has("Notes")).toBe(true);
+    expect(canForceSave("Notes")).toBe(false);
+    const before = calls.length;
+    expect(await forceSave("Notes")).toBe(false);
+    expect(calls).toHaveLength(before);
   });
 });

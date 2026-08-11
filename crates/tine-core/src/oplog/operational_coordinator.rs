@@ -27,8 +27,9 @@ use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
     ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, ObjectStore,
-    OperationTransaction, PreparedBatch, ProjectionEndpointBinding, ProjectionReceiptStore,
-    RebuildSource, SessionId, ShardedHotEngine, SqliteFrontier, TailOverlay, TailReservation,
+    OperationTransaction, PreparedBatch, ProjectionEndpointBinding, ProjectionError,
+    ProjectionReceiptStore, RebuildSource, SessionId, ShardedHotEngine, SqliteFrontier,
+    TailOverlay, TailReservation,
 };
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
@@ -155,6 +156,7 @@ pub(crate) enum RetainedBlockReason {
     Quarantined,
     PublishedAuthentication,
     StableBinding,
+    GuardedProjectionConflict,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -814,11 +816,18 @@ impl PublishedContinuationCore {
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
             }
-            executed.map_err(|error| {
-                OperationalCoordinatorError::new(
+            executed.map_err(|error| match error {
+                ProjectionError::GuardedConflict(error) => {
+                    OperationalCoordinatorError::retained_block(
+                        OperationalPhase::ProjectionDrain,
+                        error.to_string(),
+                        RetainedBlockReason::GuardedProjectionConflict,
+                    )
+                }
+                error => OperationalCoordinatorError::new(
                     OperationalPhase::ProjectionDrain,
                     error.to_string(),
-                )
+                ),
             })?;
             budget.consume(1, OperationalPhase::ProjectionDrain)?;
             fault(OperationalFaultPoint::AfterProjection)?;
@@ -1386,6 +1395,7 @@ impl OperationalCoordinator {
         graph: &Graph,
         receipts: &ProjectionReceiptStore,
         transaction: &OperationTransaction,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
         #[cfg(test)]
         reset_trusted_local_preparation_stage_timings();
@@ -1408,6 +1418,7 @@ impl OperationalCoordinator {
             LocalDraftSource::Promoted,
             LocalPreparationBinding::TrustedLocal,
             transaction,
+            prepared_editor_projection,
         )
     }
 
@@ -1517,6 +1528,7 @@ impl OperationalCoordinator {
             LocalDraftSource::Raw(author),
             LocalPreparationBinding::TrustedLocal,
             transaction,
+            None,
         )
     }
 }
@@ -1582,6 +1594,7 @@ fn prepare_local_inner(
     source: LocalDraftSource,
     binding: LocalPreparationBinding,
     transaction: &OperationTransaction,
+    prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
 ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
     #[cfg(test)]
     let bindings_started = Instant::now();
@@ -1633,7 +1646,11 @@ fn prepare_local_inner(
             let author_device_id = authority.device_id();
             let author_session_id = authority.session_id();
             let (batch_id, draft) = engine
-                .draft_admitted_local_author_transaction(&authority, transaction)
+                .draft_admitted_local_author_transaction(
+                    &authority,
+                    transaction,
+                    prepared_editor_projection,
+                )
                 .map_err(|error| {
                     OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
                 })?;
@@ -1740,6 +1757,7 @@ fn execute_local_inner(
         source,
         LocalPreparationBinding::SlowPipeline,
         transaction,
+        None,
     )? {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
