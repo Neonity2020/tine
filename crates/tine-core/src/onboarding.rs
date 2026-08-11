@@ -100,6 +100,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Reference/Troubleshooting and recovery",
         markdown: include_str!("templates/troubleshooting-recovery.md"),
     },
+    GuideTemplate {
+        title: "Workflows/Capture and plan your day",
+        markdown: include_str!("templates/capture-plan-day.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -754,6 +758,59 @@ mod tests {
         assert!(
             copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_plan_day_workflow_is_registered_linked_and_copyable() {
+        let title = "Workflows/Capture and plan your day";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("capture-and-plan workflow is registered");
+        assert!(page.markdown.contains("- # Capture and plan your day"));
+        assert!(page.markdown.contains("**Ctrl+Enter**"));
+        assert!(page
+            .markdown
+            .contains("{{query (task TODO DOING NOW LATER)}}"));
+        assert!(page.markdown.contains("Carry unfinished tasks"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("[[Features/Quick capture]]"));
+        assert!(page
+            .markdown
+            .contains("[[Reference/Troubleshooting and recovery]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Workflows/Capture and plan your day]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("capture-and-plan workflow is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Workflows/Capture and plan your day"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-capture-plan-day-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Workflows/Capture and plan your day"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("capture-and-plan workflow was copied");
+        assert!(copied_markdown.contains("{{query (task TODO DOING NOW LATER)}}"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Quick capture]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

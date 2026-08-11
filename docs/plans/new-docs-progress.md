@@ -71,3 +71,25 @@ Added one canonical workflow page, registered it in the shared manifest, linked 
 - `src-tauri/src/debug.rs` — debug output defaults to `std::env::temp_dir()/tine-debug.log`, with `TINE_DEBUG_LOG` override. The Guide names the platform temporary folder rather than assuming Linux `/tmp`.
 - `README.md:210-231` — the WebKitGTK GPU fallback is Linux-specific; `TINE_DEBUG=1` / `--debug` and the no-note-content diagnostic contract remain the startup recovery path.
 - `docs/FEATURES.md:629-635` — “runs Tine's parser (lsdoc) against Logseq's own parser… Every divergence snippet is **anonymized**… and **re-verified to still reproduce the divergence**… nothing is uploaded.” The diagnostics/report scenario.
+
+## Phase C — candidates: J03 day planning (Workflows/Capture and plan your day)
+
+### Behavioral claim sources
+
+- `src/components/Sidebar.tsx:147` — sidebar nav label “Journals”; `docs/FEATURES.md:408-409` — “Multi-day **journal feed** (one continuous editable list); today's journal created lazily on first edit”. The open-today-and-type path and “no file until you type”.
+- `crates/tine-core/src/templates/quick-capture.md:13-16` — “**Leave the title empty** → the text is appended to **today's journal**… It's the real editor in there”; `src/store.ts:2013` — “Append a quick-capture”. The quick-capture pointer.
+- `src/editor/marker.ts:1-5` — “cycle-marker-state: TODO -> DOING -> DONE -> (none); LATER -> NOW -> DONE -> (none); … Bound to mod+enter”; `src/keybindings.ts:385` — `{ id: "editor/cycle-todo", binding: "mod+enter" }`; `src/store.ts:3234-3247` — `cycleSelectionTasks` cycles every selected block; `docs/FEATURES.md:382-383` — “cycle with Mod+Enter (including every selected task at once)”. The marker-cycling actions.
+- `src/components/Block.tsx:830-836` — marker chip `onClick` → `cycleBlockMarker`; `Block.tsx:906-915` — checkbox `toggleBlockCheckbox` (open → DONE, DONE → open marker); `src/markers.ts:44-53` — checkbox states (DONE checked, open unchecked, CANCELED/none no box); `docs/FEATURES.md:391-396` — same prose. The click paths.
+- `src/editor/autocomplete.ts:422-424` — `{ label: "Priority A", action: "priority-a", key: "A" }` etc.; `src/editor/format.ts:223-224` — “Set (or replace) the `[#X]` priority … placed after any task marker”. The priority step.
+- `src/components/Block.tsx:2045-2051` — slash `scheduled`/`deadline` “open the calendar popup anchored under the editor”; `Block.tsx:851-874` — date chips, title “Scheduled — click to change”, `openDatePicker`; `src/components/DatePicker.tsx:74` — “Optional clock time (`HH:mm`), like OG's ‘Add time’”. The schedule steps and outcomes (chip).
+- `docs/FEATURES.md:397-405` — date picker, optional clock time `(<2026-07-07 Tue 14:30>)`, repeaters `+1w`/`.+1w`/`++1w`, “Re-picking the date keeps an existing time (and repeater)”, type-anywhere planning lines normalized on exit, fenced/inline-code planning lines stay literal. Cross-check for the stored-syntax claims.
+- `src/editor/repeat.ts:42-44` — “`.+` repeats from the completion date (today); `+`/`++` from the stored date. `++` is catch-up”; `repeat.ts:68-86` — completing a repeater advances dates “and resets the marker to the workflow's open state”. The repeater summary.
+- `src/components/Page.tsx:462-473` — “Agenda sits at the bottom of today's (the first) day, like OG.” `<QueryMacro body={agendaQuery()} title="Scheduled & Deadline" hideWhenEmpty>`; `src/ui.ts:469-514` — default window 7/7, window “tested against the scheduled/deadline date itself — NOT the journal day”, “Finished tasks are excluded … matches OG's `:block/marker "NIL"` default”; `Settings.tsx:1902-1928` — “Agenda window … days back · days ahead”. The agenda section.
+- `src/components/Page.tsx:954-996` — carry buttons `Carry unfinished tasks → today` / `Carry from previous day` / `Carry last {N} days` under journal titles; `src/carry.ts:71` — toast `Carried ${n} items to today` / “No unfinished tasks to carry”; `ContextMenu.tsx:888` — right-click “Carry unfinished tasks → today”; `src/keybindings.ts:353-356` — command-palette presets 7/30/365/N; `src/ui.ts:432-456` — defaults (buttons shown, keep-context on, header off); `Settings.tsx:1822-1852` — the carry settings and hints. The carry-over section.
+- `src/editor/queryBuilder.ts:17,187-189` — `(task TODO DOING NOW LATER)` DSL clause (list of markers). The executable-query example.
+- `crates/tine-core/src/templates/showcase.md:57-73` — the Feature showcase page already ships open-task examples — why the workflow page's query outcome names other pages' open tasks too.
+
+### Discrepancies / deliberate scope
+
+- `docs/FEATURES.md:552` (recent-graphs staleness) still pending from the J02 slice; not touched.
+- No per-platform quick-capture claim beyond the desktop shortcut flow already on [[Features/Quick capture]] (its page leads with Linux DE setup); Android has no global-capture story here, so none is asserted.
