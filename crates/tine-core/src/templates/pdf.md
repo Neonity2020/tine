@@ -7,6 +7,7 @@ icon:: 📄
 	- Use the reader toolbar to choose a persistent **Light**, **Warm**, or **Dark** page theme, and open **Outline** to navigate a PDF's nested table of contents.
 	- Every highlight becomes a **block** on a notes page named after the PDF, so you can write underneath it, link it, and reference it like any other bullet — and each note jumps straight back to its spot in the document.
 	- It's how you turn a paper into linked, searchable notes without ever leaving Tine.
+	- For the end-to-end path from dropping a PDF in to quoting its passages and sharing the result, see [[Workflows/Research a document]].
 - ## Create one yourself
 	- 1. Put a PDF in your graph's `assets/` folder, or drop it into a page.
 	- 2. Open the PDF from its asset link so it appears in the side pane.

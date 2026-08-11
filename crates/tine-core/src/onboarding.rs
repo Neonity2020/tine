@@ -116,6 +116,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Reference/Pages, links, references, and search",
         markdown: include_str!("templates/pages-links-references-search.md"),
     },
+    GuideTemplate {
+        title: "Workflows/Research a document",
+        markdown: include_str!("templates/research-document.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -980,6 +984,52 @@ mod tests {
             .expect("pages/links/search reference was copied");
         assert!(copied_markdown.contains("[[tine-guide/Workflows/Find and revisit]]"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Tips & shortcuts]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn research_document_workflow_is_registered_linked_and_copyable() {
+        let title = "Workflows/Research a document";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("research-document workflow is registered");
+        assert!(page.markdown.contains("- # Research a document"));
+        assert!(page.markdown.contains("**Notes**"));
+        assert!(page.markdown.contains("**Copy ref**"));
+        assert!(page.markdown.contains("hls__"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("[[Features/PDF annotation]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index.markdown.contains("[[Workflows/Research a document]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("research-document workflow is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Workflows/Research a document"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-research-document-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Workflows/Research a document"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("research-document workflow was copied");
+        assert!(copied_markdown.contains("[[tine-guide/Features/PDF annotation]]"));
+        assert!(copied_markdown.contains("[[tine-guide/Workflows/Find and revisit]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
