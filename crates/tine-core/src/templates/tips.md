@@ -22,6 +22,7 @@ icon:: ⌨️
 - ## Tabs
 	- **Middle-click** any bullet, page, or search result to open it in a background tab. **Double-click** a tab to pin it, **drag** to reorder, **Ctrl+W** to close. Your tabs come back next launch.
 	- When a pane has more tabs than fit, use its tab-overview button to see every full title, activate or pin a tab, close it, or reorder it with the drag handle / **Alt+Up/Down** without guessing from truncated labels.
+	- For arranging tabs with the sidebars and split panes into a working layout — and saving it as a workspace — see [[Workflows/Keep context visible]]; [[Start/Where things are]] maps the places first.
 - ## The sidebars
 	- **t l** toggles the left sidebar — journals, favorites, recents, all pages, and a namespace tree. Favorites and Recent can be folded independently.
 	- **t r** toggles the right sidebar; **Shift-click** any bullet's dot to open it there and keep it beside your work. Each right-sidebar item can be folded independently, and its menu can collapse, expand, or close them all.

@@ -120,6 +120,14 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Workflows/Research a document",
         markdown: include_str!("templates/research-document.md"),
     },
+    GuideTemplate {
+        title: "Start/Where things are",
+        markdown: include_str!("templates/where-things-are.md"),
+    },
+    GuideTemplate {
+        title: "Workflows/Keep context visible",
+        markdown: include_str!("templates/keep-context-visible.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -1029,6 +1037,99 @@ mod tests {
         let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
             .expect("research-document workflow was copied");
         assert!(copied_markdown.contains("[[tine-guide/Features/PDF annotation]]"));
+        assert!(copied_markdown.contains("[[tine-guide/Workflows/Find and revisit]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn where_things_are_page_is_registered_linked_and_copyable() {
+        let title = "Start/Where things are";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("where-things-are page is registered");
+        assert!(page.markdown.contains("- # Where things are"));
+        assert!(page.markdown.contains("**t l**"));
+        assert!(page.markdown.contains("**t r**"));
+        assert!(page.markdown.contains("**Shift+?**"));
+        assert!(page.markdown.contains("[[Welcome to Tine]]"));
+        assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
+        assert!(page.markdown.contains("[[Features/Tips & shortcuts]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index.markdown.contains("[[Start/Where things are]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("where-things-are is available in the read-only Guide");
+        assert_eq!(virtual_page.page.name, "Tine-guide/Start/Where things are");
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-where-things-are-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Start/Where things are"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("where-things-are was copied");
+        assert!(copied_markdown.contains("[[tine-guide/Workflows/Keep context visible]]"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Tips & shortcuts]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keep_context_visible_workflow_is_registered_linked_and_copyable() {
+        let title = "Workflows/Keep context visible";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("keep-context-visible workflow is registered");
+        assert!(page.markdown.contains("- # Keep context visible"));
+        assert!(page.markdown.contains("**Shift-click**"));
+        assert!(page.markdown.contains("**Ctrl+Shift+T**"));
+        assert!(page.markdown.contains("+ New workspace"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page.markdown.contains("[[Start/Where things are]]"));
+        assert!(page.markdown.contains("[[Features/Tips & shortcuts]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Workflows/Keep context visible]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("keep-context-visible workflow is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Workflows/Keep context visible"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-keep-context-visible-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Workflows/Keep context visible"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("keep-context-visible workflow was copied");
+        assert!(copied_markdown.contains("[[tine-guide/Start/Where things are]]"));
         assert!(copied_markdown.contains("[[tine-guide/Workflows/Find and revisit]]"));
 
         let _ = std::fs::remove_dir_all(&dir);

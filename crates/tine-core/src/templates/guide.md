@@ -5,9 +5,11 @@ icon:: 🧭
 	- Each page is read-only here. Use **Copy the guide into your graph** on any Guide page when you want an editable, interlinked sandbox under `tine-guide/`.
 - ## Start
   - [[Welcome to Tine]] — tour the basics hands-on: bullets, tasks, rich text, links, and live block references.
+  - [[Start/Where things are]] — map the main places: the page, the left sidebar, tabs, the right sidebar, and Settings and Help.
   - [[Start/Bring an existing graph]] — point Tine at your existing Logseq graph and learn what it reads and writes.
   - [[Project/Roadmap]] — try a few example tasks for your first steps.
 - ## Workflows
+  - [[Workflows/Keep context visible]] — park a source in the right sidebar, keep places in tabs and panes, and save the layout as a workspace.
   - [[Workflows/Structure repeated information]] — turn a small repeated outline into a table or board, then find and reuse its blocks before reaching for query syntax.
   - [[Workflows/Capture and plan your day]] — journal-first daily flow: tasks, priorities, dates, the agenda, and carrying leftovers forward.
   - [[Workflows/Find and revisit]] — jump back to anything with Ctrl+K, follow links and reference panels, and keep a search as an ordinary page.
