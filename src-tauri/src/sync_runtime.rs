@@ -357,6 +357,10 @@ fn action_for_runtime_lifecycle(lifecycle: &SyncRuntimeLifecycle) -> SparseV2Bin
     }
 }
 
+fn runtime_lifecycle_admits_application_pages(lifecycle: &SyncRuntimeLifecycle) -> bool {
+    matches!(lifecycle, SyncRuntimeLifecycle::Active)
+}
+
 impl SparseV2Binding {
     fn from_open(result: SyncRuntimeOpenResult) -> Self {
         Self {
@@ -374,6 +378,17 @@ impl SparseV2Binding {
 
     pub(crate) fn handle(&self) -> Option<&SyncRuntimeHandle> {
         self.handle.as_ref()
+    }
+
+    /// The frontend may preflight a bulk page write only while the retained
+    /// runtime has positively reported that it is still accepting work.  A
+    /// stopped or terminal handle deliberately remains retained for recovery,
+    /// so handle presence is not application-write authority.
+    pub(crate) fn has_active_application_handle(&self) -> bool {
+        self.handle
+            .as_ref()
+            .and_then(|handle| handle.status().ok())
+            .is_some_and(|snapshot| runtime_lifecycle_admits_application_pages(&snapshot.lifecycle))
     }
 
     /// A managed binding with no live actor, for tests that only need the slot
@@ -548,7 +563,7 @@ impl SparseV2StatusDto {
             can_cancel: false,
             cancel_reason: None,
             binding_generation,
-            application_page_admission: if binding.handle().is_some() {
+            application_page_admission: if binding.has_active_application_handle() {
                 crate::state::ApplicationPageAdmission {
                     binding_generation,
                     authority: crate::state::ApplicationPageAdmissionAuthority::ManagedWritable {
@@ -2726,6 +2741,22 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn only_an_active_runtime_lifecycle_admits_application_pages() {
+        assert!(runtime_lifecycle_admits_application_pages(
+            &SyncRuntimeLifecycle::Active
+        ));
+        assert!(!runtime_lifecycle_admits_application_pages(
+            &SyncRuntimeLifecycle::StoppedSafe
+        ));
+        assert!(!runtime_lifecycle_admits_application_pages(
+            &SyncRuntimeLifecycle::StoppedCrashed
+        ));
+        assert!(!runtime_lifecycle_admits_application_pages(
+            &SyncRuntimeLifecycle::Terminal
+        ));
+    }
+
     struct RollbackFixture {
         root: PathBuf,
         graph_root: PathBuf,
@@ -2893,6 +2924,48 @@ mod tests {
             "cold recovery starts before any graph slot"
         );
         fixture
+    }
+
+    #[test]
+    fn joinable_shared_descriptor_still_serializes_direct_application_admission() {
+        std::thread::Builder::new()
+            .name("tine-joinable-direct-admission-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(joinable_shared_descriptor_still_serializes_direct_application_admission_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn joinable_shared_descriptor_still_serializes_direct_application_admission_inner() {
+        let mut fixture = RollbackFixture::new(Some("shadow_import"));
+        fixture.make_active();
+        let descriptor = fixture
+            .slot
+            .sparse_runtime()
+            .expect("active fixture must retain its runtime")
+            .prepare_shared()
+            .unwrap();
+
+        // A second process discovering this literal shared descriptor has not
+        // opted into sparse-v2 yet, so it keeps its Direct Files writer.
+        let direct = crate::state::GraphSlot::new(
+            Graph::open(&fixture.graph_root),
+            fixture.graph_root.clone(),
+        );
+        let status = sparse_v2_status_for_slot(&direct).unwrap();
+        assert!(matches!(
+            status.availability,
+            SparseV2Availability::Joinable { ref descriptor_digest }
+                if descriptor_digest == &descriptor.descriptor_digest
+        ));
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["application_page_admission"],
+            serde_json::json!({
+                "binding_generation": direct.binding_generation,
+                "authority": "direct",
+            })
+        );
     }
 
     #[test]
@@ -3963,7 +4036,8 @@ mod tests {
             admission.authority,
             crate::state::ApplicationPageAdmissionAuthority::ManagedWritable {
                 application_save_page_blocks: tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
-                application_page_request_text_bytes: tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
+                application_page_request_text_bytes:
+                    tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
                 application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
             }
         ));
@@ -4206,6 +4280,11 @@ mod tests {
                 if stage == "local_active" && detail.contains("stopped safely")
         ));
         assert!(stopped_status.can_retry);
+        assert_eq!(
+            serde_json::to_value(stopped_status).unwrap()["application_page_admission"]
+                ["authority"],
+            "managed_unavailable"
+        );
         drop(slot);
 
         let reopened = SyncRuntimeHandle::open(open_request);

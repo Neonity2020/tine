@@ -257,7 +257,7 @@ impl GraphSlot {
     pub(crate) fn application_page_admission(&self) -> ApplicationPageAdmission {
         match &self.authority {
             GraphAuthority::Legacy(_) => ApplicationPageAdmission::direct(self.binding_generation),
-            GraphAuthority::SparseV2(binding) if binding.handle().is_some() => {
+            GraphAuthority::SparseV2(binding) if binding.has_active_application_handle() => {
                 ApplicationPageAdmission {
                     binding_generation: self.binding_generation,
                     authority: ApplicationPageAdmissionAuthority::ManagedWritable {

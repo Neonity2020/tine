@@ -1,10 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { backend } from "./backend";
-import { handleGraphChange, handleSparseV2Changed, installMobileExternalLinkHandler } from "./App";
+import {
+  acceptColdReturnManagedStorage,
+  handleGraphChange,
+  handleSparseV2Changed,
+  installMobileExternalLinkHandler,
+} from "./App";
 import { resetPaneLayoutToSingle, restorePaneLayout } from "./panes";
 import { pageByName, reloadPage, resetStore, setDoc, type FeedPage, type Node as StoreNode } from "./store";
 import { clearConflict, isConflicted, pageInventoryRev } from "./ui";
 import { flushPage, forceSave, isDirty, markDirty, resetSaveState } from "./persistence";
+import { managedStorageRuntime } from "./managedStorageRuntime";
+import type { SparseV2CancelResult } from "./types";
 
 function addAnchor(href: string): HTMLAnchorElement {
   const a = document.createElement("a");
@@ -23,8 +30,40 @@ function click(el: Element): MouseEvent {
 afterEach(() => {
   document.body.innerHTML = "";
   vi.restoreAllMocks();
+  managedStorageRuntime.clear();
   resetStore();
   resetPaneLayoutToSingle({ tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }], activeIndex: 0 });
+});
+
+describe("cold managed recovery route installation", () => {
+  it("binds the native Direct admission together with the returned generation", () => {
+    const result: SparseV2CancelResult = {
+      binding_generation: 42,
+      recovery_statement: "managed state archived",
+      status: {
+        state: "legacy_default",
+        runtime: null,
+        can_activate: true,
+        can_retry: false,
+        can_cancel: false,
+        cancel_reason: null,
+        binding_generation: 42,
+        application_page_admission: {
+          binding_generation: 42,
+          authority: "direct",
+        },
+      },
+    };
+
+    acceptColdReturnManagedStorage(result);
+
+    expect(managedStorageRuntime.snapshot().bindingGeneration).toBe(42);
+    expect(managedStorageRuntime.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 42,
+      authority: "direct",
+    });
+    expect(managedStorageRuntime.snapshot().status).toBe(result.status);
+  });
 });
 
 function page(name: string, kind: "page" | "journal", roots: string[]): FeedPage {

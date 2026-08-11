@@ -133,6 +133,7 @@ import { drainPdfWork } from "./pdfOwnership";
 import { managedStorageRuntime, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 import { createStartupRecoveryController } from "./startupRecovery";
 import { writeClipboardTextResilient } from "./clipboard";
+import type { SparseV2CancelResult } from "./types";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -581,6 +582,18 @@ export async function installMobileExternalLinkHandler(): Promise<() => void> {
   return () => document.removeEventListener("click", onClick, true);
 }
 
+/** Install the native post-cancel route before publishing its status.  In
+ * particular, Direct Files must never briefly appear as a synthetic
+ * managed-unavailable binding during cold recovery. */
+export function acceptColdReturnManagedStorage(result: SparseV2CancelResult): void {
+  managedStorageRuntime.clear();
+  managedStorageRuntime.bind(
+    result.binding_generation,
+    result.status.application_page_admission,
+  );
+  managedStorageRuntime.receiveStatus(result.status);
+}
+
 export function App(): JSX.Element {
   let openCalendarJump = () => {};
   const topbarActions = {
@@ -598,11 +611,7 @@ export function App(): JSX.Element {
     openGraph: (path) => loadGraphPath(path),
     pickGraph: switchGraph,
     coldReturn: (path, attempt) => backend().cancelSparseV2Cold(path, attempt),
-    acceptColdReturn: (result) => {
-      managedStorageRuntime.clear();
-      managedStorageRuntime.bind(result.binding_generation);
-      managedStorageRuntime.receiveStatus(result.status);
-    },
+    acceptColdReturn: acceptColdReturnManagedStorage,
     confirmColdReturn: (name) => backend().confirm(
       `Return ${name} to Direct Files?\n\nTine will archive its durable managed-storage and provider state before reopening the Markdown files directly. This is a recovery exit, not confirmation that every pending or remote change synchronized.`,
       "Return to Direct Files?",
