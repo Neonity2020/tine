@@ -1339,11 +1339,37 @@ fn report(label: &str, seed: u64, result: &CampaignResult, frozen_candidate: &Fr
     );
 }
 
+/// Run one campaign body on a stack the size production actually gives these
+/// paths.
+///
+/// A replay drives the managed engine, which in production runs on the sync
+/// actor's 16 MiB stack (`ACTOR_STACK_BYTES`), and 32 MiB on the Tauri side.
+/// libtest's worker threads get 2 MiB, and a campaign now needs slightly more
+/// than that — measured: it passes at 4 MiB. So the overflow is libtest's
+/// constraint, not a product limit, and the fix is to stop testing the engine
+/// on a stack no shipping caller uses. `tine_core::test_support` does exactly
+/// this for unit tests; it is crate-private, so integration tests carry their
+/// own copy of the same contract.
+///
+/// This deliberately does NOT cover paths that must fit the default stack —
+/// those have their own tests saying so by name.
+fn run_on_actor_sized_stack(body: impl FnOnce() + Send + 'static) {
+    const ACTOR_SIZED_STACK_BYTES: usize = 16 * 1024 * 1024;
+    std::thread::Builder::new()
+        .stack_size(ACTOR_SIZED_STACK_BYTES)
+        .spawn(body)
+        .expect("the campaign test thread spawns")
+        .join()
+        .expect("the campaign body must not panic");
+}
+
 #[test]
 fn generated_campaign_fast_default() {
-    let frozen_candidate = fixture_candidate();
-    let result = run_campaign(FAST_SEED, FAST_COUNT, &frozen_candidate);
-    report("fast", FAST_SEED, &result, &frozen_candidate);
+    run_on_actor_sized_stack(|| {
+        let frozen_candidate = fixture_candidate();
+        let result = run_campaign(FAST_SEED, FAST_COUNT, &frozen_candidate);
+        report("fast", FAST_SEED, &result, &frozen_candidate);
+    });
 }
 
 #[test]
@@ -1362,9 +1388,11 @@ fn generated_campaign_is_byte_identical_per_seed() {
 
 #[test]
 fn generated_campaign_known_seed_range_replays_green() {
-    let frozen_candidate = fixture_candidate();
-    let result = run_campaign(81_920, FAST_COUNT, &frozen_candidate);
-    report("known-range", 81_920, &result, &frozen_candidate);
+    run_on_actor_sized_stack(|| {
+        let frozen_candidate = fixture_candidate();
+        let result = run_campaign(81_920, FAST_COUNT, &frozen_candidate);
+        report("known-range", 81_920, &result, &frozen_candidate);
+    });
 }
 
 #[test]
