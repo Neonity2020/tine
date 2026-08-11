@@ -41,6 +41,7 @@ import {
   undo,
 } from "./store";
 import { startEditing } from "./editorController";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 import { initParser } from "./render/parse";
 import type { BlockDto, Format, PageDto } from "./types";
 import {
@@ -177,11 +178,147 @@ afterEach(() => {
   setGraphMeta(null);
   setGraphTransitioning(false);
   setGraphEpoch(0);
+  managedStorageRuntime.clear();
   setToasts([]);
   vi.restoreAllMocks();
 });
 
+function bindManagedWritable(): void {
+  managedStorageRuntime.bind(1);
+  managedStorageRuntime.receiveStatus({
+    state: "active",
+    runtime: null,
+    can_activate: false,
+    can_retry: false,
+    can_cancel: false,
+    cancel_reason: null,
+    binding_generation: 1,
+    application_page_admission: {
+      binding_generation: 1,
+      authority: "managed_writable",
+      application_save_page_blocks: 511,
+      application_page_request_text_bytes: 1_048_576,
+      application_page_max_depth: 128,
+    },
+  } as any);
+}
+
 describe("clipboard payload insertion and identity validation", () => {
+  it("refuses a managed 512th clipboard block before it mutates the target", async () => {
+    const target = generatedId(99_999);
+    await seed([page("Paste", [
+      ...Array.from({ length: 510 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
+      block(target, "target"),
+    ])]);
+    managedStorageRuntime.bind(1);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 1,
+      application_page_admission: {
+        binding_generation: 1,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+    await record("copy", "- incoming", {
+      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
+      sourcePages: [],
+    });
+
+    const mutations = await countStoreMutations(() => paste(target));
+
+    expect(pageNodeCount("Paste")).toBe(511);
+    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Can't insert: this page would exceed Tine-managed storage's 511-block or request-size limit. Nothing was changed.",
+    ]);
+  });
+
+  it("keeps an initially refused Cut grant and every source action untouched", async () => {
+    const fullTarget = generatedId(99_998);
+    const retryTarget = generatedId(99_997);
+    await seed([
+      page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
+      page("Full", [
+        ...Array.from({ length: 510 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
+        block(fullTarget, "target"),
+      ]),
+      page("Retry", [block(retryTarget, "target")]),
+    ]);
+    const payload = buildClipboardPayload([ID1])!;
+    await record("cut", "- source", payload);
+    deleteBlock(ID1);
+    managedStorageRuntime.bind(1);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 1,
+      application_page_admission: {
+        binding_generation: 1,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+    vi.clearAllMocks();
+
+    const mutations = await countStoreMutations(() => paste(fullTarget));
+
+    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+    expect(vi.mocked(backend().savePage)).not.toHaveBeenCalled();
+    expect(vi.mocked(backend().resolveBlocks)).not.toHaveBeenCalled();
+    expect(peekClipboardSlot()?.op).toBe("cut");
+
+    managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+    await paste(retryTarget);
+
+    expect(peekClipboardSlot()?.op).toBe("copy");
+    expect(roots("Retry")).toEqual([retryTarget, ID1]);
+  });
+
+  it("admits a small private copy through the active managed route", async () => {
+    await seed([page("Paste", [block(HOST, "target")])]);
+    bindManagedWritable();
+    await record("copy", "- incoming", {
+      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
+      sourcePages: [],
+    });
+
+    await paste();
+
+    expect(roots("Paste")).toHaveLength(2);
+    expect(doc.byId[HOST].raw).toBe("target");
+  });
+
+  it("refuses a private clipboard paste while managed storage has no writable route", async () => {
+    await seed([page("Paste", [block(HOST, "target")])]);
+    managedStorageRuntime.bind(1);
+    await record("copy", "- incoming", {
+      blocks: [{ raw: "incoming", children: [], sourceFormat: "md" }],
+      sourcePages: [],
+    });
+
+    const mutations = await countStoreMutations(() => paste());
+
+    expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+    expect(roots("Paste")).toEqual([HOST]);
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Can't insert while Tine-managed storage is changing state. Nothing was changed.",
+    ]);
+  });
+
   it("retires an immediate cut before the debounce and preserves identity", async () => {
     await seed([page("Paste", [
       block(ID1, `source\nid:: ${ID1}`),

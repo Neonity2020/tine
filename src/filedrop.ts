@@ -9,9 +9,23 @@ import { backend } from "./backend";
 import { assetFileName, assetMarkdown } from "./media";
 import { matrixGridNode, delimitedCellCount } from "./sheet/conversions";
 import { parseDelimitedText, type DelimitedKind } from "./sheet/tsv";
-import { doc, formatForBlock, insertOutlineAfter, pageByName, trackAssetWrite, visibleOrder, withUndoUnit } from "./store";
+import {
+  consumeManagedBulkInsertionAdmission,
+  depthOf,
+  doc,
+  formatForBlock,
+  insertOutlineAfter,
+  managedBulkOutlinePlan,
+  pageByName,
+  preflightManagedBulkInsertion,
+  reportManagedBulkInsertionRefusal,
+  trackAssetWrite,
+  visibleOrder,
+  withUndoUnit,
+} from "./store";
 import { pushToast } from "./ui";
 import type { OutlineNode } from "./editor/outline";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 
 const MAX_DROPPED_CELLS = 5000;
 
@@ -29,6 +43,131 @@ function delimitedKind(path: string): DelimitedKind | null {
 function titleWithoutExtension(path: string, kind: DelimitedKind): string {
   const name = basename(path);
   return name.slice(0, Math.max(0, name.length - kind.length - 1)) || "Dropped table";
+}
+
+type PlannedDrop =
+  | { kind: "grid"; node: OutlineNode }
+  | { kind: "asset"; path: string; originalName: string | undefined };
+
+async function planManagedDrop(paths: readonly string[]): Promise<PlannedDrop[]> {
+  const plan: PlannedDrop[] = [];
+  for (const path of paths) {
+    const kind = delimitedKind(path);
+    if (kind) {
+      const text = await backend().readTextFile(path);
+      const matrix = parseDelimitedText(text, kind);
+      const cells = delimitedCellCount(matrix);
+      if (cells > MAX_DROPPED_CELLS) {
+        pushToast(`"${basename(path)}" has ${cells} cells; CSV/TSV drops are limited to ${MAX_DROPPED_CELLS}.`, "error");
+        continue;
+      }
+      plan.push({ kind: "grid", node: matrixGridNode(titleWithoutExtension(path, kind), matrix) });
+      continue;
+    }
+    plan.push({ kind: "asset", path, originalName: basename(path) || undefined });
+  }
+  return plan;
+}
+
+async function materializeManagedDrop(afterId: string, plan: readonly PlannedDrop[]): Promise<OutlineNode[]> {
+  const page = pageByName(doc.byId[afterId].page);
+  const format = formatForBlock(afterId);
+  const nodes: OutlineNode[] = [];
+  for (const item of plan) {
+    if (item.kind === "grid") {
+      nodes.push(item.node);
+      continue;
+    }
+    const saved = await trackAssetWrite(backend().importAsset(item.path, assetFileName(item.originalName)));
+    nodes.push({
+      raw: assetMarkdown(saved, { label: item.originalName, pagePath: page?.path, format }),
+      children: [],
+    });
+  }
+  return nodes;
+}
+
+async function insertDroppedFilesDirect(afterId: string, paths: readonly string[]): Promise<void> {
+  const nodes: OutlineNode[] = [];
+  for (const path of paths) {
+    const kind = delimitedKind(path);
+    if (kind) {
+      const text = await backend().readTextFile(path);
+      const matrix = parseDelimitedText(text, kind);
+      const cells = delimitedCellCount(matrix);
+      if (cells > MAX_DROPPED_CELLS) {
+        pushToast(`"${basename(path)}" has ${cells} cells; CSV/TSV drops are limited to ${MAX_DROPPED_CELLS}.`, "error");
+        continue;
+      }
+      nodes.push(matrixGridNode(titleWithoutExtension(path, kind), matrix));
+      continue;
+    }
+    const orig = basename(path) || undefined;
+    const saved = await trackAssetWrite(backend().importAsset(path, assetFileName(orig)));
+    const page = pageByName(doc.byId[afterId].page);
+    nodes.push({
+      raw: assetMarkdown(saved, {
+        label: orig,
+        pagePath: page?.path,
+        format: formatForBlock(afterId),
+      }),
+      children: [],
+    });
+  }
+  if (!nodes.length) return;
+  withUndoUnit("file-drop", [doc.byId[afterId].page], () => insertOutlineAfter(afterId, nodes));
+  pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
+}
+
+/** Insert an already-native-resolved file drop. Managed bindings construct the
+ * complete grid/asset-reference outline first so a certain cap refusal cannot
+ * leave a preceding ordinary asset on disk. Direct Files retains its historical
+ * sequential IO and unbounded page behavior. */
+export async function insertDroppedFiles(afterId: string, paths: readonly string[]): Promise<void> {
+  try {
+    const authority = managedStorageRuntime.snapshot().applicationPageAdmission;
+    if (!authority || authority.authority === "direct") {
+      await insertDroppedFilesDirect(afterId, paths);
+      return;
+    }
+    if (authority.authority !== "managed_writable") {
+      const admission = preflightManagedBulkInsertion(afterId, () => ({
+        insertedDescendants: 0,
+        removedOrReusedDescendants: 0,
+        insertionRootDepth: depthOf(afterId) + 1,
+        maximumInputRelativeDepth: 0,
+        insertedRawTextUtf8Bytes: 0,
+      }));
+      if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
+      return;
+    }
+
+    const plan = await planManagedDrop(paths);
+    if (!plan.length) return;
+    const plannedNodes = plan.map((item): OutlineNode => item.kind === "grid"
+      ? item.node
+      // Generated asset filename/path bytes are actor-authoritative. The one
+      // reference node is still a certain block-count fact before import.
+      : { raw: "", children: [] });
+    const admission = preflightManagedBulkInsertion(afterId, (limits) => managedBulkOutlinePlan(
+      plannedNodes,
+      depthOf(afterId) + 1,
+      0,
+      limits,
+    ));
+    if (admission.kind === "refused") {
+      reportManagedBulkInsertionRefusal(admission.toast);
+      return;
+    }
+
+    const nodes = await materializeManagedDrop(afterId, plan);
+    if (!nodes.length) return;
+    if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, afterId)) return;
+    withUndoUnit("file-drop", [doc.byId[afterId].page], () => insertOutlineAfter(afterId, nodes));
+    pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
+  } catch (e) {
+    pushToast(`Couldn't insert dropped file: ${String(e)}`, "error");
+  }
 }
 
 /** Install the OS file-drop handler. Returns an uninstaller. No-op outside the
@@ -64,39 +203,7 @@ export async function installFileDrop(): Promise<() => void> {
       return;
     }
 
-    try {
-      const nodes: OutlineNode[] = [];
-      for (const path of paths) {
-        const kind = delimitedKind(path);
-        if (kind) {
-          const text = await backend().readTextFile(path);
-          const matrix = parseDelimitedText(text, kind);
-          const cells = delimitedCellCount(matrix);
-          if (cells > MAX_DROPPED_CELLS) {
-            pushToast(`"${basename(path)}" has ${cells} cells; CSV/TSV drops are limited to ${MAX_DROPPED_CELLS}.`, "error");
-            continue;
-          }
-          nodes.push(matrixGridNode(titleWithoutExtension(path, kind), matrix));
-          continue;
-        }
-        const orig = basename(path) || undefined;
-        const saved = await trackAssetWrite(backend().importAsset(path, assetFileName(orig)));
-        const page = pageByName(doc.byId[afterId].page);
-        nodes.push({
-          raw: assetMarkdown(saved, {
-            label: orig,
-            pagePath: page?.path,
-            format: formatForBlock(afterId),
-          }),
-          children: [],
-        });
-      }
-      if (!nodes.length) return;
-      withUndoUnit("file-drop", [doc.byId[afterId].page], () => insertOutlineAfter(afterId, nodes));
-      pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
-    } catch (e) {
-      pushToast(`Couldn't insert dropped file: ${String(e)}`, "error");
-    }
+    await insertDroppedFiles(afterId, paths);
   });
 
   return () => {

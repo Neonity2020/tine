@@ -2,13 +2,28 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { For, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { initParser } from "../render/parse";
-import { doc, loadSingle, pageByName, resetStore, undo } from "../store";
+import {
+  __setStoreMutationObserverForTest,
+  doc,
+  loadSingle,
+  pageByName,
+  resetStore,
+  undo,
+} from "../store";
 import { startEditing } from "../editorController";
 import type { BlockDto, PageDto } from "../types";
+import { managedStorageRuntime } from "../managedStorageRuntime";
+import { setToasts, toasts } from "../ui";
 import { Block } from "./Block";
 
 beforeAll(() => initParser());
-afterEach(() => { resetStore(); document.body.innerHTML = ""; });
+afterEach(() => {
+  __setStoreMutationObserverForTest(null);
+  managedStorageRuntime.clear();
+  setToasts([]);
+  resetStore();
+  document.body.innerHTML = "";
+});
 
 function mount(node: () => JSX.Element) {
   const root = document.createElement("div");
@@ -35,6 +50,68 @@ function keydown(textarea: HTMLTextAreaElement, init: KeyboardEventInit) {
 }
 
 describe("multiline paste into editor-visible empty blocks", () => {
+  it.each([
+    ["plain", "- overflow\n", ""],
+    ["Org", "* overflow\n", ""],
+    ["structured HTML", "overflow", "<ul><li>overflow</li></ul>"],
+  ])("refuses a managed 512th %s outline before the editor commits", (_kind, text, html) => {
+    const target = "99999999-9999-4999-8999-999999999999";
+    const blocks = [
+      ...Array.from({ length: 510 }, (_, index) => ({
+        id: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+        raw: `existing ${index}`,
+        collapsed: false,
+        children: [],
+      })),
+      { id: target, raw: "target", collapsed: false, children: [] },
+    ];
+    loadSingle({ name: "Paste", kind: "page", title: "Paste", pre_block: null, blocks });
+    managedStorageRuntime.bind(1);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 1,
+      application_page_admission: {
+        binding_generation: 1,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+    startEditing(target, 2);
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Paste")?.roots ?? []}>{(id) => <Block id={id} />}</For>
+    ));
+    const counts = { publications: 0, dirty: 0, undo: 0 };
+    __setStoreMutationObserverForTest((event) => {
+      if (event.kind === "publication") counts.publications++;
+      else if (event.kind === "dirty") counts.dirty++;
+      else if (event.kind === "undo-snapshot") counts.undo++;
+    });
+    try {
+      const textarea = root.querySelector(`[data-block-id="${target}"] textarea`) as HTMLTextAreaElement;
+      textarea.setSelectionRange(2, 2);
+      const event = paste(textarea, text, html);
+
+      expect(event.defaultPrevented).toBe(true);
+      expect(textarea.value).toBe("target");
+      expect([textarea.selectionStart, textarea.selectionEnd]).toEqual([2, 2]);
+      expect(pageByName("Paste")!.roots).toHaveLength(511);
+      expect(doc.byId[target].raw).toBe("target");
+      expect(counts).toEqual({ publications: 0, dirty: 0, undo: 0 });
+      expect(toasts().map(({ message }) => message)).toEqual([
+        "Can't insert: this page would exceed Tine-managed storage's 511-block or request-size limit. Nothing was changed.",
+      ]);
+    } finally {
+      dispose();
+    }
+  });
+
   it("replaces an id-only host instead of leaving a ghost blank bullet", () => {
     const block: BlockDto = {
       id: "11111111-1111-4111-8111-111111111111",

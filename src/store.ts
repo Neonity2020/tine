@@ -19,6 +19,7 @@ import type { Route } from "./router";
 import { parseOutline, type OutlineNode } from "./editor/outline";
 import type { ExportNode } from "./editor/exportText";
 import { backend } from "./backend";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 import { resetReferenceSectionState } from "./referenceSectionState";
 import {
   isConflicted,
@@ -1682,6 +1683,192 @@ export function depthOf(id: string): number {
   return d;
 }
 
+export interface ManagedBulkInsertionPlan {
+  insertedDescendants: number;
+  removedOrReusedDescendants: number;
+  insertionRootDepth: number;
+  maximumInputRelativeDepth: number;
+  insertedRawTextUtf8Bytes: number;
+}
+
+interface ManagedBulkAdmissionLimits {
+  applicationSavePageBlocks: number;
+  applicationPageRequestTextBytes: number;
+  applicationPageMaxDepth: number;
+}
+
+type BulkOutlineLike = { raw: string; children: readonly BulkOutlineLike[] };
+
+/** Count only input already materialized by a selected caller. The limits cap
+ * this pure work: no PageDto clone, actor call, block-id allocation, or scan of
+ * any other page is involved. */
+export function managedBulkOutlinePlan(
+  nodes: readonly BulkOutlineLike[],
+  insertionRootDepth: number,
+  removedOrReusedDescendants: number,
+  limits: ManagedBulkAdmissionLimits,
+): ManagedBulkInsertionPlan {
+  const blockCap = limits.applicationSavePageBlocks + 1;
+  const textCap = limits.applicationPageRequestTextBytes + 1;
+  let insertedDescendants = 0;
+  let maximumInputRelativeDepth = 0;
+  let insertedRawTextUtf8Bytes = 0;
+  const stack = nodes.map((node) => ({ node, relativeDepth: 1 }));
+  while (stack.length) {
+    const { node, relativeDepth } = stack.pop()!;
+    insertedDescendants = Math.min(blockCap, insertedDescendants + 1);
+    maximumInputRelativeDepth = Math.max(maximumInputRelativeDepth, relativeDepth);
+    insertedRawTextUtf8Bytes = Math.min(
+      textCap,
+      insertedRawTextUtf8Bytes + new TextEncoder().encode(node.raw).byteLength,
+    );
+    if (insertedDescendants === blockCap || insertedRawTextUtf8Bytes === textCap) break;
+    for (let index = node.children.length - 1; index >= 0; index--) {
+      stack.push({ node: node.children[index], relativeDepth: relativeDepth + 1 });
+    }
+  }
+  return {
+    insertedDescendants,
+    removedOrReusedDescendants,
+    insertionRootDepth,
+    maximumInputRelativeDepth,
+    insertedRawTextUtf8Bytes,
+  };
+}
+
+const bulkInsertionAdmissionSeal = Symbol("bulk-insertion-admission");
+
+export interface BulkInsertionAdmission {
+  readonly [bulkInsertionAdmissionSeal]: true;
+}
+
+interface InternalBulkInsertionAdmission extends BulkInsertionAdmission {
+  consumed: boolean;
+  targetId: string | null;
+  targetNode: Node | null;
+  targetPage: string;
+  targetGeneration: number;
+  graphEpoch: number;
+  graphRoot: string;
+  bindingGeneration: number;
+  authority: "managed_writable";
+  plan: ManagedBulkInsertionPlan;
+}
+
+export type ManagedBulkInsertionPreflight =
+  | { kind: "direct" }
+  | { kind: "admitted"; token: BulkInsertionAdmission }
+  | { kind: "refused"; toast: string };
+
+const managedBulkOverflowToast = (limit: number): string =>
+  `Can't insert: this page would exceed Tine-managed storage's ${limit}-block or request-size limit. Nothing was changed.`;
+
+const managedBulkUnavailableToast =
+  "Can't insert while Tine-managed storage is changing state. Nothing was changed.";
+
+function boundedPageBlockCount(page: FeedPage, cap: number): number {
+  let count = 0;
+  const stack = [...page.roots];
+  while (stack.length && count < cap) {
+    const id = stack.pop()!;
+    const node = doc.byId[id];
+    if (!node) continue;
+    count++;
+    for (let index = node.children.length - 1; index >= 0; index--) stack.push(node.children[index]);
+  }
+  return count;
+}
+
+/**
+ * Advisory, side-effect-free preflight for one selected bulk route. Direct
+ * bindings return before the caller builds its plan; managed records only
+ * reject a known lower-bound overflow and leave the native actor authoritative.
+ */
+export function preflightManagedBulkInsertion(
+  targetId: string | null,
+  buildPlan: (limits: ManagedBulkAdmissionLimits) => ManagedBulkInsertionPlan,
+  targetPageName?: string,
+): ManagedBulkInsertionPreflight {
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (!admission || admission.authority === "direct") return { kind: "direct" };
+  if (admission.authority !== "managed_writable") {
+    return { kind: "refused", toast: managedBulkUnavailableToast };
+  }
+
+  const target = targetId === null ? null : doc.byId[targetId];
+  if (targetId !== null && (!target || !blockWritable(targetId))) {
+    return { kind: "refused", toast: managedBulkUnavailableToast };
+  }
+  const pageName = target?.page ?? targetPageName;
+  if (!pageName || !pageWritable(pageName)) return { kind: "refused", toast: managedBulkUnavailableToast };
+  const page = pageByName(pageName);
+  const targetGeneration = pageInstanceGeneration(pageName);
+  if (!page || targetGeneration === null) return { kind: "refused", toast: managedBulkUnavailableToast };
+  const limits: ManagedBulkAdmissionLimits = {
+    applicationSavePageBlocks: admission.application_save_page_blocks,
+    applicationPageRequestTextBytes: admission.application_page_request_text_bytes,
+    applicationPageMaxDepth: admission.application_page_max_depth,
+  };
+  const plan = buildPlan(limits);
+  const currentBlocks = boundedPageBlockCount(page, limits.applicationSavePageBlocks + 1);
+  const exceedsBlockLimit =
+    currentBlocks - plan.removedOrReusedDescendants + plan.insertedDescendants
+      > limits.applicationSavePageBlocks;
+  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
+    && plan.insertionRootDepth + plan.maximumInputRelativeDepth - 1
+      > limits.applicationPageMaxDepth;
+  const exceedsTextLimit = plan.insertedRawTextUtf8Bytes > limits.applicationPageRequestTextBytes;
+  if (exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit) {
+    return { kind: "refused", toast: managedBulkOverflowToast(limits.applicationSavePageBlocks) };
+  }
+
+  const token: InternalBulkInsertionAdmission = {
+    [bulkInsertionAdmissionSeal]: true,
+    consumed: false,
+    targetId,
+    targetNode: target ? unwrap(target) : null,
+    targetPage: pageName,
+    targetGeneration,
+    graphEpoch: graphEpoch(),
+    graphRoot: graphMeta()?.root ?? "",
+    bindingGeneration: admission.binding_generation,
+    authority: admission.authority,
+    plan,
+  };
+  return { kind: "admitted", token };
+}
+
+/** Consume an admission immediately before its selected store publication. */
+export function consumeManagedBulkInsertionAdmission(
+  token: BulkInsertionAdmission,
+  targetId: string | null,
+): boolean {
+  const internal = token as InternalBulkInsertionAdmission;
+  if (!internal[bulkInsertionAdmissionSeal] || internal.consumed || internal.targetId !== targetId) return false;
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  const target = targetId === null ? null : doc.byId[targetId];
+  if (
+    !admission
+    || admission.authority !== "managed_writable"
+    || admission.binding_generation !== internal.bindingGeneration
+    || internal.authority !== admission.authority
+    || (targetId === null
+      ? internal.targetNode !== null
+      : !target
+        || unwrap(target) !== internal.targetNode
+        || target.page !== internal.targetPage)
+    || pageInstanceGeneration(internal.targetPage) !== internal.targetGeneration
+    || graphEpoch() !== internal.graphEpoch
+    || (graphMeta()?.root ?? "") !== internal.graphRoot
+  ) return false;
+  internal.consumed = true;
+  return true;
+}
+
+export function reportManagedBulkInsertionRefusal(toast: string): void {
+  pushToast(toast, "error");
+}
+
 // ---------------------------------------------------------------------------
 // Undo / redo (snapshot-based; typing in one block coalesces to one step)
 // ---------------------------------------------------------------------------
@@ -2701,6 +2888,71 @@ export function replaceEmptyBlockWithOutline(id: string, nodes: OutlineNode[]): 
   return lastId;
 }
 
+/** Replace a leaf slash-template trigger with its expanded outline in one
+ * publication. This is deliberately narrower than the generic insertion
+ * helpers: selected template admission has already accounted for reusing this
+ * host, so it must not first create an over-limit temporary sibling. */
+export function replaceTemplateTriggerWithOutline(id: string, nodes: OutlineNode[]): string {
+  const current = doc.byId[id];
+  if (!nodes.length || !current || current.children.length || !blockWritable(id)) return id;
+  const format = formatForBlock(id);
+  const hidden = splitProps(current.raw, isBuiltinHidden, format).hidden;
+  let lastId = id;
+  setDoc(produce((state) => {
+    const create = (outline: OutlineNode, parent: string | null, reuseId?: string): string => {
+      const created = reuseId ?? freshId();
+      const children = outline.children.map((child) => create(child, created));
+      const sourceRaw = reuseId ? joinProps(outline.raw, hidden, format) : outline.raw;
+      state.byId[created] = {
+        id: created,
+        raw: rawWithInheritedOrderListType(sourceRaw, format, id),
+        collapsed: false,
+        parent,
+        page: current.page,
+        children,
+      };
+      return created;
+    };
+    const created = nodes.map((node, index) => create(node, current.parent, index === 0 ? id : undefined));
+    const siblings = current.parent === null
+      ? state.pages[state.pages.findIndex((page) => page.name === current.page)].roots
+      : state.byId[current.parent].children;
+    siblings.splice(siblings.indexOf(id), 1, ...created);
+    lastId = created[created.length - 1];
+  }));
+  markDirty(current.page);
+  return lastId;
+}
+
+/** Materialize a parsed quick-capture outline as the first roots of an empty
+ * page. The caller owns one undo unit; no empty anchor is ever published. */
+function insertCaptureOutlineIntoEmptyPage(pageName: string, nodes: OutlineNode[]): string | null {
+  const page = pageByName(pageName);
+  if (!page || page.roots.length || !nodes.length || !pageWritable(pageName)) return null;
+  const format = formatForPage(pageName);
+  let lastId: string | null = null;
+  setDoc(produce((state) => {
+    const create = (outline: OutlineNode, parent: string | null): string => {
+      const id = freshId();
+      const children = outline.children.map((child) => create(child, id));
+      state.byId[id] = {
+        id,
+        raw: rawWithInheritedOrderListType(outline.raw, format, null),
+        collapsed: false,
+        parent,
+        page: pageName,
+        children,
+      };
+      return id;
+    };
+    const roots = nodes.map((node) => create(node, null));
+    state.pages[state.pages.findIndex((candidate) => candidate.name === pageName)].roots.push(...roots);
+    lastId = roots[roots.length - 1] ?? null;
+  }));
+  markDirty(pageName);
+  return lastId;
+}
+
 type ClipboardProperty = { key: string; value: string };
 
 function clipboardProperties(raw: string, format: Format): ClipboardProperty[] {
@@ -2791,11 +3043,20 @@ function clipboardPasteAuthorityCurrent(authority: ClipboardPasteAuthority): boo
     && pageInstanceGeneration(authority.targetPage) === authority.targetGeneration;
 }
 
+function clipboardTargetReusesEmptyHost(target: Node, targetFormat: Format): boolean {
+  const visible = splitProps(target.raw, isBuiltinHidden, targetFormat).visible;
+  return target.children.length === 0
+    && visible.trim() === ""
+    && existingBlockId(target.raw, targetFormat) === null
+    && !liveDocReferences(target.id);
+}
+
 function insertClipboardBlocksSync(
   targetId: string,
   blocks: readonly ClipboardBlock[],
   preserveIds: boolean,
   preservedIds: readonly string[],
+  reuseEmptyHost?: boolean,
 ): string | null {
   const target = doc.byId[targetId];
   if (!blocks.length || !target || !blockWritable(targetId)) return null;
@@ -2815,11 +3076,7 @@ function insertClipboardBlocksSync(
       children: block.children.map(prepare),
     };
   });
-  const visible = splitProps(target.raw, isBuiltinHidden, targetFormat).visible;
-  const replaceHost = target.children.length === 0
-    && visible.trim() === ""
-    && existingBlockId(target.raw, targetFormat) === null
-    && !liveDocReferences(targetId);
+  const replaceHost = reuseEmptyHost ?? clipboardTargetReusesEmptyHost(target, targetFormat);
   const parent = target.parent;
   const pageName = target.page;
   let lastId: string | null = null;
@@ -2868,8 +3125,27 @@ export function pasteClipboardPayload(
   slot: ClipboardPayloadSlot,
 ): Promise<string | null> {
   const authority = captureClipboardPasteAuthority(targetId);
-  const grant = slot.op === "cut" ? consumeCutGrant(slot.generation) : null;
   if (!authority) return Promise.resolve(null);
+
+  let managedReuseEmptyHost: boolean | null = null;
+  const admission = preflightManagedBulkInsertion(targetId, (limits) => {
+    const target = doc.byId[targetId]!;
+    managedReuseEmptyHost = clipboardTargetReusesEmptyHost(target, formatForPage(target.page));
+    return managedBulkOutlinePlan(
+      slot.blocks,
+      depthOf(targetId) + 1,
+      managedReuseEmptyHost ? 1 : 0,
+      limits,
+    );
+  });
+  if (admission.kind === "refused") {
+    reportManagedBulkInsertionRefusal(admission.toast);
+    return Promise.resolve(null);
+  }
+
+  // This must remain after the initial synchronous admission: a known target
+  // overflow leaves a Cut grant intact for a smaller retry.
+  const grant = slot.op === "cut" ? consumeCutGrant(slot.generation) : null;
 
   const idLists: string[][] = [];
   const visit = (block: ClipboardBlock) => {
@@ -2921,7 +3197,19 @@ export function pasteClipboardPayload(
       preserveIds = cutSourcePagesRetired(grant!.sourcePages)
         && !hasLoadedIdentityCollision(normalizedIds);
     }
-    return insertClipboardBlocksSync(targetId, slot.blocks, preserveIds, preserveIds ? normalizedIds : []);
+    if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, targetId)) {
+      return null;
+    }
+    const reuseEmptyHost = admission.kind === "admitted"
+      ? managedReuseEmptyHost!
+      : clipboardTargetReusesEmptyHost(doc.byId[targetId], formatForPage(doc.byId[targetId].page));
+    return insertClipboardBlocksSync(
+      targetId,
+      slot.blocks,
+      preserveIds,
+      preserveIds ? normalizedIds : [],
+      reuseEmptyHost,
+    );
   })();
 }
 
@@ -2967,27 +3255,30 @@ async function captureOutlineInto(name: string, kind: PageKind, nodes: OutlineNo
   }
   const page = pageByName(name);
   if (!page || !pageWritable(name)) return false;
+  const insertionTarget = page.roots.length ? page.roots[page.roots.length - 1] : null;
+  const admission = preflightManagedBulkInsertion(
+    insertionTarget,
+    (limits) => managedBulkOutlinePlan(
+      nodes,
+      insertionTarget === null ? 1 : depthOf(insertionTarget) + 1,
+      0,
+      limits,
+    ),
+    name,
+  );
+  if (admission.kind === "refused") {
+    reportManagedBulkInsertionRefusal(admission.toast);
+    return false;
+  }
+  if (
+    admission.kind === "admitted"
+    && !consumeManagedBulkInsertionAdmission(admission.token, insertionTarget)
+  ) return false;
   if (page.roots.length) {
     // Append after the last top-level block (end of the page).
-    insertOutlineAfter(page.roots[page.roots.length - 1], nodes);
+    insertOutlineAfter(insertionTarget!, nodes);
   } else {
-    // Empty (or brand-new) page: seed an empty anchor root, append after it, then
-    // drop the anchor — reuses insertOutlineAfter's subtree creation rather than a
-    // bespoke root builder. One undo unit: the anchor/insert/delete sequence used
-    // to push three undo entries, so one undo left the anchor + row behind
-    // (Phase-6 review finding, validated).
-    withUndoUnit("capture", [name], () => {
-      const anchor = freshId();
-      setDoc(
-        produce((s) => {
-          s.byId[anchor] = { id: anchor, raw: "", collapsed: false, parent: null, page: name, children: [] };
-          s.pages[s.pages.findIndex((p) => p.name === name)].roots.push(anchor);
-        })
-      );
-      markDirty(name);
-      insertOutlineAfter(anchor, nodes);
-      deleteBlock(anchor);
-    });
+    withUndoUnit("capture", [name], () => insertCaptureOutlineIntoEmptyPage(name, nodes));
   }
   return await flushPage(name);
 }

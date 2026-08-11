@@ -79,6 +79,8 @@ import {
   persistentBlockRef,
   resolveBlockRef,
   reloadPageIfStillSafe,
+  appendToTodayJournal,
+  captureToPage,
 } from "./store";
 import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
@@ -107,6 +109,7 @@ import {
 import { journalTitle } from "./journal";
 import type { BlockDto, PageDto } from "./types";
 import { resetPaneLayoutToSingle } from "./panes";
+import { managedStorageRuntime } from "./managedStorageRuntime";
 
 let counter = 0;
 function blk(raw: string, children: BlockDto[] = []): BlockDto {
@@ -346,6 +349,7 @@ beforeEach(() => {
   resetStore();
   setWorkflow("now");
   setGraphMeta(null);
+  managedStorageRuntime.clear();
   resetPaneLayoutToSingle({
     tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
     activeIndex: 0,
@@ -355,6 +359,70 @@ beforeEach(() => {
   setRightSidebar([]);
   setCopyIncludeSubtree(false); // copy prefs default OFF; reset so tests don't leak
   setCopyStripCollapsed(false);
+});
+
+describe("managed quick-capture admission", () => {
+  it.each(["journal", "named page"])("refuses an overflowing %s capture before a save or empty anchor", async (kind) => {
+    setToasts([]);
+    const name = kind === "journal" ? journalTitle(new Date()) : "Capture";
+    const target = "99999999-9999-4999-8999-999999999999";
+    loadSingle({
+      name,
+      kind: kind === "journal" ? "journal" : "page",
+      title: name,
+      pre_block: null,
+      blocks: [
+        ...Array.from({ length: 510 }, (_, index) => ({
+          id: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+          raw: `existing ${index}`,
+          collapsed: false,
+          children: [],
+        })),
+        { id: target, raw: "target", collapsed: false, children: [] },
+      ],
+    });
+    managedStorageRuntime.bind(1);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 1,
+      application_page_admission: {
+        binding_generation: 1,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+    const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
+    __setStoreMutationObserverForTest((observation) => {
+      if (observation.kind === "publication") counts.publications++;
+      else if (observation.kind === "dirty") counts.dirtyMarks++;
+      else if (observation.kind === "undo-snapshot") counts.snapshots++;
+    });
+    try {
+      const captured = kind === "journal"
+        ? await appendToTodayJournal("- overflow")
+        : await captureToPage(name, "- overflow");
+
+      expect(captured).toBe(false);
+      expect(pageByName(name)!.roots).toHaveLength(511);
+      expect(doc.byId[target].raw).toBe("target");
+      expect(counts).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+      expect(savePage).not.toHaveBeenCalled();
+      expect(toasts().map(({ message }) => message)).toEqual([
+        "Can't insert: this page would exceed Tine-managed storage's 511-block or request-size limit. Nothing was changed.",
+      ]);
+    } finally {
+      __setStoreMutationObserverForTest(null);
+      savePage.mockRestore();
+    }
+  });
 });
 
 describe("ordered list (logseq.order-list-type)", () => {

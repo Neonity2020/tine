@@ -51,6 +51,7 @@ import {
   insertEmptyChildBlock,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
+  replaceTemplateTriggerWithOutline,
   insertOutlineChildren,
   pasteClipboardPayload,
   deleteBlock,
@@ -75,6 +76,10 @@ import {
   trackAssetWrite,
   formatForBlock,
   depthOf,
+  managedBulkOutlinePlan,
+  preflightManagedBulkInsertion,
+  consumeManagedBulkInsertionAdmission,
+  reportManagedBulkInsertionRefusal,
   setHeading,
   collapsibleDescendantIds,
   setCollapsedDescendants,
@@ -1137,6 +1142,20 @@ export function Editor(props: { id: string }): JSX.Element {
     setRaw(props.id, next, setRawOpts);
   };
 
+  const admitBulkOutlineInsertion = (
+    nodes: readonly OutlineNode[],
+    reusedHost: boolean,
+  ) => {
+    const admission = preflightManagedBulkInsertion(props.id, (limits) => managedBulkOutlinePlan(
+      nodes,
+      depthOf(props.id) + 1,
+      reusedHost ? 1 : 0,
+      limits,
+    ));
+    if (admission.kind === "refused") reportManagedBulkInsertionRefusal(admission.toast);
+    return admission;
+  };
+
   // Nest/un-nest an in-block list item by ±2 leading spaces (Tab/Shift-Tab when
   // the caret is on a `+`/`*`/ordered list line).
   const nudgeListItem = (ll: NonNullable<ReturnType<typeof listLineAt>>, delta: number) => {
@@ -1968,16 +1987,21 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     if (item.templateNodes) {
-      // Drop the "/name" trigger text, then insert the template's blocks (with
-      // dynamic vars resolved). If the host block is now empty, replace it.
+      // Expand before any host mutation. An admitted empty trigger is replaced
+      // in one store publication; it never temporarily becomes an extra block.
       const r = applyCompletion(ref.value, t.start, t.end, "");
-      commit(r.raw);
-      closeAc();
       const nodes = item.templateNodes.map((n) => templateToOutline(n, doc.byId[props.id]?.page));
       const wasEmpty =
-        doc.byId[props.id].raw.trim() === "" && doc.byId[props.id].children.length === 0;
-      const lastId = insertOutlineAfter(props.id, nodes);
-      if (wasEmpty) deleteBlock(props.id);
+        r.raw.trim() === "" && doc.byId[props.id].children.length === 0;
+      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      if (admission.kind === "refused") return;
+      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
+      const lastId = withUndoUnit("template-insert", [doc.byId[props.id].page], () => {
+        if (wasEmpty) return replaceTemplateTriggerWithOutline(props.id, nodes);
+        commit(r.raw);
+        return insertOutlineAfter(props.id, nodes);
+      });
+      closeAc();
       startEditing(lastId, doc.byId[lastId].raw.length);
       return;
     }
@@ -3317,6 +3341,9 @@ export function Editor(props: { id: string }): JSX.Element {
     if (htmlNodes) {
       e.preventDefault();
       const wasEmpty = ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
+      const admission = admitBulkOutlineInsertion(htmlNodes, wasEmpty);
+      if (admission.kind === "refused") return;
+      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("structured-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty
@@ -3345,6 +3372,9 @@ export function Editor(props: { id: string }): JSX.Element {
       if (!nodes.length) return;
       const wasEmpty =
         ref.value.trim() === "" && doc.byId[props.id].children.length === 0;
+      const admission = admitBulkOutlineInsertion(nodes, wasEmpty);
+      if (admission.kind === "refused") return;
+      if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, props.id)) return;
       const lastId = withUndoUnit("outline-paste", [doc.byId[props.id].page], () => {
         commit(ref.value);
         return wasEmpty
