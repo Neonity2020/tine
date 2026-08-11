@@ -20,6 +20,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Changed
 
 - **Documenting a change that shipped undocumented in 0.6.90:** a page's name comes from its `title::` property when it has one, and only otherwise from its filename — which is what Logseq does (`title::` → filename → first block). Before 0.6.90 Tine used the filename and ignored `title::`. If a graph was built against the old behaviour, files carrying a `title::` that differs from their filename are now reachable under the *title*, and `[[filename]]` links to them will open blank pages. The new dimming above makes those visible; either drop the `title::` or link to its value.
+- **Experimental Tine-managed storage moved a great deal this cycle** — journal
+  format and rollover, enrollment-integrity migration, task and block queries
+  served from the sparse index, crash-recovery and save/query latency ceilings.
+  None of it changes anything for Direct files, which remains the default and
+  what this release is really about. Managed storage is still marked testing
+  only, still off unless you turn it on, and GH #292 (setup failing on some
+  graphs) is still open.
+- **Managed storage imports roughly twice as fast, and read about eight times
+  fewer bytes.** Bringing a graph into managed storage was re-reading, re-hashing
+  and re-decoding the *entire* batch of pending objects in order to fetch a
+  single one — once per document, and again once per coordinator tick. On a real
+  1,000-page graph that meant gigabytes of redundant work: importing 300 pages
+  read 3.59 GB to move about 1.3 MB of notes. Objects are now fetched
+  individually by the content digest the caller already holds, and the
+  per-tick check reads only the batch manifest, which already records everything
+  it was asking for. Measured on a real graph: 100/200/300/400/600 pages now take
+  5.6/14.5/26.0/42.2/84.9 s, down from 10.8/29.1/50.2/80.0/157.0 s. No safety
+  guarantee changes: objects remain content-addressed and are still verified
+  individually when read.
 
 
 ### Fixed
@@ -50,28 +69,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Images and other embedded media stored in a subfolder of `assets/` now display.** Every native read path applied the top-level-only rule that belongs to asset *creation*, so a file under, say, `assets/screenshots/` stayed blank even though the link was correct. Nested paths are now read, while absolute paths, `..` traversal and symlink escapes are still refused, and newly imported assets still land directly in `assets/` (GH #300).
 - **A page changed by another program no longer becomes permanently unsaveable.** Most editors and sync clients (Syncthing, Dropbox) write a file by creating a new one and renaming it into place. Tine treated the result as a different file and refused every subsequent save with an internal message it then retried forever — even when the new content was byte-for-byte what Tine already had, and even when it was a genuine change you could have resolved. Tine now compares the content: identical content just saves, and a real difference raises the normal conflict banner. "Keep mine" is now bound to the exact disk version shown by that banner (including a deletion), so it cannot overwrite a newer unseen sync or editor change; a newer change is shown as a new conflict instead. (GH #254)
 
-
-### Changed
-
-- **Experimental Tine-managed storage moved a great deal this cycle** — journal
-  format and rollover, enrollment-integrity migration, task and block queries
-  served from the sparse index, crash-recovery and save/query latency ceilings.
-  None of it changes anything for Direct files, which remains the default and
-  what this release is really about. Managed storage is still marked testing
-  only, still off unless you turn it on, and GH #292 (setup failing on some
-  graphs) is still open.
-- **Managed storage imports roughly twice as fast, and read about eight times
-  fewer bytes.** Bringing a graph into managed storage was re-reading, re-hashing
-  and re-decoding the *entire* batch of pending objects in order to fetch a
-  single one — once per document, and again once per coordinator tick. On a real
-  1,000-page graph that meant gigabytes of redundant work: importing 300 pages
-  read 3.59 GB to move about 1.3 MB of notes. Objects are now fetched
-  individually by the content digest the caller already holds, and the
-  per-tick check reads only the batch manifest, which already records everything
-  it was asking for. Measured on a real graph: 100/200/300/400/600 pages now take
-  5.6/14.5/26.0/42.2/84.9 s, down from 10.8/29.1/50.2/80.0/157.0 s. No safety
-  guarantee changes: objects remain content-addressed and are still verified
-  individually when read.
 
 ## [0.6.91] - 2026-08-07
 
