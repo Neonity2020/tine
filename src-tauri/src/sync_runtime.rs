@@ -872,35 +872,37 @@ impl SyncRuntimeFacade {
         let opened = SyncRuntimeHandle::open_with_progress(record.open_request(app)?, |update| {
             match &update {
                 SyncRuntimeOpenProgress::Phase { phase, elapsed } => crate::debug::diag(format!(
-                    "managed storage open: phase {phase:?} at {} ms",
+                    "managed storage open: phase={} elapsed_ms={}",
+                    managed_open_phase_name(*phase),
                     elapsed.as_millis()
                 )),
                 SyncRuntimeOpenProgress::Waiting { phase, elapsed } => crate::debug::diag(format!(
-                    "managed storage open: still waiting in {phase:?} at {} ms",
+                    "managed storage open: phase={} elapsed_ms={}",
+                    managed_open_waiting_phase_name(*phase),
                     elapsed.as_millis()
                 )),
                 SyncRuntimeOpenProgress::RecoveryDiagnostics { diagnostics } => {
                     crate::debug::diag(format!(
-                            "managed storage open: promoted recovery recovery={} retention={} retained_runs={} resume_candidate={} detached_bootstrap_reconstruction={} full_bootstrap_replay={} manifests={} manifest_enumeration_ms={} resume_selection_ms={} bootstrap_reconstruction_ms={} engine_open_ms={} sqlite_open_ms={} tail_construction_ms={} total_ms={}",
+                            "managed storage open: recovery={} retention={} retained_runs={} resume_candidate={} detached_bootstrap_reconstruction={} full_bootstrap_replay={} manifests={} manifest_enumeration_ms={} resume_selection_ms={} bootstrap_reconstruction_attempted={} bootstrap_reconstruction_ms={} engine_open_ms={} sqlite_open_ms={} tail_construction_ms={} total_ms={}",
                             diagnostics.recovery,
                             diagnostics.retention_plan,
                             diagnostics.retained_run_count,
                             diagnostics.resume_candidate,
-                            diagnostics.detached_bootstrap_reconstruction,
-                            diagnostics.full_bootstrap_replay,
+                            u8::from(diagnostics.detached_bootstrap_reconstruction),
+                            u8::from(diagnostics.full_bootstrap_replay),
                             diagnostics.manifest_count,
                             diagnostics.manifest_enumeration.as_millis(),
                             diagnostics.resume_selection.as_millis(),
-                            diagnostics.bootstrap_reconstruction.map(|elapsed| elapsed.as_millis()).map_or_else(|| "not_attempted".to_owned(), |elapsed| elapsed.to_string()),
+                            u8::from(diagnostics.bootstrap_reconstruction.is_some()),
+                            diagnostics.bootstrap_reconstruction.unwrap_or_default().as_millis(),
                             diagnostics.engine_open.as_millis(),
                             diagnostics.sqlite_open.as_millis(),
                             diagnostics.tail_construction.as_millis(),
                             diagnostics.total.as_millis(),
                         ));
                     crate::debug::diag(format!(
-                            "managed storage open: projection recovery={} reason={:?} sidecar_shape_ms={} checkpoint_auth_ms={} read_only_open_ms={} schema_claim_ms={} structural_ms={} materialization_stamp_ms={} forensics_ms={} rebuild_ms={} applied_batches={} bulk_pages_materialized={} ancestry_full_scans={}",
+                            "managed storage open: projection recovery={} sidecar_shape_ms={} checkpoint_auth_ms={} read_only_open_ms={} schema_claim_ms={} structural_ms={} materialization_stamp_ms={} forensics_ms={} rebuild_ms={} applied_batches={} bulk_pages_materialized={} ancestry_full_scans={}",
                             diagnostics.projection_recovery,
-                            diagnostics.projection_reason,
                             diagnostics.projection_sidecar_shape.as_millis(),
                             diagnostics.projection_checkpoint_authentication.as_millis(),
                             diagnostics.projection_read_only_open.as_millis(),
@@ -934,8 +936,8 @@ impl SyncRuntimeFacade {
             progress(update);
         });
         crate::debug::diag(format!(
-            "managed storage open: completed with {:?}",
-            opened.status
+            "managed storage open: completed outcome={}",
+            managed_open_outcome_code(&opened.status)
         ));
         Ok(SparseV2Binding::from_open(opened))
     }
@@ -1055,6 +1057,58 @@ fn managed_open_waiting_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str 
             "managed_open.waiting_recovering_promoted_runtime"
         }
         SyncRuntimeOpenPhase::AssemblingActor => "managed_open.waiting_assembling_actor",
+    }
+}
+
+/// A safe, bounded terminal code for unconditional managed-open diagnostics.
+/// `SyncRuntimeOpenStatus` also carries user/storage details for normal command
+/// replies; those details must never be formatted into the startup trace.
+fn managed_open_outcome_code(status: &SyncRuntimeOpenStatus) -> &'static str {
+    match status {
+        SyncRuntimeOpenStatus::LegacyDefault => "legacy_default",
+        SyncRuntimeOpenStatus::Absent => "absent",
+        SyncRuntimeOpenStatus::ExistingNonActive(SyncNonActiveStage::ShadowImport) => {
+            "existing_shadow_import"
+        }
+        SyncRuntimeOpenStatus::ExistingNonActive(SyncNonActiveStage::VerifiedLocal) => {
+            "existing_verified_local"
+        }
+        SyncRuntimeOpenStatus::Blocked { .. } => "blocked",
+        SyncRuntimeOpenStatus::UnsupportedOrIncompatible(SyncRuntimeComponent::Enrollment) => {
+            "unsupported_enrollment"
+        }
+        SyncRuntimeOpenStatus::UnsupportedOrIncompatible(SyncRuntimeComponent::Archive) => {
+            "unsupported_archive"
+        }
+        SyncRuntimeOpenStatus::CorruptOrUnreadable(SyncRuntimeComponent::Enrollment) => {
+            "corrupt_enrollment"
+        }
+        SyncRuntimeOpenStatus::CorruptOrUnreadable(SyncRuntimeComponent::Archive) => {
+            "corrupt_archive"
+        }
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
+            SyncAmbiguousEvidence::EnrollmentResidue,
+        ) => "ambiguous_enrollment_residue",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
+            SyncAmbiguousEvidence::EnrollmentNamespace,
+        ) => "ambiguous_enrollment_namespace",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
+            SyncAmbiguousEvidence::EnrollmentGraphBinding,
+        ) => "ambiguous_enrollment_graph_binding",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(SyncAmbiguousEvidence::ArchiveResidue) => {
+            "ambiguous_archive_residue"
+        }
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
+            SyncAmbiguousEvidence::ArchiveNamespace,
+        ) => "ambiguous_archive_namespace",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(SyncAmbiguousEvidence::ArchiveBinding) => {
+            "ambiguous_archive_binding"
+        }
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
+            SyncAmbiguousEvidence::ActiveArchiveMismatch,
+        ) => "ambiguous_active_archive_mismatch",
+        SyncRuntimeOpenStatus::Active => "active",
+        SyncRuntimeOpenStatus::OpenRefused { .. } => "open_refused",
     }
 }
 
@@ -2559,6 +2613,39 @@ mod tests {
                 "{name} must re-resolve the captured generation inside the blocking operation"
             );
         }
+    }
+
+    #[test]
+    fn managed_open_stderr_receipts_use_bounded_codes_not_storage_details() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("fn open_record_with_progress(")
+            .expect("managed open diagnostic boundary");
+        let open = &source[start
+            ..source[start..]
+                .find("    /// The startup graph-open path")
+                .map(|end| start + end)
+                .expect("managed open diagnostic end")];
+        assert!(open.contains("managed_open_phase_name(*phase)"));
+        assert!(open.contains("managed_open_waiting_phase_name(*phase)"));
+        assert!(open.contains("managed_open_outcome_code(&opened.status)"));
+        assert!(
+            !open.contains("diagnostics.projection_reason")
+                && !open.contains("completed with {:?}"),
+            "unconditional diagnostics must not format arbitrary storage details"
+        );
+        assert_eq!(
+            managed_open_outcome_code(&SyncRuntimeOpenStatus::Blocked {
+                reason_code: "/private/path/injected-detail".into(),
+            }),
+            "blocked"
+        );
+        assert_eq!(
+            managed_open_outcome_code(&SyncRuntimeOpenStatus::OpenRefused {
+                detail: "/private/path/injected-detail".into(),
+            }),
+            "open_refused"
+        );
     }
 
     #[test]

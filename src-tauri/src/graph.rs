@@ -86,6 +86,13 @@ pub(crate) fn resolve_root(path: &str) -> Option<String> {
 }
 
 pub(crate) const STARTUP_PROGRESS_EVENT: &str = "startup-progress";
+const STARTUP_PROGRESS_MAX_ELAPSED_MS: u64 = 86_400_000;
+
+fn bounded_startup_elapsed_ms(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(STARTUP_PROGRESS_MAX_ELAPSED_MS)
+}
 
 /// A bounded, content-free startup receipt.  It is intentionally suitable for
 /// both stderr diagnostics and the still-unbound startup webview: neither the
@@ -136,12 +143,7 @@ impl StartupProgressReporter {
     fn emit(&self, phase: &'static str, terminal: bool, outcome: Option<&'static str>) {
         let event = StartupProgressEvent {
             phase,
-            elapsed_ms: self
-                .started
-                .elapsed()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
+            elapsed_ms: bounded_startup_elapsed_ms(self.started.elapsed()),
             terminal,
             outcome,
         };
@@ -981,6 +983,31 @@ mod tests {
         .unwrap();
         assert!(!encoded.contains(&remembered.display().to_string()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn startup_progress_elapsed_is_clamped_to_the_frontend_contract_before_serialization() {
+        assert_eq!(
+            bounded_startup_elapsed_ms(std::time::Duration::from_millis(
+                STARTUP_PROGRESS_MAX_ELAPSED_MS - 1
+            )),
+            STARTUP_PROGRESS_MAX_ELAPSED_MS - 1
+        );
+        let elapsed_ms = bounded_startup_elapsed_ms(std::time::Duration::from_millis(
+            STARTUP_PROGRESS_MAX_ELAPSED_MS + 1,
+        ));
+        assert_eq!(elapsed_ms, STARTUP_PROGRESS_MAX_ELAPSED_MS);
+        let encoded = serde_json::to_value(StartupProgressEvent {
+            phase: "lookup.complete",
+            elapsed_ms,
+            terminal: true,
+            outcome: Some("ok"),
+        })
+        .unwrap();
+        assert_eq!(
+            encoded["elapsed_ms"],
+            serde_json::Value::from(STARTUP_PROGRESS_MAX_ELAPSED_MS)
+        );
     }
 
     #[test]
