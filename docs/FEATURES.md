@@ -440,7 +440,7 @@ within a column; merged cells are still v2+.
   middle-click → background tab. **Shift+Enter** opens the selected page or block in
   the right sidebar, while **Ctrl/Cmd+Shift+K** searches only blocks owned by the
   focused routed page (including collapsed descendants). **Search syntax** documents
-  phrases, alternatives, exclusions, and regex; **Open all results** creates the
+  phrases, alternatives, exclusions, and regex; **Open search tab** creates the
   persistent workspace above. Canonically equivalent composed/decomposed Unicode
   spellings share membership and source-accurate evidence; this does not add accent
   folding or transliteration.
