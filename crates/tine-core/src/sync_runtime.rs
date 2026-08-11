@@ -149,7 +149,7 @@ use crate::oplog::trusted_local_commit::{
 use crate::oplog::trusted_local_commit::{
     TrustedLocalCommitCoordinator, TrustedLocalCommitError, TrustedLocalCommitOutcome,
     TrustedLocalCommitted, TrustedLocalCommittedPendingProjection, TrustedLocalCommittedRecovery,
-    TrustedLocalRestartProjectionOutcome,
+    TrustedLocalResponseEvidence, TrustedLocalRestartProjectionOutcome,
 };
 use crate::oplog::watcher_queue::WatcherObservation;
 use crate::oplog::{
@@ -7644,12 +7644,40 @@ enum EditorCoordinatorExecution {
     CommitRefused(TrustedLocalCommitError),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts the parser fallback inside `application_from_trusted_local_commit`.
+    /// A direct durable foreground outcome carries a parser-owned DTO and must
+    /// not enter this fallback; projection/recovery outcomes intentionally do.
+    static TRUSTED_LOCAL_RESPONSE_PARSE_FALLBACKS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_trusted_local_response_parse_fallbacks() {
+    TRUSTED_LOCAL_RESPONSE_PARSE_FALLBACKS.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+fn trusted_local_response_parse_fallbacks() -> usize {
+    TRUSTED_LOCAL_RESPONSE_PARSE_FALLBACKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_trusted_local_response_parse_fallback() {
+    TRUSTED_LOCAL_RESPONSE_PARSE_FALLBACKS.with(|counter| {
+        counter.set(counter.get().saturating_add(1));
+    });
+}
+
 fn prepare_trusted_local_runtime_commit(
     session: &mut crate::oplog::local_active::PromotedRuntimeSession<'_>,
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
     journal: &mut ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
     target_page: &PageDto,
+    response_evidence: Option<TrustedLocalResponseEvidence>,
     transaction: &OperationTransaction,
 ) -> Result<TrustedLocalRuntimeAttempt, SyncEditorRequestError> {
     let base_revision =
@@ -7675,11 +7703,12 @@ fn prepare_trusted_local_runtime_commit(
             SyncEditorRefusalCode::TrustedLocalEngineAuthority,
         )
     })?;
-    let outcome = match TrustedLocalCommitCoordinator::commit(
+    let outcome = match TrustedLocalCommitCoordinator::commit_with_response_evidence(
         graph,
         journal,
         engine,
         target_page,
+        response_evidence,
         base_revision,
         prepared,
     ) {
@@ -14242,7 +14271,7 @@ impl RuntimeActor {
         }
         #[cfg(test)]
         let transaction_started = Instant::now();
-        let (page_id, transaction, affected_page_ids, existing_application, trusted_target_page) =
+        let (page_id, transaction, affected_page_ids, existing_application, trusted_target) =
             match &request.target {
                 SyncEditorSaveTarget::Existing { page_id, revision } => {
                     let page_id = parse_editor_page_id(page_id)?;
@@ -14353,6 +14382,11 @@ impl RuntimeActor {
                                 "constructing the accepted application page",
                             )
                         })?;
+                    let parsed_target_revision = trusted_target_page.rev.clone().ok_or(
+                        SyncEditorRequestError::ActorRefusedAt(
+                            "constructing the accepted application page",
+                        ),
+                    )?;
                     trusted_target_page.name = final_name.as_str().to_owned();
                     trusted_target_page
                         .title
@@ -14361,6 +14395,10 @@ impl RuntimeActor {
                         ManagedTextKind::Page => PageKind::Page,
                         ManagedTextKind::Journal => PageKind::Journal,
                     };
+                    let trusted_target_evidence = TrustedLocalResponseEvidence::new(
+                        trusted_target_page.clone(),
+                        parsed_target_revision,
+                    );
                     trusted_target_page.rev = current_application.page.rev.clone();
                     if final_name != current.page.name {
                         match runtime
@@ -14420,7 +14458,7 @@ impl RuntimeActor {
                         transaction,
                         affected.into_iter().map(|id| id.to_string()).collect(),
                         Some(current_application),
-                        Some(trusted_target_page),
+                        Some((trusted_target_page, trusted_target_evidence)),
                     )
                 }
                 SyncEditorSaveTarget::New {
@@ -14542,13 +14580,8 @@ impl RuntimeActor {
                 affected_page_ids,
             });
         };
-        self.execute_editor_transaction(
-            transaction,
-            page_id,
-            affected_page_ids,
-            trusted_target_page,
-        )
-        .map_err(|error| editor_refusal_at(error, "committing the semantic page transaction"))
+        self.execute_editor_transaction(transaction, page_id, affected_page_ids, trusted_target)
+            .map_err(|error| editor_refusal_at(error, "committing the semantic page transaction"))
     }
 
     fn prepare_editor_turn(&mut self) -> EditorTurnReadiness {
@@ -14806,7 +14839,7 @@ impl RuntimeActor {
         transaction: OperationTransaction,
         page_id: PageId,
         affected_page_ids: Vec<String>,
-        trusted_target_page: Option<PageDto>,
+        trusted_target: Option<(PageDto, TrustedLocalResponseEvidence)>,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         let execution = {
             let authority = self
@@ -14847,8 +14880,8 @@ impl RuntimeActor {
                     });
                 }
             };
-            let attempt = match trusted_target_page.as_ref() {
-                Some(target_page) => {
+            let attempt = match trusted_target {
+                Some((target_page, response_evidence)) => {
                     let managed = self
                         .managed_local
                         .as_mut()
@@ -14858,7 +14891,8 @@ impl RuntimeActor {
                         &self.graph,
                         &self.receipts,
                         &mut managed.journal,
-                        target_page,
+                        &target_page,
+                        Some(response_evidence),
                         &transaction,
                     )?
                 }
@@ -15312,15 +15346,41 @@ impl RuntimeActor {
         &self,
         committed: &TrustedLocalCommitted,
     ) -> Result<ApplicationCurrentPage, SyncEditorRequestError> {
-        let path = ManagedPath::parse(committed.relative_path().to_owned())
-            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-        let parsed = self
-            .graph
-            .parse_exact_page_dto(&path, committed.exact_target())
-            .map_err(|_| SyncEditorRequestError::ActorRefused)?;
-        if parsed.rev.as_deref() != Some(committed.revision()) {
-            return Err(SyncEditorRequestError::ActorRefused);
-        }
+        let parsed = match committed.trusted_target_page() {
+            Some(page) => {
+                // `TrustedLocalCommitCoordinator::commit` accepts this DTO
+                // only after it parsed the target bytes, and Graph returns the
+                // final reread target plus its content-derived durable revision.
+                // Check that private evidence remains bound to that durable
+                // target before using it as the immediate response.
+                if page.path != committed.relative_path()
+                    || page.rev.as_deref() != Some(committed.revision())
+                    || std::str::from_utf8(committed.exact_target()).map_or(true, |target| {
+                        crate::model::content_rev(target) != committed.revision()
+                    })
+                {
+                    return Err(SyncEditorRequestError::ActorRefused);
+                }
+                page.clone()
+            }
+            None => {
+                // Recovery and foreign committed outcomes have no process-local
+                // parser-owned DTO.  Preserve the established exact-byte
+                // parser fallback rather than treating durable bytes as a DTO.
+                #[cfg(test)]
+                note_trusted_local_response_parse_fallback();
+                let path = ManagedPath::parse(committed.relative_path().to_owned())
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                let parsed = self
+                    .graph
+                    .parse_exact_page_dto(&path, committed.exact_target())
+                    .map_err(|_| SyncEditorRequestError::ActorRefused)?;
+                if parsed.rev.as_deref() != Some(committed.revision()) {
+                    return Err(SyncEditorRequestError::ActorRefused);
+                }
+                parsed
+            }
+        };
         let editor = editor_current_page_from_materialized(
             committed.post_page().clone(),
             MAX_SYNC_APPLICATION_PAGE_BLOCKS,
@@ -31506,6 +31566,7 @@ mod tests {
         let mut blocks = loaded.blocks.clone();
         blocks[0].content = "after retained retry".into();
         let manifests_before = fixture.manifest_count();
+        reset_trusted_local_response_parse_fallbacks();
         let outcome = handle
             .save_editor_page(SyncEditorSaveRequest {
                 target: SyncEditorSaveTarget::Existing {
@@ -31520,6 +31581,11 @@ mod tests {
             SyncEditorSaveOutcome::Durable { page, .. } => page,
             other => panic!("trusted-local editor save was not durable: {other:?}"),
         };
+        assert_eq!(
+            trusted_local_response_parse_fallbacks(),
+            0,
+            "an immediate trusted foreground response must reuse its parser-owned target DTO"
+        );
         assert_eq!(saved.blocks[0].content, "after retained retry");
         assert_eq!(fixture.manifest_count(), manifests_before);
         assert_eq!(
@@ -31547,6 +31613,87 @@ mod tests {
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn immediate_managed_application_reply_matches_fresh_exact_parse_and_join_for_title_and_journal_identity(
+    ) {
+        crate::test_support::run_on_deep_stack(|| {
+            const DATE_CONFIG: &[u8] = br#"{:pages-directory "content/nested pages"
+            :journals-directory "diary"
+            :journal/file-name-format "dd-MM-yyyy"
+            :journal/page-title-format "yyyy-MM-dd"}"#;
+            let scenarios = [
+                (
+                    "trusted-response-explicit-title",
+                    "content/nested pages/physical title.md",
+                    b"title:: Before title\n\n- before\n".as_slice(),
+                    "title:: Explicit response title",
+                    "Explicit response title",
+                    SyncPageKind::Page,
+                ),
+                (
+                    "trusted-response-journal-kind",
+                    "content/nested pages/physical journal.md",
+                    b"title:: Before journal\n\n- before\n".as_slice(),
+                    "title:: 25-07-2026",
+                    "2026-07-25",
+                    SyncPageKind::Journal,
+                ),
+            ];
+
+            for (label, path, initial, preamble, expected_name, expected_kind) in scenarios {
+                let fixture = RuntimeHostFixture::safe_with_config(label, DATE_CONFIG);
+                let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+                drive_initial_feed(&handle);
+                admit_external_page(&handle, &fixture, path, initial);
+
+                let (mut requested, revision) = load_application_exact(&handle, path);
+                requested.pre_block = Some(preamble.into());
+                requested.blocks[0].raw = format!("accepted {expected_name} response");
+                reset_trusted_local_response_parse_fallbacks();
+                let (saved, saved_revision) = match handle
+                    .save_application_page(SyncApplicationPageSaveRequest {
+                        target: SyncApplicationPageSaveTarget::Existing {
+                            path: requested.path.clone(),
+                            revision,
+                        },
+                        page: requested,
+                    })
+                    .unwrap()
+                {
+                    SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => {
+                        (page, revision)
+                    }
+                    other => panic!("{label}: immediate managed save was not durable: {other:?}"),
+                };
+                assert_eq!(
+                    trusted_local_response_parse_fallbacks(),
+                    0,
+                    "{label}: immediate response must reuse parser-owned exact-target evidence"
+                );
+                assert_eq!(saved.name, expected_name, "{label}");
+                assert_eq!(saved.kind, sync_model_page_kind(expected_kind), "{label}");
+
+                // This independently goes through the ordinary exact load,
+                // which parses the final target bytes then joins the durable
+                // materialized identity.  Compare the complete wire DTO,
+                // including block IDs, rather than a selected field subset.
+                let (fresh_exact_joined, fresh_revision) = load_application_exact(&handle, path);
+                assert_eq!(saved_revision, fresh_revision, "{label}");
+                assert_eq!(
+                    serde_json::to_value(&saved).unwrap(),
+                    serde_json::to_value(&fresh_exact_joined).unwrap(),
+                    "{label}: immediate response diverged from fresh exact parse plus join"
+                );
+
+                drain_managed_local(&handle);
+                assert!(matches!(
+                    handle.clean_shutdown().unwrap(),
+                    SyncShutdownOutcome::Safe(_)
+                ));
+            }
+        });
     }
 
     #[test]
