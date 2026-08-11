@@ -70,10 +70,8 @@ for (const relative of sourceFiles) {
   // It is not an engine root and U2c removes it; all other compiled legacy-path
   // references are forbidden. Comments are excluded because documentation of
   // the retirement is useful and cannot activate a protocol.
-  const codeLines = source
-    .split("\n")
-    .filter((line) => !line.trimStart().startsWith("//"));
-  for (const [index, line] of codeLines.entries()) {
+  for (const [index, line] of source.split("\n").entries()) {
+    if (line.trimStart().startsWith("//")) continue;
     if (!line.includes(".tine-sync/v1")) continue;
     const u2cValidation =
       relative === "crates/tine-core/src/model.rs" &&
