@@ -1470,6 +1470,7 @@ impl OperationalCoordinator {
         receipts: &ProjectionReceiptStore,
         batch_id: BatchId,
         transaction: &OperationTransaction,
+        persist_fingerprint: impl FnOnce(ContentDigest) -> Result<(), String>,
     ) -> LocalMutationCoordinatorState {
         let (admission, engine, database, tail, bootstrap) = match session.parts_with_bootstrap() {
             Ok(parts) => parts,
@@ -1479,18 +1480,44 @@ impl OperationalCoordinator {
                 );
             }
         };
-        match execute_local_inner(
+        let prepared = match prepare_local_inner(
             &admission,
             graph,
             receipts,
             engine,
-            database,
-            tail,
             Some(bootstrap),
             LocalDraftSource::Promoted {
                 batch_id: Some(batch_id),
             },
+            LocalPreparationBinding::SlowPipeline,
             transaction,
+            None,
+        ) {
+            Ok(PreparedLocalMutationState::Prepared(prepared)) => prepared,
+            Ok(PreparedLocalMutationState::ReconciliationRequired(reconciliation)) => {
+                return LocalMutationCoordinatorState::Recovering(
+                    LocalMutationRecovery::ReconciliationRequired(reconciliation),
+                );
+            }
+            Err(error) => return LocalMutationCoordinatorState::blocked(error),
+        };
+        let manifest_bytes = match prepared.prepared.manifest().encode() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return LocalMutationCoordinatorState::blocked(OperationalCoordinatorError::new(
+                    OperationalPhase::Finalize,
+                    error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = persist_fingerprint(ContentDigest::of(&manifest_bytes)) {
+            return LocalMutationCoordinatorState::blocked(OperationalCoordinatorError::new(
+                OperationalPhase::Publication,
+                error,
+            ));
+        }
+        match publish_prepared_local(
+            &admission, graph, receipts, engine, database, tail, prepared,
         ) {
             Ok(state) => state,
             Err(error) => LocalMutationCoordinatorState::blocked(error),
@@ -1814,6 +1841,19 @@ fn execute_local_inner(
             ));
         }
     };
+    publish_prepared_local(admission, graph, receipts, engine, database, tail, prepared)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_prepared_local(
+    admission: &LocalRuntimeAdmission<'_>,
+    graph: &Graph,
+    receipts: &ProjectionReceiptStore,
+    engine: &mut ShardedHotEngine,
+    database: &mut SqliteFrontier,
+    tail: &mut TailOverlay,
+    prepared: PreparedLocalMutation,
+) -> Result<LocalMutationCoordinatorState, OperationalCoordinatorError> {
     let PreparedLocalMutation {
         endpoint,
         archive,

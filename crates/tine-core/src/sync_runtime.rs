@@ -2497,6 +2497,7 @@ pub enum SyncApplicationMoveConflict {
     DestinationTextTooLarge,
     EpisodeMismatch,
     EpisodeNotCommitted,
+    BatchCollision,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4311,6 +4312,36 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn install_move_episode_publication_after_write_fault(
+        &self,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::InstallMoveEpisodePublicationAfterWriteFault {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn force_next_move_episode_batch_id(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ForceNextMoveEpisodeBatchId {
+            batch_id,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn install_pending_publication_marker_creation_fault(
         &self,
     ) -> Result<(), SyncRuntimeRequestError> {
@@ -5661,6 +5692,27 @@ fn validate_application_move_request(
         return Err(SyncApplicationPageRequestError::RequestTooLarge(size));
     }
     Ok(())
+}
+
+fn application_move_request_digest(
+    request: &SyncApplicationMoveSubtreesRequest,
+) -> Result<ContentDigest, SyncApplicationPageRequestError> {
+    // Admission is binding-generation evidence, not move semantics. Excluding
+    // it lets an exact already-authored episode resolve after native limits
+    // change while every identity, revision, placement, and rewrite remains
+    // byte-for-byte bound.
+    let bytes = postcard::to_allocvec(&(
+        b"tine/application-move-request/v2".as_slice(),
+        request.episode_id.as_str(),
+        request.source_path.as_str(),
+        request.source_revision.as_str(),
+        request.destination_path.as_str(),
+        request.destination_revision.as_str(),
+        &request.roots,
+        &request.placement,
+    ))
+    .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_digest"))?;
+    Ok(ContentDigest::of(&bytes))
 }
 
 fn validate_application_graph_mutation_request(
@@ -7175,6 +7227,13 @@ enum ActorRequest {
         reply: mpsc::Sender<()>,
     },
     #[cfg(test)]
+    InstallMoveEpisodePublicationAfterWriteFault { reply: mpsc::Sender<()> },
+    #[cfg(test)]
+    ForceNextMoveEpisodeBatchId {
+        batch_id: BatchId,
+        reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
     InstallPendingPublicationMarkerCreationFault { reply: mpsc::Sender<()> },
     #[cfg(test)]
     InstallProviderPublicationAfterPhysicalWriteFault { reply: mpsc::Sender<()> },
@@ -7528,6 +7587,18 @@ fn run_actor_loop(
                 false
             }
             #[cfg(test)]
+            ActorRequest::InstallMoveEpisodePublicationAfterWriteFault { reply } => {
+                actor.fail_next_move_episode_publication_after_write = true;
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ForceNextMoveEpisodeBatchId { batch_id, reply } => {
+                actor.forced_next_move_episode_batch_id = Some(batch_id);
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
             ActorRequest::InstallPendingPublicationMarkerCreationFault { reply } => {
                 fail_next_pending_publication_marker_creation();
                 let _ = reply.send(());
@@ -7564,6 +7635,7 @@ enum PendingLocalMutation {
     Reconciliation {
         transaction: OperationTransaction,
         correlated_batch_id: Option<BatchId>,
+        application_move_episode: Option<ApplicationMoveEpisodeDraft>,
     },
     Published(LocalPublishedContinuation),
 }
@@ -7637,7 +7709,7 @@ struct ManagedLocalRuntimeState {
     cleanup_pending: bool,
 }
 
-const MOVE_EPISODE_SCHEMA_VERSION: u32 = 1;
+const MOVE_EPISODE_SCHEMA_VERSION: u32 = 2;
 const MOVE_EPISODE_RECORD_MAX_BYTES: u64 = 16 * 1024;
 
 /// Immutable private binding from one caller episode to the actor-derived
@@ -7653,10 +7725,10 @@ struct ApplicationMoveEpisodeRecord {
     episode_id: Uuid,
     request_digest: ContentDigest,
     batch_id: BatchId,
-    source_path: String,
-    source_revision: String,
-    destination_path: String,
-    destination_revision: String,
+    source_page_id: PageId,
+    destination_page_id: PageId,
+    transaction_fingerprint: ContentDigest,
+    manifest_fingerprint: ContentDigest,
 }
 
 impl ApplicationMoveEpisodeRecord {
@@ -7664,10 +7736,109 @@ impl ApplicationMoveEpisodeRecord {
         format!("episode-{}.bin", self.episode_id.simple())
     }
 
+    fn completion_filename(&self) -> String {
+        format!("episode-{}.complete", self.episode_id.simple())
+    }
+
+    fn completion_bytes(&self) -> Result<Vec<u8>, SyncApplicationPageRequestError> {
+        let record = self.encode()?;
+        postcard::to_allocvec(&(
+            b"tine/application-move-episode-complete/v1".as_slice(),
+            self.episode_id,
+            ContentDigest::of(&record),
+        ))
+        .map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("move_episode_complete_encode")
+        })
+    }
+
     fn encode(&self) -> Result<Vec<u8>, SyncApplicationPageRequestError> {
         postcard::to_allocvec(self)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_encode"))
     }
+}
+
+#[derive(Clone)]
+struct ApplicationMoveEpisodeDraft {
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    episode_id: Uuid,
+    request_digest: ContentDigest,
+    batch_id: BatchId,
+    source_page_id: PageId,
+    destination_page_id: PageId,
+    transaction_fingerprint: ContentDigest,
+}
+
+impl ApplicationMoveEpisodeDraft {
+    fn finish(&self, manifest_fingerprint: ContentDigest) -> ApplicationMoveEpisodeRecord {
+        ApplicationMoveEpisodeRecord {
+            schema_version: MOVE_EPISODE_SCHEMA_VERSION,
+            workspace_id: self.workspace_id,
+            lineage_digest: self.lineage_digest,
+            episode_id: self.episode_id,
+            request_digest: self.request_digest,
+            batch_id: self.batch_id,
+            source_page_id: self.source_page_id,
+            destination_page_id: self.destination_page_id,
+            transaction_fingerprint: self.transaction_fingerprint,
+            manifest_fingerprint,
+        }
+    }
+}
+
+enum ApplicationMoveEpisodeLookup {
+    Missing,
+    Pending(ApplicationMoveEpisodeRecord),
+    Complete(ApplicationMoveEpisodeRecord),
+}
+
+fn persist_application_move_episode(
+    directory: &Dir,
+    record: &ApplicationMoveEpisodeRecord,
+    fail_after_record_write_for_test: bool,
+) -> Result<(), String> {
+    let publication = DurableDirectoryPublication::open(directory)
+        .map_err(|error| format!("move episode publication open failed: {error}"))?;
+    let name = record.filename();
+    let bytes = record.encode().map_err(|error| error.to_string())?;
+    match read_optional_regular(directory, &name, MOVE_EPISODE_RECORD_MAX_BYTES, None)
+        .map_err(|error| format!("move episode record read failed: {error}"))?
+    {
+        Some(existing) if existing == bytes => {}
+        Some(_) => return Err("move episode immutable record collision".into()),
+        None => {
+            publication
+                .publish_new_exact(&name, &bytes)
+                .map_err(|error| format!("move episode record publication failed: {error}"))?;
+            if fail_after_record_write_for_test {
+                // Model an error returned after the new directory entry became
+                // readable but before the caller acquired a successful durable
+                // publication acknowledgement. The completion proof is not
+                // written, so this attempt can never proceed to the manifest.
+                return Err("injected move episode directory-sync failure".into());
+            }
+        }
+    }
+    let completion_name = record.completion_filename();
+    let completion_bytes = record
+        .completion_bytes()
+        .map_err(|error| error.to_string())?;
+    publication
+        .publish_new_exact(&completion_name, &completion_bytes)
+        .map_err(|error| format!("move episode completion publication failed: {error}"))?;
+    let retained = read_optional_regular(
+        directory,
+        &completion_name,
+        MOVE_EPISODE_RECORD_MAX_BYTES,
+        None,
+    )
+    .map_err(|error| format!("move episode completion read failed: {error}"))?
+    .ok_or_else(|| "move episode completion proof is missing".to_owned())?;
+    if retained != completion_bytes {
+        return Err("move episode completion proof collision".into());
+    }
+    Ok(())
 }
 
 impl ManagedLocalRuntimeState {
@@ -8911,6 +9082,10 @@ struct RuntimeActor {
     local_mutation: Option<PendingLocalMutation>,
     managed_local: Option<ManagedLocalRuntimeState>,
     move_episode_directory: Dir,
+    #[cfg(test)]
+    fail_next_move_episode_publication_after_write: bool,
+    #[cfg(test)]
+    forced_next_move_episode_batch_id: Option<BatchId>,
     prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
     #[cfg(test)]
     managed_application_query_instrumentation:
@@ -10413,6 +10588,10 @@ impl RuntimeActor {
             local_mutation: None,
             managed_local: Some(managed_local),
             move_episode_directory,
+            #[cfg(test)]
+            fail_next_move_episode_publication_after_write: false,
+            #[cfg(test)]
+            forced_next_move_episode_batch_id: None,
             prepared_application_reply: None,
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
@@ -13572,21 +13751,11 @@ impl RuntimeActor {
         outcome
     }
 
-    fn bind_application_move_episode(
-        &self,
-        request: &SyncApplicationMoveSubtreesRequest,
-    ) -> Result<
-        Result<ApplicationMoveEpisodeRecord, SyncApplicationMoveConflict>,
-        SyncApplicationPageRequestError,
-    > {
-        let episode_id = Uuid::parse_str(&request.episode_id).map_err(|_| {
-            SyncApplicationPageRequestError::InvalidRequest(
-                SyncApplicationPageInvalidRequest::MalformedPage,
-            )
-        })?;
-        let request_bytes = serde_json::to_vec(request)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_digest"))?;
-        let request_digest = ContentDigest::of(&request_bytes);
+    fn application_move_batch_id(&mut self, episode_id: Uuid) -> BatchId {
+        #[cfg(test)]
+        if let Some(batch_id) = self.forced_next_move_episode_batch_id.take() {
+            return batch_id;
+        }
         let mut batch_hasher = Sha256::new();
         batch_hasher.update(b"tine/application-move-episode-batch/v1\0");
         batch_hasher.update(self.binding.workspace_id().as_uuid().as_bytes());
@@ -13595,33 +13764,28 @@ impl RuntimeActor {
         let digest = batch_hasher.finalize();
         let mut batch_bytes = [0_u8; 16];
         batch_bytes.copy_from_slice(&digest[..16]);
-        let record = ApplicationMoveEpisodeRecord {
-            schema_version: MOVE_EPISODE_SCHEMA_VERSION,
-            workspace_id: self.binding.workspace_id(),
-            lineage_digest: self.binding.lineage_digest(),
-            episode_id,
-            request_digest,
-            batch_id: BatchId::from_uuid(Uuid::from_bytes(batch_bytes)),
-            source_path: request.source_path.clone(),
-            source_revision: request.source_revision.clone(),
-            destination_path: request.destination_path.clone(),
-            destination_revision: request.destination_revision.clone(),
-        };
-        let name = record.filename();
-        let bytes = record.encode()?;
-        let publication = DurableDirectoryPublication::open(&self.move_episode_directory)
-            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_open"))?;
-        let _ = publication.publish_new_exact(&name, &bytes);
+        BatchId::from_uuid(Uuid::from_bytes(batch_bytes))
+    }
+
+    fn load_application_move_episode(
+        &self,
+        episode_id: Uuid,
+        request_digest: ContentDigest,
+    ) -> Result<
+        Result<ApplicationMoveEpisodeLookup, SyncApplicationMoveConflict>,
+        SyncApplicationPageRequestError,
+    > {
+        let name = format!("episode-{}.bin", episode_id.simple());
         let retained = read_optional_regular(
             &self.move_episode_directory,
             &name,
             MOVE_EPISODE_RECORD_MAX_BYTES,
             None,
         )
-        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_read"))?
-        .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
-            "move_episode_missing",
-        ))?;
+        .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_read"))?;
+        let Some(retained) = retained else {
+            return Ok(Ok(ApplicationMoveEpisodeLookup::Missing));
+        };
         let decoded: ApplicationMoveEpisodeRecord = postcard::from_bytes(&retained)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_episode_decode"))?;
         let canonical = decoded.encode()?;
@@ -13635,10 +13799,49 @@ impl RuntimeActor {
                 "move_episode_binding",
             ));
         }
-        if decoded != record {
+        if decoded.request_digest != request_digest {
             return Ok(Err(SyncApplicationMoveConflict::EpisodeMismatch));
         }
-        Ok(Ok(decoded))
+        let completion_name = decoded.completion_filename();
+        let expected_completion = decoded.completion_bytes()?;
+        let completion = read_optional_regular(
+            &self.move_episode_directory,
+            &completion_name,
+            MOVE_EPISODE_RECORD_MAX_BYTES,
+            None,
+        )
+        .map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("move_episode_complete_read")
+        })?;
+        match completion {
+            None => Ok(Ok(ApplicationMoveEpisodeLookup::Pending(decoded))),
+            Some(bytes) if bytes == expected_completion => {
+                Ok(Ok(ApplicationMoveEpisodeLookup::Complete(decoded)))
+            }
+            Some(_) => Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                "move_episode_complete_collision",
+            )),
+        }
+    }
+
+    fn application_move_accepted(
+        &self,
+        episode: &ApplicationMoveEpisodeRecord,
+    ) -> Result<bool, SyncApplicationMoveConflict> {
+        let evidence = match self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationMoveConflict::EpisodeNotCommitted)?
+            .engine()
+            .accepted_batch_evidence(episode.batch_id)
+        {
+            Ok(evidence) => evidence,
+            Err(_) => return Ok(false),
+        };
+        if evidence.manifest_fingerprint() != episode.manifest_fingerprint {
+            return Err(SyncApplicationMoveConflict::BatchCollision);
+        }
+        Ok(true)
     }
 
     fn move_application_subtrees(
@@ -13653,6 +13856,24 @@ impl RuntimeActor {
         if let EditorTurnReadiness::Deferred(state) = self.prepare_editor_turn() {
             return Ok(SyncApplicationMoveSubtreesOutcome::Deferred { episode_id, state });
         }
+        let parsed_episode_id = Uuid::parse_str(&request.episode_id).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::MalformedPage,
+            )
+        })?;
+        let request_digest = application_move_request_digest(&request)?;
+        let existing_episode =
+            match self.load_application_move_episode(parsed_episode_id, request_digest)? {
+                Ok(episode) => episode,
+                Err(reason) => return Ok(no_commit(reason)),
+            };
+        if let ApplicationMoveEpisodeLookup::Complete(record) = &existing_episode {
+            match self.application_move_accepted(record) {
+                Ok(true) => return self.application_move_committed_outcome(record, true),
+                Ok(false) => {}
+                Err(reason) => return Ok(no_commit(reason)),
+            }
+        }
         if request.admission
             != (SyncApplicationMoveAdmission {
                 application_save_page_blocks: MAX_SYNC_EDITOR_BLOCKS,
@@ -13665,20 +13886,20 @@ impl RuntimeActor {
         if request.source_path == request.destination_path {
             return Ok(no_commit(SyncApplicationMoveConflict::SamePage));
         }
-
-        let episode = match self.bind_application_move_episode(&request)? {
-            Ok(record) => record,
-            Err(reason) => return Ok(no_commit(reason)),
+        let batch_id = match &existing_episode {
+            ApplicationMoveEpisodeLookup::Missing => {
+                self.application_move_batch_id(parsed_episode_id)
+            }
+            ApplicationMoveEpisodeLookup::Pending(record)
+            | ApplicationMoveEpisodeLookup::Complete(record) => record.batch_id,
         };
-        let already_accepted = self
-            .runtime
-            .as_ref()
-            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?
-            .engine()
-            .accepted_batch_evidence(episode.batch_id)
-            .is_ok();
-        if already_accepted {
-            return self.application_move_committed_outcome(&episode, true);
+        if matches!(existing_episode, ApplicationMoveEpisodeLookup::Missing)
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.engine().accepted_batch_evidence(batch_id).is_ok())
+        {
+            return Ok(no_commit(SyncApplicationMoveConflict::BatchCollision));
         }
 
         let source = match self.load_application_exact_ready(&request.source_path)? {
@@ -13796,71 +14017,49 @@ impl RuntimeActor {
             return Ok(no_commit(SyncApplicationMoveConflict::DestinationTooLarge));
         }
 
-        let mut prospective = destination.editor.blocks.clone();
-        prospective.extend(
-            source
-                .editor
-                .blocks
-                .iter()
-                .filter(|block| moved_ids.contains(&block.block_id))
-                .cloned(),
-        );
-        let prospective_indexes = prospective
-            .iter()
-            .enumerate()
-            .map(|(index, block)| (block.block_id, index))
-            .collect::<HashMap<_, _>>();
         let mut final_siblings = target_siblings
             .iter()
             .map(|block| block.block_id)
             .collect::<Vec<_>>();
         final_siblings.splice(target_position..target_position, selected.iter().copied());
-        for (position, block_id) in final_siblings.iter().copied().enumerate() {
-            let block = &mut prospective[prospective_indexes[&block_id]];
-            block.parent = target_parent;
-            block.order = crate::oplog::import::imported_order(position as u32);
-        }
         for (root, block_id) in request.roots.iter().zip(&selected) {
             if let Some(rewrite) = &root.raw_rewrite {
                 if source_blocks[block_id].content != rewrite.expected_raw {
                     return Ok(no_commit(SyncApplicationMoveConflict::ExpectedRawChanged));
                 }
-                prospective[prospective_indexes[block_id]]
-                    .content
-                    .clone_from(&rewrite.desired_raw);
             }
         }
-        let prospective_depth = materialized_outline_depth(&prospective).ok_or(
-            SyncApplicationPageRequestError::ActorRefusedAt("move_destination_outline"),
-        )?;
-        if prospective_depth > request.admission.application_page_max_depth {
-            return Ok(no_commit(SyncApplicationMoveConflict::DestinationTooDeep));
-        }
-        let prospective_text = destination
-            .editor
-            .page
-            .name
-            .as_str()
-            .len()
-            .saturating_add(destination.editor.page.path.as_str().len())
-            .saturating_add(
-                destination
-                    .editor
-                    .page
-                    .preamble
-                    .as_ref()
-                    .map_or(0, String::len),
-            )
-            .saturating_add(
-                prospective
-                    .iter()
-                    .map(|block| block.content.len().saturating_add(block.order.len()))
-                    .sum::<usize>(),
-            );
-        if prospective_text > request.admission.application_page_request_text_bytes {
-            return Ok(no_commit(
-                SyncApplicationMoveConflict::DestinationTextTooLarge,
-            ));
+        let prospective_destination =
+            prospective_application_move_destination(&source.page, &destination.page, &request)?;
+        let prospective_save = SyncApplicationPageSaveRequest {
+            target: SyncApplicationPageSaveTarget::Existing {
+                path: prospective_destination.path.clone(),
+                revision: destination.revision.clone(),
+            },
+            page: prospective_destination,
+        };
+        if let Err(error) = validate_application_save_request(&prospective_save) {
+            let reason = match error {
+                SyncApplicationPageRequestError::RequestTooLarge(size)
+                    if size.blocks > request.admission.application_save_page_blocks =>
+                {
+                    SyncApplicationMoveConflict::DestinationTooLarge
+                }
+                SyncApplicationPageRequestError::RequestTooLarge(size)
+                    if size.depth > request.admission.application_page_max_depth =>
+                {
+                    SyncApplicationMoveConflict::DestinationTooDeep
+                }
+                SyncApplicationPageRequestError::RequestTooLarge(_) => {
+                    SyncApplicationMoveConflict::DestinationTextTooLarge
+                }
+                _ => {
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "move_destination_page_bounds",
+                    ))
+                }
+            };
+            return Ok(no_commit(reason));
         }
 
         let mut operations = Vec::new();
@@ -13911,6 +14110,33 @@ impl RuntimeActor {
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_plan"))?;
         let transaction = validate_local_mutation_request(transaction)
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_bounds"))?;
+        let transaction_bytes = postcard::to_allocvec(&transaction)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_fingerprint"))?;
+        let episode_draft = ApplicationMoveEpisodeDraft {
+            workspace_id: self.binding.workspace_id(),
+            lineage_digest: self.binding.lineage_digest(),
+            episode_id: parsed_episode_id,
+            request_digest,
+            batch_id,
+            source_page_id: source.editor.page.page_id,
+            destination_page_id: destination.editor.page.page_id,
+            transaction_fingerprint: ContentDigest::of(&transaction_bytes),
+        };
+        if let ApplicationMoveEpisodeLookup::Pending(record)
+        | ApplicationMoveEpisodeLookup::Complete(record) = &existing_episode
+        {
+            if record.workspace_id != episode_draft.workspace_id
+                || record.lineage_digest != episode_draft.lineage_digest
+                || record.episode_id != episode_draft.episode_id
+                || record.request_digest != episode_draft.request_digest
+                || record.batch_id != episode_draft.batch_id
+                || record.source_page_id != episode_draft.source_page_id
+                || record.destination_page_id != episode_draft.destination_page_id
+                || record.transaction_fingerprint != episode_draft.transaction_fingerprint
+            {
+                return Ok(no_commit(SyncApplicationMoveConflict::EpisodeMismatch));
+            }
+        }
 
         if self.local_mutation.is_some() {
             let prior =
@@ -13926,19 +14152,41 @@ impl RuntimeActor {
                     state: editor_deferred_from_local(prior),
                 });
             }
-            if self.runtime.as_ref().is_some_and(|runtime| {
-                runtime
-                    .engine()
-                    .accepted_batch_evidence(episode.batch_id)
-                    .is_ok()
-            }) {
-                return self.application_move_committed_outcome(&episode, true);
+            if let Ok(Ok(ApplicationMoveEpisodeLookup::Complete(record))) =
+                self.load_application_move_episode(parsed_episode_id, request_digest)
+            {
+                match self.application_move_accepted(&record) {
+                    Ok(true) => return self.application_move_committed_outcome(&record, true),
+                    Ok(false) => {}
+                    Err(reason) => return Ok(no_commit(reason)),
+                }
             }
         }
-        match self.execute_local_transaction_with_batch_id(transaction, Some(episode.batch_id)) {
-            SyncLocalMutationOutcome::Durable { batch_id } => {
-                debug_assert_eq!(batch_id, episode.batch_id);
-                self.application_move_committed_outcome(&episode, false)
+        match self.execute_local_transaction_with_batch_id(
+            transaction,
+            Some(batch_id),
+            Some(episode_draft),
+        ) {
+            SyncLocalMutationOutcome::Durable {
+                batch_id: durable_batch_id,
+            } => {
+                debug_assert_eq!(durable_batch_id, batch_id);
+                let record =
+                    match self.load_application_move_episode(parsed_episode_id, request_digest)? {
+                        Ok(ApplicationMoveEpisodeLookup::Complete(record)) => record,
+                        Ok(ApplicationMoveEpisodeLookup::Missing)
+                        | Ok(ApplicationMoveEpisodeLookup::Pending(_)) => {
+                            return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                                "move_episode_not_durable",
+                            ))
+                        }
+                        Err(reason) => return Ok(no_commit(reason)),
+                    };
+                match self.application_move_accepted(&record) {
+                    Ok(true) => self.application_move_committed_outcome(&record, false),
+                    Ok(false) => Ok(no_commit(SyncApplicationMoveConflict::EpisodeNotCommitted)),
+                    Err(reason) => Ok(no_commit(reason)),
+                }
             }
             outcome => Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
                 episode_id,
@@ -13952,32 +14200,8 @@ impl RuntimeActor {
         episode: &ApplicationMoveEpisodeRecord,
         recovered: bool,
     ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
-        let source = match self.load_application_exact_ready(&episode.source_path)? {
-            ApplicationExactLoad::Loaded(current) => current,
-            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
-                    episode_id: episode.episode_id.to_string(),
-                    state: SyncEditorDeferred::BlockedRecovery {
-                        batch_id: Some(episode.batch_id.to_string()),
-                        phase: SyncLocalMutationPhase::ProjectionDrain,
-                        retained_publication: true,
-                    },
-                })
-            }
-        };
-        let destination = match self.load_application_exact_ready(&episode.destination_path)? {
-            ApplicationExactLoad::Loaded(current) => current,
-            ApplicationExactLoad::Missing | ApplicationExactLoad::Ambiguous => {
-                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
-                    episode_id: episode.episode_id.to_string(),
-                    state: SyncEditorDeferred::BlockedRecovery {
-                        batch_id: Some(episode.batch_id.to_string()),
-                        phase: SyncLocalMutationPhase::ProjectionDrain,
-                        retained_publication: true,
-                    },
-                })
-            }
-        };
+        let source = self.load_application_page_id_ready(episode.source_page_id)?;
+        let destination = self.load_application_page_id_ready(episode.destination_page_id)?;
         Ok(SyncApplicationMoveSubtreesOutcome::Committed {
             episode_id: episode.episode_id.to_string(),
             batch_id: episode.batch_id.to_string(),
@@ -20169,15 +20393,22 @@ impl RuntimeActor {
         &mut self,
         transaction: OperationTransaction,
     ) -> SyncLocalMutationOutcome {
-        self.execute_local_transaction_with_batch_id(transaction, None)
+        self.execute_local_transaction_with_batch_id(transaction, None, None)
     }
 
     fn execute_local_transaction_with_batch_id(
         &mut self,
         transaction: OperationTransaction,
         correlated_batch_id: Option<BatchId>,
+        application_move_episode: Option<ApplicationMoveEpisodeDraft>,
     ) -> SyncLocalMutationOutcome {
+        #[cfg(test)]
+        let fail_episode_publication =
+            std::mem::take(&mut self.fail_next_move_episode_publication_after_write);
+        #[cfg(not(test))]
+        let fail_episode_publication = false;
         let state = {
+            let episode_directory = &self.move_episode_directory;
             let Some(authority) = self.authority.as_mut() else {
                 return SyncLocalMutationOutcome::Revoked {
                     batch_id: None,
@@ -20212,13 +20443,29 @@ impl RuntimeActor {
                 }
             };
             match correlated_batch_id {
-                Some(batch_id) => OperationalCoordinator::execute_local_correlated(
-                    &mut session,
-                    &self.graph,
-                    &self.receipts,
-                    batch_id,
-                    &transaction,
-                ),
+                Some(batch_id) => {
+                    let Some(episode) = application_move_episode.as_ref() else {
+                        return SyncLocalMutationOutcome::Blocked {
+                            batch_id: Some(batch_id),
+                            phase: SyncLocalMutationPhase::Bindings,
+                            reason: SyncLocalMutationBlock::Prepublication,
+                        };
+                    };
+                    OperationalCoordinator::execute_local_correlated(
+                        &mut session,
+                        &self.graph,
+                        &self.receipts,
+                        batch_id,
+                        &transaction,
+                        |manifest_fingerprint| {
+                            persist_application_move_episode(
+                                episode_directory,
+                                &episode.finish(manifest_fingerprint),
+                                fail_episode_publication,
+                            )
+                        },
+                    )
+                }
                 None => OperationalCoordinator::execute_local(
                     &mut session,
                     &self.graph,
@@ -20227,7 +20474,10 @@ impl RuntimeActor {
                 ),
             }
         };
-        self.retain_local_state(state, Some((transaction, correlated_batch_id)))
+        self.retain_local_state(
+            state,
+            Some((transaction, correlated_batch_id, application_move_episode)),
+        )
     }
 
     fn advance_local_mutation_once(&mut self) -> Option<SyncLocalMutationOutcome> {
@@ -20241,6 +20491,7 @@ impl RuntimeActor {
             PendingLocalMutation::Reconciliation {
                 transaction,
                 correlated_batch_id,
+                application_move_episode,
             } => {
                 if self.last_watcher.pending {
                     let tick = self.tick_external_feed();
@@ -20248,6 +20499,7 @@ impl RuntimeActor {
                         self.local_mutation = Some(PendingLocalMutation::Reconciliation {
                             transaction,
                             correlated_batch_id,
+                            application_move_episode,
                         });
                         return Some(SyncLocalMutationOutcome::Revoked {
                             batch_id: None,
@@ -20259,18 +20511,18 @@ impl RuntimeActor {
                     self.local_mutation = Some(PendingLocalMutation::Reconciliation {
                         transaction,
                         correlated_batch_id,
+                        application_move_episode,
                     });
                     Some(SyncLocalMutationOutcome::RetryableRetainedRecovery {
                         batch_id: None,
                         phase: SyncLocalMutationPhase::Capture,
                     })
                 } else {
-                    Some(
-                        self.execute_local_transaction_with_batch_id(
-                            transaction,
-                            correlated_batch_id,
-                        ),
-                    )
+                    Some(self.execute_local_transaction_with_batch_id(
+                        transaction,
+                        correlated_batch_id,
+                        application_move_episode,
+                    ))
                 }
             }
             PendingLocalMutation::Published(continuation) => {
@@ -20331,7 +20583,11 @@ impl RuntimeActor {
     fn retain_local_state(
         &mut self,
         state: LocalMutationCoordinatorState,
-        transaction: Option<(OperationTransaction, Option<BatchId>)>,
+        transaction: Option<(
+            OperationTransaction,
+            Option<BatchId>,
+            Option<ApplicationMoveEpisodeDraft>,
+        )>,
     ) -> SyncLocalMutationOutcome {
         match state {
             LocalMutationCoordinatorState::Active(completion) => {
@@ -20374,7 +20630,9 @@ impl RuntimeActor {
                         phase: SyncLocalMutationPhase::Capture,
                     };
                 }
-                let Some((transaction, correlated_batch_id)) = transaction else {
+                let Some((transaction, correlated_batch_id, application_move_episode)) =
+                    transaction
+                else {
                     return SyncLocalMutationOutcome::Blocked {
                         batch_id: None,
                         phase: SyncLocalMutationPhase::Capture,
@@ -20384,6 +20642,7 @@ impl RuntimeActor {
                 self.local_mutation = Some(PendingLocalMutation::Reconciliation {
                     transaction,
                     correlated_batch_id,
+                    application_move_episode,
                 });
                 SyncLocalMutationOutcome::RetryableRetainedRecovery {
                     batch_id: None,
@@ -21951,46 +22210,76 @@ fn application_page_identity_map(
     Ok(identities)
 }
 
-fn materialized_outline_depth(blocks: &[MaterializedBlock]) -> Option<usize> {
-    let indexes = blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| (block.block_id, index))
-        .collect::<HashMap<_, _>>();
-    if indexes.len() != blocks.len() {
-        return None;
+fn remove_application_block_by_identity(
+    blocks: &mut Vec<BlockDto>,
+    identity: &str,
+) -> Option<BlockDto> {
+    if let Some(index) = blocks.iter().position(|block| block.id == identity) {
+        return Some(blocks.remove(index));
     }
-    let mut children = vec![Vec::new(); blocks.len()];
-    let mut indegree = vec![0_u8; blocks.len()];
-    for (index, block) in blocks.iter().enumerate() {
-        let Some(parent) = block.parent else {
-            continue;
-        };
-        let parent = *indexes.get(&parent)?;
-        children[parent].push(index);
-        indegree[index] = 1;
-    }
-    let mut queue = VecDeque::new();
-    let mut depths = vec![1_usize; blocks.len()];
-    for (index, degree) in indegree.iter().enumerate() {
-        if *degree == 0 {
-            queue.push_back(index);
+    for block in blocks {
+        if let Some(found) = remove_application_block_by_identity(&mut block.children, identity) {
+            return Some(found);
         }
     }
-    let mut visited = 0_usize;
-    let mut depth = 0_usize;
-    while let Some(index) = queue.pop_front() {
-        visited = visited.saturating_add(1);
-        depth = depth.max(depths[index]);
-        for child in &children[index] {
-            depths[*child] = depths[index].saturating_add(1);
-            indegree[*child] = indegree[*child].saturating_sub(1);
-            if indegree[*child] == 0 {
-                queue.push_back(*child);
-            }
+    None
+}
+
+fn application_block_children_by_identity<'a>(
+    blocks: &'a mut [BlockDto],
+    identity: &str,
+) -> Option<&'a mut Vec<BlockDto>> {
+    for block in blocks {
+        if block.id == identity {
+            return Some(&mut block.children);
+        }
+        if let Some(children) =
+            application_block_children_by_identity(&mut block.children, identity)
+        {
+            return Some(children);
         }
     }
-    (visited == blocks.len()).then_some(depth)
+    None
+}
+
+fn prospective_application_move_destination(
+    source: &PageDto,
+    destination: &PageDto,
+    request: &SyncApplicationMoveSubtreesRequest,
+) -> Result<PageDto, SyncApplicationPageRequestError> {
+    let mut source = source.clone();
+    let mut destination = destination.clone();
+    let mut moved = Vec::with_capacity(request.roots.len());
+    for root in &request.roots {
+        let mut block = remove_application_block_by_identity(&mut source.blocks, &root.identity)
+            .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                "move_prospective_source_identity",
+            ))?;
+        if let Some(rewrite) = &root.raw_rewrite {
+            block.raw.clone_from(&rewrite.desired_raw);
+        }
+        moved.push(block);
+    }
+    let (siblings, position) = match &request.placement {
+        SyncApplicationMovePlacement::Root { position } => (&mut destination.blocks, *position),
+        SyncApplicationMovePlacement::Child {
+            parent_identity,
+            position,
+        } => (
+            application_block_children_by_identity(&mut destination.blocks, parent_identity)
+                .ok_or(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_prospective_destination_identity",
+                ))?,
+            *position,
+        ),
+    };
+    if position > siblings.len() {
+        return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+            "move_prospective_position",
+        ));
+    }
+    siblings.splice(position..position, moved);
+    Ok(destination)
 }
 
 fn application_editor_blocks_new(
@@ -25303,6 +25592,385 @@ mod tests {
             SyncRuntimeQueryReply::PageWithBlocks(Some(page)) => page,
             other => panic!("SQLite page did not load: {other:?}"),
         }
+    }
+
+    fn simple_application_move_request(
+        handle: &SyncRuntimeHandle,
+        label: &str,
+    ) -> SyncApplicationMoveSubtreesRequest {
+        let source_name = format!("{label} Source");
+        let destination_name = format!("{label} Destination");
+        let (source, source_revision) = accepted_new_application_page(
+            handle,
+            &source_name,
+            vec![BlockDto {
+                id: "temporary-source".into(),
+                raw: "source root".into(),
+                ..BlockDto::default()
+            }],
+        );
+        let (destination, destination_revision) = accepted_new_application_page(
+            handle,
+            &destination_name,
+            vec![BlockDto {
+                id: "temporary-destination".into(),
+                raw: "destination root".into(),
+                ..BlockDto::default()
+            }],
+        );
+        drive_initial_feed(handle);
+        SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: source.path,
+            source_revision,
+            destination_path: destination.path,
+            destination_revision,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: source.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root { position: 0 },
+            admission: application_move_admission(),
+        }
+    }
+
+    #[test]
+    fn application_cross_page_move_sidecar_failure_never_reaches_manifest() {
+        let fixture = RuntimeHostFixture::safe("application-move-sidecar-fault");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "Sidecar Fault");
+        let manifests = fixture.manifest_count();
+        let sqlite = fixture.applied_batch_count();
+        handle
+            .install_move_episode_publication_after_write_fault()
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        assert_eq!(fixture.manifest_count(), manifests);
+        assert_eq!(fixture.applied_batch_count(), sqlite);
+        assert!(matches!(
+            accepted_application_move(&handle, &request),
+            SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ));
+        assert_eq!(fixture.manifest_count(), manifests + 1);
+    }
+
+    #[test]
+    fn application_cross_page_move_fault_cuts_recover_exactly_once() {
+        for (label, point) in [
+            ("pre-append", OperationalFaultPoint::AfterFinalize),
+            ("post-append", OperationalFaultPoint::AfterManifest),
+            ("projection", OperationalFaultPoint::BeforeProjection),
+        ] {
+            let fixture = RuntimeHostFixture::safe(&format!("application-move-{label}"));
+            let reopen_request = fixture.request();
+            let handle = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+            drive_initial_feed(&handle);
+            let request = simple_application_move_request(&handle, label);
+            let manifests = fixture.manifest_count();
+            handle.install_repeated_operational_fault(point, 1).unwrap();
+            let committed = accepted_application_move(&handle, &request);
+            let batch_id = match committed {
+                SyncApplicationMoveSubtreesOutcome::Committed { batch_id, .. } => batch_id,
+                other => panic!("{label} fault did not recover: {other:?}"),
+            };
+            assert_eq!(fixture.manifest_count(), manifests + 1, "{label}");
+            assert!(matches!(
+                handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+            drop(handle);
+            let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
+            drive_initial_feed(&reopened);
+            match accepted_application_move(&reopened, &request) {
+                SyncApplicationMoveSubtreesOutcome::Committed {
+                    batch_id: reopened_batch,
+                    recovered: true,
+                    ..
+                } => assert_eq!(reopened_batch, batch_id, "{label}"),
+                other => panic!("{label} cold reopen did not resolve: {other:?}"),
+            }
+            assert_eq!(fixture.manifest_count(), manifests + 1, "{label}");
+        }
+    }
+
+    #[test]
+    fn application_cross_page_move_resolves_after_rename_and_admission_change() {
+        let fixture = RuntimeHostFixture::safe("application-move-rename-resolution");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let mut request = simple_application_move_request(&handle, "Rename Resolution");
+        let batch_id = match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed { batch_id, .. } => batch_id,
+            other => panic!("move did not commit: {other:?}"),
+        };
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "Rename Resolution Source".into(),
+                    new: "Renamed Move Source".into(),
+                    expected_path: Some(request.source_path.clone()),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        assert_eq!(
+            handle
+                .mutate_application_graph(SyncApplicationGraphMutationRequest::RenamePage {
+                    old: "Rename Resolution Destination".into(),
+                    new: "Renamed Move Destination".into(),
+                    expected_path: Some(request.destination_path.clone()),
+                })
+                .unwrap(),
+            SyncApplicationUnitOutcome::Applied
+        );
+        request.admission.application_save_page_blocks = 0;
+        match accepted_application_move(&handle, &request) {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                batch_id: resolved,
+                recovered: true,
+                source,
+                destination,
+                ..
+            } => {
+                assert_eq!(resolved, batch_id);
+                assert_eq!(source.page.name, "Renamed Move Source");
+                assert_eq!(destination.page.name, "Renamed Move Destination");
+            }
+            other => panic!("renamed episode did not resolve: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn application_cross_page_move_forced_batch_collision_fails_closed() {
+        let fixture = RuntimeHostFixture::safe("application-move-batch-collision");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "Batch Collision");
+        let collision = submit_durable(
+            &handle,
+            vec![SemanticOperation::CreatePage {
+                page_id: PageId::new(),
+                home_document_id: DocumentId::new(),
+                name: LogicalPageName::parse("Unrelated Collision Page").unwrap(),
+                path: ManagedPath::parse("content/nested pages/unrelated-collision-page.md")
+                    .unwrap(),
+                kind: ManagedTextKind::Page,
+            }],
+        );
+        drive_initial_feed(&handle);
+        let manifests = fixture.manifest_count();
+        handle.force_next_move_episode_batch_id(collision).unwrap();
+        let mut observed_collision = false;
+        for _ in 0..16 {
+            match handle.move_application_subtrees(request.clone()).unwrap() {
+                SyncApplicationMoveSubtreesOutcome::NoCommit {
+                    reason: SyncApplicationMoveConflict::BatchCollision,
+                    ..
+                } => {
+                    observed_collision = true;
+                    break;
+                }
+                SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
+                    let _ = handle.tick().unwrap();
+                }
+                other => panic!("forced collision did not fail closed: {other:?}"),
+            }
+        }
+        assert!(observed_collision);
+        assert_eq!(fixture.manifest_count(), manifests);
+        let (source, _) =
+            load_application_logical(&handle, "Batch Collision Source", SyncPageKind::Page);
+        let (destination, _) =
+            load_application_logical(&handle, "Batch Collision Destination", SyncPageKind::Page);
+        assert_eq!(source.blocks.len(), 1);
+        assert_eq!(destination.blocks.len(), 1);
+    }
+
+    #[test]
+    fn application_cross_page_move_enforces_exact_destination_bounds() {
+        let fixture = RuntimeHostFixture::safe("application-move-count-boundary");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let destination_blocks = (0..(MAX_SYNC_EDITOR_BLOCKS - 1))
+            .map(|index| BlockDto {
+                id: format!("destination-{index}"),
+                raw: format!("destination {index}"),
+                ..BlockDto::default()
+            })
+            .collect();
+        let (source, source_revision) = accepted_new_application_page(
+            &handle,
+            "Count Source",
+            vec![
+                BlockDto {
+                    id: "first".into(),
+                    raw: "first".into(),
+                    ..BlockDto::default()
+                },
+                BlockDto {
+                    id: "second".into(),
+                    raw: "second".into(),
+                    ..BlockDto::default()
+                },
+            ],
+        );
+        let (destination, destination_revision) =
+            accepted_new_application_page(&handle, "Count Destination", destination_blocks);
+        drive_initial_feed(&handle);
+        let first = SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: source.path.clone(),
+            source_revision,
+            destination_path: destination.path.clone(),
+            destination_revision,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: source.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root { position: 0 },
+            admission: application_move_admission(),
+        };
+        let (source_after, destination_after) = match accepted_application_move(&handle, &first) {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                source,
+                destination,
+                ..
+            } => (source, destination),
+            other => panic!("510 -> 511 move failed: {other:?}"),
+        };
+        assert_eq!(
+            flatten_application_blocks(&destination_after.page.blocks).len(),
+            MAX_SYNC_EDITOR_BLOCKS
+        );
+        let second = SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: source_after.page.path.clone(),
+            source_revision: source_after.revision,
+            destination_path: destination_after.page.path.clone(),
+            destination_revision: destination_after.revision,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: source_after.page.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root { position: 0 },
+            admission: application_move_admission(),
+        };
+        assert!(matches!(
+            handle.move_application_subtrees(second).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::NoCommit {
+                reason: SyncApplicationMoveConflict::DestinationTooLarge,
+                ..
+            }
+        ));
+
+        let depth_fixture = RuntimeHostFixture::safe("application-move-depth-boundary");
+        let depth_handle = active_handle(SyncRuntimeHandle::open(depth_fixture.request()));
+        drive_initial_feed(&depth_handle);
+        let mut chain = BlockDto {
+            id: "depth-126".into(),
+            raw: "depth 126".into(),
+            ..BlockDto::default()
+        };
+        for depth in (0..126).rev() {
+            chain = BlockDto {
+                id: format!("depth-{depth}"),
+                raw: format!("depth {depth}"),
+                children: vec![chain],
+                ..BlockDto::default()
+            };
+        }
+        let (depth_destination, depth_destination_revision) =
+            accepted_new_application_page(&depth_handle, "Depth Destination", vec![chain]);
+        let (depth_source, depth_source_revision) = accepted_new_application_page(
+            &depth_handle,
+            "Depth Source",
+            vec![BlockDto {
+                id: "depth-source".into(),
+                raw: "depth source".into(),
+                children: vec![BlockDto {
+                    id: "depth-source-child".into(),
+                    raw: "depth source child".into(),
+                    ..BlockDto::default()
+                }],
+                ..BlockDto::default()
+            }],
+        );
+        let mut deepest = &depth_destination.blocks[0];
+        while let Some(child) = deepest.children.first() {
+            deepest = child;
+        }
+        let depth_request = SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: depth_source.path,
+            source_revision: depth_source_revision,
+            destination_path: depth_destination.path,
+            destination_revision: depth_destination_revision,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: depth_source.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Child {
+                parent_identity: deepest.id.clone(),
+                position: 0,
+            },
+            admission: application_move_admission(),
+        };
+        assert!(matches!(
+            depth_handle
+                .move_application_subtrees(depth_request)
+                .unwrap(),
+            SyncApplicationMoveSubtreesOutcome::NoCommit {
+                reason: SyncApplicationMoveConflict::DestinationTooDeep,
+                ..
+            }
+        ));
+
+        let text_fixture = RuntimeHostFixture::safe("application-move-text-boundary");
+        let text_handle = active_handle(SyncRuntimeHandle::open(text_fixture.request()));
+        drive_initial_feed(&text_handle);
+        let (text_source, text_source_revision) = accepted_new_application_page(
+            &text_handle,
+            "Text Source",
+            vec![BlockDto {
+                id: "text-source".into(),
+                raw: "s".repeat(600_000),
+                properties: vec![("metadata".into(), "m".repeat(1_024))],
+                ..BlockDto::default()
+            }],
+        );
+        let (text_destination, text_destination_revision) = accepted_new_application_page(
+            &text_handle,
+            "Text Destination",
+            vec![BlockDto {
+                id: "text-destination".into(),
+                raw: "d".repeat(500_000),
+                ..BlockDto::default()
+            }],
+        );
+        let text_request = SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: text_source.path,
+            source_revision: text_source_revision,
+            destination_path: text_destination.path,
+            destination_revision: text_destination_revision,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: text_source.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root { position: 0 },
+            admission: application_move_admission(),
+        };
+        assert!(matches!(
+            text_handle.move_application_subtrees(text_request).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::NoCommit {
+                reason: SyncApplicationMoveConflict::DestinationTextTooLarge,
+                ..
+            }
+        ));
     }
 
     #[test]
