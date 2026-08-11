@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tine_core::model::{Graph, GraphMeta};
-use tine_core::sync_runtime::inspect_shared_enrollment_for_cold_discovery;
+use tine_core::sync_runtime::{
+    inspect_shared_enrollment_for_cold_discovery, inspect_shared_provider_cold_prefix,
+    SyncSharedProviderColdPrefix,
+};
 
 /// Reset the warm flag for a new graph load and return the new warm generation
 /// (passed to `warm_cache_async`, which only reports done if still current).
@@ -276,17 +279,17 @@ enum ColdSparseArchive {
 }
 
 fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
-    refuse_unclaimed_sparse_archive_with(root, |shared| {
-        // An empty provider root is an honest-provider arrival state: the
-        // namespace appeared before the canonical enrollment descriptor. It is
-        // retryable, but must not bind a writable Direct Files slot.
-        if std::fs::read_dir(shared)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false)
-        {
-            return Ok(false);
+    refuse_unclaimed_sparse_archive_with(root, |shared| match inspect_shared_provider_cold_prefix(
+        shared,
+    )? {
+        SyncSharedProviderColdPrefix::Partial => Ok(false),
+        SyncSharedProviderColdPrefix::ReadyForDescriptorInspection => {
+            inspect_shared_enrollment_for_cold_discovery(shared)
+                .map(|descriptor| descriptor.is_some())
         }
-        inspect_shared_enrollment_for_cold_discovery(shared).map(|descriptor| descriptor.is_some())
+        SyncSharedProviderColdPrefix::Refused => {
+            Err("shared provider namespace is ambiguous or unsafe".into())
+        }
     })
 }
 
@@ -517,6 +520,29 @@ pub(crate) struct DirectFilesOpen {
     pub(crate) binding_generation: u64,
 }
 
+/// Install the ordinary Direct Files authority in the window registry.  This is
+/// intentionally the one testable sub-boundary of Direct Files publishing: a
+/// caller that reaches it has already made the storage decision, and the slot
+/// itself proves every later graph command is routed to Direct Files rather
+/// than a sparse-v2 actor.
+fn publish_direct_files_slot(
+    state: &AppState,
+    window_label: &str,
+    graph: Graph,
+    root_key: PathBuf,
+) -> Result<(Arc<GraphSlot>, u64), String> {
+    let slot = Arc::new(GraphSlot::new(graph, root_key));
+    let warm_generation = begin_warm_cache(&slot);
+    state
+        .graphs
+        .write()
+        .unwrap()
+        .bind(window_label.to_string(), Arc::clone(&slot))?;
+    state.note_focused(window_label);
+    poke_watcher(state);
+    Ok((slot, warm_generation))
+}
+
 pub(crate) fn open_and_publish_direct_files(
     app: &tauri::AppHandle,
     window_label: &str,
@@ -537,15 +563,7 @@ pub(crate) fn open_and_publish_direct_files(
             .migrate_journal_filenames_checked()
             .map_err(|error| format!("journal filename migration failed: {error}"))?;
     }
-    let slot = Arc::new(GraphSlot::new(graph, root_key));
-    let warm_generation = begin_warm_cache(&slot);
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(window_label.to_string(), Arc::clone(&slot))?;
-    state.note_focused(window_label);
-    poke_watcher(state);
+    let (slot, warm_generation) = publish_direct_files_slot(state, window_label, graph, root_key)?;
     if !launch_backup_done {
         backup_async(app.clone(), slot.clone())?;
     }
@@ -901,6 +919,20 @@ mod tests {
         files
     }
 
+    fn direct_test_state() -> AppState {
+        AppState {
+            graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
+            graph_load: std::sync::Mutex::new(()),
+            watch_ctl: std::sync::Mutex::new(None),
+            last_focused: std::sync::Mutex::new(None),
+            capture_graph: std::sync::Mutex::new(None),
+            startup_recovery: std::sync::Mutex::new(std::collections::HashMap::new()),
+            sync_runtime: crate::sync_runtime::SyncRuntimeFacade::default(),
+            #[cfg(desktop)]
+            next_window: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
     fn copy_graph_text_dir(src: &Path, dest: &Path) -> (usize, bool) {
         let _ = std::fs::create_dir_all(dest);
         let mut copied = 0usize;
@@ -1037,12 +1069,132 @@ mod tests {
     }
 
     #[test]
+    fn honest_cold_provider_prefixes_are_retryable_before_the_descriptor_arrives() {
+        for (tag, prefix) in [
+            ("outbox-absent", 0_u8),
+            ("enrollment-absent", 1),
+            ("enrollment-empty", 2),
+        ] {
+            let dir = scratch(&format!("cold-provider-prefix-{tag}"));
+            let page = dir.join("pages/representative.md");
+            let recovery = dir.join(".tine-sync/recovery/returned/receipt");
+            let shared = dir.join(".tine-sync/v2/shared");
+            std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+            std::fs::write(&page, b"- unchanged Direct Files bytes\n").unwrap();
+            std::fs::write(&recovery, b"unchanged recovery bytes\n").unwrap();
+            match prefix {
+                // Syncthing may create the sibling provider tree before outbox.
+                0 => std::fs::create_dir_all(shared.join("inbox")).unwrap(),
+                // The provider may deliver another recognized outbox namespace
+                // before it delivers enrollment.
+                1 => std::fs::create_dir_all(shared.join("outbox/objects")).unwrap(),
+                // The enrollment directory itself may arrive before its one
+                // canonical descriptor file.
+                2 => {
+                    std::fs::create_dir_all(shared.join("outbox/objects")).unwrap();
+                    std::fs::create_dir_all(shared.join("outbox/enrollment")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let page_before = std::fs::read(&page).unwrap();
+            let recovery_before = std::fs::read(&recovery).unwrap();
+
+            assert!(
+                inspect_shared_enrollment_for_cold_discovery(&shared).is_err(),
+                "the real cold inspector must see the unfinished {tag} prefix"
+            );
+            assert_eq!(
+                refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
+                PARTIAL_PROVIDER_REFUSAL,
+                "{tag} is an honest provider prefix, not corrupt managed data"
+            );
+            assert_eq!(std::fs::read(&page).unwrap(), page_before);
+            assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
+            assert!(
+                !dir.join(".tine-sync/v1").exists(),
+                "a retryable cold refusal must not activate or create v1"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn cold_provider_malformed_and_ambiguous_enrollment_stays_refused() {
+        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
+        let dir = scratch("cold-provider-invalid-enrollment");
+        let enrollment = dir.join(".tine-sync/v2/shared/outbox/enrollment");
+        std::fs::create_dir_all(&enrollment).unwrap();
+        std::fs::write(enrollment.join("shared-enrollment-v1.json"), b"{").unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
+            REFUSAL,
+            "a malformed canonical descriptor is not a retryable prefix"
+        );
+        std::fs::write(
+            enrollment.join("shared-enrollment-v1.sync-conflict.json"),
+            b"{",
+        )
+        .unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
+            REFUSAL,
+            "conflict copies remain ambiguous and must not be retried as prefixes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cold_provider_noncanonical_prefix_entries_stay_refused() {
+        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
+
+        let non_directory = scratch("cold-provider-outbox-file");
+        let shared = non_directory.join(".tine-sync/v2/shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("outbox"), b"not a directory").unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive(&non_directory).unwrap_err(),
+            REFUSAL
+        );
+        let _ = std::fs::remove_dir_all(non_directory);
+
+        let unknown = scratch("cold-provider-unknown-outbox-entry");
+        std::fs::create_dir_all(unknown.join(".tine-sync/v2/shared/outbox/unknown")).unwrap();
+        assert_eq!(
+            refuse_unclaimed_sparse_archive(&unknown).unwrap_err(),
+            REFUSAL
+        );
+        let _ = std::fs::remove_dir_all(unknown);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlinked = scratch("cold-provider-outbox-symlink");
+            let shared = symlinked.join(".tine-sync/v2/shared");
+            std::fs::create_dir_all(&shared).unwrap();
+            let target = symlinked.join("provider-outbox-target");
+            std::fs::create_dir_all(&target).unwrap();
+            symlink(&target, shared.join("outbox")).unwrap();
+            assert_eq!(
+                refuse_unclaimed_sparse_archive(&symlinked).unwrap_err(),
+                REFUSAL
+            );
+            let _ = std::fs::remove_dir_all(symlinked);
+        }
+    }
+
+    #[test]
     fn cold_shared_discovery_requires_the_sole_real_v2_shared_namespace() {
         const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
         let dir = scratch("cold-shared-layout");
         let v2 = dir.join(".tine-sync/v2");
         let shared = v2.join("shared");
-        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(shared.join("outbox/enrollment")).unwrap();
+        std::fs::write(
+            shared.join("outbox/enrollment/shared-enrollment-v1.json"),
+            b"test descriptor bytes",
+        )
+        .unwrap();
         assert_eq!(
             refuse_unclaimed_sparse_archive_with(&dir, |path| {
                 assert_eq!(path, shared);
@@ -1177,34 +1329,49 @@ mod tests {
         let v1 = dir.join(".tine-sync/v1");
         let v1_before = tree_bytes(&v1);
         let recovery_before = std::fs::read(&recovery).unwrap();
+        let graph_before = tree_bytes(&dir);
 
+        let root_key = std::fs::canonicalize(&dir).unwrap();
         let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |_| (0, false)).unwrap();
         assert_eq!(loaded.meta.root, dir.display().to_string());
+        let state = direct_test_state();
+        let (slot, warm_generation) =
+            publish_direct_files_slot(&state, "ordinary", loaded.graph, root_key.clone()).unwrap();
+        let installed = state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("ordinary")
+            .expect("ordinary publish must install a graph slot");
+        assert!(Arc::ptr_eq(&installed, &slot));
+        assert_eq!(installed.root_key, root_key);
+        assert_eq!(installed.binding_generation, slot.binding_generation);
+        assert_eq!(
+            installed.warm_generation.load(Ordering::Acquire),
+            warm_generation,
+            "the installed Direct slot owns the scheduled warm generation"
+        );
+        assert!(
+            !installed.is_sparse_v2() && installed.legacy_graph().is_ok(),
+            "ordinary publish must install a Direct Files registry binding"
+        );
         assert_eq!(std::fs::read(&page).unwrap(), page_before);
         assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
         assert_eq!(tree_bytes(&v1), v1_before);
+        assert_eq!(tree_bytes(&dir), graph_before);
 
-        let source = include_str!("graph.rs");
-        let start = source
-            .find("pub(crate) fn open_and_publish_direct_files")
-            .expect("ordinary Direct Files publish");
-        let end = source[start..]
-            .find("pub(crate) fn load_graph_for_label")
-            .map(|offset| start + offset)
-            .expect("next graph-load function");
-        let direct_publish = &source[start..end];
-        for legacy_root in [
-            "managed_sync_store_state",
-            "ensure_managed_sync_safety_snapshot",
-            "start_managed_sync_after_safety",
-            "start_managed_sync",
-            "project_all_managed_sync",
-        ] {
-            assert!(
-                !direct_publish.contains(legacy_root),
-                "ordinary Direct Files publish must not reach {legacy_root}"
-            );
-        }
+        let no_v1 = scratch("direct-publish-does-not-create-v1");
+        std::fs::write(no_v1.join("pages/representative.md"), b"- direct only\n").unwrap();
+        let no_v1_before = tree_bytes(&no_v1);
+        let no_v1_root = std::fs::canonicalize(&no_v1).unwrap();
+        let loaded = open_graph_for_load(no_v1.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        publish_direct_files_slot(&state, "direct-only", loaded.graph, no_v1_root).unwrap();
+        assert!(
+            !no_v1.join(".tine-sync/v1").exists(),
+            "ordinary Direct Files publishing must not create or activate v1"
+        );
+        assert_eq!(tree_bytes(&no_v1), no_v1_before);
+        let _ = std::fs::remove_dir_all(&no_v1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

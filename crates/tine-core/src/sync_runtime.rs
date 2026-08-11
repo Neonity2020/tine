@@ -132,9 +132,10 @@ use crate::oplog::simulator::{
     fail_next_provider_publication_after_physical_write,
 };
 use crate::oplog::simulator::{
-    inspect_cold_shared_provider_descriptor, inspect_shared_provider_descriptor,
-    provider_transient_path, SharedProviderFrontierHeadV1, SharedProviderManifestRecoveryLinkV1,
-    SharedProviderObservation, SharedProviderObservationCursor, SharedProviderPublicationCursor,
+    inspect_cold_shared_provider_descriptor, inspect_cold_shared_provider_prefix,
+    inspect_shared_provider_descriptor, provider_transient_path, ColdSharedProviderPrefix,
+    SharedProviderFrontierHeadV1, SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
+    SharedProviderObservationCursor, SharedProviderPublicationCursor,
     SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
     SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
     SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
@@ -1326,6 +1327,28 @@ pub struct SyncSharedEnrollmentDescriptor {
     pub lineage_digest: LineageDigest,
     pub catalog_document_id: DocumentId,
     pub descriptor_digest: String,
+}
+
+/// Structural provider-prefix state observed before cold descriptor discovery.
+/// `Partial` is retryable honest file-sync delivery; `Refused` is an unsafe or
+/// ambiguous shape and deliberately carries no storage authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncSharedProviderColdPrefix {
+    Partial,
+    ReadyForDescriptorInspection,
+    Refused,
+}
+
+pub fn inspect_shared_provider_cold_prefix(
+    provider_root: &Path,
+) -> Result<SyncSharedProviderColdPrefix, String> {
+    match inspect_cold_shared_provider_prefix(provider_root).map_err(display)? {
+        ColdSharedProviderPrefix::Partial => Ok(SyncSharedProviderColdPrefix::Partial),
+        ColdSharedProviderPrefix::ReadyForDescriptorInspection => {
+            Ok(SyncSharedProviderColdPrefix::ReadyForDescriptorInspection)
+        }
+        ColdSharedProviderPrefix::Refused => Ok(SyncSharedProviderColdPrefix::Refused),
+    }
 }
 
 impl SyncSharedEnrollmentDescriptor {
@@ -36678,6 +36701,11 @@ mod tests {
         let descriptor = activate_and_prepare_shared(&fixture);
         let enrollment = fixture.request.provider_root.join("outbox/enrollment");
         let canonical = enrollment.join("shared-enrollment-v1.json");
+        assert_eq!(
+            inspect_shared_provider_cold_prefix(&fixture.request.provider_root).unwrap(),
+            SyncSharedProviderColdPrefix::ReadyForDescriptorInspection,
+            "the complete provider shape must still reach canonical descriptor discovery"
+        );
         assert_eq!(
             inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root)
                 .unwrap()
