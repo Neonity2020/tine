@@ -13,7 +13,7 @@ icon:: 📖
   - What you should see: colored marks on the document — and, behind each mark, a bullet on a notes page named after the PDF.
 - ## Turn highlights into notes
   - 1. Press **Notes** in the reader toolbar. Tine opens the document's highlights page — listed under the document's plain name (its page name starts with `hls__`, like Logseq) — where every highlight is a bullet marked with a colored dot.
-  - 2. Write under a highlight bullet: a summary, a question, your own structure. These are ordinary bullets in ordinary Markdown — edit, nest, tag, and search them like any others.
+  - 2. Write under a highlight bullet: a summary, a question, your own structure. These are ordinary bullets on an ordinary graph page — edit, nest, tag, and search them like any others.
   - 3. Click the colored dot on a highlight bullet (or the highlight itself back in the PDF) to jump between the two: each note goes straight back to its spot in the document.
   - What you should see: your notes and their source passages stay connected in both directions, and recoloring a highlight updates its dot on the notes page to match.
 - ## Quote a passage in your ordinary notes
@@ -22,8 +22,8 @@ icon:: 📖
   - 3. Choose **Linked references** on the highlight's menu (also on desktop) to list every note that quotes it — the trail from one passage to everywhere you used it.
   - What you should see: your note cites the source live, not as a copied excerpt — touch nothing, and the quote still opens the PDF at the right page tomorrow.
 - ## Share the result
-  - 1. From the notes page title's right-click menu (or its ⋯ menu): **Copy page as Markdown** moves a clean outline elsewhere, **Copy / export as…** offers a rendered copy, and **Export to PDF…** prints the whole page through your OS print dialog — always on a light background, whatever your theme.
+  - 1. From the notes page title's right-click menu (or its ⋯ menu): **Copy page as Markdown** puts a clean outline on the clipboard, **Copy / export as…** offers a rendered copy, and **Export to PDF…** prints the whole page through your OS print dialog — always on a light background, whatever your theme.
   - 2. Publishing on the web? Pages marked `public:: true` are included in the static HTML export (Settings → Graph → **Export graph to HTML**).
-  - Your annotations are stored Logseq-compatibly — the `hls__` page with your pages, an `.edn` sidecar and any clipped area images under `assets/` — so launch snapshots cover your notes, config, and PDF highlights (not media files), and another Logseq-compatible tool reads the same annotations.
+  - Your annotations are stored Logseq-compatibly — the `hls__` page with your notes, an `.edn` sidecar and any clipped area images under `assets/` — so launch snapshots cover your notes, config, and PDF highlights (not media files), and another Logseq-compatible tool reads the same annotations.
 - ## Where next
   - The exact highlight, merge, and storage rules are mapped in [[Features/PDF annotation]]. For quoting anything else with `((…))` and the reference panels, see [[Workflows/Find and revisit]]; for snapshots and backups, [[Reference/Files, external edits, and backups]].
