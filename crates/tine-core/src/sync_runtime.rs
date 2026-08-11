@@ -42676,6 +42676,63 @@ mod tests {
         (startup_median(&values), startup_p95(&values))
     }
 
+    fn managed_application_save_benchmark_target_blocks(
+        configured: Option<&str>,
+    ) -> Result<usize, String> {
+        let target_blocks = match configured {
+            Some(value) => value.trim().parse::<usize>().map_err(|error| {
+                format!("contains {value:?}, which is not an unsigned block count: {error}")
+            })?,
+            None => 10,
+        };
+        if !(1..=MAX_SYNC_EDITOR_BLOCKS).contains(&target_blocks) {
+            return Err(format!(
+                "must be in 1..={MAX_SYNC_EDITOR_BLOCKS} public editor blocks, got {target_blocks}"
+            ));
+        }
+        Ok(target_blocks)
+    }
+
+    fn managed_application_save_benchmark_p95_ceiling(target_blocks: usize) -> Duration {
+        assert!(
+            (1..=MAX_SYNC_EDITOR_BLOCKS).contains(&target_blocks),
+            "managed application-save benchmark target blocks must be in 1..={MAX_SYNC_EDITOR_BLOCKS}: {target_blocks}"
+        );
+        if target_blocks <= 10 {
+            Duration::from_millis(15)
+        } else {
+            Duration::from_millis(50)
+        }
+    }
+
+    #[test]
+    fn managed_application_save_benchmark_target_blocks_follow_the_public_save_boundary() {
+        assert_eq!(MAX_SYNC_EDITOR_BLOCKS, 511);
+        assert_eq!(
+            managed_application_save_benchmark_target_blocks(None),
+            Ok(10)
+        );
+        assert_eq!(
+            managed_application_save_benchmark_target_blocks(Some(" 511 ")),
+            Ok(MAX_SYNC_EDITOR_BLOCKS)
+        );
+        assert!(managed_application_save_benchmark_target_blocks(Some("0")).is_err());
+        assert!(managed_application_save_benchmark_target_blocks(Some("512")).is_err());
+        assert!(managed_application_save_benchmark_target_blocks(Some("not-a-count")).is_err());
+        assert_eq!(
+            managed_application_save_benchmark_p95_ceiling(10),
+            Duration::from_millis(15)
+        );
+        assert_eq!(
+            managed_application_save_benchmark_p95_ceiling(11),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            managed_application_save_benchmark_p95_ceiling(MAX_SYNC_EDITOR_BLOCKS),
+            Duration::from_millis(50)
+        );
+    }
+
     fn managed_application_save_read_quantiles(
         samples: &[ManagedApplicationSaveBenchmarkSample],
         select: impl Fn(&ManagedApplicationSaveBenchmarkSample) -> usize,
@@ -44972,6 +45029,15 @@ mod tests {
             !page_counts.is_empty() && page_counts.iter().all(|pages| *pages >= 4),
             "managed application-save benchmark needs nonempty total page counts of at least four: {page_counts:?}"
         );
+        let target_blocks = managed_application_save_benchmark_target_blocks(
+            std::env::var("TINE_MANAGED_APPLICATION_SAVE_BENCH_TARGET_BLOCKS")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("TINE_MANAGED_APPLICATION_SAVE_BENCH_TARGET_BLOCKS {error}")
+        });
+        let p95_ceiling = managed_application_save_benchmark_p95_ceiling(target_blocks);
         let runs = std::env::var("TINE_MANAGED_APPLICATION_SAVE_BENCH_RUNS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -45001,7 +45067,7 @@ mod tests {
                     &format!("managed-application-save-{total_pages}-run-{run}"),
                     0xa120 + total_pages as u128 * 16 + run as u128,
                     additional_pages,
-                    10,
+                    target_blocks,
                     unrelated_blocks,
                 );
                 let mut expected_graph = user_graph_bytes(&fixture.graph_root);
@@ -45178,7 +45244,7 @@ mod tests {
                     &format!("direct-files-save-{total_pages}-run-{run}"),
                     0xa220 + total_pages as u128 * 16 + run as u128,
                     additional_pages,
-                    10,
+                    target_blocks,
                     unrelated_blocks,
                 );
                 let mut direct_expected_graph = user_graph_bytes(&direct_fixture.graph_root);
@@ -45240,19 +45306,26 @@ mod tests {
 
             assert_eq!(managed_samples.len(), runs * samples_per_run);
             assert_eq!(direct_files_samples.len(), runs * samples_per_run);
-            let (managed_p50, _) =
+            let (managed_p50, managed_p95) =
                 managed_application_save_quantiles(&managed_samples, |sample| sample.caller);
             let direct_files_p50 = startup_median(&direct_files_samples);
             let direct_files_p95 = startup_p95(&direct_files_samples);
             eprintln!(
-                "managed_application_save_bench total_pages={total_pages} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
+                "managed_application_save_bench total_pages={total_pages} target_blocks={target_blocks} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
                 managed_application_save_phase_receipt(&managed_samples),
                 startup_ms(direct_files_p50),
                 startup_ms(direct_files_p95),
             );
+            if target_blocks <= 10 {
+                assert!(
+                    managed_p50 < Duration::from_millis(10),
+                    "managed application save ordinary-page p50 exceeded 10 ms at scale={total_pages} pages target_blocks={target_blocks}: p50={managed_p50:?} p95={managed_p95:?}"
+                );
+            }
             assert!(
-                managed_p50 < Duration::from_millis(10),
-                "managed application save p50 exceeded 10 ms at {total_pages} pages: {managed_p50:?}"
+                managed_p95 < p95_ceiling,
+                "managed application save p95 exceeded {:?} at scale={total_pages} pages target_blocks={target_blocks}: p50={managed_p50:?} p95={managed_p95:?}",
+                p95_ceiling,
             );
         }
     }
