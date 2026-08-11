@@ -20,6 +20,7 @@ icon:: 🧭
   - [[Features/Tips & shortcuts]] — learn Ctrl+K, slash commands, tabs, sidebars, focus mode, and daily shortcuts.
   - [[Reference/Files, external edits, and backups]] — learn what Tine writes where, and where snapshots, conflict copies, and the trash live.
   - [[Reference/Troubleshooting and recovery]] — follow numbered recovery steps for conflict banners, deleted pages, snapshots, sync copies, duplicate days, and bad starts.
+  - [[Reference/Journals, tasks, and scheduling]] — map journal setup, task markers and priorities, scheduling dates, the agenda, time tracking, and repeating tasks.
 - ## Feature showcase
   - [[Feature showcase]] — inspect one live example of each supported Logseq rendering feature.
 - ## Create one yourself

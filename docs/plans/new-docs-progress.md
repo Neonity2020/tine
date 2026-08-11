@@ -89,7 +89,25 @@ Added one canonical workflow page, registered it in the shared manifest, linked 
 - `src/editor/queryBuilder.ts:17,187-189` — `(task TODO DOING NOW LATER)` DSL clause (list of markers). The executable-query example.
 - `crates/tine-core/src/templates/showcase.md:57-73` — the Feature showcase page already ships open-task examples — why the workflow page's query outcome names other pages' open tasks too.
 
+### Reference page (Reference/Journals, tasks, and scheduling) sources
+
+- `src/journal.ts:1-5` — frontend title format mirrors the backend, “defaults to Logseq's ‘MMM do, yyyy’”, fed by `GraphMeta.journal_page_title_format`; `journal.ts:90-93` — `[[journal title]]` links route “to the journal page rather than opened as an empty regular page”. The journal-routing claim.
+- `src/components/Settings.tsx:1784-1794` — “How journal dates are displayed and how new `[[date]]` titles are written. Display-only — your journal *file names* are untouched and existing journals keep working. Saved to `:journal/page-title-format`”; `src/types.ts:593` — `journal_file_name_format` “`:journal/file-name-format` (default `yyyy_MM_dd`)”. Date-format scope.
+- `src/components/Settings.tsx:1524-1532` — “Template inserted into a new day's journal. Saved to `:default-templates {:journals …}`… ‘(none)’ → blank days (the default). Make a template via a block's right-click menu.” New-journal template.
+- `src/markers.ts:13-25` — the full marker set (TODO DOING NOW LATER WAITING WAIT STARTED IN-PROGRESS DONE CANCELED CANCELLED), “stored” as the first word (markers.ts:37-42 `MARKER_RE`).
+- `src/components/Settings.tsx:1855-1874` — “Task workflow … Saved to `:preferred-workflow` in `config.edn`, so it travels with the graph”, buttons “TODO / DOING” vs “NOW / LATER”; `src/ui.ts:106-107` — `createSignal<"now" | "todo">("now")`. Workflow default.
+- `src/editor/autocomplete.ts:412-426` — slash commands for every marker plus “Priority A/B/C”, “Scheduled”, “Deadline”; `src/components/Block.tsx:2045-2051` — the date commands “open the calendar popup anchored under the editor”; `Block.tsx:851-874` — date chips with title “Scheduled — click to change” / “Deadline — click to change”.
+- `src/editor/planning.ts:1-10,63-64` — “type anywhere, normalize on exit… first line → SCHEDULED → DEADLINE → properties”, “Canonical order: SCHEDULED before DEADLINE”, inline-code/fenced `SCHEDULED:` never moved. Stored-syntax claims.
+- `src/components/DatePicker.tsx:13` — “First day of week from the Tine display pref”; `Settings.tsx:1796-1804` — “Starting column of the calendar and the scheduled/deadline date pickers. Saved to `:start-of-week`”. The picker-startweek claim.
+- `src/components/Macro.tsx:437-439` — `hideWhenEmpty && !ADVANCED_RE && total() === 0` hides the block (user-authored queries instead show “No results”, Macro.tsx:114-116). The agenda “disappears entirely” claim.
+- `src/ui.ts:509-514` — `agendaQuery()` returns `query (and (or (between scheduled -7d +7d) (between deadline -7d +7d)) (not (task DONE CANCELED CANCELLED)))` at default 7/7 — the stored-query quotation on the page.
+- `src/components/Settings.tsx:1877-1888` — “Time tracking … Marker transitions write OG-compatible `:LOGBOOK:` CLOCK rows. Saved to `:feature/enable-timetracking?`; seconds mode follows `:logbook/settings`”; `src/ui.ts:116-122` — both default true. Logbook claims.
+- `src/sheet/fields.ts:319-334`, `src/components/SheetTable.tsx:1379` — sheet state/priority/deadline cells route through the same marker/date machinery (“The same chips and pickers appear wherever the block does”).
+- `docs/SETTINGS-INVENTORY.md:30-40` — Journals-tab rows exist for every control named on the page (Journal date format, First day of week, carry-over trio, Task workflow, Time tracking, New-journal template, Agenda window).
+
 ### Discrepancies / deliberate scope
 
 - `docs/FEATURES.md:552` (recent-graphs staleness) still pending from the J02 slice; not touched.
 - No per-platform quick-capture claim beyond the desktop shortcut flow already on [[Features/Quick capture]] (its page leads with Linux DE setup); Android has no global-capture story here, so none is asserted.
+- HEAD's `reference-troubleshooting-and-recovery.html` (and two sibling pages) were stale against the template corrections in `360f251d` (“Correct Guide file and recovery claims”); the J03 regen refreshed them — flagged here so the manager knows those tracked-HTML changes are build output, not new wording by this worker.
+- `website/demo/search-index.js` and `website/demo/feature-showcase.html` are untracked build artifacts on this branch (untouched by the commits; noted for the manager in case tracking them is intended).

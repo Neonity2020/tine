@@ -104,6 +104,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Workflows/Capture and plan your day",
         markdown: include_str!("templates/capture-plan-day.md"),
     },
+    GuideTemplate {
+        title: "Reference/Journals, tasks, and scheduling",
+        markdown: include_str!("templates/journals-tasks-scheduling.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -811,6 +815,60 @@ mod tests {
             .expect("capture-and-plan workflow was copied");
         assert!(copied_markdown.contains("{{query (task TODO DOING NOW LATER)}}"));
         assert!(copied_markdown.contains("[[tine-guide/Features/Quick capture]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journals_scheduling_reference_page_is_registered_linked_and_copyable() {
+        let title = "Reference/Journals, tasks, and scheduling";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("journals/scheduling reference page is registered");
+        assert!(page
+            .markdown
+            .contains("- # Journals, tasks, and scheduling"));
+        assert!(page.markdown.contains("TODO → DOING → DONE"));
+        assert!(page.markdown.contains("Scheduled &amp; Deadline"));
+        assert!(page.markdown.contains("`++1w`"));
+        assert!(page
+            .markdown
+            .contains("(not (task DONE CANCELED CANCELLED))"));
+        assert!(page
+            .markdown
+            .contains("[[Workflows/Capture and plan your day]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Reference/Journals, tasks, and scheduling]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("journals/scheduling reference page is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Reference/Journals, tasks, and scheduling"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-journals-scheduling-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Reference/Journals, tasks, and scheduling"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("journals/scheduling reference page was copied");
+        assert!(copied_markdown.contains("`++1w`"));
+        assert!(copied_markdown.contains("[[tine-guide/Workflows/Capture and plan your day]]"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

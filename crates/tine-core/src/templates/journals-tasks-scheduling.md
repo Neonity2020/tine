@@ -1,0 +1,37 @@
+icon:: 📅
+
+- # Journals, tasks, and scheduling
+  - Everything dated lives here: one journal page per day, tasks as plain-text markers at the start of a block, `[#A]`–`[#C]` priorities, and `SCHEDULED:`/`DEADLINE:` planning lines with calendar pickers. This page maps the shipped behavior; [[Workflows/Capture and plan your day]] walks through using it, and [[Feature showcase]] shows each construct rendered.
+- ## Journals
+  - The **Journals** entry in the sidebar opens a multi-day feed — one continuous, editable list, newest day first. Today's journal page is created lazily on first edit: the feed shows the day, but no file exists until you type.
+  - Each journal title parses as a date in the graph's journal formats, so a `[[date]]`-looking reference routes to that journal page rather than opening an empty named page.
+  - Settings → **Journals** → **Journal date format** controls the display titles and how new `[[date]]` titles are written (saved to `:journal/page-title-format`, traveling with the graph). It is display-only: journal *file* names are untouched and existing journals keep working; for files, duplicate days, and the on-disk layout in general, see [[Reference/Files, external edits, and backups]].
+  - Settings → **Journals** → **New-journal template** inserts a template into each new day (`:default-templates {:journals …}` in `config.edn`); “(none)” means blank days, the default. Make a template from a block's right-click menu.
+- ## Task markers
+  - The marker set is `TODO`, `DOING`, `NOW`, `LATER`, `WAITING`, `WAIT`, `STARTED`, `IN-PROGRESS`, `DONE`, `CANCELED`, `CANCELLED` — stored as the plain first word of the block's first line, like Logseq.
+  - Settings → **Journals** → **Task workflow** chooses between two cycling lanes, TODO / DOING and NOW / LATER (`:preferred-workflow`, traveling with the graph); NOW / LATER is the default.
+  - Click the marker chip to cycle (TODO → DOING → DONE → none; LATER → NOW → DONE → none). **Ctrl+Enter** (Cmd on Mac) while editing does the same, applied to every selected task when several blocks are selected.
+  - Every task also shows a checkbox in front of it: click to mark DONE, click again to reopen to the workflow's open marker (TODO or LATER). `DONE` shows a checked box; `CANCELED`/`CANCELLED` show none. Checkboxes appear read-only inside query results, linked references, and embeds.
+  - Queries filter on markers with a task clause, e.g. `(task TODO DOING)` in `{{query }}` or in the visual query builder.
+- ## Priorities
+  - `[#A]`, `[#B]`, `[#C]` sit directly after the task marker; a block without a task marker can carry one too. Type slash, choose **Priority A** (or B, C), and the chip updates in place.
+  - Priorities are queryable and sortable in the visual builder too, and they render like any other header facet — the [[Feature showcase]] has them all.
+- ## Scheduled and deadline dates
+  - A block's plan is a `SCHEDULED:` and/or `DEADLINE:` line with an Org-style timestamp `<2026-07-07 Tue>`, optionally with a clock time `<2026-07-07 Tue 14:30>`. Convention: use SCHEDULED for the day you intend to work on something, DEADLINE for the day it must be done.
+  - While editing, type / and choose **Scheduled** or **Deadline**: a calendar popup picks the day (its first weekday follows Settings → **Journals** → **First day of week**), and **Add time** attaches `HH:mm`. The block then gains a calendar **date chip** — click it to change the date again; re-picking keeps an existing time (and any repeater).
+  - You may also type a planning line anywhere in the block: on leaving the editor it moves to its canonical spot — right after the first line, before any properties, SCHEDULED before DEADLINE — like Logseq. A `SCHEDULED:` inside inline code or a code fence stays literal content and is never moved.
+  - The same chips and pickers appear wherever the block does; a sheet's Scheduled/Deadline cells go through the same path (see [[Features/Sheets]]).
+- ## Agenda
+  - Today's journal ends with a **Scheduled &amp; Deadline** list of *open* items whose date falls inside the Agenda window — by default 7 days back and 7 ahead, adjustable and persisted in Settings → **Journals** → **Agenda window**. It disappears entirely when nothing matches.
+  - Keyed off the scheduled/deadline date itself, not the page's journal day: an unfinished item on an old page still shows while its date is in range. The underlying stored query is `(and (or (between scheduled -7d +7d) (between deadline -7d +7d)) (not (task DONE CANCELED CANCELLED)))`.
+  - Finished tasks (`DONE`, `CANCELED`, `CANCELLED`) never appear, matching Logseq.
+- ## Time tracking and the logbook
+  - With Settings → **Journals** → **Time tracking** on (the default), moving into DOING / NOW records a clock-in and moving back to TODO / LATER or into DONE records a clock-out, as OG-compatible `:LOGBOOK:` `CLOCK:` rows (seconds on by default via `:logbook/settings`). Saved to `:feature/enable-timetracking?`.
+  - Blocks with clock rows show a small elapsed-time badge with a Type / Start / End / Span tooltip; the `:LOGBOOK:` drawer itself stays hidden by default, like Logseq.
+  - Toggled off, markers change without writing log rows.
+- ## Repeating tasks
+  - Put a repeater inside the timestamp, e.g. `<2026-07-07 Tue +1w>`; the units are `d`, `w`, `m`, `y` for days, weeks, months, years.
+  - Marking a repeating task done does not close it: the date advances to the next occurrence and the marker resets to the workflow's open state (TODO, or LATER under NOW / LATER). This works from the checkbox, the marker chip, and Ctrl+Enter.
+  - `+1w` advances from the stored date; `.+1w` counts from the day you complete it; `++1w` skips missed occurrences, landing past today. The repeater survives date re-picks in the calendar.
+- ## Settings quick map
+  - Settings → **Journals** collects every control above: **Journal date format**, **First day of week**, **Task workflow**, **Time tracking**, **New-journal template**, and **Agenda window**, plus the carry-over controls — for those in use, see [[Workflows/Capture and plan your day]].
