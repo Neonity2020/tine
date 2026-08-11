@@ -1826,6 +1826,35 @@ fn reserve_cold_recovery_slot(
     Ok(slot)
 }
 
+/// Resolve the exact slot that appeared while a cold-start recovery request was
+/// waiting for `graph_load`.  Callers hold that lock, so this is the mutation
+/// boundary rather than a stale preflight: an exact managed slot is safe to
+/// drain and archive through the established live-slot path; any other slot
+/// means the recovery request has been superseded.
+fn exact_live_cold_recovery_slot(
+    state: &crate::state::AppState,
+    label: &str,
+    root_key: &Path,
+) -> Result<Option<Arc<crate::state::GraphSlot>>, String> {
+    let slot = state.graphs.read().unwrap().slot(label);
+    let Some(slot) = slot else {
+        return Ok(None);
+    };
+    if slot.root_key != root_key {
+        return Err(
+            "This recovery action is stale because the window opened a different graph. Nothing was changed."
+                .into(),
+        );
+    }
+    if !slot.is_sparse_v2() {
+        return Err(
+            "This recovery action is stale because the window is already using Direct files. Nothing was changed."
+                .into(),
+        );
+    }
+    Ok(Some(slot))
+}
+
 fn cancel_sparse_v2_cold_at_paths_with_archive(
     state: &crate::state::AppState,
     label: &str,
@@ -1835,6 +1864,18 @@ fn cancel_sparse_v2_cold_at_paths_with_archive(
     approved_assets: Option<&Path>,
     archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
 ) -> Result<SparseV2ColdCancelResult, String> {
+    if let Some(slot) = exact_live_cold_recovery_slot(state, label, &root_key)? {
+        return cancel_sparse_v2_at_paths_with_archive(
+            state,
+            label,
+            slot,
+            private_root,
+            recovery_root,
+            approved_assets,
+            shutdown_for_direct_files_escape,
+            archive,
+        );
+    }
     // This is deliberately before the reservation: a missing/corrupt binding
     // is a persistent safe refusal, never permission to archive either side.
     let record = cold_binding_record_at(private_root, &root_key)?;
@@ -1866,6 +1907,19 @@ fn cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
     archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
     publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
 ) -> Result<SparseV2ColdCancelResult, String> {
+    if let Some(slot) = exact_live_cold_recovery_slot(state, label, &root_key)? {
+        return cancel_sparse_v2_at_paths_with_archive_and_publish(
+            state,
+            label,
+            slot,
+            private_root,
+            recovery_root,
+            approved_assets,
+            shutdown_for_direct_files_escape,
+            archive,
+            publish_direct,
+        );
+    }
     let record = cold_binding_record_at(private_root, &root_key)?;
     let slot = reserve_cold_recovery_slot(
         state,
@@ -2891,10 +2945,65 @@ mod tests {
     }
 
     #[test]
-    fn cold_return_never_archives_while_a_live_slot_owns_the_target() {
-        let fixture = RollbackFixture::new(Some("shadow_import"));
-        let private_before = snapshot_tree(&fixture.private_root);
+    fn cold_return_with_exact_live_managed_slot_uses_the_live_shutdown_and_archive_path() {
+        std::thread::Builder::new()
+            .name("tine-sparse-cold-live-return-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(cold_return_with_exact_live_managed_slot_uses_the_live_shutdown_and_archive_path_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn cold_return_with_exact_live_managed_slot_uses_the_live_shutdown_and_archive_path_inner() {
+        let mut fixture = RollbackFixture::new(Some("shadow_import"));
+        fixture.make_active();
         let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
+        let result = cancel_sparse_v2_cold_at_paths(
+            &fixture.state,
+            "main",
+            fixture.graph_root.clone(),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!fixture.private_root.exists());
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            markdown_before
+        );
+        assert!(fixture.recovery_root.exists());
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+    }
+
+    #[test]
+    fn cold_return_refuses_an_exact_direct_slot_without_archiving() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        let direct = Arc::new(crate::state::GraphSlot::new(
+            Graph::open(&fixture.graph_root),
+            fixture.graph_root.clone(),
+        ));
+        fixture
+            .state
+            .graphs
+            .write()
+            .unwrap()
+            .bind("main".into(), direct)
+            .unwrap();
+        let private_before = snapshot_tree(&fixture.private_root);
         let error = cancel_sparse_v2_cold_at_paths(
             &fixture.state,
             "main",
@@ -2904,14 +3013,29 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.contains("already owns a graph"));
+        assert!(error.contains("already using Direct files"));
         assert_eq!(snapshot_tree(&fixture.private_root), private_before);
-        assert_eq!(
-            std::fs::read(&fixture.markdown_path).unwrap(),
-            markdown_before
-        );
         assert!(!fixture.recovery_root.exists());
-        assert!(fixture.state.graphs.read().unwrap().slot("main").is_some());
+    }
+
+    #[test]
+    fn cold_return_refuses_a_slot_for_a_different_root_without_archiving() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        let other_root = fixture.root.join("other-graph");
+        std::fs::create_dir_all(&other_root).unwrap();
+        let private_before = snapshot_tree(&fixture.private_root);
+        let error = cancel_sparse_v2_cold_at_paths(
+            &fixture.state,
+            "main",
+            other_root,
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("opened a different graph"));
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert!(!fixture.recovery_root.exists());
     }
 
     #[test]
