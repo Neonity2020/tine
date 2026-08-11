@@ -48143,16 +48143,26 @@ mod tests {
     #[test]
     fn explicit_local_activation_ignores_inert_legacy_v1_and_preserves_exact_bytes() {
         let control = ActivationFixture::nested_unicode("activation-without-v1", 0xa800);
+        let control_graph_before = user_graph_bytes(&control.graph_root);
         let control_result = SyncRuntimeHandle::activate_or_resume_local(control.request.clone());
         assert_eq!(control_result.status, SyncLocalActivationStatus::Active);
         let control_handle = control_result
             .handle
             .expect("a graph without retired v1 bytes activates normally");
+        assert!(control.request.archive_root.is_dir());
+        assert!(control.request.database_path.is_file());
         drive_initial_feed(&control_handle);
+        assert_eq!(user_graph_bytes(&control.graph_root), control_graph_before);
+        assert!(
+            !control.graph_root.join(".tine-sync").exists(),
+            "local-only activation keeps sparse-v2 state outside the graph tree"
+        );
         assert!(matches!(
             control_handle.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+        assert_eq!(user_graph_bytes(&control.graph_root), control_graph_before);
+        assert!(!control.graph_root.join(".tine-sync").exists());
 
         let fixture = ActivationFixture::nested_unicode("activation-with-inert-v1", 0xa801);
         let legacy = fixture.graph_root.join(".tine-sync/v1");
@@ -48177,9 +48187,14 @@ mod tests {
             .expect("v2 activation must retain the active runtime handle");
         assert_eq!(user_graph_bytes(&fixture.graph_root), graph_before);
         assert_eq!(recursive_file_bytes(&legacy), legacy_before);
+        assert!(fixture.request.archive_root.is_dir());
+        assert!(fixture.request.database_path.is_file());
+        drive_initial_feed(&handle);
+        assert_eq!(user_graph_bytes(&fixture.graph_root), graph_before);
+        assert_eq!(recursive_file_bytes(&legacy), legacy_before);
         assert!(
-            fixture.graph_root.join(".tine-sync/v2/shared").is_dir(),
-            "explicit activation writes only the sparse-v2 graph namespace"
+            !fixture.graph_root.join(".tine-sync/v2").exists(),
+            "local-only activation must not publish sparse-v2 beside inert legacy bytes"
         );
         let graph_sync_entries = fs::read_dir(fixture.graph_root.join(".tine-sync"))
             .unwrap()
@@ -48188,19 +48203,15 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             graph_sync_entries,
-            BTreeSet::from([
-                std::ffi::OsString::from("v1"),
-                std::ffi::OsString::from("v2")
-            ]),
-            "activation must retain the legacy child and create only sparse-v2 graph state"
+            BTreeSet::from([std::ffi::OsString::from("v1")]),
+            "the inert fixture retains only its exact legacy graph-local state"
         );
-        assert!(fixture.request.archive_root.is_dir());
-        drive_initial_feed(&handle);
-        assert_eq!(user_graph_bytes(&fixture.graph_root), graph_before);
-        assert_eq!(recursive_file_bytes(&legacy), legacy_before);
         assert!(matches!(
             handle.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
         ));
+        assert_eq!(user_graph_bytes(&fixture.graph_root), graph_before);
+        assert_eq!(recursive_file_bytes(&legacy), legacy_before);
+        assert!(!fixture.graph_root.join(".tine-sync/v2").exists());
     }
 }

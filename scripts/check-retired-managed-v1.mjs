@@ -56,13 +56,20 @@ const retiredLifecycle = [
   "pull_managed_sync",
   "ManagedSyncStoreState",
   "CrdtGraph",
+  "legacy_v1_namespace_present",
 ];
 
-for (const relative of sourceFiles) {
-  const source = compiledSource(relative);
+const retiredV1SplitPath = /\.join\(\s*["']\.tine-sync["']\s*\)\s*\.join\(\s*["']v1["']\s*\)/s;
+
+function sourceProblems(relative, source) {
+  const findings = [];
+  const executable = source
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
   for (const name of retiredLifecycle) {
-    if (new RegExp(`\\b${name}\\b`).test(source)) {
-      problems.push(`retired prototype lifecycle ${name} is compiled in ${relative}`);
+    if (new RegExp(`\\b${name}\\b`).test(executable)) {
+      findings.push(`retired prototype lifecycle ${name} is compiled in ${relative}`);
     }
   }
 
@@ -72,8 +79,39 @@ for (const relative of sourceFiles) {
   for (const [index, line] of source.split("\n").entries()) {
     if (line.trimStart().startsWith("//")) continue;
     if (!line.includes(".tine-sync/v1")) continue;
-    problems.push(`legacy v1 path is compiled outside inert fixture: ${relative}:${index + 1}`);
+    findings.push(`legacy v1 path is compiled outside inert fixture: ${relative}:${index + 1}`);
   }
+  if (retiredV1SplitPath.test(executable)) {
+    findings.push(`legacy v1 split path is compiled outside inert fixture: ${relative}`);
+  }
+  return findings;
+}
+
+function assertDetectorSelfTests() {
+  const probes = [
+    ["literal child path", 'let path = ".tine-sync/v1";', "legacy v1 path"],
+    [
+      "split child path",
+      'let path = root.join(".tine-sync").join("v1");',
+      "legacy v1 split path",
+    ],
+    [
+      "retired helper",
+      "fn legacy_v1_namespace_present() {}",
+      "legacy_v1_namespace_present",
+    ],
+  ];
+  for (const [label, source, expected] of probes) {
+    if (!sourceProblems("guard-self-test.rs", source).some((finding) => finding.includes(expected))) {
+      throw new Error(`retired managed-v1 source guard self-test missed ${label}`);
+    }
+  }
+}
+
+assertDetectorSelfTests();
+
+for (const relative of sourceFiles) {
+  problems.push(...sourceProblems(relative, compiledSource(relative)));
 }
 
 if (problems.length) {
