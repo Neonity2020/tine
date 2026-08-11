@@ -22,12 +22,13 @@
         "tests": [
           "src/components/ContextMenu.test.tsx",
           "src/components/Block.selectionDrag.test.tsx",
-          "src/store.test.ts"
+          "src/store.test.ts",
+          "scripts/e2e-selection-actions.mjs"
         ],
         "scenario": "block-selection.heading-and-drag-own-active-selection",
         "failBefore": "proven"
       },
-      "notes": "GH #240. Fail-before on exact base d1ad0f2c38120de8c88247f7d6062edf8a6ac812: writable pointer changed C and left selected A raw as 'A' instead of '## A'; read-only pointer hid Heading 2 entirely; dragging A's bullet with B+C selected produced B,C,D,E,A instead of A,D,E,B,C. Covered by component ownership tests plus store atomicity, writability, normalization, subtree, undo/redo, cross-page persistence-barrier, and ordered-inheritance tests. Scope is heading and pointer bullet drag only; adjacent context actions remain pointer-owned."
+      "notes": "GH #240. Fail-before on exact base d1ad0f2c38120de8c88247f7d6062edf8a6ac812: writable pointer changed C and left selected A raw as 'A' instead of '## A'; read-only pointer hid Heading 2 entirely; dragging A's bullet with B+C selected produced B,C,D,E,A instead of A,D,E,B,C. Covered by component ownership tests plus store atomicity, writability, normalization, subtree, undo/redo, cross-page persistence-barrier, and ordered-inheritance tests. Native Linux confirmation on 2026-08-11 used three green runs after the final master rebase of unchanged staged artifact 55e4840eb0bfe2926e2085d5c6079347a96b0ea6: a fresh named page was reached through a rendered journal link, keyboard-selected B+C received H2 from A's rendered context menu and one undo, then a real WebDriver bullet drag from A moved B+C together after E; A,D,E,B,C survived durable relaunch. Scope is heading and pointer bullet drag only; adjacent context actions remain pointer-owned."
     },
     {
       "id": "UI-MANAGED-ANDROID-ROOT-SHUTDOWN-001",

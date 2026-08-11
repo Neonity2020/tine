@@ -66,6 +66,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-selection-actions.mjs": {
+   "contracts": [
+    {
+     "class": "stateful-ux",
+     "userOutcome": "A routed page keeps an active B+C block selection authoritative for an H2 command opened on A and for a real bullet drag begun on A; one undo removes both headings and the moved order survives a native relaunch.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Menu presentation, pointer threshold, drop-marker styling, and animation may evolve while selection ownership, rendered content, root order, and durable reload remain intact."
+   ],
+   "nonRequirements": [
+    "Exact pixels, menu geometry, coordinate values, CSS/DOM nesting, timing, palette/order, or animation."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-capabilities.mjs": {
    "contracts": [
     {

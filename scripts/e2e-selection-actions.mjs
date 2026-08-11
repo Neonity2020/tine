@@ -1,0 +1,389 @@
+// Native Linux semantic journey for GH #240 selection-owned heading and drag.
+// It intentionally observes content, active block selection, root order, and
+// durable reload only; coordinate values come from live rows and are not an
+// oracle. Run with the staged binary explicitly, for example:
+// TINE_APP=/path/to/tine TINE_CANDIDATE_COMMIT=$(git rev-parse HEAD) node scripts/e2e-selection-actions.mjs
+
+import { spawn } from "node:child_process";
+import { remote, Key } from "webdriverio";
+import { setTimeout as sleep } from "node:timers/promises";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  freeLoopbackPort,
+  tauriCapabilities,
+  webdriverServerArgs,
+} from "./e2e-capabilities.mjs";
+import { waitForFileText } from "./e2e-file-poll.mjs";
+import { ensureDisplay, stopDisplay } from "./lib/e2e-display.mjs";
+
+const CANDIDATE_COMMIT = process.env.TINE_CANDIDATE_COMMIT;
+if (!CANDIDATE_COMMIT || !/^[0-9a-f]{40}$/.test(CANDIDATE_COMMIT)) {
+  throw new Error("GH #240 native E2E requires the exact 40-character artifact commit through TINE_CANDIDATE_COMMIT.");
+}
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const APP = process.env.TINE_APP;
+if (!APP) throw new Error("GH #240 native E2E requires the exact artifact through TINE_APP; no worktree-binary fallback is allowed.");
+if (!fs.existsSync(APP)) throw new Error(`TINE_APP does not exist: ${APP}`);
+
+await ensureDisplay();
+
+const RUN_ID = `${process.pid}-${Date.now()}`;
+// Native Linux test runners can advertise a read-only Node tmpdir. `/tmp` is
+// the controlled writable parent; every child remains uniquely GH240-named.
+const TMP = path.join("/tmp", `tine-gh240-selection-action-ownership-e2e-${RUN_ID}`);
+const GRAPH = path.join(TMP, "graph");
+const XDG = path.join(TMP, "xdg");
+const ARTIFACTS = path.join(TMP, "artifacts");
+const PAGE = "GH240 Selection Ownership";
+const PAGE_FILE = path.join(GRAPH, "pages", `${PAGE}.md`);
+const today = new Date();
+const JOURNAL_STEM = `${today.getFullYear()}_${String(today.getMonth() + 1).padStart(2, "0")}_${String(today.getDate()).padStart(2, "0")}`;
+const JOURNAL_FILE = path.join(GRAPH, "journals", `${JOURNAL_STEM}.md`);
+const EXPECTED_ORDER = ["A", "D", "E", "B", "C"];
+const DRIVER = await freeLoopbackPort();
+const NATIVE = await freeLoopbackPort(new Set([DRIVER]));
+
+// This is a fresh, named routed page: the only roots are the semantic labels
+// used by the journey, so root order can be checked without layout assumptions.
+fs.rmSync(TMP, { recursive: true, force: true });
+for (const directory of ["pages", "journals", "logseq", "assets"]) {
+  fs.mkdirSync(path.join(GRAPH, directory), { recursive: true });
+}
+for (const directory of ["data", "config", "cache"]) {
+  fs.mkdirSync(path.join(XDG, directory), { recursive: true });
+}
+fs.mkdirSync(ARTIFACTS, { recursive: true });
+fs.writeFileSync(path.join(GRAPH, "logseq", "config.edn"), "{}\n");
+fs.writeFileSync(PAGE_FILE, "- A\n- B\n- C\n- D\n- E\n");
+// Filename-discovered pages are not necessarily in the initial sidebar. Seed
+// the app's normal starting journal with a visible page reference, then use
+// that rendered reference for each route into this named-page journey.
+fs.writeFileSync(JOURNAL_FILE, `- Open [[${PAGE}]]\n`);
+
+const env = {
+  ...process.env,
+  TINE_GRAPH: GRAPH,
+  XDG_DATA_HOME: path.join(XDG, "data"),
+  XDG_CONFIG_HOME: path.join(XDG, "config"),
+  XDG_CACHE_HOME: path.join(XDG, "cache"),
+  WEBKIT_DISABLE_DMABUF_RENDERER: "1",
+  WEBKIT_DISABLE_COMPOSITING_MODE: "1",
+  LIBGL_ALWAYS_SOFTWARE: "1",
+  GDK_BACKEND: "x11",
+};
+
+const driverLogPath = path.join(ARTIFACTS, "tauri-driver.log");
+const driverLog = fs.openSync(driverLogPath, "w");
+const driver = spawn(
+  process.env.TAURI_DRIVER || "tauri-driver",
+  webdriverServerArgs(DRIVER, NATIVE, process.env.WEBKIT_DRIVER || "/usr/bin/WebKitWebDriver"),
+  { env, stdio: ["ignore", driverLog, driverLog], detached: process.platform !== "win32" },
+);
+
+let browser;
+let step = "start driver";
+let expected = "a fresh named page with five roots A-E";
+let failure = false;
+
+function phase(nextStep, nextExpected) {
+  step = nextStep;
+  expected = nextExpected;
+}
+
+function assert(condition, message, observed) {
+  if (!condition) throw new Error(`${message}: ${JSON.stringify(observed)}`);
+}
+
+async function rootSnapshot() {
+  return browser.execute(() => [...document.querySelectorAll(".page-blocks > .ls-block")]
+    .filter((root) => !root.hasAttribute("data-page-preamble"))
+    .map((root) => {
+      const main = root.querySelector(":scope > .block-main");
+      const content = root.querySelector(":scope > .block-main > .block-content-wrapper > .block-content");
+      return {
+        id: root.getAttribute("data-block-id"),
+        label: content?.textContent?.trim() ?? "",
+        selected: main?.classList.contains("selected") ?? false,
+        h2: content?.classList.contains("h2") ?? false,
+        classes: content?.className ?? "",
+      };
+    }));
+}
+
+async function selectedLabels() {
+  return (await rootSnapshot()).filter((row) => row.selected).map((row) => row.label);
+}
+
+async function waitForRoots(predicate, message) {
+  await browser.waitUntil(async () => predicate(await rootSnapshot()), {
+    timeout: 10_000,
+    interval: 100,
+    timeoutMsg: message,
+  });
+}
+
+async function rootElement(label) {
+  const roots = await browser.$$(".page-blocks > .ls-block");
+  for (const root of roots) {
+    if (await root.getAttribute("data-page-preamble")) continue;
+    const content = await root.$(":scope > .block-main > .block-content-wrapper > .block-content");
+    if (await content.isExisting() && (await content.getText()).trim() === label) return root;
+  }
+  throw new Error(`could not find root ${label}: ${JSON.stringify(await rootSnapshot())}`);
+}
+
+async function installWebviewErrorCapture() {
+  await browser.execute(() => {
+    const windowWithCapture = window;
+    windowWithCapture.__gh240WebviewErrors = [];
+    window.addEventListener("error", (event) => {
+      windowWithCapture.__gh240WebviewErrors.push(`onerror: ${event.message || String(event.error)}`);
+    });
+    window.addEventListener("unhandledrejection", (event) => {
+      windowWithCapture.__gh240WebviewErrors.push(`unhandledrejection: ${String(event.reason?.message || event.reason)}`);
+    });
+    const originalError = console.error;
+    console.error = (...args) => {
+      windowWithCapture.__gh240WebviewErrors.push(`console.error: ${args.map((arg) => arg?.message || String(arg)).join(" ")}`);
+      originalError(...args);
+    };
+  });
+}
+
+async function webviewErrors() {
+  return browser.execute(() => [...(window.__gh240WebviewErrors || [])]);
+}
+
+async function assertNoWebviewErrors(label) {
+  const errors = await webviewErrors();
+  assert(errors.length === 0, `uncaught webview errors at ${label}`, errors);
+}
+
+async function openSession() {
+  browser = await remote({
+    hostname: "127.0.0.1",
+    port: DRIVER,
+    path: "/",
+    logLevel: "error",
+    connectionRetryCount: 1,
+    connectionRetryTimeout: 60_000,
+    capabilities: tauriCapabilities(APP),
+  });
+  await browser.$(".page-title, .ls-block").waitForExist({ timeout: 20_000 });
+  await installWebviewErrorCapture();
+}
+
+async function openPage(name) {
+  await browser.waitUntil(async () => {
+    const refs = await browser.$$(".page-ref");
+    for (const ref of refs) {
+      const text = (await ref.getText()).trim();
+      if (text === name || text === `[[${name}]]`) return true;
+    }
+    return false;
+  }, {
+    timeout: 15_000,
+    timeoutMsg: `journal did not render a normal page link for ${name}`,
+  });
+  const refs = await browser.$$(".page-ref");
+  let pageRef;
+  for (const ref of refs) {
+    const text = (await ref.getText()).trim();
+    if (text === name || text === `[[${name}]]`) {
+      pageRef = ref;
+      break;
+    }
+  }
+  assert(pageRef, `rendered journal link for ${name} disappeared before click`, []);
+  await pageRef.click();
+  await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === name, {
+    timeout: 10_000,
+    timeoutMsg: `rendered journal link did not route to ${name}`,
+  });
+  await waitForRoots((rows) => rows.length === 5, "routed page roots did not load");
+}
+
+async function selectBAndC() {
+  phase("select B+C with the editor keyboard path", "B+C are the exact active block selection");
+  const b = await rootElement("B");
+  const content = await b.$(":scope > .block-main > .block-content-wrapper");
+  await content.click();
+  await browser.$("textarea.block-editor").waitForExist({ timeout: 5_000 });
+  await browser.keys([Key.Escape]);
+  await waitForRoots((rows) => rows.filter((row) => row.selected).map((row) => row.label).join(",") === "B", "Escape did not select B");
+  await browser.keys([Key.Shift, Key.ArrowDown]);
+  await waitForRoots((rows) => rows.filter((row) => row.selected).map((row) => row.label).join(",") === "B,C", "Shift+ArrowDown did not extend B selection to C");
+}
+
+async function ensureBAndCSelected() {
+  const selected = await selectedLabels();
+  if (selected.join(",") === "B,C") return "preserved";
+  await selectBAndC();
+  return "reselected";
+}
+
+async function openContextMenuOnA() {
+  phase("open actual context menu on unselected A", "the rendered context menu opens on A while B+C remain selected");
+  const opened = await browser.execute(() => {
+    const root = [...document.querySelectorAll(".page-blocks > .ls-block")].find((candidate) => {
+      const content = candidate.querySelector(":scope > .block-main > .block-content-wrapper > .block-content");
+      return content?.textContent?.trim() === "A";
+    });
+    const surface = root?.querySelector(":scope > .block-main > .block-content-wrapper");
+    if (!(surface instanceof HTMLElement)) return { found: false };
+    const rect = surface.getBoundingClientRect();
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + Math.max(4, Math.min(rect.width - 4, rect.width / 2)),
+      clientY: rect.top + Math.max(4, Math.min(rect.height - 4, rect.height / 2)),
+      view: window,
+    });
+    surface.dispatchEvent(event);
+    return { found: true, defaultPrevented: event.defaultPrevented };
+  });
+  assert(opened.found && opened.defaultPrevented, "context-menu dispatch did not reach the rendered A block menu", opened);
+  await browser.$(".ctx-menu").waitForExist({ timeout: 5_000 });
+}
+
+async function chooseHeading2() {
+  phase("choose H2 through the rendered menu", "only B+C render as H2 and remain selected");
+  const h2 = await browser.$('button.ctx-h[title="Heading 2"]');
+  await h2.waitForExist({ timeout: 5_000 });
+  await h2.click();
+  await waitForRoots((rows) => {
+    const h2Labels = rows.filter((row) => row.h2).map((row) => row.label);
+    const selection = rows.filter((row) => row.selected).map((row) => row.label);
+    return h2Labels.join(",") === "B,C" && selection.join(",") === "B,C" && !rows.find((row) => row.label === "A")?.h2;
+  }, "H2 did not apply exactly to B+C while retaining their block selection");
+}
+
+async function undoHeading() {
+  phase("undo the batch H2 operation", "one actual undo removes H2 from both B and C");
+  await browser.keys(["Control", "z"]);
+  await waitForRoots((rows) => rows.every((row) => !row.h2), "one undo did not remove both H2 renderings");
+}
+
+async function dragSelectionFromAToAfterE() {
+  phase("drag B+C from A bullet to after E", "visible roots become A,D,E,B,C and B+C remain grouped in order");
+  const mode = await ensureBAndCSelected();
+  fs.writeFileSync(path.join(ARTIFACTS, "selection-before-drag.json"), JSON.stringify({ mode, roots: await rootSnapshot() }, null, 2) + "\n");
+  const points = await browser.execute(() => {
+    const rootFor = (label) => [...document.querySelectorAll(".page-blocks > .ls-block")].find((root) =>
+      root.querySelector(":scope > .block-main > .block-content-wrapper > .block-content")?.textContent?.trim() === label,
+    );
+    const aBullet = rootFor("A")?.querySelector(":scope > .block-main .bullet-container");
+    const eMain = rootFor("E")?.querySelector(":scope > .block-main");
+    if (!(aBullet instanceof HTMLElement) || !(eMain instanceof HTMLElement)) return null;
+    const start = aBullet.getBoundingClientRect();
+    const target = eMain.getBoundingClientRect();
+    return {
+      start: { x: start.left + start.width / 2, y: start.top + start.height / 2 },
+      // Lower interior of E's live row requests the semantic "after E" side.
+      end: { x: target.left + target.width * 0.65, y: target.top + target.height * 0.75 },
+    };
+  });
+  assert(points && Number.isFinite(points.start.x) && Number.isFinite(points.end.y), "live A bullet/E row drag coordinates were unavailable", points);
+  const steps = 8;
+  const actions = [
+    { type: "pointerMove", duration: 0, x: Math.round(points.start.x), y: Math.round(points.start.y) },
+    { type: "pointerDown", button: 0 },
+  ];
+  for (let index = 1; index <= steps; index += 1) {
+    actions.push({
+      type: "pointerMove",
+      duration: 35,
+      x: Math.round(points.start.x + ((points.end.x - points.start.x) * index) / steps),
+      y: Math.round(points.start.y + ((points.end.y - points.start.y) * index) / steps),
+    });
+  }
+  actions.push({ type: "pointerUp", button: 0 });
+  await browser.performActions([{ type: "pointer", id: "gh240-native-mouse", parameters: { pointerType: "mouse" }, actions }]);
+  await browser.releaseActions();
+  await waitForRoots((rows) => rows.map((row) => row.label).join(",") === EXPECTED_ORDER.join(","), "bullet pointer drag did not produce A,D,E,B,C");
+}
+
+function diskOrder(text) {
+  return text.split(/\r?\n/).flatMap((line) => {
+    const match = /^- ([A-E])$/.exec(line);
+    return match ? [match[1]] : [];
+  });
+}
+
+async function waitForDurableOrder() {
+  phase("wait for durable save", "the page file records root order A,D,E,B,C");
+  const text = await waitForFileText(PAGE_FILE, (body) => diskOrder(body).join(",") === EXPECTED_ORDER.join(","), "GH #240 root order");
+  fs.writeFileSync(path.join(ARTIFACTS, "durable-page.md"), text);
+}
+
+async function relaunchAndAssert() {
+  phase("end session and relaunch exact artifact", "the same graph/XDG/artifact routes back to the named page with durable A,D,E,B,C");
+  await browser.deleteSession();
+  browser = undefined;
+  await sleep(900);
+  await openSession();
+  await openPage(PAGE);
+  await waitForRoots((rows) => rows.map((row) => row.label).join(",") === EXPECTED_ORDER.join(","), "relaunch did not render persisted A,D,E,B,C order");
+  await assertNoWebviewErrors("post-relaunch");
+}
+
+function failureClassification(error) {
+  const message = String(error);
+  if (/Failed to initialize gtk|ECONNREFUSED|headers timeout|WebDriver.*(connect|session)|driver.*exit/i.test(message)) return "infrastructure";
+  return "ambiguous";
+}
+
+async function preserveFailureCapsule(error) {
+  const observed = browser ? await rootSnapshot().catch((snapshotError) => ({ snapshotError: String(snapshotError) })) : { browser: "no session" };
+  const errors = browser ? await webviewErrors().catch((webviewError) => [`capture failed: ${String(webviewError)}`]) : [];
+  try { await browser?.saveScreenshot(path.join(ARTIFACTS, "failure.png")); } catch {}
+  try { fs.writeFileSync(path.join(ARTIFACTS, "page-on-failure.md"), fs.readFileSync(PAGE_FILE, "utf8")); } catch {}
+  const capsule = {
+    classification: failureClassification(error),
+    step,
+    expected,
+    observed,
+    webviewErrors: errors,
+    error: String(error),
+    candidateCommit: CANDIDATE_COMMIT,
+    artifact: APP,
+    graph: GRAPH,
+    xdg: XDG,
+    driverLog: driverLogPath,
+    screenshot: path.join(ARTIFACTS, "failure.png"),
+  };
+  fs.writeFileSync(path.join(ARTIFACTS, "failure-capsule.json"), JSON.stringify(capsule, null, 2) + "\n");
+  console.error(`GH240 E2E FAILURE (${capsule.classification}): capsule retained at ${path.join(ARTIFACTS, "failure-capsule.json")}`);
+}
+
+try {
+  phase("launch exact artifact", "the native app opens under its private GH240 graph and XDG state");
+  await openSession();
+  await openPage(PAGE);
+  await selectBAndC();
+  await openContextMenuOnA();
+  await chooseHeading2();
+  await assertNoWebviewErrors("heading command");
+  await undoHeading();
+  await dragSelectionFromAToAfterE();
+  await assertNoWebviewErrors("pointer drag");
+  await waitForDurableOrder();
+  await relaunchAndAssert();
+  console.log(`PASS: GH #240 native selection-owned H2, one undo, pointer bullet drag, and durable relaunch on ${CANDIDATE_COMMIT}`);
+} catch (error) {
+  failure = true;
+  await preserveFailureCapsule(error);
+  process.exitCode = 1;
+} finally {
+  try { await browser?.deleteSession(); } catch {}
+  if (process.platform === "win32") {
+    try { driver.kill("SIGKILL"); } catch {}
+  } else {
+    try { process.kill(-driver.pid, "SIGKILL"); } catch {}
+  }
+  try { fs.closeSync(driverLog); } catch {}
+  stopDisplay();
+  if (!failure) fs.rmSync(TMP, { recursive: true, force: true });
+}
