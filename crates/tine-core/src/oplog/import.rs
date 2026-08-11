@@ -5436,17 +5436,16 @@ fn capture_import_scope(
         let page_id = match current_owner {
             CurrentPageAtPath::ExactOwner(occupied) => occupied.page_id(),
             CurrentPageAtPath::Released(release) => {
+                // Bytes at a released path authenticate a GUARDED CONFLICT — an
+                // external replacement written where a page used to live. An
+                // ordinary completed deletion leaves the path absent, and that
+                // is the common case, so their absence is not an error here:
+                // `authorize_projected_release` prefers the absent-completion
+                // route and only needs an observation on the conflict route.
                 let observed = inventory
                     .entries()
                     .get(path)
-                    .and_then(RawObservation::description)
-                    .ok_or_else(|| {
-                        authority_block(
-                            ImportBlockReason::StaleScope,
-                            Some(path),
-                            "released path no longer has the observed replacement bytes",
-                        )
-                    })?;
+                    .and_then(RawObservation::description);
                 let (_, work_index) = engine.enrolled_projection_runtime().map_err(|error| {
                     authority_block(
                         ImportBlockReason::AuthorityUnavailable,

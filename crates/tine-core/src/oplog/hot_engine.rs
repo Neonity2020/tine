@@ -18347,7 +18347,10 @@ impl ShardedHotEngine {
         &self,
         index: &ProjectionWorkIndex,
         release: &PortablePathReleased,
-        observed: BlobDescription,
+        // `None` when the released path is absent. Only the guarded-conflict
+        // route needs bytes to authenticate against; an absent completion — an
+        // ordinary deletion — is authorized without any observation.
+        observed: Option<BlobDescription>,
     ) -> Result<ProjectedReleaseAuthority, EngineError> {
         self.begin_point_operation();
         self.ensure_not_blocked()?;
@@ -18435,6 +18438,13 @@ impl ShardedHotEngine {
             }
             return Ok(ProjectedReleaseAuthority::Completed(completed));
         }
+        let observed = observed.ok_or_else(|| {
+            EngineError::ProjectionWork(
+                "projection release has no absent completion, and no replacement bytes to \
+                 authenticate a guarded conflict against"
+                    .into(),
+            )
+        })?;
         let blocked = index
             .blocked_release_for_observation(
                 release.release_batch(),

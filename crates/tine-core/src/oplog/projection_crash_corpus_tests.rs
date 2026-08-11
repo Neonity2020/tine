@@ -591,7 +591,7 @@ fn assert_fixture_semantics(manifest: &CorpusManifest) {
         Some(PageState::Tombstone { kind, .. }) if kind == page.kind.managed_kind()
     ));
     let import = plan_affected_import(&graph, &receipts, &engine, &[page.path.as_str()]);
-    assert_eq!(import.status(), ImportPlanStatus::Noop);
+    assert_eq!(import.status(), ImportPlanStatus::Noop, "blocks: {:?}", import.blocks());
     assert!(import.inventory().unwrap().present(&page.path).is_none());
 }
 
