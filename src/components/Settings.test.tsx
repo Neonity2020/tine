@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
-import { closeSettings, openSettings, setToasts, toasts } from "../ui";
+import { closeSettings, dismissToast, openSettings, setToasts, toasts } from "../ui";
 import { backend } from "../backend";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import * as store from "../store";
@@ -30,6 +30,7 @@ afterEach(() => {
   setToasts([]);
   managedStorageRuntime.clear();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("Settings storage transitions", () => {
@@ -146,12 +147,204 @@ describe("Settings storage transitions", () => {
 
     expect(calls).toEqual(["flush", "activate"]);
     expect(reset).toHaveBeenCalled();
-    expect(toasts().at(-1)?.message).toBe(
-      "Tine-managed storage setup did not complete: Setup can be retried."
-    );
+    expect(toasts().at(-1)).toMatchObject({
+      message: "Tine-managed storage setup did not complete: projection proof paused on the exact test cut",
+      kind: "error",
+      sticky: true,
+    });
     expect(root.textContent).toContain("Retry setup");
     expect(root.textContent).toContain("Setup paused. You can retry setup when you are ready.");
     expect(root.textContent).toContain("Return to Direct files");
+    dispose();
+  });
+
+  it("keeps setup failure detail visible until dismissed and lets the user copy it", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "activateSparseV2").mockResolvedValue(localRetryable());
+    const writeText = vi.spyOn(backend(), "writeText").mockResolvedValue(undefined);
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const enable = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Enable Tine-managed storage")
+    ) as HTMLButtonElement;
+    enable.click();
+    await tick();
+    await tick();
+
+    const failure = toasts().at(-1)!;
+    expect(failure.sticky).toBe(true);
+    vi.useFakeTimers();
+    await vi.advanceTimersByTimeAsync(3201);
+    expect(toasts().some((toast) => toast.id === failure.id)).toBe(true);
+
+    const copy = [...root.querySelectorAll("button")].find(
+      (button) => button.textContent === "Copy details"
+    ) as HTMLButtonElement;
+    expect(root.textContent).toContain("Setup: projection proof paused on the exact test cut");
+    copy.click();
+    await vi.runAllTimersAsync();
+    expect(writeText).toHaveBeenCalledWith("Setup: projection proof paused on the exact test cut");
+
+    dismissToast(failure.id);
+    expect(toasts().some((toast) => toast.id === failure.id)).toBe(false);
+    dispose();
+  });
+
+  it("keeps backend activation errors instead of replacing them with a generic retry message", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "activateSparseV2").mockRejectedValue(new Error("native activation rejected the prepared recovery state"));
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const enable = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Enable Tine-managed storage")
+    ) as HTMLButtonElement;
+    enable.click();
+    await tick();
+    await tick();
+
+    expect(toasts().at(-1)).toMatchObject({
+      message: "Tine-managed storage was not enabled: native activation rejected the prepared recovery state",
+      sticky: true,
+    });
+    dispose();
+  });
+
+  it("redacts paths and bounds unstructured managed-storage errors", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "activateSparseV2").mockRejectedValue(new Error(
+      "materialization failed at /home/martin/private/Tine.md, file:///home/martin/private/Graph.md, C:\\Users\\Martin\\Graph\\Tine.md, and \\\\server\\share\\Graph\\Tine.md; " + "diagnostic ".repeat(80)
+    ));
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const enable = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Enable Tine-managed storage")
+    ) as HTMLButtonElement;
+    enable.click();
+    await tick();
+    await tick();
+
+    const detail = toasts().at(-1)?.message ?? "";
+    expect(detail).toContain("materialization failed at [path]");
+    expect(detail.match(/\[path\]/g)?.length).toBe(4);
+    expect(detail).not.toContain("/home/martin");
+    expect(detail).not.toContain("C:\\Users");
+    expect(detail).not.toContain("server\\share");
+    expect(detail.length).toBeLessThanOrEqual("Tine-managed storage was not enabled: ".length + 280);
+    expect(detail).toMatch(/…$/u);
+    dispose();
+  });
+
+  it("keeps share setup failures sticky with their backend detail", async () => {
+    const retry = { ...localRetryable(), binding_generation: 11 };
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(localActive());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "prepareSparseV2Share").mockResolvedValue(retry);
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    const share = [...root.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Set up sync with another device")
+    ) as HTMLButtonElement;
+    share.click();
+    await tick();
+    await tick();
+    expect(toasts().at(-1)).toMatchObject({
+      message: "Sync setup did not complete: projection proof paused on the exact test cut",
+      sticky: true,
+    });
+    dispose();
+  });
+
+  it("keeps join setup failures sticky with their backend detail", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue({
+      state: "joinable",
+      descriptor_digest: "test-descriptor",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 15,
+    });
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    vi.spyOn(backend(), "joinSparseV2Shared").mockResolvedValue({ ...localRetryable(), binding_generation: 15 });
+
+    const joinRoot = document.createElement("div");
+    document.body.append(joinRoot);
+    const joinDispose = render(() => <Settings />, joinRoot);
+    await showSparsePanel(joinRoot);
+    const join = [...joinRoot.querySelectorAll("button")].find((button) =>
+      button.textContent?.includes("Join this synced graph")
+    ) as HTMLButtonElement;
+    join.click();
+    await tick();
+    await tick();
+    expect(toasts().at(-1)).toMatchObject({
+      message: "Joining the synced graph did not complete: projection proof paused on the exact test cut",
+      sticky: true,
+    });
+    joinDispose();
+  });
+
+  it("keeps the refused causal class while redacting paths from all structured diagnostics", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue({
+      state: "refused",
+      reason_code: "local_active",
+      detail: "SQLite materialization failed: immutable archive error: document scratch index failed: malformed scratch blob at /home/martin/private/.tine-sync/v2/blobs.data",
+      runtime: null,
+      can_activate: false,
+      can_retry: true,
+      can_cancel: false,
+      cancel_reason: "The managed recovery archive at C:\\Users\\Martin\\Graph\\.tine-sync could not be verified.",
+      binding_generation: 12,
+    });
+    const writeText = vi.spyOn(backend(), "writeText").mockResolvedValue(undefined);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+    managedStorageRuntime.receiveError({
+      binding_generation: 12,
+      message: 'LeaseContended("/var/lib/tine/private/lease")',
+    });
+    await tick();
+
+    expect(root.textContent).toContain("document scratch index failed: malformed scratch blob");
+    expect(root.textContent).toContain("LeaseContended(\"[path]\")");
+    expect(root.textContent).not.toContain("/home/martin");
+    expect(root.textContent).not.toContain("C:\\Users\\Martin");
+    expect(root.textContent).not.toContain("/var/lib/tine");
+    const copy = [...root.querySelectorAll("button")].find(
+      (button) => button.textContent === "Copy details"
+    ) as HTMLButtonElement;
+    copy.click();
+    await tick();
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("malformed scratch blob"));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("Return to Direct files:"));
+    const copied = writeText.mock.calls.at(-1)?.[0] ?? "";
+    expect(copied).toContain("[path]");
+    expect(copied).not.toContain("/home/martin");
+    expect(copied).not.toContain("C:\\Users\\Martin");
+    expect(copied).not.toContain("/var/lib/tine");
     dispose();
   });
 
@@ -173,7 +366,7 @@ describe("Settings storage transitions", () => {
     });
     await tick();
 
-    expect(root.textContent).toContain('Managed storage needs attention: Blocked("missing trusted recovery receipt")');
+    expect(root.textContent).toContain('Managed storage needs attention: Blocked("[redacted]")');
     dispose();
   });
 
@@ -287,8 +480,11 @@ describe("Settings storage transitions", () => {
     expect(reset).toHaveBeenCalledOnce();
     expect(confirm).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Pending in-memory edits will be retried after Direct files returns."
+        "continuing may omit in-memory managed edits that are not yet durable"
       )
+    );
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining("archive the complete durable managed-storage and provider state")
     );
     expect(toasts().at(-1)?.message).toBe(
       "Direct file mode is active. Complete recovery state was preserved."
@@ -367,12 +563,13 @@ describe("Settings storage transitions", () => {
     dispose();
   });
 
-  it("does not offer rollback when shared evidence makes it unsafe", async () => {
+  it("offers rollback with an explicit warning when shared evidence is present", async () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue({
       ...localActive(),
       can_cancel: false,
       cancel_reason: "Sync data already exists for another device.",
     });
+    const confirm = vi.spyOn(backend(), "confirm").mockResolvedValue(false);
     const cancel = vi.spyOn(backend(), "cancelSparseV2");
     const root = document.createElement("div");
     document.body.append(root);
@@ -383,10 +580,17 @@ describe("Settings storage transitions", () => {
       [...root.querySelectorAll("button")].find(
         (button) => button.textContent === "Return to Direct files"
       )
-    ).toBeUndefined();
+    ).toBeTruthy();
     expect(root.textContent).toContain(
-      "Return to Direct files is unavailable because safety could not be verified."
+      "Sync data already exists for another device."
     );
+    expect(root.textContent).toContain("might not include every durable managed or sync change");
+    const rollback = [...root.querySelectorAll("button")].find(
+      (button) => button.textContent === "Return to Direct files"
+    ) as HTMLButtonElement;
+    rollback.click();
+    await tick();
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("recovery exit, not confirmation"));
     expect(cancel).not.toHaveBeenCalled();
     dispose();
   });
