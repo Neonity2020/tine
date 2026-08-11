@@ -2824,7 +2824,7 @@
         "all"
       ],
       "layer": "browser",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "crates/tine-core/src/publish.rs"
