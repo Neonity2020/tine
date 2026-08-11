@@ -19,10 +19,10 @@ use tine_core::sync_runtime::{
     SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationProgress,
     SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
     SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
-    SyncRuntimeLifecycle, SyncRuntimeOpenProgress, SyncRuntimeOpenRequest, SyncRuntimeOpenResult,
-    SyncRuntimeOpenStatus, SyncRuntimeRecovery, SyncRuntimeStatusSnapshot, SyncRuntimeTick,
-    SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole, SyncShutdownOutcome,
-    SyncStorageProfile,
+    SyncRuntimeLifecycle, SyncRuntimeOpenPhase, SyncRuntimeOpenProgress, SyncRuntimeOpenRequest,
+    SyncRuntimeOpenResult, SyncRuntimeOpenStatus, SyncRuntimeRecovery, SyncRuntimeStatusSnapshot,
+    SyncRuntimeTick, SyncSharedEnrollmentDescriptor, SyncSharedPhase, SyncSharedRole,
+    SyncShutdownOutcome, SyncStorageProfile,
 };
 use uuid::Uuid;
 
@@ -855,9 +855,22 @@ impl SyncRuntimeFacade {
         app: &tauri::AppHandle,
         record: &SparseV2ActivationRecord,
     ) -> Result<SparseV2Binding, String> {
+        self.open_record_with_progress(app, record, |_| {})
+    }
+
+    /// Open a retained managed runtime while forwarding only bounded phase
+    /// names and elapsed time to the caller.  Detailed recovery telemetry
+    /// remains in the terminal diagnostic stream; it must not be copied into a
+    /// startup webview before a graph slot exists.
+    fn open_record_with_progress(
+        &self,
+        app: &tauri::AppHandle,
+        record: &SparseV2ActivationRecord,
+        mut progress: impl FnMut(SyncRuntimeOpenProgress),
+    ) -> Result<SparseV2Binding, String> {
         crate::debug::diag("managed storage open: begin authenticated existing-state recovery");
         let opened = SyncRuntimeHandle::open_with_progress(record.open_request(app)?, |update| {
-            match update {
+            match &update {
                 SyncRuntimeOpenProgress::Phase { phase, elapsed } => crate::debug::diag(format!(
                     "managed storage open: phase {phase:?} at {} ms",
                     elapsed.as_millis()
@@ -918,12 +931,45 @@ impl SyncRuntimeFacade {
                         ));
                 }
             }
+            progress(update);
         });
         crate::debug::diag(format!(
             "managed storage open: completed with {:?}",
             opened.status
         ));
         Ok(SparseV2Binding::from_open(opened))
+    }
+
+    /// The startup graph-open path has no `GraphSlot` until this operation
+    /// succeeds.  Publish the same bounded progress vocabulary directly to
+    /// that webview so a long recovery is visible without granting it any
+    /// additional storage authority.
+    pub(crate) fn open_record_for_window(
+        &self,
+        app: &tauri::AppHandle,
+        label: &str,
+        record: &SparseV2ActivationRecord,
+    ) -> Result<SparseV2Binding, String> {
+        let reporter = crate::graph::StartupProgressReporter::for_window(app, label);
+        reporter.phase("managed_open.entry");
+        let result = self.open_record_with_progress(app, record, |progress| match progress {
+            SyncRuntimeOpenProgress::Phase { phase, .. } => {
+                reporter.phase(managed_open_phase_name(phase));
+            }
+            SyncRuntimeOpenProgress::Waiting { phase, .. } => {
+                reporter.phase(managed_open_waiting_phase_name(phase));
+            }
+            // The detailed receipt remains terminal-only.  The webview sees a
+            // bounded phase update, never counts, error strings, or paths.
+            SyncRuntimeOpenProgress::RecoveryDiagnostics { .. } => {
+                reporter.phase("managed_open.recovery_diagnostics");
+            }
+        });
+        reporter.terminal(
+            "managed_open.complete",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
     }
 
     pub(crate) fn activate_record(
@@ -965,6 +1011,50 @@ impl SyncRuntimeFacade {
     #[cfg(test)]
     fn open_explicit(&self, request: SyncRuntimeOpenRequest) -> SyncRuntimeOpenResult {
         SyncRuntimeHandle::open(request)
+    }
+}
+
+fn managed_open_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
+    match phase {
+        SyncRuntimeOpenPhase::RetainingGraph => "managed_open.retaining_graph",
+        SyncRuntimeOpenPhase::DiscoveringEnrollment => "managed_open.discovering_enrollment",
+        SyncRuntimeOpenPhase::OpeningActorGraph => "managed_open.opening_actor_graph",
+        SyncRuntimeOpenPhase::RevalidatingEnrollment => "managed_open.revalidating_enrollment",
+        SyncRuntimeOpenPhase::OpeningEnrollment => "managed_open.opening_enrollment",
+        SyncRuntimeOpenPhase::OpeningProjectionReceipts => {
+            "managed_open.opening_projection_receipts"
+        }
+        SyncRuntimeOpenPhase::OpeningReconciliationBaseline => {
+            "managed_open.opening_reconciliation_baseline"
+        }
+        SyncRuntimeOpenPhase::RecoveringPromotedRuntime => {
+            "managed_open.recovering_promoted_runtime"
+        }
+        SyncRuntimeOpenPhase::AssemblingActor => "managed_open.assembling_actor",
+    }
+}
+
+fn managed_open_waiting_phase_name(phase: SyncRuntimeOpenPhase) -> &'static str {
+    match phase {
+        SyncRuntimeOpenPhase::RetainingGraph => "managed_open.waiting_retaining_graph",
+        SyncRuntimeOpenPhase::DiscoveringEnrollment => {
+            "managed_open.waiting_discovering_enrollment"
+        }
+        SyncRuntimeOpenPhase::OpeningActorGraph => "managed_open.waiting_opening_actor_graph",
+        SyncRuntimeOpenPhase::RevalidatingEnrollment => {
+            "managed_open.waiting_revalidating_enrollment"
+        }
+        SyncRuntimeOpenPhase::OpeningEnrollment => "managed_open.waiting_opening_enrollment",
+        SyncRuntimeOpenPhase::OpeningProjectionReceipts => {
+            "managed_open.waiting_opening_projection_receipts"
+        }
+        SyncRuntimeOpenPhase::OpeningReconciliationBaseline => {
+            "managed_open.waiting_opening_reconciliation_baseline"
+        }
+        SyncRuntimeOpenPhase::RecoveringPromotedRuntime => {
+            "managed_open.waiting_recovering_promoted_runtime"
+        }
+        SyncRuntimeOpenPhase::AssemblingActor => "managed_open.waiting_assembling_actor",
     }
 }
 
@@ -1298,6 +1388,11 @@ pub(crate) struct SparseV2CancelResult {
     recovery_statement: String,
 }
 
+/// Cold startup recovery intentionally has the same public result shape as an
+/// in-app Direct Files return.  The caller's attempt is validated at the
+/// mutation boundary, not trusted as storage authority or reflected to the UI.
+pub(crate) type SparseV2ColdCancelResult = SparseV2CancelResult;
+
 fn archive_private_root(
     private_root: &Path,
     recovery_root: &Path,
@@ -1494,7 +1589,7 @@ fn publish_retryable_sparse_slot(
     Ok(replacement)
 }
 
-fn cancel_sparse_v2_at_paths_with_archive(
+fn cancel_sparse_v2_at_paths_with_archive_and_publish(
     state: &crate::state::AppState,
     label: &str,
     slot: Arc<crate::state::GraphSlot>,
@@ -1503,6 +1598,7 @@ fn cancel_sparse_v2_at_paths_with_archive(
     approved_assets: Option<&Path>,
     shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
     archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
 ) -> Result<SparseV2CancelResult, String> {
     slot.sparse_binding()
         .ok_or("This graph is already using Direct files.")?;
@@ -1576,37 +1672,28 @@ fn cancel_sparse_v2_at_paths_with_archive(
         return Err(reason);
     }
 
-    let graph = tine_core::model::Graph::open_checked_with_assets(
-        &direct_root,
-        approved_assets,
-    )
-    .map_err(|error| {
-        state.graphs.write().unwrap().remove(label);
-        crate::state::poke_watcher(state);
+    let binding_generation = publish_direct(&direct_root, approved_assets).map_err(|error| {
+        // Before Direct publication the retryable no-actor slot remains the
+        // only authority.  Remove only that slot; if a later lifecycle step
+        // already published Direct Files, leave its usable binding intact.
+        let removed = {
+            let mut graphs = state.graphs.write().unwrap();
+            graphs
+                .slot(label)
+                .is_some_and(|slot| slot.binding_generation == retry_generation)
+                .then(|| graphs.remove(label))
+                .flatten()
+        };
+        if removed.is_some() {
+            crate::state::poke_watcher(state);
+        }
         format!(
             "Tine-managed storage recovery state was preserved, but Direct files could not reopen: {error}. Restart Tine to reopen the unchanged Markdown/Org graph."
         )
     })?;
-    let replacement = Arc::new(crate::state::GraphSlot::new(graph, direct_root));
-    state
-        .graphs
-        .write()
-        .unwrap()
-        .bind(label.to_string(), Arc::clone(&replacement))
-        .map_err(|error| {
-            let removed = state.graphs.write().unwrap().remove(label);
-            debug_assert!(removed.as_ref().is_none_or(|slot| {
-                slot.binding_generation == retry_generation
-            }));
-            crate::state::poke_watcher(state);
-            format!(
-                "Tine-managed storage recovery state was preserved, but Direct files could not be restored: {error}. Restart Tine to reopen the unchanged Markdown/Org graph."
-            )
-        })?;
-    crate::state::poke_watcher(state);
-    let status = SparseV2StatusDto::legacy(replacement.binding_generation);
+    let status = SparseV2StatusDto::legacy(binding_generation);
     Ok(SparseV2CancelResult {
-        binding_generation: replacement.binding_generation,
+        binding_generation,
         status,
         recovery_statement: match shutdown.completion_note() {
             Some(note) => format!(
@@ -1615,6 +1702,45 @@ fn cancel_sparse_v2_at_paths_with_archive(
             None => "Direct file mode is active. Complete managed-storage recovery state was preserved.".into(),
         },
     })
+}
+
+fn cancel_sparse_v2_at_paths_with_archive(
+    state: &crate::state::AppState,
+    label: &str,
+    slot: Arc<crate::state::GraphSlot>,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+) -> Result<SparseV2CancelResult, String> {
+    cancel_sparse_v2_at_paths_with_archive_and_publish(
+        state,
+        label,
+        slot,
+        private_root,
+        recovery_root,
+        approved_assets,
+        shutdown,
+        archive,
+        |direct_root, approved_assets| {
+            let graph =
+                tine_core::model::Graph::open_checked_with_assets(direct_root, approved_assets)
+                    .map_err(|error| error.to_string())?;
+            let replacement = Arc::new(crate::state::GraphSlot::new(
+                graph,
+                direct_root.to_path_buf(),
+            ));
+            let binding_generation = replacement.binding_generation;
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), replacement)?;
+            crate::state::poke_watcher(state);
+            Ok(binding_generation)
+        },
+    )
 }
 
 fn cancel_sparse_v2_at_paths(
@@ -1635,6 +1761,228 @@ fn cancel_sparse_v2_at_paths(
         approved_assets,
         shutdown,
         archive_private_root,
+    )
+}
+
+fn cold_binding_record_at(
+    private_root: &Path,
+    root_key: &Path,
+) -> Result<SparseV2ActivationRecord, String> {
+    match read_binding_at(&private_root.join(SPARSE_BINDING_FILE), root_key) {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err(
+            "No local Tine-managed storage recovery binding was found for this remembered graph. Nothing was changed."
+                .into(),
+        ),
+        Err(_) => Err(
+            "The local Tine-managed storage recovery binding is incomplete or unreadable. Nothing was changed."
+                .into(),
+        ),
+    }
+}
+
+/// The caller must hold `graph_load`.  That lock serializes every graph-open,
+/// sparse activation, and Direct Files return.  The registry check below is
+/// therefore a quiescence proof, not a best-effort snapshot: an actor/open
+/// worker cannot acquire a target slot between this check and the no-actor
+/// recovery slot reservation.
+fn reserve_cold_recovery_slot(
+    state: &crate::state::AppState,
+    label: &str,
+    root_key: PathBuf,
+    graph_meta: GraphMeta,
+) -> Result<Arc<crate::state::GraphSlot>, String> {
+    let mut graphs = state.graphs.write().unwrap();
+    if graphs.slot(label).is_some() {
+        return Err(
+            "This window already owns a graph while recovery was requested. Nothing was changed; retry from the current recovery panel."
+                .into(),
+        );
+    }
+    if graphs.entries().into_iter().any(|(_, slot)| {
+        slot.root_key.starts_with(&root_key) || root_key.starts_with(&slot.root_key)
+    }) {
+        return Err(
+            "The remembered graph is already open or opening in another window. Nothing was changed."
+                .into(),
+        );
+    }
+    let slot = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+        retryable_binding(
+            "local_active",
+            "Cold-start recovery reserved this managed binding before reopening Direct files."
+                .into(),
+        ),
+        root_key,
+        graph_meta,
+    ));
+    graphs
+        .bind(label.to_string(), Arc::clone(&slot))
+        .map_err(|_| {
+            "Tine could not reserve the remembered graph for recovery. Nothing was changed."
+        })?;
+    drop(graphs);
+    crate::state::poke_watcher(state);
+    Ok(slot)
+}
+
+fn cancel_sparse_v2_cold_at_paths_with_archive(
+    state: &crate::state::AppState,
+    label: &str,
+    root_key: PathBuf,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+) -> Result<SparseV2ColdCancelResult, String> {
+    // This is deliberately before the reservation: a missing/corrupt binding
+    // is a persistent safe refusal, never permission to archive either side.
+    let record = cold_binding_record_at(private_root, &root_key)?;
+    let slot = reserve_cold_recovery_slot(
+        state,
+        label,
+        root_key,
+        SyncRuntimeFacade::graph_meta(&record),
+    )?;
+    cancel_sparse_v2_at_paths_with_archive(
+        state,
+        label,
+        slot,
+        private_root,
+        recovery_root,
+        approved_assets,
+        shutdown_for_direct_files_escape,
+        archive,
+    )
+}
+
+fn cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
+    state: &crate::state::AppState,
+    label: &str,
+    root_key: PathBuf,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
+    publish_direct: impl FnOnce(&Path, Option<&Path>) -> Result<u64, String>,
+) -> Result<SparseV2ColdCancelResult, String> {
+    let record = cold_binding_record_at(private_root, &root_key)?;
+    let slot = reserve_cold_recovery_slot(
+        state,
+        label,
+        root_key,
+        SyncRuntimeFacade::graph_meta(&record),
+    )?;
+    cancel_sparse_v2_at_paths_with_archive_and_publish(
+        state,
+        label,
+        slot,
+        private_root,
+        recovery_root,
+        approved_assets,
+        shutdown_for_direct_files_escape,
+        archive,
+        publish_direct,
+    )
+}
+
+fn cancel_sparse_v2_cold_at_paths(
+    state: &crate::state::AppState,
+    label: &str,
+    root_key: PathBuf,
+    private_root: &Path,
+    recovery_root: &Path,
+    approved_assets: Option<&Path>,
+) -> Result<SparseV2ColdCancelResult, String> {
+    cancel_sparse_v2_cold_at_paths_with_archive(
+        state,
+        label,
+        root_key,
+        private_root,
+        recovery_root,
+        approved_assets,
+        archive_private_root,
+    )
+}
+
+#[tauri::command]
+pub(crate) async fn cancel_sparse_v2_cold(
+    path: String,
+    attempt: u64,
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<SparseV2ColdCancelResult, String> {
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        cancel_sparse_v2_cold_blocking(&app, &label, path, attempt)
+    })
+    .await
+    .map_err(|_| "Cold Direct Files recovery worker stopped before completion.".to_string())?
+}
+
+fn cancel_sparse_v2_cold_blocking(
+    app: &tauri::AppHandle,
+    label: &str,
+    path: String,
+    attempt: u64,
+) -> Result<SparseV2ColdCancelResult, String> {
+    // Canonicalization is read-only.  It happens before `graph_load` only to
+    // compare the submitted target with native authority; every state/storage
+    // mutation remains inside the serialized transition below.
+    let submitted_root = crate::state::canonical_graph_root(&path).map_err(|_| {
+        "The selected recovery folder is unavailable. Retry graph lookup or choose another graph."
+            .to_string()
+    })?;
+    let state = app.state::<crate::state::AppState>();
+    let _transition = state.graph_load.lock().unwrap();
+
+    // Re-read both the native attempt and exact canonical target *after*
+    // acquiring the open lock.  A late result, picker, normal open, or another
+    // recovery action cannot turn a stale frontend token into archive authority.
+    let authorized_root = match state.authorized_startup_recovery_target(label, attempt) {
+        Ok(root) => root,
+        Err(_) if state.startup_recovery_attempt_is_current(label, attempt) => {
+            // A lookup watchdog is observational: it cannot let a locally
+            // cached path archive anything by itself.  The only timeout route
+            // independently rereads native settings under this same lock and
+            // accepts an exact canonical remembered/known graph only.
+            if !crate::settings::startup_recovery_target_is_remembered(app, &submitted_root) {
+                return Err(
+                    "Tine could not verify this recovery target in its remembered graphs. Nothing was changed; retry graph lookup or choose another graph."
+                        .into(),
+                );
+            }
+            state.authorize_startup_recovery_target(label, attempt, Some(submitted_root.clone()));
+            submitted_root.clone()
+        }
+        Err(error) => return Err(error),
+    };
+    if authorized_root != submitted_root {
+        return Err(
+            "The selected recovery target no longer matches Tine's remembered graph. Retry graph lookup before returning to Direct files."
+                .into(),
+        );
+    }
+    let private_root = sparse_private_root(app, &submitted_root)?;
+    let recovery_root = sparse_recovery_root(app)?;
+    let approved_assets = crate::settings::approved_external_assets(app, &submitted_root);
+    cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
+        &state,
+        label,
+        submitted_root,
+        &private_root,
+        &recovery_root,
+        approved_assets.as_deref(),
+        archive_private_root,
+        |direct_root, _| {
+            crate::graph::open_and_publish_direct_files(
+                app,
+                label,
+                &state,
+                direct_root.to_path_buf(),
+            )
+            .map(|direct| direct.binding_generation)
+        },
     )
 }
 
@@ -2242,6 +2590,7 @@ mod tests {
                 watch_ctl: Mutex::new(None),
                 last_focused: Mutex::new(None),
                 capture_graph: Mutex::new(None),
+                startup_recovery: Mutex::new(std::collections::HashMap::new()),
                 sync_runtime: SyncRuntimeFacade,
                 #[cfg(desktop)]
                 next_window: std::sync::atomic::AtomicU64::new(1),
@@ -2352,6 +2701,217 @@ mod tests {
                 std::fs::create_dir_all(shared.join(tree).join(namespace)).unwrap();
             }
         }
+    }
+
+    fn cold_fixture(stage: Option<&str>) -> RollbackFixture {
+        let fixture = RollbackFixture::new(stage);
+        let removed = fixture.state.graphs.write().unwrap().remove("main");
+        assert!(
+            removed.is_some(),
+            "cold recovery starts before any graph slot"
+        );
+        fixture
+    }
+
+    #[test]
+    fn cold_return_requires_native_lock_attempt_target_and_full_direct_lifecycle() {
+        let source = include_str!("sync_runtime.rs");
+        let start = source
+            .find("fn cancel_sparse_v2_cold_blocking(")
+            .expect("cold recovery blocking boundary");
+        let command = &source[start
+            ..source[start..]
+                .find("#[tauri::command]\npub(crate) async fn cancel_sparse_v2(")
+                .map(|end| start + end)
+                .expect("next managed command")];
+        for required in [
+            "state.graph_load.lock()",
+            "authorized_startup_recovery_target",
+            "startup_recovery_target_is_remembered",
+            "cancel_sparse_v2_cold_at_paths_with_archive_and_publish",
+            "open_and_publish_direct_files",
+        ] {
+            assert!(
+                command.contains(required),
+                "cold recovery must retain `{required}`"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_return_without_slot_archives_local_and_shared_provider_evidence_preserving_bytes() {
+        let local = cold_fixture(Some("shadow_import"));
+        create_empty_local_provider_scaffold(&local.graph_root);
+        let local_provider = snapshot_tree(&local.graph_root.join(".tine-sync/v2"));
+        let local_result = cancel_sparse_v2_cold_at_paths(
+            &local.state,
+            "main",
+            local.graph_root.clone(),
+            &local.private_root,
+            &local.recovery_root,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            local_result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!local.private_root.exists());
+        assert_eq!(
+            snapshot_tree(
+                &std::fs::read_dir(local.graph_root.join(".tine-sync/recovery"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            ),
+            local_provider
+        );
+        assert_eq!(
+            std::fs::read(&local.markdown_path).unwrap(),
+            local.markdown_bytes
+        );
+        assert!(local
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+
+        let shared = cold_fixture(Some("joining"));
+        std::fs::create_dir_all(shared.graph_root.join(".tine-sync/v2/shared")).unwrap();
+        std::fs::write(
+            shared
+                .graph_root
+                .join(".tine-sync/v2/shared/provider-evidence"),
+            b"shared provider bytes",
+        )
+        .unwrap();
+        let shared_provider = snapshot_tree(&shared.graph_root.join(".tine-sync/v2"));
+        cancel_sparse_v2_cold_at_paths(
+            &shared.state,
+            "main",
+            shared.graph_root.clone(),
+            &shared.private_root,
+            &shared.recovery_root,
+            None,
+        )
+        .unwrap();
+        let archived_provider = std::fs::read_dir(shared.graph_root.join(".tine-sync/recovery"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(snapshot_tree(&archived_provider), shared_provider);
+        assert!(!shared.private_root.exists());
+        assert!(shared
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+    }
+
+    #[test]
+    fn cold_return_archive_failure_keeps_private_provider_and_markdown_bytes_retryable() {
+        let fixture = cold_fixture(Some("shadow_import"));
+        create_empty_local_provider_scaffold(&fixture.graph_root);
+        let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+        let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
+        let error = cancel_sparse_v2_cold_at_paths_with_archive(
+            &fixture.state,
+            "main",
+            fixture.graph_root.clone(),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            |_, _| Err("injected cold archive failure".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected cold archive failure"));
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            markdown_before
+        );
+        assert!(!fixture.recovery_root.exists());
+        let retryable = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(retryable.is_sparse_v2());
+        assert!(retryable.sparse_runtime().is_none());
+    }
+
+    #[test]
+    fn cold_return_refuses_missing_or_corrupt_binding_without_archiving() {
+        let missing = cold_fixture(Some("shadow_import"));
+        std::fs::remove_file(missing.private_root.join(SPARSE_BINDING_FILE)).unwrap();
+        let missing_before = snapshot_tree(&missing.private_root);
+        let missing_error = cancel_sparse_v2_cold_at_paths(
+            &missing.state,
+            "main",
+            missing.graph_root.clone(),
+            &missing.private_root,
+            &missing.recovery_root,
+            None,
+        )
+        .unwrap_err();
+        assert!(missing_error.contains("No local Tine-managed storage recovery binding"));
+        assert_eq!(snapshot_tree(&missing.private_root), missing_before);
+        assert!(!missing.recovery_root.exists());
+        assert!(missing.state.graphs.read().unwrap().slot("main").is_none());
+
+        let corrupt = cold_fixture(Some("shadow_import"));
+        std::fs::write(corrupt.private_root.join(SPARSE_BINDING_FILE), b"{").unwrap();
+        let corrupt_before = snapshot_tree(&corrupt.private_root);
+        let corrupt_error = cancel_sparse_v2_cold_at_paths(
+            &corrupt.state,
+            "main",
+            corrupt.graph_root.clone(),
+            &corrupt.private_root,
+            &corrupt.recovery_root,
+            None,
+        )
+        .unwrap_err();
+        assert!(corrupt_error.contains("incomplete or unreadable"));
+        assert_eq!(snapshot_tree(&corrupt.private_root), corrupt_before);
+        assert!(!corrupt.recovery_root.exists());
+        assert!(corrupt.state.graphs.read().unwrap().slot("main").is_none());
+    }
+
+    #[test]
+    fn cold_return_never_archives_while_a_live_slot_owns_the_target() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        let private_before = snapshot_tree(&fixture.private_root);
+        let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
+        let error = cancel_sparse_v2_cold_at_paths(
+            &fixture.state,
+            "main",
+            fixture.graph_root.clone(),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("already owns a graph"));
+        assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            std::fs::read(&fixture.markdown_path).unwrap(),
+            markdown_before
+        );
+        assert!(!fixture.recovery_root.exists());
+        assert!(fixture.state.graphs.read().unwrap().slot("main").is_some());
     }
 
     #[test]
