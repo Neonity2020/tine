@@ -4118,6 +4118,47 @@ impl SyncRuntimeHandle {
         Ok(outcome)
     }
 
+    /// Explicit crash-style stop for the user-confirmed Direct Files escape.
+    ///
+    /// This deliberately does not attempt a drain, reconciliation, or Safe
+    /// handoff.  It serializes with all public actor requests, closes the sole
+    /// private sender, and joins the actor before returning, so callers may
+    /// archive private managed state without racing a live writer.  It is
+    /// idempotent: a previously Safe runtime stays Safe, while every other
+    /// stopped state truthfully records that it was stopped without a clean
+    /// drain.
+    pub fn stop_without_clean_drain(
+        &self,
+    ) -> Result<SyncRuntimeStatusSnapshot, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        self.inner.sender.lock().unwrap().take();
+        let joined = self
+            .inner
+            .join
+            .lock()
+            .unwrap()
+            .take()
+            .map(|join| join.join().is_ok())
+            .unwrap_or(true);
+
+        let mut status = self.inner.status.write().unwrap();
+        if status.lifecycle != SyncRuntimeLifecycle::StoppedSafe {
+            status.lifecycle = SyncRuntimeLifecycle::StoppedCrashed;
+            status.detail = Some(
+                "explicit Direct Files override stopped managed storage without a clean drain"
+                    .into(),
+            );
+            status.shared_role = None;
+            status.shared_phase = None;
+        }
+        let snapshot = status.clone();
+        if joined {
+            Ok(snapshot)
+        } else {
+            Err(SyncRuntimeRequestError::ActorUnavailable)
+        }
+    }
+
     #[cfg(test)]
     fn install_repeated_operational_fault(
         &self,
@@ -22692,6 +22733,7 @@ mod tests {
     use crate::model::Format;
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::exact_external_feed::tests::RuntimeHostFixture;
+    use crate::oplog::resume_point::RuntimeResumePointV2;
     use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
     use std::collections::BTreeMap;
     use std::fs;
@@ -43095,6 +43137,47 @@ mod tests {
         files
     }
 
+    /// Resolve the run named by the newest concrete resume-point record, rather
+    /// than choosing an arbitrary retained directory.  The runtime itself
+    /// makes the same record selection before it tries to adopt the run.
+    fn selected_retained_scratch_run_for_test(archive_root: &Path) -> (Uuid, PathBuf) {
+        let history_root = archive_root.join("engine-history");
+        let mut endpoints = fs::read_dir(&history_root)
+            .unwrap_or_else(|error| panic!("promoted archive has engine history: {error}"))
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_dir())
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "fixture has exactly one durable history endpoint"
+        );
+        let mut points = fs::read_dir(endpoints.pop().unwrap().join("resume-points"))
+            .unwrap_or_else(|error| panic!("safe handoff published a resume point: {error}"))
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                RuntimeResumePointV2::decode(
+                    &fs::read(entry.path())
+                        .unwrap_or_else(|error| panic!("resume point is readable: {error}")),
+                )
+                .unwrap_or_else(|error| panic!("resume point is canonical: {error}"))
+            })
+            .collect::<Vec<_>>();
+        let point = points
+            .drain(..)
+            .max_by_key(RuntimeResumePointV2::resume_sequence)
+            .expect("safe handoff leaves a resume point to select the retained run");
+        let run_id = point.scratch_run_id();
+        let run = archive_root
+            .join("engine-scratch-v2")
+            .join(format!("run-{run_id}"));
+        assert!(run.is_dir(), "selected retained scratch run exists");
+        (run_id, run)
+    }
+
     #[derive(Debug)]
     struct ActivationScaleReceipt {
         source_files: usize,
@@ -45378,6 +45461,122 @@ mod tests {
                     .expect("the projection file is writable");
             },
             "rebuilt-preserving-evidence",
+        );
+    }
+
+    /// A retained run is a reconstructible accelerator, not authority.  This
+    /// captures the pre-recovery failure journey by corrupting only the
+    /// `blobs.data` file of the exact run selected by the published resume
+    /// point, then forcing SQLite to materialize documents from that selected
+    /// run on reopen.
+    #[test]
+    fn managed_reopen_rebuilds_after_malformed_retained_scratch_blob() {
+        let fixture = ActivationFixture::nested_unicode(
+            "managed-reopen-malformed-retained-scratch-blob",
+            0xa0ed,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "accepted before retained scratch corruption",
+        );
+        let (written, _) = load_application_exact(&handle, "Root.md");
+        assert!(
+            written
+                .blocks
+                .iter()
+                .any(|block| block.raw.contains("accepted before retained scratch corruption")),
+            "the fresh activation's current retained scratch must serve a read-after-write before any restart"
+        );
+        drain_managed_local(&handle);
+        assert!(
+            matches!(handle.clean_shutdown(), Ok(SyncShutdownOutcome::Safe(_))),
+            "the selected run is emitted only after a safe, settled handoff"
+        );
+        drop(handle);
+
+        let expected_graph = user_graph_bytes(&fixture.graph_root);
+
+        let (selected_run_id, selected_run) =
+            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
+        let selected_before = fs::read_dir(&selected_run)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let selected_blobs = selected_run.join(tine_storage::formats::SCRATCH_BLOBS_FILE);
+        assert!(
+            selected_blobs.is_file(),
+            "selected retained run has blobs.data"
+        );
+
+        // The retained SQLite projection would otherwise remain a valid cache
+        // and hide the fault.  It is disposable, so force its normal rebuild
+        // without touching any accepted immutable archive bytes.
+        tine_storage::sqlite::SqliteFileSet::new(&fixture.request.database_path)
+            .remove()
+            .expect("the disposable SQLite projection is removable");
+        fs::write(&selected_blobs, b"not a scratch blob").unwrap();
+        let selected_corrupted = fs::read_dir(&selected_run)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
+        let reopened = reopened
+            .handle
+            .expect("typed retained-scratch failure replays into an active runtime");
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            expected_graph,
+            "replay recovery must not rewrite direct graph bytes"
+        );
+        let selected_after = fs::read_dir(&selected_run)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            selected_after, selected_corrupted,
+            "recovery must leave the abandoned selected run {selected_run_id} byte-for-byte intact"
+        );
+        assert_ne!(selected_corrupted, selected_before);
+        assert!(matches!(
+            reopened.clean_shutdown(),
+            Ok(SyncShutdownOutcome::Safe(_))
+        ));
+        let (replacement_run_id, _) =
+            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
+        assert_ne!(
+            replacement_run_id, selected_run_id,
+            "safe recovery publishes a fresh retained run rather than reusing the malformed one"
         );
     }
 

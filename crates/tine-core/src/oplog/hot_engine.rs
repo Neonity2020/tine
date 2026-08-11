@@ -6149,6 +6149,88 @@ pub struct RuntimeResumeObservation {
     pub replayed_generations: u64,
 }
 
+/// A recoverable read failure in the retained scratch run selected by an
+/// authenticated runtime-resume point.  Retained scratch is an accelerator,
+/// not authority: the immutable archive remains sufficient to reconstruct a
+/// fresh run.  This type deliberately preserves that distinction until the
+/// promoted-runtime boundary can make the one allowed recovery decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RetainedScratchFault {
+    Unreadable,
+    UnsafeEntry,
+    MalformedMarker,
+    MalformedPage,
+    MalformedBlob,
+    PageTooLarge,
+    PageDigestMismatch,
+    BlobDigestMismatch,
+    PageBindingMismatch,
+}
+
+impl fmt::Display for RetainedScratchFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable => f.write_str("scratch I/O failed"),
+            Self::UnsafeEntry => f.write_str("unsafe scratch entry"),
+            Self::MalformedMarker => f.write_str("malformed scratch marker"),
+            Self::MalformedPage => f.write_str("malformed or non-canonical scratch page"),
+            Self::MalformedBlob => f.write_str("malformed scratch blob"),
+            Self::PageTooLarge => f.write_str("scratch page is too large"),
+            Self::PageDigestMismatch => f.write_str("scratch page digest mismatch"),
+            Self::BlobDigestMismatch => f.write_str("scratch blob digest mismatch"),
+            Self::PageBindingMismatch => f.write_str("scratch page reference is misbound"),
+        }
+    }
+}
+
+/// Typed provenance for a reconstructible retained-scratch failure.  The run
+/// identifier is not an authority; it only proves the error arose while this
+/// engine was reading the exact run it adopted at open.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetainedScratchResumeFailure {
+    run_id: Uuid,
+    fault: RetainedScratchFault,
+}
+
+impl RetainedScratchResumeFailure {
+    fn from_scratch(run_id: Uuid, error: &super::scratch_store::ScratchError) -> Option<Self> {
+        use super::scratch_store::ScratchError;
+
+        let fault = match error {
+            ScratchError::Io(_) => RetainedScratchFault::Unreadable,
+            ScratchError::UnsafeEntry(_) => RetainedScratchFault::UnsafeEntry,
+            ScratchError::MalformedMarker(_) => RetainedScratchFault::MalformedMarker,
+            ScratchError::MalformedPage => RetainedScratchFault::MalformedPage,
+            ScratchError::MalformedBlob => RetainedScratchFault::MalformedBlob,
+            ScratchError::PageTooLarge(_) => RetainedScratchFault::PageTooLarge,
+            ScratchError::PageDigestMismatch(_) => RetainedScratchFault::PageDigestMismatch,
+            ScratchError::BlobDigestMismatch(_) => RetainedScratchFault::BlobDigestMismatch,
+            ScratchError::PageBindingMismatch => RetainedScratchFault::PageBindingMismatch,
+            // These are engine/programming invariants, not an untrusted
+            // retained-cache representation.  Do not turn them into an
+            // automatic replay signal.
+            ScratchError::KeyDigestCollision
+            | ScratchError::IndexCapacity
+            | ScratchError::Poisoned => return None,
+        };
+        Some(Self { run_id, fault })
+    }
+
+    pub(crate) const fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
+    pub(crate) const fn fault(&self) -> &RetainedScratchFault {
+        &self.fault
+    }
+}
+
+impl fmt::Display for RetainedScratchResumeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "document scratch index failed: {}", self.fault)
+    }
+}
+
 /// The complete authenticated Patricia inventory owned by a store-backed hot
 /// engine. Keeping this closed list beside the shared builder makes adding a
 /// fifth store impossible without updating both ordinary ownership and
@@ -9185,6 +9267,22 @@ impl ShardedHotEngine {
         self.retained_scratch.map(|identity| identity.run_id())
     }
 
+    fn document_state_error(
+        &self,
+        error: super::document_state::DocumentStateError,
+    ) -> EngineError {
+        if self.resume_observation.adopted {
+            if let (Some(run_id), super::document_state::DocumentStateError::Scratch(scratch)) =
+                (self.retained_scratch_run_id(), &error)
+            {
+                if let Some(failure) = RetainedScratchResumeFailure::from_scratch(run_id, scratch) {
+                    return EngineError::RetainedScratchResumeFailure(failure);
+                }
+            }
+        }
+        EngineError::Archive(error.to_string())
+    }
+
     /// This engine's runtime-resume observation. Set once, at startup.
     pub(crate) const fn runtime_resume_observation(&self) -> RuntimeResumeObservation {
         self.resume_observation
@@ -9836,7 +9934,7 @@ impl ShardedHotEngine {
             super::document_state::DocumentLane::Visible,
             self.catalog_document_id,
         )
-        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .map_err(|error| self.document_state_error(error))?
         else {
             return Ok(RunLocalCatalogHotState {
                 catalog_heads: BTreeSet::new(),
@@ -9872,7 +9970,7 @@ impl ShardedHotEngine {
             super::document_state::DocumentLane::Visible,
             self.catalog_document_id,
         )
-        .map_err(|error| EngineError::Archive(error.to_string()))?
+        .map_err(|error| self.document_state_error(error))?
         else {
             return Ok(BTreeSet::new());
         };
@@ -9970,6 +10068,41 @@ impl ShardedHotEngine {
             .committed_manifests()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
         self.validate_retained_bootstrap_publication()?;
+        self.rotate_to_fresh_retained_scratch()?;
+        self.prepare_operational_recovery_replay()?;
+        self.resume_observation.adopted = false;
+        self.replay_operational_history(&committed_manifests, false)?;
+        Ok(())
+    }
+
+    /// Recover once from a late read failure in the exact retained run adopted
+    /// at open.  This boundary is intentionally narrower than generic SQLite
+    /// recovery: it accepts only typed reconstructible-scratch faults tied to
+    /// the selected run, revalidates immutable bootstrap authority, leaves the
+    /// old run untouched, and replays the complete authenticated history into
+    /// a fresh retained run.
+    pub(crate) fn recover_from_retained_scratch_resume_failure(
+        &mut self,
+        failure: &RetainedScratchResumeFailure,
+    ) -> Result<(), EngineError> {
+        if !self.resume_observation.adopted
+            || self.retained_scratch_run_id() != Some(failure.run_id())
+        {
+            return Err(EngineError::Archive(
+                "retained scratch recovery is not bound to the adopted resume run".into(),
+            ));
+        }
+        let committed_manifests = self
+            .archive_store
+            .as_ref()
+            .ok_or_else(|| EngineError::Archive("engine has no immutable archive store".into()))?
+            .committed_manifests()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.validate_retained_bootstrap_publication()?;
+        eprintln!(
+            "[tine] retained scratch resume read failed ({}) ; rebuilding from immutable history",
+            failure.fault()
+        );
         self.rotate_to_fresh_retained_scratch()?;
         self.prepare_operational_recovery_replay()?;
         self.resume_observation.adopted = false;
@@ -11589,7 +11722,7 @@ impl ShardedHotEngine {
             &requested,
             external_exact_session,
         )
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
+        .map_err(|error| self.document_state_error(error))?;
         dependencies
             .into_iter()
             .flatten()
@@ -31640,6 +31773,10 @@ pub enum EngineError {
     /// At least one member of the exact canonical dependency sequence bound by
     /// this commitment was rejected. Appended to preserve prior enum tags.
     RejectedDependencySet(ContentDigest),
+    /// A late read from the exact retained run adopted at open failed in a
+    /// reconstructible accelerator.  The promoted-runtime boundary may rotate
+    /// once to a fresh retained run and replay immutable history.
+    RetainedScratchResumeFailure(RetainedScratchResumeFailure),
 }
 
 impl fmt::Display for EngineError {
@@ -31788,6 +31925,9 @@ impl fmt::Display for EngineError {
                 f,
                 "at least one member of dependency set {commitment} was rejected"
             ),
+            Self::RetainedScratchResumeFailure(failure) => {
+                write!(f, "immutable archive error: {failure}")
+            }
         }
     }
 }

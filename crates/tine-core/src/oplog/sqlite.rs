@@ -59,7 +59,9 @@ use tine_storage::sqlite::{
 };
 use uuid::Uuid;
 
-use super::hot_engine::{AcceptedFrontierRoot, EngineAuthority};
+use super::hot_engine::{
+    AcceptedFrontierRoot, EngineAuthority, EngineError, RetainedScratchResumeFailure,
+};
 use super::import::{
     InactiveBootstrapAcceptedAuthority, InactiveBootstrapAcceptedAuthorityBinding,
     TerminalBootstrapConstructionMaterial,
@@ -1283,7 +1285,7 @@ fn materialize_accepted_event_with_stats(
     let mut materializer = (!affected_pages.is_empty())
         .then(|| engine.accepted_root_materializer(event.post_frontier_root()))
         .transpose()
-        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        .map_err(ProjectionError::materialization_from_engine)?;
     if materializer.is_some() {
         instrumentation.accepted_root_authentications = 1;
     }
@@ -1292,7 +1294,7 @@ fn materialize_accepted_event_with_stats(
             .as_mut()
             .expect("nonempty affected pages construct a materializer")
             .materialize_page(page_id)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+            .map_err(ProjectionError::materialization_from_engine)?
         {
             Some(mut page) => {
                 if let Some(transition) = effective_transitions.get(&page_id) {
@@ -1381,7 +1383,7 @@ fn materialize_inactive_bootstrap_event_bulk_with_budget(
                     event.post_frontier_root(),
                     session_budget_bytes_per_root,
                 )
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))
+                .map_err(ProjectionError::materialization_from_engine)
         })
         .transpose()?;
     let mut replacements = Vec::new();
@@ -1392,7 +1394,7 @@ fn materialize_inactive_bootstrap_event_bulk_with_budget(
             .as_ref()
             .expect("nonempty affected pages construct a bulk materializer")
             .materialize_pages(page_ids)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         for (page_id, page) in page_ids.iter().copied().zip(pages) {
             match page {
                 Some(mut page) => {
@@ -4738,7 +4740,7 @@ impl SqliteFrontier {
     ) -> Result<u64, ProjectionError> {
         let binding = engine
             .current_path_catalog_binding()
-            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         if binding.workspace_id() != engine.workspace_id()
             || binding.lineage_digest() != engine.lineage_digest()
             || binding.accepted_frontier() != terminal_root.state_digest()
@@ -4755,7 +4757,7 @@ impl SqliteFrontier {
             )?;
         let reference_index = engine
             .reference_source_posting_index_at(&catalog_root)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         bootstrap.terminal_reference_index_traversals = 1;
         bootstrap.terminal_reference_index_entries = reference_index.len();
         if reference_index.len() as u64 != binding.catalog_rows() {
@@ -4771,7 +4773,7 @@ impl SqliteFrontier {
                         terminal_root,
                         super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
                     )
-                    .map_err(|error| ProjectionError::Materialization(error.to_string()))
+                    .map_err(ProjectionError::materialization_from_engine)
             })
             .transpose()?;
         bootstrap.terminal_materializations = 1;
@@ -4780,7 +4782,7 @@ impl SqliteFrontier {
         let mut cursor = Some(
             engine
                 .begin_current_path_cursor()
-                .map_err(|error| ProjectionError::Rebuild(error.to_string()))?,
+                .map_err(ProjectionError::materialization_from_engine)?,
         );
         let mut pending: Vec<super::hot_engine::CurrentPathCatalogRow> = Vec::new();
         let mut observed_rows = 0_u64;
@@ -4793,7 +4795,7 @@ impl SqliteFrontier {
                     TERMINAL_CATALOG_CURSOR_PAGE_ROWS
                         .min(super::hot_engine::MAX_CURRENT_PATH_CURSOR_PAGE_ROWS),
                 )
-                .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+                .map_err(ProjectionError::materialization_from_engine)?;
             bootstrap.terminal_catalog_cursor_micros = bootstrap
                 .terminal_catalog_cursor_micros
                 .saturating_add(cursor_started.elapsed().as_micros());
@@ -4858,7 +4860,7 @@ impl SqliteFrontier {
         }
         let current = engine
             .current_path_catalog_binding()
-            .map_err(|error| ProjectionError::Rebuild(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         if current != binding
             || observed_rows != binding.catalog_rows()
             || seen_pages.len() as u64 != binding.catalog_rows()
@@ -4914,7 +4916,7 @@ impl SqliteFrontier {
         let materialize_started = std::time::Instant::now();
         let materialized = materializer
             .materialize_pages(&page_ids)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+            .map_err(ProjectionError::materialization_from_engine)?;
         bootstrap.terminal_materialization_micros = bootstrap
             .terminal_materialization_micros
             .saturating_add(materialize_started.elapsed().as_micros());
@@ -8041,6 +8043,10 @@ pub enum ProjectionError {
     },
     FrontierRegression,
     BatchCollision(BatchId),
+    /// A selected retained scratch accelerator became unreadable while this
+    /// SQLite open was materializing the current authenticated frontier.  It
+    /// remains typed so `local_active` can take the single safe replay retry.
+    RetainedScratchResumeFailure(RetainedScratchResumeFailure),
     Materialization(String),
     Rebuild(String),
     InjectedFailure,
@@ -8118,9 +8124,34 @@ impl fmt::Display for ProjectionError {
                     "accepted batch {batch_id} collides with its SQLite record"
                 )
             }
+            Self::RetainedScratchResumeFailure(failure) => write!(
+                f,
+                "SQLite materialization failed: immutable archive error: {failure}"
+            ),
             Self::Materialization(error) => write!(f, "SQLite materialization failed: {error}"),
             Self::Rebuild(error) => write!(f, "SQLite rebuild failed: {error}"),
             Self::InjectedFailure => write!(f, "injected SQLite transaction failure"),
+        }
+    }
+}
+
+impl ProjectionError {
+    /// Preserve the only typed accelerator fault that may be recovered at the
+    /// promoted-runtime open boundary.  Every other engine failure remains an
+    /// ordinary materialization failure and must fail closed.
+    pub(crate) fn materialization_from_engine(error: EngineError) -> Self {
+        match error {
+            EngineError::RetainedScratchResumeFailure(failure) => {
+                Self::RetainedScratchResumeFailure(failure)
+            }
+            error => Self::Materialization(error.to_string()),
+        }
+    }
+
+    pub(crate) fn retained_scratch_resume_failure(&self) -> Option<&RetainedScratchResumeFailure> {
+        match self {
+            Self::RetainedScratchResumeFailure(failure) => Some(failure),
+            _ => None,
         }
     }
 }
