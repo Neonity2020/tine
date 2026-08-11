@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { Settings } from "./Settings";
 import { closeSettings, dismissToast, openSettings, setToasts, toasts } from "../ui";
@@ -35,6 +35,13 @@ afterEach(() => {
 });
 
 describe("Settings storage transitions", () => {
+  beforeEach(() => {
+    // The render harness provides a Direct Files binding for ordinary component
+    // fixtures. These tests intentionally exercise backend status transitions
+    // across several explicit binding generations, so they must begin unbound.
+    managedStorageRuntime.clear();
+  });
+
   const legacy = (): SparseV2Status => ({
     state: "legacy_default",
     runtime: null,
@@ -44,6 +51,14 @@ describe("Settings storage transitions", () => {
     cancel_reason: null,
     binding_generation: 10,
     application_page_admission: { binding_generation: 10, authority: "direct" },
+  });
+  const legacyAt = (bindingGeneration: number): SparseV2Status => ({
+    ...legacy(),
+    binding_generation: bindingGeneration,
+    application_page_admission: {
+      binding_generation: bindingGeneration,
+      authority: "direct",
+    },
   });
 
   const localActive = (): SparseV2Status => ({
@@ -297,7 +312,14 @@ describe("Settings storage transitions", () => {
     });
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
     vi.spyOn(store, "flushAll").mockResolvedValue(true);
-    vi.spyOn(backend(), "joinSparseV2Shared").mockResolvedValue({ ...localRetryable(), binding_generation: 15 });
+    vi.spyOn(backend(), "joinSparseV2Shared").mockResolvedValue({
+      ...localRetryable(),
+      binding_generation: 15,
+      application_page_admission: {
+        binding_generation: 15,
+        authority: "managed_unavailable",
+      },
+    });
 
     const joinRoot = document.createElement("div");
     document.body.append(joinRoot);
@@ -468,7 +490,7 @@ describe("Settings storage transitions", () => {
     });
     vi.spyOn(backend(), "cancelSparseV2").mockImplementation(async () => {
       calls.push("cancel");
-      const status = { ...legacy(), binding_generation: 12 };
+      const status = legacyAt(12);
       return {
         status,
         binding_generation: 12,
@@ -511,7 +533,7 @@ describe("Settings storage transitions", () => {
     const flush = vi.spyOn(store, "flushAll").mockResolvedValue(true);
     const reset = vi.spyOn(store, "resetStore");
     vi.spyOn(backend(), "cancelSparseV2").mockResolvedValue({
-      status: { ...legacy(), binding_generation: 12 },
+      status: legacyAt(12),
       binding_generation: 12,
       recovery_statement: "Direct file mode is active. Complete recovery state was preserved.",
     });
@@ -546,7 +568,7 @@ describe("Settings storage transitions", () => {
     const reset = vi.spyOn(store, "resetStore");
     vi.spyOn(backend(), "cancelSparseV2").mockImplementation(async () => {
       calls.push("cancel");
-      const status = { ...legacy(), binding_generation: 12 };
+      const status = legacyAt(12);
       return {
         status,
         binding_generation: 12,
