@@ -6638,6 +6638,10 @@ struct WarmDraftWork {
     prospective_catalog_shape_entry_visits: usize,
     author_snapshot_clones: usize,
     author_snapshot_clone_ops: usize,
+    projection_capture_document_moves: usize,
+    projection_capture_document_clones: usize,
+    projection_prestate_document_clones: usize,
+    retained_author_candidate_clones: usize,
     prepare_document_head_visits: usize,
     catalog_page_entry_visits: usize,
     document_point_reads: usize,
@@ -6669,6 +6673,14 @@ fn warm_draft_work(fixture: &WarmCatalogFixture, batch: u128, content: &str) -> 
         author_snapshot_clones: after.author_snapshot_clones - before.author_snapshot_clones,
         author_snapshot_clone_ops: after.author_snapshot_clone_ops
             - before.author_snapshot_clone_ops,
+        projection_capture_document_moves: after.projection_capture_document_moves
+            - before.projection_capture_document_moves,
+        projection_capture_document_clones: after.projection_capture_document_clones
+            - before.projection_capture_document_clones,
+        projection_prestate_document_clones: after.projection_prestate_document_clones
+            - before.projection_prestate_document_clones,
+        retained_author_candidate_clones: after.retained_author_candidate_clones
+            - before.retained_author_candidate_clones,
         prepare_document_head_visits: after.prepare_document_head_visits
             - before.prepare_document_head_visits,
         catalog_page_entry_visits: crate::oplog::hot_engine::catalog_page_entry_visits()
@@ -6715,9 +6727,22 @@ fn warm_one_page_content_edit_draft_is_independent_of_total_graph_pages() {
     );
     assert_eq!(large_work.catalog_page_entry_visits, 0);
     assert_eq!(
-        small_work.prospective_document_copies, 1,
-        "only the edited page's own shard is reproduced"
+        small_work.prospective_document_copies, 0,
+        "the prospective post-state is borrowed from the owned capture"
     );
+    assert_eq!(large_work.prospective_document_copies, 0);
+    assert_eq!(
+        small_work.projection_capture_document_moves, 1,
+        "only the edited page's owned author document moves into the prospective capture"
+    );
+    assert_eq!(large_work.projection_capture_document_moves, 1);
+    assert_eq!(small_work.projection_capture_document_clones, 0);
+    assert_eq!(large_work.projection_capture_document_clones, 0);
+    assert_eq!(
+        small_work.projection_prestate_document_clones, 1,
+        "the pre-state remains independently materialized"
+    );
+    assert_eq!(large_work.projection_prestate_document_clones, 1);
     assert!(
         small_work.external_point_reads <= 4,
         "the accepted-page proof may perform only constant-size point reads"
@@ -6889,8 +6914,8 @@ fn every_local_author_transaction_class_derives_the_same_draft_as_the_previous_d
         );
     }
 
-    // Catalog-changing and refusing classes keep the previous derivation,
-    // because the drafted transaction owns the prospective catalog itself.
+    // Catalog-changing classes now borrow their owned prospective catalog as
+    // well. The previous derivation remains the complete forced-copy oracle.
     let catalog_wide: Vec<(&str, OperationTransaction)> = vec![
         (
             "new page",
@@ -6964,12 +6989,12 @@ fn every_local_author_transaction_class_derives_the_same_draft_as_the_previous_d
         );
         assert_eq!(observed.refused, None, "{label} must draft");
         assert_eq!(
-            observed.optimized_catalog_copies, observed.oracle_catalog_copies,
-            "{label} changes catalog-wide identity and must keep the previous derivation"
+            observed.optimized_catalog_copies, 0,
+            "{label} must borrow its owned prospective catalog"
         );
         assert!(
-            observed.optimized_catalog_copies >= 1,
-            "{label} must fall back to the previous derivation"
+            observed.oracle_catalog_copies >= 1,
+            "{label} oracle must retain the forced-copy derivation"
         );
     }
 
