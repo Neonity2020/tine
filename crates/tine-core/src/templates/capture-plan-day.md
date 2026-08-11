@@ -31,7 +31,7 @@ icon:: ✅
 		SCHEDULED: <2026-08-12 Wed +1w>
 	- Then this query lists them:
 	- {{query (task TODO DOING NOW LATER)}}
-	- What you should see: the marked tasks above, and any other open task in the graph (the [[Feature showcase]] has a few; a copied Guide adds your own), because the query scans the whole graph for those markers. DONE tasks never appear.
+	- What you should see: the marked tasks above, plus tasks elsewhere in the graph that use `TODO`, `DOING`, `NOW`, or `LATER` (the [[Feature showcase]] has a few; a copied Guide adds your own). The query scans the whole graph for those four markers; DONE tasks and tasks using other markers do not appear.
 - ## See the plan: the Agenda
   - 1. Scroll to the bottom of today's journal: the **Scheduled &amp; Deadline** list shows open items whose date is near today, wherever in the graph they were written.
   - 2. What you should see: your dated tasks, each with its date chip; click one to jump to it. Widen or narrow the range in Settings → **Journals** → **Agenda window** (default: a week back and a week ahead).
@@ -41,4 +41,4 @@ icon:: ✅
   - 3. Variants: on today, **Carry from previous day** pulls yesterday in; **Carry last N days** goes further back (N is set in Settings, default 7). The same action is on a journal's right-click menu, and the command palette (Ctrl+K) has 7 / 30 / 365-day presets.
   - Settings → **Journals** also tunes it: hide the buttons (the right-click menu keeps working), move the whole block with its context or just the task line, add a “Carried over” heading.
 - ## Where everything lives
-  - All of this is plain text in `journals/`: the marker first, then `[#A]`, then the `SCHEDULED:`/`DEADLINE:` lines — readable by Logseq and by any editor. The companion reference page [[Reference/Journals, tasks, and scheduling]] maps the marker set, repeaters, time tracking, and the stored query behind the Agenda. If something looks wrong — a banner, a conflict copy, a duplicate day — [[Reference/Troubleshooting and recovery]] has the recovery steps.
+  - All of this remains plain text. Journal entries use the graph's configured journal directory; tasks on ordinary pages stay in their own Markdown or Org files. Within a task, the marker comes first, then `[#A]`, then the `SCHEDULED:`/`DEADLINE:` lines — readable by Logseq and by any editor. The companion reference page [[Reference/Journals, tasks, and scheduling]] maps the marker set, repeaters, time tracking, and the stored query behind the Agenda. If something looks wrong — a banner, a conflict copy, a duplicate day — [[Reference/Troubleshooting and recovery]] has the recovery steps.
