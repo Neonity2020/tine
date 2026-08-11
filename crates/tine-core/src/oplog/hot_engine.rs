@@ -113,6 +113,123 @@ pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 
+/// Test-only, per-thread attribution for the ordinary trusted-local authoring
+/// path.  This is deliberately an observation receipt, not engine state: it
+/// is reset by the trusted-local coordinator and is absent from release
+/// artifacts.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LocalMutationDetailTimings {
+    pub(crate) core_total: std::time::Duration,
+    pub(crate) core_preflight: std::time::Duration,
+    pub(crate) author_operations_inclusive: std::time::Duration,
+    pub(crate) before_semantic_snapshots_child: std::time::Duration,
+    pub(crate) identity_trigger_validation: std::time::Duration,
+    pub(crate) after_semantic_snapshots: std::time::Duration,
+    pub(crate) effect_derive_encode: std::time::Duration,
+    pub(crate) dependencies_frontier: std::time::Duration,
+    pub(crate) delta_export_object_construction: std::time::Duration,
+    pub(crate) manifest_path_authority: std::time::Duration,
+    pub(crate) prospective_document_capture: std::time::Duration,
+    pub(crate) before_projection_materialization: std::time::Duration,
+    pub(crate) post_projection_materialization: std::time::Duration,
+    pub(crate) projection_requirement_assembly: std::time::Duration,
+    pub(crate) finalize_authority_checks: std::time::Duration,
+    pub(crate) finalize_base_objects: std::time::Duration,
+    pub(crate) finalize_projection_intents: std::time::Duration,
+    pub(crate) finalize_seal_pending: std::time::Duration,
+    pub(crate) core_calls: usize,
+    pub(crate) operation_count: usize,
+    pub(crate) before_snapshot_documents: usize,
+    pub(crate) before_snapshot_blocks: usize,
+    pub(crate) after_snapshot_documents: usize,
+    pub(crate) after_snapshot_blocks: usize,
+    pub(crate) effect_block_deltas: usize,
+    pub(crate) affected_documents: usize,
+    pub(crate) affected_heads: usize,
+    pub(crate) delta_exports: usize,
+    pub(crate) delta_export_bytes: usize,
+    pub(crate) constructed_object_bytes: usize,
+    pub(crate) captured_documents: usize,
+    pub(crate) before_projection_pages: usize,
+    pub(crate) post_projection_pages: usize,
+    pub(crate) projection_requirements: usize,
+    pub(crate) draft_calls: usize,
+    pub(crate) finalize_captured_inputs: usize,
+    pub(crate) finalize_base_objects_count: usize,
+    pub(crate) finalize_projection_intents_count: usize,
+    pub(crate) finalize_projection_intent_bytes: usize,
+    pub(crate) finalize_final_objects: usize,
+    pub(crate) finalize_calls: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_LOCAL_MUTATION_DETAIL_TIMINGS: Cell<LocalMutationDetailTimings> =
+        Cell::new(LocalMutationDetailTimings {
+            core_total: std::time::Duration::ZERO,
+            core_preflight: std::time::Duration::ZERO,
+            author_operations_inclusive: std::time::Duration::ZERO,
+            before_semantic_snapshots_child: std::time::Duration::ZERO,
+            identity_trigger_validation: std::time::Duration::ZERO,
+            after_semantic_snapshots: std::time::Duration::ZERO,
+            effect_derive_encode: std::time::Duration::ZERO,
+            dependencies_frontier: std::time::Duration::ZERO,
+            delta_export_object_construction: std::time::Duration::ZERO,
+            manifest_path_authority: std::time::Duration::ZERO,
+            prospective_document_capture: std::time::Duration::ZERO,
+            before_projection_materialization: std::time::Duration::ZERO,
+            post_projection_materialization: std::time::Duration::ZERO,
+            projection_requirement_assembly: std::time::Duration::ZERO,
+            finalize_authority_checks: std::time::Duration::ZERO,
+            finalize_base_objects: std::time::Duration::ZERO,
+            finalize_projection_intents: std::time::Duration::ZERO,
+            finalize_seal_pending: std::time::Duration::ZERO,
+            core_calls: 0,
+            operation_count: 0,
+            before_snapshot_documents: 0,
+            before_snapshot_blocks: 0,
+            after_snapshot_documents: 0,
+            after_snapshot_blocks: 0,
+            effect_block_deltas: 0,
+            affected_documents: 0,
+            affected_heads: 0,
+            delta_exports: 0,
+            delta_export_bytes: 0,
+            constructed_object_bytes: 0,
+            captured_documents: 0,
+            before_projection_pages: 0,
+            post_projection_pages: 0,
+            projection_requirements: 0,
+            draft_calls: 0,
+            finalize_captured_inputs: 0,
+            finalize_base_objects_count: 0,
+            finalize_projection_intents_count: 0,
+            finalize_projection_intent_bytes: 0,
+            finalize_final_objects: 0,
+            finalize_calls: 0,
+        });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_local_mutation_detail_timings() {
+    LAST_LOCAL_MUTATION_DETAIL_TIMINGS.set(LocalMutationDetailTimings::default());
+}
+
+#[cfg(test)]
+pub(crate) fn last_local_mutation_detail_timings() -> LocalMutationDetailTimings {
+    LAST_LOCAL_MUTATION_DETAIL_TIMINGS.get()
+}
+
+#[cfg(test)]
+fn note_local_mutation_detail(update: impl FnOnce(&mut LocalMutationDetailTimings)) {
+    LAST_LOCAL_MUTATION_DETAIL_TIMINGS.with(|timings| {
+        let mut current = timings.get();
+        update(&mut current);
+        timings.set(current);
+    });
+}
+
 // This is a run-local, authenticated view over the accepted catalog. It is
 // deliberately not an object-store, receipt, or projection format.
 #[allow(dead_code)]
@@ -15596,6 +15713,10 @@ impl ShardedHotEngine {
         observation: Option<ExternalImportObservationMaterial>,
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.draft_calls = detail.draft_calls.saturating_add(1);
+        });
         if origin == BatchOrigin::BootstrapImport {
             return Err(EngineError::InvalidTransaction(
                 "bootstrap import must use the origin-explicit bootstrap helper".into(),
@@ -15613,11 +15734,22 @@ impl ShardedHotEngine {
         let affected_pages = affected_projection_pages(&parts.semantic_effect);
         let mut pages = BTreeMap::new();
         for page_id in affected_pages {
+            #[cfg(test)]
+            let before_projection_started = Instant::now();
             let before = match self.materialize_page_for_projection(page_id) {
                 Ok(state) => Some(state),
                 Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => None,
                 Err(error) => return Err(error),
             };
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_projection_materialization = detail
+                    .before_projection_materialization
+                    .saturating_add(before_projection_started.elapsed());
+                detail.before_projection_pages = detail.before_projection_pages.saturating_add(1);
+            });
+            #[cfg(test)]
+            let post_projection_started = Instant::now();
             let after = self.prospective_projection_page(
                 page_id,
                 author.batch_id,
@@ -15633,6 +15765,13 @@ impl ShardedHotEngine {
                     &parts.prospective_documents,
                 )?,
             };
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.post_projection_materialization = detail
+                    .post_projection_materialization
+                    .saturating_add(post_projection_started.elapsed());
+                detail.post_projection_pages = detail.post_projection_pages.saturating_add(1);
+            });
             pages.insert(
                 page_id,
                 DraftProjectionPage {
@@ -15642,7 +15781,18 @@ impl ShardedHotEngine {
                 },
             );
         }
+        #[cfg(test)]
+        let requirements_started = Instant::now();
         let requirements = projection_requirements(&pages)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.projection_requirement_assembly = detail
+                .projection_requirement_assembly
+                .saturating_add(requirements_started.elapsed());
+            detail.projection_requirements = detail
+                .projection_requirements
+                .saturating_add(requirements.len());
+        });
         if origin == BatchOrigin::LocalMutation && requirements.is_empty() {
             // This is valid only for a semantic transaction whose exact
             // projection transition set is empty. Closed-set acceptance
@@ -16205,6 +16355,8 @@ impl ShardedHotEngine {
         captured: CapturedAuthorTransaction,
         receipts: &ProjectionReceiptStore,
     ) -> Result<PreparedBatch, EngineError> {
+        #[cfg(test)]
+        let authority_checks_started = Instant::now();
         let CapturedAuthorTransaction {
             mut draft,
             source,
@@ -16310,6 +16462,14 @@ impl ShardedHotEngine {
             .into_iter()
             .map(|input| (input.path, input.material))
             .collect::<BTreeMap<_, _>>();
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.finalize_authority_checks = detail
+                .finalize_authority_checks
+                .saturating_add(authority_checks_started.elapsed());
+            detail.finalize_captured_inputs =
+                detail.finalize_captured_inputs.saturating_add(inputs.len());
+        });
 
         // This is the only consumer of editor preparation.  Any transaction
         // shape other than one existing Present -> Present requirement remains
@@ -16328,7 +16488,11 @@ impl ShardedHotEngine {
             None
         };
 
+        #[cfg(test)]
+        let base_objects_started = Instant::now();
         let mut objects = draft.prepared_core.objects().to_vec();
+        #[cfg(test)]
+        let core_object_count = objects.len();
         let mut observed_bases =
             BTreeMap::<ManagedPath, (ManifestObjectRef, AnnotatedProjectionBase)>::new();
         let mut render_bases =
@@ -16469,6 +16633,20 @@ impl ShardedHotEngine {
             }
         }
 
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            let base_objects = &objects[core_object_count..];
+            detail.finalize_base_objects = detail
+                .finalize_base_objects
+                .saturating_add(base_objects_started.elapsed());
+            detail.finalize_base_objects_count = detail
+                .finalize_base_objects_count
+                .saturating_add(base_objects.len());
+        });
+        #[cfg(test)]
+        let projection_intents_started = Instant::now();
+        #[cfg(test)]
+        let projection_intent_start = objects.len();
         for requirement in &draft.requirements {
             let page = &draft.pages[&requirement.page_id];
             let precondition = match &inputs[&requirement.path] {
@@ -16620,6 +16798,25 @@ impl ShardedHotEngine {
             )?;
             objects.push(object);
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            let intents = &objects[projection_intent_start..];
+            detail.finalize_projection_intents = detail
+                .finalize_projection_intents
+                .saturating_add(projection_intents_started.elapsed());
+            detail.finalize_projection_intents_count = detail
+                .finalize_projection_intents_count
+                .saturating_add(intents.len());
+            detail.finalize_projection_intent_bytes =
+                detail.finalize_projection_intent_bytes.saturating_add(
+                    intents
+                        .iter()
+                        .map(|object| object.payload().len())
+                        .sum::<usize>(),
+                );
+        });
+        #[cfg(test)]
+        let seal_pending_started = Instant::now();
         objects.sort_unstable_by_key(|object| {
             object
                 .descriptor()
@@ -16666,6 +16863,16 @@ impl ShardedHotEngine {
             });
         }
         let _ = draft.semantic_effect;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.finalize_seal_pending = detail
+                .finalize_seal_pending
+                .saturating_add(seal_pending_started.elapsed());
+            detail.finalize_final_objects = detail
+                .finalize_final_objects
+                .saturating_add(prepared.objects().len());
+            detail.finalize_calls = detail.finalize_calls.saturating_add(1);
+        });
         Ok(prepared)
     }
 
@@ -16677,6 +16884,10 @@ impl ShardedHotEngine {
         capture: TransactionCapture,
         observation: Option<ExternalImportObservationMaterial>,
     ) -> Result<PreparedTransactionParts, EngineError> {
+        #[cfg(test)]
+        let core_started = Instant::now();
+        #[cfg(test)]
+        let preflight_started = Instant::now();
         self.begin_point_operation();
         // A pending author buffer is only an optimization for the immediately
         // following stage of that exact prepared batch. Starting any later
@@ -16762,19 +16973,42 @@ impl ShardedHotEngine {
                     .set_peer_id(author.crdt_peer_id.as_u64())
                     .map_err(loro_error)?;
                 before_vectors.insert(document_id, document.document().oplog_vv());
-                before_snapshots.insert(
+                #[cfg(test)]
+                let before_snapshot_started = Instant::now();
+                let snapshot = snapshot_document(
+                    self.catalog_document_id,
                     document_id,
-                    snapshot_document(
-                        self.catalog_document_id,
-                        document_id,
-                        document.document(),
-                        false,
-                    )?,
-                );
+                    document.document(),
+                    false,
+                )?;
+                #[cfg(test)]
+                note_local_mutation_detail(|detail| {
+                    detail.before_semantic_snapshots_child = detail
+                        .before_semantic_snapshots_child
+                        .saturating_add(before_snapshot_started.elapsed());
+                    detail.before_snapshot_documents =
+                        detail.before_snapshot_documents.saturating_add(1);
+                    detail.before_snapshot_blocks = detail
+                        .before_snapshot_blocks
+                        .saturating_add(semantic_snapshot_block_count(&snapshot));
+                });
+                before_snapshots.insert(document_id, snapshot);
                 authenticated_direct_heads.insert(document_id, direct_heads);
                 working.insert(document_id, document);
             }
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.core_preflight = detail
+                .core_preflight
+                .saturating_add(preflight_started.elapsed());
+            detail.core_calls = detail.core_calls.saturating_add(1);
+            detail.operation_count = detail
+                .operation_count
+                .saturating_add(transaction.operations.len());
+        });
+        #[cfg(test)]
+        let author_operations_started = Instant::now();
         for operation in &transaction.operations {
             self.apply_author_operation(
                 &mut working,
@@ -16786,7 +17020,21 @@ impl ShardedHotEngine {
                 operation,
             )?;
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.author_operations_inclusive = detail
+                .author_operations_inclusive
+                .saturating_add(author_operations_started.elapsed());
+        });
+        #[cfg(test)]
+        let identity_triggers_started = Instant::now();
         self.validate_logseq_identity_triggers(transaction, &working, &mut read_only_catalog)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.identity_trigger_validation = detail
+                .identity_trigger_validation
+                .saturating_add(identity_triggers_started.elapsed());
+        });
 
         let affected: Vec<DocumentId> = working.keys().copied().collect();
         if matches!(origin, BatchOrigin::ExternalReconciliation { .. })
@@ -16796,10 +17044,37 @@ impl ShardedHotEngine {
         {
             return Err(EngineError::CrdtPeerCollision(author.crdt_peer_id));
         }
+        #[cfg(test)]
+        let after_snapshots_started = Instant::now();
         let after_snapshots = snapshot_engine_documents(self.catalog_document_id, &working, true)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.after_semantic_snapshots = detail
+                .after_semantic_snapshots
+                .saturating_add(after_snapshots_started.elapsed());
+            detail.after_snapshot_documents = detail
+                .after_snapshot_documents
+                .saturating_add(after_snapshots.len());
+            detail.after_snapshot_blocks = detail
+                .after_snapshot_blocks
+                .saturating_add(semantic_snapshot_blocks(&after_snapshots));
+        });
+        #[cfg(test)]
+        let effect_derive_started = Instant::now();
         let effect = derive_effect_from_snapshots(&before_snapshots, &after_snapshots)?;
         let effect_bytes = effect.encode()?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.effect_derive_encode = detail
+                .effect_derive_encode
+                .saturating_add(effect_derive_started.elapsed());
+            detail.effect_block_deltas = detail
+                .effect_block_deltas
+                .saturating_add(effect.blocks().len());
+        });
 
+        #[cfg(test)]
+        let dependencies_started = Instant::now();
         let mut frontier_documents = Vec::with_capacity(affected.len());
         let mut affected_heads = BTreeMap::new();
         let mut batch_dependency_heads = BTreeSet::new();
@@ -16838,7 +17113,17 @@ impl ShardedHotEngine {
         }
         let frontier = FrontierV2::new(frontier_documents)?;
         let batch_dependency_heads: Vec<_> = batch_dependency_heads.into_iter().collect();
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.dependencies_frontier = detail
+                .dependencies_frontier
+                .saturating_add(dependencies_started.elapsed());
+            detail.affected_documents = detail.affected_documents.saturating_add(affected.len());
+            detail.affected_heads = detail.affected_heads.saturating_add(affected_heads.len());
+        });
 
+        #[cfg(test)]
+        let delta_export_started = Instant::now();
         let mut objects = Vec::with_capacity(working.len() + 1);
         objects.push(OperationObject::new(
             self.workspace_id,
@@ -16895,6 +17180,28 @@ impl ShardedHotEngine {
                 )?,
             )?);
         }
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.delta_export_object_construction = detail
+                .delta_export_object_construction
+                .saturating_add(delta_export_started.elapsed());
+            detail.delta_exports = detail.delta_exports.saturating_add(working.len());
+            detail.delta_export_bytes = detail.delta_export_bytes.saturating_add(
+                objects
+                    .iter()
+                    .skip(1)
+                    .map(|object| object.payload().len())
+                    .sum::<usize>(),
+            );
+            detail.constructed_object_bytes = detail.constructed_object_bytes.saturating_add(
+                objects
+                    .iter()
+                    .map(|object| object.payload().len())
+                    .sum::<usize>(),
+            );
+        });
+        #[cfg(test)]
+        let manifest_path_authority_started = Instant::now();
         let descriptors = objects
             .iter()
             .map(OperationObject::descriptor)
@@ -17084,6 +17391,14 @@ impl ShardedHotEngine {
             )?;
         }
         let prepared = PreparedBatch::new(manifest, objects).map_err(EngineError::from)?;
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.manifest_path_authority = detail
+                .manifest_path_authority
+                .saturating_add(manifest_path_authority_started.elapsed());
+        });
+        #[cfg(test)]
+        let prospective_capture_started = Instant::now();
         let (prospective_documents, detached_bootstrap) = match capture {
             TransactionCapture::Projection => (
                 working
@@ -17126,6 +17441,16 @@ impl ShardedHotEngine {
                 (BTreeMap::new(), None)
             }
         };
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.prospective_document_capture = detail
+                .prospective_document_capture
+                .saturating_add(prospective_capture_started.elapsed());
+            detail.captured_documents = detail
+                .captured_documents
+                .saturating_add(prospective_documents.len());
+            detail.core_total = detail.core_total.saturating_add(core_started.elapsed());
+        });
         Ok(PreparedTransactionParts {
             prepared,
             semantic_effect: effect,
@@ -25855,15 +26180,26 @@ impl ShardedHotEngine {
                 EngineDocument::InMemory(document)
             };
             before_vectors.insert(document_id, document.document().oplog_vv());
-            before_snapshots.insert(
+            #[cfg(test)]
+            let before_snapshot_started = Instant::now();
+            let snapshot = snapshot_document(
+                self.catalog_document_id,
                 document_id,
-                snapshot_document(
-                    self.catalog_document_id,
-                    document_id,
-                    document.document(),
-                    false,
-                )?,
-            );
+                document.document(),
+                false,
+            )?;
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_semantic_snapshots_child = detail
+                    .before_semantic_snapshots_child
+                    .saturating_add(before_snapshot_started.elapsed());
+                detail.before_snapshot_documents =
+                    detail.before_snapshot_documents.saturating_add(1);
+                detail.before_snapshot_blocks = detail
+                    .before_snapshot_blocks
+                    .saturating_add(semantic_snapshot_block_count(&snapshot));
+            });
+            before_snapshots.insert(document_id, snapshot);
             entry.insert(document);
         }
         Ok(working
@@ -29094,6 +29430,19 @@ enum SemanticDocumentSnapshot {
         blocks: BTreeMap<BlockId, BlockState>,
         memberships: BTreeMap<BlockId, MembershipClaim>,
     },
+}
+
+#[cfg(test)]
+fn semantic_snapshot_block_count(snapshot: &SemanticDocumentSnapshot) -> usize {
+    match snapshot {
+        SemanticDocumentSnapshot::Catalog(_) => 0,
+        SemanticDocumentSnapshot::Shard { blocks, .. } => blocks.len(),
+    }
+}
+
+#[cfg(test)]
+fn semantic_snapshot_blocks(snapshots: &BTreeMap<DocumentId, SemanticDocumentSnapshot>) -> usize {
+    snapshots.values().map(semantic_snapshot_block_count).sum()
 }
 
 #[cfg(test)]

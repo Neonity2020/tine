@@ -1398,7 +1398,10 @@ impl OperationalCoordinator {
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<PreparedLocalMutationState, OperationalCoordinatorError> {
         #[cfg(test)]
-        reset_trusted_local_preparation_stage_timings();
+        {
+            reset_trusted_local_preparation_stage_timings();
+            super::hot_engine::reset_local_mutation_detail_timings();
+        }
         #[cfg(test)]
         let parts_started = Instant::now();
         let (admission, engine, _database, _tail, bootstrap) =

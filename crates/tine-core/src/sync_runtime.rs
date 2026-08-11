@@ -381,6 +381,7 @@ struct RuntimeOpenInstrumentation {
 struct ManagedApplicationSaveInstrumentation {
     application_stages: ManagedApplicationSaveStageTimings,
     preparation_stages: TrustedLocalPreparationStageTimings,
+    local_mutation_detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
     commit_stages: TrustedLocalCommitStageTimings,
     forbidden: ForbiddenCommitWork,
     graph_wide: GraphWideCommitWork,
@@ -7010,6 +7011,8 @@ fn run_actor_loop(
                 let _ = reply.send(ManagedApplicationSaveInstrumentation {
                     application_stages: last_application_save_stage_timings(),
                     preparation_stages: last_trusted_local_preparation_stage_timings(),
+                    local_mutation_detail:
+                        crate::oplog::hot_engine::last_local_mutation_detail_timings(),
                     commit_stages: last_commit_stage_timings(),
                     forbidden: forbidden_commit_work(),
                     graph_wide: graph_wide_commit_work(),
@@ -23729,6 +23732,11 @@ mod tests {
             .managed_application_save_instrumentation()
             .expect("managed application save exposes post-save instrumentation");
         assert_managed_application_save_foreground_counters(before, after, page_blocks);
+        let _detail_accounting = assert_managed_application_save_detail_accounting(
+            after.preparation_stages,
+            after.local_mutation_detail,
+            page_blocks,
+        );
         match outcome {
             SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
             other => panic!("managed-local application save was not direct: {other:?}"),
@@ -43065,8 +43073,18 @@ mod tests {
         caller: Duration,
         application_stages: ManagedApplicationSaveStageTimings,
         preparation_stages: TrustedLocalPreparationStageTimings,
+        local_mutation_detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
+        local_mutation_detail_accounting: ManagedApplicationSaveDetailAccounting,
         stages: TrustedLocalCommitStageTimings,
         page_local_reads: ManagedApplicationSavePageLocalReads,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ManagedApplicationSaveDetailAccounting {
+        author_operations_ex_snapshot: Duration,
+        core_remainder: Duration,
+        draft_remainder: Duration,
+        finalize_remainder: Duration,
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -43155,6 +43173,339 @@ mod tests {
         (p50, p95, *values.last().unwrap())
     }
 
+    fn checked_save_detail_remainder(
+        parent: Duration,
+        children: impl IntoIterator<Item = Duration>,
+        label: &str,
+    ) -> Duration {
+        let used = children.into_iter().fold(Duration::ZERO, |sum, child| {
+            sum.checked_add(child)
+                .unwrap_or_else(|| panic!("managed save {label} child durations overflow"))
+        });
+        parent.checked_sub(used).unwrap_or_else(|| {
+            panic!(
+                "managed save {label} timing children exceed their parent: parent={parent:?} children={used:?}"
+            )
+        })
+    }
+
+    fn assert_save_detail_remainder_bounded(parent: Duration, remainder: Duration, label: &str) {
+        let fractional = parent.checked_div(20).unwrap_or(Duration::ZERO);
+        let ceiling = Duration::from_millis(1).max(fractional);
+        assert!(
+            remainder <= ceiling,
+            "managed save {label} instrumentation leaves too much unaccounted time: parent={parent:?} remainder={remainder:?} ceiling={ceiling:?}"
+        );
+    }
+
+    fn assert_managed_application_save_detail_accounting(
+        preparation: TrustedLocalPreparationStageTimings,
+        detail: crate::oplog::hot_engine::LocalMutationDetailTimings,
+        page_blocks: usize,
+    ) -> ManagedApplicationSaveDetailAccounting {
+        let author_operations_ex_snapshot = detail
+            .author_operations_inclusive
+            .checked_sub(detail.before_semantic_snapshots_child)
+            .unwrap_or_else(|| {
+                panic!(
+                    "managed save nested before-snapshot timing exceeds author operations: {detail:?}"
+                )
+            });
+        let core_remainder = checked_save_detail_remainder(
+            detail.core_total,
+            [
+                detail.core_preflight,
+                detail.author_operations_inclusive,
+                detail.identity_trigger_validation,
+                detail.after_semantic_snapshots,
+                detail.effect_derive_encode,
+                detail.dependencies_frontier,
+                detail.delta_export_object_construction,
+                detail.manifest_path_authority,
+                detail.prospective_document_capture,
+            ],
+            "core",
+        );
+        let draft_remainder = checked_save_detail_remainder(
+            preparation.draft,
+            [
+                detail.core_total,
+                detail.before_projection_materialization,
+                detail.post_projection_materialization,
+                detail.projection_requirement_assembly,
+            ],
+            "draft",
+        );
+        let finalize_remainder = checked_save_detail_remainder(
+            preparation.finalize,
+            [
+                detail.finalize_authority_checks,
+                detail.finalize_base_objects,
+                detail.finalize_projection_intents,
+                detail.finalize_seal_pending,
+            ],
+            "finalize",
+        );
+        assert_save_detail_remainder_bounded(detail.core_total, core_remainder, "core");
+        assert_save_detail_remainder_bounded(preparation.draft, draft_remainder, "draft");
+        assert_save_detail_remainder_bounded(preparation.finalize, finalize_remainder, "finalize");
+        assert_eq!(detail.draft_calls, 1, "ordinary save drafts exactly once");
+        assert_eq!(detail.core_calls, 1, "ordinary save prepares one core");
+        assert_eq!(
+            detail.finalize_calls, 1,
+            "ordinary save finalizes exactly once"
+        );
+        assert_eq!(
+            detail.operation_count, 1,
+            "ordinary save emits one semantic operation"
+        );
+        assert_eq!(
+            detail.effect_block_deltas, 1,
+            "ordinary save changes exactly one semantic block"
+        );
+        assert_eq!(
+            detail.affected_documents, 1,
+            "ordinary save affects one document"
+        );
+        assert_eq!(
+            detail.affected_heads, 1,
+            "ordinary save records one document head"
+        );
+        assert_eq!(
+            detail.before_projection_pages, 1,
+            "ordinary save materializes one pre-page"
+        );
+        assert_eq!(
+            detail.post_projection_pages, 1,
+            "ordinary save materializes one post-page"
+        );
+        assert_eq!(
+            detail.projection_requirements, 1,
+            "ordinary save assembles one requirement"
+        );
+        assert_eq!(
+            detail.delta_exports, 1,
+            "ordinary save exports one CRDT delta"
+        );
+        assert_eq!(
+            detail.captured_documents, 1,
+            "ordinary save captures one post-document"
+        );
+        assert_eq!(
+            detail.finalize_captured_inputs, 1,
+            "ordinary save finalizer sees one input"
+        );
+        assert_eq!(
+            detail.finalize_projection_intents_count, 1,
+            "ordinary save finalizer seals one intent"
+        );
+        assert_eq!(
+            detail.before_snapshot_documents, 1,
+            "ordinary save snapshots one pre-document"
+        );
+        assert_eq!(
+            detail.after_snapshot_documents, 1,
+            "ordinary save snapshots one post-document"
+        );
+        assert_eq!(
+            detail.before_snapshot_blocks, page_blocks,
+            "ordinary save pre-snapshot block count"
+        );
+        assert_eq!(
+            detail.after_snapshot_blocks, page_blocks,
+            "ordinary save post-snapshot block count"
+        );
+        assert!(
+            detail.delta_export_bytes > 0,
+            "ordinary save exports nonempty CRDT bytes"
+        );
+        assert!(
+            detail.constructed_object_bytes > 0,
+            "ordinary save constructs objects"
+        );
+        assert!(
+            detail.finalize_projection_intent_bytes > 0,
+            "ordinary save encodes an intent"
+        );
+        ManagedApplicationSaveDetailAccounting {
+            author_operations_ex_snapshot,
+            core_remainder,
+            draft_remainder,
+            finalize_remainder,
+        }
+    }
+
+    fn managed_application_save_detail_phase_receipt(
+        samples: &[ManagedApplicationSaveBenchmarkSample],
+    ) -> String {
+        macro_rules! duration_quantiles {
+            ($field:ident) => {{
+                let (p50, p95) = managed_application_save_quantiles(samples, |sample| {
+                    sample.local_mutation_detail.$field
+                });
+                format!(
+                    "{}p50_ms={:.3} {}p95_ms={:.3}",
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p50),
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p95),
+                )
+            }};
+        }
+        macro_rules! count_summary {
+            ($field:ident) => {{
+                let mut values = samples
+                    .iter()
+                    .map(|sample| sample.local_mutation_detail.$field)
+                    .collect::<Vec<_>>();
+                values.sort_unstable();
+                format!(
+                    "{}min={} {}median={} {}max={}",
+                    concat!(stringify!($field), "_"),
+                    values[0],
+                    concat!(stringify!($field), "_"),
+                    values[values.len() / 2],
+                    concat!(stringify!($field), "_"),
+                    values[values.len() - 1],
+                )
+            }};
+        }
+        macro_rules! accounting_duration_quantiles {
+            ($field:ident) => {{
+                let (p50, p95) = managed_application_save_quantiles(samples, |sample| {
+                    sample.local_mutation_detail_accounting.$field
+                });
+                format!(
+                    "{}p50_ms={:.3} {}p95_ms={:.3}",
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p50),
+                    concat!(stringify!($field), "_"),
+                    startup_ms(p95),
+                )
+            }};
+        }
+        let correlated_vector = |sample: &ManagedApplicationSaveBenchmarkSample| {
+            format!(
+                "caller={:?} application_stages={:?} preparation_stages={:?} commit_stages={:?} local_mutation_detail={:?} derived={:?}",
+                sample.caller,
+                sample.application_stages,
+                sample.preparation_stages,
+                sample.stages,
+                sample.local_mutation_detail,
+                sample.local_mutation_detail_accounting,
+            )
+        };
+        let mut actor_ranked = samples.iter().collect::<Vec<_>>();
+        actor_ranked.sort_unstable_by_key(|sample| sample.application_stages.actor_total);
+        let p50 = actor_ranked[actor_ranked.len() / 2];
+        let p95 = actor_ranked[(actor_ranked.len() * 95).div_ceil(100).saturating_sub(1)];
+        [
+            duration_quantiles!(core_total),
+            duration_quantiles!(core_preflight),
+            duration_quantiles!(author_operations_inclusive),
+            duration_quantiles!(before_semantic_snapshots_child),
+            duration_quantiles!(identity_trigger_validation),
+            duration_quantiles!(after_semantic_snapshots),
+            duration_quantiles!(effect_derive_encode),
+            duration_quantiles!(dependencies_frontier),
+            duration_quantiles!(delta_export_object_construction),
+            duration_quantiles!(manifest_path_authority),
+            duration_quantiles!(prospective_document_capture),
+            duration_quantiles!(before_projection_materialization),
+            duration_quantiles!(post_projection_materialization),
+            duration_quantiles!(projection_requirement_assembly),
+            duration_quantiles!(finalize_authority_checks),
+            duration_quantiles!(finalize_base_objects),
+            duration_quantiles!(finalize_projection_intents),
+            duration_quantiles!(finalize_seal_pending),
+            accounting_duration_quantiles!(author_operations_ex_snapshot),
+            accounting_duration_quantiles!(core_remainder),
+            accounting_duration_quantiles!(draft_remainder),
+            accounting_duration_quantiles!(finalize_remainder),
+            count_summary!(core_calls),
+            count_summary!(operation_count),
+            count_summary!(before_snapshot_documents),
+            count_summary!(before_snapshot_blocks),
+            count_summary!(after_snapshot_documents),
+            count_summary!(after_snapshot_blocks),
+            count_summary!(effect_block_deltas),
+            count_summary!(affected_documents),
+            count_summary!(affected_heads),
+            count_summary!(delta_exports),
+            count_summary!(delta_export_bytes),
+            count_summary!(constructed_object_bytes),
+            count_summary!(captured_documents),
+            count_summary!(before_projection_pages),
+            count_summary!(post_projection_pages),
+            count_summary!(projection_requirements),
+            count_summary!(draft_calls),
+            count_summary!(finalize_captured_inputs),
+            count_summary!(finalize_base_objects_count),
+            count_summary!(finalize_projection_intents_count),
+            count_summary!(finalize_projection_intent_bytes),
+            count_summary!(finalize_final_objects),
+            count_summary!(finalize_calls),
+            format!("actor_ranked_p50_vector={}", correlated_vector(p50)),
+            format!("actor_ranked_p95_vector={}", correlated_vector(p95)),
+        ]
+        .join(" ")
+    }
+
+    fn managed_application_save_run_receipt(
+        runs: &[Vec<ManagedApplicationSaveBenchmarkSample>],
+    ) -> String {
+        assert!(
+            !runs.is_empty() && runs.iter().all(|samples| !samples.is_empty()),
+            "managed application save receipt requires timed samples for every run"
+        );
+        let mut p50s = Vec::with_capacity(runs.len());
+        let mut p95s = Vec::with_capacity(runs.len());
+        let per_run = runs
+            .iter()
+            .enumerate()
+            .map(|(run, samples)| {
+                let (p50, p95) =
+                    managed_application_save_quantiles(samples, |sample| sample.caller);
+                p50s.push(p50);
+                p95s.push(p95);
+                format!(
+                    "run{run}_caller_p50_ms={:.3} run{run}_caller_p95_ms={:.3}",
+                    startup_ms(p50),
+                    startup_ms(p95),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let median_p50 = startup_median(&p50s);
+        let median_p95 = startup_median(&p95s);
+        let spread = |values: &mut Vec<Duration>| {
+            values.sort_unstable();
+            values[values.len() - 1]
+                .checked_sub(values[0])
+                .expect("sorted durations have a nonnegative range")
+        };
+        let mad = |values: &[Duration], median: Duration| {
+            let deviations = values
+                .iter()
+                .map(|value| value.abs_diff(median))
+                .collect::<Vec<_>>();
+            startup_median(&deviations)
+        };
+        let p50_mad = mad(&p50s, median_p50);
+        let p95_mad = mad(&p95s, median_p95);
+        let p50_range = spread(&mut p50s);
+        let p95_range = spread(&mut p95s);
+        format!(
+            "{per_run} run_p50_median_ms={:.3} run_p50_range_ms={:.3} run_p50_mad_ms={:.3} run_p95_median_ms={:.3} run_p95_range_ms={:.3} run_p95_mad_ms={:.3}",
+            startup_ms(median_p50),
+            startup_ms(p50_range),
+            startup_ms(p50_mad),
+            startup_ms(median_p95),
+            startup_ms(p95_range),
+            startup_ms(p95_mad),
+        )
+    }
+
     fn managed_application_save_phase_receipt(
         samples: &[ManagedApplicationSaveBenchmarkSample],
     ) -> String {
@@ -43236,8 +43587,9 @@ mod tests {
             managed_application_save_read_quantiles(samples, |sample| {
                 sample.page_local_reads.history_points
             });
+        let detail = managed_application_save_detail_phase_receipt(samples);
         format!(
-            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={}",
+            "caller_p50_ms={:.3} caller_p95_ms={:.3} actor_total_p50_ms={:.3} actor_total_p95_ms={:.3} application_prepare_p50_ms={:.3} application_prepare_p95_ms={:.3} application_request_p50_ms={:.3} application_request_p95_ms={:.3} exact_page_load_p50_ms={:.3} exact_page_load_p95_ms={:.3} editor_prepare_p50_ms={:.3} editor_prepare_p95_ms={:.3} editor_total_p50_ms={:.3} editor_total_p95_ms={:.3} editor_transaction_p50_ms={:.3} editor_transaction_p95_ms={:.3} mutation_admission_p50_ms={:.3} mutation_admission_p95_ms={:.3} application_outcome_p50_ms={:.3} application_outcome_p95_ms={:.3} session_parts_p50_ms={:.3} session_parts_p95_ms={:.3} bindings_p50_ms={:.3} bindings_p95_ms={:.3} draft_p50_ms={:.3} draft_p95_ms={:.3} capture_p50_ms={:.3} capture_p95_ms={:.3} finalize_p50_ms={:.3} finalize_p95_ms={:.3} prepared_p50_ms={:.3} prepared_p95_ms={:.3} graph_p50_ms={:.3} graph_p95_ms={:.3} graph_validation_p50_ms={:.3} graph_validation_p95_ms={:.3} journal_p50_ms={:.3} journal_p95_ms={:.3} graph_publication_p50_ms={:.3} graph_publication_p95_ms={:.3} graph_cache_p50_ms={:.3} graph_cache_p95_ms={:.3} overlay_p50_ms={:.3} overlay_p95_ms={:.3} response_p50_ms={:.3} response_p95_ms={:.3} page_local_external_point_reads_p50={} page_local_external_point_reads_p95={} page_local_external_point_reads_max={} page_local_history_point_reads_p50={} page_local_history_point_reads_p95={} page_local_history_point_reads_max={} local_mutation_detail: {}",
             startup_ms(caller_p50),
             startup_ms(caller_p95),
             startup_ms(actor_total_p50),
@@ -43290,6 +43642,7 @@ mod tests {
             history_reads_p50,
             history_reads_p95,
             history_reads_max,
+            detail,
         )
     }
 
@@ -45466,9 +45819,11 @@ mod tests {
         for total_pages in page_counts {
             let additional_pages = total_pages - 3;
             let mut managed_samples = Vec::with_capacity(runs * samples_per_run);
+            let mut managed_runs = Vec::with_capacity(runs);
             let mut direct_files_samples = Vec::with_capacity(runs * samples_per_run);
 
             for run in 0..runs {
+                let mut managed_run_samples = Vec::with_capacity(samples_per_run);
                 let unrelated_blocks = if total_pages >= 10_000 { 1 } else { 10 };
                 let fixture = ActivationFixture::scaled_with_target_and_unrelated_blocks(
                     &format!("managed-application-save-{total_pages}-run-{run}"),
@@ -45579,13 +45934,23 @@ mod tests {
                             counters_after,
                             page_blocks,
                         );
-                        managed_samples.push(ManagedApplicationSaveBenchmarkSample {
+                        let local_mutation_detail_accounting =
+                            assert_managed_application_save_detail_accounting(
+                                counters_after.preparation_stages,
+                                counters_after.local_mutation_detail,
+                                page_blocks,
+                            );
+                        let sample = ManagedApplicationSaveBenchmarkSample {
                             caller,
                             application_stages: counters_after.application_stages,
                             preparation_stages: counters_after.preparation_stages,
+                            local_mutation_detail: counters_after.local_mutation_detail,
+                            local_mutation_detail_accounting,
                             stages: counters_after.commit_stages,
                             page_local_reads,
-                        });
+                        };
+                        managed_samples.push(sample);
+                        managed_run_samples.push(sample);
                     }
                     page = returned;
                     revision = returned_revision;
@@ -45709,17 +46074,20 @@ mod tests {
                     direct_expected_graph,
                     "the completed Direct Files edit sequence changes exactly its target file"
                 );
+                managed_runs.push(managed_run_samples);
             }
 
             assert_eq!(managed_samples.len(), runs * samples_per_run);
+            assert_eq!(managed_runs.len(), runs);
             assert_eq!(direct_files_samples.len(), runs * samples_per_run);
             let (managed_p50, managed_p95) =
                 managed_application_save_quantiles(&managed_samples, |sample| sample.caller);
             let direct_files_p50 = startup_median(&direct_files_samples);
             let direct_files_p95 = startup_p95(&direct_files_samples);
             eprintln!(
-                "managed_application_save_bench total_pages={total_pages} target_blocks={target_blocks} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
+                "managed_application_save_bench total_pages={total_pages} target_blocks={target_blocks} runs={runs} warmups={warmups} samples_per_run={samples_per_run} managed_application_save: {} managed_application_save_runs: {} direct_files_existing_page_save_p50_ms={:.3} direct_files_existing_page_save_p95_ms={:.3} (reported separately; this operation does not perform managed caller work)",
                 managed_application_save_phase_receipt(&managed_samples),
+                managed_application_save_run_receipt(&managed_runs),
                 startup_ms(direct_files_p50),
                 startup_ms(direct_files_p95),
             );
