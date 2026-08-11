@@ -6225,7 +6225,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/components/Block.mathBlockEnter.test.tsx"
@@ -6251,7 +6251,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/router.revealBlock.test.tsx"
@@ -6277,7 +6277,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "reproduced",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/components/LinkedReferences.test.tsx",
@@ -6304,7 +6304,7 @@
         "macos"
       ],
       "layer": "unit",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/editor/nearestLink.test.ts",
