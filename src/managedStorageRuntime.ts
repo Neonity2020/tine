@@ -1,6 +1,7 @@
 import { createSignal, type Accessor } from "solid-js";
 import { backend, type Backend } from "./backend";
 import type {
+  ApplicationPageAdmission,
   SparseV2ErrorEvent,
   SparseV2RuntimeStatus,
   SparseV2RuntimeStatusEvent,
@@ -17,6 +18,8 @@ type RuntimeEventBackend = Pick<
 export interface ManagedStorageRuntimeSnapshot {
   /** The only graph binding whose watcher events this store may accept. */
   bindingGeneration: number | null;
+  /** Native writer capability for this exact binding, never inferred from status. */
+  applicationPageAdmission: ApplicationPageAdmission | null;
   /** Full status returned by a graph-scoped command or the Storage & sync panel. */
   status: SparseV2Status | null;
   /** Latest runtime-only watcher status. Kept separately before the panel opens. */
@@ -27,6 +30,7 @@ export interface ManagedStorageRuntimeSnapshot {
 
 const initialSnapshot = (): ManagedStorageRuntimeSnapshot => ({
   bindingGeneration: null,
+  applicationPageAdmission: null,
   status: null,
   runtime: null,
   tick: null,
@@ -48,18 +52,31 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
 
   const accepts = (bindingGeneration: number) => snapshot().bindingGeneration === bindingGeneration;
 
-  const bind = (bindingGeneration: number) => {
-    if (snapshot().bindingGeneration === bindingGeneration) return;
-    setSnapshot({ ...initialSnapshot(), bindingGeneration });
+  const bind = (
+    bindingGeneration: number,
+    applicationPageAdmission: ApplicationPageAdmission = {
+      binding_generation: bindingGeneration,
+      authority: "managed_unavailable",
+    },
+  ) => {
+    if (applicationPageAdmission.binding_generation !== bindingGeneration) return false;
+    if (snapshot().bindingGeneration === bindingGeneration) {
+      setSnapshot((current) => ({ ...current, applicationPageAdmission }));
+      return true;
+    }
+    setSnapshot({ ...initialSnapshot(), bindingGeneration, applicationPageAdmission });
+    return true;
   };
 
   const clear = () => setSnapshot(initialSnapshot());
 
   const receiveStatus = (status: SparseV2Status): boolean => {
     if (!accepts(status.binding_generation)) return false;
+    if (status.application_page_admission.binding_generation !== status.binding_generation) return false;
     setSnapshot((current) => ({
       ...current,
       status,
+      applicationPageAdmission: status.application_page_admission,
       runtime: status.runtime,
       tick: status.runtime?.last_tick ?? current.tick,
     }));
@@ -68,8 +85,10 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
 
   const transitionTo = (status: SparseV2Status, expectedPreviousBinding = snapshot().bindingGeneration): boolean => {
     if (snapshot().bindingGeneration !== expectedPreviousBinding) return false;
+    if (status.application_page_admission.binding_generation !== status.binding_generation) return false;
     setSnapshot({
       bindingGeneration: status.binding_generation,
+      applicationPageAdmission: status.application_page_admission,
       status,
       runtime: status.runtime,
       tick: status.runtime?.last_tick ?? null,
@@ -120,7 +139,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     const currentBinding = snapshot().bindingGeneration;
     if (currentBinding !== null && currentBinding !== requestedBinding) return null;
     if (requestedBinding !== null && status.binding_generation !== requestedBinding) return null;
-    if (currentBinding === null) bind(status.binding_generation);
+    if (currentBinding === null) bind(status.binding_generation, status.application_page_admission);
     return receiveStatus(status) ? status : null;
   };
 

@@ -14,6 +14,44 @@ pub(crate) const SPARSE_V2_UNSUPPORTED: &str =
     "This action is unavailable while Tine-managed storage is active.";
 static NEXT_BINDING: AtomicU64 = AtomicU64::new(1);
 
+/// The bounded application-page envelope the current graph binding can accept.
+/// This is an advisory frontend wire record only: the actor remains the final
+/// authority for every managed application save.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct ApplicationPageAdmission {
+    pub(crate) binding_generation: u64,
+    #[serde(flatten)]
+    pub(crate) authority: ApplicationPageAdmissionAuthority,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(tag = "authority", rename_all = "snake_case")]
+pub(crate) enum ApplicationPageAdmissionAuthority {
+    Direct,
+    ManagedWritable {
+        application_save_page_blocks: usize,
+        application_page_request_text_bytes: usize,
+        application_page_max_depth: usize,
+    },
+    ManagedUnavailable,
+}
+
+impl ApplicationPageAdmission {
+    pub(crate) fn direct(binding_generation: u64) -> Self {
+        Self {
+            binding_generation,
+            authority: ApplicationPageAdmissionAuthority::Direct,
+        }
+    }
+
+    pub(crate) fn managed_unavailable(binding_generation: u64) -> Self {
+        Self {
+            binding_generation,
+            authority: ApplicationPageAdmissionAuthority::ManagedUnavailable,
+        }
+    }
+}
+
 /// Read-only graph lease used by the auxiliary Quick Capture WebView. Capture
 /// deliberately does not own a graph slot: the registry permits one writable
 /// window per graph root, while this surface only needs the selected graph's
@@ -210,6 +248,31 @@ impl GraphSlot {
 
     pub(crate) fn is_sparse_v2(&self) -> bool {
         self.authority.is_sparse_v2()
+    }
+
+    /// Report the selected save route for this exact graph binding.  The
+    /// frontend must not infer this from a managed-status label: a joinable
+    /// archive still has a legacy Direct-Files writer, while a sparse slot with
+    /// no retained application handle has no writer at all.
+    pub(crate) fn application_page_admission(&self) -> ApplicationPageAdmission {
+        match &self.authority {
+            GraphAuthority::Legacy(_) => ApplicationPageAdmission::direct(self.binding_generation),
+            GraphAuthority::SparseV2(binding) if binding.handle().is_some() => {
+                ApplicationPageAdmission {
+                    binding_generation: self.binding_generation,
+                    authority: ApplicationPageAdmissionAuthority::ManagedWritable {
+                        application_save_page_blocks:
+                            tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
+                        application_page_request_text_bytes:
+                            tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
+                        application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
+                    },
+                }
+            }
+            GraphAuthority::SparseV2(_) => {
+                ApplicationPageAdmission::managed_unavailable(self.binding_generation)
+            }
+        }
     }
 
     /// Persist a change to `logseq/config.edn` under whichever authority this

@@ -2,7 +2,10 @@ use crate::backup::backup_async;
 use crate::settings::{
     approved_external_assets, remember_external_assets_approval, remember_graph,
 };
-use crate::state::{canonical_graph_root, poke_watcher, slot_for_window, AppState, GraphSlot};
+use crate::state::{
+    canonical_graph_root, poke_watcher, slot_for_window, AppState, ApplicationPageAdmission,
+    GraphSlot,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -518,6 +521,7 @@ fn graph_load_phase(started: Option<Instant>, previous: &mut Option<Instant>, ph
 pub(crate) struct DirectFilesOpen {
     pub(crate) meta: GraphMeta,
     pub(crate) binding_generation: u64,
+    pub(crate) application_page_admission: ApplicationPageAdmission,
 }
 
 /// Install the ordinary Direct Files authority in the window registry.  This is
@@ -576,11 +580,13 @@ pub(crate) fn open_and_publish_direct_files(
         let _ = window.set_title(&format!("Tine — {name}"));
     }
     let binding_generation = slot.binding_generation;
+    let application_page_admission = slot.application_page_admission();
     warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
     state.clear_startup_recovery_target(window_label);
     Ok(DirectFilesOpen {
         meta,
         binding_generation,
+        application_page_admission,
     })
 }
 
@@ -605,6 +611,7 @@ pub(crate) fn load_graph_for_label(
             return Ok(LoadGraphResult::AlreadyCurrent {
                 meta: slot.graph_meta(),
                 binding_generation: slot.binding_generation,
+                application_page_admission: slot.application_page_admission(),
             });
         }
         if let Some(existing) = app.get_webview_window(&owner) {
@@ -659,6 +666,7 @@ pub(crate) fn load_graph_for_label(
         return Ok(LoadGraphResult::Loaded {
             meta,
             binding_generation: slot.binding_generation,
+            application_page_admission: slot.application_page_admission(),
         });
     }
     refuse_unclaimed_sparse_archive(&root_key)?;
@@ -668,6 +676,7 @@ pub(crate) fn load_graph_for_label(
     Ok(LoadGraphResult::Loaded {
         meta: direct.meta,
         binding_generation: direct.binding_generation,
+        application_page_admission: direct.application_page_admission,
     })
 }
 
@@ -743,10 +752,12 @@ pub(crate) enum LoadGraphResult {
     Loaded {
         meta: GraphMeta,
         binding_generation: u64,
+        application_page_admission: ApplicationPageAdmission,
     },
     AlreadyCurrent {
         meta: GraphMeta,
         binding_generation: u64,
+        application_page_admission: ApplicationPageAdmission,
     },
     FocusedExisting {
         window_label: String,

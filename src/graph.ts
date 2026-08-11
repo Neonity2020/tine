@@ -144,7 +144,7 @@ export async function loadGraphPath(
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     return { kind: "focused_existing" };
   }
-  managedStorageRuntime.bind(result.binding_generation);
+  managedStorageRuntime.bind(result.binding_generation, result.application_page_admission);
   const meta = result.meta;
   if (result.kind === "already_current" && hadGraph && !options.forceRefresh) {
     return { kind: "already_current", root: meta.root };

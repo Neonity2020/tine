@@ -6,6 +6,7 @@ import { notifyGraphRebound } from "./modeHooks";
 import type {
   ActivationExpectedRevision,
   ActivationIntent,
+  ApplicationPageAdmission,
   AdvancedQueryResult,
   BacklinkFilterContext,
   BacklinkFilterTarget,
@@ -182,7 +183,12 @@ export type PluginRegistryCacheLoad =
   | { kind: "unsafe"; reason: string };
 
 export type LoadGraphResult =
-  | { kind: "loaded" | "already_current"; meta: GraphMeta; binding_generation: number }
+  | {
+      kind: "loaded" | "already_current";
+      meta: GraphMeta;
+      binding_generation: number;
+      application_page_admission: ApplicationPageAdmission;
+    }
   | { kind: "focused_existing"; window_label: string };
 
 export interface CaptureGraphBindingResult {

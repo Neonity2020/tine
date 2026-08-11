@@ -43,6 +43,7 @@ describe("Settings storage transitions", () => {
     can_cancel: false,
     cancel_reason: null,
     binding_generation: 10,
+    application_page_admission: { binding_generation: 10, authority: "direct" },
   });
 
   const localActive = (): SparseV2Status => ({
@@ -71,6 +72,13 @@ describe("Settings storage transitions", () => {
     can_cancel: true,
     cancel_reason: null,
     binding_generation: 11,
+    application_page_admission: {
+      binding_generation: 11,
+      authority: "managed_writable",
+      application_save_page_blocks: 511,
+      application_page_request_text_bytes: 1_048_576,
+      application_page_max_depth: 128,
+    },
   });
 
   const localRetryable = (): SparseV2Status => ({
@@ -83,6 +91,7 @@ describe("Settings storage transitions", () => {
     can_cancel: true,
     cancel_reason: null,
     binding_generation: 11,
+    application_page_admission: { binding_generation: 11, authority: "managed_unavailable" },
   });
 
   it("discloses managed storage as experimental and keeps Direct files available", async () => {
@@ -284,6 +293,7 @@ describe("Settings storage transitions", () => {
       can_cancel: false,
       cancel_reason: null,
       binding_generation: 15,
+      application_page_admission: { binding_generation: 15, authority: "direct" },
     });
     vi.spyOn(backend(), "confirm").mockResolvedValue(true);
     vi.spyOn(store, "flushAll").mockResolvedValue(true);
@@ -317,6 +327,7 @@ describe("Settings storage transitions", () => {
       can_cancel: false,
       cancel_reason: "The managed recovery archive at C:\\Users\\Martin\\Graph\\.tine-sync could not be verified.",
       binding_generation: 12,
+      application_page_admission: { binding_generation: 12, authority: "managed_unavailable" },
     });
     const writeText = vi.spyOn(backend(), "writeText").mockResolvedValue(undefined);
     const root = document.createElement("div");

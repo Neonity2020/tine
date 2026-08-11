@@ -33,6 +33,13 @@ function active(bindingGeneration: number): SparseV2Status {
     can_cancel: true,
     cancel_reason: null,
     binding_generation: bindingGeneration,
+    application_page_admission: {
+      binding_generation: bindingGeneration,
+      authority: "managed_writable",
+      application_save_page_blocks: 511,
+      application_page_request_text_bytes: 1_048_576,
+      application_page_max_depth: 128,
+    },
   };
 }
 
@@ -103,5 +110,32 @@ describe("managed-storage runtime event bridge", () => {
     expect(bridge.receiveStatus(active(8))).toBe(true);
     expect(bridge.receiveError({ binding_generation: 8, message: "current graph failure" })).toBe(true);
     expect(bridge.snapshot().error).toBe("current graph failure");
+  });
+
+  it("installs the load-route authority atomically and cannot let an old managed transition replace Direct", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(31)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+
+    expect(bridge.bind(31, active(31).application_page_admission)).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({
+      binding_generation: 31,
+      authority: "managed_writable",
+      application_save_page_blocks: 511,
+    });
+    expect(bridge.bind(32, { binding_generation: 32, authority: "direct" })).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 32,
+      authority: "direct",
+    });
+    expect(bridge.receiveStatus(active(31))).toBe(false);
+    expect(bridge.transitionTo(active(31), 31)).toBe(false);
+    expect(bridge.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 32,
+      authority: "direct",
+    });
   });
 });

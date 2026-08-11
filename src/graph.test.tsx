@@ -24,6 +24,8 @@ const META: GraphMeta = {
   guide_announced: true,
 };
 
+const DIRECT_ADMISSION = { binding_generation: 1, authority: "direct" as const };
+
 async function loadHarness(
   existing: PageDto | null,
   access = { graph_root: META.root, external_assets_path: null as string | null, approved: true },
@@ -40,7 +42,12 @@ async function loadHarness(
     inspectGraphAccess: vi.fn(async () => access),
     approveExternalAssets: vi.fn(async () => {}),
     confirm: vi.fn(async () => confirm),
-    loadGraph: vi.fn(async () => ({ kind: "loaded" as const, meta: META, binding_generation: 1 })),
+    loadGraph: vi.fn(async () => ({
+      kind: "loaded" as const,
+      meta: META,
+      binding_generation: 1,
+      application_page_admission: DIRECT_ADMISSION,
+    })),
     getPage: vi.fn(async () => existing),
     getAppString: vi.fn(async (_key: string, fallback: string) => fallback),
     setAppString: vi.fn(async (_key: string, _value: string) => {}),
@@ -439,7 +446,12 @@ describe("PDF graph ownership", () => {
     const nextMeta = { ...META, root: "/tmp/other-graph" };
     harness.api.loadGraph.mockImplementationOnce(async () => {
       harness.events.push("load-next");
-      return { kind: "loaded" as const, meta: nextMeta, binding_generation: 2 };
+      return {
+        kind: "loaded" as const,
+        meta: nextMeta,
+        binding_generation: 2,
+        application_page_admission: { binding_generation: 2, authority: "direct" as const },
+      };
     });
 
     await harness.loadGraphPath(nextMeta.root);
@@ -474,7 +486,12 @@ describe("PDF graph ownership", () => {
     harness.events.length = 0;
     (harness.api.loadGraph as any).mockImplementationOnce(async () => {
       harness.events.push("load-refresh");
-      return { kind: "already_current" as const, meta: META, binding_generation: 1 };
+      return {
+        kind: "already_current" as const,
+        meta: META,
+        binding_generation: 1,
+        application_page_admission: DIRECT_ADMISSION,
+      };
     });
 
     await harness.loadGraphPath(META.root, { forceRefresh: true });

@@ -29,6 +29,7 @@ function fakeCancelResult(): SparseV2CancelResult {
       can_cancel: false,
       cancel_reason: null,
       binding_generation: 9,
+      application_page_admission: { binding_generation: 9, authority: "direct" },
     },
     binding_generation: 9,
     recovery_statement: "Direct file mode is active.",

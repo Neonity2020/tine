@@ -258,6 +258,19 @@ export type SparseV2Availability =
   | { state: "blocked"; reason_code: string }
   | { state: "refused"; reason_code: string; detail: string | null };
 
+/** Native, binding-scoped advisory envelope for pre-mutation bulk admission.
+ * The managed actor remains the final save authority. */
+export type ApplicationPageAdmission =
+  | { binding_generation: number; authority: "direct" }
+  | {
+      binding_generation: number;
+      authority: "managed_writable";
+      application_save_page_blocks: number;
+      application_page_request_text_bytes: number;
+      application_page_max_depth: number;
+    }
+  | { binding_generation: number; authority: "managed_unavailable" };
+
 export type SparseV2Status = SparseV2Availability & {
   runtime: SparseV2RuntimeStatus | null;
   can_activate: boolean;
@@ -265,6 +278,7 @@ export type SparseV2Status = SparseV2Availability & {
   can_cancel: boolean;
   cancel_reason: string | null;
   binding_generation: number;
+  application_page_admission: ApplicationPageAdmission;
 };
 
 /** A status snapshot scoped to the graph binding that produced it. */

@@ -469,6 +469,7 @@ pub(crate) struct SparseV2StatusDto {
     can_cancel: bool,
     cancel_reason: Option<String>,
     binding_generation: u64,
+    application_page_admission: crate::state::ApplicationPageAdmission,
 }
 
 impl SparseV2StatusDto {
@@ -481,6 +482,9 @@ impl SparseV2StatusDto {
             can_cancel: false,
             cancel_reason: None,
             binding_generation,
+            application_page_admission: crate::state::ApplicationPageAdmission::direct(
+                binding_generation,
+            ),
         }
     }
 
@@ -501,6 +505,12 @@ impl SparseV2StatusDto {
                     .into(),
             ),
             binding_generation,
+            // A joinable descriptor is discovered while this GraphSlot still
+            // writes through Direct Files. `sparse_v2_status_for_slot` replaces
+            // this from the actual slot as a single final step.
+            application_page_admission: crate::state::ApplicationPageAdmission::direct(
+                binding_generation,
+            ),
         }
     }
 
@@ -538,6 +548,20 @@ impl SparseV2StatusDto {
             can_cancel: false,
             cancel_reason: None,
             binding_generation,
+            application_page_admission: if binding.handle().is_some() {
+                crate::state::ApplicationPageAdmission {
+                    binding_generation,
+                    authority: crate::state::ApplicationPageAdmissionAuthority::ManagedWritable {
+                        application_save_page_blocks:
+                            tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
+                        application_page_request_text_bytes:
+                            tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
+                        application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
+                    },
+                }
+            } else {
+                crate::state::ApplicationPageAdmission::managed_unavailable(binding_generation)
+            },
         }
     }
 }
@@ -1207,7 +1231,7 @@ pub(crate) fn active_handle(
 }
 
 fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2StatusDto, String> {
-    Ok(match slot.sparse_binding() {
+    let mut status = match slot.sparse_binding() {
         Some(binding) => {
             let mut status = SparseV2StatusDto::from_binding(binding, slot.binding_generation);
             // Once the binding itself belongs to this graph, the explicit
@@ -1227,7 +1251,11 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
                 None => SparseV2StatusDto::legacy(slot.binding_generation),
             }
         }
-    })
+    };
+    // Status names describe enrollment/recovery. This record describes the
+    // exact writer retained by the slot that will service `save_page`.
+    status.application_page_admission = slot.application_page_admission();
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2678,6 +2706,26 @@ mod tests {
         assert_eq!(serialized["progress"]["total"], 5);
     }
 
+    #[test]
+    fn direct_slot_serializes_direct_application_page_admission() {
+        let root = std::env::temp_dir().join(format!("tine-admission-direct-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let slot = crate::state::GraphSlot::new(Graph::open(&root), root.clone());
+
+        let status = sparse_v2_status_for_slot(&slot).unwrap();
+        let wire = serde_json::to_value(status).unwrap();
+
+        assert_eq!(wire["binding_generation"], slot.binding_generation);
+        assert_eq!(
+            wire["application_page_admission"],
+            serde_json::json!({
+                "binding_generation": slot.binding_generation,
+                "authority": "direct",
+            })
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     struct RollbackFixture {
         root: PathBuf,
         graph_root: PathBuf,
@@ -3127,6 +3175,11 @@ mod tests {
         );
         assert!(SPARSE_V2_NOT_ACTIVE.contains("Retry setup"));
         assert!(SPARSE_V2_NOT_ACTIVE.contains("return to Direct files"));
+        let status = sparse_v2_status_for_slot(&fixture.slot).unwrap();
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["application_page_admission"]["authority"],
+            "managed_unavailable"
+        );
     }
 
     #[test]
@@ -3904,6 +3957,21 @@ mod tests {
         let handle = slot
             .sparse_runtime()
             .expect("active sparse slot must retain the actor");
+        let admission = slot.application_page_admission();
+        assert_eq!(admission.binding_generation, slot.binding_generation);
+        assert!(matches!(
+            admission.authority,
+            crate::state::ApplicationPageAdmissionAuthority::ManagedWritable {
+                application_save_page_blocks: tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
+                application_page_request_text_bytes: tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
+                application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(sparse_v2_status_for_slot(&slot).unwrap()).unwrap()
+                ["application_page_admission"]["application_save_page_blocks"],
+            511
+        );
         for _ in 0..128 {
             match handle.tick().unwrap() {
                 SyncRuntimeTick::Idle

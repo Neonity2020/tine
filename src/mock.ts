@@ -657,6 +657,7 @@ export function mockBackend(): Backend {
     can_cancel: false,
     cancel_reason: null,
     binding_generation: 1,
+    application_page_admission: { binding_generation: 1, authority: "direct" },
   };
   const find = (name: string) =>
     all.find((p) => p.name.toLowerCase() === name.toLowerCase()) ?? null;
@@ -694,7 +695,11 @@ export function mockBackend(): Backend {
 
   return {
     async loadGraph() {
-      return { kind: "loaded" as const, binding_generation: 1, meta: {
+      return {
+        kind: "loaded" as const,
+        binding_generation: 1,
+        application_page_admission: { binding_generation: 1, authority: "direct" as const },
+        meta: {
         root: "/mock/graph",
         journals_dir: "journals",
         pages_dir: "pages",
@@ -934,6 +939,13 @@ export function mockBackend(): Backend {
         can_cancel: true,
         cancel_reason: null,
         binding_generation: sparseV2.binding_generation + 1,
+        application_page_admission: {
+          binding_generation: sparseV2.binding_generation + 1,
+          authority: "managed_writable",
+          application_save_page_blocks: 511,
+          application_page_request_text_bytes: 1_048_576,
+          application_page_max_depth: 128,
+        },
       };
       return sparseV2;
     },
@@ -946,6 +958,10 @@ export function mockBackend(): Backend {
         can_cancel: false,
         cancel_reason: null,
         binding_generation: sparseV2.binding_generation + 1,
+        application_page_admission: {
+          binding_generation: sparseV2.binding_generation + 1,
+          authority: "direct",
+        },
       };
       return {
         status: sparseV2,
@@ -963,6 +979,10 @@ export function mockBackend(): Backend {
         can_cancel: false,
         cancel_reason: null,
         binding_generation: sparseV2.binding_generation + 1,
+        application_page_admission: {
+          binding_generation: sparseV2.binding_generation + 1,
+          authority: "direct",
+        },
       };
       return {
         status: sparseV2,
