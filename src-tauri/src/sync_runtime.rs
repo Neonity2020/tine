@@ -641,11 +641,121 @@ pub(crate) fn shutdown_status(outcome: SyncShutdownOutcome) -> SparseV2RuntimeSt
     }
 }
 
-fn provider_namespace_has_evidence(path: &Path) -> Result<bool, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!("Couldn't inspect sync data: {error}")),
+/// What the graph-local provider namespace proves for the narrowly scoped
+/// "Return to Direct files" escape hatch.
+///
+/// The first local activation creates the provider directory skeleton before
+/// any shared enrollment exists.  Its mere presence is therefore not proof
+/// that another device can depend on this graph.  In contrast, a descriptor,
+/// provider work, or anything that does not exactly match that empty local
+/// skeleton is treated as shared/unknown and remains fail-closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderNamespaceEvidence {
+    LocalOnly,
+    SharedOrUnknown,
+}
+
+const PROVIDER_SCAFFOLD_TREES: [&str; 2] = ["inbox", "outbox"];
+const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 10] = [
+    "objects",
+    "manifests",
+    "enrollment",
+    "frontier-heads-v1",
+    "publication-intents-v1",
+    "manifest-recovery-links-v1",
+    "manifest-recovery-blobs-v1",
+    ".part",
+    "removed",
+    "rename-evidence",
+];
+
+fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|error| format!("Couldn't inspect sync data: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+fn has_exact_directory_names(entries: &[std::fs::DirEntry], expected: &[&str]) -> bool {
+    entries.len() == expected.len()
+        && expected.iter().all(|expected| {
+            entries
+                .iter()
+                .any(|entry| entry.file_name().to_string_lossy() == *expected)
+        })
+}
+
+fn is_empty_local_provider_scaffold(shared_root: &Path) -> Result<bool, String> {
+    let root_entries = sorted_directory_entries(shared_root)?;
+    if !has_exact_directory_names(&root_entries, &PROVIDER_SCAFFOLD_TREES) {
+        return Ok(false);
+    }
+
+    for tree in root_entries {
+        let file_type = tree
+            .file_type()
+            .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return Ok(false);
+        }
+        let namespaces = sorted_directory_entries(&tree.path())?;
+        if !has_exact_directory_names(&namespaces, &PROVIDER_SCAFFOLD_NAMESPACES) {
+            return Ok(false);
+        }
+        for namespace in namespaces {
+            let file_type = namespace
+                .file_type()
+                .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+            if !file_type.is_dir()
+                || file_type.is_symlink()
+                || !sorted_directory_entries(&namespace.path())?.is_empty()
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn provider_namespace_evidence(path: &Path) -> Result<ProviderNamespaceEvidence, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProviderNamespaceEvidence::LocalOnly);
+        }
+        Err(error) => return Err(format!("Couldn't inspect sync data: {error}")),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(ProviderNamespaceEvidence::SharedOrUnknown);
+    }
+
+    let entries = sorted_directory_entries(path)?;
+    if entries.is_empty() {
+        return Ok(ProviderNamespaceEvidence::LocalOnly);
+    }
+    if entries.len() != 1 || entries[0].file_name() != "shared" {
+        return Ok(ProviderNamespaceEvidence::SharedOrUnknown);
+    }
+    let shared = &entries[0];
+    let file_type = shared
+        .file_type()
+        .map_err(|error| format!("Couldn't inspect sync data: {error}"))?;
+    if !file_type.is_dir() || file_type.is_symlink() {
+        return Ok(ProviderNamespaceEvidence::SharedOrUnknown);
+    }
+
+    match inspect_shared_enrollment_for_cold_discovery(&shared.path()) {
+        Ok(Some(_)) => Ok(ProviderNamespaceEvidence::SharedOrUnknown),
+        // A canonical empty provider topology is made by a first local
+        // activation, before any authority/share publication.  Any other
+        // descriptor-inspection failure remains evidence, rather than being
+        // guessed to be local-only.
+        Ok(None) | Err(_) if is_empty_local_provider_scaffold(&shared.path())? => {
+            Ok(ProviderNamespaceEvidence::LocalOnly)
+        }
+        Ok(None) | Err(_) => Ok(ProviderNamespaceEvidence::SharedOrUnknown),
     }
 }
 
@@ -660,37 +770,35 @@ fn binding_names_shared_state(binding: &SparseV2Binding) -> bool {
     )
 }
 
-fn cancel_eligibility(binding: &SparseV2Binding, provider_namespace: &Path) -> Result<(), String> {
-    let provider_evidence = provider_namespace_has_evidence(provider_namespace)?;
-    if binding_names_shared_state(binding) {
-        return Err(
-            "This graph is synced with another device, so returning to Direct files is unavailable."
-                .into(),
-        );
-    }
+/// A shared or malformed provider namespace is a warning for the explicit
+/// archive-and-return action, not a reason to strand the user in a refused
+/// managed runtime.  The action preserves the complete private managed state
+/// before Direct Files is installed, so the user can later inspect or recover
+/// it.  The frontend requires an acknowledgement before invoking the command.
+fn cancel_warning(binding: &SparseV2Binding, provider_namespace: &Path) -> Option<String> {
+    let provider_evidence = provider_namespace_evidence(provider_namespace)
+        .unwrap_or(ProviderNamespaceEvidence::SharedOrUnknown);
+    let mut shared_or_unknown = binding_names_shared_state(binding)
+        || provider_evidence == ProviderNamespaceEvidence::SharedOrUnknown;
     if let Some(handle) = binding.handle() {
-        let status = handle.status().map_err(|error| {
-            format!("Couldn't verify that returning to Direct files is safe: {error}")
-        })?;
-        let names_shared_runtime = status.shared_role.is_some() || status.shared_phase.is_some();
-        // A local-only core snapshot currently counts its absent provider
-        // recovery-coverage sentinel as one pending item. It cannot represent
-        // provider work when both shared runtime identity and the complete
-        // graph-local provider namespace are absent.
-        if names_shared_runtime || (status.provider_pending != 0 && provider_evidence) {
-            return Err(
-                "This graph is synced with another device, so returning to Direct files is unavailable."
-                    .into(),
-            );
+        match handle.status() {
+            Ok(status) => {
+                shared_or_unknown |= status.shared_role.is_some()
+                    || status.shared_phase.is_some()
+                    // A local-only snapshot can retain its absent-provider
+                    // sentinel.  Pending work matters here only when provider
+                    // evidence says this is not the exact local scaffold.
+                    || (status.provider_pending != 0
+                        && provider_evidence == ProviderNamespaceEvidence::SharedOrUnknown);
+            }
+            // The warning is deliberately conservative, but inability to
+            // inspect an already-refused runtime must not suppress the escape.
+            Err(_) => shared_or_unknown = true,
         }
     }
-    if provider_evidence {
-        return Err(
-            "This graph is synced with another device, so returning to Direct files is unavailable."
-                .into(),
-        );
-    }
-    Ok(())
+    shared_or_unknown.then(|| {
+        "Managed storage may contain shared or pending provider state. Tine will archive the complete private managed-storage state before reopening this graph with Direct files. Other devices will not receive further managed-storage updates from this device.".into()
+    })
 }
 
 #[derive(Default)]
@@ -965,16 +1073,11 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
     Ok(match slot.sparse_binding() {
         Some(binding) => {
             let mut status = SparseV2StatusDto::from_binding(binding, slot.binding_generation);
-            match cancel_eligibility(binding, &slot.root_key.join(".tine-sync/v2")) {
-                Ok(()) => {
-                    status.can_cancel = true;
-                    status.cancel_reason = None;
-                }
-                Err(reason) => {
-                    status.can_cancel = false;
-                    status.cancel_reason = Some(reason);
-                }
-            }
+            // Once the binding itself belongs to this graph, the explicit
+            // archive-and-return command is always available.  Shared/pending
+            // state is surfaced as a confirmation warning, never as a lockout.
+            status.can_cancel = true;
+            status.cancel_reason = cancel_warning(binding, &slot.root_key.join(".tine-sync/v2"));
             status
         }
         None => {
@@ -1195,16 +1298,34 @@ pub(crate) struct SparseV2CancelResult {
     recovery_statement: String,
 }
 
-fn archive_private_root(private_root: &Path, recovery_root: &Path) -> Result<PathBuf, String> {
-    let metadata = std::fs::symlink_metadata(private_root).map_err(|error| {
-        format!("Couldn't inspect Tine-managed storage recovery state: {error}")
-    })?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err("Tine-managed storage recovery state is not a local directory, so returning to Direct files is unavailable.".into());
+fn archive_private_root(
+    private_root: &Path,
+    recovery_root: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let metadata = match std::fs::symlink_metadata(private_root) {
+        Ok(metadata) => metadata,
+        // A failed or partially-created activation need not have retained any
+        // app-private state.  There is then nothing to preserve, not a reason
+        // to strand the user.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Couldn't inspect Tine-managed storage recovery state: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err("Tine-managed storage recovery state is a symbolic link, so it could not be archived safely.".into());
     }
     std::fs::create_dir_all(recovery_root).map_err(|error| {
         format!("Couldn't prepare Tine-managed storage recovery state: {error}")
     })?;
+    let recovery_metadata = std::fs::symlink_metadata(recovery_root).map_err(|error| {
+        format!("Couldn't inspect Tine-managed storage recovery state: {error}")
+    })?;
+    if !recovery_metadata.is_dir() || recovery_metadata.file_type().is_symlink() {
+        return Err("Tine-managed storage recovery state is not a local directory, so it could not be archived safely.".into());
+    }
     let key = private_root
         .file_name()
         .and_then(|value| value.to_str())
@@ -1213,40 +1334,164 @@ fn archive_private_root(private_root: &Path, recovery_root: &Path) -> Result<Pat
     std::fs::rename(private_root, &destination).map_err(|error| {
         format!("Couldn't preserve Tine-managed storage recovery state: {error}")
     })?;
-    Ok(destination)
+    Ok(Some(destination))
 }
 
-fn require_safe_sparse_shutdown(slot: &crate::state::GraphSlot) -> Result<(), String> {
-    let Some(handle) = slot.sparse_runtime() else {
+#[derive(Debug)]
+enum ProviderNamespaceArchive {
+    Absent,
+    Moved {
+        source: PathBuf,
+        destination: PathBuf,
+    },
+}
+
+/// Preserve graph-local provider state outside the live `.tine-sync/v2`
+/// namespace.  A Direct Files restart deliberately refuses an unclaimed v2
+/// namespace, so archiving only private app-data would leave a delayed
+/// lockout.  This is a same-filesystem rename, never a delete or copy.
+fn archive_graph_provider_namespace(graph_root: &Path) -> Result<ProviderNamespaceArchive, String> {
+    let source = graph_root.join(".tine-sync/v2");
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProviderNamespaceArchive::Absent);
+        }
+        Err(error) => {
+            return Err(format!(
+                "Couldn't inspect graph-local managed-storage state before returning to Direct files: {error}"
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err("Graph-local managed-storage state is a symbolic link, so it could not be archived safely.".into());
+    }
+    let tine_sync = source
+        .parent()
+        .ok_or("Graph-local managed-storage state has no .tine-sync parent.")?;
+    let parent_metadata = std::fs::symlink_metadata(tine_sync).map_err(|error| {
+        format!(
+            "Couldn't inspect graph-local managed-storage parent before returning to Direct files: {error}"
+        )
+    })?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err("Graph-local managed-storage parent is not a local directory, so it could not be archived safely.".into());
+    }
+    let recovery = tine_sync.join("recovery");
+    match std::fs::create_dir(&recovery) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "Couldn't prepare graph-local managed-storage recovery state: {error}"
+            ));
+        }
+    }
+    let recovery_metadata = std::fs::symlink_metadata(&recovery).map_err(|error| {
+        format!("Couldn't inspect graph-local managed-storage recovery state: {error}")
+    })?;
+    if !recovery_metadata.is_dir() || recovery_metadata.file_type().is_symlink() {
+        return Err("Graph-local managed-storage recovery state is not a local directory, so it could not be archived safely.".into());
+    }
+    let destination = recovery.join(format!("v2-{}", Uuid::new_v4()));
+    std::fs::rename(&source, &destination)
+        .map_err(|error| format!("Couldn't preserve graph-local managed-storage state: {error}"))?;
+    Ok(ProviderNamespaceArchive::Moved {
+        source,
+        destination,
+    })
+}
+
+fn restore_graph_provider_namespace(archive: ProviderNamespaceArchive) -> Result<(), String> {
+    let ProviderNamespaceArchive::Moved {
+        source,
+        destination,
+    } = archive
+    else {
         return Ok(());
     };
-    match handle.clean_shutdown() {
-        Ok(SyncShutdownOutcome::Safe(_)) => Ok(()),
-        Ok(SyncShutdownOutcome::Terminal(_)) => {
-            Err("Tine-managed storage could not verify a safe local stop.".into())
+    std::fs::rename(&destination, &source).map_err(|error| {
+        format!(
+            "Tine-managed storage could not restore graph-local provider state after preserving private recovery state failed: {error}"
+        )
+    })
+}
+
+#[derive(Debug)]
+enum DirectFilesShutdown {
+    Clean,
+    Forced { detail: String },
+}
+
+impl DirectFilesShutdown {
+    fn retry_detail(&self) -> String {
+        match self {
+            Self::Clean => "Tine-managed storage stopped before returning to Direct files, but archival did not complete. Retry setup can reopen the retained state.".into(),
+            Self::Forced { detail } => format!(
+                "Tine-managed storage was explicitly stopped without a clean drain ({detail}), and archival did not complete. Retry setup can reopen the retained state; any in-memory managed edits that had not reached durable storage may be absent."
+            ),
         }
-        Err(error) => Err(format!(
-            "Tine-managed storage could not stop safely: {error}"
-        )),
+    }
+
+    fn completion_note(&self) -> Option<&str> {
+        match self {
+            Self::Clean => None,
+            Self::Forced { .. } => Some(
+                "Managed storage could not complete a clean drain before this confirmed return. Its retained state was archived, but any in-memory managed edits that had not reached durable storage may be absent.",
+            ),
+        }
     }
 }
 
-fn restore_sparse_slot(
+/// Attempt the normal drain first.  A confirmed return to Direct Files is an
+/// explicit escape hatch, so a refusal does not leave the user trapped: the
+/// actor is then crash-stopped and joined before any managed files move.
+fn shutdown_for_direct_files_escape(
+    slot: &crate::state::GraphSlot,
+) -> Result<DirectFilesShutdown, String> {
+    let Some(handle) = slot.sparse_runtime() else {
+        return Ok(DirectFilesShutdown::Clean);
+    };
+    match handle.clean_shutdown() {
+        Ok(SyncShutdownOutcome::Safe(_)) => Ok(DirectFilesShutdown::Clean),
+        Ok(SyncShutdownOutcome::Terminal(snapshot)) => {
+            let detail = snapshot
+                .detail
+                .unwrap_or_else(|| "the managed actor reached a terminal state".into());
+            handle.stop_without_clean_drain().map_err(|error| {
+                format!("Tine-managed storage could not stop for the confirmed Direct Files return: {error}")
+            })?;
+            Ok(DirectFilesShutdown::Forced { detail })
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            handle.stop_without_clean_drain().map_err(|stop| {
+                format!("Tine-managed storage could not stop for the confirmed Direct Files return after its clean drain failed ({detail}): {stop}")
+            })?;
+            Ok(DirectFilesShutdown::Forced { detail })
+        }
+    }
+}
+
+fn publish_retryable_sparse_slot(
     state: &crate::state::AppState,
     label: &str,
-    slot: Arc<crate::state::GraphSlot>,
-    reason: String,
-) -> Result<SparseV2CancelResult, String> {
+    root_key: PathBuf,
+    graph_meta: GraphMeta,
+    detail: String,
+) -> Result<Arc<crate::state::GraphSlot>, String> {
+    let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+        retryable_binding("local_active", detail),
+        root_key,
+        graph_meta,
+    ));
     state
         .graphs
         .write()
         .unwrap()
-        .bind(label.to_string(), slot)
-        .map_err(|restore| {
-            format!("{reason}; Tine-managed storage could not be restored in memory: {restore}")
-        })?;
+        .bind(label.to_string(), Arc::clone(&replacement))?;
     crate::state::poke_watcher(state);
-    Err(reason)
+    Ok(replacement)
 }
 
 fn cancel_sparse_v2_at_paths_with_archive(
@@ -1256,21 +1501,16 @@ fn cancel_sparse_v2_at_paths_with_archive(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<(), String>,
-    archive: impl FnOnce(&Path, &Path) -> Result<PathBuf, String>,
+    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
+    archive: impl FnOnce(&Path, &Path) -> Result<Option<PathBuf>, String>,
 ) -> Result<SparseV2CancelResult, String> {
-    let binding = slot
-        .sparse_binding()
+    slot.sparse_binding()
         .ok_or("This graph is already using Direct files.")?;
-    let record = read_binding_at(&private_root.join(SPARSE_BINDING_FILE), &slot.root_key)?
-        .ok_or("Tine-managed storage setup for this graph is missing.")?;
-    if record.graph_meta.root != slot.root_key.display().to_string()
-        || slot.graph_meta().root != record.graph_meta.root
-    {
-        return Err("Tine-managed storage data does not match this graph.".into());
-    }
-    cancel_eligibility(binding, &slot.root_key.join(".tine-sync/v2"))?;
-
+    // The slot is the live, exact graph binding.  Explicit recovery must not
+    // require parsing a possibly-corrupt or absent private binding merely to
+    // learn a path we already own.
+    let direct_root = slot.root_key.clone();
+    let graph_meta = slot.graph_meta();
     let removed = state.graphs.write().unwrap().remove(label);
     if removed.is_some() {
         crate::state::poke_watcher(state);
@@ -1289,30 +1529,76 @@ fn cancel_sparse_v2_at_paths_with_archive(
         return Err("The graph changed while returning to Direct files. Try again.".into());
     }
 
-    if let Err(error) = shutdown(&slot) {
-        return restore_sparse_slot(state, label, slot, error);
-    }
+    let shutdown = match shutdown(&slot) {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            // No archive has started; the live slot remains usable when a
+            // force-stop itself could not be completed.
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .bind(label.to_string(), slot)
+                .map_err(|restore| {
+                    format!(
+                        "{error}; Tine-managed storage could not be restored in memory: {restore}"
+                    )
+                })?;
+            crate::state::poke_watcher(state);
+            return Err(error);
+        }
+    };
 
+    // `clean_shutdown` consumes the live actor even when it succeeds.  If a
+    // later archive step fails, re-publishing that old slot would advertise a
+    // dead handle.  Publish a fresh no-handle retry route, then release every
+    // reference to the retired actor before touching its storage.
+    let retryable = publish_retryable_sparse_slot(
+        state,
+        label,
+        direct_root.clone(),
+        graph_meta,
+        shutdown.retry_detail(),
+    )?;
+    let retry_generation = retryable.binding_generation;
+    drop(removed);
+    drop(slot);
+
+    let provider_archive = match archive_graph_provider_namespace(&direct_root) {
+        Ok(archive) => archive,
+        Err(error) => return Err(error),
+    };
     if let Err(error) = archive(private_root, recovery_root) {
-        return restore_sparse_slot(state, label, slot, error);
+        let reason = match restore_graph_provider_namespace(provider_archive) {
+            Ok(()) => error,
+            Err(restore) => format!("{error}; {restore}"),
+        };
+        return Err(reason);
     }
 
     let graph = tine_core::model::Graph::open_checked_with_assets(
-        &record.graph_root,
+        &direct_root,
         approved_assets,
     )
     .map_err(|error| {
+        state.graphs.write().unwrap().remove(label);
+        crate::state::poke_watcher(state);
         format!(
             "Tine-managed storage recovery state was preserved, but Direct files could not reopen: {error}. Restart Tine to reopen the unchanged Markdown/Org graph."
         )
     })?;
-    let replacement = Arc::new(crate::state::GraphSlot::new(graph, slot.root_key.clone()));
+    let replacement = Arc::new(crate::state::GraphSlot::new(graph, direct_root));
     state
         .graphs
         .write()
         .unwrap()
         .bind(label.to_string(), Arc::clone(&replacement))
         .map_err(|error| {
+            let removed = state.graphs.write().unwrap().remove(label);
+            debug_assert!(removed.as_ref().is_none_or(|slot| {
+                slot.binding_generation == retry_generation
+            }));
+            crate::state::poke_watcher(state);
             format!(
                 "Tine-managed storage recovery state was preserved, but Direct files could not be restored: {error}. Restart Tine to reopen the unchanged Markdown/Org graph."
             )
@@ -1322,8 +1608,12 @@ fn cancel_sparse_v2_at_paths_with_archive(
     Ok(SparseV2CancelResult {
         binding_generation: replacement.binding_generation,
         status,
-        recovery_statement: "Direct file mode is active. Complete recovery state was preserved."
-            .into(),
+        recovery_statement: match shutdown.completion_note() {
+            Some(note) => format!(
+                "Direct file mode is active. Complete managed-storage recovery state was preserved. {note}"
+            ),
+            None => "Direct file mode is active. Complete managed-storage recovery state was preserved.".into(),
+        },
     })
 }
 
@@ -1334,7 +1624,7 @@ fn cancel_sparse_v2_at_paths(
     private_root: &Path,
     recovery_root: &Path,
     approved_assets: Option<&Path>,
-    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<(), String>,
+    shutdown: impl FnOnce(&crate::state::GraphSlot) -> Result<DirectFilesShutdown, String>,
 ) -> Result<SparseV2CancelResult, String> {
     cancel_sparse_v2_at_paths_with_archive(
         state,
@@ -1378,7 +1668,7 @@ fn cancel_sparse_v2_blocking(
         &private_root,
         &recovery_root,
         approved_assets.as_deref(),
-        require_safe_sparse_shutdown,
+        shutdown_for_direct_files_escape,
     )
 }
 
@@ -2055,6 +2345,15 @@ mod tests {
         found
     }
 
+    fn create_empty_local_provider_scaffold(graph_root: &Path) {
+        let shared = graph_root.join(".tine-sync/v2/shared");
+        for tree in PROVIDER_SCAFFOLD_TREES {
+            for namespace in PROVIDER_SCAFFOLD_NAMESPACES {
+                std::fs::create_dir_all(shared.join(tree).join(namespace)).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn sparse_binding_without_live_handle_gives_actionable_recovery() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
@@ -2067,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_status_uses_the_exact_slots_rollback_eligibility() {
+    fn transition_status_keeps_archive_and_direct_escape_available_with_warnings() {
         let local = RollbackFixture::new(Some("shadow_import"));
         let local_status = sparse_v2_status_for_slot(&local.slot).unwrap();
         assert!(matches!(
@@ -2084,12 +2383,12 @@ mod tests {
         for stage in ["share_prepared", "joining", "shared_active"] {
             let shared = RollbackFixture::new(Some(stage));
             let shared_status = sparse_v2_status_for_slot(&shared.slot).unwrap();
-            assert!(!shared_status.can_cancel, "{stage}");
+            assert!(shared_status.can_cancel, "{stage}");
             assert!(
                 shared_status
                     .cancel_reason
                     .as_deref()
-                    .is_some_and(|reason| reason.contains("synced with another device")),
+                    .is_some_and(|reason| reason.contains("archive the complete private")),
                 "{stage}: {:?}",
                 shared_status.cancel_reason
             );
@@ -2097,17 +2396,28 @@ mod tests {
 
         let provider = RollbackFixture::new(Some("shadow_import"));
         std::fs::create_dir_all(provider.graph_root.join(".tine-sync/v2")).unwrap();
+        std::fs::write(
+            provider.graph_root.join(".tine-sync/v2/provider-evidence"),
+            b"unclassifiable provider state",
+        )
+        .unwrap();
         let provider_status = sparse_v2_status_for_slot(&provider.slot).unwrap();
-        assert!(!provider_status.can_cancel);
+        assert!(provider_status.can_cancel);
         assert!(provider_status
             .cancel_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("synced with another device")));
+            .is_some_and(|reason| reason.contains("archive the complete private")));
     }
 
     #[test]
     fn incomplete_local_activation_retires_without_touching_markdown_and_preserves_private_bytes() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_local_provider_scaffold(&fixture.graph_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
+        assert_eq!(
+            provider_namespace_evidence(&fixture.graph_root.join(".tine-sync/v2")).unwrap(),
+            ProviderNamespaceEvidence::LocalOnly
+        );
         let result = cancel_sparse_v2_at_paths(
             &fixture.state,
             "main",
@@ -2115,7 +2425,7 @@ mod tests {
             &fixture.private_root,
             &fixture.recovery_root,
             None,
-            require_safe_sparse_shutdown,
+            shutdown_for_direct_files_escape,
         )
         .unwrap();
 
@@ -2126,7 +2436,7 @@ mod tests {
         assert_eq!(result.binding_generation, result.status.binding_generation);
         assert!(result
             .recovery_statement
-            .contains("Complete recovery state was preserved"));
+            .contains("Complete managed-storage recovery state was preserved"));
         assert!(!fixture.private_root.exists());
         let archives = std::fs::read_dir(&fixture.recovery_root)
             .unwrap()
@@ -2145,6 +2455,13 @@ mod tests {
             std::fs::read(&fixture.markdown_path).unwrap(),
             fixture.markdown_bytes
         );
+        assert!(!fixture.graph_root.join(".tine-sync/v2").exists());
+        let provider_archives = std::fs::read_dir(fixture.graph_root.join(".tine-sync/recovery"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(provider_archives.len(), 1);
+        assert_eq!(snapshot_tree(&provider_archives[0]), provider_before);
         assert!(fixture
             .state
             .graphs
@@ -2173,7 +2490,7 @@ mod tests {
             &fixture.private_root,
             &fixture.recovery_root,
             None,
-            require_safe_sparse_shutdown,
+            shutdown_for_direct_files_escape,
         )
         .unwrap();
 
@@ -2207,6 +2524,73 @@ mod tests {
             std::fs::read_to_string(&fixture.markdown_path).unwrap(),
             "- genuinely external edit\n"
         );
+    }
+
+    fn assert_return_to_direct_files_after_unreadable_private_state(fixture: &RollbackFixture) {
+        let result = cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+        )
+        .unwrap();
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+    }
+
+    #[test]
+    fn missing_private_binding_does_not_block_explicit_return_to_direct_files() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        std::fs::remove_file(fixture.private_root.join(SPARSE_BINDING_FILE)).unwrap();
+
+        assert_return_to_direct_files_after_unreadable_private_state(&fixture);
+        let archived = std::fs::read_dir(&fixture.recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].join("diagnostic-bytes").is_file());
+        assert!(!archived[0].join(SPARSE_BINDING_FILE).exists());
+    }
+
+    #[test]
+    fn corrupt_private_binding_does_not_block_explicit_return_to_direct_files() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        std::fs::write(fixture.private_root.join(SPARSE_BINDING_FILE), b"{").unwrap();
+
+        assert_return_to_direct_files_after_unreadable_private_state(&fixture);
+        let archived = std::fs::read_dir(&fixture.recovery_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(
+            std::fs::read(archived[0].join(SPARSE_BINDING_FILE)).unwrap(),
+            b"{"
+        );
+    }
+
+    #[test]
+    fn absent_private_root_does_not_block_explicit_return_to_direct_files() {
+        let fixture = RollbackFixture::new(Some("shadow_import"));
+        std::fs::remove_dir_all(&fixture.private_root).unwrap();
+
+        assert_return_to_direct_files_after_unreadable_private_state(&fixture);
+        assert!(!fixture.recovery_root.exists());
     }
 
     #[test]
@@ -2246,7 +2630,7 @@ mod tests {
             &fixture.private_root,
             &fixture.recovery_root,
             None,
-            require_safe_sparse_shutdown,
+            shutdown_for_direct_files_escape,
         )
         .unwrap();
 
@@ -2272,6 +2656,55 @@ mod tests {
     }
 
     #[test]
+    fn terminal_runtime_uses_real_confirmed_override_and_reaches_direct_files() {
+        std::thread::Builder::new()
+            .name("tine-sparse-forced-direct-return-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(terminal_runtime_uses_real_confirmed_override_and_reaches_direct_files_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn terminal_runtime_uses_real_confirmed_override_and_reaches_direct_files_inner() {
+        let mut fixture = RollbackFixture::new(Some("shadow_import"));
+        fixture.make_active();
+        let handle = fixture.slot.sparse_runtime().unwrap();
+        handle.stop_without_clean_drain().unwrap();
+        assert_eq!(
+            handle.status().unwrap().lifecycle,
+            SyncRuntimeLifecycle::StoppedCrashed
+        );
+
+        let result = cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+        )
+        .unwrap();
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(result
+            .recovery_statement
+            .contains("had not reached durable storage may be absent"));
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
+    }
+
+    #[test]
     fn shutdown_refusal_restores_sparse_authority_and_changes_no_durable_bytes() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
         let private_before = snapshot_tree(&fixture.private_root);
@@ -2285,11 +2718,11 @@ mod tests {
             &fixture.private_root,
             &fixture.recovery_root,
             None,
-            |_| Err("injected clean shutdown refusal".into()),
+            |_| Err("injected force-stop refusal".into()),
         )
         .unwrap_err();
 
-        assert!(error.contains("injected clean shutdown refusal"));
+        assert!(error.contains("injected force-stop refusal"));
         let restored = fixture.state.graphs.read().unwrap().slot("main").unwrap();
         assert!(restored.is_sparse_v2());
         assert_eq!(restored.binding_generation, generation);
@@ -2302,12 +2735,12 @@ mod tests {
     }
 
     #[test]
-    fn archive_rename_failure_restores_the_same_sparse_slot_and_all_bytes() {
+    fn archive_failure_publishes_a_fresh_retryable_slot_after_shutdown() {
         let fixture = RollbackFixture::new(Some("shadow_import"));
+        create_empty_local_provider_scaffold(&fixture.graph_root);
         let private_before = snapshot_tree(&fixture.private_root);
+        let provider_before = snapshot_tree(&fixture.graph_root.join(".tine-sync/v2"));
         let markdown_before = std::fs::read(&fixture.markdown_path).unwrap();
-        let generation = fixture.slot.binding_generation;
-
         let error = cancel_sparse_v2_at_paths_with_archive(
             &fixture.state,
             "main",
@@ -2317,12 +2750,14 @@ mod tests {
             None,
             |_| {
                 assert!(fixture.state.graphs.read().unwrap().slot("main").is_none());
-                Ok(())
+                Ok(DirectFilesShutdown::Clean)
             },
             |private_root, recovery_root| {
                 assert_eq!(private_root, fixture.private_root);
                 assert_eq!(recovery_root, fixture.recovery_root);
-                assert!(fixture.state.graphs.read().unwrap().slot("main").is_none());
+                let retryable = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+                assert!(retryable.is_sparse_v2());
+                assert!(retryable.sparse_runtime().is_none());
                 Err("injected archive rename failure".into())
             },
         )
@@ -2330,18 +2765,104 @@ mod tests {
 
         assert!(error.contains("injected archive rename failure"));
         let restored = fixture.state.graphs.read().unwrap().slot("main").unwrap();
-        assert!(Arc::ptr_eq(&restored, &fixture.slot));
-        assert_eq!(restored.binding_generation, generation);
+        assert!(!Arc::ptr_eq(&restored, &fixture.slot));
+        assert!(restored.is_sparse_v2());
+        assert!(restored.sparse_runtime().is_none());
+        let retry_status = sparse_v2_status_for_slot(&restored).unwrap();
+        assert!(retry_status.can_retry);
+        assert!(retry_status.can_cancel);
         assert_eq!(snapshot_tree(&fixture.private_root), private_before);
+        assert_eq!(
+            snapshot_tree(&fixture.graph_root.join(".tine-sync/v2")),
+            provider_before
+        );
         assert_eq!(
             std::fs::read(&fixture.markdown_path).unwrap(),
             markdown_before
         );
         assert!(!fixture.recovery_root.exists());
+
+        let result = cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&restored),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+        )
+        .unwrap();
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(fixture
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
     }
 
     #[test]
-    fn any_shared_or_provider_evidence_refuses_rollback_before_shutdown() {
+    fn real_clean_shutdown_archive_failure_never_republishes_a_dead_handle() {
+        std::thread::Builder::new()
+            .name("tine-sparse-archive-failure-retry-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(real_clean_shutdown_archive_failure_never_republishes_a_dead_handle_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn real_clean_shutdown_archive_failure_never_republishes_a_dead_handle_inner() {
+        let mut fixture = RollbackFixture::new(Some("shadow_import"));
+        fixture.make_active();
+        let error = cancel_sparse_v2_at_paths_with_archive(
+            &fixture.state,
+            "main",
+            Arc::clone(&fixture.slot),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+            |_, _| Err("injected private archive failure".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected private archive failure"));
+
+        let retryable = fixture.state.graphs.read().unwrap().slot("main").unwrap();
+        assert!(!Arc::ptr_eq(&retryable, &fixture.slot));
+        assert!(retryable.sparse_runtime().is_none());
+        let retry_status = sparse_v2_status_for_slot(&retryable).unwrap();
+        assert!(retry_status.can_retry);
+        assert!(retry_status.can_cancel);
+        assert!(matches!(
+            retry_status.availability,
+            SparseV2Availability::Retryable { ref stage, .. } if stage == "local_active"
+        ));
+
+        let result = cancel_sparse_v2_at_paths(
+            &fixture.state,
+            "main",
+            Arc::clone(&retryable),
+            &fixture.private_root,
+            &fixture.recovery_root,
+            None,
+            shutdown_for_direct_files_escape,
+        )
+        .unwrap();
+        assert!(matches!(
+            result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+    }
+
+    #[test]
+    fn shared_or_provider_evidence_is_archived_before_returning_to_direct_files() {
         let provider = RollbackFixture::new(Some("shadow_import"));
         std::fs::create_dir_all(provider.graph_root.join(".tine-sync/v2")).unwrap();
         std::fs::write(
@@ -2349,17 +2870,24 @@ mod tests {
             b"shared",
         )
         .unwrap();
-        let provider_error = cancel_sparse_v2_at_paths(
+        let provider_result = cancel_sparse_v2_at_paths(
             &provider.state,
             "main",
             Arc::clone(&provider.slot),
             &provider.private_root,
             &provider.recovery_root,
             None,
-            |_| panic!("provider evidence must refuse before shutdown"),
+            shutdown_for_direct_files_escape,
         )
-        .unwrap_err();
-        assert!(provider_error.contains("synced with another device"));
+        .unwrap();
+        assert!(matches!(
+            provider_result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!provider.private_root.exists());
+        assert!(provider.recovery_root.is_dir());
+        assert!(!provider.graph_root.join(".tine-sync/v2").exists());
+        assert!(provider.graph_root.join(".tine-sync/recovery").is_dir());
         assert!(provider
             .state
             .graphs
@@ -2367,21 +2895,26 @@ mod tests {
             .unwrap()
             .slot("main")
             .unwrap()
-            .is_sparse_v2());
+            .legacy_graph()
+            .is_ok());
 
         let shared = RollbackFixture::new(Some("joining"));
-        let shared_error = cancel_sparse_v2_at_paths(
+        let shared_result = cancel_sparse_v2_at_paths(
             &shared.state,
             "main",
             Arc::clone(&shared.slot),
             &shared.private_root,
             &shared.recovery_root,
             None,
-            |_| panic!("shared lifecycle must refuse before shutdown"),
+            shutdown_for_direct_files_escape,
         )
-        .unwrap_err();
-        assert!(shared_error.contains("synced with another device"));
-        assert!(shared.private_root.exists());
+        .unwrap();
+        assert!(matches!(
+            shared_result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!shared.private_root.exists());
+        assert!(shared.recovery_root.is_dir());
     }
 
     #[test]
