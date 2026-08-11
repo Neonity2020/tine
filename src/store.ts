@@ -1601,6 +1601,8 @@ interface SnapEntry {
   nodes: Record<string, Node>; // snapshot of nodes living on those pages
   dirty: string[]; // pages to re-save on undo/redo
   context: HistoryContext;
+  /** Page-instance generations this entry was recorded against (GH #305). */
+  instances: Record<string, number>;
   /** Identity-bearing clipboard paste whose redo must fail on a live conflict. */
   preservedIds?: string[];
 }
@@ -1615,6 +1617,8 @@ interface RawEntry {
   headerRoot?: { node: Node; rootIndex: number };
   removeHeaderOnApply?: boolean;
   context: HistoryContext;
+  /** Page-instance generations this entry was recorded against (GH #305). */
+  instances: Record<string, number>;
   preservedIds?: string[];
 }
 type UndoEntry = SnapEntry | RawEntry;
@@ -1689,6 +1693,46 @@ export function clearUndoHistory() {
 function entryTouchesPage(e: UndoEntry, name: string): boolean {
   if (e.kind === "raw") return e.page === name;
   return e.pages === null || e.pages.includes(name);
+}
+
+/** The page-instance generations an entry is being recorded against.
+ *
+ *  An undo entry describes ONE loaded instance of each page it touches. Eviction
+ *  deliberately keeps history, and re-opening the page installs a fresh instance
+ *  carrying whatever the file says NOW — so replaying the old entry would restore
+ *  pre-eviction content and mark the page dirty, and the save guard would accept
+ *  it, because the baseline it submits under genuinely matches disk. Nothing in
+ *  that path looks like a conflict. Stamping the generation makes the staleness
+ *  visible at replay time, and covers every other way an instance is swapped
+ *  (reload, rebind, forget) rather than only the reload-in-place path
+ *  `invalidateUndoForPage` already handles. (GH #305) */
+function captureInstances(names: readonly string[]): Record<string, number> {
+  const instances: Record<string, number> = {};
+  for (const name of names) {
+    const generation = pageInstanceGeneration(name);
+    if (generation !== null) instances[name] = generation;
+  }
+  return instances;
+}
+
+/** True when every page the entry describes is still the same loaded instance. */
+function entryIsReplayable(e: UndoEntry): boolean {
+  for (const name of Object.keys(e.instances)) {
+    // peek, never the lazily-activating reader: minting a generation here would
+    // make the check pass by inventing the identity it is supposed to compare.
+    if (peekPageInstanceGeneration(name) !== e.instances[name]) return false;
+  }
+  return true;
+}
+
+/** Drop the popped stale entry's whole page history and say so once. Silence
+ *  would read as "undo did nothing", which is how this class of bug hides. */
+function discardStaleHistory(e: UndoEntry): void {
+  for (const name of Object.keys(e.instances)) {
+    if (peekPageInstanceGeneration(name) !== e.instances[name]) invalidateUndoForPage(name);
+  }
+  lastUndoTag = null;
+  pushToast("Undo history for this page was discarded: the page was reloaded since those edits", "info");
 }
 
 /** The page owning the active editor wins over the focused pane's route. This is
@@ -1782,6 +1826,7 @@ function snapEntry(affected?: string[] | null, preservedIds?: readonly string[])
     nodes,
     dirty: names,
     context,
+    instances: captureInstances(names),
     ...(preservedIds?.length ? { preservedIds: [...preservedIds] } : {}),
   };
 }
@@ -1816,6 +1861,7 @@ function pushRawUndo(id: string, prevRaw: string) {
     raw: prevRaw,
     page: node.page,
     context: captureHistoryContext(),
+    instances: captureInstances([node.page]),
     ...(rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
   });
   if (undoStack.length > 200) undoStack.shift();
@@ -1836,6 +1882,7 @@ function applyEntry(e: UndoEntry): UndoEntry {
       raw: node ? node.raw : "",
       page: e.page,
       context: captureHistoryContext(),
+      instances: captureInstances([e.page]),
       ...(node && rootIndex >= 0 ? { headerRoot: { node: cloneNode(node), rootIndex } } : {}),
       ...(e.preservedIds?.length ? { preservedIds: [...e.preservedIds] } : {}),
     };
@@ -1933,6 +1980,7 @@ export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
 export function undo() {
   const entry = popHistoryEntry(undoStack);
   if (!entry) return;
+  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
   redoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("undo");
@@ -1943,6 +1991,7 @@ export function undo() {
 export function redo() {
   const entry = popHistoryEntry(redoStack);
   if (!entry) return;
+  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
   if (entry.preservedIds?.some(docHasBlockIdentity)) {
     // The selected prerequisite is already popped. A later redo snapshot cannot
     // remain valid without it, including in page-only mode where the tagged

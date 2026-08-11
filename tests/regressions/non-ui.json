@@ -2808,6 +2808,28 @@
       "notes": "Remaining half of the 2026-08-07 authority defect. The read half is REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001 (25f36f16); settings and the asset trash are REG-MANAGED-SETTINGS-WRITES-REFUSED-001 and REG-MANAGED-ASSET-TRASH-REFUSED-001. Still refused under managed storage, needing real oplog transactions: rename_page, delete_page, merge_pages, rename_file_to_page, resolve_sync_conflict, trash_sync_conflict, trash_journal_file, copy_guide_into_graph. The enumeration this row asked for now exists: src-tauri/src/managed_command_surface.rs lists all 141 Tauri commands with the routing each one uses, re-derives that routing from the sources, and fails when the refused set changes -- so a new command that cannot work under managed storage is a failing diff rather than a user report. That enumeration surfaced a group nobody had listed: publish_html, open_pdf, read_highlights, write_highlights, write_pdf_view_state, save_pdf_area_image, save_asset and stream_asset_path are all asset/publish-domain work, outside the oplog's document domain, still sitting on the legacy write authority. They are the cheapest remaining slice. Tracked as M5 in specs/handoffs/2026-08-06-direct-files-program.md."
     },
     {
+      "id": "REG-UNDO-ACROSS-EVICTION-305",
+      "title": "Undo cannot replay a snapshot recorded against a page instance that was evicted and re-opened",
+      "family": "direct-files-data-safety",
+      "sources": {
+        "issues": [
+          305
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/store.test.ts::working-set eviction::refuses an undo entry recorded before the page was evicted (GH #305)"
+        ]
+      },
+      "notes": "Working-set eviction keeps undo history by design, but the kept entry describes the evicted instance. Re-opening installs a fresh instance carrying the file's current content, and invalidateUndoForPage only runs when a load REPLACES a page that is still present, so the stale entry stayed eligible. Replaying it restored pre-eviction content and marked the page dirty; the next save submitted that content under the fresh instance's baseline, which the base-revision guard accepts because the baseline genuinely matches disk, so no conflict was ever raised. Undo/redo entries now carry the page-instance generations they were recorded against and are refused (with the page's history dropped and a toast) when any of those instances is gone. Verified fail-before: the structural-edit repro restored ['keep me','delete me'] over the external content on the unfixed tree."
+    },
+    {
       "id": "REG-NESTED-ASSET-READ-300",
       "title": "Images and streamed media can be read from nested assets directories",
       "family": "assets",

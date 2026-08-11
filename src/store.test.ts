@@ -1313,6 +1313,57 @@ describe("working-set eviction", () => {
 
     expect(pageByName("Pinned")).toBeTruthy();
   });
+
+  // GH #305. Eviction deliberately keeps undo history, but the entry it keeps
+  // describes the instance that was evicted. Re-opening the page installs a
+  // FRESH instance carrying whatever the file says now — so replaying that entry
+  // would restore pre-eviction text and mark the page dirty, and the next save
+  // would submit it under the new file's revision, which the base-revision guard
+  // accepts because that baseline genuinely matches disk. No conflict is raised.
+  it("refuses an undo entry recorded before the page was evicted (GH #305)", async () => {
+    const saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("rev-victim");
+    await ensurePageLoaded({
+      name: "Victim",
+      kind: "page",
+      title: "Victim",
+      pre_block: null,
+      blocks: [blk("keep me"), blk("delete me")],
+    });
+    // A STRUCTURAL edit: its undo entry is a whole-page snapshot, which is what
+    // can resurrect pre-eviction content wholesale.
+    const doomed = pageByName("Victim")!.roots[1];
+    deleteBlock(doomed);
+    expect(pageByName("Victim")!.roots).toHaveLength(1);
+    // A dirty page is pinned against eviction, which is correct — the bug needs
+    // a page the user has FINISHED with, so settle the edit first.
+    await flushAll();
+    expect(isDirty("Victim")).toBe(false);
+
+    // Browse far enough that Victim ages out of the working set.
+    for (let i = 0; i < 90; i++) await ensurePageLoaded(page(`Filler ${i}`));
+    expect(pageByName("Victim")).toBeFalsy();
+
+    // The file changed elsewhere while we were away; re-opening reads it fresh.
+    await ensurePageLoaded({
+      name: "Victim",
+      kind: "page",
+      title: "Victim",
+      pre_block: null,
+      blocks: [blk("changed by another device")],
+    });
+    const after = pageByName("Victim")!.roots;
+    expect(after.map((id) => doc.byId[id].raw)).toEqual(["changed by another device"]);
+
+    undo();
+
+    // The external content must survive, and the page must not be left dirty
+    // with pre-eviction content queued for the next save.
+    expect(pageByName("Victim")!.roots.map((id) => doc.byId[id].raw)).toEqual([
+      "changed by another device",
+    ]);
+    expect(isDirty("Victim")).toBe(false);
+    saveSpy.mockRestore();
+  });
 });
 
 describe("collapse / visible order", () => {
