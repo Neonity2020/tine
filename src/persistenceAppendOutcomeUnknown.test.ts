@@ -6,6 +6,9 @@ let nextSave: () => Promise<string>;
 
 vi.mock("./store", () => ({
   doc: { loaded: true, pages: [] },
+  bumpEditGeneration: () => {},
+  editorActivationFor: () => 1,
+  peekPageInstanceGeneration: () => 1,
   pageByName: (name: string) => ({ name }),
   pageInstanceGeneration: () => 1,
   pageToDto: (name: string) => ({
@@ -18,7 +21,9 @@ vi.mock("./store", () => ({
     path: `pages/${name}.md`,
     guide: false,
     read_only: false,
+    activation: 1,
   }),
+  sweepReplaceable: () => {},
 }));
 
 vi.mock("./backend", () => ({
