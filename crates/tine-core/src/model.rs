@@ -3450,12 +3450,39 @@ struct PageCacheIndex {
     by_path: std::collections::HashMap<PathBuf, usize>,
 }
 
-#[derive(Clone)]
 struct EffectiveIdentityIndex {
-    generation: u64,
+    generation: std::sync::atomic::AtomicU64,
     owners: std::collections::HashMap<(PageKind, String), Vec<PageEntry>>,
     physical_paths: std::collections::HashSet<PathBuf>,
     failures: Vec<String>,
+}
+
+impl Clone for EffectiveIdentityIndex {
+    fn clone(&self) -> Self {
+        Self {
+            generation: std::sync::atomic::AtomicU64::new(self.generation()),
+            owners: self.owners.clone(),
+            physical_paths: self.physical_paths.clone(),
+            failures: self.failures.clone(),
+        }
+    }
+}
+
+impl EffectiveIdentityIndex {
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn retag_generation(&self, previous: u64, next: u64) -> bool {
+        self.generation
+            .compare_exchange(
+                previous,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3819,7 +3846,7 @@ fn build_effective_identity_index(
             .push(entry.clone());
     }
     EffectiveIdentityIndex {
-        generation,
+        generation: std::sync::atomic::AtomicU64::new(generation),
         owners,
         physical_paths,
         failures,
@@ -7414,6 +7441,7 @@ impl Graph {
         &self,
         permit: &ManagedTextWritePermit,
         managed_path: &ManagedPath,
+        strict_creation: bool,
     ) -> io::Result<()> {
         #[cfg(test)]
         GRAPH_TEXT_PORTABLE_TRAVERSALS.with(|count| count.set(count.get().saturating_add(1)));
@@ -7492,10 +7520,13 @@ impl Graph {
                     };
                     let file_type = entry.file_type()?;
                     if file_type.is_symlink() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "projection path has no retained no-follow directory or file",
-                        ));
+                        if strict_creation {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "projection path has no retained no-follow directory or file",
+                            ));
+                        }
+                        continue;
                     }
 
                     if is_filename {
@@ -7530,7 +7561,7 @@ impl Graph {
                     if directory_count > limits.directories {
                         return Err(managed_text_inventory_limit_error("directory count"));
                     }
-                    if relative != requested_relative {
+                    if strict_creation && relative != requested_relative {
                         projection_real_directory(&prefix.directory, name)?;
                         let _alias = open_projection_dir_nofollow(&prefix.directory, name)?;
                         return Err(io::Error::new(
@@ -7676,7 +7707,7 @@ impl Graph {
                 .iter()
                 .map(|(entry, _)| entry.path.clone())
                 .collect::<std::collections::HashSet<_>>();
-            if identity_index.generation != generation
+            if identity_index.generation() != generation
                 || identity_index.failures != failures
                 || identity_index.physical_paths != cached_paths
                 || disk_revs.len() != cached_paths.len()
@@ -7779,6 +7810,14 @@ impl Graph {
         &self,
         permit: &ManagedTextWritePermit,
     ) -> io::Result<std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>> {
+        self.capture_direct_creation_census_with_limits(permit, INITIAL_SHADOW_LIMITS)
+    }
+
+    fn capture_direct_creation_census_with_limits(
+        &self,
+        permit: &ManagedTextWritePermit,
+        limits: InitialShadowLimits,
+    ) -> io::Result<std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>> {
         struct PendingDirectory {
             directory: Dir,
             relative: String,
@@ -7786,7 +7825,6 @@ impl Graph {
         }
 
         count_direct_creation_census();
-        let limits = INITIAL_SHADOW_LIMITS;
         let mut files = std::collections::BTreeMap::new();
         let mut pending = vec![PendingDirectory {
             directory: self.managed_permit_root(permit)?.try_clone()?,
@@ -7930,7 +7968,7 @@ impl Graph {
         loop {
             let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
             if let Some(index) = self.effective_identity_index.read().unwrap().as_ref() {
-                if index.generation == generation {
+                if index.generation() == generation {
                     return Ok(Arc::clone(index));
                 }
             }
@@ -7976,7 +8014,7 @@ impl Graph {
                 .as_ref()
                 .map(Arc::clone);
             if let Some(index) = retained {
-                if index.generation == generation {
+                if index.generation() == generation {
                     index
                 } else if !current_entries.is_empty() || !failures.is_empty() {
                     return Err(io::Error::new(
@@ -7985,7 +8023,7 @@ impl Graph {
                     ));
                 } else {
                     let index = Arc::new(EffectiveIdentityIndex {
-                        generation,
+                        generation: std::sync::atomic::AtomicU64::new(generation),
                         owners: std::collections::HashMap::new(),
                         physical_paths: std::collections::HashSet::new(),
                         failures: Vec::new(),
@@ -8000,7 +8038,7 @@ impl Graph {
                 ));
             } else {
                 let index = Arc::new(EffectiveIdentityIndex {
-                    generation,
+                    generation: std::sync::atomic::AtomicU64::new(generation),
                     owners: std::collections::HashMap::new(),
                     physical_paths: std::collections::HashSet::new(),
                     failures: Vec::new(),
@@ -8020,7 +8058,7 @@ impl Graph {
                 ),
             ));
         }
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != index.generation {
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != index.generation() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "effective page identity evidence changed during name-only creation",
@@ -8052,12 +8090,13 @@ impl Graph {
         let Some(current) = guard.as_ref() else {
             return;
         };
-        if current.generation.checked_add(1) != Some(generation) {
+        if current.generation().checked_add(1) != Some(generation) {
             *guard = None;
             return;
         }
         let mut next = (**current).clone();
-        next.generation = generation;
+        next.generation
+            .store(generation, std::sync::atomic::Ordering::Release);
         next.physical_paths.insert(entry.path.clone());
         for owners in next.owners.values_mut() {
             owners.retain(|owner| owner.path != entry.path);
@@ -8095,14 +8134,15 @@ impl Graph {
                 let retained = self.effective_identity_index.read().unwrap().clone();
                 Some(Arc::new(retained.map_or_else(
                     || EffectiveIdentityIndex {
-                        generation,
+                        generation: std::sync::atomic::AtomicU64::new(generation),
                         owners: std::collections::HashMap::new(),
                         physical_paths: std::iter::once(path.to_path_buf()).collect(),
                         failures: failures.clone(),
                     },
                     |current| {
                         let mut next = (*current).clone();
-                        next.generation = generation;
+                        next.generation
+                            .store(generation, std::sync::atomic::Ordering::Release);
                         next.physical_paths.insert(path.to_path_buf());
                         next.failures = failures.clone();
                         next
@@ -8148,12 +8188,13 @@ impl Graph {
                         .as_deref()
                         .cloned()
                         .unwrap_or_else(|| EffectiveIdentityIndex {
-                            generation,
+                            generation: std::sync::atomic::AtomicU64::new(generation),
                             owners: std::collections::HashMap::new(),
                             physical_paths: std::collections::HashSet::new(),
                             failures: Vec::new(),
                         });
-                next.generation = generation;
+                next.generation
+                    .store(generation, std::sync::atomic::Ordering::Release);
                 next.physical_paths.insert(entry.path.clone());
                 for owners in next.owners.values_mut() {
                     owners.retain(|owner| owner.path != entry.path);
@@ -8511,7 +8552,7 @@ impl Graph {
                 "effective page identity evidence changed before creation publication",
             ));
         }
-        self.validate_graph_text_portable_aliases_path_local(permit, &managed_path)?;
+        self.validate_graph_text_portable_aliases_path_local(permit, &managed_path, true)?;
         match self.managed_target(permit, path, false) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -8710,7 +8751,7 @@ impl Graph {
             // final byte reread and after force-save's final retained-identity
             // validation, but before the first live-name mutation.
             managed_write_before_mutation_hook()?;
-            self.validate_graph_text_portable_aliases_path_local(permit, &managed_path)?;
+            self.validate_graph_text_portable_aliases_path_local(permit, &managed_path, false)?;
             if let Err(error) = self.validate_existing_graph_text_target_exact(
                 &target,
                 &managed_path,
@@ -15214,9 +15255,16 @@ impl Graph {
             && !failures_changed
         {
             // Exact content-only publication does not alter effective identity.
-            // Drop the generation tag instead of rebuilding every unrelated
-            // owner now; name-only creation can reconstruct it on demand.
-            *self.effective_identity_index.write().unwrap() = None;
+            // Advance the shared generation tag in O(1): creation requires warm
+            // parsed semantic evidence and must not rebuild it merely because
+            // unrelated bytes changed.
+            let mut identity_guard = self.effective_identity_index.write().unwrap();
+            let advanced = identity_guard
+                .as_ref()
+                .is_some_and(|index| index.retag_generation(newgen - 1, newgen));
+            if !advanced {
+                *identity_guard = None;
+            }
         } else if let Some(pages) = guard.as_ref() {
             *self.effective_identity_index.write().unwrap() = Some(Arc::new(
                 build_effective_identity_index(newgen, pages, resulting_failures.clone()),
@@ -21586,7 +21634,7 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        self.validate_graph_text_portable_aliases_path_local(write, &managed_path)
+        self.validate_graph_text_portable_aliases_path_local(write, &managed_path, false)
     }
 
     fn observe_editor_conflict(
@@ -31251,12 +31299,12 @@ fn hash_direct_creation_census_file(
     expected_resource: ContentDigest,
     expected_link_count: u64,
     aggregate_hashed_bytes: &mut u64,
-    aggregate_limit: u64,
+    per_file_limit: u64,
 ) -> io::Result<[u8; 32]> {
     const READ_BUFFER_BYTES: usize = 64 * 1024;
     let advertised_len = file.metadata()?.len();
-    if advertised_len > aggregate_limit.saturating_sub(*aggregate_hashed_bytes) {
-        return Err(initial_shadow_limit_error("aggregate raw bytes"));
+    if advertised_len > per_file_limit {
+        return Err(initial_shadow_limit_error("file raw bytes"));
     }
     let mut buffer = vec![0_u8; READ_BUFFER_BYTES];
     let mut hasher = Sha256::new();
@@ -31272,8 +31320,8 @@ fn hash_direct_creation_census_file(
         *aggregate_hashed_bytes = aggregate_hashed_bytes
             .checked_add(read as u64)
             .ok_or_else(|| initial_shadow_limit_error("aggregate raw bytes"))?;
-        if *aggregate_hashed_bytes > aggregate_limit {
-            return Err(initial_shadow_limit_error("aggregate raw bytes"));
+        if byte_length > per_file_limit {
+            return Err(initial_shadow_limit_error("file raw bytes"));
         }
         hasher.update(&buffer[..read]);
     }
@@ -38989,7 +39037,7 @@ mod tests {
             .as_ref()
             .cloned()
             .unwrap();
-        assert_eq!(installed.generation, graph.cache_generation());
+        assert_eq!(installed.generation(), graph.cache_generation());
         assert_eq!(installed.failures, vec!["pages/Invalid.md"]);
         let _ = fs::remove_dir_all(&dir);
 
@@ -39018,7 +39066,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(failed.generation, graph.cache_generation());
+            assert_eq!(failed.generation(), graph.cache_generation());
             assert_eq!(failed.failures, vec!["pages/Mutable.md"]);
             let blocked =
                 markdown_page_dto("Blocked Watcher", "Blocked Watcher", "- no\n").unwrap();
@@ -39035,7 +39083,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(repaired.generation, graph.cache_generation());
+            assert_eq!(repaired.generation(), graph.cache_generation());
             assert!(repaired.failures.is_empty());
             assert!(repaired
                 .owners
@@ -39085,7 +39133,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(failed.generation, graph.cache_generation());
+            assert_eq!(failed.generation(), graph.cache_generation());
             assert_eq!(failed.failures, vec!["pages/Mutable.md"]);
             let blocked =
                 markdown_page_dto("Blocked Snapshot", "Blocked Snapshot", "- no\n").unwrap();
@@ -39134,7 +39182,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .expect("cold watcher failure must install effective evidence");
-            assert_eq!(failed.generation, graph.cache_generation());
+            assert_eq!(failed.generation(), graph.cache_generation());
             assert_eq!(failed.failures, vec!["pages/Cold Failure.md"]);
             assert!(failed.physical_paths.contains(&path));
 
@@ -39153,7 +39201,7 @@ mod tests {
                 .as_ref()
                 .cloned()
                 .unwrap();
-            assert_eq!(repaired.generation, graph.cache_generation());
+            assert_eq!(repaired.generation(), graph.cache_generation());
             assert!(repaired.failures.is_empty());
             assert!(repaired
                 .owners
@@ -43364,6 +43412,189 @@ mod tests {
         }
     }
 
+    /// A content-only existing save must carry the already-warm semantic
+    /// evidence forward. The immediately following creation may stream one
+    /// census, but may not rebuild/capture/parse the graph to recover evidence
+    /// that the existing save already proved unchanged.
+    #[test]
+    fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
+        let dir = scratch("existing-save-then-create-warm-evidence");
+        fs::write(dir.join("pages/Existing.md"), b"- before\n").unwrap();
+        fs::write(
+            dir.join("pages/Explicit Owner.md"),
+            b"title:: Claimed Identity\n\n- owner\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut existing = graph.load_by_path("pages/Existing.md").unwrap().unwrap();
+        existing.blocks[0].raw = "after".into();
+        graph
+            .save_page(&existing, existing.rev.as_deref())
+            .expect("identity-preserving existing save");
+        let installed = graph
+            .effective_identity_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("content-only save must retain warm semantic evidence");
+        assert_eq!(installed.generation(), graph.cache_generation());
+
+        let before = graph.guarded_graph_text_identity_report();
+        reset_graph_text_admission_test_counters();
+        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE
+            .with(|charge| charge.set(Some(INITIAL_SHADOW_LIMITS.peak_build_bytes)));
+        graph
+            .save_page(
+                &direct_save_bench_new_page("Fresh After Existing Save"),
+                None,
+            )
+            .expect("warm evidence must authorize the noncolliding creation");
+        let after = graph.guarded_graph_text_identity_report();
+        let counters = graph_text_admission_test_counters();
+        assert_eq!(counters.direct_creation_censuses, 1);
+        assert_eq!(counters.direct_creation_files_hashed, 2);
+        assert_eq!(counters.builder_enumerations, 0);
+        assert_eq!(counters.parser_invocations, 0);
+        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(
+            GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE.with(Cell::take),
+            Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
+            "creation consumed the retained shadow capture hook"
+        );
+        assert_eq!(
+            fs::read(dir.join("pages/Existing.md")).unwrap(),
+            b"- after\n"
+        );
+        assert!(dir.join("pages/Fresh After Existing Save.md").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The O(1) content-only path is not authority to retain stale semantic
+    /// ownership when an ordinary existing save changes `title::`.
+    #[test]
+    fn identity_changing_existing_save_refreshes_creation_evidence() {
+        let dir = scratch("existing-save-retitles-identity-evidence");
+        fs::write(
+            dir.join("pages/Physical Owner.md"),
+            b"title:: Alpha Identity\n\n- owner\n",
+        )
+        .unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+
+        let mut owner = graph
+            .load_by_path("pages/Physical Owner.md")
+            .unwrap()
+            .unwrap();
+        owner.pre_block = Some("title:: Omega Identity\n".into());
+        graph
+            .save_page(&owner, owner.rev.as_deref())
+            .expect("identity-changing existing save");
+
+        let installed = graph
+            .effective_identity_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("identity-changing save must publish replacement evidence");
+        assert_eq!(installed.generation(), graph.cache_generation());
+        assert!(!installed
+            .owners
+            .contains_key(&page_cache_key(PageKind::Page, "Alpha Identity")));
+        assert!(installed
+            .owners
+            .contains_key(&page_cache_key(PageKind::Page, "Omega Identity")));
+        let target = dir.join("pages/Omega Identity.md");
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Omega Identity"), None)
+            .expect_err("the new effective owner must refuse a duplicate creation");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Existing exact-target authority is not invalidated by a noncolliding
+    /// sibling under another spelling of the same portable ancestor. A leaf
+    /// collision under that ancestor remains a hard refusal.
+    #[test]
+    fn existing_save_allows_portable_ancestor_neighbor_but_refuses_colliding_leaf() {
+        for (tag, alias_leaf, should_save) in [
+            ("noncolliding", "Other.md", true),
+            ("colliding", "Target.md", false),
+        ] {
+            let dir = scratch(&format!("existing-save-portable-ancestor-{tag}"));
+            fs::create_dir_all(dir.join("logseq")).unwrap();
+            fs::write(
+                dir.join("logseq/config.edn"),
+                "{:pages-directory \"Pages\"}\n",
+            )
+            .unwrap();
+            fs::create_dir_all(dir.join("Pages")).unwrap();
+            let target = dir.join("Pages/Target.md");
+            let neighbor = dir.join("pages").join(alias_leaf);
+            fs::write(&target, b"- before\n").unwrap();
+            fs::write(&neighbor, b"- neighbor\n").unwrap();
+            let graph = Graph::open(&dir);
+            graph.warm_cache();
+            let mut page = graph.load_by_path("Pages/Target.md").unwrap().unwrap();
+            page.blocks[0].raw = "after".into();
+
+            let result = graph.save_page(&page, page.rev.as_deref());
+            if should_save {
+                result.expect("noncolliding portable ancestor neighbor must not block save");
+                assert_eq!(fs::read(&target).unwrap(), b"- after\n");
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+                assert_eq!(fs::read(&target).unwrap(), b"- before\n");
+            }
+            assert_eq!(fs::read(&neighbor).unwrap(), b"- neighbor\n");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A portable-equivalent symlink branch is not traversal authority over an
+    /// already loaded exact target. The save stays on the retained exact path.
+    #[cfg(unix)]
+    #[test]
+    fn existing_save_allows_portable_equivalent_symlink_neighbor() {
+        let dir = scratch("existing-save-portable-symlink-neighbor");
+        fs::create_dir_all(dir.join("logseq")).unwrap();
+        fs::write(
+            dir.join("logseq/config.edn"),
+            "{:pages-directory \"Pages\"}\n",
+        )
+        .unwrap();
+        fs::remove_dir_all(dir.join("pages")).unwrap();
+        fs::create_dir_all(dir.join("Pages")).unwrap();
+        let target = dir.join("Pages/Target.md");
+        fs::write(&target, b"- before\n").unwrap();
+        let outside = dir.with_extension("portable-symlink-neighbor");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("Other.md"), b"- outside neighbor\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("pages")).unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("Pages/Target.md").unwrap().unwrap();
+        page.blocks[0].raw = "after".into();
+
+        graph
+            .save_page(&page, page.rev.as_deref())
+            .expect("portable-equivalent symlink neighbor must not block exact save");
+        assert_eq!(fs::read(&target).unwrap(), b"- after\n");
+        assert_eq!(
+            fs::read(outside.join("Other.md")).unwrap(),
+            b"- outside neighbor\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
     /// Repeated existing saves never need to construct the complete admission
     /// index, even when their own exact publications leave that optional index
     /// invalidated. State this as counters rather than a CI stopwatch.
@@ -43416,6 +43647,37 @@ mod tests {
             Some(INITIAL_SHADOW_LIMITS.peak_build_bytes),
             "ordinary creation consumed the retained shadow capture hook"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The retained-shadow raw-byte ceiling remains a sensible per-file stream
+    /// bound, but is not a cumulative graph-size cap. Exercise the production
+    /// census decision with tiny real files instead of a 512 MiB allocation.
+    #[test]
+    fn direct_creation_census_accepts_aggregate_above_retained_byte_limit() {
+        let dir = scratch("creation-census-aggregate-stream-bound");
+        fs::write(dir.join("pages/First.md"), b"123456").unwrap();
+        fs::write(dir.join("pages/Second.md"), b"abcdef").unwrap();
+        let graph = Graph::open(&dir);
+        let permit = graph.admit_retained_managed_text_writer().unwrap();
+        let limits = InitialShadowLimits {
+            raw_bytes: 6,
+            ..INITIAL_SHADOW_LIMITS
+        };
+
+        let files = graph
+            .capture_direct_creation_census_with_limits(&permit, limits)
+            .expect("aggregate streamed bytes may exceed the retained-byte ceiling");
+        assert_eq!(files.len(), 2);
+        let aggregate = fs::metadata(dir.join("pages/First.md")).unwrap().len()
+            + fs::metadata(dir.join("pages/Second.md")).unwrap().len();
+        assert!(aggregate > limits.raw_bytes);
+
+        fs::write(dir.join("pages/Oversized.md"), b"1234567").unwrap();
+        let error = graph
+            .capture_direct_creation_census_with_limits(&permit, limits)
+            .expect_err("the per-file streamed resource bound must remain enforced");
+        assert!(error.to_string().contains("file raw bytes"), "{error}");
         let _ = fs::remove_dir_all(&dir);
     }
 
