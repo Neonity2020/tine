@@ -57,6 +57,34 @@ afterEach(() => {
 });
 
 describe("managed file-drop admission", () => {
+  it("refuses a null route record before a mixed asset and CSV can begin I/O or mutate", async () => {
+    loadSingle({
+      name: "Drop",
+      kind: "page",
+      title: "Drop",
+      pre_block: null,
+      blocks: [{ id: TARGET, raw: "target", collapsed: false, children: [] }],
+    });
+    const readTextFile = vi.spyOn(backend(), "readTextFile");
+    const importAsset = vi.spyOn(backend(), "importAsset");
+    const counts = { publications: 0, dirty: 0, undo: 0 };
+    __setStoreMutationObserverForTest((event) => {
+      if (event.kind === "publication") counts.publications++;
+      else if (event.kind === "dirty") counts.dirty++;
+      else if (event.kind === "undo-snapshot") counts.undo++;
+    });
+
+    await insertDroppedFiles(TARGET, ["/tmp/image.png", "/tmp/huge.csv"]);
+
+    expect(readTextFile).not.toHaveBeenCalled();
+    expect(importAsset).not.toHaveBeenCalled();
+    expect(pageByName("Drop")!.roots).toEqual([TARGET]);
+    expect(counts).toEqual({ publications: 0, dirty: 0, undo: 0 });
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Can't insert while Tine-managed storage is changing state. Nothing was changed.",
+    ]);
+  });
+
   it("plans a mixed 5,000-cell CSV drop before any ordinary asset import", async () => {
     seedNearFullPage();
     managedWritable();

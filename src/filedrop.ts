@@ -126,11 +126,11 @@ async function insertDroppedFilesDirect(afterId: string, paths: readonly string[
 export async function insertDroppedFiles(afterId: string, paths: readonly string[]): Promise<void> {
   try {
     const authority = managedStorageRuntime.snapshot().applicationPageAdmission;
-    if (!authority || authority.authority === "direct") {
+    if (authority?.authority === "direct") {
       await insertDroppedFilesDirect(afterId, paths);
       return;
     }
-    if (authority.authority !== "managed_writable") {
+    if (!authority || authority.authority !== "managed_writable") {
       const admission = preflightManagedBulkInsertion(afterId, () => ({
         insertedDescendants: 0,
         removedOrReusedDescendants: 0,

@@ -1790,7 +1790,8 @@ export function preflightManagedBulkInsertion(
   targetPageName?: string,
 ): ManagedBulkInsertionPreflight {
   const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
-  if (!admission || admission.authority === "direct") return { kind: "direct" };
+  if (admission?.authority === "direct") return { kind: "direct" };
+  if (!admission) return { kind: "refused", toast: managedBulkUnavailableToast };
   if (admission.authority !== "managed_writable") {
     return { kind: "refused", toast: managedBulkUnavailableToast };
   }

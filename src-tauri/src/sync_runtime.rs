@@ -564,16 +564,7 @@ impl SparseV2StatusDto {
             cancel_reason: None,
             binding_generation,
             application_page_admission: if binding.has_active_application_handle() {
-                crate::state::ApplicationPageAdmission {
-                    binding_generation,
-                    authority: crate::state::ApplicationPageAdmissionAuthority::ManagedWritable {
-                        application_save_page_blocks:
-                            tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
-                        application_page_request_text_bytes:
-                            tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
-                        application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
-                    },
-                }
+                crate::state::ApplicationPageAdmission::managed_writable(binding_generation)
             } else {
                 crate::state::ApplicationPageAdmission::managed_unavailable(binding_generation)
             },

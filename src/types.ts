@@ -285,6 +285,7 @@ export type SparseV2Status = SparseV2Availability & {
 export interface SparseV2RuntimeStatusEvent {
   binding_generation: number;
   runtime: SparseV2RuntimeStatus;
+  application_page_admission: ApplicationPageAdmission;
 }
 
 export interface SparseV2CancelResult {

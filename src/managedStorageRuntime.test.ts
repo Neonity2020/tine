@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { createManagedStorageRuntimeBridge, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
-import type { SparseV2RuntimeStatus, SparseV2Status, SparseV2Tick } from "./types";
+import type {
+  SparseV2RuntimeStatus,
+  SparseV2RuntimeStatusEvent,
+  SparseV2Status,
+  SparseV2Tick,
+} from "./types";
 
 function runtime(lastTick: SparseV2Tick | null = null): SparseV2RuntimeStatus {
   return {
@@ -43,9 +48,22 @@ function active(bindingGeneration: number): SparseV2Status {
   };
 }
 
+function runtimeEvent(
+  bindingGeneration: number,
+  lifecycle: SparseV2RuntimeStatus["lifecycle"],
+): SparseV2RuntimeStatusEvent {
+  return {
+    binding_generation: bindingGeneration,
+    runtime: { ...runtime(), lifecycle },
+    application_page_admission: lifecycle === "active"
+      ? active(bindingGeneration).application_page_admission
+      : { binding_generation: bindingGeneration, authority: "managed_unavailable" },
+  };
+}
+
 describe("managed-storage runtime event bridge", () => {
   it("owns one typed subscription set and carries live runtime state into the current binding", async () => {
-    let statusListener: ((event: { binding_generation: number; runtime: SparseV2RuntimeStatus }) => void) | undefined;
+    let statusListener: ((event: SparseV2RuntimeStatusEvent) => void) | undefined;
     let tickListener: ((event: { binding_generation: number; tick: SparseV2Tick }) => void) | undefined;
     let errorListener: ((event: { binding_generation: number; message: string }) => void) | undefined;
     const unlisten = [vi.fn(), vi.fn(), vi.fn()];
@@ -71,7 +89,7 @@ describe("managed-storage runtime event bridge", () => {
     expect(tickListener).toBeTypeOf("function");
     expect(errorListener).toBeTypeOf("function");
 
-    statusListener?.({ binding_generation: 41, runtime: runtime() });
+    statusListener?.(runtimeEvent(41, "active"));
     const blocked = { state: "blocked", detail: "the exact recovery proof is unavailable", epoch: null };
     tickListener?.({ binding_generation: 41, tick: blocked });
     errorListener?.({ binding_generation: 41, message: "Blocked(\"the exact recovery proof is unavailable\")" });
@@ -137,5 +155,46 @@ describe("managed-storage runtime event bridge", () => {
       binding_generation: 32,
       authority: "direct",
     });
+  });
+
+  it.each(["stopped_safe", "stopped_crashed", "terminal"] as const)(
+    "replaces writable admission with managed-unavailable on a same-generation %s event",
+    (lifecycle) => {
+      const bridge = createManagedStorageRuntimeBridge({
+        sparseV2Status: vi.fn().mockResolvedValue(active(51)),
+        onSparseV2Status: async () => () => {},
+        onSparseV2Tick: async () => () => {},
+        onSparseV2Error: async () => () => {},
+      });
+      bridge.bind(51, active(51).application_page_admission);
+
+      expect(bridge.receiveRuntimeStatus(runtimeEvent(51, lifecycle))).toBe(true);
+      expect(bridge.snapshot().runtime?.lifecycle).toBe(lifecycle);
+      expect(bridge.snapshot().applicationPageAdmission).toEqual({
+        binding_generation: 51,
+        authority: "managed_unavailable",
+      });
+    },
+  );
+
+  it("cannot let a stale runtime event replace a newer Direct or managed binding", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(61)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+    bridge.bind(61, active(61).application_page_admission);
+    bridge.bind(62, { binding_generation: 62, authority: "direct" });
+
+    expect(bridge.receiveRuntimeStatus(runtimeEvent(61, "terminal"))).toBe(false);
+    expect(bridge.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 62,
+      authority: "direct",
+    });
+
+    bridge.bind(63, active(63).application_page_admission);
+    expect(bridge.receiveRuntimeStatus(runtimeEvent(61, "active"))).toBe(false);
+    expect(bridge.snapshot().applicationPageAdmission).toEqual(active(63).application_page_admission);
   });
 });

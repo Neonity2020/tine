@@ -99,10 +99,18 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
 
   const receiveRuntimeStatus = (event: SparseV2RuntimeStatusEvent): boolean => {
     if (!accepts(event.binding_generation)) return false;
+    if (event.application_page_admission.binding_generation !== event.binding_generation) return false;
     setSnapshot((current) => ({
       ...current,
+      applicationPageAdmission: event.application_page_admission,
       runtime: event.runtime,
-      status: current.status ? { ...current.status, runtime: event.runtime } : null,
+      status: current.status
+        ? {
+            ...current.status,
+            runtime: event.runtime,
+            application_page_admission: event.application_page_admission,
+          }
+        : null,
       tick: event.runtime.last_tick ?? current.tick,
     }));
     return true;

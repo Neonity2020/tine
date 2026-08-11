@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager, State};
-use tine_core::sync_runtime::{SyncRuntimeHandle, SyncRuntimeTick, SyncWatcherObservation};
+use tine_core::sync_runtime::{
+    SyncRuntimeHandle, SyncRuntimeStatusSnapshot, SyncRuntimeTick, SyncWatcherObservation,
+};
 use tine_core::{model::GraphTextExactFeedPathClass, model::PageKind, Graph};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -24,6 +26,26 @@ struct GraphChange {
 struct SparseV2RuntimeStatusEvent {
     binding_generation: u64,
     runtime: crate::sync_runtime::SparseV2RuntimeStatusDto,
+    application_page_admission: crate::state::ApplicationPageAdmission,
+}
+
+/// Build the event from the one actor status observation that the watcher has
+/// already obtained. A second `handle.status()` call could observe a different
+/// lifecycle and briefly retain stale frontend write authority.
+fn sparse_v2_runtime_status_event(
+    binding_generation: u64,
+    status: SyncRuntimeStatusSnapshot,
+) -> SparseV2RuntimeStatusEvent {
+    let application_page_admission =
+        crate::state::ApplicationPageAdmission::from_managed_runtime_lifecycle(
+            binding_generation,
+            &status.lifecycle,
+        );
+    SparseV2RuntimeStatusEvent {
+        binding_generation,
+        runtime: crate::sync_runtime::runtime_status(status),
+        application_page_admission,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -1215,10 +1237,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             let _ = app.emit_to(
                                 label,
                                 "sparse-v2-status",
-                                SparseV2RuntimeStatusEvent {
-                                    binding_generation: graph.binding_generation,
-                                    runtime: crate::sync_runtime::runtime_status(status),
-                                },
+                                sparse_v2_runtime_status_event(graph.binding_generation, status),
                             );
                         }
                     }
@@ -1334,6 +1353,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tine_core::model::{BlockDto, Format, PageDto};
+    use tine_core::sync_runtime::SyncRuntimeLifecycle;
+
+    fn runtime_snapshot(lifecycle: SyncRuntimeLifecycle) -> SyncRuntimeStatusSnapshot {
+        SyncRuntimeStatusSnapshot {
+            lifecycle,
+            recovery: None,
+            watcher: Default::default(),
+            last_tick: None,
+            detail: None,
+            shared_role: None,
+            shared_phase: None,
+            provider_pending: 0,
+            managed_local_pending: 0,
+            managed_local_checkpointed_sequence: 0,
+            managed_local_next_sequence: 0,
+            managed_local_stage: None,
+        }
+    }
+
+    #[test]
+    fn sparse_status_event_derives_admission_from_its_single_status_observation() {
+        for (lifecycle, authority) in [
+            (SyncRuntimeLifecycle::Active, "managed_writable"),
+            (SyncRuntimeLifecycle::StoppedSafe, "managed_unavailable"),
+            (SyncRuntimeLifecycle::StoppedCrashed, "managed_unavailable"),
+            (SyncRuntimeLifecycle::Terminal, "managed_unavailable"),
+        ] {
+            let event = sparse_v2_runtime_status_event(73, runtime_snapshot(lifecycle));
+            let wire = serde_json::to_value(event).unwrap();
+            assert_eq!(wire["binding_generation"], 73);
+            assert_eq!(wire["application_page_admission"]["binding_generation"], 73);
+            assert_eq!(wire["application_page_admission"]["authority"], authority);
+        }
+    }
 
     #[test]
     fn atomic_page_save_temp_events_stay_incremental() {

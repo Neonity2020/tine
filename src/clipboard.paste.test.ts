@@ -166,6 +166,9 @@ async function countStoreMutations<T>(run: () => T | Promise<T>) {
 }
 
 beforeEach(() => {
+  // Legacy clipboard fixtures exercise Direct Files behavior explicitly. A
+  // missing route record is now intentionally fail-closed during transitions.
+  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
   vi.spyOn(backend(), "writeRich").mockResolvedValue();
   vi.spyOn(backend(), "savePage").mockResolvedValue("saved-rev");
   vi.spyOn(backend(), "resolveBlocks").mockImplementation(async (ids) => ids.map(() => null));
@@ -201,6 +204,37 @@ function bindManagedWritable(): void {
       application_page_max_depth: 128,
     },
   } as any);
+}
+
+function receiveManagedUnavailableRuntime(
+  lifecycle: "stopped_safe" | "stopped_crashed" | "terminal",
+): boolean {
+  return managedStorageRuntime.receiveRuntimeStatus({
+    binding_generation: 1,
+    runtime: {
+      lifecycle,
+      recovery: null,
+      watcher: {
+        latest_enqueue: 0,
+        acknowledged: 0,
+        drain_in_flight: false,
+        pending: false,
+        pending_requires_full_scan: false,
+        deferred: false,
+        quiescing: false,
+        sequence_exhausted: false,
+      },
+      last_tick: null,
+      detail: null,
+      shared_role: null,
+      shared_phase: null,
+      provider_pending: 0,
+    },
+    application_page_admission: {
+      binding_generation: 1,
+      authority: "managed_unavailable",
+    },
+  });
 }
 
 describe("clipboard payload insertion and identity validation", () => {
@@ -287,6 +321,33 @@ describe("clipboard payload insertion and identity validation", () => {
     expect(peekClipboardSlot()?.op).toBe("copy");
     expect(roots("Retry")).toEqual([retryTarget, ID1]);
   });
+
+  it.each(["stopped_safe", "stopped_crashed", "terminal"] as const)(
+    "keeps a Cut grant untouched after a same-generation managed %s runtime event",
+    async (lifecycle) => {
+      await seed([
+        page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
+        page("Target", [block(HOST, "target")]),
+      ]);
+      const payload = buildClipboardPayload([ID1])!;
+      await record("cut", "- source", payload);
+      deleteBlock(ID1);
+      bindManagedWritable();
+      expect(receiveManagedUnavailableRuntime(lifecycle)).toBe(true);
+      vi.clearAllMocks();
+
+      const mutations = await countStoreMutations(() => paste(HOST));
+
+      expect(mutations).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+      expect(vi.mocked(backend().savePage)).not.toHaveBeenCalled();
+      expect(vi.mocked(backend().resolveBlocks)).not.toHaveBeenCalled();
+      expect(peekClipboardSlot()?.op).toBe("cut");
+      expect(roots("Target")).toEqual([HOST]);
+      expect(toasts().map(({ message }) => message)).toEqual([
+        "Can't insert while Tine-managed storage is changing state. Nothing was changed.",
+      ]);
+    },
+  );
 
   it("admits a small private copy through the active managed route", async () => {
     await seed([page("Paste", [block(HOST, "target")])]);

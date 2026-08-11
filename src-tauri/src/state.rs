@@ -50,6 +50,35 @@ impl ApplicationPageAdmission {
             authority: ApplicationPageAdmissionAuthority::ManagedUnavailable,
         }
     }
+
+    pub(crate) fn managed_writable(binding_generation: u64) -> Self {
+        Self {
+            binding_generation,
+            authority: ApplicationPageAdmissionAuthority::ManagedWritable {
+                application_save_page_blocks: tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
+                application_page_request_text_bytes:
+                    tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
+                application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
+            },
+        }
+    }
+
+    /// Map one already-observed managed runtime lifecycle to the matching
+    /// frontend advisory route. Watcher callers must use this rather than
+    /// probing the actor again after obtaining their status observation.
+    pub(crate) fn from_managed_runtime_lifecycle(
+        binding_generation: u64,
+        lifecycle: &tine_core::sync_runtime::SyncRuntimeLifecycle,
+    ) -> Self {
+        if matches!(
+            lifecycle,
+            tine_core::sync_runtime::SyncRuntimeLifecycle::Active
+        ) {
+            Self::managed_writable(binding_generation)
+        } else {
+            Self::managed_unavailable(binding_generation)
+        }
+    }
 }
 
 /// Read-only graph lease used by the auxiliary Quick Capture WebView. Capture
@@ -258,16 +287,7 @@ impl GraphSlot {
         match &self.authority {
             GraphAuthority::Legacy(_) => ApplicationPageAdmission::direct(self.binding_generation),
             GraphAuthority::SparseV2(binding) if binding.has_active_application_handle() => {
-                ApplicationPageAdmission {
-                    binding_generation: self.binding_generation,
-                    authority: ApplicationPageAdmissionAuthority::ManagedWritable {
-                        application_save_page_blocks:
-                            tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
-                        application_page_request_text_bytes:
-                            tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
-                        application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
-                    },
-                }
+                ApplicationPageAdmission::managed_writable(self.binding_generation)
             }
             GraphAuthority::SparseV2(_) => {
                 ApplicationPageAdmission::managed_unavailable(self.binding_generation)
