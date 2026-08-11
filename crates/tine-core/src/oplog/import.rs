@@ -13846,12 +13846,19 @@ mod tests {
                 .map(|part| { part.evidence().payload_object_root().object_count() as usize })
                 .sum::<usize>()
         );
-        assert_eq!(multi_opened.rebuild.accepted_events_validated, 2);
-        assert_eq!(multi_opened.rebuild.accepted_events_applied, 2);
+        // One per accepted part, derived rather than hard-coded: the fixture's
+        // part count follows MAX_OPERATIONS_PER_BOOTSTRAP_PART, so a packing
+        // change moves it (it is now three, was two) without weakening a thing
+        // this test is guarding. The per-part invariant is what matters, and
+        // the `max_live_*` bounds below are what keep the work bounded no
+        // matter how many parts there are.
+        let parts = multi.aggregate().parts().len();
+        assert_eq!(multi_opened.rebuild.accepted_events_validated, parts);
+        assert_eq!(multi_opened.rebuild.accepted_events_applied, parts);
         assert_eq!(multi_opened.rebuild.max_live_events, 1);
         assert_eq!(multi_opened.rebuild.max_live_evidence_records, 1);
-        assert_eq!(multi_opened.rebuild.accepted_root_authentications, 2);
-        assert_eq!(multi_opened.rebuild.exact_catalog_loads, 2);
+        assert_eq!(multi_opened.rebuild.accepted_root_authentications, parts);
+        assert_eq!(multi_opened.rebuild.exact_catalog_loads, parts);
         assert_eq!(
             multi_opened.rebuild.reference_coverage_inductive_checks,
             multi.aggregate().parts().len()
