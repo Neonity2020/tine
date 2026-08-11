@@ -44159,12 +44159,13 @@ mod tests {
             max_query_gate_counter(&graph_search_counters, |counters| counters.result_page_hydrations),
         );
 
-        // These are emergency tripwires retained from the predecessor receipt,
-        // not calibrated architectural budgets. The exact-current p50/p95
-        // output above is what a release measurement will use to set budgets.
+        // The indexed task-query ceiling is calibrated from the exact-current
+        // release receipt: 10k/100% density measured p95 92.271ms. 150ms
+        // preserves modest machine-variance headroom; the remaining limits
+        // stay emergency tripwires retained from the predecessor receipt.
         assert!(
-            indexed_p95 < Duration::from_secs(1),
-            "indexed query emergency tripwire exceeded one second at {label}: {indexed_p95:?}"
+            indexed_p95 < Duration::from_millis(150),
+            "indexed query calibrated 150ms p95 architectural ceiling exceeded at {label}: {indexed_p95:?}"
         );
         assert!(
             regex_all_p95 < Duration::from_secs(2),
