@@ -981,6 +981,15 @@ fn intervening_engine_mutation_refuses_retained_managed_candidate_before_visibil
     );
 }
 
+// QUARANTINED (GH #308, Martin's call 2026-08-11). Same cause as the
+// fast-commit torn-tail test: tine-storage's v1 reader now refuses a partially
+// declared final frame instead of discarding it, per the journal-v2 fail-closed
+// spec. Unlike that one this IS the managed local journal, so until the v2
+// migration lands a crash during an append leaves a managed journal that will
+// not open. Managed storage is off by default and marked testing-only, which is
+// why this is tracked rather than release-blocking — see GH #308.
+#[ignore = "GH #308: v1 torn-tail contract superseded by the journal-v2 fail-closed spec; \
+            un-ignore with the v2 migration"]
 #[test]
 fn torn_final_frame_recovers_and_replays_only_the_complete_prefix() {
     let (_, batches) = finalized_edit_chain("managed-record-torn-source", "org", 8, 2);

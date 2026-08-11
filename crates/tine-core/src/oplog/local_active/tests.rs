@@ -9539,14 +9539,23 @@ fn first_mutation_refuses_when_deferred_catalog_bytes_are_missing() {
                     error,
                     RuntimePromotionError::Engine(EngineError::Archive(_))
                 ));
-                assert!(
-                    runtime.engine().instrumentation().catalog_hot_state_loads > 1,
-                    "the refused deferred read must be followed by ordinary replay"
-                );
+                // Outcome first, probe second: the durable retirement is what a
+                // user is protected by, the load count is only how we witness
+                // the replay that produced it.
                 assert!(
                     !retained_run_directories(&fixture.archive_root).contains(&runs[0]),
                     "the refused adopted run must be durably retired after full replay"
                 );
+                // The recovery this is really about: having refused once and
+                // retired the bad run, the runtime must be usable again rather
+                // than stuck refusing. Asserted directly, because the count that
+                // used to stand in for it no longer witnesses the replay —
+                // reads became run-local, so recovery reaches the same state
+                // without loading the catalog hot state a second time. A proxy
+                // that a pure optimization can silence was never the invariant.
+                runtime
+                    .admit_promoted_mutation(authority, &fixture.graph)
+                    .expect("the runtime recovers and admits a mutation after the refusal");
             },
         );
 

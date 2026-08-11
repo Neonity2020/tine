@@ -52,7 +52,11 @@ const WORK_SCHEMA_VERSION: u32 = 3;
 // v8 makes each authenticated exact-path completion leaf a bounded current
 // authority (or a constant-size ambiguity marker), rather than a lifetime
 // history of every receipt ever completed at that path.
-const INDEX_SCHEMA_VERSION: u32 = 10;
+//
+// v11 carries `intent_id` on a Blocked row. v10 rows encode that variant with
+// one fewer field, so a v10 row cannot be decoded by a v11 reader: the version
+// must move with the layout, or an older row is misread rather than rejected.
+const INDEX_SCHEMA_VERSION: u32 = 11;
 const MAX_WORK_ROW_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREPARED_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_NODE_BYTES: u64 = 8 * 1024 * 1024;
@@ -3766,7 +3770,11 @@ enum StoredWorkStatus {
     },
     Blocked {
         observed: Option<BlobDescription>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        // No `skip_serializing_if` here. These rows are encoded with postcard,
+        // which is not self-describing: omitting the field drops its Option tag
+        // byte from the wire, and the decoder — which always reads one — then
+        // runs off the end of the buffer. Every Blocked row written since the
+        // field was introduced has been undecodable for exactly that reason.
         intent_id: Option<ProjectionIntentId>,
     },
     Superseded {

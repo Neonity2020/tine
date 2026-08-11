@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 #[cfg(target_os = "android")]
 use tauri::{
     plugin::{Builder, PluginApi, PluginHandle, TauriPlugin},
-    AppHandle, Runtime,
+    AppHandle, Manager, Runtime,
 };
 
 #[cfg(target_os = "android")]

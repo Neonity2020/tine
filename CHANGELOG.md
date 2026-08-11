@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+
+## [0.6.92] - 2026-08-11
+
 ### Added
 
 - **Ctrl+O opens the page under the caret**, and Ctrl+Shift+O opens it in the sidebar — matching Logseq, so you can navigate `[[links]]` and `#tags` without the mouse (GH #274).
@@ -17,6 +20,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ### Changed
 
 - **Documenting a change that shipped undocumented in 0.6.90:** a page's name comes from its `title::` property when it has one, and only otherwise from its filename — which is what Logseq does (`title::` → filename → first block). Before 0.6.90 Tine used the filename and ignored `title::`. If a graph was built against the old behaviour, files carrying a `title::` that differs from their filename are now reachable under the *title*, and `[[filename]]` links to them will open blank pages. The new dimming above makes those visible; either drop the `title::` or link to its value.
+- **Experimental Tine-managed storage moved a great deal this cycle** — journal
+  format and rollover, enrollment-integrity migration, task and block queries
+  served from the sparse index, crash-recovery and save/query latency ceilings.
+  None of it changes anything for Direct files, which remains the default and
+  what this release is really about. Managed storage is still marked testing
+  only, still off unless you turn it on, and GH #292 (setup failing on some
+  graphs) is still open.
+- **Managed storage imports roughly twice as fast, and read about eight times
+  fewer bytes.** Bringing a graph into managed storage was re-reading, re-hashing
+  and re-decoding the *entire* batch of pending objects in order to fetch a
+  single one — once per document, and again once per coordinator tick. On a real
+  1,000-page graph that meant gigabytes of redundant work: importing 300 pages
+  read 3.59 GB to move about 1.3 MB of notes. Objects are now fetched
+  individually by the content digest the caller already holds, and the
+  per-tick check reads only the batch manifest, which already records everything
+  it was asking for. Measured on a real graph: 100/200/300/400/600 pages now take
+  5.6/14.5/26.0/42.2/84.9 s, down from 10.8/29.1/50.2/80.0/157.0 s. No safety
+  guarantee changes: objects remain content-addressed and are still verified
+  individually when read.
 
 
 ### Fixed
@@ -36,27 +58,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 - **Edits are now saved when the app is backgrounded**, not only when a window is closed cleanly. On Android and iOS the system can reclaim a backgrounded app without warning, so anything typed since the last pause could be lost; desktop had narrower versions of the same hole (GH #255).
 - **Editing one block no longer rewrites blocks you never touched.** On a real-shaped 1,045-file graph, editing a block and undoing it failed to restore 96 of 983 files: an unbulleted `## Heading` gained a `- ` prefix, and in the worst case the file's indentation was pushed *into* the note text and the block gained a nesting level. Found by the 2026-08-09 Direct Files data-safety audit; the same measurement now reports zero damaged files.
 - **Typing no longer makes the next click slow.** Every save threw away Tine's index of which pages exist, and the only way to rebuild it was to re-read and re-parse the whole graph. So the first navigation or `[[` autocomplete after each typing pause stalled for about a quarter of a second on a 5,000-file graph, and longer on bigger ones. Found by the 2026-08-09 Direct Files performance audit.
+- **Each save costs less on a big graph, and a pause in typing no longer ships the whole graph's link list across.** Two things ran on every save: a scan that rebuilt a normalized key for *every* filename in each directory along the path (4.87 ms per save with 4,000 pages in one folder, against 0.70 ms with the same pages spread over subfolders — unbounded growth in the one directory that only ever grows, inside the lock that guards the write), and a refresh of the full referenced-page-name set (15–23 ms and ~5,000 names at 5,225 files, parsed on the UI thread) that fired about 700 ms after every lull even though typing inside a block almost never changes which pages are linked. The scan now folds each path component once — which also fixes it being ~1.8× *slower* than before for any graph whose names carry diacritics — and the name set is only shipped when its digest actually changed. Found by the 2026-08-09 Direct Files performance audit.
+- **A file changed outside Tine is noticed promptly again when you have more than one graph open.** If watching one graph's folder failed while another succeeded, the watcher could sit blocked on the healthy graph instead of retrying the failed one, so external edits to the failed graph went unseen for as long as the other stayed quiet. The wait is now bounded whenever any root is still unwatched.
 - Linked and Unlinked References no longer collapse themselves while you scroll or expand a group on a large graph; the section now keeps the state you put it in (GH #272).
 - **Unlinked References now finds mentions inside code blocks, inline code, math and other literal text**, as Logseq does — previously a page name written inside a fenced block, `$$…$$`, raw HTML, an example block or a hiccup vector was invisible to the panel (GH #270). Mentions inside `[[…]]` or after `#` still don't count, including inside code where there is no parsed link to recognise. The scan also got considerably faster: on a real 1,045-file graph an unlinked-reference lookup went from about 285 ms to 36 ms, despite now searching more of each file.
 - Jumping to a block from the Quick Switcher (or any "go to block" action) now expands its collapsed parents, so the block is actually scrolled to and highlighted instead of the jump silently doing nothing (GH #258).
 - Pressing Enter inside a multi-line `$$ … $$` math environment now inserts a new line and keeps the block together, instead of splitting it and breaking the environment (GH #278).
+- **Undo can no longer silently overwrite a file that changed while you were away.** Tine keeps about eighty pages in memory and drops the oldest ones as you browse past that, deliberately keeping their undo history. But the kept history described the copy that was dropped: re-opening the page read the file fresh, and pressing undo then restored the *old* content and saved it — against the new file's revision, which the save guard accepts, because that baseline genuinely matched what was on disk. Nothing looked like a conflict. Undo entries now name the exact loaded copy they were recorded against; when that copy is gone, the entry is discarded and Tine says so instead of replaying it. Found during review of GH #254 (GH #305).
+- **Tine no longer dies at launch when its data directory cannot be written.** On a machine where `~/.local/share` is owned by root — or `XDG_DATA_HOME` otherwise points somewhere unwritable — the app printed a Rust backtrace and quit, because Tauri creates the WebView's data directory during its own startup and panics on the error. Tine now checks that directory before anything resolves paths against it, moves the whole launch to the first writable fallback (`~/.tine-data`, then the runtime directory, then a temp directory), and says so in a sticky notice naming where it went. If nothing is writable it prints one actionable line instead of a backtrace (GH #303).
+- **Images and other embedded media stored in a subfolder of `assets/` now display.** Every native read path applied the top-level-only rule that belongs to asset *creation*, so a file under, say, `assets/screenshots/` stayed blank even though the link was correct. Nested paths are now read, while absolute paths, `..` traversal and symlink escapes are still refused, and newly imported assets still land directly in `assets/` (GH #300).
 - **A page changed by another program no longer becomes permanently unsaveable.** Most editors and sync clients (Syncthing, Dropbox) write a file by creating a new one and renaming it into place. Tine treated the result as a different file and refused every subsequent save with an internal message it then retried forever — even when the new content was byte-for-byte what Tine already had, and even when it was a genuine change you could have resolved. Tine now compares the content: identical content just saves, and a real difference raises the normal conflict banner. "Keep mine" is now bound to the exact disk version shown by that banner (including a deletion), so it cannot overwrite a newer unseen sync or editor change; a newer change is shown as a new conflict instead. (GH #254)
 
-
-### Changed
-
-- **Managed storage imports roughly twice as fast, and read about eight times
-  fewer bytes.** Bringing a graph into managed storage was re-reading, re-hashing
-  and re-decoding the *entire* batch of pending objects in order to fetch a
-  single one — once per document, and again once per coordinator tick. On a real
-  1,000-page graph that meant gigabytes of redundant work: importing 300 pages
-  read 3.59 GB to move about 1.3 MB of notes. Objects are now fetched
-  individually by the content digest the caller already holds, and the
-  per-tick check reads only the batch manifest, which already records everything
-  it was asking for. Measured on a real graph: 100/200/300/400/600 pages now take
-  5.6/14.5/26.0/42.2/84.9 s, down from 10.8/29.1/50.2/80.0/157.0 s. No safety
-  guarantee changes: objects remain content-addressed and are still verified
-  individually when read.
 
 ## [0.6.91] - 2026-08-07
 
