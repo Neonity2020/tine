@@ -101,7 +101,6 @@ impl CrdtGraph {
         device_id: Uuid,
         session_id: Uuid,
         pages: Vec<PageSnapshot>,
-        _authority: &mut crate::model::PreparedCrdtMutationCapability<'_>,
     ) -> Result<Self, CrdtError> {
         validate_pages(&pages)?;
 
@@ -200,7 +199,6 @@ impl CrdtGraph {
     pub(crate) fn commit_page_owned(
         &mut self,
         snapshot: PageSnapshot,
-        _authority: &mut crate::model::PreparedCrdtMutationCapability<'_>,
     ) -> Result<CommitReport, CrdtError> {
         self.commit_page(snapshot)
     }
@@ -261,7 +259,6 @@ impl CrdtGraph {
     pub(crate) fn commit_pages_owned(
         &mut self,
         snapshots: Vec<PageSnapshot>,
-        _authority: &mut crate::model::PreparedCrdtMutationCapability<'_>,
     ) -> Result<CommitReport, CrdtError> {
         self.commit_pages(snapshots)
     }
@@ -350,7 +347,6 @@ impl CrdtGraph {
         &mut self,
         snapshots: Vec<PageSnapshot>,
         projection_preconditions: Vec<ProjectionPrecondition>,
-        _authority: &mut crate::model::PreparedCrdtMutationCapability<'_>,
     ) -> Result<CommitReport, CrdtError> {
         self.replace_pages_with_projection_preconditions(snapshots, projection_preconditions)
     }
@@ -386,7 +382,6 @@ impl CrdtGraph {
     pub(crate) fn delete_page_owned(
         &mut self,
         page: impl Into<PageSelector>,
-        _authority: &mut crate::model::PreparedCrdtMutationCapability<'_>,
     ) -> Result<CommitReport, CrdtError> {
         self.delete_page(page)
     }
@@ -452,7 +447,6 @@ impl CrdtGraph {
         source_page_id: PageId,
         copy_page_id: PageId,
         promoted: PageSnapshot,
-        _authority: &mut crate::model::PreparedCrdtMutationCapability<'_>,
     ) -> Result<CommitReport, CrdtError> {
         self.promote_copy(source_page_id, copy_page_id, promoted)
     }
