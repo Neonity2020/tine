@@ -509,7 +509,7 @@ pub(crate) async fn restore_backup(
     let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let base = backup_base_for_root(&restore_app, &source.root).ok_or("no app-data dir")?;
-        restore_from_backup_source(&stamp, &base, source, Some(&graph), |source| {
+        restore_from_backup_source(&stamp, &base, source, |source| {
             do_backup_source(&restore_app, source.clone(), "pre-restore")
         })
     })
@@ -522,7 +522,6 @@ fn restore_from_backup_source(
     stamp: &str,
     base: &std::path::Path,
     source: BackupSource,
-    managed_graph: Option<&Graph>,
     snapshot_current: impl FnOnce(&BackupSource) -> (usize, bool),
 ) -> Result<(), String> {
     let assets = source.assets.clone();
@@ -619,22 +618,6 @@ fn restore_from_backup_source(
             .scope()?,
         _ => return Err("backup uses an unsupported snapshot schema".into()),
     };
-    if let Some(graph) = managed_graph.filter(|graph| graph.managed_sync_status().is_some()) {
-        let restore_files = match manifest.schema {
-            LEGACY_SNAPSHOT_SCHEMA => collect_legacy_restore_graph_text(
-                &src,
-                &manifest.journals_dir,
-                &manifest.pages_dir,
-            )?,
-            SNAPSHOT_SCHEMA => {
-                collect_scoped_restore_graph_text(&src.join("graph"), &snapshot_scope)?
-            }
-            _ => return Err("backup uses an unsupported snapshot schema".into()),
-        };
-        graph
-            .commit_managed_restore(&restore_files)
-            .map_err(|error| format!("managed-sync restore preflight failed: {error}"))?;
-    }
     // Copies happen before extras are moved to recovery, so failure leaves
     // either the original or a recoverable copy.
     match manifest.schema {
@@ -698,6 +681,7 @@ fn restore_from_backup_source(
     Ok(())
 }
 
+#[cfg(test)]
 fn collect_legacy_restore_graph_text(
     snapshot: &Path,
     journals_dir: &str,
@@ -756,6 +740,7 @@ fn collect_legacy_restore_graph_text(
     Ok(files)
 }
 
+#[cfg(test)]
 fn collect_scoped_restore_graph_text(
     source: &Path,
     scope: &GraphTextScope,
@@ -1465,6 +1450,7 @@ fn copy_md_dir(src: &std::path::Path, dest: &std::path::Path) -> (usize, usize) 
     copy_md_dir_cancellable(src, dest, &|| false)
 }
 
+#[cfg(test)]
 fn copy_md_dir_cancellable(
     src: &std::path::Path,
     dest: &std::path::Path,
@@ -2076,7 +2062,7 @@ mod tests {
         };
 
         PAYLOAD_HASH_READS.with(|reads| reads.set(0));
-        let result = restore_from_backup_source(stamp, &base, source, None, |_| {
+        let result = restore_from_backup_source(stamp, &base, source, |_| {
             std::fs::write(&live_page, b"mutated graph data").unwrap();
             (1, true)
         });
@@ -2346,8 +2332,7 @@ mod tests {
             },
         };
 
-        restore_from_backup_source("2026-08-11_12-00-00", &base, source, None, |_| (1, true))
-            .unwrap();
+        restore_from_backup_source("2026-08-11_12-00-00", &base, source, |_| (1, true)).unwrap();
 
         assert_eq!(
             std::fs::read(graph.join("Root.md")).unwrap(),

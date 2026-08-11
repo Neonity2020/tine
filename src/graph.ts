@@ -19,8 +19,25 @@ import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
 import { openConfiguredHomePage } from "./homePage";
+import { safeManagedErrorDetail } from "./managedDiagnostics";
 
 const GRAPH_KEY = "tine.graphPath";
+export const PARTIAL_PROVIDER_REFUSAL =
+  "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.";
+
+/** Keep a graph-open refusal visible until the user can retry the exact same
+ * target. A picker has already returned its target at this point, so reopening
+ * the picker would be a lossy and surprising substitute for Retry. */
+export function reportGraphOpenFailure(error: unknown, retry: () => void): void {
+  const detail = safeManagedErrorDetail(error);
+  const message = detail === PARTIAL_PROVIDER_REFUSAL
+    ? PARTIAL_PROVIDER_REFUSAL
+    : `Couldn't open the graph. (${detail})`;
+  pushToast(message, "error", {
+    sticky: true,
+    action: { label: "Retry", run: retry },
+  });
+}
 
 export function persistedGraphPath(): string {
   try {
@@ -439,7 +456,7 @@ export async function switchGraph(): Promise<LoadGraphPathOutcome> {
     if (result.status === "picked") {
       if (result.path) {
         console.info(`[tine/${platform}] loadGraphPath: start`);
-        const outcome = await loadGraphPath(result.path);
+        const outcome = await openPickedGraphPath(result.path);
         console.info(`[tine/${platform}] loadGraphPath: done`);
         return outcome;
       }
@@ -457,7 +474,16 @@ export async function switchGraph(): Promise<LoadGraphPathOutcome> {
     return { kind: "aborted" };
   }
   const path = await backend().pickFolder();
-  return path ? loadGraphPath(path) : { kind: "aborted" };
+  return path ? openPickedGraphPath(path) : { kind: "aborted" };
+}
+
+async function openPickedGraphPath(path: string): Promise<LoadGraphPathOutcome> {
+  try {
+    return await loadGraphPath(path);
+  } catch (error) {
+    reportGraphOpenFailure(error, () => void openPickedGraphPath(path));
+    return { kind: "aborted" };
+  }
 }
 
 /** Onboarding "create a new graph": pick where to put it, scaffold a small

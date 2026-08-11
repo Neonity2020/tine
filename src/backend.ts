@@ -28,9 +28,6 @@ import type {
   SyncConflictDiff,
   MergeDecision,
   PrintOpts,
-  ManagedSyncStatus,
-  SyncIdentityPlan,
-  ManagedSyncEnableResult,
   SparseV2Status,
   SparseV2CancelResult,
   SparseV2ActivationProgressEvent,
@@ -271,9 +268,6 @@ export interface Backend {
     conflictEpoch?: number | null,
     managedConflictObservation?: { path: string; revision: string } | null,
   ): Promise<SavePageResult>;
-  managedSyncStatus(): Promise<ManagedSyncStatus | null>;
-  managedSyncIdentityPlan(): Promise<SyncIdentityPlan>;
-  enableManagedSync(): Promise<ManagedSyncEnableResult>;
   sparseV2Status(): Promise<SparseV2Status>;
   onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
   onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
@@ -829,15 +823,6 @@ class TauriBackend implements Backend {
         managedConflictObservation,
       })
     );
-  }
-  managedSyncStatus() {
-    return this.call<ManagedSyncStatus | null>("managed_sync_status");
-  }
-  managedSyncIdentityPlan() {
-    return this.call<SyncIdentityPlan>("managed_sync_identity_plan");
-  }
-  enableManagedSync() {
-    return this.call<ManagedSyncEnableResult>("enable_managed_sync");
   }
   sparseV2Status() {
     return this.call<SparseV2Status>("sparse_v2_status");

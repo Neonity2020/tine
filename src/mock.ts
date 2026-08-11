@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedSyncStatus, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -649,7 +649,6 @@ const mockActivations = new Map<string, number>();
 
 export function mockBackend(): Backend {
   const all = [...PAGES, ...NAMED];
-  let managedSync: ManagedSyncStatus | null = null;
   let sparseV2: SparseV2Status = {
     state: "legacy_default",
     runtime: null,
@@ -892,27 +891,6 @@ export function mockBackend(): Backend {
     },
     async savePage(_page: PageDto, _baseRev: string | null, _force?: boolean, _conflictEpoch?: number | null): Promise<SavePageResult> {
       return { revision: "mock-rev" }; // no-op in mock; managed-compatible (no activation)
-    },
-    async managedSyncStatus() {
-      return managedSync;
-    },
-    async managedSyncIdentityPlan() {
-      return { pages: all.length, blocks: 42 };
-    },
-    async enableManagedSync() {
-      managedSync = {
-        workspace_id: "00000000-0000-4000-8000-000000000001",
-        device_id: "00000000-0000-4000-8000-000000000002",
-        session_id: "00000000-0000-4000-8000-000000000003",
-        page_count: all.length,
-        imported_chunks: 1,
-        store_root: "/mock/.tine-sync/v1",
-        durability_blocked: false,
-      };
-      return {
-        migration: { pages_changed: all.length, blocks_changed: 42 },
-        status: managedSync,
-      };
     },
     async sparseV2Status() {
       return sparseV2;

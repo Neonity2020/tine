@@ -1,4 +1,4 @@
-use crate::backup::{backup_async, backup_graph_now};
+use crate::backup::backup_async;
 use crate::settings::{
     approved_external_assets, remember_external_assets_approval, remember_graph,
 };
@@ -8,60 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
-use tine_core::crdt::ManagedSyncStoreState;
 use tine_core::model::{Graph, GraphMeta};
 use tine_core::sync_runtime::inspect_shared_enrollment_for_cold_discovery;
-
-pub(crate) fn ensure_managed_sync_safety_snapshot(
-    app: &tauri::AppHandle,
-    graph: &Graph,
-    state: ManagedSyncStoreState,
-    already_complete: bool,
-    suffix: &str,
-) -> Result<bool, String> {
-    if state == ManagedSyncStoreState::Absent || already_complete {
-        return Ok(already_complete);
-    }
-    let (_, complete) = backup_graph_now(app, graph, suffix);
-    if !complete {
-        return Err(
-            "managed sync needs a complete safety snapshot before replay; graph left unchanged"
-                .into(),
-        );
-    }
-    Ok(true)
-}
-
-pub(crate) fn start_managed_sync_after_safety(
-    app: &tauri::AppHandle,
-    graph: &Graph,
-    state: ManagedSyncStoreState,
-) -> Result<(), String> {
-    if state == ManagedSyncStoreState::Absent {
-        return Ok(());
-    }
-    let device_id = crate::settings::managed_sync_device_id(app)?;
-    match state {
-        ManagedSyncStoreState::Absent => unreachable!("handled before reading device identity"),
-        ManagedSyncStoreState::Unclaimed | ManagedSyncStoreState::Claimed => {
-            graph
-                .enable_managed_sync(device_id, uuid::Uuid::new_v4())
-                .map_err(|error| format!("managed sync could not resume activation: {error}"))?;
-        }
-        ManagedSyncStoreState::Initialized => {
-            let started = graph
-                .start_managed_sync(device_id, uuid::Uuid::new_v4())
-                .map_err(|error| format!("managed sync could not start: {error}"))?;
-            if !started {
-                return Err("managed sync store changed while it was being opened".into());
-            }
-        }
-    }
-    graph
-        .project_all_managed_sync()
-        .map_err(|error| format!("managed sync could not project: {error}"))?;
-    Ok(())
-}
 
 /// Reset the warm flag for a new graph load and return the new warm generation
 /// (passed to `warm_cache_async`, which only reports done if still current).
@@ -316,8 +264,28 @@ struct LoadedGraph {
     launch_backup_done: bool,
 }
 
+const PARTIAL_PROVIDER_REFUSAL: &str =
+    "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColdSparseArchive {
+    Absent,
+    Joinable,
+    Partial,
+    Refused,
+}
+
 fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
     refuse_unclaimed_sparse_archive_with(root, |shared| {
+        // An empty provider root is an honest-provider arrival state: the
+        // namespace appeared before the canonical enrollment descriptor. It is
+        // retryable, but must not bind a writable Direct Files slot.
+        if std::fs::read_dir(shared)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
         inspect_shared_enrollment_for_cold_discovery(shared).map(|descriptor| descriptor.is_some())
     })
 }
@@ -327,10 +295,28 @@ fn refuse_unclaimed_sparse_archive_with(
     inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
 ) -> Result<(), String> {
     const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
+    match inspect_unclaimed_sparse_archive(root, inspect_shared)? {
+        ColdSparseArchive::Absent | ColdSparseArchive::Joinable => Ok(()),
+        ColdSparseArchive::Partial => {
+            crate::debug::diag(
+                "sparse-v2 cold discovery: phase=provider_evidence; outcome=partial_provider_refusal",
+            );
+            Err(PARTIAL_PROVIDER_REFUSAL.into())
+        }
+        ColdSparseArchive::Refused => Err(REFUSAL.into()),
+    }
+}
+
+fn inspect_unclaimed_sparse_archive(
+    root: &Path,
+    inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
+) -> Result<ColdSparseArchive, String> {
     let archive = root.join(".tine-sync/v2");
     let metadata = match std::fs::symlink_metadata(&archive) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ColdSparseArchive::Absent)
+        }
         Err(error) => {
             return Err(format!(
                 "Couldn't verify Tine-managed storage data before opening this graph: {error}"
@@ -338,7 +324,7 @@ fn refuse_unclaimed_sparse_archive_with(
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(REFUSAL.into());
+        return Ok(ColdSparseArchive::Refused);
     }
     let mut entries = std::fs::read_dir(&archive).map_err(|error| {
         format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
@@ -347,7 +333,7 @@ fn refuse_unclaimed_sparse_archive_with(
         format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
     })?
     else {
-        return Err(REFUSAL.into());
+        return Ok(ColdSparseArchive::Partial);
     };
     if shared.file_name() != "shared"
         || !shared
@@ -368,11 +354,12 @@ fn refuse_unclaimed_sparse_archive_with(
             })?
             .is_some()
     {
-        return Err(REFUSAL.into());
+        return Ok(ColdSparseArchive::Refused);
     }
     match inspect_shared(&shared.path()) {
-        Ok(true) => Ok(()),
-        Ok(false) | Err(_) => Err(REFUSAL.into()),
+        Ok(true) => Ok(ColdSparseArchive::Joinable),
+        Ok(false) => Ok(ColdSparseArchive::Partial),
+        Err(_) => Ok(ColdSparseArchive::Refused),
     }
 }
 
@@ -391,10 +378,7 @@ fn open_graph_for_load(
         (0, false)
     };
     let launch_backup_done = backup_n > 0 && backup_complete;
-    let migration_may_run_before_sync = graph
-        .managed_sync_store_state()
-        .is_ok_and(|state| state == ManagedSyncStoreState::Absent);
-    if needs_migration && launch_backup_done && migration_may_run_before_sync {
+    if needs_migration && launch_backup_done {
         // Recover any journals mis-saved under their title (see method docs),
         // but only after the launch snapshot has captured the original names.
         graph
@@ -544,23 +528,10 @@ pub(crate) fn open_and_publish_direct_files(
     let LoadedGraph {
         graph,
         meta,
-        mut launch_backup_done,
+        launch_backup_done,
     } = open_graph_for_load(&root, approved_assets.as_deref(), |graph| {
-        backup_graph_now(app, graph, "")
+        crate::backup::backup_graph_now(app, graph, "")
     })?;
-    let managed_state = graph
-        .managed_sync_store_state()
-        .map_err(|error| format!("managed sync store is unsafe or invalid: {error}"))?;
-    if managed_state != ManagedSyncStoreState::Absent {
-        launch_backup_done = ensure_managed_sync_safety_snapshot(
-            app,
-            &graph,
-            managed_state,
-            launch_backup_done,
-            "pre-sync-replay",
-        )?;
-        start_managed_sync_after_safety(app, &graph, managed_state)?;
-    }
     if launch_backup_done {
         graph
             .migrate_journal_filenames_checked()
@@ -908,6 +879,28 @@ mod tests {
         dir
     }
 
+    fn tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn collect(root: &Path, relative: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+            for entry in std::fs::read_dir(root.join(relative)).unwrap() {
+                let entry = entry.unwrap();
+                let child = relative.join(entry.file_name());
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink(), "fixture must not contain symlinks");
+                if kind.is_dir() {
+                    collect(root, &child, files);
+                } else {
+                    assert!(kind.is_file(), "fixture must contain only regular files");
+                    files.push((child.clone(), std::fs::read(root.join(child)).unwrap()));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect(root, Path::new(""), &mut files);
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
     fn copy_graph_text_dir(src: &Path, dest: &Path) -> (usize, bool) {
         let _ = std::fs::create_dir_all(dest);
         let mut copied = 0usize;
@@ -1038,7 +1031,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".tine-sync/v2")).unwrap();
         assert_eq!(
             refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely."
+            PARTIAL_PROVIDER_REFUSAL
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1066,7 +1059,7 @@ mod tests {
         std::fs::remove_file(v2.join("unknown")).unwrap();
         assert_eq!(
             refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(false)).unwrap_err(),
-            REFUSAL
+            PARTIAL_PROVIDER_REFUSAL
         );
         assert_eq!(
             refuse_unclaimed_sparse_archive_with(&dir, |_| Err("malformed".into())).unwrap_err(),
@@ -1132,56 +1125,86 @@ mod tests {
     }
 
     #[test]
-    fn managed_graph_load_defers_journal_migration_until_it_is_an_operation() {
-        let dir = scratch("managed-journal-migration");
-        std::fs::create_dir_all(dir.join("logseq")).unwrap();
-        std::fs::write(
-            dir.join("logseq/config.edn"),
-            "{:preferred-format \"Org\"\n :journal/page-title-format \"EEEE, dd-MM-yyyy\"}\n",
-        )
-        .unwrap();
-        let old = dir.join("journals/Thursday, 25-06-2026.org");
-        let canonical = dir.join("journals/2026_06_25.org");
-        std::fs::write(&old, "* managed journal\n").unwrap();
+    fn partial_provider_arrival_refuses_before_direct_open_without_mutating_the_graph() {
+        let dir = scratch("partial-provider-arrival");
+        let page = dir.join("pages/representative.md");
+        let recovery = dir.join(".tine-sync/recovery/v2-returned-from-desktop/receipt");
+        let partial_shared = dir.join(".tine-sync/v2/shared");
+        std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&partial_shared).unwrap();
+        std::fs::write(&page, "- representative Direct Files bytes\n").unwrap();
+        std::fs::write(&recovery, "preserved recovery evidence\n").unwrap();
+        let page_before = std::fs::read(&page).unwrap();
+        let recovery_before = std::fs::read(&recovery).unwrap();
+
+        assert_eq!(
+            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
+            "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
+        );
+        assert_eq!(std::fs::read(&page).unwrap(), page_before);
+        assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
+        assert!(
+            !dir.join(".tine-sync/v1").exists(),
+            "a partial v2 refusal must not invoke legacy activation"
+        );
+
+        let source = include_str!("graph.rs");
+        let load = &source[source
+            .find("pub(crate) fn load_graph_for_label")
+            .expect("ordinary graph-load decision")..];
+        assert!(
+            load.find("refuse_unclaimed_sparse_archive")
+                < load.find("open_and_publish_direct_files"),
+            "partial provider evidence must be refused before a Direct Files binding is installed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_direct_publish_treats_v1_and_return_recovery_as_inert() {
+        let dir = scratch("direct-with-inert-legacy-and-recovery");
+        let page = dir.join("pages/representative.md");
+        let recovery = dir.join(".tine-sync/recovery/v2-returned-from-desktop/receipt");
+        std::fs::write(&page, "- exact Direct Files bytes\n").unwrap();
         let initial = Graph::open(&dir);
         initial
             .enable_managed_sync(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
             .unwrap();
-        let original_id = std::fs::read_to_string(&old)
-            .unwrap()
-            .lines()
-            .filter_map(|line| line.split_whitespace().last())
-            .find(|value| uuid::Uuid::parse_str(value).is_ok())
-            .unwrap()
-            .to_string();
         drop(initial);
+        std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+        std::fs::write(&recovery, "preserved provider recovery evidence\n").unwrap();
+        let page_before = std::fs::read(&page).unwrap();
+        let v1 = dir.join(".tine-sync/v1");
+        let v1_before = tree_bytes(&v1);
+        let recovery_before = std::fs::read(&recovery).unwrap();
 
-        let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |graph| {
-            copy_graph_text_dir(&graph.journals_path(), &dir.join("backup/journals"))
-        })
-        .unwrap();
-        assert!(
-            old.exists(),
-            "the startup layer must not move it before replay"
-        );
-        assert!(!canonical.exists());
-        loaded
-            .graph
-            .start_managed_sync(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
-            .unwrap();
-        loaded.graph.project_all_managed_sync().unwrap();
-        assert_eq!(loaded.graph.migrate_journal_filenames_checked().unwrap(), 1);
+        let loaded = open_graph_for_load(dir.to_str().unwrap(), None, |_| (0, false)).unwrap();
+        assert_eq!(loaded.meta.root, dir.display().to_string());
+        assert_eq!(std::fs::read(&page).unwrap(), page_before);
+        assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
+        assert_eq!(tree_bytes(&v1), v1_before);
 
-        assert!(!old.exists());
-        let projected = std::fs::read_to_string(&canonical).unwrap();
-        assert_eq!(projected.matches(&original_id).count(), 1);
-        assert_eq!(loaded.graph.managed_sync_status().unwrap().page_count, 1);
-        assert_eq!(
-            count_update_chunks(&dir.join(".tine-sync/v1")),
-            1,
-            "journal migration is one durable update operation"
-        );
-
+        let source = include_str!("graph.rs");
+        let start = source
+            .find("pub(crate) fn open_and_publish_direct_files")
+            .expect("ordinary Direct Files publish");
+        let end = source[start..]
+            .find("pub(crate) fn load_graph_for_label")
+            .map(|offset| start + offset)
+            .expect("next graph-load function");
+        let direct_publish = &source[start..end];
+        for legacy_root in [
+            "managed_sync_store_state",
+            "ensure_managed_sync_safety_snapshot",
+            "start_managed_sync_after_safety",
+            "start_managed_sync",
+            "project_all_managed_sync",
+        ] {
+            assert!(
+                !direct_publish.contains(legacy_root),
+                "ordinary Direct Files publish must not reach {legacy_root}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1227,24 +1250,5 @@ mod tests {
         } else {
             let _ = std::fs::remove_dir_all(&dir);
         }
-    }
-
-    fn count_update_chunks(path: &Path) -> usize {
-        let Ok(entries) = std::fs::read_dir(path) else {
-            return 0;
-        };
-        entries
-            .flatten()
-            .map(|entry| {
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    count_update_chunks(&entry.path())
-                } else {
-                    usize::from(
-                        entry.path().extension().and_then(|value| value.to_str()) == Some("chunk")
-                            && entry.path().to_string_lossy().contains("/sessions/"),
-                    )
-                }
-            })
-            .sum()
     }
 }
