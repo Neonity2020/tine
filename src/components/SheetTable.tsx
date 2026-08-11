@@ -8,6 +8,7 @@ import {
   formatForPage,
   insertEmptyChildBlock,
   pageByName,
+  pageWritable,
   readPageProperty,
   setBlockProperty,
   setPageProperty,
@@ -51,7 +52,16 @@ import {
   type FieldId,
   type FieldValue,
 } from "../sheet/fields";
-import { parseFields, serializeFields, sheetConfig, type FieldSpec, type FieldType } from "../sheet/config";
+import {
+  parseFields,
+  parseTableColumnWidths,
+  serializeFields,
+  serializeTableColumnWidths,
+  sheetConfig,
+  TABLE_COLUMN_MAX_WIDTH,
+  type FieldSpec,
+  type FieldType,
+} from "../sheet/config";
 import { planSheetFieldRename } from "../sheet/renameField";
 import { formulaFieldId, formulaNameFromField, formulasOf, mergeFormulas } from "../sheet/formulaFields";
 import {
@@ -93,9 +103,15 @@ type SchemaHome = { kind: "block"; id: string; value: string } | { kind: "page";
 type FormulaHome = { kind: "block"; id: string } | { kind: "page"; name: string };
 type SchemaMenuType = "text" | "number" | "date" | "datetime" | "checkbox" | "list" | "ref";
 type FieldHeaderDrop = { field: FieldId; before: boolean };
+type TableColumn = "title" | FieldId;
+type TableWidthHome =
+  | { kind: "block"; id: string; page: string; widths: ReadonlyMap<string, number> }
+  | { kind: "page"; name: string; widths: ReadonlyMap<string, number> };
 
 const BUILTIN_FIELDS = new Set<FieldId>(["state", "priority", "scheduled", "deadline", "tags", "page"]);
 const FIELD_HEADER_DRAG_THRESHOLD_PX = 4;
+const TABLE_TITLE_RENDERED_MIN_WIDTH = 180;
+const TABLE_FIELD_RENDERED_MIN_WIDTH = 90;
 const SCHEMA_PROP_TYPES: SchemaMenuType[] = [
   "text",
   "number",
@@ -105,6 +121,17 @@ const SCHEMA_PROP_TYPES: SchemaMenuType[] = [
   "list",
   "ref",
 ];
+
+function tableColumnRenderedMinWidth(column: TableColumn): number {
+  return column === "title" ? TABLE_TITLE_RENDERED_MIN_WIDTH : TABLE_FIELD_RENDERED_MIN_WIDTH;
+}
+
+function clampTableColumnRenderedWidth(column: TableColumn, width: number): number {
+  return Math.min(
+    TABLE_COLUMN_MAX_WIDTH,
+    Math.max(tableColumnRenderedMinWidth(column), Math.round(width)),
+  );
+}
 
 function measuredGridTracks(grid: HTMLElement, count: number): string | null {
   const cells = [...grid.children].filter((child): child is HTMLElement =>
@@ -141,10 +168,13 @@ export function SheetTable(props: {
   const [editingProp, setEditingProp] = createSignal<{ rowId: string; field: FieldId; initial: string } | null>(null);
   const [hovering, setHovering] = createSignal(false);
   const [stableColumns, setStableColumns] = createSignal<string | null>(null);
+  const [previewTableColumnWidths, setPreviewTableColumnWidths] = createSignal<ReadonlyMap<string, number> | null>(null);
+  const [resizingColumn, setResizingColumn] = createSignal<TableColumn | null>(null);
   const [draggingFieldHeader, setDraggingFieldHeader] = createSignal<FieldId | null>(null);
   const [fieldHeaderDrop, setFieldHeaderDrop] = createSignal<FieldHeaderDrop | null>(null);
   let sortBeforePotentialHeaderDoubleClick: SortState | undefined;
   let cancelFieldHeaderDrag: (() => void) | undefined;
+  let cancelColumnResize: (() => void) | undefined;
   let suppressFieldHeaderClick = false;
   const sheetOverlay = useContext(SheetContainerOverlayContext);
   const sheetHovering = () => sheetOverlay?.hovering() ?? hovering();
@@ -152,6 +182,31 @@ export function SheetTable(props: {
     const owner = doc.byId[props.ownerId];
     return sheetConfig(owner ? facetsOf(owner.raw, formatForBlock(props.ownerId)).properties : []);
   });
+  const tableWidthHome = createMemo<TableWidthHome | null>(() => {
+    const owner = doc.byId[props.ownerId];
+    if (owner) return { kind: "block", id: props.ownerId, page: owner.page, widths: config().tableColumnWidths };
+    if (!props.schemaPage) return null;
+    return {
+      kind: "page",
+      name: props.schemaPage,
+      widths: parseTableColumnWidths(readPageProperty(props.schemaPage, "tine.table-widths") ?? ""),
+    };
+  });
+  const tableWidthWriteAllowed = () => {
+    const home = tableWidthHome();
+    return home?.kind === "block" ? blockWritable(home.id) : home?.kind === "page" ? pageWritable(home.name) : false;
+  };
+  const effectiveTableColumnWidths = () => previewTableColumnWidths() ?? tableWidthHome()?.widths ?? new Map<string, number>();
+  const writeTableColumnWidths = (widths: ReadonlyMap<string, number>) => {
+    const home = tableWidthHome();
+    if (!home || !tableWidthWriteAllowed()) return;
+    const value = serializeTableColumnWidths(widths) || null;
+    const page = home.kind === "block" ? home.page : home.name;
+    withUndoUnit("sheet:table-column-width", [page], () => {
+      if (home.kind === "block") setBlockProperty(home.id, "tine.table-widths", value);
+      else setPageProperty(home.name, "tine.table-widths", value);
+    });
+  };
   const schemaHome = createMemo<SchemaHome | null>(() => {
     if (doc.byId[props.ownerId]) {
       const value = blockProperty(props.ownerId, "tine.fields");
@@ -257,7 +312,7 @@ export function SheetTable(props: {
   });
   const formulaEntries = () => [...formulas().entries()];
 
-  const columns = createMemo(() => ["title" as const, ...fields()]);
+  const columns = createMemo<TableColumn[]>(() => ["title", ...fields()]);
   const columnIndex = createMemo(() => new Map(columns().map((column, index) => [column, index] as const)));
   const hasActionColumn = () => props.rowSource === "children" || !!props.addRow;
   const actionColumn = () => hasActionColumn() ? "96px" : "";
@@ -265,15 +320,37 @@ export function SheetTable(props: {
   // white-space) instead of stretching its column to the full unwrapped line —
   // an uncapped `max-content` track made one long value blow the table out
   // horizontally. Users can still resize wider (stableColumns overrides this).
-  const baseGridColumns = createMemo(() =>
-    // NB: fit-content() is NOT valid inside minmax() — that voids the whole
-    // grid-template-columns and collapses the table to one column. Use bare
-    // fit-content() tracks; the title cell keeps its own min-width (`.sheet-cell`
-    // / `.sheet-title-header`), so the 180px floor is preserved.
-    `fit-content(420px) repeat(${fields().length}, fit-content(320px)) ${actionColumn()}`
-  );
+  const baseGridColumns = createMemo(() => {
+    const widths = effectiveTableColumnWidths();
+    const tracks = columns().map((column, index) => {
+      const width = widths.get(column);
+      if (width !== undefined) return `${clampTableColumnRenderedWidth(column, width)}px`;
+      // NB: fit-content() is NOT valid inside minmax() — that voids the whole
+      // grid-template-columns and collapses the table to one column.
+      return index === 0 ? "fit-content(420px)" : "fit-content(320px)";
+    });
+    if (hasActionColumn()) tracks.push(actionColumn());
+    return tracks.join(" ");
+  });
   const editingInThisTable = () => editingOwner()?.startsWith(`sheet:${surfaceId}:${props.ownerId}:`) ?? false;
-  const gridColumns = createMemo(() => stableColumns() ?? baseGridColumns());
+  const gridColumns = createMemo(() => {
+    if (resizingColumn()) return baseGridColumns();
+    const stable = stableColumns();
+    if (!stable) return baseGridColumns();
+    // Editing stabilization freezes measured auto tracks, but an explicit
+    // identity-keyed width remains authoritative (including a commit from a
+    // duplicate split/sidebar surface). Overlay those widths on the measured
+    // tracks instead of letting a stale positional snapshot hide the update.
+    const tracks = stable.trim().split(/\s+/);
+    const widths = effectiveTableColumnWidths();
+    columns().forEach((column, index) => {
+      const width = widths.get(column);
+      if (width !== undefined && index < tracks.length) {
+        tracks[index] = `${clampTableColumnRenderedWidth(column, width)}px`;
+      }
+    });
+    return tracks.join(" ");
+  });
   const hasAggregates = createMemo(() => config().colAggregates.size > 0);
   const footerPinned = createMemo(() => aggregateFooterPinned(props.ownerId));
   const showFooter = createMemo(() => hasAggregates() || footerPinned());
@@ -309,6 +386,95 @@ export function SheetTable(props: {
     if (tracks) setStableColumns(tracks);
   };
 
+  const beginColumnResize = (column: TableColumn, event: PointerEvent) => {
+    if (event.button !== 0 || !tableWidthWriteAllowed()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    cancelColumnResize?.();
+    cancelFieldHeaderDrag?.();
+    const header = (event.currentTarget as HTMLElement).parentElement;
+    const measured = header?.getBoundingClientRect().width ?? 0;
+    const startWidth = measured > 0
+      ? measured
+      : effectiveTableColumnWidths().get(column) ?? tableColumnRenderedMinWidth(column);
+    const startX = event.clientX;
+    const pointerId = event.pointerId;
+    let moved = false;
+    let active = true;
+    setStableColumns(null);
+    setResizingColumn(column);
+
+    const cleanup = () => {
+      if (!active) return;
+      active = false;
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKeyDown);
+      if (cancelColumnResize === cancel) cancelColumnResize = undefined;
+    };
+    const finish = (commit: boolean) => {
+      const preview = previewTableColumnWidths();
+      cleanup();
+      setResizingColumn(null);
+      setPreviewTableColumnWidths(null);
+      if (commit && moved && preview) writeTableColumnWidths(preview);
+    };
+    const ownsPointer = (pointer: PointerEvent) => pointer.pointerId === pointerId;
+    const onMove = (move: PointerEvent) => {
+      if (!ownsPointer(move)) return;
+      move.preventDefault();
+      moved = true;
+      const next = new Map(tableWidthHome()?.widths ?? []);
+      next.set(column, clampTableColumnRenderedWidth(column, startWidth + move.clientX - startX));
+      setPreviewTableColumnWidths(next);
+    };
+    const onUp = (up: PointerEvent) => {
+      if (ownsPointer(up)) finish(true);
+    };
+    const onCancel = (cancelEvent: PointerEvent) => {
+      if (ownsPointer(cancelEvent)) finish(false);
+    };
+    const onKeyDown = (key: KeyboardEvent) => {
+      if (key.key !== "Escape") return;
+      key.preventDefault();
+      finish(false);
+    };
+    const cancel = () => finish(false);
+
+    cancelColumnResize = cancel;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKeyDown);
+  };
+  const resetColumnWidth = (column: TableColumn, event: MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!tableWidthWriteAllowed()) return;
+    const next = new Map(tableWidthHome()?.widths ?? []);
+    if (!next.delete(column)) return;
+    writeTableColumnWidths(next);
+  };
+  const columnResizeHandle = (column: TableColumn) => (
+    <Show when={tableWidthWriteAllowed()}>
+      <button
+        type="button"
+        class="sheet-table-column-resize-handle"
+        classList={{ "sheet-table-column-resize-handle-active": resizingColumn() === column }}
+        data-sheet-resize-handle={column}
+        aria-label={`Resize ${column === "title" ? "Block" : fieldLabel(column)} column`}
+        title="Drag to resize; double-click to reset"
+        onPointerDown={(event) => beginColumnResize(column, event)}
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }}
+        onDblClick={(event) => resetColumnWidth(column, event)}
+      />
+    </Show>
+  );
+
   let wasEditing = false;
   createEffect(() => {
     const sel = cellSel();
@@ -320,7 +486,7 @@ export function SheetTable(props: {
       return;
     }
     wasEditing = editing;
-    if (!tableRef || editing) return;
+    if (!tableRef || editing || resizingColumn()) return;
     if (sel && sel.gridId === props.ownerId && sel.kind !== "row-seam" && sel.kind !== "col-seam") captureStableColumns();
     else setStableColumns(null);
   });
@@ -556,7 +722,10 @@ export function SheetTable(props: {
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onCancel);
   };
-  onCleanup(() => cancelFieldHeaderDrag?.());
+  onCleanup(() => {
+    cancelFieldHeaderDrag?.();
+    cancelColumnResize?.();
+  });
   const changeFieldType = (field: FieldId, type: SchemaMenuType) => {
     writeSchemaFields(schemaFields().map((spec) => (spec.field === field ? { ...spec, type } : spec)));
   };
@@ -849,6 +1018,7 @@ export function SheetTable(props: {
           tableRef = el;
         }}
         class="sheet-table"
+        classList={{ "sheet-table-resizing": resizingColumn() !== null }}
         data-sheet-grid-id={props.ownerId}
         data-sheet-surface-id={surfaceId}
         style={{ "grid-template-columns": gridColumns() }}
@@ -867,6 +1037,7 @@ export function SheetTable(props: {
               </span>
             )}
           </Show>
+          {columnResizeHandle("title")}
         </div>
         <For each={fields()}>
           {(field, i) => (
@@ -935,6 +1106,7 @@ export function SheetTable(props: {
                   }}
                 />
               </Show>
+              {columnResizeHandle(field)}
             </div>
           )}
         </For>

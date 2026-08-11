@@ -6,6 +6,7 @@ import { backend } from "../backend";
 import { managedStorageRuntime } from "../managedStorageRuntime";
 import * as store from "../store";
 import type { SparseV2ActivationProgress, SparseV2Status } from "../types";
+import { formatJournal, parseJournalWith } from "../journal";
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const showSparsePanel = async (root: HTMLElement) => {
@@ -597,6 +598,28 @@ describe("Settings storage transitions", () => {
 });
 
 describe("Settings progressive disclosure and search", () => {
+  it("offers the three dot-separated weekday journal formats and the date engine round-trips them", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    openSettings("journals");
+    await tick();
+
+    const select = [...root.querySelectorAll<HTMLSelectElement>("select")].find((candidate) =>
+      [...candidate.options].some((option) => option.value === "MMM do, yyyy")
+    );
+    expect(select).toBeDefined();
+
+    const formats = ["E, dd.MM.yyyy", "EEE, dd.MM.yyyy", "EEEE, dd.MM.yyyy"];
+    expect([...select!.options].map((option) => option.value)).toEqual(expect.arrayContaining(formats));
+    const date = new Date(2026, 7, 11);
+    for (const format of formats) {
+      const title = formatJournal(date, format);
+      expect(parseJournalWith(title, format), `${format} <- ${title}`).toEqual({ y: 2026, m: 8, d: 11 });
+    }
+    dispose();
+  });
+
   it("exposes the accessible three-mode Link autocomplete policy through Settings search", async () => {
     const root = document.createElement("div");
     document.body.append(root);

@@ -5781,6 +5781,45 @@ body.file-drop-active::after {
   overflow: visible;
   position: relative;
 }
+.sheet-table-resizing,
+.sheet-table-resizing .sheet-header-cell {
+  cursor: col-resize;
+}
+.sheet-table-column-resize-handle {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  right: -5px;
+  bottom: 0;
+  width: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+.sheet-table-column-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent, #4c8bf5);
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+.sheet-header-cell:hover > .sheet-table-column-resize-handle::after,
+.sheet-table-column-resize-handle:hover::after,
+.sheet-table-column-resize-handle:focus-visible::after,
+.sheet-table-column-resize-handle-active::after {
+  opacity: 0.8;
+}
+.sheet-table-column-resize-handle:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent, #4c8bf5) 55%, transparent);
+  outline-offset: -2px;
+}
 .sheet-title-header,
 .sheet-field-header {
   cursor: pointer;

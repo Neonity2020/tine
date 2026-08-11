@@ -133,6 +133,26 @@ describe("horizontal boundary navigation and forward merge (GH #213)", () => {
     }
   });
 
+  it("Delete at block end absorbs an empty next visible block (GH #239)", async () => {
+    loadSingle(page([block("kept"), block("")]));
+    const keptId = pageByName("Caret")!.roots[0];
+    const emptyId = pageByName("Caret")!.roots[1];
+    startEditing(keptId, 4);
+    const m = mountPage();
+    try {
+      const ta = editor(m.root);
+      ta.setSelectionRange(4, 4);
+      key(ta, "Delete");
+      expect(pageByName("Caret")!.roots).toEqual([keptId]);
+      expect(doc.byId[emptyId]).toBeUndefined();
+      expect(doc.byId[keptId].raw).toBe("kept");
+      await vi.waitFor(() => expect(editor(m.root).value).toBe("kept"));
+      expect(editor(m.root).selectionStart).toBe(4);
+    } finally {
+      m.dispose();
+    }
+  });
+
   it("Delete at end does not merge into a following calc block", () => {
     loadSingle(page([block("foo"), block("```calc\n1 + 1\n```")]));
     const fooId = pageByName("Caret")!.roots[0];

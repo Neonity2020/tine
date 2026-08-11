@@ -281,6 +281,69 @@ try {
   const betaCount = (disk5.match(/- beta/g) || []).length;
   check("Ctrl+D filled beta into the row below", betaCount === 2, JSON.stringify(disk5));
 
+  // GH #316: drag a real table field edge, observe a materially wider column
+  // inside the horizontal scroller, then prove the stable field-keyed setting
+  // survives a real app reload and double-click reset removes it. Exact pixels
+  // are deliberately not contractual: the journey compares the semantic size
+  // change and scrollability on this runtime.
+  const resizedTable = await browser.execute(() => {
+    const header = [...document.querySelectorAll(".sheet-table .sheet-field-header")]
+      .find((el) => (el.textContent ?? "").trim() === "topic");
+    const handle = header?.querySelector('[data-sheet-resize-handle="prop:topic"]');
+    const scroll = header?.closest(".block-sheet-container")?.querySelector(".sheet-scroll");
+    if (!(header instanceof HTMLElement) || !(handle instanceof HTMLElement) || !(scroll instanceof HTMLElement)) {
+      return { ok: false, reason: "missing topic header, resize edge, or horizontal scroller" };
+    }
+    const before = header.getBoundingClientRect().width;
+    const edge = header.getBoundingClientRect().right;
+    handle.dispatchEvent(new PointerEvent("pointerdown", {
+      bubbles: true, cancelable: true, button: 0, pointerId: 316, clientX: edge, clientY: 10,
+    }));
+    window.dispatchEvent(new PointerEvent("pointermove", {
+      bubbles: true, cancelable: true, button: 0, pointerId: 316, clientX: edge + 360, clientY: 10,
+    }));
+    const live = header.getBoundingClientRect().width;
+    window.dispatchEvent(new PointerEvent("pointerup", {
+      bubbles: true, cancelable: true, button: 0, pointerId: 316, clientX: edge + 360, clientY: 10,
+    }));
+    scroll.scrollLeft = scroll.scrollWidth;
+    return {
+      ok: live > before + 200 && scroll.scrollWidth > scroll.clientWidth && scroll.scrollLeft > 0,
+      before,
+      live,
+      scrollWidth: scroll.scrollWidth,
+      clientWidth: scroll.clientWidth,
+      scrollLeft: scroll.scrollLeft,
+    };
+  });
+  check("table field edge widens live inside a usable horizontal scroller", resizedTable.ok, JSON.stringify(resizedTable));
+  await browser.saveScreenshot("/tmp/sheets-e2e-table-resize.png");
+  await sleep(2400);
+  const resizedDisk = fs.readFileSync(JFILE, "utf8");
+  check("table width persists by encoded field identity on the owner block",
+    /tine\.table-widths:: prop%3Atopic=\d+/.test(resizedDisk), JSON.stringify(resizedDisk));
+
+  await browser.refresh();
+  await browser.$('.sheet-table [data-sheet-resize-handle="prop:topic"]').waitForExist({ timeout: 15_000 });
+  const reloadedTableWidth = await browser.execute(() => {
+    const header = [...document.querySelectorAll(".sheet-table .sheet-field-header")]
+      .find((el) => (el.textContent ?? "").trim() === "topic");
+    return header?.getBoundingClientRect().width ?? 0;
+  });
+  check("stable table width survives a real app reload",
+    reloadedTableWidth > (resizedTable.before ?? 0) + 200,
+    JSON.stringify({ before: resizedTable.before, reloaded: reloadedTableWidth }));
+
+  const resetTableWidth = await browser.execute(() => {
+    const handle = document.querySelector('.sheet-table [data-sheet-resize-handle="prop:topic"]');
+    if (!(handle instanceof HTMLElement)) return false;
+    handle.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, button: 0 }));
+    return true;
+  });
+  await sleep(2400);
+  const resetDisk = fs.readFileSync(JFILE, "utf8");
+  check("double-click reset removes the durable table width", resetTableWidth && !resetDisk.includes("tine.table-widths::"), JSON.stringify(resetDisk));
+
   // --- Typed cells (phase 6b): checkbox toggle + enum popup write ------------
   // Seed has a schema'd table: columns title=0, state=1, topic(enum)=2, shipped(checkbox)=3.
   const tableNavStart = await browser.$('.sheet-table .sheet-cell[data-row="0"][data-col="0"]');

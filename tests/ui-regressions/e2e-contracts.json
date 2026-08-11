@@ -693,7 +693,7 @@
    "contracts": [
     {
      "class": "core-operation",
-     "userOutcome": "Sheet cells commit before navigation, arrow keys follow the real event path, and field rename migrates dependent data atomically.",
+     "userOutcome": "Sheet cells commit before navigation, arrow keys follow the real event path, table columns resize durably by field identity inside a horizontal scroller and reset, and field rename migrates dependent data atomically.",
      "blocking": true
     }
    ],

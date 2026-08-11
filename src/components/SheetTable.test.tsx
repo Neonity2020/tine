@@ -104,6 +104,24 @@ function dragFieldHeader(source: HTMLElement, target: HTMLElement, before = true
   }
 }
 
+function resizeHandle(root: HTMLElement, column: string): HTMLElement {
+  const handle = root.querySelector<HTMLElement>(`[data-sheet-resize-handle="${column}"]`);
+  if (!handle) throw new Error(`missing ${column} resize handle`);
+  return handle;
+}
+
+function resizeColumn(root: HTMLElement, column: string, from: number, to: number): void {
+  const handle = resizeHandle(root, column);
+  const header = handle.parentElement as HTMLElement;
+  header.getBoundingClientRect = () => ({
+    x: 0, y: 0, left: 0, top: 0, right: from, bottom: 30, width: from, height: 30,
+    toJSON: () => ({}),
+  });
+  handle.dispatchEvent(pointer("pointerdown", from, 10));
+  window.dispatchEvent(pointer("pointermove", to, 10));
+  window.dispatchEvent(pointer("pointerup", to, 10));
+}
+
 function cell(root: HTMLElement, row: number, col: number, gridId = "table"): HTMLElement {
   const el = root.querySelector(
     `.sheet-cell[data-sheet-grid-id="${gridId}"][data-row="${row}"][data-col="${col}"]`
@@ -728,6 +746,224 @@ describe("SheetTable", () => {
 
     expect([...root.querySelectorAll(".sheet-title-cell .sheet-cell-body")].map((cell) => cell.textContent?.trim()))
       .toEqual(["Alpha", "Beta"]);
+    dispose();
+  });
+
+  it("floors a far-left title drag at 180px for preview and its guarded undo commit", () => {
+    loadTableDoc();
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    const handle = resizeHandle(root, "title");
+    const header = handle.parentElement as HTMLElement;
+    header.getBoundingClientRect = () => ({
+      x: 0, y: 0, left: 0, top: 0, right: 180, bottom: 30, width: 180, height: 30,
+      toJSON: () => ({}),
+    });
+
+    handle.dispatchEvent(pointer("pointerdown", 180, 10));
+    window.dispatchEvent(pointer("pointermove", -1000, 10));
+    expect((root.querySelector(".sheet-table") as HTMLElement).style.gridTemplateColumns).toContain("180px");
+    expect(blockProperty("table", "tine.table-widths")).toBeNull();
+    window.dispatchEvent(pointer("pointerup", -1000, 10));
+
+    expect(blockProperty("table", "tine.table-widths")).toBe("title=180");
+    undo();
+    expect(blockProperty("table", "tine.table-widths")).toBeNull();
+    redo();
+    expect(blockProperty("table", "tine.table-widths")).toBe("title=180");
+    dispose();
+  });
+
+  it("floors a far-left field drag at 90px for preview and commit", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.fields:: owner=text", null, ["r1"]),
+        r1: node("r1", "Row\nowner:: Martin", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    const handle = resizeHandle(root, "prop:owner");
+    const header = handle.parentElement as HTMLElement;
+    header.getBoundingClientRect = () => ({
+      x: 0, y: 0, left: 0, top: 0, right: 120, bottom: 30, width: 120, height: 30,
+      toJSON: () => ({}),
+    });
+
+    handle.dispatchEvent(pointer("pointerdown", 120, 10));
+    window.dispatchEvent(pointer("pointermove", -1000, 10));
+    expect((root.querySelector(".sheet-table") as HTMLElement).style.gridTemplateColumns).toContain("90px");
+    expect(blockProperty("table", "tine.table-widths")).toBeNull();
+    window.dispatchEvent(pointer("pointerup", -1000, 10));
+
+    expect(blockProperty("table", "tine.table-widths")).toBe("prop%3Aowner=90");
+    dispose();
+  });
+
+  it("renders accepted stored widths below the semantic floors as 180px and 90px", () => {
+    setDoc({
+      byId: {
+        table: node(
+          "table",
+          "Table\ntine.view:: table\ntine.fields:: owner=text\ntine.table-widths:: title=64;prop%3Aowner=64",
+          null,
+          ["r1"]
+        ),
+        r1: node("r1", "Row\nowner:: Martin", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+
+    expect((root.querySelector(".sheet-table") as HTMLElement).style.gridTemplateColumns)
+      .toBe("180px 90px 96px");
+    expect(blockProperty("table", "tine.table-widths")).toBe("title=64;prop%3Aowner=64");
+    dispose();
+  });
+
+  it("normalizes accepted sub-floor widths while editing-stabilized tracks are active", async () => {
+    const originalRect = HTMLElement.prototype.getBoundingClientRect;
+    const rect = (width: number): DOMRect => ({
+      x: 0, y: 0, left: 0, top: 0, right: width, bottom: 30, width, height: 30,
+      toJSON: () => ({}),
+    } as DOMRect);
+    HTMLElement.prototype.getBoundingClientRect = function () {
+      if (this.classList.contains("sheet-title-header") || this.classList.contains("sheet-title-cell")) return rect(240);
+      if (this.classList.contains("sheet-field-header") || this.classList.contains("sheet-field-cell")) return rect(130);
+      if (this.classList.contains("sheet-add-field") || this.classList.contains("sheet-row-tail")) return rect(96);
+      return originalRect.call(this);
+    };
+    setDoc({
+      byId: {
+        table: node(
+          "table",
+          "Table\ntine.view:: table\ntine.fields:: owner=text\ntine.table-widths:: title=64;prop%3Aowner=64",
+          null,
+          ["r1"]
+        ),
+        r1: node("r1", "Row\nowner:: Martin", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    try {
+      cell(root, 0, 0).dispatchEvent(pointer("pointerdown", 0, 0));
+      window.dispatchEvent(pointer("pointerup", 0, 0));
+      await tick();
+      doubleClick(cell(root, 0, 0));
+      await tick();
+
+      expect(editingId()).toBe("r1");
+      expect((root.querySelector(".sheet-table") as HTMLElement).style.gridTemplateColumns)
+        .toBe("180px 90px 96px");
+    } finally {
+      dispose();
+      HTMLElement.prototype.getBoundingClientRect = originalRect;
+    }
+  });
+
+  it("persists a synthetic tag table width on its schema page", () => {
+    setDoc({
+      byId: { row: node("row", "Tagged #Tag\nowner:: Martin", null) },
+      pages: [page(["row"], "tine.fields:: owner=text")], feed: ["Sheet"], loaded: true,
+    });
+    const groups: RefGroup[] = [{
+      page: "Sheet", kind: "page",
+      blocks: [{ id: "row", raw: doc.byId.row.raw, collapsed: false, children: [], properties: [["owner", "Martin"]] }],
+    }];
+    const { root, dispose } = mount(() => (
+      <SheetTable ownerId="tag-page:Tag" rowSource="query" groups={groups} schemaPage="Sheet" />
+    ));
+
+    resizeColumn(root, "prop:owner", 120, 280);
+    expect(readPageProperty("Sheet", "tine.table-widths")).toBe("prop%3Aowner=280");
+    expect(doc.byId["tag-page:Tag"]).toBeUndefined();
+    dispose();
+  });
+
+  it("shares a committed stable width with a duplicate split surface", () => {
+    setDoc({
+      byId: {
+        table: node("table", "Table\ntine.view:: table\ntine.fields:: owner=text", null, ["r1"]),
+        r1: node("r1", "Row\nowner:: Martin", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <>
+      <SurfaceContext.Provider value="pane:left">
+        <SheetTable ownerId="table" rowSource="children" />
+      </SurfaceContext.Provider>
+      <SurfaceContext.Provider value="pane:right">
+        <SheetTable ownerId="table" rowSource="children" />
+      </SurfaceContext.Provider>
+    </>);
+    const [left, right] = [...root.querySelectorAll<HTMLElement>(".sheet-table")];
+
+    resizeColumn(left, "prop:owner", 120, 275);
+    expect(blockProperty("table", "tine.table-widths")).toBe("prop%3Aowner=275");
+    expect(left.style.gridTemplateColumns).toContain("275px");
+    expect(right.style.gridTemplateColumns).toContain("275px");
+    dispose();
+  });
+
+  it("keeps explicit widths attached to stable identities across reorder and remount", () => {
+    setDoc({
+      byId: {
+        table: node(
+          "table",
+          "Table\ntine.view:: table\ntine.fields:: first=text;second=number\ntine.table-widths:: prop%3Afirst=260;prop%3Asecond=140",
+          null,
+          ["r1"]
+        ),
+        r1: node("r1", "Row\nfirst:: one\nsecond:: 2", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const initial = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    expect((initial.root.querySelector(".sheet-table") as HTMLElement).style.gridTemplateColumns)
+      .toContain("260px 140px");
+
+    dragFieldHeader(fieldHeader(initial.root, "second"), fieldHeader(initial.root, "first"));
+    expect(blockProperty("table", "tine.table-widths")).toBe("prop%3Afirst=260;prop%3Asecond=140");
+    expect((initial.root.querySelector(".sheet-table") as HTMLElement).style.gridTemplateColumns)
+      .toContain("140px 260px");
+    initial.dispose();
+
+    const restarted = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    expect((restarted.root.querySelector(".sheet-table") as HTMLElement).style.gridTemplateColumns)
+      .toContain("140px 260px");
+    restarted.dispose();
+  });
+
+  it("double-click resets only the owned edge and a cancelled drag neither sorts nor persists", () => {
+    setDoc({
+      byId: {
+        table: node(
+          "table",
+          "Table\ntine.view:: table\ntine.fields:: score=number\ntine.table-widths:: title=300;prop%3Ascore=220",
+          null,
+          ["r1", "r2"]
+        ),
+        r1: node("r1", "Beta\nscore:: 2", "table"),
+        r2: node("r2", "Alpha\nscore:: 1", "table"),
+      },
+      pages: [page(["table"])], feed: ["Sheet"], loaded: true,
+    });
+    const { root, dispose } = mount(() => <SheetTable ownerId="table" rowSource="children" />);
+    doubleClick(resizeHandle(root, "prop:score"));
+    expect(blockProperty("table", "tine.table-widths")).toBe("title=300");
+
+    const titleHandle = resizeHandle(root, "title");
+    const titleHeader = titleHandle.parentElement as HTMLElement;
+    titleHeader.getBoundingClientRect = () => ({
+      x: 0, y: 0, left: 0, top: 0, right: 300, bottom: 30, width: 300, height: 30,
+      toJSON: () => ({}),
+    });
+    titleHandle.dispatchEvent(pointer("pointerdown", 300, 10));
+    window.dispatchEvent(pointer("pointermove", 420, 10));
+    window.dispatchEvent(pointer("pointercancel", 420, 10));
+    expect(blockProperty("table", "tine.table-widths")).toBe("title=300");
+    expect([...root.querySelectorAll(".sheet-title-cell .sheet-cell-body")].map((cell) => cell.textContent?.trim()))
+      .toEqual(["Beta", "Alpha"]);
     dispose();
   });
 
@@ -1513,11 +1749,12 @@ describe("SheetTable", () => {
     dispose();
   });
 
-  it("children add-row creates an empty child at the end and enters title edit", async () => {
+  it("children add-row creates an empty child after at least two existing rows and enters title edit", async () => {
     setDoc({
       byId: {
-        table: node("table", "Table\ntine.view:: table", null, ["r1"]),
-        r1: node("r1", "Existing", "table"),
+        table: node("table", "Table\ntine.view:: table", null, ["r1", "r2"]),
+        r1: node("r1", "First", "table"),
+        r2: node("r2", "Second", "table"),
       },
       pages: [page(["table"])],
       feed: ["Sheet"],
@@ -1529,8 +1766,9 @@ describe("SheetTable", () => {
     await tick();
 
     const children = doc.byId.table.children;
-    expect(children).toHaveLength(2);
-    const id = children[1];
+    expect(children).toHaveLength(3);
+    expect(children.slice(0, 2)).toEqual(["r1", "r2"]);
+    const id = children[2];
     expect(doc.byId[id].raw).toBe("");
     expect(doc.byId[id].parent).toBe("table");
     expect(editingId()).toBe(id);
