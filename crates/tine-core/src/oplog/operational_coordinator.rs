@@ -1418,7 +1418,7 @@ impl OperationalCoordinator {
             receipts,
             engine,
             Some(bootstrap),
-            LocalDraftSource::Promoted,
+            LocalDraftSource::Promoted { batch_id: None },
             LocalPreparationBinding::TrustedLocal,
             transaction,
             prepared_editor_projection,
@@ -1453,7 +1453,43 @@ impl OperationalCoordinator {
             database,
             tail,
             Some(bootstrap),
-            LocalDraftSource::Promoted,
+            LocalDraftSource::Promoted { batch_id: None },
+            transaction,
+        ) {
+            Ok(state) => state,
+            Err(error) => LocalMutationCoordinatorState::blocked(error),
+        }
+    }
+
+    /// Execute one semantic transaction with a stable batch identity derived
+    /// inside an actor-owned application protocol. Ordinary local mutations
+    /// continue to mint random batch IDs through [`Self::execute_local`].
+    pub(crate) fn execute_local_correlated(
+        session: &mut PromotedRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        batch_id: BatchId,
+        transaction: &OperationTransaction,
+    ) -> LocalMutationCoordinatorState {
+        let (admission, engine, database, tail, bootstrap) = match session.parts_with_bootstrap() {
+            Ok(parts) => parts,
+            Err(refusal) => {
+                return LocalMutationCoordinatorState::blocked(
+                    OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal),
+                );
+            }
+        };
+        match execute_local_inner(
+            &admission,
+            graph,
+            receipts,
+            engine,
+            database,
+            tail,
+            Some(bootstrap),
+            LocalDraftSource::Promoted {
+                batch_id: Some(batch_id),
+            },
             transaction,
         ) {
             Ok(state) => state,
@@ -1537,7 +1573,9 @@ impl OperationalCoordinator {
 }
 
 enum LocalDraftSource {
-    Promoted,
+    Promoted {
+        batch_id: Option<BatchId>,
+    },
     #[cfg(test)]
     Raw(AuthorBatch),
 }
@@ -1642,21 +1680,28 @@ fn prepare_local_inner(
     #[cfg(test)]
     let draft_started = Instant::now();
     let (batch_id, author_device_id, author_session_id, draft) = match source {
-        LocalDraftSource::Promoted => {
+        LocalDraftSource::Promoted { batch_id } => {
             let authority = admission
                 .mint_local_author_authority(graph, engine, endpoint)
                 .map_err(classify_authorization_failure)?;
             let author_device_id = authority.device_id();
             let author_session_id = authority.session_id();
-            let (batch_id, draft) = engine
-                .draft_admitted_local_author_transaction(
+            let (batch_id, draft) = match batch_id {
+                Some(batch_id) => engine.draft_admitted_local_author_transaction_with_batch_id(
+                    &authority,
+                    batch_id,
+                    transaction,
+                    prepared_editor_projection,
+                ),
+                None => engine.draft_admitted_local_author_transaction(
                     &authority,
                     transaction,
                     prepared_editor_projection,
-                )
-                .map_err(|error| {
-                    OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
-                })?;
+                ),
+            }
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Draft, error.to_string())
+            })?;
             (batch_id, author_device_id, author_session_id, draft)
         }
         #[cfg(test)]

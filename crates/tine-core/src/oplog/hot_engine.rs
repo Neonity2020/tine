@@ -15102,13 +15102,31 @@ impl ShardedHotEngine {
         transaction: &OperationTransaction,
         prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
+        self.draft_admitted_local_author_transaction_with_batch_id(
+            authority,
+            BatchId::new(),
+            transaction,
+            prepared_editor_projection,
+        )
+    }
+
+    /// Draft one admitted local transaction with an actor-derived stable batch
+    /// identity. This is reserved for application operations whose public
+    /// contract includes durable idempotence across an uncertain acknowledgement.
+    /// The caller still cannot select device, session, or CRDT peer identity.
+    pub(crate) fn draft_admitted_local_author_transaction_with_batch_id(
+        &self,
+        authority: &super::local_active::AdmittedLocalAuthorAuthority<'_>,
+        batch_id: BatchId,
+        transaction: &OperationTransaction,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+    ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         if authority.workspace_id() != self.workspace_id
             || authority.generation().generation != self.history_generation
             || authority.generation().mutation_token != self.author_mutation_generation()
         {
             return Err(EngineError::AuthorDraftStale);
         }
-        let batch_id = BatchId::new();
         let mut prepared_editor_projection = prepared_editor_projection;
         for attempt in 0..LOCAL_AUTHOR_PEER_PROBE_BUDGET {
             let crdt_peer_id = CrdtPeerId::local_mutation_candidate(
