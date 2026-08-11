@@ -7,7 +7,7 @@ icon:: 🗺️
   - Everything you write is a **block** (one bullet). Blocks nest under other blocks to form the outline, and any block can carry a task, a date, a link, or its own id for references from elsewhere.
   - Press **Ctrl+K** at any time to jump to a page by name or to text inside any block.
 - ## The left sidebar: your graph's contents
-  - The graph-name menu at the very top switches between the graphs Tine knows, with **Open graph…** and **New graph…** beside them — Shift-click a graph row to open it in a second window instead of switching this one.
+  - At the very top sits the workspace switcher — saved window layouts, covered in [[Workflows/Keep context visible]]. Just under it, the graph-name menu switches between the graphs Tine knows, with **Open graph…** and **New graph…** beside them — Shift-click a graph row to open it in a second window instead of switching this one.
   - Below the menu: **Journals**, then fold-up **Favorites**, **Recent**, **All pages**, and the **Namespaces** tree, where `Project/Roadmap` nests under `Project`. Favorites and Recent remember per graph whether you left them open or folded.
   - The **+ New page** button at the bottom opens the same Ctrl+K box; a name that matches nothing becomes a page you can create. Press **t l** to fold the whole sidebar away, and **t l** again to bring it back.
 - ## The tab strip: what's open
