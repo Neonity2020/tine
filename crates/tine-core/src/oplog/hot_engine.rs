@@ -152,6 +152,11 @@ pub(crate) struct LocalMutationDetailTimings {
     pub(crate) constructed_object_bytes: usize,
     pub(crate) captured_documents: usize,
     pub(crate) before_projection_pages: usize,
+    pub(crate) before_projection_full_materializations: usize,
+    pub(crate) before_projection_affine_attempts: usize,
+    pub(crate) before_projection_affine_reuses: usize,
+    pub(crate) before_projection_affine_fallbacks: usize,
+    pub(crate) before_projection_affine_snapshot_blocks: usize,
     pub(crate) post_projection_pages: usize,
     pub(crate) projection_requirements: usize,
     pub(crate) draft_calls: usize,
@@ -199,6 +204,11 @@ thread_local! {
             constructed_object_bytes: 0,
             captured_documents: 0,
             before_projection_pages: 0,
+            before_projection_full_materializations: 0,
+            before_projection_affine_attempts: 0,
+            before_projection_affine_reuses: 0,
+            before_projection_affine_fallbacks: 0,
+            before_projection_affine_snapshot_blocks: 0,
             post_projection_pages: 0,
             projection_requirements: 0,
             draft_calls: 0,
@@ -561,6 +571,7 @@ struct PreparedTransactionParts {
     prepared: PreparedBatch,
     semantic_effect: SemanticEffect,
     prospective_documents: BTreeMap<DocumentId, LoroDoc>,
+    projection_before_snapshots: Option<BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
     detached_bootstrap: Option<DetachedBootstrapAuthoredState>,
     portable_path_root: PortablePathIndexRoot,
     external_observation: Option<ExternalImportObservationMaterial>,
@@ -3989,11 +4000,43 @@ impl CaptureSealedPendingLocalPredecessor {
 thread_local! {
     static FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static FORCE_GENERIC_BEFORE_PROJECTION_AFFINE_REUSE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn force_generic_pending_local_predecessor_replay_for_test(force: bool) {
     FORCE_GENERIC_PENDING_LOCAL_PREDECESSOR_REPLAY.with(|enabled| enabled.set(force));
+}
+
+#[cfg(test)]
+pub(crate) fn force_generic_before_projection_affine_reuse_for_test(force: bool) {
+    FORCE_GENERIC_BEFORE_PROJECTION_AFFINE_REUSE.with(|enabled| enabled.set(force));
+}
+
+fn before_projection_affine_reuse_enabled() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_GENERIC_BEFORE_PROJECTION_AFFINE_REUSE.with(|force| !force.get());
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+fn affine_before_projection_frontier_documents_are_exact(
+    frontier: &FrontierV2,
+    page_home_document_id: DocumentId,
+    catalog_document_id: DocumentId,
+) -> bool {
+    frontier.documents().len() == 2
+        && frontier
+            .documents()
+            .iter()
+            .map(DocumentDependencies::document_id)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([page_home_document_id, catalog_document_id])
 }
 
 fn capture_sealed_pending_local_predecessor_enabled() -> bool {
@@ -10297,6 +10340,48 @@ impl ShardedHotEngine {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) fn rewrite_managed_local_projection_frontier_with_foreign_document_for_test(
+        &mut self,
+        sequence: u64,
+        batch_id: BatchId,
+    ) -> bool {
+        let Some(entry) = self
+            .local_overlay
+            .entries
+            .iter_mut()
+            .find(|entry| entry.sequence == sequence && entry.batch_id == batch_id)
+        else {
+            return false;
+        };
+        let intent = &entry.projection.intent;
+        let foreign_document_id = DocumentId::from_uuid(Uuid::from_u128(0xfeed_f00d));
+        let mut documents = intent.post_frontier().documents().to_vec();
+        documents.push(
+            DocumentDependencies::new(foreign_document_id, Vec::new(), vec![batch_id])
+                .expect("test-only foreign frontier document is well formed"),
+        );
+        let frontier = FrontierV2::new(documents)
+            .expect("test-only foreign frontier remains canonically ordered");
+        entry.projection.intent = ManifestedProjectionIntent::new(
+            intent.workspace_id(),
+            intent.source_batch_id(),
+            intent.source_author_device_id(),
+            intent.source_author_session_id(),
+            intent.source_endpoint_id(),
+            intent.page_id(),
+            intent.path().clone(),
+            intent.portable_path_index_root(),
+            intent.precondition().clone(),
+            intent.render_base().cloned(),
+            intent.target().clone(),
+            frontier,
+            intent.claim_evidence().to_vec(),
+        )
+        .expect("test-only foreign frontier rewrite retains a valid manifested projection intent");
+        true
+    }
+
     /// Materialize one exact current path from accepted state plus the
     /// journal-committed local overlay, without SQLite or a graph reload.
     pub fn materialize_current_page_at_path(
@@ -14951,6 +15036,22 @@ impl ShardedHotEngine {
         self.draft_author_transaction_with_observation(author, origin, transaction, None, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn draft_author_transaction_with_prepared_editor_for_test(
+        &self,
+        author: AuthorBatch,
+        transaction: &OperationTransaction,
+        prepared_editor_projection: super::projection::PreparedEditorProjection,
+    ) -> Result<AuthorTransactionDraft, EngineError> {
+        self.draft_author_transaction_with_observation(
+            author,
+            BatchOrigin::LocalMutation,
+            transaction,
+            None,
+            Some(prepared_editor_projection),
+        )
+    }
+
     /// Prepare one canonical managed-local record from the exact finalized
     /// `PreparedBatch` that the archive expander will later publish.
     ///
@@ -15918,7 +16019,7 @@ impl ShardedHotEngine {
         origin: BatchOrigin,
         transaction: &OperationTransaction,
         observation: Option<ExternalImportObservationMaterial>,
-        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
+        mut prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
         #[cfg(test)]
         note_local_mutation_detail(|detail| {
@@ -15943,11 +16044,13 @@ impl ShardedHotEngine {
         for page_id in affected_pages {
             #[cfg(test)]
             let before_projection_started = Instant::now();
-            let before = match self.materialize_page_for_projection(page_id) {
-                Ok(state) => Some(state),
-                Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => None,
-                Err(error) => return Err(error),
-            };
+            let before = self.materialize_before_projection_for_draft(
+                page_id,
+                origin,
+                &parts.semantic_effect,
+                parts.projection_before_snapshots.as_ref(),
+                prepared_editor_projection.as_mut(),
+            )?;
             #[cfg(test)]
             note_local_mutation_detail(|detail| {
                 detail.before_projection_materialization = detail
@@ -16019,6 +16122,255 @@ impl ShardedHotEngine {
             external_observation: parts.external_observation,
             prepared_editor_projection,
         })
+    }
+
+    /// Use an editor-owned pre-page only after proving that it describes this
+    /// exact, current pending-local predecessor.  This deliberately accepts a
+    /// single claim-free Markdown content-edit lane; every missing proof
+    /// consumes the affine artifact and follows the established full
+    /// materializer.
+    fn materialize_before_projection_for_draft(
+        &self,
+        page_id: PageId,
+        origin: BatchOrigin,
+        effect: &SemanticEffect,
+        before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
+        prepared_editor_projection: Option<&mut super::projection::PreparedEditorProjection>,
+    ) -> Result<Option<ProjectionPageState>, EngineError> {
+        let affine =
+            if origin == BatchOrigin::LocalMutation && before_projection_affine_reuse_enabled() {
+                prepared_editor_projection.and_then(|prepared| {
+                    let exact_base_matches = prepared.before_candidate_matches_exact_base();
+                    prepared
+                        .take_before_candidate()
+                        .map(|candidate| (candidate, exact_base_matches))
+                })
+            } else {
+                None
+            };
+
+        if let Some((candidate, exact_base_matches)) = affine {
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_projection_affine_attempts =
+                    detail.before_projection_affine_attempts.saturating_add(1);
+            });
+            if let Some((page, accepted_target, accepted_annotations)) =
+                candidate.into_page_and_accepted_render()
+            {
+                if let Some(state) = self.authenticate_affine_before_projection_candidate(
+                    page_id,
+                    effect,
+                    before_snapshots,
+                    page,
+                    exact_base_matches,
+                    &accepted_target,
+                    &accepted_annotations,
+                )? {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.before_projection_affine_reuses =
+                            detail.before_projection_affine_reuses.saturating_add(1);
+                        detail.before_projection_affine_snapshot_blocks = detail
+                            .before_projection_affine_snapshot_blocks
+                            .saturating_add(state.page.blocks.len());
+                    });
+                    return Ok(Some(state));
+                }
+            }
+            #[cfg(test)]
+            note_local_mutation_detail(|detail| {
+                detail.before_projection_affine_fallbacks =
+                    detail.before_projection_affine_fallbacks.saturating_add(1);
+            });
+        }
+
+        #[cfg(test)]
+        note_local_mutation_detail(|detail| {
+            detail.before_projection_full_materializations = detail
+                .before_projection_full_materializations
+                .saturating_add(1);
+        });
+        match self.materialize_page_for_projection(page_id) {
+            Ok(state) => Ok(Some(state)),
+            Err(EngineError::PageNotFound(_) | EngineError::PageDeleted(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns a state only when the whole affine pre-state is independently
+    /// tied to the current local-overlay and engine points.  This helper never
+    /// parses source, reads Graph/SQLite, or reconstructs a page.
+    fn authenticate_affine_before_projection_candidate(
+        &self,
+        page_id: PageId,
+        effect: &SemanticEffect,
+        before_snapshots: Option<&BTreeMap<DocumentId, SemanticDocumentSnapshot>>,
+        page: MaterializedPage,
+        exact_base_matches: bool,
+        accepted_target: &[u8],
+        accepted_annotations: &[AnnotatedIdentity],
+    ) -> Result<Option<ProjectionPageState>, EngineError> {
+        if page.page_id != page_id
+            || !page.path.as_str().ends_with(".md")
+            || !effect.pages().is_empty()
+            || !effect.page_preambles().is_empty()
+            || !effect.memberships().is_empty()
+            || effect.blocks().is_empty()
+            || effect.blocks().iter().any(|delta| {
+                let (Some(before), Some(after)) = (&delta.before, &delta.after) else {
+                    return true;
+                };
+                before.block_id != delta.block_id
+                    || after.block_id != delta.block_id
+                    || before.home_document_id != page.home_document_id
+                    || after.home_document_id != page.home_document_id
+                    || before.owner != BlockOwner::Page(page_id)
+                    || after.owner != BlockOwner::Page(page_id)
+                    || before.logseq_uuid.is_some()
+                    || after.logseq_uuid.is_some()
+                    || before.logseq_identity_origin.is_some()
+                    || after.logseq_identity_origin.is_some()
+                    || before.content == after.content
+            })
+            || page.blocks.iter().any(|block| {
+                block.home_document_id != page.home_document_id
+                    || block.logseq_uuid.is_some()
+                    || block.logseq_identity_origin.is_some()
+            })
+            || !page_logseq_references(&page.path, page.preamble.as_deref(), &page.blocks)
+                .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(before_snapshots) = before_snapshots else {
+            return Ok(None);
+        };
+        if before_snapshots.len() != 1 || !before_snapshots.contains_key(&page.home_document_id) {
+            return Ok(None);
+        }
+        let Some(SemanticDocumentSnapshot::Shard {
+            page_id: Some(snapshot_page_id),
+            page_preamble,
+            blocks,
+            memberships,
+        }) = before_snapshots.get(&page.home_document_id)
+        else {
+            return Ok(None);
+        };
+        if *snapshot_page_id != page_id
+            || page_preamble
+                .as_ref()
+                .and_then(|preamble| preamble.preamble.as_deref())
+                != page.preamble.as_deref()
+            || blocks.len() != page.blocks.len()
+            || memberships.len() != page.blocks.len()
+            || page.blocks.iter().any(|block| {
+                let Some(state) = blocks.get(&block.block_id) else {
+                    return true;
+                };
+                let Some(membership) = memberships.get(&block.block_id) else {
+                    return true;
+                };
+                state.block_id != block.block_id
+                    || state.home_document_id != page.home_document_id
+                    || state.owner != BlockOwner::Page(page_id)
+                    || state.logseq_uuid != block.logseq_uuid
+                    || state.logseq_identity_origin != block.logseq_identity_origin
+                    || state.content != block.content
+                    || membership.home_document_id != page.home_document_id
+                    || membership.parent != block.parent
+                    || membership.order != block.order
+            })
+        {
+            return Ok(None);
+        }
+
+        let PageState::Live {
+            name,
+            path,
+            kind,
+            home_document_id,
+        } = self.current_hot_page_state(page_id)?
+        else {
+            return Ok(None);
+        };
+        if name != page.name
+            || path != page.path
+            || kind != page.kind
+            || home_document_id != page.home_document_id
+        {
+            return Ok(None);
+        }
+        let CurrentPageAtPath::ExactOwner(owner) = self.current_page_at_path(&page.path)? else {
+            return Ok(None);
+        };
+        if owner.page_id() != page_id {
+            return Ok(None);
+        }
+
+        let Some(last) = self.local_overlay.entries.last() else {
+            return Ok(None);
+        };
+        let intent = &last.projection.intent;
+        if last.batch_id != intent.source_batch_id()
+            || intent.page_id() != page_id
+            || intent.path() != &page.path
+            || intent.portable_path_index_root() != self.portable_path_root
+            || !intent.claim_evidence().is_empty()
+            || !exact_base_matches
+        {
+            return Ok(None);
+        }
+        let ManifestProjectionTarget::Present {
+            bytes, annotations, ..
+        } = intent.target()
+        else {
+            return Ok(None);
+        };
+        if bytes.as_slice() != accepted_target || annotations.as_slice() != accepted_annotations {
+            return Ok(None);
+        }
+
+        let home_dependencies =
+            self.current_hot_document_dependencies_by_id(page.home_document_id)?;
+        if !affine_before_projection_frontier_documents_are_exact(
+            intent.post_frontier(),
+            page.home_document_id,
+            self.catalog_document_id,
+        ) {
+            return Ok(None);
+        }
+        let Some(intent_home_dependencies) = intent
+            .post_frontier()
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == page.home_document_id)
+        else {
+            return Ok(None);
+        };
+        let current_catalog_dependencies =
+            self.current_hot_document_dependencies_by_id(self.catalog_document_id)?;
+        let Some(intent_catalog_dependencies) = intent
+            .post_frontier()
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == self.catalog_document_id)
+        else {
+            return Ok(None);
+        };
+        if home_dependencies.direct_dependency_heads() != [last.batch_id]
+            || intent_home_dependencies != &home_dependencies
+            || intent_catalog_dependencies != &current_catalog_dependencies
+        {
+            return Ok(None);
+        }
+        Ok(Some(ProjectionPageState {
+            page,
+            frontier: intent.post_frontier().clone(),
+            claim_evidence: Vec::new(),
+        }))
     }
 
     /// Inactive session-facing gate for local semantic authoring. The draft is
@@ -17658,7 +18010,8 @@ impl ShardedHotEngine {
         });
         #[cfg(test)]
         let prospective_capture_started = Instant::now();
-        let (prospective_documents, detached_bootstrap) = match capture {
+        let (prospective_documents, detached_bootstrap, projection_before_snapshots) = match capture
+        {
             TransactionCapture::Projection => (
                 working
                     .iter()
@@ -17667,6 +18020,7 @@ impl ShardedHotEngine {
                     })
                     .collect::<Result<BTreeMap<_, _>, _>>()?,
                 None,
+                Some(before_snapshots),
             ),
             TransactionCapture::DetachedBootstrap => (
                 BTreeMap::new(),
@@ -17677,6 +18031,7 @@ impl ShardedHotEngine {
                     before_vectors,
                     dependency_heads: affected_heads,
                 }),
+                None,
             ),
             TransactionCapture::None => {
                 if self.scratch.is_none() {
@@ -17697,7 +18052,7 @@ impl ShardedHotEngine {
                         projection_pages: BTreeMap::new(),
                     });
                 }
-                (BTreeMap::new(), None)
+                (BTreeMap::new(), None, None)
             }
         };
         #[cfg(test)]
@@ -17714,6 +18069,7 @@ impl ShardedHotEngine {
             prepared,
             semantic_effect: effect,
             prospective_documents,
+            projection_before_snapshots,
             detached_bootstrap,
             portable_path_root,
             external_observation,

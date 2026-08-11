@@ -211,6 +211,32 @@ impl OverlayFixture {
         }])
     }
 
+    /// Retain a genuine no-op read of a second page's document while changing
+    /// the first page. This is useful for proving that a narrow page-local
+    /// fast path refuses a draft whose captured pre-state spans more than the
+    /// edited page's one home document.
+    pub(crate) fn content_edit_with_noop_foreign_read(
+        &self,
+        generation: usize,
+    ) -> OperationTransaction {
+        tx(vec![
+            SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: self.block_id,
+                    home_document_id: self.home_document_id,
+                },
+                content: format!("managed revision {generation}"),
+            },
+            SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: crate::oplog::BlockId::from_uuid(uuid(BLOCK_BASE + 1)),
+                    home_document_id: DocumentId::from_uuid(uuid(HOME_BASE + 1)),
+                },
+                content: "initial content 1".into(),
+            },
+        ])
+    }
+
     pub(crate) fn finalize_edit(&self, seed: u128, generation: usize) -> PreparedBatch {
         let draft = self
             .engine

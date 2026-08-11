@@ -3810,6 +3810,22 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn force_generic_before_projection_affine_reuse_for_test(
+        &self,
+        force: bool,
+    ) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::ForceGenericBeforeProjectionAffineReuse {
+            force,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
     fn reset_managed_application_query_instrumentation(
         &self,
     ) -> Result<(), SyncRuntimeRequestError> {
@@ -6720,6 +6736,11 @@ enum ActorRequest {
         reply: mpsc::Sender<ManagedApplicationSaveInstrumentation>,
     },
     #[cfg(test)]
+    ForceGenericBeforeProjectionAffineReuse {
+        force: bool,
+        reply: mpsc::Sender<()>,
+    },
+    #[cfg(test)]
     ResetManagedApplicationQueryInstrumentation { reply: mpsc::Sender<()> },
     #[cfg(test)]
     ManagedApplicationQueryInstrumentation {
@@ -7030,6 +7051,14 @@ fn run_actor_loop(
                     guarded_graph_validation_parse_pairs:
                         crate::model::journal_projection_guarded_parse_pairs_for_runtime_test(),
                 });
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::ForceGenericBeforeProjectionAffineReuse { force, reply } => {
+                crate::oplog::hot_engine::force_generic_before_projection_affine_reuse_for_test(
+                    force,
+                );
+                let _ = reply.send(());
                 false
             }
             #[cfg(test)]
@@ -14496,11 +14525,23 @@ impl RuntimeActor {
                         operations.extend(content.operations);
                     }
                     let transaction = finish_editor_transaction(operations)?;
+                    // This transaction consumes the existing application
+                    // snapshot. Move its already authenticated materialized
+                    // pre-page into the affine editor artifact rather than
+                    // cloning a second whole page solely for draft-time
+                    // before-projection reuse.
+                    let ApplicationCurrentPage { editor, .. } = current_application;
+                    let EditorCurrentPage {
+                        page: accepted_page,
+                        ..
+                    } = editor;
+                    let prepared_editor_projection =
+                        prepared_editor_projection.bind_accepted_page(accepted_page);
                     (
                         page_id,
                         transaction,
                         affected.into_iter().map(|id| id.to_string()).collect(),
-                        Some(current_application),
+                        None::<ApplicationCurrentPage>,
                         Some((
                             trusted_target_page,
                             trusted_target_evidence,
@@ -27061,6 +27102,14 @@ mod tests {
             instrumentation.guarded_graph_validation_parse_pairs, 1,
             "reuse must still execute Graph's guarded base/target validation parse pair"
         );
+        let before_detail = instrumentation.local_mutation_detail;
+        assert_eq!(
+            before_detail.before_projection_full_materializations, 1,
+            "the first save has no authenticated pending-local predecessor"
+        );
+        assert_eq!(before_detail.before_projection_affine_attempts, 1);
+        assert_eq!(before_detail.before_projection_affine_reuses, 0);
+        assert_eq!(before_detail.before_projection_affine_fallbacks, 1);
 
         let (saved, saved_revision) = match saved {
             SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
@@ -27089,6 +27138,18 @@ mod tests {
         let instrumentation = handle
             .managed_application_save_instrumentation()
             .expect("consecutive save exposes capture-sealed instrumentation");
+        let before_detail = instrumentation.local_mutation_detail;
+        assert_eq!(
+            before_detail.before_projection_full_materializations, 0,
+            "second pending-local 511-block save must not reconstruct its pre-page"
+        );
+        assert_eq!(before_detail.before_projection_affine_attempts, 1);
+        assert_eq!(before_detail.before_projection_affine_reuses, 1);
+        assert_eq!(before_detail.before_projection_affine_fallbacks, 0);
+        assert_eq!(
+            before_detail.before_projection_affine_snapshot_blocks, MAX_SYNC_EDITOR_BLOCKS,
+            "the affine proof must compare every pre-page block exactly once"
+        );
         let counters = instrumentation.prepared_editor_projection;
         assert_eq!(counters.created, 1);
         assert_eq!(counters.reused, 1);
@@ -27169,6 +27230,86 @@ mod tests {
             reopened.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
         ));
+    }
+
+    #[test]
+    fn affine_before_projection_matches_forced_generic_application_save() {
+        let run = |label: &str, force_generic: bool| {
+            let fixture = ActivationFixture::empty(label, 0xa13f);
+            let source = (0..4)
+                .map(|index| format!("- before {index}\r\n"))
+                .collect::<String>();
+            fs::write(fixture.graph_root.join("Tine.md"), source).unwrap();
+            let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+            assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+            let handle = activated.handle.expect("activation retains a runtime");
+            drive_initial_feed(&handle);
+
+            let (mut first_page, first_revision) =
+                load_application_logical(&handle, "Tine", SyncPageKind::Page);
+            first_page.blocks[0].raw = "first exact pre-page".into();
+            let (first_page, first_revision) = accepted_application_save(
+                &handle,
+                handle
+                    .save_application_page(SyncApplicationPageSaveRequest {
+                        target: SyncApplicationPageSaveTarget::Existing {
+                            path: first_page.path.clone(),
+                            revision: first_revision,
+                        },
+                        page: first_page,
+                    })
+                    .unwrap(),
+                "Tine",
+                SyncPageKind::Page,
+            );
+
+            let mut second_page = first_page;
+            second_page.blocks[0].raw = "second exact pre-page".into();
+            if force_generic {
+                handle
+                    .force_generic_before_projection_affine_reuse_for_test(true)
+                    .unwrap();
+            }
+            let second = handle.save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: second_page.path.clone(),
+                    revision: first_revision,
+                },
+                page: second_page,
+            });
+            if force_generic {
+                handle
+                    .force_generic_before_projection_affine_reuse_for_test(false)
+                    .unwrap();
+            }
+            let (second, _) =
+                accepted_application_save(&handle, second.unwrap(), "Tine", SyncPageKind::Page);
+            let target = fs::read(fixture.graph_root.join(&second.path)).unwrap();
+            let detail = handle
+                .managed_application_save_instrumentation()
+                .expect("second save reports local mutation detail")
+                .local_mutation_detail;
+
+            drain_managed_local(&handle);
+            assert!(matches!(
+                handle.clean_shutdown().unwrap(),
+                SyncShutdownOutcome::Safe(_)
+            ));
+            (second, target, detail)
+        };
+
+        let generic = run("before-projection-generic", true);
+        let affine = run("before-projection-affine", false);
+
+        assert_parser_dto_semantics(&generic.0, &affine.0);
+        assert_eq!(generic.1, affine.1);
+        assert_eq!(generic.2.before_projection_full_materializations, 1);
+        assert_eq!(generic.2.before_projection_affine_attempts, 0);
+        assert_eq!(generic.2.before_projection_affine_reuses, 0);
+        assert_eq!(affine.2.before_projection_full_materializations, 0);
+        assert_eq!(affine.2.before_projection_affine_attempts, 1);
+        assert_eq!(affine.2.before_projection_affine_reuses, 1);
+        assert_eq!(affine.2.before_projection_affine_fallbacks, 0);
     }
 
     #[test]

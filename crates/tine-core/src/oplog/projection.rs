@@ -273,6 +273,35 @@ struct RenderedProjection {
     generated_anchors: Vec<PolicyGeneratedAnchor>,
 }
 
+/// The affine pre-state half of an editor request.  The page is transferred
+/// from the already authenticated editor load; it is never reconstructed from
+/// a cache or persisted.  `hot_engine` may consume it exactly once while
+/// proving a narrow current pending-local predecessor.  The accepted render
+/// remains process-local evidence only.
+pub(crate) struct PreparedEditorProjectionBeforeCandidate {
+    accepted_page: Option<MaterializedPage>,
+    accepted_rendered: RenderedProjection,
+}
+
+impl PreparedEditorProjectionBeforeCandidate {
+    fn bind_accepted_page(&mut self, accepted_page: MaterializedPage) {
+        debug_assert!(self.accepted_page.is_none());
+        self.accepted_page = Some(accepted_page);
+    }
+
+    pub(crate) fn into_page_and_accepted_render(
+        self,
+    ) -> Option<(MaterializedPage, Vec<u8>, Vec<AnnotatedIdentity>)> {
+        self.accepted_page.map(|accepted_page| {
+            (
+                accepted_page,
+                self.accepted_rendered.target,
+                self.accepted_rendered.annotations,
+            )
+        })
+    }
+}
+
 /// One editor-requested post-state rendering, retained only while the same
 /// trusted-local mutation crosses draft, capture, and finalization.  It is
 /// affine: neither the artifact nor its candidate layout identities are
@@ -282,7 +311,7 @@ pub(crate) struct PreparedEditorProjection {
     requested_page: MaterializedPage,
     exact_base: Vec<u8>,
     candidate_base_layout: Vec<StructuralLayoutIdentity>,
-    accepted_target: Vec<u8>,
+    before_candidate: Option<PreparedEditorProjectionBeforeCandidate>,
     rendered: RenderedProjection,
 }
 
@@ -298,7 +327,6 @@ impl PreparedEditorProjection {
     ) -> Result<Self, ProjectionError> {
         let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
         let candidate_base_layout = structural_layout_identities(&accepted.annotations);
-        let accepted_target = accepted.target;
         let rendered = render_projection_page_with_layout_identities(
             &requested_page,
             Some(&exact_base),
@@ -312,7 +340,13 @@ impl PreparedEditorProjection {
             requested_page,
             exact_base,
             candidate_base_layout,
-            accepted_target,
+            before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
+                // The caller binds the owned accepted page below.  Keeping the
+                // render here first lets the UI boundary use the same borrowed
+                // page for all ordinary request construction.
+                accepted_page: None,
+                accepted_rendered: accepted,
+            }),
             rendered,
         })
     }
@@ -322,7 +356,36 @@ impl PreparedEditorProjection {
     }
 
     pub(crate) fn accepted_target(&self) -> &[u8] {
-        &self.accepted_target
+        &self
+            .before_candidate
+            .as_ref()
+            .expect("accepted editor projection remains available before draft")
+            .accepted_rendered
+            .target
+    }
+
+    /// Replace the provisional accepted page with the exact editor-owned
+    /// value.  The ordinary editor route calls this after it has finished
+    /// reading that page, avoiding a second 511-block clone solely for the
+    /// affine before-projection candidate.
+    pub(crate) fn bind_accepted_page(mut self, accepted_page: MaterializedPage) -> Self {
+        self.before_candidate
+            .as_mut()
+            .expect("new editor projection has an accepted render")
+            .bind_accepted_page(accepted_page);
+        self
+    }
+
+    pub(crate) fn before_candidate_matches_exact_base(&self) -> bool {
+        self.before_candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.accepted_rendered.target == self.exact_base)
+    }
+
+    pub(crate) fn take_before_candidate(
+        &mut self,
+    ) -> Option<PreparedEditorProjectionBeforeCandidate> {
+        self.before_candidate.take()
     }
 
     /// Consume the artifact only after final capture proves that its accepted
