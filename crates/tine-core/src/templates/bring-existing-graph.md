@@ -3,25 +3,25 @@ icon:: 📂
 - # Bring an existing graph
 	- Tine works directly on the same Markdown/Org files as Logseq — no import, no export, no lock-in. This **Direct files** mode is the normal mode; the separate **Testing only** storage & sync opt-in is documented at [[Features/Managed sync]].
 - ## Open your graph
-	- 1. On the Welcome screen, choose **Open an existing graph** and pick the folder that holds your graph — the one containing `pages/`, `journals/`, and `logseq/`.
+	- 1. On the Welcome screen, choose **Open an existing graph** and pick the graph's top-level folder — usually the one containing `pages/`, `journals/`, and `logseq/`.
 	- 2. Later, use the graph-name menu at the top of the left sidebar → **Open graph…**, or Settings (**t s**) → **Graph** → **Open another graph…**. Graphs you have opened appear in the same sidebar menu for one-click switching.
 	- 3. From the command line, `tine /path/to/graph` (or `TINE_GRAPH=/path/to/graph`) opens a graph directly.
-	- 4. What you should see: your pages and journals, exactly as Logseq shows them — every page is a file of the same name under `pages/` or `journals/`.
+	- 4. What you should see: the same pages and journals Logseq finds. Existing Markdown and Org pages may be at the graph root or in nested folders, not only under `pages/` and `journals/`.
 - ## What Tine reads
-	- The standard layout: `pages/`, `journals/`, `assets/`, and `logseq/config.edn` — Markdown and Org files alike.
-	- Pages filed into sub-folders of `pages/` and `journals/` are found; a nested page is named by its file name and saves back in place.
+	- The usual layout is `pages/`, `journals/`, `assets/`, and `logseq/config.edn`, but Tine also finds eligible `.md`, `.markdown`, and `.org` pages elsewhere inside the graph.
+	- Root-level and nested pages are named from their file names and save back to their exact existing paths. Tine skips hidden/internal trees, assets, publish output, and sync-provider conflict copies.
 	- Your journal settings are honored: Tine reads the journal date formats from `config.edn`, so old files are recognized and new journals are created in your format.
 	- An Org file Tine cannot reproduce byte-for-byte opens **read-only** rather than being rewritten imperfectly.
 - ## What Tine writes
 	- Edits save automatically into the same file each page came from, preserving that file's exact formatting; files with no changes are not rewritten.
-	- New pages and journals are ordinary `.md` or `.org` files (Settings → **Editor** → **File format** chooses what new files use).
+	- New pages and journals are ordinary `.md` or `.org` files in the configured pages and journals folders (Settings → **Editor** → **File format** chooses what new files use).
 	- A Tine view (grid, table, board) attaches harmless `tine.*` properties to its own block; Logseq shows them as ordinary property lines — see [[Features/Sheets]].
 - ## Coexisting with other tools
-	- Switch apps freely: Tine watches the files, so changes made in Logseq or synced in from another device appear automatically.
-	- Run one app at a time on a given graph: a second Tine window on the same graph is refused, and concurrent edits across apps or devices are what conflict handling is for.
+	- While Tine is open, it watches the files, so changes made by Logseq, another editor, or a sync tool appear automatically.
+	- Avoid editing the same graph in two apps at once. A second Tine window on the same graph is refused; concurrent edits across other apps or devices are handled as conflicts, not assumed safe.
 	- If a page changes on disk while you have unsaved edits, Tine overwrites nothing — a banner offers **Use disk version** and **Keep mine (overwrite)**. The mechanics are in [[Reference/Files, external edits, and backups]].
 	- Syncthing and Dropbox keep working on the folder as before; Tine detects their conflict copies and helps you merge them — also in [[Reference/Files, external edits, and backups]].
 - ## First safety checks
-	- 1. Confirm you opened the graph root: Settings (**t s**) → **Graph** shows the current graph path; it should be the folder containing `pages/`, `journals/`, and `logseq/config.edn`.
+	- 1. Confirm you opened the graph root: Settings (**t s**) → **Graph** shows the current graph path. In a standard Logseq graph, this is the folder containing `pages/`, `journals/`, and `logseq/config.edn`.
 	- 2. Skim [[Reference/Files, external edits, and backups]] now — know where snapshots, conflict copies, and the trash live before you need them.
-	- 3. What you should see: no banner, no conflict copies, and your ordinary folders underneath — edits in Tine and Logseq land in the same files.
+	- 3. What you should see: no conflict banner, your existing pages in their original locations, and edits from Tine landing in the same files Logseq reads.

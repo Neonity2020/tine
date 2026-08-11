@@ -1,9 +1,9 @@
 icon:: 🗄️
 
 - # Files, external edits, and backups
-	- Everything Tine keeps lives as ordinary files in your graph folder: `pages/` and `journals/` (Markdown or Org), `assets/`, and `logseq/config.edn`. This page maps what is written where, and the safety nets around it.
+	- Your graph content stays in ordinary files shared with Logseq. Tine also keeps device settings and launch snapshots outside the graph. This page maps what is written where, and the safety nets around it.
 - ## What lands on disk
-	- **Pages and journals** — one file per page, named after it, anywhere under `pages/` or `journals/`. Sub-folders are scanned too; a nested file is a page named by its file name, like Logseq.
+	- **Pages and journals** — one Markdown or Org file per page. Existing files may live at the graph root or in nested folders; Tine saves each one back to its exact path. New files use the configured `pages/` and `journals/` folders.
 	- **Assets** — pasted and uploaded files in `assets/`. Deleting a block never deletes its media.
 	- **Graph configuration** — `logseq/config.edn`, shared with Logseq: journal date formats, macros, and UI choices such as `:ui/show-brackets?` live there.
 	- **Tine's view config** — harmless `tine.*` block properties on the view-owning block (see [[Features/Sheets]]). Everything else stays ordinary graph text.
@@ -17,14 +17,14 @@ icon:: 🗄️
 	- A page you are not editing updates in place automatically. A page with unsaved edits is never overwritten: Tine shows a banner and skips that page in future saves until you choose **Use disk version** (re-read the file) or **Keep mine (overwrite)** (write your version).
 	- Running two Tine windows on the same graph — or on a graph nested inside an open one — is refused, so that conflict cannot happen locally. For file sync between devices, run one app at a time on the graph where you can, and let conflict copies (below) catch the rest.
 - ## Snapshots — automatic backups
-	- Each time Tine opens your graph it snapshots the Markdown/Org files to a local folder **outside** the graph, so Syncthing never syncs the backup. It is a safety net against a bad write, independent of Logseq's own backups.
+	- Each time Tine opens your graph it snapshots eligible Markdown/Org files across the graph, plus `logseq/config.edn` and asset `.edn` sidecars, to a local folder **outside** the graph. Syncthing never syncs it. Binary assets are not copied.
 	- Settings → **Backups & recovery** → **Snapshots to keep** (default 12) controls how many survive; the oldest beyond the count are pruned.
 	- 1. Pick a snapshot and choose **Restore**, then confirm.
-	- 2. What you should see: Tine snapshots your current state first, overwrites `journals/` and `pages/` with the backup, and reloads the graph — a mistaken restore is itself reversible.
+	- 2. What you should see: Tine snapshots your current state first, restores backed-up graph text to its original paths, restores config and sidecars, and reloads the graph — a mistaken restore is itself reversible.
 - ## Trash
-	- Deleting a page or journal moves the file to `logseq/.tine-trash`, not permanent deletion.
+	- Deleting a page or journal moves the file to `logseq/.tine-trash/pages/` or `logseq/.tine-trash/journals/`, not permanent deletion. Its name gains a timestamp followed by `__`.
 	- Duplicate journal files you trash, discarded sync-conflict copies, and unused media from an orphan scan land there too.
-	- To restore something, move it out of `logseq/.tine-trash` into `pages/`, `journals/`, or `assets/` with your file manager; Tine picks it up like any external change.
+	- To restore something, open the matching typed folder, remove the timestamp and `__` from its name, then move it into `pages/`, `journals/`, or `assets/` with your file manager. Tine picks it up like any external change.
 	- Settings → **Files** → **Orphan assets and trash** can find media no block links to (a deleted block keeps its files, so unused media accumulates) and trash it, and **Empty asset trash** deletes *asset* trash permanently — page, journal, and conflict recovery files are always kept.
 - ## Sync tools and conflict copies
 	- Keep Syncthing or Dropbox on your graph — Tine is built to coexist with them. Two files that resolve to the same journal day are kept, not dropped: Settings → **Backups & recovery** → **Duplicate journal days** offers **Open**, **Merge**, **Rename**, or **Trash** per file.
