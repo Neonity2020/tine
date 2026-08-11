@@ -734,8 +734,11 @@ export function mockBackend(): Backend {
     async openGraphWindow() {
       return { kind: "focused_existing" as const, window_label: "main" };
     },
-    async startupGraphPath() {
+    async startupGraphPath(_attempt: number) {
       return "/mock/graph";
+    },
+    async onStartupProgress() {
+      return () => {};
     },
     async captureTarget() {
       return "main";
@@ -957,6 +960,23 @@ export function mockBackend(): Backend {
       return sparseV2;
     },
     async cancelSparseV2() {
+      sparseV2 = {
+        state: "legacy_default",
+        runtime: null,
+        can_activate: true,
+        can_retry: false,
+        can_cancel: false,
+        cancel_reason: null,
+        binding_generation: sparseV2.binding_generation + 1,
+      };
+      return {
+        status: sparseV2,
+        binding_generation: sparseV2.binding_generation,
+        recovery_statement:
+          "Direct file mode is active. Complete recovery state was preserved.",
+      };
+    },
+    async cancelSparseV2Cold() {
       sparseV2 = {
         state: "legacy_default",
         runtime: null,

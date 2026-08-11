@@ -302,6 +302,23 @@ export interface SparseV2CancelResult {
   recovery_statement: string;
 }
 
+/** Privacy-safe native progress shared by terminal diagnostics and cold-start UI. */
+export type StartupProgressPhase =
+  | "lookup.entry"
+  | "lookup.app_data"
+  | "lookup.settings_stat"
+  | "lookup.settings_read"
+  | "lookup.settings_parse"
+  | "lookup.complete"
+  | `managed_open.${string}`;
+
+export interface StartupProgressEvent {
+  phase: StartupProgressPhase;
+  elapsed_ms: number;
+  terminal: boolean;
+  outcome?: "ok" | "error";
+}
+
 export type SparseV2ActivationPhase =
   | "source_capture"
   | "bootstrap_import_preparation"
