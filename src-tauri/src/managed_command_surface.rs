@@ -114,7 +114,6 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("detect_media_editor", NoGraphSlot),
     ("edit_asset_external", Filesystem),
     ("empty_asset_trash", TrashWrite),
-    ("enable_managed_sync", LegacyOnly),
     ("existing_page_names", ManagedRouted),
     ("export_query_subtrees", ManagedRouted),
     ("forget_known_graph", NoGraphSlot),
@@ -153,8 +152,6 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("load_plugin_registry_cache", NoGraphSlot),
     ("load_session", NoGraphSlot),
     ("load_workspaces", NoGraphSlot),
-    ("managed_sync_identity_plan", LegacyOnly),
-    ("managed_sync_status", LegacyOnly),
     ("merge_pages", ManagedRouted),
     ("open_asset", Filesystem),
     ("open_external", NoGraphSlot),
@@ -245,20 +242,8 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
 /// Each entry says what the command needs before it can come back.
 const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
     (
-        "enable_managed_sync",
-        "legacy-only by construction: it is the migration into managed storage",
-    ),
-    (
         "list_backups",
         "legacy zip backups have no managed analogue",
-    ),
-    (
-        "managed_sync_identity_plan",
-        "legacy-only by construction: plans the migration",
-    ),
-    (
-        "managed_sync_status",
-        "legacy-only by construction: reports the migration",
     ),
     (
         "present_conflict_override",
@@ -283,7 +268,6 @@ const REFUSED_UNDER_MANAGED_STORAGE: &[(&str, &str)] = &[
 /// though its other arm takes the legacy graph, so that marker wins.
 const ROUTING_MARKERS: &[(&str, ManagedRouting)] = &[
     ("sparse_application_handle", ManagedRouted),
-    ("with_graph(", LegacyOnly),
     ("legacy_graph(", LegacyOnly),
     ("legacy_graph_cloned(", LegacyOnly),
     ("with_config_graph(", ConfigWrite),

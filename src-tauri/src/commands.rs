@@ -4,8 +4,8 @@ use crate::debug::diag;
 use crate::platform::{open_page_source, opener_command, reveal_page_source};
 use crate::state::{
     capture_quick_switch_slot, owned_graph_context, refresh_graph, slot_for_bound_window,
-    slot_for_context, with_config_graph, with_filesystem_graph, with_graph, with_trash_graph,
-    AppState, GraphContext,
+    slot_for_context, with_config_graph, with_filesystem_graph, with_trash_graph, AppState,
+    GraphContext,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -1094,45 +1094,6 @@ pub(crate) async fn save_page(
     })
     .await
     .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-pub(crate) fn managed_sync_status(
-    state: GraphContext<'_>,
-) -> Result<Option<tine_core::crdt::CrdtStatus>, String> {
-    with_graph(&state, |g| Ok(g.managed_sync_status()))
-}
-
-#[tauri::command]
-pub(crate) fn managed_sync_identity_plan(
-    state: GraphContext<'_>,
-) -> Result<tine_core::model::SyncIdentityPlan, String> {
-    with_graph(&state, |g| {
-        g.sync_identity_plan().map_err(|error| error.to_string())
-    })
-}
-
-#[tauri::command]
-pub(crate) fn enable_managed_sync(
-    app: tauri::AppHandle,
-    state: GraphContext<'_>,
-) -> Result<tine_core::model::ManagedSyncEnableResult, String> {
-    let device_id = crate::settings::managed_sync_device_id(&app)?;
-    let result = with_graph(&state, |g| {
-        if !g.managed_sync_configured() {
-            let (_, complete) = crate::backup::backup_graph_now(&app, g, "pre-sync-enable");
-            if !complete {
-                return Err(
-                    "couldn't create a complete pre-sync safety snapshot; activation aborted"
-                        .into(),
-                );
-            }
-        }
-        g.enable_managed_sync(device_id, uuid::Uuid::new_v4())
-            .map_err(|error| error.to_string())
-    })?;
-    crate::state::poke_watcher(&state.state);
-    Ok(result)
 }
 
 #[tauri::command]

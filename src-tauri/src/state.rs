@@ -7,7 +7,6 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tauri::ipc::{CommandArg, CommandItem, InvokeBody, InvokeError};
 use tauri::{Manager, Runtime, State, WebviewWindow};
-use tine_core::crdt::ManagedSyncStoreState;
 use tine_core::model::Graph;
 
 pub(crate) type WindowKey = String;
@@ -652,17 +651,6 @@ pub(crate) fn capture_quick_switch_slot(
     Ok(slot)
 }
 
-/// Run a whole-graph operation that may **write**. Managed bindings are refused
-/// here, deliberately: graph text belongs to the oplog, not to a legacy `Graph`.
-pub(crate) fn with_graph<T>(
-    ctx: &GraphContext<'_>,
-    f: impl FnOnce(&Graph) -> Result<T, String>,
-) -> Result<T, String> {
-    let slot = slot_for_context(ctx)?;
-    let graph = slot.legacy_graph()?;
-    f(&graph)
-}
-
 /// Run one non-graph-semantic filesystem/config/asset operation. Managed mode
 /// uses a short-lived root capability and never opens the retained parsed view.
 pub(crate) fn with_filesystem_graph<T>(
@@ -693,8 +681,7 @@ pub(crate) fn with_trash_graph<T>(
 pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
     let label = ctx.window.label().to_string();
     // Refresh may migrate graph files before publishing its replacement slot.
-    // Serialize the whole operation with graph loads and sparse-v2 promotion so
-    // no legacy writer can be reopened after authority retirement begins.
+    // Serialize the whole operation with graph loads and sparse-v2 promotion.
     let _transition = ctx.state.graph_load.lock().unwrap();
     let old = slot_for_window(&ctx.state, &label)?;
     if old.is_sparse_v2() {
@@ -715,28 +702,9 @@ pub(crate) fn refresh_graph(ctx: &GraphContext<'_>) -> Result<(), String> {
         crate::settings::approved_external_assets(ctx.window.app_handle(), &old.root_key);
     let graph = Graph::open_checked_with_assets(&old.root_key, approved.as_deref())
         .map_err(|e| e.to_string())?;
-    let managed_state = graph
-        .managed_sync_store_state()
-        .map_err(|error| format!("managed sync store is unsafe or invalid: {error}"))?;
-    let sync_safety_complete = crate::graph::ensure_managed_sync_safety_snapshot(
-        ctx.window.app_handle(),
-        &graph,
-        managed_state,
-        false,
-        "pre-sync-refresh",
-    )?;
-    if managed_state != ManagedSyncStoreState::Absent {
-        crate::graph::start_managed_sync_after_safety(
-            ctx.window.app_handle(),
-            &graph,
-            managed_state,
-        )?;
-    }
-    if managed_state == ManagedSyncStoreState::Absent || sync_safety_complete {
-        graph
-            .migrate_journal_filenames_checked()
-            .map_err(|error| format!("journal filename migration failed: {error}"))?;
-    }
+    graph
+        .migrate_journal_filenames_checked()
+        .map_err(|error| format!("journal filename migration failed: {error}"))?;
     let replacement = Arc::new(GraphSlot::refreshed(graph, &old)?);
     ctx.state.graphs.write().unwrap().bind(label, replacement)?;
     poke_watcher(&ctx.state);

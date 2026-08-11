@@ -3419,6 +3419,119 @@ pub(crate) fn inspect_cold_shared_provider_descriptor(
     inspect_shared_provider_descriptor_with(provider_root, true)
 }
 
+/// The non-authoritative shape of a provider tree while a filesystem sync is
+/// still materializing its canonical enrollment prefix.  This deliberately
+/// recognizes only names and real directory/file kinds; descriptor bytes stay
+/// with [`inspect_cold_shared_provider_descriptor`], which validates them
+/// before cold discovery can join anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ColdSharedProviderPrefix {
+    Partial,
+    ReadyForDescriptorInspection,
+    Refused,
+}
+
+/// Classify the known, append-only provider-directory prefixes that an honest
+/// file-sync client may expose before it has delivered the canonical enrollment
+/// descriptor.  Unknown names, symlinks, non-directories, extra enrollment
+/// entries, and a non-regular descriptor are deliberately `Refused`: only an
+/// exact namespace prefix is retryable.
+pub(crate) fn inspect_cold_shared_provider_prefix(
+    provider_root: &Path,
+) -> Result<ColdSharedProviderPrefix, ScenarioError> {
+    const ROOT_NAMESPACES: &[&str] = &["inbox", "outbox"];
+    const OUTBOX_NAMESPACES: &[&str] = &[
+        PROVIDER_OBJECTS_NAMESPACE,
+        PROVIDER_MANIFESTS_NAMESPACE,
+        PROVIDER_ENROLLMENT_NAMESPACE,
+        SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+        SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+        SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+        SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+        PROVIDER_TEMP_NAMESPACE,
+        PROVIDER_REMOVED_NAMESPACE,
+        PROVIDER_RENAME_EVIDENCE_NAMESPACE,
+    ];
+
+    fn known_real_directories(
+        directory: &Path,
+        known: &[&str],
+    ) -> Result<Option<BTreeSet<String>>, ScenarioError> {
+        let mut names = BTreeSet::new();
+        for entry in
+            fs::read_dir(directory).map_err(|error| ScenarioError::Io(error.to_string()))?
+        {
+            let entry = entry.map_err(|error| ScenarioError::Io(error.to_string()))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ScenarioError::UnsafeProviderEntry(directory.display().to_string()))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| ScenarioError::Io(error.to_string()))?;
+            if !known.contains(&name.as_str()) || kind.is_symlink() || !kind.is_dir() {
+                return Ok(None);
+            }
+            names.insert(name);
+        }
+        Ok(Some(names))
+    }
+
+    let metadata = match fs::symlink_metadata(provider_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(ColdSharedProviderPrefix::Refused)
+        }
+        Err(error) => return Err(ScenarioError::Io(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(ColdSharedProviderPrefix::Refused);
+    }
+    let Some(root_entries) = known_real_directories(provider_root, ROOT_NAMESPACES)? else {
+        return Ok(ColdSharedProviderPrefix::Refused);
+    };
+    if !root_entries.contains("outbox") {
+        return Ok(ColdSharedProviderPrefix::Partial);
+    }
+
+    let outbox = provider_root.join("outbox");
+    let Some(outbox_entries) = known_real_directories(&outbox, OUTBOX_NAMESPACES)? else {
+        return Ok(ColdSharedProviderPrefix::Refused);
+    };
+    if !outbox_entries.contains(PROVIDER_ENROLLMENT_NAMESPACE) {
+        return Ok(ColdSharedProviderPrefix::Partial);
+    }
+
+    let enrollment = outbox.join(PROVIDER_ENROLLMENT_NAMESPACE);
+    let mut entries =
+        fs::read_dir(&enrollment).map_err(|error| ScenarioError::Io(error.to_string()))?;
+    let Some(entry) = entries
+        .next()
+        .transpose()
+        .map_err(|error| ScenarioError::Io(error.to_string()))?
+    else {
+        return Ok(ColdSharedProviderPrefix::Partial);
+    };
+    let name = entry
+        .file_name()
+        .into_string()
+        .map_err(|_| ScenarioError::UnsafeProviderEntry("enrollment/non-UTF-8".into()))?;
+    if name != "shared-enrollment-v1.json"
+        || !entry
+            .file_type()
+            .map_err(|error| ScenarioError::Io(error.to_string()))?
+            .is_file()
+        || entries
+            .next()
+            .transpose()
+            .map_err(|error| ScenarioError::Io(error.to_string()))?
+            .is_some()
+    {
+        return Ok(ColdSharedProviderPrefix::Refused);
+    }
+    Ok(ColdSharedProviderPrefix::ReadyForDescriptorInspection)
+}
+
 fn inspect_shared_provider_descriptor_with(
     provider_root: &Path,
     require_sole_enrollment_entry: bool,

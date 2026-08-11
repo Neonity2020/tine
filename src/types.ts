@@ -210,29 +210,6 @@ export interface SyncConflict {
   preview: string;
 }
 
-export interface ManagedSyncStatus {
-  workspace_id: string;
-  device_id: string;
-  session_id: string;
-  page_count: number;
-  imported_chunks: number;
-  store_root: string;
-  durability_blocked: boolean;
-}
-
-export interface SyncIdentityPlan {
-  pages: number;
-  blocks: number;
-}
-
-export interface ManagedSyncEnableResult {
-  migration: {
-    pages_changed: number;
-    blocks_changed: number;
-  };
-  status: ManagedSyncStatus;
-}
-
 export interface SparseV2WatcherStatus {
   latest_enqueue: number;
   acknowledged: number;

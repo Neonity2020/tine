@@ -177,6 +177,33 @@ describe("mobile graph folder picker", () => {
       "info"
     );
   });
+
+  it("keeps a partial-provider picked graph failure sticky and retries the same target", async () => {
+    const harness = await loadHarness(
+      null,
+      undefined,
+      true,
+      false,
+      "android",
+      { status: "picked", path: META.root }
+    );
+    harness.api.loadGraph.mockRejectedValue(
+      new Error(
+        "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
+      )
+    );
+
+    await expect(harness.switchGraph()).resolves.toEqual({ kind: "aborted" });
+    expect(harness.pushToast).toHaveBeenCalledWith(
+      "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.",
+      "error",
+      expect.objectContaining({ sticky: true, action: expect.objectContaining({ label: "Retry" }) })
+    );
+    const options = harness.pushToast.mock.calls.at(-1)![2]!;
+    options.action.run();
+    await vi.waitFor(() => expect(harness.api.loadGraph).toHaveBeenCalledTimes(2));
+    expect(harness.api.loadGraph).toHaveBeenLastCalledWith(META.root);
+  });
 });
 
 afterEach(() => {
