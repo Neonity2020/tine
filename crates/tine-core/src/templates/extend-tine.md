@@ -24,7 +24,7 @@ icon:: 🔌
   - Your own `logseq/custom.css` outranks every theme: themes recolor Tine through Logseq's `--ls-*` variables, and your CSS loads last. Uninstalling a theme package leaves it untouched, too.
 - ## Platform and distribution lines
   - Desktop and Android share the same plugin and theme lifecycle; a package that did not declare your platform shows as unavailable rather than failing later.
-  - The F-Droid build ships without the network community catalogue to comply with its runtime-code-download policy. The plugin host, your already-installed plugins and themes, local `manifest.json` + `.wasm` and theme packages, and the built-in gallery all keep working.
+  - The F-Droid build is planned, not distributed today; F-Droid builds omit the network community catalogue to comply with the store's runtime-code-download policy. The plugin host, your already-installed plugins and themes, local `manifest.json` + `.wasm` and theme packages, and the built-in gallery all keep working there.
   - Current public releases do not include an iOS app, and the iOS plugin host is not enabled. [[Reference/Platforms and mobile]] carries the full platform map.
 - ## Where next
   - [[Features/Plugins]] keeps the detailed reference, including the safety-report fields and the cascade order — and links the authoring, packaging, and registry guide used by plugin developers.

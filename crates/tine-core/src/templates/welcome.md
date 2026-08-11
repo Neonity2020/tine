@@ -1,7 +1,7 @@
 icon:: 👋
 
 - # Welcome to Tine 👋
-	- Tine is a fast, local outliner that reads and writes the **same Markdown files as Logseq** — the very folder you point it at. Edit here or in Logseq; it's one graph, no import, no export. We have a lot of respect for Logseq — Tine just tries to improve a few things.
+	- Tine is a fast, local outliner that reads and writes the **same Markdown/Org files as Logseq** — the very folder you point it at. Edit here or in Logseq; it's one graph, no import, no export. We have a lot of respect for Logseq — Tine just tries to improve a few things.
 	- **Everything you see here is a real Markdown file** in this graph's `pages/` folder. Open that folder in your file manager and look — nothing is locked away.
 - ## Try the basics right now
 	- Click any bullet to edit it. **Enter** makes a new bullet, **Tab** indents, **Shift+Tab** outdents. Drag a bullet's dot to move it (and everything under it).
@@ -17,10 +17,10 @@ icon:: 👋
 - ## Keep exploring
 	- [[Tine Guide]] — open the in-app how-to guide beside your own graph, with live examples you can copy into a sandbox.
 	- [[Start/Where things are]] — a map of the main places: the page, the sidebars, tabs, and Settings and Help.
-	- [[Features/Quick capture]] — drop a thought into your graph from **any** app with a global hotkey. (Set this one up — it's genuinely good.)
+	- [[Features/Quick capture]] — on desktop, drop a thought into your graph from **any** app with a global hotkey. (Set this one up — it's genuinely good.)
 	- [[Features/Tips & shortcuts]] — slash commands, the command palette, tabs, the sidebar, focus mode and dimming.
 	- [[Features/Sheets]] — grids, field tables, and task boards over plain bullets.
 	- [[Features/PDF annotation]] — highlight PDFs and turn them into linked notes.
 	- [[Features/Plugins]] — add small capability-limited extensions or token themes without giving code unrestricted access to Tine.
 	- [[Features/Managed sync]] — learn about the separate, opt-in **Testing only** mode for operation-backed sync that keeps your Markdown/Org graph in place.
-	- When you're ready, point Tine at your **own** Logseq graph: open Settings (**t s**) and pick a different folder. Your notes stay exactly where they are.
+	- When you're ready, point Tine at your **own** Logseq graph: open Settings (**t s**) and pick a different folder — [[Start/Bring an existing graph]] walks you through it. Your notes stay exactly where they are.

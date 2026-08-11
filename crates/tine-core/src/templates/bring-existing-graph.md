@@ -25,3 +25,5 @@ icon:: 📂
 	- 1. Confirm you opened the graph root: Settings (**t s**) → **Graph** shows the current graph path. In a standard Logseq graph, this is the folder containing `pages/`, `journals/`, and `logseq/config.edn`.
 	- 2. Skim [[Reference/Files, external edits, and backups]] now — know where snapshots, conflict copies, and the trash live before you need them.
 	- 3. What you should see: no conflict banner, your existing pages in their original locations, and edits from Tine landing in the same files Logseq reads.
+- ## Where next
+	- [[Start/Where things are]] maps the page, sidebars, tabs, and Settings and Help you will meet on the way; [[Workflows/Capture and plan your day]] starts the journal-first daily flow.

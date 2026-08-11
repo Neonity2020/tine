@@ -44,7 +44,7 @@ icon:: ▦
 	  owner:: [[Codex]]
 - ### Create one yourself — formula
 	- 1. Start with a table that has a numeric or enum field, for example `rating=number`.
-	- 2. Right-click a column header and choose **Add/Edit formula**, then build the value from the visual faces (or the `</> raw` box).
+	- 2. Right-click a column header and choose **Add formula…**, then build the value from the visual faces (or the `</> raw` box).
 	- 3. What you should see: a read-only computed column — like `effort` above, which multiplies each row's `rating` by 2 — whose values evaluate live and are not written onto the rows.
 	- 4. For the full walkthrough — the value picker, IF / THEN / ELSE, transforms, and when to reach for `</> raw` — see [[Features/Formulas]].
 - ## Task board

@@ -38,7 +38,7 @@ icon:: ✅
 - ## Carry-over: let unfinished tasks follow you
   - 1. Scroll to a past day in the feed and click **Carry unfinished tasks → today** under its title. Blocks with open markers move to today; DONE and CANCELED stay put.
   - 2. What you should see: a "Carried N items to today" toast — or "No unfinished tasks to carry" if none were open.
-  - 3. Variants: on today, **Carry from previous day** pulls yesterday in; **Carry last N days** goes further back (N is set in Settings, default 7). The same action is on a journal's right-click menu, and the command palette (Ctrl+K) has 7 / 30 / 365-day presets.
+  - 3. Variants: on today, **Carry from previous day** pulls yesterday in; **Carry last N days** goes further back (N is set in Settings, default 7). The same action is on a journal's right-click menu, and the command palette (Ctrl+Shift+P) has 7 / 30 / 365-day presets.
   - Settings → **Journals** also tunes it: hide the buttons (the right-click menu keeps working), move the whole block with its context or just the task line, add a “Carried over” heading.
 - ## Where everything lives
   - All of this remains plain text. Journal entries use the graph's configured journal directory; tasks on ordinary pages stay in their own Markdown or Org files. Within a task, the marker comes first, then `[#A]`, then the `SCHEDULED:`/`DEADLINE:` lines — readable by Logseq and by any editor. The companion reference page [[Reference/Journals, tasks, and scheduling]] maps the marker set, repeaters, time tracking, and the stored query behind the Agenda. If something looks wrong — a banner, a conflict copy, a duplicate day — [[Reference/Troubleshooting and recovery]] has the recovery steps.

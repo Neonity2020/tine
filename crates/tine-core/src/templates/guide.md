@@ -17,7 +17,7 @@ icon:: 🧭
   - [[Workflows/Extend Tine]] — install a plugin or theme, see exactly what authority it receives, and disable or remove it safely.
   - [[Features/Sheets]] — create grids, tables, boards, queries, and formulas over ordinary bullets.
   - [[Features/Formulas]] — build read-only computed columns with the visual formula editor.
-  - [[Features/Quick capture]] — set up a global capture box that files notes into your graph.
+  - [[Features/Quick capture]] — set up a global capture box (desktop) that files notes into your graph.
   - [[Features/PDF annotation]] — highlight PDFs and turn those highlights into linked note blocks.
 - ## Feature reference
   - [[Features/Plugins]] — install capability-limited extensions and token themes, review what they request, and keep them under your control.
