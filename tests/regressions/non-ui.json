@@ -2,6 +2,39 @@
   "schemaVersion": 1,
   "entries": [
     {
+      "id": "REG-DIRECT-COLD-CREATION-318",
+      "title": "Direct Files safely creates pages and journals after graph open or identity-cache invalidation without mistaking cold proof state for a collision",
+      "family": "direct-files-creation-authority",
+      "sources": {
+        "issues": [
+          318
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/model.rs::cold_graph_creation_repairs_identity_evidence_once",
+          "crates/tine-core/src/model.rs::generation_bound_identity_validation_avoids_save_time_graph_reparse",
+          "crates/tine-core/src/model.rs::default_journal_format_creates_journal",
+          "crates/tine-core/src/model.rs::direct_cold_creation_joins_a_paused_paced_warm",
+          "crates/tine-core/src/model.rs::concurrent_direct_creation_proofs_join_one_build_and_census_independently",
+          "crates/tine-core/src/model.rs::racing_save_page_creators_serialize_and_reuse_one_published_build",
+          "crates/tine-core/src/model.rs::late_page_build_claim_after_completed_install_is_non_owner",
+          "crates/tine-core/src/model.rs::generation_drift_before_direct_install_refuses_without_retry_or_census",
+          "crates/tine-core/src/model.rs::broad_invalidation_rebuilds_current_titles_once_before_creation",
+          "crates/tine-core/src/model.rs::cold_malformed_owner_refuses_without_census_or_mutation"
+        ],
+        "scenario": "direct-files.cold-generation-safe-page-and-journal-creation",
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before on 2f935398: ordinary missing-target page and journal creation returned AlreadyExists when Graph::open had not yet completed its asynchronous parsed-cache warm. The covered core matrix proves one generation-coherent shared identity build, join behavior with paced warm and racing creators, exact-generation refusal without retry, current identity publication after invalidation, malformed-owner refusal before census or mutation, and graph-parse-free subsequent warm creation. Existing semantic, portable-path, hard-link, symlink, external-race, unreadable-owner, and no-overwrite refusals remain covered. Managed storage is out of scope and unchanged."
+    },
+    {
       "id": "REG-PAGE-FILENAME-IDENTITY-249",
       "title": "Page titles map injectively to Windows-safe reversible filenames and survive save and reopen without changing existing graph files",
       "family": "filesystem-safety",
