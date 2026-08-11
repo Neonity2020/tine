@@ -323,7 +323,9 @@ export function createStartupRecoveryController(deps: StartupRecoveryDeps): {
 
   const returnToDirectFiles = async () => {
     const previous = snapshot();
-    if (previous.mode !== "recovery" || !previous.target) return;
+    const eligible = previous.mode === "recovery"
+      || (previous.mode === "working" && previous.operation === "graph_open");
+    if (!eligible || !previous.target || previous.nativeAttempt <= 0) return;
     const attempt = invalidate();
     const startedAt = now();
     begin(attempt, "cold_return", "direct.confirm", previous.target, startedAt, previous.nativeAttempt);

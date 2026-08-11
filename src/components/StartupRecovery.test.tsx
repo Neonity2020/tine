@@ -48,4 +48,39 @@ describe("startup recovery surface", () => {
     controller.dispose();
     dispose();
   });
+
+  it("keeps the Direct Files escape visible while managed open is still progressing", async () => {
+    vi.useFakeTimers();
+    const controller = createStartupRecoveryController({
+      lookupGraphPath: async () => "/graphs/alpha",
+      injectedGraphPath: () => "",
+      persistedGraphPath: () => "/graphs/alpha",
+      openGraph: () => new Promise(() => {}),
+      pickGraph: vi.fn(),
+      coldReturn: vi.fn(),
+      acceptColdReturn: vi.fn(),
+      confirmColdReturn: vi.fn(async () => false),
+      copyText: vi.fn(),
+      notify: vi.fn(),
+      completeFirstLoad: vi.fn(),
+    });
+    const host = document.createElement("div");
+    document.body.append(host);
+    const dispose = render(() => <StartupRecoveryLayer controller={controller} />, host);
+
+    controller.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    // The elapsed-time signal updates on the controller's 100 ms ticker.
+    await vi.advanceTimersByTimeAsync(300);
+
+    const direct = [...host.querySelectorAll("button")]
+      .find((button) => button.textContent?.includes("Return alpha to Direct Files"));
+    expect(direct).toBeDefined();
+    expect(direct?.disabled).toBe(false);
+    expect(host.textContent).not.toContain("Retry lookup");
+
+    controller.dispose();
+    dispose();
+  });
 });

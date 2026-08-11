@@ -211,6 +211,47 @@ describe("cold-start recovery controller", () => {
     controller.dispose();
   });
 
+  it("keeps cold Return callable while managed-open heartbeats repeatedly defer the inactivity watchdog", async () => {
+    vi.useFakeTimers();
+    const firstOpen = deferred<Awaited<ReturnType<StartupRecoveryDeps["openGraph"]>>>();
+    let openCount = 0;
+    const openGraph = vi.fn(() => {
+      openCount++;
+      return openCount === 1
+        ? firstOpen.promise
+        : Promise.resolve({ kind: "already_current" as const, root: "/graphs/alpha" });
+    });
+    const coldReturn = vi.fn(async () => fakeCancelResult());
+    const deps = dependencies({ openGraph, coldReturn, actionWatchdogMs: 500 });
+    const controller = createStartupRecoveryController(deps);
+    controller.start();
+    await settle();
+    expect(controller.snapshot()).toMatchObject({
+      mode: "working",
+      operation: "graph_open",
+      nativeAttempt: 1,
+    });
+
+    for (let heartbeat = 0; heartbeat < 4; heartbeat++) {
+      await vi.advanceTimersByTimeAsync(400);
+      controller.receiveProgress({
+        phase: "managed_open.waiting_recovering_promoted_runtime",
+        elapsed_ms: (heartbeat + 1) * 400,
+        terminal: false,
+      });
+    }
+    expect(controller.snapshot()).toMatchObject({ mode: "working", operation: "graph_open" });
+
+    await controller.returnToDirectFiles();
+    expect(coldReturn).toHaveBeenCalledWith("/graphs/alpha", 1);
+    expect(controller.snapshot().mode).toBe("idle");
+
+    firstOpen.resolve({ kind: "loaded", root: "/graphs/alpha" });
+    await settle();
+    expect(deps.completeFirstLoad).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
   it("uses the privacy-safe native phase vocabulary without accepting it as an outcome", async () => {
     vi.useFakeTimers();
     const lookup = deferred<string | null>();

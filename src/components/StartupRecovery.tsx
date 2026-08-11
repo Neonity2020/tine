@@ -22,6 +22,10 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
     || (current().mode === "working" && current().elapsedMs >= STARTUP_PROGRESS_VISIBLE_MS);
   const phase = () => current().nativePhase ?? current().phase;
   const targetName = () => current().target ? startupGraphName(current().target) : null;
+  const canReturnToDirectFiles = () => Boolean(current().target)
+    && current().nativeAttempt > 0
+    && (current().mode === "recovery"
+      || (current().mode === "working" && current().operation === "graph_open"));
 
   return (
     <Show when={visible()}>
@@ -57,21 +61,27 @@ export function StartupRecoveryLayer(props: { controller: StartupController }): 
               Tine has not discarded managed-storage data. You can retry, choose another graph,
               or close and relaunch Tine before attempting manual recovery.
             </p>
+          </Show>
+          <Show when={current().mode === "recovery" || canReturnToDirectFiles()}>
             <div class="startup-recovery-actions">
-              <button type="button" class="settings-btn primary" onClick={() => props.controller.retry()}>
-                Retry lookup
-              </button>
-              <button type="button" class="settings-btn" onClick={() => void props.controller.openAnother()}>
-                Open another graph…
-              </button>
-              <Show when={current().target}>
+              <Show when={current().mode === "recovery"}>
+                <button type="button" class="settings-btn primary" onClick={() => props.controller.retry()}>
+                  Retry lookup
+                </button>
+                <button type="button" class="settings-btn" onClick={() => void props.controller.openAnother()}>
+                  Open another graph…
+                </button>
+              </Show>
+              <Show when={canReturnToDirectFiles()}>
                 <button type="button" class="settings-btn danger" onClick={() => void props.controller.returnToDirectFiles()}>
                   Return {targetName()} to Direct Files…
                 </button>
               </Show>
-              <button type="button" class="settings-btn" onClick={() => void props.controller.copyDetails()}>
-                Copy details
-              </button>
+              <Show when={current().mode === "recovery"}>
+                <button type="button" class="settings-btn" onClick={() => void props.controller.copyDetails()}>
+                  Copy details
+                </button>
+              </Show>
             </div>
           </Show>
           <details class="startup-recovery-technical">
