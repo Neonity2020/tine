@@ -2808,6 +2808,26 @@
       "notes": "Remaining half of the 2026-08-07 authority defect. The read half is REG-MANAGED-WHOLE-GRAPH-READS-REFUSED-001 (25f36f16); settings and the asset trash are REG-MANAGED-SETTINGS-WRITES-REFUSED-001 and REG-MANAGED-ASSET-TRASH-REFUSED-001. Still refused under managed storage, needing real oplog transactions: rename_page, delete_page, merge_pages, rename_file_to_page, resolve_sync_conflict, trash_sync_conflict, trash_journal_file, copy_guide_into_graph. The enumeration this row asked for now exists: src-tauri/src/managed_command_surface.rs lists all 141 Tauri commands with the routing each one uses, re-derives that routing from the sources, and fails when the refused set changes -- so a new command that cannot work under managed storage is a failing diff rather than a user report. That enumeration surfaced a group nobody had listed: publish_html, open_pdf, read_highlights, write_highlights, write_pdf_view_state, save_pdf_area_image, save_asset and stream_asset_path are all asset/publish-domain work, outside the oplog's document domain, still sitting on the legacy write authority. They are the cheapest remaining slice. Tracked as M5 in specs/handoffs/2026-08-06-direct-files-program.md."
     },
     {
+      "id": "REG-MANAGED-JOURNAL-TORN-TAIL-308",
+      "title": "A managed local journal torn by a crash mid-append can be reopened",
+      "family": "managed-storage-durability",
+      "sources": {
+        "issues": [
+          308
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "reported",
+      "coverage": {
+        "tests": []
+      },
+      "notes": "KNOWN GAP, quarantined on Martin's call 2026-08-11 rather than held against the 0.6.92 release. tine-storage's v1 journal reader returned FrameRead::TornTail for a partially declared final frame in v0.1.0 and returns CorruptSegment by v0.3.0, per the 2026-08-10 journal-v2 spec requiring a partial frame to fail closed byte-for-byte instead of letting a damaged length field erase a durable commit. The reconciling migration (non-mutating v1 inspection, then rollover to v2) is unfinished, so a crash during an append leaves a managed segment the v1 opener refuses. Managed storage is off by default and testing-only, so no Direct Files user is exposed. Two tests carry the old contract and are #[ignore]d naming GH #308: hot_overlay_tests::torn_final_frame_recovers_and_replays_only_the_complete_prefix (the real gap) and fast_commit::tests::a_torn_final_append_is_recovered_without_losing_earlier_commits (the unwired latency prototype, no user impact). Closing condition is the v2 migration, not loosening the dependency."
+    },
+    {
       "id": "REG-UNDO-ACROSS-EVICTION-305",
       "title": "Undo cannot replay a snapshot recorded against a page instance that was evicted and re-opened",
       "family": "direct-files-data-safety",
