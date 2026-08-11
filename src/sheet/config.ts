@@ -25,6 +25,7 @@ export interface SheetConfig {
   groupBy: string | null;
   header: boolean;
   colWidths: ReadonlyMap<number, number>;
+  tableColumnWidths: ReadonlyMap<string, number>;
   colAggregates: ReadonlyMap<string, AggregateFn>;
   fields: readonly FieldSpec[];
   filter: string | null;
@@ -33,6 +34,10 @@ export interface SheetConfig {
 const VIEWS = new Set<SheetView>(["table", "grid", "board"]);
 const BUILTIN_FIELDS = new Set<FieldId>(["state", "priority", "scheduled", "deadline", "tags", "page"]);
 const PROP_FIELD_TYPES = new Set<FieldType>(["text", "number", "date", "datetime", "checkbox", "list", "ref"]);
+export const TABLE_COLUMN_MIN_WIDTH = 64;
+export const TABLE_COLUMN_MAX_WIDTH = 1600;
+const TABLE_COLUMN_WIDTH_LIMIT = 256;
+const TABLE_COLUMN_KEY_LIMIT = 512;
 
 function scalarSafe(value: string): boolean {
   return value.trim() !== "" && !/(\[\[|\(\(|\{\{|#|`|[=;\n\r])/.test(value);
@@ -44,6 +49,36 @@ function parseColWidths(value: string): ReadonlyMap<number, number> {
     const m = /^\s*(\d+)\s*=\s*(\d+)\s*$/.exec(part);
     if (!m) continue;
     out.set(Number(m[1]), Number(m[2]));
+  }
+  return out;
+}
+
+function validTableColumnKey(key: string): boolean {
+  return key.length > 0 && key.length <= TABLE_COLUMN_KEY_LIMIT && !/[\0-\x1f\x7f]/.test(key);
+}
+
+/** Table-only width grammar. Stable column identities are URI encoded so
+ * property/formula field IDs cannot collide with the `;` / `=` delimiters.
+ * Coordinate-grid widths deliberately remain on the positional tine.col-widths
+ * grammar above. */
+export function parseTableColumnWidths(value: string): ReadonlyMap<string, number> {
+  const out = new Map<string, number>();
+  for (const part of value.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq <= 0 || part.indexOf("=", eq + 1) >= 0) continue;
+    const encoded = part.slice(0, eq).trim();
+    const widthToken = part.slice(eq + 1).trim();
+    if (!/^\d+$/.test(widthToken)) continue;
+    const width = Number(widthToken);
+    if (!Number.isSafeInteger(width) || width < TABLE_COLUMN_MIN_WIDTH || width > TABLE_COLUMN_MAX_WIDTH) continue;
+    try {
+      const key = decodeURIComponent(encoded);
+      if (!validTableColumnKey(key)) continue;
+      out.set(key, width);
+      if (out.size >= TABLE_COLUMN_WIDTH_LIMIT) break;
+    } catch {
+      // A malformed percent escape is just one invalid entry, not a bad sheet.
+    }
   }
   return out;
 }
@@ -103,6 +138,19 @@ export function serializeColWidths(widths: ReadonlyMap<number, number>): string 
     .join(";");
 }
 
+export function serializeTableColumnWidths(widths: ReadonlyMap<string, number>): string {
+  return [...widths.entries()]
+    .filter(([key, width]) => validTableColumnKey(key) && Number.isFinite(width))
+    .map(([key, width]) => [encodeURIComponent(key), Math.min(
+      TABLE_COLUMN_MAX_WIDTH,
+      Math.max(TABLE_COLUMN_MIN_WIDTH, Math.round(width)),
+    )] as const)
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+    .slice(0, TABLE_COLUMN_WIDTH_LIMIT)
+    .map(([key, width]) => `${key}=${width}`)
+    .join(";");
+}
+
 export function serializeColAggregates(aggregates: ReadonlyMap<string, AggregateFn>): string {
   return [...aggregates.entries()]
     .filter(([key, fn]) => key.trim() && !/[=;\n\r]/.test(key) && isAggregateFn(fn))
@@ -150,6 +198,7 @@ export function sheetConfig(props: readonly [string, string][]): SheetConfig {
   let groupBy: string | null = null;
   let header = false;
   let colWidths: ReadonlyMap<number, number> = new Map();
+  let tableColumnWidths: ReadonlyMap<string, number> = new Map();
   let colAggregates: ReadonlyMap<string, AggregateFn> = new Map();
   let fields: readonly FieldSpec[] = [];
   let filter: string | null = null;
@@ -166,6 +215,8 @@ export function sheetConfig(props: readonly [string, string][]): SheetConfig {
       header = value.toLowerCase() === "true";
     } else if (key === "tine.col-widths") {
       colWidths = parseColWidths(value);
+    } else if (key === "tine.table-widths") {
+      tableColumnWidths = parseTableColumnWidths(value);
     } else if (key === "tine.col-aggregates") {
       colAggregates = parseColAggregates(value);
     } else if (key === "tine.fields") {
@@ -175,7 +226,7 @@ export function sheetConfig(props: readonly [string, string][]): SheetConfig {
     }
   }
 
-  return { view, groupBy, header, colWidths, colAggregates, fields, filter };
+  return { view, groupBy, header, colWidths, tableColumnWidths, colAggregates, fields, filter };
 }
 
 /** Sheet config straight from a block's raw text, through the ONE block-property

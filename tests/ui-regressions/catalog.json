@@ -5764,6 +5764,32 @@
       "notes": "Martin's report (no GH issue). A second journals pane is forbidden, so the split substituted the last kind:page route from the tab's back-history verbatim - including its block zoom field - and duplicateActiveSnapshot copied the pinned flag. The substitute is now the day page containing the selected feed block, with block cleared and pinned false (fallbacks: today's day page, then the first visible feed day). Non-journals mirror splits are unchanged. No E2E journey covers Esc -> pane-select -> split from journals."
     },
     {
+      "id": "UI-SHEET-TABLE-COLUMN-RESIZE-316",
+      "title": "Table column edges resize by stable field identity, persist on the real block or schema-page owner, and reset independently",
+      "family": "sheets",
+      "sources": {
+        "issues": [
+          316
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native",
+      "status": "reported",
+      "coverage": {
+        "tests": [
+          "src/sheet/config.test.ts",
+          "src/components/SheetTable.test.tsx",
+          "scripts/e2e-sheets.mjs"
+        ],
+        "scenario": "sheets.table-stable-column-resize",
+        "failBefore": "proven"
+      },
+      "notes": "The table-only tine.table-widths grammar URI-encodes stable title/FieldId keys, rejects malformed values, and bounds serialized pixels. Pointer-edge tests cover live preview, one guarded owner-property commit, cancel, independent reset, field reorder, remount, duplicate surfaces, and both block/page homes. The native sheet journey now expresses horizontal usability and durable reset without making exact pixels authoritative, but the local candidate run stopped before its first check because the initial .ls-block never appeared; keep this reported until that observation runs. Coordinate-grid tine.col-widths remains unchanged."
+    },
+    {
       "id": "UI-SHEET-TABLE-COLUMN-REORDER-217",
       "title": "Table columns can be dragged into a new order and the order survives a restart",
       "family": "sheets",
