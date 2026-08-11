@@ -2332,7 +2332,7 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src-tauri/src/watcher.rs::quiet_poll_cycles_keep_the_admission_index_warm",
@@ -2361,7 +2361,7 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::invalidated_graph_index_does_not_expand_an_existing_save",
@@ -2391,7 +2391,7 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::a_same_bytes_external_replace_does_not_strand_the_editor",
@@ -2417,7 +2417,7 @@
         "macos"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::a_symlink_blocks_saves_only_inside_a_descended_scope",
@@ -2442,7 +2442,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src-tauri/src/commands.rs::only_a_real_base_revision_conflict_raises_the_conflict_prompt"
@@ -2468,7 +2468,7 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::a_concurrent_change_during_capture_is_retried_not_surfaced"
@@ -2492,7 +2492,7 @@
         "all"
       ],
       "layer": "frontend",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/persistence.test.ts::does not retry failures a retry cannot change"
@@ -2841,7 +2841,7 @@
         "all"
       ],
       "layer": "frontend-store",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/store.test.ts::working-set eviction::refuses an undo entry recorded before the page was evicted (GH #305)"
@@ -2863,7 +2863,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::tests::nested_asset_reads_accept_relative_paths_but_not_traversal",
@@ -2933,7 +2933,7 @@
         "macos"
       ],
       "layer": "release-tooling",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "scripts/test-release-pipeline.mjs"
@@ -3003,7 +3003,7 @@
         "ios"
       ],
       "layer": "frontend",
-      "status": "reproduced",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/backgroundFlush.test.ts"
@@ -3097,7 +3097,7 @@
         "macos"
       ],
       "layer": "tine-core",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/tests/graph.rs"
@@ -3121,7 +3121,7 @@
         "macos"
       ],
       "layer": "tine-core",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs",
@@ -3147,7 +3147,7 @@
         "macos"
       ],
       "layer": "tine-core",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/reference_evidence.rs",
@@ -3353,14 +3353,16 @@
       "title": "Tine crashes at launch with a backtrace when the app-data home is not writable",
       "family": "availability",
       "sources": {
-        "issues": [],
+        "issues": [
+          303
+        ],
         "commits": []
       },
       "platforms": [
         "linux"
       ],
       "layer": "tauri-app",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src-tauri/src/data_home.rs"
@@ -3476,7 +3478,7 @@
         "android"
       ],
       "layer": "tine-core",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs",
@@ -3532,7 +3534,7 @@
         "android"
       ],
       "layer": "frontend",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/instanceReplacement.test.ts"

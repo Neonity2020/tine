@@ -3,14 +3,23 @@ icon:: 🧭
 - # Tine Guide
 	- Open this Guide beside your own graph when you want live examples without switching graphs.
 	- Each page is read-only here. Use **Copy the guide into your graph** on any Guide page when you want an editable, interlinked sandbox under `tine-guide/`.
-- ## Start here
+- ## Start
+  - [[Welcome to Tine]] — tour the basics hands-on: bullets, tasks, rich text, links, and live block references.
+  - [[Start/Bring an existing graph]] — point Tine at your existing Logseq graph and learn what it reads and writes.
+  - [[Project/Roadmap]] — try a few example tasks for your first steps.
+- ## Workflows
+  - [[Workflows/Structure repeated information]] — turn a small repeated outline into a table or board, then find and reuse its blocks before reaching for query syntax.
   - [[Features/Sheets]] — create grids, tables, boards, queries, and formulas over ordinary bullets.
   - [[Features/Formulas]] — build read-only computed columns with the visual formula editor.
   - [[Features/Quick capture]] — set up a global capture box that files notes into your graph.
   - [[Features/PDF annotation]] — highlight PDFs and turn those highlights into linked note blocks.
+- ## Feature reference
   - [[Features/Plugins]] — install capability-limited extensions and token themes, review what they request, and keep them under your control.
   - [[Features/Managed sync]] — understand the separate **Testing only** opt-in that can add operation-backed sync while keeping your Markdown/Org graph in place.
   - [[Features/Tips & shortcuts]] — learn Ctrl+K, slash commands, tabs, sidebars, focus mode, and daily shortcuts.
+  - [[Reference/Files, external edits, and backups]] — learn what Tine writes where, and where snapshots, conflict copies, and the trash live.
+  - [[Reference/Troubleshooting and recovery]] — follow numbered recovery steps for conflict banners, deleted pages, snapshots, sync copies, duplicate days, and bad starts.
+- ## Feature showcase
   - [[Feature showcase]] — inspect one live example of each supported Logseq rendering feature.
 - ## Create one yourself
   - 1. Open one of the Guide pages above and follow its numbered steps.

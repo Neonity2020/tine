@@ -5632,6 +5632,12 @@ impl Graph {
         self.graph_text_scope.version()
     }
 
+    /// Snapshot the graph-text discovery policy without granting any write
+    /// authority. Launch backups use the same eligibility rules as graph reads.
+    pub fn graph_text_scope(&self) -> GraphTextScope {
+        self.graph_text_scope.clone()
+    }
+
     /// Bind the precomputed effective graph-text policy to the exact retained
     /// graph-root capability without walking or hashing graph contents.
     pub fn graph_text_scope_binding(&self) -> io::Result<GraphTextScopeBinding> {

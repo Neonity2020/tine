@@ -1,0 +1,34 @@
+icon:: 🛟
+
+- # Troubleshooting and recovery
+	- Only recovery paths Tine actually ships, each as numbered actions with the outcome to expect. For where everything lives, see [[Reference/Files, external edits, and backups]].
+- ## “Page changed on disk” banner
+	- Meaning: the file changed elsewhere (a sync tool or another editor) while you had unsaved edits. Nothing was written over — your unsaved text is still on screen.
+	- 1. If the disk version is the one you want, choose **Use disk version** — Tine re-reads the file. Copy your unsaved text somewhere first if you still need parts of it.
+	- 2. If your version is right, choose **Keep mine (overwrite)** — Tine writes yours over the file.
+	- 3. What you should see: the banner clears and the page saves normally again. Until you choose, that page is skipped by saving rather than silently clobbered.
+- ## Restore a deleted page or journal
+	- 1. Open `logseq/.tine-trash/pages/` or `logseq/.tine-trash/journals/` inside your graph. Deleted files have a timestamp followed by `__` before their original name.
+	- 2. Remove the timestamp and `__`, then move the file into the configured pages or journals folder. For a page that originally lived elsewhere, you may return it to that location instead.
+	- 3. What you should see: Tine notices the restored file like any external change, and the page reappears.
+- ## Restore an earlier state of the graph
+	- 1. Open Settings (**t s**) → **Backups & recovery** and find the snapshot from before the damage. (Tine snapshots your Markdown/Org files on every launch; **Snapshots to keep** controls how many survive.)
+	- 2. Choose **Restore** beside it and confirm.
+	- 3. What you should see: your current state is snapshotted first, backed-up graph text returns to its original paths, config and sidecars are restored, and the graph reloads — so even a mistaken restore can be undone by restoring the snapshot it just made.
+- ## Merge a sync-conflict copy
+	- 1. Open Settings → **Backups & recovery** → **Sync conflict copies** and choose **Review & merge** on the copy.
+	- 2. In the block-by-block diff, pick keep-current, keep-copy, or keep-both per block (page properties merge too).
+	- 3. What you should see: your choices are saved to the current page through the normal save path, and the conflict copy moves to the trash. If the shadowed page no longer exists, discard the copy or restore it in Logseq.
+- ## Reconcile a duplicate journal day
+	- 1. Open Settings → **Backups & recovery** → **Duplicate journal days** — usually left over from a journal date-format change or a sync.
+	- 2. Choose **Open** to view a file (it saves back to itself), **Merge** to fold it into the canonical day, **Rename** to turn it into a normal page, or **Trash** (recoverable).
+	- 3. What you should see: the stray file handled, with the day otherwise intact — Tine kept both files rather than dropping one.
+- ## Tine will not start
+	- 1. Run it with debug logging: `TINE_DEBUG=1 tine` (or `tine --debug`; the AppImage the same way), reproduce the problem, then quit.
+	- 2. Tine prints the log path on startup. By default it is `tine-debug.log` in your platform's temporary folder; `TINE_DEBUG_LOG=/path` overrides it.
+	- 3. What you should see: a timestamped trace covering the environment, startup milestones, and any panic with a backtrace. It records no note content — send that file with your report.
+	- 4. On Linux, if the window never appears at all, run `TINE_GPU=0 tine` once: a rare GPU/WebKitGTK rendering failure then falls back to software rendering.
+- ## Something parses or renders wrong
+	- 1. Open Settings → **Help improve Tine**: Tine runs its own parser and Logseq's parser over your graph, locally, and lists every place they disagree plus a parse-speed comparison.
+	- 2. Copy the report shown there — every snippet is anonymized (page names and words are scrubbed, markup shape kept) and re-verified to still reproduce the divergence before it is shown. Nothing is uploaded.
+	- 3. What you should see: a local report, including the Tine version, that you can paste into an issue.

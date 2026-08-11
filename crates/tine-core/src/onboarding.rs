@@ -84,6 +84,22 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Project/Roadmap",
         markdown: include_str!("templates/roadmap.md"),
     },
+    GuideTemplate {
+        title: "Workflows/Structure repeated information",
+        markdown: include_str!("templates/structure-repeated-information.md"),
+    },
+    GuideTemplate {
+        title: "Reference/Files, external edits, and backups",
+        markdown: include_str!("templates/files-external-edits-backups.md"),
+    },
+    GuideTemplate {
+        title: "Start/Bring an existing graph",
+        markdown: include_str!("templates/bring-existing-graph.md"),
+    },
+    GuideTemplate {
+        title: "Reference/Troubleshooting and recovery",
+        markdown: include_str!("templates/troubleshooting-recovery.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -349,6 +365,7 @@ pub fn create_demo_graph(root: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::config::{Config, FileNameFormat};
+    use std::collections::HashSet;
 
     /// The bullet on Project/Roadmap that Welcome both references and embeds.
     const TARGET_ID: &str = "7a1c0f5e-0000-4000-8000-000000000001";
@@ -380,6 +397,9 @@ mod tests {
         assert!(dir.join("pages/Tine Guide.md").is_file());
         assert!(dir.join("pages/Feature showcase.md").is_file());
         assert!(dir.join("pages/Project___Roadmap.md").is_file());
+        assert!(dir
+            .join("pages/Workflows___Structure repeated information.md")
+            .is_file());
 
         // Every page loads by its (namespace-decoded) title, and every page parses.
         let graph = Graph::open(&dir);
@@ -463,53 +483,292 @@ mod tests {
         assert!(plugins.markdown.contains("not Logseq or Obsidian plugins"));
     }
 
-    /// Bare `[[…]]` link targets in a markdown body (labelled links, embeds, and
-    /// queries all wrap a `[[…]]`, so one scan covers them). Non-nested; a nested
-    /// `[[a [[b]] c]]` yields harmless fragments that never match a demo title.
-    fn extract_page_links(markdown: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut rest = markdown;
-        while let Some(i) = rest.find("[[") {
-            let after = &rest[i + 2..];
-            let Some(j) = after.find("]]") else { break };
-            out.push(after[..j].trim().to_string());
-            rest = &after[j + 2..];
+    #[test]
+    fn structure_workflow_is_registered_linked_copyable_and_executable() {
+        let title = "Workflows/Structure repeated information";
+        let workflow = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("structure workflow is registered");
+        assert!(workflow
+            .markdown
+            .contains("- # Structure repeated information"));
+        assert!(workflow
+            .markdown
+            .contains("tine.fields:: status=enum:planned,active,done;owner=text;estimate=number"));
+        assert!(workflow
+            .markdown
+            .contains("{{query (property owner Avery)}}"));
+        assert!(workflow
+            .markdown
+            .contains("What you should see: a reusable selection of matching tracker blocks"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Workflows/Structure repeated information]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("structure workflow is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Workflows/Structure repeated information"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-structure-workflow-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Workflows/Structure repeated information"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("structure workflow was copied");
+        assert!(copied_markdown.contains("{{query (property owner Avery)}}"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Sheets]]"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Formulas]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DeliberateGuideStub {
+        title: String,
+    }
+
+    fn deliberate_guide_stub_keys() -> HashSet<String> {
+        serde_json::from_str::<Vec<DeliberateGuideStub>>(include_str!(
+            "../../../docs/guide-deliberate-stubs.json"
+        ))
+        .expect("guide deliberate-stub allowlist is valid JSON")
+        .into_iter()
+        .map(|stub| crate::refs::page_key(&stub.title))
+        .collect()
+    }
+
+    fn guide_reference_targets(markdown: &str) -> Vec<String> {
+        fn collect(blocks: &[crate::doc::DocBlock], targets: &mut Vec<String>) {
+            for block in blocks {
+                // `DocBlock::projection` is the canonical lsdoc-backed reference
+                // extraction used by the graph's index and backlink paths.
+                let projection = block.projection();
+                targets.extend(
+                    projection
+                        .refs_page
+                        .iter()
+                        .filter(|target| !projection.block_refs.contains(target))
+                        .cloned(),
+                );
+                collect(&block.children, targets);
+            }
         }
-        out
+
+        let document = crate::doc::parse(markdown);
+        let mut targets = Vec::new();
+        collect(&document.roots, &mut targets);
+        targets
+    }
+
+    fn guide_template_link_errors(templates: &[GuideTemplate]) -> Vec<String> {
+        let registered: HashSet<String> = templates
+            .iter()
+            .map(|template| crate::refs::page_key(template.title))
+            .collect();
+        let deliberate_stubs = deliberate_guide_stub_keys();
+        let mut errors = Vec::new();
+        for template in templates {
+            for target in guide_reference_targets(template.markdown) {
+                let key = crate::refs::page_key(&target);
+                if !registered.contains(&key) && !deliberate_stubs.contains(&key) {
+                    errors.push(format!(
+                        "{}: unregistered Guide target {target}",
+                        template.title
+                    ));
+                }
+            }
+        }
+        errors
     }
 
     #[test]
     fn guide_link_set_is_closed_over_demo_pages() {
-        // Every guide page that another guide page links to must itself be a
-        // bundled guide page — otherwise the link dangles in the in-app guide AND
-        // in the copied-into-graph copy (the bug that shipped when Welcome/Roadmap
-        // were in the onboarding list but not GUIDE_TEMPLATES). We flag ONLY targets that are
-        // real demo pages (in the manifest); links to stub pages like [[Martin]] are a
-        // deliberate Logseq affordance (click-to-create) and stay out of the guide.
-        use std::collections::HashSet;
-        let guide: HashSet<String> = GUIDE_TEMPLATES
+        let errors = guide_template_link_errors(GUIDE_TEMPLATES);
+        assert!(
+            errors.is_empty(),
+            "Guide links must target a registered page or deliberate stub:\n{}",
+            errors.join("\n")
+        );
+    }
+
+    #[test]
+    fn files_reference_page_is_registered_linked_and_copyable() {
+        let title = "Reference/Files, external edits, and backups";
+        let page = GUIDE_TEMPLATES
             .iter()
-            .map(|t| crate::refs::page_key(t.title))
-            .collect();
-        let demo: HashSet<String> = GUIDE_TEMPLATES
+            .find(|template| template.title == title)
+            .expect("files reference page is registered");
+        assert!(page
+            .markdown
+            .contains("- # Files, external edits, and backups"));
+        assert!(page.markdown.contains("logseq/.tine-trash"));
+        assert!(page.markdown.contains("Watch for external edits"));
+        assert!(page.markdown.contains("Snapshots to keep"));
+        assert!(page.markdown.contains("What you should see"));
+
+        let index = GUIDE_TEMPLATES
             .iter()
-            .map(|t| crate::refs::page_key(t.title))
-            .collect();
-        for t in GUIDE_TEMPLATES {
-            for target in extract_page_links(t.markdown) {
-                let key = crate::refs::page_key(&target);
-                if demo.contains(&key) {
-                    assert!(
-                        guide.contains(&key),
-                        "guide page {:?} links to demo page {:?}, which is not in \
-                         GUIDE_TEMPLATES — the link dangles in the in-app guide and \
-                         in copy-into-graph. Add it to GUIDE_TEMPLATES.",
-                        t.title,
-                        target
-                    );
-                }
-            }
-        }
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Reference/Files, external edits, and backups]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("files reference is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Reference/Files, external edits, and backups"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-files-reference-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Reference/Files, external edits, and backups"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("files reference was copied");
+        assert!(copied_markdown.contains("logseq/.tine-trash"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
+        assert!(copied_markdown.contains("[[tine-guide/Features/Sheets]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bring_existing_graph_page_is_registered_linked_and_copyable() {
+        let title = "Start/Bring an existing graph";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("bring-an-existing-graph page is registered");
+        assert!(page.markdown.contains("- # Bring an existing graph"));
+        assert!(page.markdown.contains("Open an existing graph"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page
+            .markdown
+            .contains("[[Reference/Files, external edits, and backups]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index.markdown.contains("[[Start/Bring an existing graph]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("bring-an-existing-graph is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Start/Bring an existing graph"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-bring-existing-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Start/Bring an existing graph"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("bring-an-existing-graph was copied");
+        assert!(copied_markdown.contains("Open an existing graph"));
+        assert!(
+            copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
+        );
+        assert!(copied_markdown.contains("[[tine-guide/Features/Managed sync]]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn troubleshooting_page_is_registered_linked_and_copyable() {
+        let title = "Reference/Troubleshooting and recovery";
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == title)
+            .expect("troubleshooting page is registered");
+        assert!(page.markdown.contains("- # Troubleshooting and recovery"));
+        assert!(page.markdown.contains("TINE_DEBUG=1"));
+        assert!(page.markdown.contains("Help improve Tine"));
+        assert!(page.markdown.contains("Use disk version"));
+        assert!(page.markdown.contains("What you should see"));
+        assert!(page
+            .markdown
+            .contains("[[Reference/Files, external edits, and backups]]"));
+
+        let index = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Tine Guide")
+            .expect("guide index is registered");
+        assert!(index
+            .markdown
+            .contains("[[Reference/Troubleshooting and recovery]]"));
+
+        let virtual_page = bundled_guide_pages()
+            .unwrap()
+            .into_iter()
+            .find(|page| page.title == title)
+            .expect("troubleshooting page is available in the read-only Guide");
+        assert_eq!(
+            virtual_page.page.name,
+            "Tine-guide/Reference/Troubleshooting and recovery"
+        );
+        assert!(virtual_page.page.read_only);
+
+        let dir = scratch("tine-guide-troubleshooting-copy");
+        let graph = Graph::open(&dir);
+        let copied = copy_guide_into_graph(&graph, title).unwrap();
+        assert!(copied
+            .created_pages
+            .iter()
+            .any(|name| name == "tine-guide/Reference/Troubleshooting and recovery"));
+        let copied_markdown = std::fs::read_to_string(graph.path_for(&copied.name, PageKind::Page))
+            .expect("troubleshooting page was copied");
+        assert!(copied_markdown.contains("TINE_DEBUG=1"));
+        assert!(
+            copied_markdown.contains("[[tine-guide/Reference/Files, external edits, and backups]]")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guide_link_validator_rejects_accidental_targets_and_ignores_inline_code() {
+        let templates = [GuideTemplate {
+            title: "Test source",
+            markdown: "- [[Martin]] #demo [[Accidental target]] `[[literal brackets]]` ((00000000-0000-4000-8000-00000000feed))",
+        }];
+
+        assert_eq!(
+            guide_template_link_errors(&templates),
+            vec!["Test source: unregistered Guide target Accidental target"]
+        );
     }
 
     #[test]

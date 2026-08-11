@@ -2660,7 +2660,7 @@ function BackupsTab(props: { search: string }): JSX.Element {
     if (
       !(await backend().confirm(
         `Restore the snapshot from ${when}?\n\n` +
-          `This overwrites journals/ and pages/ with the ${b.files} file(s) in that backup. ` +
+          `This restores the ${b.files} file(s) in that backup to their original locations. ` +
           `Your current state is snapshotted first, so this is reversible.`
       ))
     )

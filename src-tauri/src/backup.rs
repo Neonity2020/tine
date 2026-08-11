@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::Manager;
-use tine_core::model::Graph;
+use tine_core::{model::Graph, GraphTextScope, GRAPH_TEXT_SCOPE_VERSION};
 
-// Snapshot the graph's markdown into the OS app-data dir on open, keeping the
+// Snapshot the graph's Markdown/Org into the OS app-data dir on open, keeping the
 // last few. Local-only (outside the graph, so Syncthing never sees it); a safety
 // net against a bad write or accidental edit. Best-effort and fully detached so
 // it never blocks startup or holds the graph lock during file copies.
@@ -69,30 +69,35 @@ pub(crate) fn backup_graph_now(
 /// proceed without a full rollback snapshot.
 #[derive(Clone)]
 struct BackupSource {
-    journals: PathBuf,
-    pages: PathBuf,
     assets: PathBuf,
     cfg: PathBuf,
     root: PathBuf,
     journals_dir: String,
     pages_dir: String,
+    graph_text_scope: GraphTextScope,
+    graph_text_policy: SnapshotGraphTextPolicy,
 }
 
 impl BackupSource {
     fn from_graph(g: &Graph) -> Self {
         Self {
-            journals: g.journals_path(),
-            pages: g.pages_path(),
             assets: g.assets_path(),
             cfg: g.root.join("logseq").join("config.edn"),
             root: g.root.clone(),
             journals_dir: g.config.journals_dir.clone(),
             pages_dir: g.config.pages_dir.clone(),
+            graph_text_scope: g.graph_text_scope(),
+            graph_text_policy: SnapshotGraphTextPolicy {
+                version: GRAPH_TEXT_SCOPE_VERSION,
+                hidden: g.config.hidden.clone(),
+                hidden_parse_failed_closed: g.config.hidden_parse_failed_closed,
+            },
         }
     }
 }
 
-const SNAPSHOT_SCHEMA: u32 = 2;
+const LEGACY_SNAPSHOT_SCHEMA: u32 = 2;
+const SNAPSHOT_SCHEMA: u32 = 3;
 const SNAPSHOT_MANIFEST: &str = "snapshot.json";
 
 #[cfg(test)]
@@ -112,8 +117,32 @@ struct SnapshotManifest {
     root: String,
     journals_dir: String,
     pages_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graph_text_policy: Option<SnapshotGraphTextPolicy>,
     files: Vec<SnapshotFile>,
     complete: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SnapshotGraphTextPolicy {
+    version: u32,
+    hidden: Vec<String>,
+    hidden_parse_failed_closed: bool,
+}
+
+impl SnapshotGraphTextPolicy {
+    fn scope(&self) -> Result<GraphTextScope, String> {
+        if self.version != GRAPH_TEXT_SCOPE_VERSION {
+            return Err(format!(
+                "backup uses unsupported graph-text policy version {}",
+                self.version
+            ));
+        }
+        Ok(GraphTextScope::new(
+            &self.hidden,
+            self.hidden_parse_failed_closed,
+        ))
+    }
 }
 
 fn root_backup_id(root: &std::path::Path) -> String {
@@ -155,7 +184,13 @@ fn write_manifest(dir: &std::path::Path, manifest: &SnapshotManifest) -> std::io
 fn read_manifest(dir: &std::path::Path) -> Option<SnapshotManifest> {
     let bytes = std::fs::read(dir.join(SNAPSHOT_MANIFEST)).ok()?;
     let manifest: SnapshotManifest = serde_json::from_slice(&bytes).ok()?;
-    (manifest.schema == SNAPSHOT_SCHEMA && manifest.complete).then_some(manifest)
+    let supported = manifest.schema == LEGACY_SNAPSHOT_SCHEMA
+        || (manifest.schema == SNAPSHOT_SCHEMA
+            && manifest
+                .graph_text_policy
+                .as_ref()
+                .is_some_and(|policy| policy.version == GRAPH_TEXT_SCOPE_VERSION));
+    (supported && manifest.complete).then_some(manifest)
 }
 
 fn hash_snapshot_file(path: &std::path::Path) -> std::io::Result<String> {
@@ -298,20 +333,19 @@ fn do_backup_source_cancellable(
         path: dest.clone(),
         committed: false,
     };
-    let live_text_n = count_md_recursive_cancellable(&source.journals, cancelled)
-        + count_md_recursive_cancellable(&source.pages, cancelled);
-    if cancelled() {
-        return (0, false);
-    }
-    let (cj, fj) = copy_md_dir_cancellable(&source.journals, &dest.join("journals"), cancelled);
-    let (cp, fp) = copy_md_dir_cancellable(&source.pages, &dest.join("pages"), cancelled);
+    let (ct, ft) = copy_graph_text_tree_cancellable(
+        &source.root,
+        &dest.join("graph"),
+        &source.graph_text_scope,
+        cancelled,
+    );
     let (ca, fa) = copy_asset_sidecars_dir_cancellable(
         &source.assets,
         &dest.join(dir_name(&source.assets)),
         cancelled,
     );
-    let mut n = cj + cp + ca;
-    let mut failed = fj + fp + fa;
+    let mut n = ct + ca;
+    let mut failed = ft + fa;
     if !cancelled() && source.cfg.exists() {
         let out = dest.join("logseq");
         if std::fs::create_dir_all(&out).is_ok()
@@ -322,7 +356,7 @@ fn do_backup_source_cancellable(
             failed += 1;
         }
     }
-    let complete = !cancelled() && failed == 0 && cj + cp == live_text_n;
+    let complete = !cancelled() && failed == 0;
     if n == 0 {
         return (0, complete);
     }
@@ -341,6 +375,7 @@ fn do_backup_source_cancellable(
                 .to_string(),
             journals_dir: source.journals_dir,
             pages_dir: source.pages_dir,
+            graph_text_policy: Some(source.graph_text_policy),
             files,
             complete: true,
         };
@@ -449,52 +484,10 @@ fn list_backups_from_base(base: &std::path::Path, root: &std::path::Path) -> Vec
     out
 }
 
-fn count_md_recursive(dir: &std::path::Path) -> usize {
-    count_md_recursive_cancellable(dir, &|| false)
-}
-
-fn count_md_recursive_cancellable(dir: &std::path::Path, cancelled: &dyn Fn() -> bool) -> usize {
-    let mut n = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        if cancelled() {
-            return n;
-        }
-        if let Ok(rd) = std::fs::read_dir(&d) {
-            for e in rd.flatten() {
-                if cancelled() {
-                    return n;
-                }
-                let p = e.path();
-                if is_graph_text(&p) {
-                    n += 1;
-                } else if is_visible_real_dir(&e).unwrap_or(false) {
-                    stack.push(p);
-                }
-            }
-        }
-    }
-    n
-}
-
-fn count_asset_sidecars_recursive(dir: &std::path::Path) -> usize {
-    let mut n = 0;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                n += count_asset_sidecars_recursive(&p);
-            } else if is_asset_sidecar(&p) {
-                n += 1;
-            }
-        }
-    }
-    n
-}
-
-/// Restore a snapshot into the live graph, overwriting `journals/`, `pages/`,
-/// asset `.edn` sidecars, and `config.edn`. Takes a fresh safety snapshot of the
-/// *current* state first (so a mistaken restore is itself reversible).
+/// Restore a snapshot into the live graph. Schema 3 restores graph text at its
+/// exact graph-relative path; schema 2 retains the original configured-root
+/// behavior. Asset `.edn` sidecars and `config.edn` are restored by both.
+/// Takes a fresh safety snapshot of the *current* state first.
 /// Destructive — the frontend confirms.
 #[tauri::command]
 pub(crate) async fn restore_backup(
@@ -532,8 +525,6 @@ fn restore_from_backup_source(
     managed_graph: Option<&Graph>,
     snapshot_current: impl FnOnce(&BackupSource) -> (usize, bool),
 ) -> Result<(), String> {
-    let journals = source.journals.clone();
-    let pages = source.pages.clone();
     let assets = source.assets.clone();
     let cfg_dest = source.cfg.clone();
     let src = base.join(&stamp);
@@ -561,16 +552,22 @@ fn restore_from_backup_source(
         }
         Ok(current_root.join(rel))
     };
-    let restore_journals = safe_dir(&manifest.journals_dir)?;
-    let restore_pages = safe_dir(&manifest.pages_dir)?;
+    let legacy_restore_roots = (manifest.schema == LEGACY_SNAPSHOT_SCHEMA)
+        .then(|| {
+            Ok::<_, String>((
+                safe_dir(&manifest.journals_dir)?,
+                safe_dir(&manifest.pages_dir)?,
+            ))
+        })
+        .transpose()?;
     let validate_live_layout = || -> Result<(), String> {
-        for (label, path) in [
-            ("journals", &restore_journals),
-            ("pages", &restore_pages),
-            ("config", &cfg_dest),
-        ] {
-            ensure_target_within_root(&current_root, path)
-                .map_err(|e| format!("unsafe live {label} path: {e}"))?;
+        ensure_target_within_root(&current_root, &cfg_dest)
+            .map_err(|e| format!("unsafe live config path: {e}"))?;
+        if let Some((journals, pages)) = &legacy_restore_roots {
+            for (label, path) in [("journals", journals), ("pages", pages)] {
+                ensure_target_within_root(&current_root, path)
+                    .map_err(|e| format!("unsafe live {label} path: {e}"))?;
+            }
         }
         // Assets have a separate, explicitly-approved capability and therefore
         // validate against their own canonical root. For ordinary graphs this is
@@ -602,13 +599,10 @@ fn restore_from_backup_source(
     // name so it can't collide with (or be pruned by) the launch snapshot the
     // post-restore reload will take. Abort if the snapshot fails while the live
     // graph has content — never run a destructive restore without a way back.
-    let (snapshot_n, complete) = snapshot_current(&source);
-    let live_n = count_md_recursive(&journals)
-        + count_md_recursive(&pages)
-        + count_asset_sidecars_recursive(&assets);
-    // A destructive restore must be fully reversible: abort unless the pre-restore
-    // snapshot captured everything (every file copied, nothing skipped).
-    if live_n > 0 && (snapshot_n == 0 || !complete) {
+    let (_, complete) = snapshot_current(&source);
+    // A destructive restore must be fully reversible. A successful empty
+    // snapshot is valid; any failed copy or traversal aborts the restore.
+    if !complete {
         return Err(
             "couldn't create a complete pre-restore safety snapshot — restore aborted".into(),
         );
@@ -616,29 +610,62 @@ fn restore_from_backup_source(
     // The safety snapshot can take time. Revalidate after it so a symlink swap
     // cannot redirect the destructive copy/delete phase outside the graph.
     validate_live_layout()?;
+    let snapshot_scope = match manifest.schema {
+        LEGACY_SNAPSHOT_SCHEMA => source.graph_text_scope.clone(),
+        SNAPSHOT_SCHEMA => manifest
+            .graph_text_policy
+            .as_ref()
+            .ok_or("backup does not record its graph-text policy")?
+            .scope()?,
+        _ => return Err("backup uses an unsupported snapshot schema".into()),
+    };
     if let Some(graph) = managed_graph.filter(|graph| graph.managed_sync_status().is_some()) {
-        let restore_files =
-            collect_restore_graph_text(&src, &manifest.journals_dir, &manifest.pages_dir)?;
+        let restore_files = match manifest.schema {
+            LEGACY_SNAPSHOT_SCHEMA => collect_legacy_restore_graph_text(
+                &src,
+                &manifest.journals_dir,
+                &manifest.pages_dir,
+            )?,
+            SNAPSHOT_SCHEMA => {
+                collect_scoped_restore_graph_text(&src.join("graph"), &snapshot_scope)?
+            }
+            _ => return Err("backup uses an unsupported snapshot schema".into()),
+        };
         graph
             .commit_managed_restore(&restore_files)
             .map_err(|error| format!("managed-sync restore preflight failed: {error}"))?;
     }
-    // Restore each dir; copies happen before extras are moved to the dedicated
-    // recovery area, so a failure leaves either the original or a recoverable copy.
-    restore_md_dir(
-        &src.join("journals"),
-        &restore_journals,
-        &graph_recovery,
-        std::path::Path::new("journals"),
-    )
-    .map_err(|e| format!("restore journals failed: {e}"))?;
-    restore_md_dir(
-        &src.join("pages"),
-        &restore_pages,
-        &graph_recovery,
-        std::path::Path::new("pages"),
-    )
-    .map_err(|e| format!("restore pages failed: {e}"))?;
+    // Copies happen before extras are moved to recovery, so failure leaves
+    // either the original or a recoverable copy.
+    match manifest.schema {
+        LEGACY_SNAPSHOT_SCHEMA => {
+            let (restore_journals, restore_pages) = legacy_restore_roots
+                .as_ref()
+                .expect("legacy restore roots were validated");
+            restore_md_dir(
+                &src.join("journals"),
+                restore_journals,
+                &graph_recovery,
+                std::path::Path::new("journals"),
+            )
+            .map_err(|e| format!("restore journals failed: {e}"))?;
+            restore_md_dir(
+                &src.join("pages"),
+                restore_pages,
+                &graph_recovery,
+                std::path::Path::new("pages"),
+            )
+            .map_err(|e| format!("restore pages failed: {e}"))?;
+        }
+        SNAPSHOT_SCHEMA => restore_graph_text_tree(
+            &src.join("graph"),
+            &current_root,
+            &snapshot_scope,
+            &graph_recovery,
+        )
+        .map_err(|e| format!("restore graph text failed: {e}"))?,
+        _ => return Err("backup uses an unsupported snapshot schema".into()),
+    }
     restore_asset_sidecars_dir(
         &src.join(dir_name(&assets)),
         &assets,
@@ -671,7 +698,7 @@ fn restore_from_backup_source(
     Ok(())
 }
 
-fn collect_restore_graph_text(
+fn collect_legacy_restore_graph_text(
     snapshot: &Path,
     journals_dir: &str,
     pages_dir: &str,
@@ -725,6 +752,41 @@ fn collect_restore_graph_text(
         Path::new(""),
         &mut files,
     )?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+fn collect_scoped_restore_graph_text(
+    source: &Path,
+    scope: &GraphTextScope,
+) -> Result<Vec<(String, String)>, String> {
+    let mut files = Vec::new();
+    if !source.is_dir() {
+        return Ok(files);
+    }
+    let mut stack = vec![(source.to_path_buf(), PathBuf::new())];
+    while let Some((directory, relative)) = stack.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read verified backup directory: {error}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read verified backup: {error}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect verified backup: {error}"))?;
+            let child = relative.join(entry.file_name());
+            let child_text = graph_relative_text(&child)
+                .ok_or_else(|| "backup contains an unsafe graph path".to_string())?;
+            if file_type.is_file() && scope.is_eligible(&child_text) {
+                let content = std::fs::read_to_string(entry.path())
+                    .map_err(|error| format!("cannot read verified backup page: {error}"))?;
+                files.push((child_text, content));
+            } else if file_type.is_dir() && scope.should_descend(&child_text) {
+                stack.push((entry.path(), child));
+            } else if file_type.is_symlink() {
+                return Err("backup contains a symbolic link".into());
+            }
+        }
+    }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(files)
 }
@@ -1111,6 +1173,91 @@ fn restore_md_dir(
     Ok(())
 }
 
+fn restore_graph_text_tree(
+    source: &Path,
+    graph_root: &Path,
+    scope: &GraphTextScope,
+    recovery: &RestoreRecovery,
+) -> std::io::Result<()> {
+    if !source.is_dir() {
+        return Ok(());
+    }
+    ensure_target_within_root(&recovery.root_path, graph_root)?;
+    let mut restored = std::collections::HashSet::new();
+    restore_scoped_graph_text_copy(
+        source,
+        graph_root,
+        Path::new(""),
+        scope,
+        &mut restored,
+        recovery,
+    )?;
+    retire_unrestored_graph_text(graph_root, Path::new(""), scope, &restored, recovery)
+}
+
+fn restore_scoped_graph_text_copy(
+    source: &Path,
+    graph_root: &Path,
+    relative: &Path,
+    scope: &GraphTextScope,
+    restored: &mut std::collections::HashSet<PathBuf>,
+    recovery: &RestoreRecovery,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(source.join(relative))? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let child = relative.join(entry.file_name());
+        let child_text = graph_relative_text(&child).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 graph path")
+        })?;
+        if file_type.is_file() && scope.is_eligible(&child_text) {
+            let target = graph_root.join(&child);
+            ensure_target_within_root(&recovery.root_path, &target)?;
+            if target.exists() {
+                move_live_to_recovery(recovery, &target, &Path::new("graph").join(&child))?;
+            }
+            atomic_copy_new_into_live(recovery, &entry.path(), &target)?;
+            restored.insert(child);
+        } else if file_type.is_dir() && scope.should_descend(&child_text) {
+            ensure_target_within_root(&recovery.root_path, &graph_root.join(&child))?;
+            restore_scoped_graph_text_copy(source, graph_root, &child, scope, restored, recovery)?;
+        } else if file_type.is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "snapshot graph tree contains a symbolic link",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn retire_unrestored_graph_text(
+    graph_root: &Path,
+    relative: &Path,
+    scope: &GraphTextScope,
+    restored: &std::collections::HashSet<PathBuf>,
+    recovery: &RestoreRecovery,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(graph_root.join(relative))? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let child = relative.join(entry.file_name());
+        let Some(child_text) = graph_relative_text(&child) else {
+            continue;
+        };
+        if file_type.is_file() && scope.is_eligible(&child_text) {
+            if !restored.contains(&child) {
+                let live = graph_root.join(&child);
+                ensure_target_within_root(&recovery.root_path, &live)?;
+                move_live_to_recovery(recovery, &live, &Path::new("graph").join(&child))?;
+            }
+        } else if file_type.is_dir() && scope.should_descend(&child_text) {
+            retire_unrestored_graph_text(graph_root, &child, scope, restored, recovery)?;
+        }
+    }
+    Ok(())
+}
+
 fn restore_md_copy(
     src: &std::path::Path,
     dest: &std::path::Path,
@@ -1267,10 +1414,22 @@ fn delete_unrestored_asset_sidecars(
 /// `.edn` sidecars are handled separately under `assets`; binary asset bytes stay
 /// excluded from snapshots by design.
 fn is_graph_text(p: &std::path::Path) -> bool {
-    matches!(
-        p.extension().and_then(|x| x.to_str()),
-        Some("md") | Some("org")
-    )
+    p.extension().and_then(|x| x.to_str()).is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("md")
+            || ext.eq_ignore_ascii_case("markdown")
+            || ext.eq_ignore_ascii_case("org")
+    })
+}
+
+fn graph_relative_text(relative: &Path) -> Option<String> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!components.is_empty()).then(|| components.join("/"))
 }
 
 fn is_asset_sidecar(p: &std::path::Path) -> bool {
@@ -1376,6 +1535,82 @@ fn copy_md_dir_cancellable(
                     Ok(false) => {}
                     Err(_) => failed += 1,
                 }
+            }
+        }
+    }
+    (copied, failed)
+}
+
+fn copy_graph_text_tree_cancellable(
+    root: &Path,
+    destination: &Path,
+    scope: &GraphTextScope,
+    cancelled: &dyn Fn() -> bool,
+) -> (usize, usize) {
+    if cancelled() {
+        return (0, 1);
+    }
+    if let Err(error) = std::fs::read_dir(root) {
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            (0, 0)
+        } else {
+            (0, 1)
+        };
+    }
+    if std::fs::create_dir_all(destination).is_err() {
+        return (0, 1);
+    }
+
+    let (mut copied, mut failed) = (0usize, 0usize);
+    let mut stack = vec![(root.to_path_buf(), PathBuf::new())];
+    while let Some((directory, relative)) = stack.pop() {
+        if cancelled() {
+            return (copied, failed + 1);
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            if cancelled() {
+                return (copied, failed + 1);
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            let child = relative.join(entry.file_name());
+            let Some(child_text) = graph_relative_text(&child) else {
+                continue;
+            };
+            if file_type.is_file() && scope.is_eligible(&child_text) {
+                let target = destination.join(&child);
+                let copied_ok = target
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .unwrap_or(Ok(()))
+                    .is_ok()
+                    && std::fs::copy(entry.path(), target).is_ok();
+                if copied_ok {
+                    copied += 1;
+                } else {
+                    failed += 1;
+                }
+            } else if file_type.is_dir() && scope.should_descend(&child_text) {
+                stack.push((entry.path(), child));
             }
         }
     }
@@ -1722,13 +1957,14 @@ mod tests {
     }
 
     #[test]
-    fn only_complete_v2_manifests_are_readable() {
+    fn complete_v2_and_v3_manifests_are_readable() {
         let root = scratch("backup-manifest");
-        let manifest = SnapshotManifest {
-            schema: SNAPSHOT_SCHEMA,
+        let mut manifest = SnapshotManifest {
+            schema: LEGACY_SNAPSHOT_SCHEMA,
             root: root.display().to_string(),
             journals_dir: "diary".into(),
             pages_dir: "archive/pages".into(),
+            graph_text_policy: None,
             files: Vec::new(),
             complete: true,
         };
@@ -1736,6 +1972,16 @@ mod tests {
         let read = read_manifest(&root).unwrap();
         assert_eq!(read.pages_dir, "archive/pages");
         assert!(verify_snapshot(&root, &read));
+        let v3 = root.join("v3");
+        std::fs::create_dir_all(&v3).unwrap();
+        manifest.schema = SNAPSHOT_SCHEMA;
+        manifest.graph_text_policy = Some(SnapshotGraphTextPolicy {
+            version: GRAPH_TEXT_SCOPE_VERSION,
+            hidden: Vec::new(),
+            hidden_parse_failed_closed: false,
+        });
+        write_manifest(&v3, &manifest).unwrap();
+        assert_eq!(read_manifest(&v3).unwrap().schema, SNAPSHOT_SCHEMA);
         std::fs::write(root.join("journals.md"), "- changed\n").unwrap();
         assert!(!verify_snapshot(&root, &read));
         std::fs::remove_file(root.join("journals.md")).unwrap();
@@ -1760,10 +2006,11 @@ mod tests {
         write_manifest(
             &snapshot,
             &SnapshotManifest {
-                schema: SNAPSHOT_SCHEMA,
+                schema: LEGACY_SNAPSHOT_SCHEMA,
                 root: std::fs::canonicalize(&graph).unwrap().display().to_string(),
                 journals_dir: "journals".into(),
                 pages_dir: "pages".into(),
+                graph_text_policy: None,
                 files: vec![SnapshotFile {
                     path: "pages/note.md".into(),
                     sha256: "manifest metadata only".into(),
@@ -1801,10 +2048,11 @@ mod tests {
         write_manifest(
             &snapshot,
             &SnapshotManifest {
-                schema: SNAPSHOT_SCHEMA,
+                schema: LEGACY_SNAPSHOT_SCHEMA,
                 root: std::fs::canonicalize(&graph).unwrap().display().to_string(),
                 journals_dir: "journals".into(),
                 pages_dir: "pages".into(),
+                graph_text_policy: None,
                 files: vec![SnapshotFile {
                     path: "pages/note.md".into(),
                     sha256: "does not match the payload".into(),
@@ -1814,13 +2062,17 @@ mod tests {
         )
         .unwrap();
         let source = BackupSource {
-            journals: graph.join("journals"),
-            pages: graph.join("pages"),
             assets: graph.join("assets"),
             cfg: graph.join("logseq/config.edn"),
             root: graph.clone(),
             journals_dir: "journals".into(),
             pages_dir: "pages".into(),
+            graph_text_scope: GraphTextScope::new(&[], false),
+            graph_text_policy: SnapshotGraphTextPolicy {
+                version: GRAPH_TEXT_SCOPE_VERSION,
+                hidden: Vec::new(),
+                hidden_parse_failed_closed: false,
+            },
         };
 
         PAYLOAD_HASH_READS.with(|reads| reads.set(0));
@@ -1885,7 +2137,7 @@ mod tests {
         .unwrap();
         std::fs::write(snapshot.join("pages").join("ignored.txt"), "ignored\n").unwrap();
 
-        let files = collect_restore_graph_text(&snapshot, "diary", "notes").unwrap();
+        let files = collect_legacy_restore_graph_text(&snapshot, "diary", "notes").unwrap();
         assert_eq!(
             files,
             vec![
@@ -1894,6 +2146,242 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_wide_snapshot_preserves_eligible_paths_and_excludes_internal_trees() {
+        let root = scratch("graph-wide-snapshot");
+        let graph = root.join("graph");
+        let snapshot = root.join("snapshot/graph");
+        for directory in [
+            "pages",
+            "archive/自由",
+            "assets",
+            "logseq/.tine-trash/pages",
+            ".hidden",
+            "private",
+        ] {
+            std::fs::create_dir_all(graph.join(directory)).unwrap();
+        }
+        for (relative, bytes) in [
+            ("Root.md", b"root\n".as_slice()),
+            ("pages/Normal.org", b"* normal\n".as_slice()),
+            ("archive/自由/Elsewhere.Markdown", b"elsewhere\n".as_slice()),
+            ("assets/ignored.md", b"asset\n".as_slice()),
+            ("logseq/.tine-trash/pages/ignored.md", b"trash\n".as_slice()),
+            (".hidden/ignored.md", b"hidden\n".as_slice()),
+            ("private/ignored.md", b"private\n".as_slice()),
+        ] {
+            std::fs::write(graph.join(relative), bytes).unwrap();
+        }
+
+        let scope = GraphTextScope::new(&["private".into()], false);
+        let result = copy_graph_text_tree_cancellable(&graph, &snapshot, &scope, &|| false);
+
+        assert_eq!(result, (3, 0));
+        assert_eq!(std::fs::read(snapshot.join("Root.md")).unwrap(), b"root\n");
+        assert_eq!(
+            std::fs::read(snapshot.join("archive/自由/Elsewhere.Markdown")).unwrap(),
+            b"elsewhere\n"
+        );
+        for excluded in [
+            "assets/ignored.md",
+            "logseq/.tine-trash/pages/ignored.md",
+            ".hidden/ignored.md",
+            "private/ignored.md",
+        ] {
+            assert!(!snapshot.join(excluded).exists(), "{excluded}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn graph_wide_restore_is_exact_for_eligible_text_and_leaves_exclusions_untouched() {
+        let root = scratch("graph-wide-restore");
+        let graph = root.join("graph");
+        let snapshot = root.join("snapshot/graph");
+        for directory in [
+            "pages",
+            "archive/自由",
+            "assets",
+            "logseq/.tine-trash/pages",
+            ".hidden",
+            "private",
+        ] {
+            std::fs::create_dir_all(graph.join(directory)).unwrap();
+        }
+        std::fs::create_dir_all(snapshot.join("pages")).unwrap();
+        std::fs::create_dir_all(snapshot.join("archive/自由")).unwrap();
+        std::fs::write(snapshot.join("Root.md"), b"snapshot root\n").unwrap();
+        std::fs::write(snapshot.join("pages/Normal.org"), b"* snapshot\n").unwrap();
+        std::fs::write(
+            snapshot.join("archive/自由/Elsewhere.markdown"),
+            b"snapshot elsewhere\n",
+        )
+        .unwrap();
+        std::fs::write(graph.join("Root.md"), b"live root\n").unwrap();
+        std::fs::write(graph.join("archive/Stale.md"), b"stale\n").unwrap();
+        for (relative, bytes) in [
+            ("assets/untouched.md", b"asset\n".as_slice()),
+            (
+                "logseq/.tine-trash/pages/untouched.md",
+                b"trash\n".as_slice(),
+            ),
+            (".hidden/untouched.md", b"hidden\n".as_slice()),
+            ("private/untouched.md", b"private\n".as_slice()),
+        ] {
+            std::fs::write(graph.join(relative), bytes).unwrap();
+        }
+        let recovery = reserve_restore_recovery(
+            &graph,
+            Path::new("logseq/.tine-trash"),
+            "restore-graph-wide",
+        )
+        .unwrap();
+        let scope = GraphTextScope::new(&["private".into()], false);
+
+        restore_graph_text_tree(&snapshot, &graph, &scope, &recovery).unwrap();
+
+        assert_eq!(
+            std::fs::read(graph.join("Root.md")).unwrap(),
+            b"snapshot root\n"
+        );
+        assert_eq!(
+            std::fs::read(graph.join("archive/自由/Elsewhere.markdown")).unwrap(),
+            b"snapshot elsewhere\n"
+        );
+        assert!(!graph.join("archive/Stale.md").exists());
+        assert_eq!(
+            std::fs::read(recovery.path.join("graph/archive/Stale.md")).unwrap(),
+            b"stale\n"
+        );
+        for (relative, bytes) in [
+            ("assets/untouched.md", b"asset\n".as_slice()),
+            (
+                "logseq/.tine-trash/pages/untouched.md",
+                b"trash\n".as_slice(),
+            ),
+            (".hidden/untouched.md", b"hidden\n".as_slice()),
+            ("private/untouched.md", b"private\n".as_slice()),
+        ] {
+            assert_eq!(
+                std::fs::read(graph.join(relative)).unwrap(),
+                bytes,
+                "{relative}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_restore_collection_keeps_graph_relative_paths() {
+        let root = scratch("managed-restore-graph-wide");
+        let graph = root.join("graph");
+        std::fs::create_dir_all(graph.join("archive/自由")).unwrap();
+        std::fs::write(graph.join("Root.md"), "- root\n").unwrap();
+        std::fs::write(graph.join("archive/自由/Page.markdown"), "- nested\n").unwrap();
+        let scope = GraphTextScope::new(&[], false);
+
+        let files = collect_scoped_restore_graph_text(&graph, &scope).unwrap();
+
+        assert_eq!(
+            files,
+            vec![
+                ("Root.md".into(), "- root\n".into()),
+                ("archive/自由/Page.markdown".into(), "- nested\n".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_v3_restore_dispatches_graph_wide_payload() {
+        let root = scratch("schema-v3-restore");
+        let graph = root.join("graph");
+        let base = root.join("backups");
+        let snapshot = base.join("2026-08-11_12-00-00");
+        for directory in ["logseq", "assets", "archive"] {
+            std::fs::create_dir_all(graph.join(directory)).unwrap();
+        }
+        std::fs::create_dir_all(snapshot.join("graph/archive/自由")).unwrap();
+        std::fs::write(snapshot.join("graph/Root.md"), b"snapshot root\n").unwrap();
+        std::fs::write(
+            snapshot.join("graph/archive/自由/Page.markdown"),
+            b"snapshot nested\n",
+        )
+        .unwrap();
+        std::fs::write(graph.join("Root.md"), b"live root\n").unwrap();
+        std::fs::write(graph.join("archive/Stale.org"), b"* stale\n").unwrap();
+        let files = snapshot_inventory(&snapshot).unwrap();
+        write_manifest(
+            &snapshot,
+            &SnapshotManifest {
+                schema: SNAPSHOT_SCHEMA,
+                root: std::fs::canonicalize(&graph).unwrap().display().to_string(),
+                // Schema 3 paths are carried by graph/, not these schema-2
+                // compatibility fields.
+                journals_dir: "../unused-legacy-root".into(),
+                pages_dir: "/unused-legacy-root".into(),
+                graph_text_policy: Some(SnapshotGraphTextPolicy {
+                    version: GRAPH_TEXT_SCOPE_VERSION,
+                    hidden: Vec::new(),
+                    hidden_parse_failed_closed: false,
+                }),
+                files,
+                complete: true,
+            },
+        )
+        .unwrap();
+        let source = BackupSource {
+            assets: graph.join("assets"),
+            cfg: graph.join("logseq/config.edn"),
+            root: graph.clone(),
+            journals_dir: "journals".into(),
+            pages_dir: "pages".into(),
+            graph_text_scope: GraphTextScope::new(&[], false),
+            graph_text_policy: SnapshotGraphTextPolicy {
+                version: GRAPH_TEXT_SCOPE_VERSION,
+                hidden: Vec::new(),
+                hidden_parse_failed_closed: false,
+            },
+        };
+
+        restore_from_backup_source("2026-08-11_12-00-00", &base, source, None, |_| (1, true))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(graph.join("Root.md")).unwrap(),
+            b"snapshot root\n"
+        );
+        assert_eq!(
+            std::fs::read(graph.join("archive/自由/Page.markdown")).unwrap(),
+            b"snapshot nested\n"
+        );
+        assert!(!graph.join("archive/Stale.org").exists());
+        let recovered = graph.join("logseq/.tine-trash");
+        assert!(walk_contains(
+            &recovered,
+            Path::new("graph/archive/Stale.org")
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn walk_contains(root: &Path, suffix: &Path) -> bool {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.path().ends_with(suffix) {
+                    return true;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        false
     }
 
     #[test]
@@ -1953,16 +2441,12 @@ mod tests {
         std::fs::write(pages.join("client-a").join("Deep.md"), b"deep\n").unwrap();
         std::fs::write(journals.join("2026_07_09.md"), b"journal\n").unwrap();
 
-        let live_pages = count_md_recursive(&pages);
-        let live_journals = count_md_recursive(&journals);
         let (copied_pages, failed_pages) = copy_md_dir(&pages, &backup.join("pages"));
         let (copied_journals, failed_journals) = copy_md_dir(&journals, &backup.join("journals"));
         let copied = copied_pages + copied_journals;
         let failed = failed_pages + failed_journals;
-        let complete = failed == 0 && copied == live_pages + live_journals;
+        let complete = failed == 0 && copied == 3;
 
-        assert_eq!(live_pages, 2);
-        assert_eq!(live_journals, 1);
         assert!(complete);
         assert_eq!(
             std::fs::read(backup.join("pages").join("Top.md")).unwrap(),
