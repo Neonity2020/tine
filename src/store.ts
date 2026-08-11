@@ -3351,6 +3351,18 @@ const setMarkdownHeading = (raw: string, level: number): string => {
     : prefix + raw.trimStart();
 };
 
+/** Pure format-aware heading transition shared by single-block and selection
+ * commands so their Markdown/Org serialization cannot drift apart. */
+function rawWithHeading(raw: string, format: Format, state: HeadingState): string {
+  const level = typeof state === "number" && state >= 1 && state <= 6 ? state : null;
+  if (format === "org") {
+    return orgRawWithProperty(raw, "heading", state === true ? "true" : level === null ? null : String(level));
+  }
+  if (state === true) return markdownRawWithProperty(clearMarkdownHeading(raw), "heading", "true");
+  if (level !== null) return setMarkdownHeading(markdownRawWithProperty(raw, "heading", null), level);
+  return markdownRawWithProperty(clearMarkdownHeading(raw), "heading", null);
+}
+
 /** Switch between boolean automatic headings and explicit numeric headings.
  * Markdown writes ATX prefixes for numeric state and `heading:: true` for auto;
  * Org writes both states through its property drawer. Each transition clears the
@@ -3361,21 +3373,35 @@ const setMarkdownHeading = (raw: string, level: number): string => {
 export function setHeading(id: string, state: HeadingState) {
   const node = doc.byId[id];
   if (!node || !blockWritable(id)) return;
-  const level = typeof state === "number" && state >= 1 && state <= 6 ? state : null;
-  let next: string;
-  if (formatForBlock(id) === "org") {
-    next = orgRawWithProperty(node.raw, "heading", state === true ? "true" : level === null ? null : String(level));
-  } else if (state === true) {
-    next = markdownRawWithProperty(clearMarkdownHeading(node.raw), "heading", "true");
-  } else if (level !== null) {
-    next = setMarkdownHeading(markdownRawWithProperty(node.raw, "heading", null), level);
-  } else {
-    next = markdownRawWithProperty(clearMarkdownHeading(node.raw), "heading", null);
-  }
+  const next = rawWithHeading(node.raw, formatForBlock(id), state);
   if (next === node.raw) return;
   pushUndo(`heading:${id}`, [node.page]);
   setDoc("byId", id, "raw", next);
   markDirty(node.page);
+}
+
+/** Apply a context heading command to the active selection, falling back to the
+ * pointer block only when no selection is active. The preflight makes a mixed
+ * writable/read-only selection an exact no-op. */
+export function setSelectionHeading(pointerId: string, state: HeadingState): boolean {
+  const selected = selectedIds();
+  const ids = selected.length ? selected : [pointerId];
+  if (!ids.length || ids.some((id) => !blockWritable(id))) return false;
+
+  const changes = ids.map((id) => ({
+    id,
+    page: doc.byId[id].page,
+    raw: rawWithHeading(doc.byId[id].raw, formatForBlock(id), state),
+  })).filter((change) => change.raw !== doc.byId[change.id].raw);
+  if (!changes.length) return true;
+
+  const pages = [...new Set(changes.map((change) => change.page))];
+  pushUndo("heading-selection", pages);
+  setDoc(produce((stateDoc) => {
+    for (const change of changes) stateDoc.byId[change.id].raw = change.raw;
+  }));
+  for (const page of pages) markDirty(page);
+  return true;
 }
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -4604,6 +4630,171 @@ export async function moveBlock(
   } else {
     markDirty(oldPage);
   }
+}
+
+interface RelativeMovePlan {
+  roots: string[];
+  sourcePages: string[];
+  sourcePageByRoot: string[];
+  destinationPage: string;
+}
+
+/** Build the complete target-relative move plan without mutating. Captured IDs
+ * are stable-deduped, then descendants of another captured ID are subsumed. */
+function relativeMovePlan(capturedIds: readonly string[], targetId: string): RelativeMovePlan | null {
+  const unique = [...new Set(capturedIds)];
+  if (!unique.length || unique.some((id) => !doc.byId[id])) return null;
+  const captured = new Set(unique);
+  const roots: string[] = [];
+
+  for (const id of unique) {
+    const seen = new Set([id]);
+    let parent = doc.byId[id].parent;
+    let subsumed = false;
+    while (parent !== null) {
+      if (seen.has(parent)) return null;
+      seen.add(parent);
+      if (captured.has(parent)) {
+        subsumed = true;
+        break;
+      }
+      const ancestor = doc.byId[parent];
+      if (!ancestor) return null;
+      parent = ancestor.parent;
+    }
+    if (!subsumed) roots.push(id);
+  }
+  if (!roots.length) return null;
+
+  const target = doc.byId[targetId];
+  if (!target || !pageWritable(target.page)) return null;
+  const destinationParent = target.parent;
+  if (destinationParent !== null) {
+    const parent = doc.byId[destinationParent];
+    if (!parent || parent.page !== target.page || !blockWritable(destinationParent)) return null;
+  }
+  const targetSiblings = destinationParent === null
+    ? pageByName(target.page)?.roots
+    : doc.byId[destinationParent]?.children;
+  if (!targetSiblings || targetSiblings.filter((id) => id === targetId).length !== 1) return null;
+
+  const moved = new Set<string>();
+  const visit = (id: string, page: string, ancestry: Set<string>): boolean => {
+    const node = doc.byId[id];
+    if (!node || node.page !== page || moved.has(id) || ancestry.has(id)) return false;
+    moved.add(id);
+    const childSet = new Set(node.children);
+    if (childSet.size !== node.children.length) return false;
+    const nextAncestry = new Set(ancestry).add(id);
+    return node.children.every((childId) => {
+      const child = doc.byId[childId];
+      return !!child && child.parent === id && visit(childId, page, nextAncestry);
+    });
+  };
+
+  const sourcePageByRoot: string[] = [];
+  for (const id of roots) {
+    const node = doc.byId[id];
+    if (!blockWritable(id)) return null;
+    const siblings = node.parent === null
+      ? pageByName(node.page)?.roots
+      : doc.byId[node.parent]?.children;
+    if (!siblings || siblings.filter((sibling) => sibling === id).length !== 1) return null;
+    if (node.parent !== null) {
+      const parent = doc.byId[node.parent];
+      if (!parent || parent.page !== node.page) return null;
+    }
+    if (!visit(id, node.page, new Set())) return null;
+    sourcePageByRoot.push(node.page);
+  }
+  if (moved.has(targetId)) return null;
+
+  const sourcePages = [...new Set(sourcePageByRoot)];
+  if (sourcePages.some((page) => !pageWritable(page))) return null;
+  return {
+    roots,
+    sourcePages,
+    sourcePageByRoot,
+    destinationPage: target.page,
+  };
+}
+
+/** Move captured selection roots together before/after a live target ID. This is
+ * intentionally separate from same-page selection indent/outdent and never loops
+ * over moveBlock: arbitrary source sibling arrays and pages form one transaction. */
+export async function moveBlocksRelative(
+  capturedIds: readonly string[],
+  targetId: string,
+  position: "before" | "after",
+): Promise<boolean> {
+  let plan = relativeMovePlan(capturedIds, targetId);
+  if (!plan) return false;
+
+  const crossSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
+  if (crossSources.length) {
+    if (!(await prepareCrossPageSources(crossSources))) {
+      pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
+      return false;
+    }
+    const rebuilt = relativeMovePlan(capturedIds, targetId);
+    if (!rebuilt) return false;
+    // Every non-destination source in the rebuilt plan must be one we flushed
+    // while it still contained its roots. A concurrent cross-page reparent is a
+    // safe abort, not permission to mutate a newly unprepared source.
+    const rebuiltCross = rebuilt.sourcePages.filter((page) => page !== rebuilt.destinationPage);
+    if (rebuilt.destinationPage !== plan.destinationPage
+      || rebuilt.roots.length !== plan.roots.length
+      || rebuilt.roots.some((id, index) => id !== plan!.roots[index])
+      || rebuilt.sourcePageByRoot.some((page, index) => page !== plan!.sourcePageByRoot[index])
+      || rebuiltCross.length !== crossSources.length
+      || rebuiltCross.some((page, index) => page !== crossSources[index])) return false;
+    plan = rebuilt;
+  }
+
+  const destinationFormat = formatForPage(plan.destinationPage);
+  const movedRaw = new Map(plan.roots.map((id) => {
+    const sourceRaw = doc.byId[id].raw;
+    const raw = orderListTypeFromRaw(sourceRaw, formatForBlock(id)) !== null
+      ? sourceRaw
+      : rawWithInheritedOrderListType(sourceRaw, destinationFormat, targetId);
+    return [id, raw];
+  }));
+  const affectedPages = [...new Set([plan.destinationPage, ...plan.sourcePages])];
+  pushUndo("move-selection-relative", affectedPages);
+  setDoc(produce((state) => {
+    const siblingsFor = (id: string): string[] => {
+      const node = state.byId[id];
+      return node.parent === null
+        ? state.pages.find((page) => page.name === node.page)!.roots
+        : state.byId[node.parent].children;
+    };
+    for (const id of plan!.roots) {
+      const siblings = siblingsFor(id);
+      siblings.splice(siblings.indexOf(id), 1);
+    }
+
+    const target = state.byId[targetId];
+    const destination = target.parent === null
+      ? state.pages.find((page) => page.name === target.page)!.roots
+      : state.byId[target.parent].children;
+    const targetIndex = destination.indexOf(targetId);
+    for (const id of plan!.roots) {
+      state.byId[id].parent = target.parent;
+      state.byId[id].raw = movedRaw.get(id)!;
+    }
+    destination.splice(targetIndex + (position === "after" ? 1 : 0), 0, ...plan!.roots);
+
+    const reassign = (id: string) => {
+      state.byId[id].page = plan!.destinationPage;
+      for (const child of state.byId[id].children) reassign(child);
+    };
+    for (const id of plan!.roots) reassign(id);
+  }));
+
+  const persistenceSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
+  if (persistenceSources.length) persistCrossPage(plan.destinationPage, persistenceSources);
+  else markDirty(plan.destinationPage);
+  return true;
 }
 
 /** Move a block up/down among its siblings (mod+Up/Down). Keyed <For> keeps the

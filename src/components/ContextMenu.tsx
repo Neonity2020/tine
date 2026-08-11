@@ -35,7 +35,7 @@ import {
   toggleBlockProperty,
   toggleOwnNumberedList,
   blockProperty,
-  setHeading,
+  setSelectionHeading,
   setCollapsedDeep,
   dtoSubtreeMarkdown,
   flushAll,
@@ -45,6 +45,7 @@ import {
   restoreTodayJournalInFeed,
   selectedIds,
   blockPageReadOnly,
+  blockWritable,
   pageByName,
   buildClipboardPayload,
 } from "../store";
@@ -341,31 +342,38 @@ function ShowChildrenAsSubmenu(props: { id: string; close: () => void }): JSX.El
 function BlockMenu(props: { id: string; close: () => void }): JSX.Element {
   const hasChildren = () => (doc.byId[props.id]?.children.length ?? 0) > 0;
   const readOnly = () => blockPageReadOnly(props.id);
+  const headingTargets = () => {
+    const selected = selectedIds();
+    return selected.length ? selected : [props.id];
+  };
+  const headingsWritable = () => headingTargets().length > 0 && headingTargets().every(blockWritable);
   return (
     <>
       <Show when={!readOnly()}>
         {/* Color row */}
         <ColorPalette id={props.id} close={props.close} />
+      </Show>
 
+      <Show when={headingsWritable()}>
         {/* Heading row */}
         <div class="ctx-row ctx-headings">
-          <button class="ctx-h" title="Automatic heading" onClick={() => { setHeading(props.id, true); props.close(); }}>
+          <button class="ctx-h" title="Automatic heading" onClick={() => { setSelectionHeading(props.id, true); props.close(); }}>
             Auto
           </button>
           <For each={[1, 2, 3, 4, 5, 6]}>
             {(h) => (
-              <button class="ctx-h" title={`Heading ${h}`} onClick={() => { setHeading(props.id, h); props.close(); }}>
+              <button class="ctx-h" title={`Heading ${h}`} onClick={() => { setSelectionHeading(props.id, h); props.close(); }}>
                 H{h}
               </button>
             )}
           </For>
-          <button class="ctx-h" title="Remove heading" onClick={() => { setHeading(props.id, null); props.close(); }}>
+          <button class="ctx-h" title="Remove heading" onClick={() => { setSelectionHeading(props.id, null); props.close(); }}>
             ⌫
           </button>
         </div>
-
-        <div class="ctx-sep" />
       </Show>
+
+      <Show when={!readOnly() || headingsWritable()}><div class="ctx-sep" /></Show>
 
       <For each={blockActions(props.id)}>
         {(it) => (

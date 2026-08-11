@@ -54,7 +54,7 @@ import {
   insertOutlineChildren,
   pasteClipboardPayload,
   deleteBlock,
-  moveBlock,
+  moveBlocksRelative,
   moveBlockFeed,
   moveItem,
   selectBlock,
@@ -62,6 +62,7 @@ import {
   extendSelectionTo,
   clearSelection,
   moveSelection,
+  selectedIds,
   isSelected,
   ensureBlockId,
   persistentBlockRef,
@@ -228,24 +229,17 @@ const [dragId, setDragId] = createSignal<string | null>(null);
 const [dropInd, setDropInd] = createSignal<{ id: string; before: boolean } | null>(null);
 let dragMoved = false;
 
-function siblingIndex(id: string): number {
-  const n = doc.byId[id];
-  if (!n) return -1;
-  const sibs =
-    n.parent === null
-      ? doc.pages.find((p) => p.name === n.page)?.roots ?? []
-      : doc.byId[n.parent].children;
-  return sibs.indexOf(id);
-}
-
 function beginDrag(id: string, e: MouseEvent) {
   const startX = e.clientX;
   const startY = e.clientY;
+  let capturedIds: string[] | null = null;
   dragMoved = false;
   const onMove = (ev: MouseEvent) => {
     if (!dragMoved && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) return;
     if (!dragMoved) {
       dragMoved = true;
+      const selected = selectedIds();
+      capturedIds = selected.length ? [...selected] : [id];
       setDragId(id);
       endEdit("drag-start");
     }
@@ -253,7 +247,7 @@ function beginDrag(id: string, e: MouseEvent) {
       ".ls-block"
     ) as HTMLElement | null;
     const tid = el?.dataset.blockId;
-    if (tid && tid !== id) {
+    if (tid) {
       const main = el!.querySelector(".block-main")!.getBoundingClientRect();
       setDropInd({ id: tid, before: ev.clientY < main.top + main.height / 2 });
     } else {
@@ -265,20 +259,7 @@ function beginDrag(id: string, e: MouseEvent) {
     document.removeEventListener("mouseup", onUp);
     const ind = dropInd();
     if (dragMoved && ind && doc.byId[ind.id]) {
-      const tgt = doc.byId[ind.id];
-      // can't drop onto own descendant
-      let p: string | null = ind.id;
-      let ok = true;
-      while (p !== null) {
-        if (p === id) {
-          ok = false;
-          break;
-        }
-        p = doc.byId[p].parent;
-      }
-      // Pass the target's page so a root-to-root drop across pages (e.g. between
-      // journal days) lands on the page it was dropped onto, not the source page.
-      if (ok) void moveBlock(id, tgt.parent, siblingIndex(ind.id) + (ind.before ? 0 : 1), tgt.page, ind.id);
+      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.before ? "before" : "after");
     }
     setDragId(null);
     setDropInd(null);

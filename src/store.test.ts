@@ -45,6 +45,7 @@ import {
   moveSelectionItems,
   moveBlockFeed,
   moveBlock,
+  moveBlocksRelative,
   indentSelection,
   outdentSelection,
   __setStoreMutationObserverForTest,
@@ -62,6 +63,7 @@ import {
   orderedListMarker,
   blockProperty,
   setBlockProperty,
+  setSelectionHeading,
   setSchedule,
   pageToDto,
   blockSubtreeMarkdown,
@@ -1670,6 +1672,288 @@ describe("root-to-root drop across pages targets the drop page (#38)", () => {
     expect(raws("Today")).toEqual([]); // left the source page
     expect(raws("Older")).toEqual(["o1", "t1"]); // landed on the drop page
     expect(doc.byId[t1].page).toBe("Older");
+  });
+});
+
+describe("selection heading ownership (GH #240)", () => {
+  async function observe(run: () => Promise<unknown> | unknown) {
+    const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
+    __setStoreMutationObserverForTest((observation) => {
+      if (observation.kind === "publication") counts.publications++;
+      else if (observation.kind === "dirty") counts.dirtyMarks++;
+      else if (observation.kind === "undo-snapshot") counts.snapshots++;
+    });
+    try {
+      await run();
+    } finally {
+      __setStoreMutationObserverForTest(null);
+    }
+    return counts;
+  }
+
+  it("serializes Markdown and Org targets in one publication/undo unit and restores both pages", async () => {
+    const markdown = { id: "heading-md", raw: "Markdown", collapsed: false, children: [] };
+    const org = { id: "heading-org", raw: "Org", collapsed: false, children: [] };
+    await loadFeed([
+      { name: "Markdown", kind: "page", title: "Markdown", pre_block: null, blocks: [markdown], format: "md" },
+      { name: "Org", kind: "page", title: "Org", pre_block: null, blocks: [org], format: "org" },
+    ]);
+    clearSeededFacets();
+    selectBlock(markdown.id);
+    extendSelectionTo(org.id);
+    const beforeMarkdown = pageState("Markdown");
+    const beforeOrg = pageState("Org");
+
+    expect(await observe(() => setSelectionHeading("unused-pointer", 2))).toEqual({
+      publications: 1,
+      dirtyMarks: 2,
+      snapshots: 1,
+    });
+    expect(doc.byId[markdown.id].raw).toBe("## Markdown");
+    expect(doc.byId[org.id].raw).toBe("Org\n:PROPERTIES:\n:heading: 2\n:END:");
+    expect(selectedIds()).toEqual([markdown.id, org.id]);
+    const afterMarkdown = pageState("Markdown");
+    const afterOrg = pageState("Org");
+
+    undo();
+    expect(pageState("Markdown")).toEqual(beforeMarkdown);
+    expect(pageState("Org")).toEqual(beforeOrg);
+    redo();
+    expect(pageState("Markdown")).toEqual(afterMarkdown);
+    expect(pageState("Org")).toEqual(afterOrg);
+  });
+
+  it("is an exact no-op when any selected page is read-only", async () => {
+    const writable = { id: "heading-writable", raw: "Writable", collapsed: false, children: [] };
+    const readOnly = { id: "heading-read-only", raw: "Read only", collapsed: false, children: [] };
+    await loadFeed([
+      { name: "Writable", kind: "page", title: "Writable", pre_block: null, blocks: [writable], format: "md" },
+      { name: "Read only", kind: "page", title: "Read only", pre_block: null, blocks: [readOnly], format: "org", read_only: true },
+    ]);
+    selectBlock(writable.id);
+    extendSelectionTo(readOnly.id);
+
+    let result = true;
+    expect(await observe(() => { result = setSelectionHeading(writable.id, 3); })).toEqual({
+      publications: 0,
+      dirtyMarks: 0,
+      snapshots: 0,
+    });
+    expect(result).toBe(false);
+    expect(doc.byId[writable.id].raw).toBe("Writable");
+    expect(doc.byId[readOnly.id].raw).toBe("Read only");
+    expect(isDirty("Writable")).toBe(false);
+    expect(isDirty("Read only")).toBe(false);
+    expect(selectedIds()).toEqual([writable.id, readOnly.id]);
+  });
+});
+
+describe("target-relative multi-root drag (GH #240)", () => {
+  async function observe(run: () => Promise<unknown>) {
+    const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
+    __setStoreMutationObserverForTest((observation) => {
+      if (observation.kind === "publication") counts.publications++;
+      else if (observation.kind === "dirty") counts.dirtyMarks++;
+      else if (observation.kind === "undo-snapshot") counts.snapshots++;
+    });
+    try {
+      await run();
+    } finally {
+      __setStoreMutationObserverForTest(null);
+    }
+    return counts;
+  }
+
+  it("moves normalized roots from different sibling arrays together with exact undo/redo", async () => {
+    const descendant = blk("descendant");
+    const parent = blk("parent", [descendant]);
+    const nested = blk("nested");
+    const holder = blk("holder", [nested]);
+    const target = blk("target");
+    load([parent, holder, target]);
+    const before = pageState("Test");
+
+    expect(await observe(() => moveBlocksRelative(
+      [parent.id, descendant.id, nested.id, nested.id],
+      target.id,
+      "after",
+    ))).toEqual({ publications: 1, dirtyMarks: 1, snapshots: 1 });
+    expect(pageByName("Test")!.roots).toEqual([holder.id, target.id, parent.id, nested.id]);
+    expect(doc.byId[holder.id].children).toEqual([]);
+    expect(doc.byId[parent.id].children).toEqual([descendant.id]);
+    expect(doc.byId[descendant.id]).toMatchObject({ parent: parent.id, raw: "descendant" });
+    expect(doc.byId[nested.id].parent).toBeNull();
+    const after = pageState("Test");
+
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
+  it.each([
+    ["target is a moved root", "same"],
+    ["target is inside a moved subtree", "descendant"],
+    ["source page is read-only", "source-read-only"],
+    ["destination page is read-only", "destination-read-only"],
+  ] as const)("rejects when %s without publication, undo, or dirty marks", async (_label, scenario) => {
+    let sourceId: string;
+    let targetId: string;
+    if (scenario === "same" || scenario === "descendant") {
+      const child = blk("child");
+      const source = blk("source", [child]);
+      const target = blk("target");
+      load([source, target]);
+      sourceId = source.id;
+      targetId = scenario === "same" ? source.id : child.id;
+    } else {
+      const source = { id: "invalid-source", raw: "source", collapsed: false, children: [] };
+      const target = { id: "invalid-target", raw: "target", collapsed: false, children: [] };
+      await loadFeed([
+        {
+          name: "Source", kind: "page", title: "Source", pre_block: null, blocks: [source],
+          read_only: scenario === "source-read-only",
+        },
+        {
+          name: "Destination", kind: "page", title: "Destination", pre_block: null, blocks: [target],
+          read_only: scenario === "destination-read-only",
+        },
+      ]);
+      sourceId = source.id;
+      targetId = target.id;
+    }
+    const before = JSON.parse(JSON.stringify(doc));
+    let result = true;
+
+    expect(await observe(async () => { result = await moveBlocksRelative([sourceId], targetId, "after"); })).toEqual({
+      publications: 0,
+      dirtyMarks: 0,
+      snapshots: 0,
+    });
+    expect(result).toBe(false);
+    expect(JSON.parse(JSON.stringify(doc))).toEqual(before);
+  });
+
+  it("moves multiple source-page subtrees in captured order with per-root inheritance and exact undo", async () => {
+    const childOne = { id: "child-one", raw: "child one\nbody:: byte-exact", collapsed: false, children: [] };
+    const childTwo = { id: "child-two", raw: "child two\n:literal: byte-exact", collapsed: false, children: [] };
+    const sourceOne = { id: "source-one", raw: "source one", collapsed: false, children: [childOne] };
+    const sourceTwoRaw = "source two\n:PROPERTIES:\n:logseq.order-list-type: number\n:END:";
+    const sourceTwo = { id: "source-two", raw: sourceTwoRaw, collapsed: false, children: [childTwo] };
+    const targetRaw = "target\n:PROPERTIES:\n:logseq.order-list-type: number\n:END:";
+    const target = { id: "destination-target", raw: targetRaw, collapsed: false, children: [] };
+    const tail = { id: "destination-tail", raw: "tail", collapsed: false, children: [] };
+    await loadFeed([
+      { name: "Source one", kind: "page", title: "Source one", pre_block: null, blocks: [sourceOne], format: "md" },
+      { name: "Source two", kind: "page", title: "Source two", pre_block: null, blocks: [sourceTwo], format: "org" },
+      { name: "Destination", kind: "page", title: "Destination", pre_block: null, blocks: [target, tail], format: "org" },
+    ]);
+    clearSeededFacets();
+    const before = [pageState("Source one"), pageState("Source two"), pageState("Destination")];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockResolvedValue("selection-drag-rev");
+    try {
+      expect(await observe(() => moveBlocksRelative(
+        [sourceTwo.id, sourceOne.id],
+        target.id,
+        "before",
+      ))).toMatchObject({ publications: 1, snapshots: 1 });
+      await flushAll();
+
+      expect(pageByName("Source one")!.roots).toEqual([]);
+      expect(pageByName("Source two")!.roots).toEqual([]);
+      expect(pageByName("Destination")!.roots).toEqual([sourceTwo.id, sourceOne.id, target.id, tail.id]);
+      expect(doc.byId[sourceTwo.id].raw).toBe(sourceTwoRaw);
+      expect(doc.byId[sourceOne.id].raw).toBe(
+        "source one\n:PROPERTIES:\n:logseq.order-list-type: number\n:END:",
+      );
+      expect(doc.byId[childOne.id]).toMatchObject({ page: "Destination", raw: childOne.raw });
+      expect(doc.byId[childTwo.id]).toMatchObject({ page: "Destination", raw: childTwo.raw });
+      expect(doc.byId[sourceOne.id].page).toBe("Destination");
+      expect(doc.byId[sourceTwo.id].page).toBe("Destination");
+      const after = [pageState("Source one"), pageState("Source two"), pageState("Destination")];
+
+      undo();
+      expect([pageState("Source one"), pageState("Source two"), pageState("Destination")]).toEqual(before);
+      redo();
+      expect([pageState("Source one"), pageState("Source two"), pageState("Destination")]).toEqual(after);
+    } finally {
+      saveSpy.mockRestore();
+    }
+  });
+});
+
+describe("target-relative drag persistence barrier (GH #240)", () => {
+  const page = (name: string, id: string): PageDto => ({
+    name,
+    kind: "page",
+    title: name,
+    pre_block: null,
+    blocks: [{ id, raw: id, collapsed: false, children: [] }],
+  });
+
+  it("flushes every dirty source while it still contains its moved root", async () => {
+    await loadFeed([page("Source one", "source-one"), page("Source two", "source-two"), page("Destination", "target")]);
+    markDirty("Source one");
+    markDirty("Source two");
+    const saved: PageDto[] = [];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
+      saved.push(dto);
+      return "barrier-rev";
+    });
+    try {
+      expect(await moveBlocksRelative(["source-one", "source-two"], "target", "before")).toBe(true);
+      await flushAll();
+      expect(saved.slice(0, 2).map((dto) => [dto.name, dto.blocks.map((block) => block.id)])).toEqual([
+        ["Source one", ["source-one"]],
+        ["Source two", ["source-two"]],
+      ]);
+    } finally {
+      saveSpy.mockRestore();
+    }
+  });
+
+  it("aborts before mutation when a dirty source flush is refused", async () => {
+    await loadFeed([page("Source", "source"), page("Destination", "target")]);
+    markDirty("Source");
+    const before = [pageState("Source"), pageState("Destination")];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockRejectedValueOnce(new Error("conflict:240"));
+    const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
+    __setStoreMutationObserverForTest((observation) => {
+      if (observation.kind === "publication") counts.publications++;
+      else if (observation.kind === "dirty") counts.dirtyMarks++;
+      else if (observation.kind === "undo-snapshot") counts.snapshots++;
+    });
+    try {
+      expect(await moveBlocksRelative(["source"], "target", "before")).toBe(false);
+    } finally {
+      __setStoreMutationObserverForTest(null);
+      saveSpy.mockRestore();
+    }
+    expect(counts).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+    expect([pageState("Source"), pageState("Destination")]).toEqual(before);
+  });
+
+  it("does not begin a post-removal source save before the destination resolves", async () => {
+    await loadFeed([page("Source one", "source-one"), page("Source two", "source-two"), page("Destination", "target")]);
+    let resolveDestination!: (revision: string) => void;
+    const destinationSaved = new Promise<string>((resolve) => { resolveDestination = resolve; });
+    const saved: PageDto[] = [];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation((dto) => {
+      saved.push(dto);
+      return dto.name === "Destination" ? destinationSaved : Promise.resolve("source-rev");
+    });
+    try {
+      expect(await moveBlocksRelative(["source-one", "source-two"], "target", "before")).toBe(true);
+      await vi.waitFor(() => expect(saved.map((dto) => dto.name)).toEqual(["Destination"]));
+      expect(saved[0].blocks.map((block) => block.id)).toEqual(["source-one", "source-two", "target"]);
+
+      resolveDestination("destination-rev");
+      await flushAll();
+      expect(saved.map((dto) => dto.name)).toEqual(["Destination", "Source one", "Source two"]);
+      expect(saved.slice(1).map((dto) => dto.blocks)).toEqual([[], []]);
+    } finally {
+      saveSpy.mockRestore();
+    }
   });
 });
 
