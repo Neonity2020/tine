@@ -21506,6 +21506,10 @@ impl Graph {
             self.parse_external_document(&managed_path, expected_base.as_bytes(), false)?;
         let parsed_target =
             self.parse_external_document(&managed_path, exact_target.as_bytes(), false)?;
+        #[cfg(test)]
+        JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| {
+            pairs.set(pairs.get().saturating_add(1));
+        });
         let resolved_target =
             parsed_target.resolve_identity(Some(AcceptedExternalDocumentIdentity {
                 name: &page.name,
@@ -22967,6 +22971,7 @@ thread_local! {
     static GRAPH_TEXT_PARSE_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static EXACT_PAGE_DTO_PARSE_ATTEMPTS: std::cell::Cell<usize> = std::cell::Cell::new(0);
     static GRAPH_TEXT_VALIDATION_TARGET_READS: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
 
 #[cfg(test)]
@@ -22977,6 +22982,19 @@ pub(crate) fn reset_exact_page_dto_parse_attempts() {
 #[cfg(test)]
 pub(crate) fn exact_page_dto_parse_attempts() -> usize {
     EXACT_PAGE_DTO_PARSE_ATTEMPTS.with(Cell::get)
+}
+
+/// The runtime actor owns this thread-local counter.  Its save instrumentation
+/// snapshots it after a foreground attempt so a caller-side test can prove the
+/// guarded Graph base/target validation still parsed on an optimized route.
+#[cfg(test)]
+pub(crate) fn reset_journal_projection_guarded_parse_pairs_for_runtime_test() {
+    JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| pairs.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn journal_projection_guarded_parse_pairs_for_runtime_test() -> usize {
+    JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(Cell::get)
 }
 
 #[cfg(test)]

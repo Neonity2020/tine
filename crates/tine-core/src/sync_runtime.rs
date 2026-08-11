@@ -111,7 +111,12 @@ use crate::oplog::operational_coordinator::{
     LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
     PreparedLocalMutationState, ProviderArchiveContinuation, ProviderArchiveIngress,
 };
-use crate::oplog::projection::render_requested_page_document;
+#[cfg(test)]
+use crate::oplog::projection::{
+    prepared_editor_projection_instrumentation, reset_prepared_editor_projection_instrumentation,
+    PreparedEditorProjectionInstrumentation,
+};
+use crate::oplog::projection::{render_requested_page_document, PreparedEditorProjection};
 use crate::oplog::projection_store::ProjectionReceiptStore;
 use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
@@ -383,6 +388,8 @@ struct ManagedApplicationSaveInstrumentation {
     provider_pending: usize,
     managed_local_pending: usize,
     managed_local_next_sequence: u64,
+    prepared_editor_projection: PreparedEditorProjectionInstrumentation,
+    guarded_graph_validation_parse_pairs: usize,
 }
 
 /// Actor-local, test-only accounting for the managed application query paths.
@@ -7016,6 +7023,9 @@ fn run_actor_loop(
                         .managed_local
                         .as_ref()
                         .map_or(0, |managed| managed.journal.next_sequence()),
+                    prepared_editor_projection: prepared_editor_projection_instrumentation(),
+                    guarded_graph_validation_parse_pairs:
+                        crate::model::journal_projection_guarded_parse_pairs_for_runtime_test(),
                 });
                 false
             }
@@ -7686,6 +7696,7 @@ fn prepare_trusted_local_runtime_commit(
     journal: &mut ManagedLocalJournal<ManagedLocalJournalPayloadKind>,
     target_page: &PageDto,
     response_evidence: Option<TrustedLocalResponseEvidence>,
+    prepared_editor_projection: Option<PreparedEditorProjection>,
     transaction: &OperationTransaction,
 ) -> Result<TrustedLocalRuntimeAttempt, SyncEditorRequestError> {
     let base_revision =
@@ -7695,9 +7706,14 @@ fn prepare_trusted_local_runtime_commit(
             .ok_or(SyncEditorRequestError::ActorRefusedWithCode(
                 SyncEditorRefusalCode::TrustedLocalMissingBaseRevision,
             ))?;
-    let prepared =
-        OperationalCoordinator::prepare_trusted_local(session, graph, receipts, transaction)
-            .map_err(trusted_local_preparation_refusal)?;
+    let prepared = OperationalCoordinator::prepare_trusted_local(
+        session,
+        graph,
+        receipts,
+        transaction,
+        prepared_editor_projection,
+    )
+    .map_err(trusted_local_preparation_refusal)?;
     let prepared = match prepared {
         PreparedLocalMutationState::Prepared(prepared) => prepared,
         PreparedLocalMutationState::ReconciliationRequired(reconciliation) => {
@@ -12831,6 +12847,8 @@ impl RuntimeActor {
         {
             reset_application_save_stage_timings();
             crate::model::reset_exact_page_dto_parse_attempts();
+            crate::model::reset_journal_projection_guarded_parse_pairs_for_runtime_test();
+            reset_prepared_editor_projection_instrumentation();
         }
         #[cfg(test)]
         let prepare_started = Instant::now();
@@ -14268,6 +14286,8 @@ impl RuntimeActor {
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         self.prepared_application_reply = None;
         #[cfg(test)]
+        reset_prepared_editor_projection_instrumentation();
+        #[cfg(test)]
         let prepare_started = Instant::now();
         let readiness = self.prepare_editor_turn();
         #[cfg(test)]
@@ -14340,20 +14360,15 @@ impl RuntimeActor {
                         .ok_or(SyncEditorRequestError::ActorRefusedAt(
                             "reading the current Markdown or Org projection",
                         ))?;
-                    let target = render_requested_page_document(&requested_page, Some(&base))
-                        .map_err(|_| {
-                            SyncEditorRequestError::ActorRefusedAt(
-                                "rendering the requested page edit",
-                            )
-                        })?;
-                    let accepted_target =
-                        render_requested_page_document(&current.page, Some(&base)).map_err(
-                            |_| {
+                    let prepared_editor_projection =
+                        PreparedEditorProjection::prepare(requested_page, &current.page, base)
+                            .map_err(|_| {
                                 SyncEditorRequestError::ActorRefusedAt(
-                                    "rendering the accepted page baseline",
+                                    "rendering the requested page edit",
                                 )
-                            },
-                        )?;
+                            })?;
+                    let target = prepared_editor_projection.target().to_vec();
+                    let accepted_target = prepared_editor_projection.accepted_target();
                     let accepted_source = self
                         .graph
                         .parse_external_document(&current.page.path, &accepted_target, false)
@@ -14483,7 +14498,11 @@ impl RuntimeActor {
                         transaction,
                         affected.into_iter().map(|id| id.to_string()).collect(),
                         Some(current_application),
-                        Some((trusted_target_page, trusted_target_evidence)),
+                        Some((
+                            trusted_target_page,
+                            trusted_target_evidence,
+                            prepared_editor_projection,
+                        )),
                     )
                 }
                 SyncEditorSaveTarget::New {
@@ -14864,7 +14883,11 @@ impl RuntimeActor {
         transaction: OperationTransaction,
         page_id: PageId,
         affected_page_ids: Vec<String>,
-        trusted_target: Option<(PageDto, TrustedLocalResponseEvidence)>,
+        trusted_target: Option<(
+            PageDto,
+            TrustedLocalResponseEvidence,
+            PreparedEditorProjection,
+        )>,
     ) -> Result<SyncEditorSaveOutcome, SyncEditorRequestError> {
         let execution = {
             let authority = self
@@ -14906,7 +14929,7 @@ impl RuntimeActor {
                 }
             };
             let attempt = match trusted_target {
-                Some((target_page, response_evidence)) => {
+                Some((target_page, response_evidence, prepared_editor_projection)) => {
                     let managed = self
                         .managed_local
                         .as_mut()
@@ -14918,6 +14941,7 @@ impl RuntimeActor {
                         &mut managed.journal,
                         &target_page,
                         Some(response_evidence),
+                        Some(prepared_editor_projection),
                         &transaction,
                     )?
                 }
@@ -26983,6 +27007,160 @@ mod tests {
     }
 
     #[test]
+    fn prepared_editor_projection_reuses_one_511_block_crlf_markdown_save() {
+        let fixture = ActivationFixture::empty("prepared-editor-projection-crlf", 0xa13d);
+        let runtime_request = reopen_request(&fixture.request);
+        let source = (0..MAX_SYNC_EDITOR_BLOCKS)
+            .map(|index| format!("- before {index}\r\n"))
+            .collect::<String>();
+        fs::write(fixture.graph_root.join("Tine.md"), source).unwrap();
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains a runtime");
+        drive_initial_feed(&handle);
+
+        let (mut page, revision) = load_application_logical(&handle, "Tine", SyncPageKind::Page);
+        page.blocks[0].raw = "after retained CRLF layout".into();
+        let saved = handle
+            .save_application_page(SyncApplicationPageSaveRequest {
+                target: SyncApplicationPageSaveTarget::Existing {
+                    path: page.path.clone(),
+                    revision,
+                },
+                page,
+            })
+            .unwrap();
+        let instrumentation = handle
+            .managed_application_save_instrumentation()
+            .expect("ordinary save exposes prepared-projection instrumentation");
+        let counters = instrumentation.prepared_editor_projection;
+        assert_eq!(counters.created, 1);
+        assert_eq!(counters.reused, 1);
+        assert_eq!(counters.fallback, 0);
+        assert_eq!(counters.finalizer_post_state_render, 0);
+        assert_eq!(
+            counters.finalizer_predecessor_replay_render, 1,
+            "the retained predecessor replay remains a separately counted safety render"
+        );
+        assert_eq!(
+            instrumentation.guarded_graph_validation_parse_pairs, 1,
+            "reuse must still execute Graph's guarded base/target validation parse pair"
+        );
+
+        let (saved, saved_revision) = match saved {
+            SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
+            other => panic!("ordinary prepared projection save was not durable: {other:?}"),
+        };
+        let (fresh, fresh_revision) = load_application_exact(&handle, &saved.path);
+        assert_eq!(saved_revision, fresh_revision);
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&fresh).unwrap(),
+            "reused target must match the ordinary exact parser DTO"
+        );
+
+        let frames = managed_local_journal_frames(&runtime_request);
+        assert_eq!(
+            frames.len(),
+            1,
+            "one durable foreground save appends one frame"
+        );
+        let record = decode_managed_local_record(&frames[0]).unwrap();
+        assert_eq!(record.projection().intent().path().as_str(), saved.path);
+        let journal_target = fs::read(fixture.graph_root.join(&saved.path)).unwrap();
+        assert_eq!(
+            record.projection().intent().target().bytes(),
+            Some(journal_target.as_slice()),
+            "the journal records the exact reused projection target"
+        );
+
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let reopened = active_handle(SyncRuntimeHandle::open(runtime_request));
+        drive_initial_feed(&reopened);
+        let (clean_reopen, clean_reopen_revision) = load_application_exact(&reopened, &saved.path);
+        assert_eq!(clean_reopen_revision, saved_revision);
+        assert_eq!(
+            serde_json::to_value(&clean_reopen).unwrap(),
+            serde_json::to_value(&saved).unwrap(),
+            "a clean reopen must retain the same complete reused DTO"
+        );
+        assert!(matches!(
+            reopened.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn non_round_tripping_org_application_save_refuses_before_prepared_projection() {
+        let fixture = ActivationFixture::empty("prepared-editor-projection-read-only-org", 0xa13e);
+        let runtime_request = reopen_request(&fixture.request);
+        let source = b"* root\n*** skipped level\n";
+        fs::write(fixture.graph_root.join("Read Only.org"), source).unwrap();
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains a runtime");
+        drive_initial_feed(&handle);
+
+        let (mut page, revision) =
+            load_application_logical(&handle, "Read Only", SyncPageKind::Page);
+        assert!(
+            page.read_only,
+            "the non-round-tripping Org page is read-only"
+        );
+        page.blocks[0].raw = "must not render or append".into();
+        let frames_before = managed_local_journal_frames(&runtime_request);
+        assert!(matches!(
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: page.path.clone(),
+                        revision,
+                    },
+                    page,
+                })
+                .unwrap(),
+            SyncApplicationPageSaveOutcome::Conflict {
+                reason: SyncApplicationPageConflict::ReadOnly
+            }
+        ));
+        let counters = handle
+            .managed_application_save_instrumentation()
+            .expect("read-only refusal exposes save instrumentation")
+            .prepared_editor_projection;
+        assert_eq!(
+            counters.created, 0,
+            "read-only refusal must not create an artifact"
+        );
+        assert_eq!(
+            counters.reused, 0,
+            "read-only refusal must not reuse an artifact"
+        );
+        assert_eq!(
+            counters.fallback, 0,
+            "read-only refusal never enters finalization"
+        );
+        assert_eq!(
+            managed_local_journal_frames(&runtime_request),
+            frames_before
+        );
+        assert_eq!(
+            fs::read(fixture.graph_root.join("Read Only.org")).unwrap(),
+            source
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
     fn managed_application_conflict_resolution_reauthors_retained_outline_at_one_observed_revision()
     {
         let fixture = ActivationFixture::nested_unicode("managed-conflict-resolution", 0xa12f);
@@ -31052,6 +31230,23 @@ mod tests {
             }
             other => panic!("atomic editor rename was not retained or durable: {other:?}"),
         };
+        let counters = handle
+            .managed_application_save_instrumentation()
+            .expect("multi-page editor save exposes prepared-projection instrumentation")
+            .prepared_editor_projection;
+        assert_eq!(counters.created, 1);
+        assert_eq!(
+            counters.reused, 0,
+            "rename/referrer work is ineligible for reuse"
+        );
+        assert_eq!(
+            counters.fallback, 1,
+            "the affine artifact is discarded once"
+        );
+        assert!(
+            counters.finalizer_post_state_render >= 2,
+            "the renamed page and its referrer must each retain an ordinary complete post-state render"
+        );
         assert_eq!(
             affected.into_iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([target_id.to_string(), referrer_id.to_string()])
@@ -31717,6 +31912,25 @@ mod tests {
                         .response_target_exact_dto_reparses,
                     0,
                     "{label}: response preparation must not enter Graph::parse_exact_page_dto"
+                );
+                assert_eq!(
+                    parse_census.prepared_editor_projection.created, 1,
+                    "{label}: the editor may prepare one local candidate"
+                );
+                assert_eq!(
+                    parse_census.prepared_editor_projection.reused, 0,
+                    "{label}: title/kind changes must retain the complete finalizer planner"
+                );
+                assert_eq!(
+                    parse_census.prepared_editor_projection.fallback, 1,
+                    "{label}: ineligible editor preparation must be discarded exactly once"
+                );
+                assert!(
+                    parse_census
+                        .prepared_editor_projection
+                        .finalizer_post_state_render
+                        >= 1,
+                    "{label}: fallback must render every final post-state requirement"
                 );
                 assert_eq!(saved.name, expected_name, "{label}");
                 assert_eq!(saved.kind, sync_model_page_kind(expected_kind), "{label}");

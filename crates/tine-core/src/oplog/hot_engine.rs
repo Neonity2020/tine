@@ -3680,6 +3680,9 @@ pub struct AuthorTransactionDraft {
     requirements: Vec<ProjectionRequirement>,
     pages: BTreeMap<PageId, DraftProjectionPage>,
     external_observation: Option<ExternalImportObservationMaterial>,
+    /// Process-local editor work.  This remains affine and never crosses a
+    /// draft/capture/finalize failure, journal, overlay, or recovery boundary.
+    prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
 }
 
 /// Complete exact-path evidence required before retrying a local semantic
@@ -14555,6 +14558,7 @@ impl ShardedHotEngine {
         &self,
         authority: &super::local_active::AdmittedLocalAuthorAuthority<'_>,
         transaction: &OperationTransaction,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<(BatchId, AuthorTransactionDraft), EngineError> {
         if authority.workspace_id() != self.workspace_id
             || authority.generation().generation != self.history_generation
@@ -14563,6 +14567,7 @@ impl ShardedHotEngine {
             return Err(EngineError::AuthorDraftStale);
         }
         let batch_id = BatchId::new();
+        let mut prepared_editor_projection = prepared_editor_projection;
         for attempt in 0..LOCAL_AUTHOR_PEER_PROBE_BUDGET {
             let crdt_peer_id = CrdtPeerId::local_mutation_candidate(
                 self.workspace_id,
@@ -14585,6 +14590,7 @@ impl ShardedHotEngine {
                 BatchOrigin::LocalMutation,
                 transaction,
                 None,
+                prepared_editor_projection.take(),
             ) {
                 Ok(draft) => {
                     #[cfg(test)]
@@ -14618,7 +14624,7 @@ impl ShardedHotEngine {
                 "raw local author identity is unavailable on a promoted production runtime".into(),
             ));
         }
-        self.draft_author_transaction_with_observation(author, origin, transaction, None)
+        self.draft_author_transaction_with_observation(author, origin, transaction, None, None)
     }
 
     /// Prepare one canonical managed-local record from the exact finalized
@@ -15463,7 +15469,7 @@ impl ShardedHotEngine {
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(true);
         let oracle =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None);
+            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
         let oracle_copies = self.prospective_catalog_document_copies() - oracle_copies;
         let oracle_shape_visits = self
             .history_work
@@ -15478,7 +15484,7 @@ impl ShardedHotEngine {
             .prospective_catalog_shape_entry_visits;
         self.set_previous_document_derivation(false);
         let optimized =
-            self.draft_author_transaction_with_observation(author, origin, transaction, None);
+            self.draft_author_transaction_with_observation(author, origin, transaction, None, None);
         let optimized_copies = self.prospective_catalog_document_copies() - optimized_copies;
         let optimized_shape_visits = self
             .history_work
@@ -15578,6 +15584,7 @@ impl ShardedHotEngine {
             BatchOrigin::ExternalReconciliation { import_id },
             &transaction,
             Some(observation),
+            None,
         )
     }
 
@@ -15587,6 +15594,7 @@ impl ShardedHotEngine {
         origin: BatchOrigin,
         transaction: &OperationTransaction,
         observation: Option<ExternalImportObservationMaterial>,
+        prepared_editor_projection: Option<super::projection::PreparedEditorProjection>,
     ) -> Result<AuthorTransactionDraft, EngineError> {
         if origin == BatchOrigin::BootstrapImport {
             return Err(EngineError::InvalidTransaction(
@@ -15652,6 +15660,7 @@ impl ShardedHotEngine {
             requirements,
             pages,
             external_observation: parts.external_observation,
+            prepared_editor_projection,
         })
     }
 
@@ -15802,6 +15811,7 @@ impl ShardedHotEngine {
         external: bool,
         bootstrap: Option<&BootstrapProjectionAuthority>,
     ) -> Result<Result<CapturedAuthorTransaction, ReconciliationNeeded>, EngineError> {
+        let mut draft = draft;
         self.ensure_not_blocked()?;
         if source.device_id != draft.author.author_device_id {
             return Err(EngineError::ProjectionManifest(
@@ -16152,6 +16162,9 @@ impl ShardedHotEngine {
         drop(external_observation_index);
         if !mismatches.is_empty() {
             debug_assert!(mismatches.windows(2).all(|pair| pair[0] < pair[1]));
+            if let Some(prepared_editor_projection) = draft.prepared_editor_projection.take() {
+                prepared_editor_projection.record_fallback();
+            }
             return Ok(Err(ReconciliationNeeded { paths: mismatches }));
         }
         Ok(Ok(CapturedAuthorTransaction {
@@ -16193,7 +16206,7 @@ impl ShardedHotEngine {
         receipts: &ProjectionReceiptStore,
     ) -> Result<PreparedBatch, EngineError> {
         let CapturedAuthorTransaction {
-            draft,
+            mut draft,
             source,
             receipt_store_id,
             graph_scope,
@@ -16298,6 +16311,23 @@ impl ShardedHotEngine {
             .map(|input| (input.path, input.material))
             .collect::<BTreeMap<_, _>>();
 
+        // This is the only consumer of editor preparation.  Any transaction
+        // shape other than one existing Present -> Present requirement remains
+        // on the established complete planner.
+        let mut prepared_editor_projection = if !external_reconciliation
+            && requirement_index.len() == 1
+            && matches!(
+                draft.requirements[requirement_index.entries()[0].roles().owner].target,
+                ProjectionRequirementState::Present
+            ) {
+            draft.prepared_editor_projection.take()
+        } else {
+            if let Some(prepared_editor_projection) = draft.prepared_editor_projection.take() {
+                prepared_editor_projection.record_fallback();
+            }
+            None
+        };
+
         let mut objects = draft.prepared_core.objects().to_vec();
         let mut observed_bases =
             BTreeMap::<ManagedPath, (ManifestObjectRef, AnnotatedProjectionBase)>::new();
@@ -16339,6 +16369,7 @@ impl ShardedHotEngine {
                         "captured path {path} completion is not its intended semantic predecessor"
                     )));
                 }
+                super::projection::note_finalizer_predecessor_replay_render();
                 let replay = super::projection::plan_projection_with_layout_annotations(
                     self.workspace_id,
                     before,
@@ -16517,13 +16548,37 @@ impl ShardedHotEngine {
                             } => (Some(bytes.as_slice()), Some(annotations.as_slice())),
                             CapabilityCapturedProjectionMaterial::Absent { .. } => (None, None),
                         });
-                    let plan = super::projection::plan_projection_with_layout_annotations(
-                        self.workspace_id,
-                        after,
-                        render_bytes,
-                        render_annotations,
-                    )
-                    .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+                    let prepared_plan = match prepared_editor_projection.take() {
+                        Some(prepared_editor_projection) => match &inputs[&requirement.path] {
+                            CapabilityCapturedProjectionMaterial::Present {
+                                bytes,
+                                annotations,
+                                ..
+                            } => prepared_editor_projection
+                                .into_fresh_plan(self.workspace_id, after, bytes, annotations)
+                                .map_err(|error| {
+                                    EngineError::ProjectionManifest(error.to_string())
+                                })?,
+                            CapabilityCapturedProjectionMaterial::Absent { .. } => {
+                                prepared_editor_projection.record_fallback();
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    let plan = match prepared_plan {
+                        Some(plan) => plan,
+                        None => {
+                            super::projection::note_finalizer_post_state_render();
+                            super::projection::plan_projection_with_layout_annotations(
+                                self.workspace_id,
+                                after,
+                                render_bytes,
+                                render_annotations,
+                            )
+                            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                        }
+                    };
                     ManifestProjectionTarget::present(
                         plan.target().to_vec(),
                         plan.intent().annotations().to_vec(),

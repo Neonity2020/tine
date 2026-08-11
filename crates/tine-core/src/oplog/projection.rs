@@ -50,11 +50,78 @@ thread_local! {
     // Counts only test builds, so the exact-source reuse proof adds no
     // production instrumentation or hot-path work.
     static PAGE_DOCUMENT_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only structural accounting for the affine editor projection.  The
+    /// counters intentionally distinguish finalizer post-state work from
+    /// predecessor replay: the latter remains a separate safety proof.
+    static PREPARED_EDITOR_PROJECTION_INSTRUMENTATION: std::cell::Cell<PreparedEditorProjectionInstrumentation> =
+        const { std::cell::Cell::new(PreparedEditorProjectionInstrumentation::ZERO) };
 }
 
 #[cfg(test)]
 fn page_document_build_count_for_test() -> usize {
     PAGE_DOCUMENT_BUILD_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PreparedEditorProjectionInstrumentation {
+    pub(crate) created: usize,
+    pub(crate) reused: usize,
+    pub(crate) fallback: usize,
+    pub(crate) finalizer_post_state_render: usize,
+    pub(crate) finalizer_predecessor_replay_render: usize,
+}
+
+#[cfg(test)]
+impl PreparedEditorProjectionInstrumentation {
+    const ZERO: Self = Self {
+        created: 0,
+        reused: 0,
+        fallback: 0,
+        finalizer_post_state_render: 0,
+        finalizer_predecessor_replay_render: 0,
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_prepared_editor_projection_instrumentation() {
+    PREPARED_EDITOR_PROJECTION_INSTRUMENTATION
+        .with(|instrumentation| instrumentation.set(PreparedEditorProjectionInstrumentation::ZERO));
+}
+
+#[cfg(test)]
+pub(crate) fn prepared_editor_projection_instrumentation() -> PreparedEditorProjectionInstrumentation
+{
+    PREPARED_EDITOR_PROJECTION_INSTRUMENTATION.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_prepared_editor_projection(
+    update: impl FnOnce(&mut PreparedEditorProjectionInstrumentation),
+) {
+    PREPARED_EDITOR_PROJECTION_INSTRUMENTATION.with(|instrumentation| {
+        let mut current = instrumentation.get();
+        update(&mut current);
+        instrumentation.set(current);
+    });
+}
+
+pub(crate) fn note_finalizer_post_state_render() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.finalizer_post_state_render = instrumentation
+            .finalizer_post_state_render
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_finalizer_predecessor_replay_render() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.finalizer_predecessor_replay_render = instrumentation
+            .finalizer_predecessor_replay_render
+            .saturating_add(1);
+    });
 }
 
 /// Operation-scoped capability for the deterministic manifested-projection
@@ -182,6 +249,112 @@ struct RenderedProjection {
     annotations: Vec<AnnotatedIdentity>,
     base_layout_identities: Vec<StructuralLayoutIdentity>,
     generated_anchors: Vec<PolicyGeneratedAnchor>,
+}
+
+/// One editor-requested post-state rendering, retained only while the same
+/// trusted-local mutation crosses draft, capture, and finalization.  It is
+/// affine: neither the artifact nor its candidate layout identities are
+/// authority.  Capture must bind both to the exact current base before this
+/// value can mint a fresh final projection plan.
+pub(crate) struct PreparedEditorProjection {
+    requested_page: MaterializedPage,
+    exact_base: Vec<u8>,
+    candidate_base_layout: Vec<StructuralLayoutIdentity>,
+    accepted_target: Vec<u8>,
+    rendered: RenderedProjection,
+}
+
+impl PreparedEditorProjection {
+    /// Render an editor-requested page with candidate layout identities from
+    /// the already accepted pre-state and exact base.  The accepted rendering
+    /// is only process-local preparation: finalization authenticates the
+    /// captured annotations before it can reuse the target.
+    pub(crate) fn prepare(
+        requested_page: MaterializedPage,
+        accepted_page: &MaterializedPage,
+        exact_base: Vec<u8>,
+    ) -> Result<Self, ProjectionError> {
+        let accepted = render_projection_page(accepted_page, Some(&exact_base), None)?;
+        let candidate_base_layout = structural_layout_identities(&accepted.annotations);
+        let accepted_target = accepted.target;
+        let rendered = render_projection_page_with_layout_identities(
+            &requested_page,
+            Some(&exact_base),
+            &candidate_base_layout,
+        )?;
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.created = instrumentation.created.saturating_add(1);
+        });
+        Ok(Self {
+            requested_page,
+            exact_base,
+            candidate_base_layout,
+            accepted_target,
+            rendered,
+        })
+    }
+
+    pub(crate) fn target(&self) -> &[u8] {
+        &self.rendered.target
+    }
+
+    pub(crate) fn accepted_target(&self) -> &[u8] {
+        &self.accepted_target
+    }
+
+    /// Consume the artifact only after final capture proves that its accepted
+    /// base/layout candidates are still the exact current projection input.
+    /// The returned plan is freshly minted from the captured base plus the
+    /// final state frontier and claim evidence; no pre-capture plan authority
+    /// is retained.
+    pub(crate) fn into_fresh_plan(
+        self,
+        workspace_id: WorkspaceId,
+        after: &ProjectionPageState,
+        captured_base: &[u8],
+        captured_annotations: &[AnnotatedIdentity],
+    ) -> Result<Option<ProjectionPlan>, ProjectionError> {
+        let reusable =
+            materialized_page_projection_identity_equal(&self.requested_page, &after.page)
+                && self.exact_base == captured_base
+                && self.candidate_base_layout == structural_layout_identities(captured_annotations);
+        if !reusable {
+            #[cfg(test)]
+            note_prepared_editor_projection(|instrumentation| {
+                instrumentation.fallback = instrumentation.fallback.saturating_add(1);
+            });
+            return Ok(None);
+        }
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.reused = instrumentation.reused.saturating_add(1);
+        });
+        projection_plan_from_rendered(workspace_id, after, Some(captured_base), self.rendered)
+            .map(Some)
+    }
+
+    /// Record a deliberate terminal fallback when capture/reconciliation or a
+    /// multi-requirement route makes the affine artifact ineligible.
+    pub(crate) fn record_fallback(self) {
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.fallback = instrumentation.fallback.saturating_add(1);
+        });
+    }
+}
+
+fn materialized_page_projection_identity_equal(
+    left: &MaterializedPage,
+    right: &MaterializedPage,
+) -> bool {
+    left.page_id == right.page_id
+        && left.home_document_id == right.home_document_id
+        && left.name == right.name
+        && left.path == right.path
+        && left.kind == right.kind
+        && left.preamble == right.preamble
+        && left.blocks == right.blocks
 }
 
 /// Identity-bound formatting authority carried from the pure planner (or an
@@ -803,6 +976,48 @@ fn render_projection_page(
         expected_base_annotations,
         metadata,
     )
+}
+
+/// Render against already-selected structural layout identities.  This is used
+/// only by the affine editor artifact; those identities are candidates until
+/// capture compares them with authenticated base annotations.
+fn render_projection_page_with_layout_identities(
+    page: &MaterializedPage,
+    expected_base: Option<&[u8]>,
+    base_layout_identities: &[StructuralLayoutIdentity],
+) -> Result<RenderedProjection, ProjectionError> {
+    let format = format_for_page(page)?;
+    let base_text = expected_base
+        .map(|bytes| {
+            std::str::from_utf8(bytes).map_err(|_| ProjectionError::InvalidUtf8("projection base"))
+        })
+        .transpose()?;
+    let mut metadata = ProjectionMetadata::with_capacity(page.blocks.len());
+    let document = build_page_document(
+        page,
+        format,
+        ProjectionRenderMode::Sparse,
+        Some(&mut metadata),
+    )?;
+    let target =
+        serialize_document(format, &document, base_text, base_layout_identities).into_bytes();
+    let annotations = annotate_serialized_blocks(
+        format,
+        &document,
+        base_text,
+        base_layout_identities,
+        &target,
+        &metadata.pending_annotations,
+    )?;
+    metadata
+        .generated_anchors
+        .sort_unstable_by_key(PolicyGeneratedAnchor::block_id);
+    Ok(RenderedProjection {
+        target,
+        annotations,
+        base_layout_identities: base_layout_identities.to_vec(),
+        generated_anchors: metadata.generated_anchors,
+    })
 }
 
 /// Render a document and its projection metadata that were built together.
@@ -3089,6 +3304,251 @@ mod tests {
             Some(base.intent().annotations()),
         )
         .unwrap()
+    }
+
+    fn assert_prepared_editor_projection_matches_ordinary_fallback(
+        label: &str,
+        accepted: ProjectionPageState,
+        after: ProjectionPageState,
+        base: &[u8],
+    ) {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_071));
+        let authenticated_base = plan_projection(workspace, &accepted, Some(base))
+            .unwrap_or_else(|error| panic!("{label}: authenticated base planning failed: {error}"));
+        let ordinary = plan_projection_with_layout_annotations(
+            workspace,
+            &after,
+            Some(base),
+            Some(authenticated_base.intent().annotations()),
+        )
+        .unwrap_or_else(|error| panic!("{label}: ordinary fallback planning failed: {error}"));
+        let prepared =
+            PreparedEditorProjection::prepare(after.page.clone(), &accepted.page, base.to_vec())
+                .unwrap_or_else(|error| panic!("{label}: editor preparation failed: {error}"));
+        let reused = prepared
+            .into_fresh_plan(
+                workspace,
+                &after,
+                base,
+                authenticated_base.intent().annotations(),
+            )
+            .unwrap_or_else(|error| panic!("{label}: reuse validation failed: {error}"))
+            .unwrap_or_else(|| panic!("{label}: exact authenticated inputs did not reuse"));
+
+        // The ordinary plan is the complete planner selected after an
+        // authenticated mismatch.  Compare every authority-bearing component,
+        // not only the target bytes, so rendering reuse cannot retain a stale
+        // precondition, frontier, or claim set.
+        assert_eq!(reused.target(), ordinary.target(), "{label}: target");
+        assert_eq!(
+            reused.intent().annotations(),
+            ordinary.intent().annotations(),
+            "{label}: annotations"
+        );
+        assert_eq!(
+            reused.intent().precondition(),
+            ordinary.intent().precondition(),
+            "{label}: precondition"
+        );
+        assert_eq!(
+            reused.intent().frontier(),
+            ordinary.intent().frontier(),
+            "{label}: frontier"
+        );
+        assert_eq!(
+            reused.intent().claim_evidence(),
+            ordinary.intent().claim_evidence(),
+            "{label}: claim evidence"
+        );
+        assert_eq!(reused.intent(), ordinary.intent(), "{label}: full intent");
+
+        // An exact-base mismatch must decline reuse and leave the same ordinary
+        // post-state plan as the sole finalizer authority.
+        let mut mismatched_base = base.to_vec();
+        mismatched_base.push(b'!');
+        let forced_fallback =
+            PreparedEditorProjection::prepare(after.page.clone(), &accepted.page, base.to_vec())
+                .unwrap_or_else(|error| panic!("{label}: fallback preparation failed: {error}"))
+                .into_fresh_plan(
+                    workspace,
+                    &after,
+                    &mismatched_base,
+                    authenticated_base.intent().annotations(),
+                )
+                .unwrap_or_else(|error| panic!("{label}: fallback validation failed: {error}"));
+        assert!(
+            forced_fallback.is_none(),
+            "{label}: mismatched capture base must select the ordinary planner"
+        );
+    }
+
+    #[test]
+    fn prepared_editor_projection_matches_the_complete_planner_for_markdown_and_org() {
+        let markdown_uuid = LogseqUuid::from_uuid(Uuid::from_u128(80_081));
+        let mut markdown = structural_layout_state(
+            "pages/prepared-layout.md",
+            vec![
+                (80_081, None, "a", "before".into(), Some(markdown_uuid)),
+                (80_083, Some(80_081), "a", "child".into(), None),
+                (80_084, None, "b", "tail".into(), None),
+            ],
+        );
+        markdown.page.preamble = Some("title:: Structural Layout".into());
+        markdown.page.blocks[0].content = format!("before\nid:: {markdown_uuid}");
+        let markdown_base = format!(
+            concat!(
+                "title:: Structural Layout\r\n",
+                "\r\n",
+                "- before\r\n",
+                "  id:: {}\r\n",
+                "  - child\r\n",
+                "\r\n",
+                "- tail\r\n"
+            ),
+            markdown_uuid
+        );
+        let mut markdown_after = markdown.clone();
+        markdown_after.page.blocks[2].content = "tail after reuse".into();
+        assert_prepared_editor_projection_matches_ordinary_fallback(
+            "CRLF Markdown layout",
+            markdown,
+            markdown_after,
+            markdown_base.as_bytes(),
+        );
+
+        let org_uuid = LogseqUuid::from_uuid(Uuid::from_u128(80_091));
+        let mut org = structural_layout_state(
+            "journals/prepared-layout.org",
+            vec![
+                (80_091, None, "a", "before".into(), Some(org_uuid)),
+                (80_093, Some(80_091), "a", "child".into(), None),
+                (80_094, None, "b", "tail".into(), None),
+            ],
+        );
+        org.page.preamble = Some("#+TITLE: Structural Layout".into());
+        org.page.blocks[0].content = format!("before\n:PROPERTIES:\n:ID: {org_uuid}\n:END:");
+        let org_base = format!(
+            concat!(
+                "#+TITLE: Structural Layout\n",
+                "\n",
+                "* before\n",
+                ":PROPERTIES:\n",
+                ":ID: {}\n",
+                ":END:\n",
+                "** child\n",
+                "* tail\n"
+            ),
+            org_uuid
+        );
+        let mut org_after = org.clone();
+        org_after.page.blocks[2].content = "tail after reuse".into();
+        assert_prepared_editor_projection_matches_ordinary_fallback(
+            "editable Org",
+            org,
+            org_after,
+            org_base.as_bytes(),
+        );
+    }
+
+    #[test]
+    fn prepared_editor_projection_reuses_only_authenticated_page_base_and_layout_identity() {
+        reset_prepared_editor_projection_instrumentation();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_101));
+        let accepted = structural_layout_state(
+            "pages/prepared-mismatch.md",
+            vec![
+                (80_102, None, "a", "before".into(), None),
+                (80_103, Some(80_102), "a", "child".into(), None),
+            ],
+        );
+        let base = b"- before\n  - child\n".to_vec();
+        let authenticated_base = plan_projection(workspace, &accepted, Some(&base)).unwrap();
+        let annotations = authenticated_base.intent().annotations().to_vec();
+        assert!(
+            !annotations.is_empty(),
+            "the mismatch matrix needs structural capture annotations"
+        );
+
+        let mut requested = accepted.clone();
+        requested.page.blocks[0].content = "after".into();
+        let attempt = |after: ProjectionPageState,
+                       captured_base: Vec<u8>,
+                       captured_annotations: Vec<AnnotatedIdentity>| {
+            PreparedEditorProjection::prepare(requested.page.clone(), &accepted.page, base.clone())
+                .unwrap()
+                .into_fresh_plan(workspace, &after, &captured_base, &captured_annotations)
+                .unwrap()
+        };
+
+        let mut stats_only = requested.clone();
+        stats_only.page.stats.catalog_documents_loaded = 1;
+        let reused = attempt(stats_only, base.clone(), annotations.clone());
+        assert!(
+            reused.is_some(),
+            "instrumentation-only materialization statistics are not projection identity"
+        );
+
+        let mut base_mismatch = base.clone();
+        base_mismatch.push(b'!');
+        let mut annotations_mismatch = annotations.clone();
+        annotations_mismatch.pop();
+        let mut page_id = requested.clone();
+        page_id.page.page_id = PageId::from_uuid(Uuid::from_u128(80_104));
+        let mut home_document_id = requested.clone();
+        home_document_id.page.home_document_id = DocumentId::from_uuid(Uuid::from_u128(80_105));
+        let mut name = requested.clone();
+        name.page.name = crate::oplog::LogicalPageName::parse("other name").unwrap();
+        let mut path = requested.clone();
+        path.page.path = ManagedPath::parse("pages/other-name.md").unwrap();
+        let mut kind = requested.clone();
+        kind.page.kind = crate::oplog::ManagedTextKind::Journal;
+        let mut preamble = requested.clone();
+        preamble.page.preamble = Some("title:: other preamble".into());
+        let mut blocks = requested.clone();
+        blocks.page.blocks[1].content = "other child".into();
+
+        for (label, after, captured_base, captured_annotations) in [
+            (
+                "exact base bytes",
+                requested.clone(),
+                base_mismatch,
+                annotations.clone(),
+            ),
+            (
+                "structural annotations",
+                requested.clone(),
+                base.clone(),
+                annotations_mismatch,
+            ),
+            ("page id", page_id, base.clone(), annotations.clone()),
+            (
+                "home document id",
+                home_document_id,
+                base.clone(),
+                annotations.clone(),
+            ),
+            ("name", name, base.clone(), annotations.clone()),
+            ("path", path, base.clone(), annotations.clone()),
+            ("kind", kind, base.clone(), annotations.clone()),
+            ("preamble", preamble, base.clone(), annotations.clone()),
+            ("blocks", blocks, base.clone(), annotations.clone()),
+        ] {
+            assert!(
+                attempt(after, captured_base, captured_annotations).is_none(),
+                "{label} mismatch must select the ordinary finalizer planner"
+            );
+        }
+
+        assert_eq!(
+            prepared_editor_projection_instrumentation(),
+            PreparedEditorProjectionInstrumentation {
+                created: 10,
+                reused: 1,
+                fallback: 9,
+                finalizer_post_state_render: 0,
+                finalizer_predecessor_replay_render: 0,
+            }
+        );
     }
 
     /// Planning the same state over the same bytes must yield the same intent
