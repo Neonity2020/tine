@@ -356,6 +356,11 @@ thread_local! {
     };
 }
 
+#[cfg(test)]
+static WORKSPACE_RESUME_LIFECYCLE_CUTS: Mutex<
+    BTreeMap<WorkspaceId, (ResumeLifecycleCut, Box<dyn FnOnce() + Send>)>,
+> = Mutex::new(BTreeMap::new());
+
 /// Exact causal accounting for one promoted-runtime boundary or admission.
 ///
 /// Counters, never timing.
@@ -4184,17 +4189,52 @@ fn automatically_publish_post_open(
     // Libtest's worker stack is substantially smaller than the application's
     // main thread. Keep the exact production call but give the large promoted
     // runtime fixture enough stack for its snapshot frame.
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("tine-post-open-publication".into())
-            .stack_size(16 * 1024 * 1024)
-            .spawn_scoped(scope, || {
-                runtime.publish_post_open_resume_point(authority, graph);
-            })
-            .expect("post-open publication test thread must start")
-            .join()
-            .expect("post-open publication test thread must not panic");
-    });
+    {
+        // The lifecycle cut remains thread-local so parallel tests cannot
+        // consume one another's hooks. This one production-equivalent call is
+        // moved to a larger scoped test thread, so carry the caller's one-shot
+        // seam with it and return it if the requested cut was not reached.
+        let workspace = runtime.state.workspace_id;
+        let inherited_thread_cut = take_resume_lifecycle_cut_for_test();
+        let inherited_workspace_cut = if inherited_thread_cut.is_none() {
+            WORKSPACE_RESUME_LIFECYCLE_CUTS
+                .lock()
+                .unwrap()
+                .remove(&workspace)
+        } else {
+            None
+        };
+        let came_from_workspace = inherited_workspace_cut.is_some();
+        let inherited_cut = inherited_thread_cut.or(inherited_workspace_cut);
+        let leftover_cut = std::thread::scope(|scope| {
+            let runtime_for_publication = &mut *runtime;
+            std::thread::Builder::new()
+                .name("tine-post-open-publication".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn_scoped(scope, move || {
+                    restore_resume_lifecycle_cut_for_test(inherited_cut);
+                    runtime_for_publication.publish_post_open_resume_point(authority, graph);
+                    take_resume_lifecycle_cut_for_test()
+                })
+                .expect("post-open publication test thread must start")
+                .join()
+                .expect("post-open publication test thread must not panic")
+        });
+        if came_from_workspace {
+            if let Some(leftover_cut) = leftover_cut {
+                assert!(
+                    WORKSPACE_RESUME_LIFECYCLE_CUTS
+                        .lock()
+                        .unwrap()
+                        .insert(workspace, leftover_cut)
+                        .is_none(),
+                    "workspace lifecycle cut was replaced while publication ran"
+                );
+            }
+        } else {
+            restore_resume_lifecycle_cut_for_test(leftover_cut);
+        }
+    }
     // The report-only attempt authenticates the retained enrollment session
     // again before it derives the Unsafe binding. That full read advances the
     // session-local generation even though the exclusive session proves no
@@ -4505,7 +4545,7 @@ pub(crate) enum ResumeLifecycleCut {
 
 #[cfg(test)]
 thread_local! {
-    static RESUME_LIFECYCLE_CUT: std::cell::RefCell<Option<(ResumeLifecycleCut, Box<dyn FnOnce()>)>> =
+    static RESUME_LIFECYCLE_CUT: std::cell::RefCell<Option<(ResumeLifecycleCut, Box<dyn FnOnce() + Send>)>> =
         const { std::cell::RefCell::new(None) };
     static SAFE_GRAPH_WRITER_PROBE_ARMED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -4518,9 +4558,37 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn act_once_at_resume_lifecycle_cut_for_test(
     cut: ResumeLifecycleCut,
-    action: Box<dyn FnOnce()>,
+    action: Box<dyn FnOnce() + Send>,
 ) {
     RESUME_LIFECYCLE_CUT.with(|slot| *slot.borrow_mut() = Some((cut, action)));
+}
+
+#[cfg(test)]
+pub(crate) fn act_once_at_resume_lifecycle_cut_for_workspace_for_test(
+    workspace: WorkspaceId,
+    cut: ResumeLifecycleCut,
+    action: Box<dyn FnOnce() + Send>,
+) {
+    assert!(
+        WORKSPACE_RESUME_LIFECYCLE_CUTS
+            .lock()
+            .unwrap()
+            .insert(workspace, (cut, action))
+            .is_none(),
+        "workspace lifecycle cut was already armed"
+    );
+}
+
+#[cfg(test)]
+fn take_resume_lifecycle_cut_for_test() -> Option<(ResumeLifecycleCut, Box<dyn FnOnce() + Send>)> {
+    RESUME_LIFECYCLE_CUT.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn restore_resume_lifecycle_cut_for_test(
+    armed: Option<(ResumeLifecycleCut, Box<dyn FnOnce() + Send>)>,
+) {
+    RESUME_LIFECYCLE_CUT.with(|slot| *slot.borrow_mut() = armed);
 }
 
 #[cfg(test)]

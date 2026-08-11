@@ -76,17 +76,18 @@ use crate::oplog::import::{
 use crate::oplog::import::{
     BootstrapStreamingImportInstrumentation, InactiveBootstrapOrchestrationInstrumentation,
 };
+#[cfg(test)]
+use crate::oplog::local_active::{
+    act_once_at_resume_lifecycle_cut_for_workspace_for_test,
+    reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
+    PromotedRuntimeOpenInstrumentation, ResumeLifecycleCut,
+};
 use crate::oplog::local_active::{
     activate_verified_local_with_retained_validation, reopen_promoted_local_runtime,
     seal_local_runtime_promotion, take_over_promoted_local_runtime_recovering_projection,
     InactiveBootstrapRuntimeSession, LocalActiveAuthority, LocalActiveRuntime,
     PromotedLocalRuntime, PromotedRuntimeOpen, PromotedRuntimeRecoveryDiagnostics,
     RuntimeRecoveryState,
-};
-#[cfg(test)]
-use crate::oplog::local_active::{
-    reset_promoted_runtime_open_instrumentation, take_promoted_runtime_open_instrumentation,
-    PromotedRuntimeOpenInstrumentation,
 };
 use crate::oplog::local_journal_drain::{
     resume_managed_local_journal_drain_with_superseding_projection,
@@ -45630,6 +45631,22 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
 
+        let selected_at_reclamation = Arc::new(Mutex::new(None));
+        let selected_at_reclamation_result = Arc::clone(&selected_at_reclamation);
+        let selected_at_reclamation_path = selected_run.clone();
+        let selected_at_reclamation_expected = selected_corrupted.clone();
+        act_once_at_resume_lifecycle_cut_for_workspace_for_test(
+            fixture.request.identities.workspace_id,
+            ResumeLifecycleCut::BeforeReclamation,
+            Box::new(move || {
+                let observed = recursive_file_bytes(&selected_at_reclamation_path);
+                assert_eq!(
+                    observed, selected_at_reclamation_expected,
+                    "recovery must leave the refused run byte-exact through replacement publication and up to authenticated reclamation"
+                );
+                *selected_at_reclamation_result.lock().unwrap() = Some(observed);
+            }),
+        );
         let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
         assert_eq!(reopened.status, SyncRuntimeOpenStatus::Active);
         let reopened = reopened
@@ -45655,21 +45672,27 @@ mod tests {
             expected_graph,
             "replay recovery must not rewrite direct graph bytes"
         );
-        let selected_after = fs::read_dir(&selected_run)
-            .unwrap()
-            .map(Result::unwrap)
-            .filter(|entry| entry.file_type().unwrap().is_file())
-            .map(|entry| {
-                (
-                    entry.file_name().to_string_lossy().into_owned(),
-                    fs::read(entry.path()).unwrap(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         assert_eq!(
-            selected_after, selected_corrupted,
-            "recovery must leave the abandoned selected run {selected_run_id} byte-for-byte intact"
+            selected_at_reclamation.lock().unwrap().as_ref(),
+            Some(&selected_corrupted),
+            "the exact pre-reclamation preservation seam must fire during post-open publication"
         );
+        let (replacement_after_recovery, replacement_after_recovery_path) =
+            selected_retained_scratch_run_for_test(&fixture.request.archive_root);
+        assert_ne!(replacement_after_recovery, selected_run_id);
+        assert!(replacement_after_recovery_path.is_dir());
+        if selected_run.is_dir() {
+            assert_eq!(
+                recursive_file_bytes(&selected_run),
+                selected_corrupted,
+                "an unreclaimed refused run must remain byte-for-byte intact"
+            );
+        } else {
+            assert!(
+                !selected_run.exists(),
+                "authenticated reclamation must remove the whole refused run, never leave a partial entry"
+            );
+        }
         assert_ne!(selected_corrupted, selected_before);
 
         let (recovered_page, recovered_revision) = load_application_exact(&reopened, "Root.md");
@@ -45725,11 +45748,18 @@ mod tests {
                 .any(|window| window == b"accepted after retained scratch recovery")),
             "the direct graph projection must contain the accepted post-recovery edit"
         );
-        let selected_after_save = recursive_file_bytes(&selected_run);
-        assert_eq!(
-            selected_after_save, selected_corrupted,
-            "the accepted post-recovery save must not reuse or alter abandoned run {selected_run_id}"
-        );
+        if selected_run.is_dir() {
+            assert_eq!(
+                recursive_file_bytes(&selected_run),
+                selected_corrupted,
+                "the accepted post-recovery save must not reuse or alter abandoned run {selected_run_id}"
+            );
+        } else {
+            assert!(
+                !selected_run.exists(),
+                "later lifecycle work must not recreate a partially retired refused run"
+            );
+        }
         assert!(matches!(
             reopened.clean_shutdown(),
             Ok(SyncShutdownOutcome::Safe(_))
