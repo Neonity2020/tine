@@ -405,6 +405,12 @@ struct ManagedApplicationQueryInstrumentation {
     sparse_ancestor_rows: usize,
     sparse_parser_rows: usize,
     sparse_overlay_rows: usize,
+    sparse_sqlite_rows_fetched: usize,
+    sparse_overlay_index_visits: usize,
+    sparse_overlay_candidate_visits: usize,
+    sparse_overlay_structure_lookups: usize,
+    sparse_overlay_raw_bytes_cloned: usize,
+    sparse_masked_page_fast_forwards: usize,
     sparse_dto_constructions: usize,
     full_inventory_passes: usize,
     inventory_pages: usize,
@@ -451,7 +457,9 @@ enum ManagedTaskQueryOverlayStateSnapshot {
         kind: ManagedTextKind,
         format: Format,
         preamble: Option<String>,
-        blocks: Vec<(BlockId, Option<BlockId>, String, String, Option<LogseqUuid>)>,
+        structures: Vec<(BlockId, Option<BlockId>, String)>,
+        candidates: Vec<(BlockId, String, Option<LogseqUuid>)>,
+        candidate_ids_by_marker: Vec<(String, Vec<BlockId>)>,
     },
     Incomplete,
 }
@@ -7109,11 +7117,11 @@ enum PendingManagedLocalCommit {
     Response(TrustedLocalCommitted),
 }
 
-/// Parser-owned input retained for one exact, not-yet-materialized page.
+/// Parser-owned sparse input retained for one exact, not-yet-materialized page.
 ///
-/// This is deliberately shallow: Q2 can reconstruct candidate blocks and
-/// their ancestry without reparsing a complete page at query time, but it
-/// cannot obtain task semantics from SQLite's derived facets.
+/// Every block contributes only immutable structure. Raw parser input and UUID
+/// identity are retained only for blocks selected by the exact canonical task
+/// marker index, so a later query never has to copy or scan the whole hot page.
 #[derive(Clone, Debug)]
 struct LatestTaskQueryOverlayPage {
     page_id: PageId,
@@ -7122,23 +7130,21 @@ struct LatestTaskQueryOverlayPage {
     kind: ManagedTextKind,
     format: Format,
     preamble: Option<String>,
-    blocks: BTreeMap<BlockId, LatestTaskQueryOverlayBlock>,
+    structures: BTreeMap<BlockId, LatestTaskQueryOverlayStructure>,
+    candidates: BTreeMap<BlockId, LatestTaskQueryOverlayCandidate>,
+    candidate_ids_by_marker: BTreeMap<String, Vec<BlockId>>,
 }
 
 #[derive(Clone, Debug)]
-struct LatestTaskQueryOverlayBlock {
-    block_id: BlockId,
+struct LatestTaskQueryOverlayStructure {
     parent: Option<BlockId>,
     order: String,
-    content: String,
+}
+
+#[derive(Clone, Debug)]
+struct LatestTaskQueryOverlayCandidate {
+    raw: String,
     logseq_uuid: Option<LogseqUuid>,
-    // These are captured from the already parsed application DTO at the
-    // serialized save/recovery seam.  Q2 may enumerate marker candidates
-    // without reparsing every hot block just to rediscover task headers.
-    marker: Option<String>,
-    priority: Option<String>,
-    scheduled: Option<String>,
-    deadline: Option<String>,
 }
 
 /// Every locally newest projection frame has one entry.  An incomplete entry
@@ -7265,7 +7271,12 @@ fn latest_task_query_overlay_page_from_application(
         .iter()
         .map(|block| (block.block_id, block))
         .collect::<HashMap<_, _>>();
-    let mut blocks = BTreeMap::new();
+    if materialized.len() != current.editor.blocks.len() {
+        return Err(());
+    }
+    let mut structures = BTreeMap::new();
+    let mut candidates = BTreeMap::new();
+    let mut candidate_ids_by_marker = BTreeMap::<String, Vec<BlockId>>::new();
     for (index, parsed_block) in parsed.iter().enumerate() {
         let SyncEditorBlockKey::Existing(id) = &current.editor.dto.blocks[index].key else {
             return Err(());
@@ -7273,29 +7284,48 @@ fn latest_task_query_overlay_page_from_application(
         let block_id = parse_editor_block_id(id).map_err(|_| ())?;
         let materialized = materialized.get(&block_id).ok_or(())?;
         if materialized.content != parsed_block.block.raw
-            || blocks
+            || !sparse_task_query_order_is_valid(&materialized.order)
+            || structures
                 .insert(
                     block_id,
-                    LatestTaskQueryOverlayBlock {
-                        block_id,
+                    LatestTaskQueryOverlayStructure {
                         parent: materialized.parent,
                         order: materialized.order.clone(),
-                        content: parsed_block.block.raw.clone(),
-                        logseq_uuid: materialized.logseq_uuid,
-                        marker: parsed_block
-                            .block
-                            .marker
-                            .as_deref()
-                            .map(str::to_ascii_uppercase),
-                        priority: parsed_block.block.priority.clone(),
-                        scheduled: parsed_block.block.scheduled.clone(),
-                        deadline: parsed_block.block.deadline.clone(),
                     },
                 )
                 .is_some()
         {
             return Err(());
         }
+        if let Some(marker) = parsed_block.block.marker.as_deref() {
+            let marker = marker.to_ascii_uppercase();
+            if marker.is_empty()
+                || candidates
+                    .insert(
+                        block_id,
+                        LatestTaskQueryOverlayCandidate {
+                            raw: parsed_block.block.raw.clone(),
+                            logseq_uuid: materialized.logseq_uuid,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(());
+            }
+            candidate_ids_by_marker
+                .entry(marker)
+                .or_default()
+                .push(block_id);
+        }
+    }
+    if structures.len() != materialized.len()
+        || structures.values().any(|structure| {
+            structure
+                .parent
+                .is_some_and(|parent| !structures.contains_key(&parent))
+        })
+    {
+        return Err(());
     }
     Ok(LatestTaskQueryOverlayPage {
         page_id: current.editor.page.page_id,
@@ -7304,7 +7334,9 @@ fn latest_task_query_overlay_page_from_application(
         kind: current.editor.page.kind,
         format: current.page.format,
         preamble: current.page.pre_block.clone(),
-        blocks,
+        structures,
+        candidates,
+        candidate_ids_by_marker,
     })
 }
 
@@ -7378,6 +7410,12 @@ struct ManagedSparseTaskQueryMetrics {
     ancestor_rows: usize,
     parser_rows: usize,
     overlay_rows: usize,
+    sqlite_rows_fetched: usize,
+    overlay_index_visits: usize,
+    overlay_candidate_visits: usize,
+    overlay_structure_lookups: usize,
+    overlay_raw_bytes_cloned: usize,
+    masked_page_fast_forwards: usize,
     dto_constructions: usize,
 }
 
@@ -7483,11 +7521,10 @@ fn sparse_task_query_dfs_key(leaf_to_root: Vec<(String, BlockId)>) -> Vec<String
 
 fn sparse_task_query_dfs_order(
     candidate: &ManagedSparseTaskQueryCandidate,
-    overlay_structures: &HashMap<BlockId, ManagedSparseTaskQueryStructure>,
-    overlay_page_ids: &HashSet<PageId>,
+    overlay_pages: &HashMap<PageId, &LatestTaskQueryOverlayPage>,
     read: &SqliteMaterializedRead<'_>,
     structure_cache: &mut HashMap<BlockId, ManagedSparseTaskQueryStructure>,
-    ancestor_rows: &mut usize,
+    metrics: &mut ManagedSparseTaskQueryMetrics,
 ) -> Result<Vec<String>, ManagedSparseTaskQueryFallback> {
     let mut seen = HashSet::new();
     let mut block_id = candidate.block_id;
@@ -7509,19 +7546,22 @@ fn sparse_task_query_dfs_order(
             break;
         };
         block_id = parent;
-        structure = if let Some(structure) = overlay_structures.get(&parent) {
-            structure.clone()
-        } else {
-            // A page masked by a latest frame must obtain every ancestor from
-            // that exact frame as well.  Falling through to SQLite here would
-            // silently combine two authority epochs.
-            if overlay_page_ids.contains(&candidate.page_id) {
-                return Err(ManagedSparseTaskQueryFallback::Structure);
+        structure = if let Some(page) = overlay_pages.get(&candidate.page_id) {
+            metrics.overlay_structure_lookups = metrics.overlay_structure_lookups.saturating_add(1);
+            let structure = page
+                .structures
+                .get(&parent)
+                .ok_or(ManagedSparseTaskQueryFallback::Structure)?;
+            ManagedSparseTaskQueryStructure {
+                page_id: candidate.page_id,
+                parent: structure.parent,
+                order: structure.order.clone(),
             }
+        } else {
             if let Some(structure) = structure_cache.get(&parent) {
                 structure.clone()
             } else {
-                *ancestor_rows = ancestor_rows.saturating_add(1);
+                metrics.ancestor_rows = metrics.ancestor_rows.saturating_add(1);
                 let row = read
                     .block_structure(parent)
                     .map_err(|_| ManagedSparseTaskQueryFallback::Structure)?
@@ -9959,17 +9999,29 @@ impl RuntimeActor {
                                     kind: page.kind,
                                     format: page.format,
                                     preamble: page.preamble.clone(),
-                                    blocks: page
-                                        .blocks
-                                        .values()
-                                        .map(|block| {
+                                    structures: page
+                                        .structures
+                                        .iter()
+                                        .map(|(block_id, structure)| {
+                                            (*block_id, structure.parent, structure.order.clone())
+                                        })
+                                        .collect(),
+                                    candidates: page
+                                        .candidates
+                                        .iter()
+                                        .map(|(block_id, candidate)| {
                                             (
-                                                block.block_id,
-                                                block.parent,
-                                                block.order.clone(),
-                                                block.content.clone(),
-                                                block.logseq_uuid,
+                                                *block_id,
+                                                candidate.raw.clone(),
+                                                candidate.logseq_uuid,
                                             )
+                                        })
+                                        .collect(),
+                                    candidate_ids_by_marker: page
+                                        .candidate_ids_by_marker
+                                        .iter()
+                                        .map(|(marker, block_ids)| {
+                                            (marker.clone(), block_ids.clone())
                                         })
                                         .collect(),
                                 }
@@ -10016,10 +10068,16 @@ impl RuntimeActor {
         let LatestTaskQueryOverlayState::Complete(page) = &mut entry.state else {
             panic!("malformed-order test requires a complete exact overlay")
         };
-        page.blocks
-            .values_mut()
+        let candidate_id = page
+            .candidate_ids_by_marker
+            .values()
+            .flatten()
             .next()
-            .expect("complete test overlay retains a block")
+            .copied()
+            .expect("complete test overlay retains a task candidate");
+        page.structures
+            .get_mut(&candidate_id)
+            .expect("task candidate retains exact structure")
             .order
             .clear();
     }
@@ -10104,24 +10162,42 @@ impl RuntimeActor {
     }
 
     #[cfg(test)]
-    fn note_managed_sparse_task_query_completion(
-        &self,
-        candidate_rows: usize,
-        ancestor_rows: usize,
-        parser_rows: usize,
-        overlay_rows: usize,
-        dto_constructions: usize,
-    ) {
+    fn note_managed_sparse_task_query_completion(&self, metrics: ManagedSparseTaskQueryMetrics) {
         let mut current = self.managed_application_query_instrumentation.get();
         current.sparse_completions = current.sparse_completions.saturating_add(1);
-        current.sparse_candidate_rows =
-            current.sparse_candidate_rows.saturating_add(candidate_rows);
-        current.sparse_ancestor_rows = current.sparse_ancestor_rows.saturating_add(ancestor_rows);
-        current.sparse_parser_rows = current.sparse_parser_rows.saturating_add(parser_rows);
-        current.sparse_overlay_rows = current.sparse_overlay_rows.saturating_add(overlay_rows);
+        current.sparse_candidate_rows = current
+            .sparse_candidate_rows
+            .saturating_add(metrics.candidate_rows);
+        current.sparse_ancestor_rows = current
+            .sparse_ancestor_rows
+            .saturating_add(metrics.ancestor_rows);
+        current.sparse_parser_rows = current
+            .sparse_parser_rows
+            .saturating_add(metrics.parser_rows);
+        current.sparse_overlay_rows = current
+            .sparse_overlay_rows
+            .saturating_add(metrics.overlay_rows);
+        current.sparse_sqlite_rows_fetched = current
+            .sparse_sqlite_rows_fetched
+            .saturating_add(metrics.sqlite_rows_fetched);
+        current.sparse_overlay_index_visits = current
+            .sparse_overlay_index_visits
+            .saturating_add(metrics.overlay_index_visits);
+        current.sparse_overlay_candidate_visits = current
+            .sparse_overlay_candidate_visits
+            .saturating_add(metrics.overlay_candidate_visits);
+        current.sparse_overlay_structure_lookups = current
+            .sparse_overlay_structure_lookups
+            .saturating_add(metrics.overlay_structure_lookups);
+        current.sparse_overlay_raw_bytes_cloned = current
+            .sparse_overlay_raw_bytes_cloned
+            .saturating_add(metrics.overlay_raw_bytes_cloned);
+        current.sparse_masked_page_fast_forwards = current
+            .sparse_masked_page_fast_forwards
+            .saturating_add(metrics.masked_page_fast_forwards);
         current.sparse_dto_constructions = current
             .sparse_dto_constructions
-            .saturating_add(dto_constructions);
+            .saturating_add(metrics.dto_constructions);
         self.managed_application_query_instrumentation.set(current);
     }
 
@@ -11575,13 +11651,7 @@ impl RuntimeActor {
         match self.application_sparse_task_query_ready(&eligibility, query, max_rows, max_bytes) {
             Ok((result, metrics)) => {
                 #[cfg(test)]
-                self.note_managed_sparse_task_query_completion(
-                    metrics.candidate_rows,
-                    metrics.ancestor_rows,
-                    metrics.parser_rows,
-                    metrics.overlay_rows,
-                    metrics.dto_constructions,
-                );
+                self.note_managed_sparse_task_query_completion(metrics);
                 let _ = metrics;
                 Ok(result)
             }
@@ -11610,104 +11680,100 @@ impl RuntimeActor {
         ),
         ManagedSparseTaskQueryFallback,
     > {
-        let markers = eligibility.markers.iter().collect::<HashSet<_>>();
-        if markers.is_empty() {
+        if eligibility.markers.is_empty() {
             return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
         }
 
-        // Copy the tiny pending suffix out of actor-local state.  It has to be
-        // a one-for-one companion to the latest frames: any absent or
-        // incomplete entry is an authority boundary, not an empty overlay.
-        let (overlay_pages, overlay_structures, masked_paths, masked_page_ids) = {
-            let managed = self
-                .managed_local
-                .as_ref()
+        // Borrow the exact pending suffix in place. It has to be a one-for-one
+        // companion to the latest frames: any absent or incomplete entry is an
+        // authority boundary, not an empty overlay.
+        let managed = self
+            .managed_local
+            .as_ref()
+            .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
+        if managed.latest_projection_frames.len() != managed.latest_task_query_overlay.len() {
+            return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
+        }
+        let mut overlay_pages = Vec::new();
+        let mut overlay_pages_by_id = HashMap::new();
+        let mut masked_paths = HashSet::new();
+        let mut masked_page_ids = HashSet::new();
+        for (key, frame) in &managed.latest_projection_frames {
+            let entry = managed
+                .latest_task_query_overlay
+                .get(key)
                 .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
-            if managed.latest_projection_frames.len() != managed.latest_task_query_overlay.len() {
+            if entry.sequence != frame.sequence() || entry.path.as_str() != key {
                 return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
             }
-            let mut pages = Vec::new();
-            let mut structures = HashMap::new();
-            let mut paths = HashSet::new();
-            let mut page_ids = HashSet::new();
-            for (key, frame) in &managed.latest_projection_frames {
-                let entry = managed
-                    .latest_task_query_overlay
-                    .get(key)
-                    .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
-                if entry.sequence != frame.sequence() || entry.path.as_str() != key {
-                    return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
-                }
-                let LatestTaskQueryOverlayState::Complete(page) = &entry.state else {
-                    return Err(ManagedSparseTaskQueryFallback::OverlayIncomplete);
-                };
-                if page.path != entry.path
-                    || LogicalPageName::parse(page.name.clone()).is_err()
-                    || page.format != Format::from_path(Path::new(page.path.as_str()))
-                    || !paths.insert(page.path.clone())
-                    || !page_ids.insert(page.page_id)
-                {
-                    return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
-                }
-                for (block_id, block) in &page.blocks {
-                    if *block_id != block.block_id
-                        || structures
-                            .insert(
-                                *block_id,
-                                ManagedSparseTaskQueryStructure {
-                                    page_id: page.page_id,
-                                    parent: block.parent,
-                                    order: block.order.clone(),
-                                },
-                            )
-                            .is_some()
-                    {
-                        return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
-                    }
-                    if !sparse_task_query_order_is_valid(&block.order) {
-                        return Err(ManagedSparseTaskQueryFallback::Structure);
-                    }
-                }
-                pages.push(page.clone());
+            let LatestTaskQueryOverlayState::Complete(page) = &entry.state else {
+                return Err(ManagedSparseTaskQueryFallback::OverlayIncomplete);
+            };
+            if page.path != entry.path
+                || LogicalPageName::parse(page.name.clone()).is_err()
+                || page.format != Format::from_path(Path::new(page.path.as_str()))
+                || !masked_paths.insert(page.path.clone())
+                || !masked_page_ids.insert(page.page_id)
+                || overlay_pages_by_id.insert(page.page_id, page).is_some()
+            {
+                return Err(ManagedSparseTaskQueryFallback::OverlayAuthority);
             }
-            (pages, structures, paths, page_ids)
-        };
+            overlay_pages.push(page);
+        }
 
         let mut metrics = ManagedSparseTaskQueryMetrics::default();
         let mut candidates = BTreeMap::<BlockId, ManagedSparseTaskQueryCandidate>::new();
         for page in &overlay_pages {
-            let sparse_page = crate::query::ApplicationSparseQueryPage {
-                name: page.name.clone(),
-                path: page.path.as_str().to_owned(),
-                kind: sparse_task_query_page_kind(page.kind),
-                is_org: page.format == Format::Org,
-                recency: sparse_task_query_page_recency(
-                    &self.graph.root,
-                    &page.name,
-                    &page.path,
-                    page.kind,
-                ),
-            };
-            for block in page.blocks.values() {
-                if !block
-                    .marker
-                    .as_ref()
-                    .is_some_and(|marker| markers.contains(marker))
-                {
+            let mut sparse_page = None;
+            for marker in &eligibility.markers {
+                metrics.overlay_index_visits = metrics.overlay_index_visits.saturating_add(1);
+                let Some(block_ids) = page.candidate_ids_by_marker.get(marker) else {
                     continue;
-                }
-                metrics.overlay_rows = metrics.overlay_rows.saturating_add(1);
-                candidates.entry(block.block_id).or_insert_with(|| {
-                    ManagedSparseTaskQueryCandidate {
-                        block_id: block.block_id,
+                };
+                for block_id in block_ids {
+                    metrics.overlay_candidate_visits =
+                        metrics.overlay_candidate_visits.saturating_add(1);
+                    metrics.overlay_rows = metrics.overlay_rows.saturating_add(1);
+                    metrics.overlay_structure_lookups =
+                        metrics.overlay_structure_lookups.saturating_add(1);
+                    let structure = page
+                        .structures
+                        .get(block_id)
+                        .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
+                    let candidate = page
+                        .candidates
+                        .get(block_id)
+                        .ok_or(ManagedSparseTaskQueryFallback::OverlayAuthority)?;
+                    let sparse_page = sparse_page.get_or_insert_with(|| {
+                        crate::query::ApplicationSparseQueryPage {
+                            name: page.name.clone(),
+                            path: page.path.as_str().to_owned(),
+                            kind: sparse_task_query_page_kind(page.kind),
+                            is_org: page.format == Format::Org,
+                            recency: sparse_task_query_page_recency(
+                                &self.graph.root,
+                                &page.name,
+                                &page.path,
+                                page.kind,
+                            ),
+                        }
+                    });
+                    metrics.overlay_raw_bytes_cloned = metrics
+                        .overlay_raw_bytes_cloned
+                        .saturating_add(candidate.raw.len());
+                    let candidate = ManagedSparseTaskQueryCandidate {
+                        block_id: *block_id,
                         page_id: page.page_id,
-                        parent: block.parent,
-                        order: block.order.clone(),
-                        raw: block.content.clone(),
-                        identity: sparse_task_query_identity(block.block_id, block.logseq_uuid),
+                        parent: structure.parent,
+                        order: structure.order.clone(),
+                        raw: candidate.raw.clone(),
+                        identity: sparse_task_query_identity(*block_id, candidate.logseq_uuid),
                         page: sparse_page.clone(),
+                    };
+                    if candidates.insert(*block_id, candidate).is_some() {
+                        return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
                     }
-                });
+                }
             }
         }
 
@@ -11726,6 +11792,8 @@ impl RuntimeActor {
                     break;
                 }
                 let len = rows.len();
+                metrics.sqlite_rows_fetched = metrics.sqlite_rows_fetched.saturating_add(len);
+                let mut fast_forwarded_masked_page = false;
                 for row in rows {
                     cursor = Some((row.page_id, row.block_id));
                     // Path *and* page-id masks defend rename/replacement and
@@ -11734,7 +11802,12 @@ impl RuntimeActor {
                     if masked_paths.contains(&row.page_path)
                         || masked_page_ids.contains(&row.page_id)
                     {
-                        continue;
+                        cursor =
+                            Some((row.page_id, BlockId::from_uuid(Uuid::from_u128(u128::MAX))));
+                        metrics.masked_page_fast_forwards =
+                            metrics.masked_page_fast_forwards.saturating_add(1);
+                        fast_forwarded_masked_page = true;
+                        break;
                     }
                     let page = if let Some(page) = page_cache.get(&row.page_id) {
                         if !page.matches_joined_row(&row) {
@@ -11756,7 +11829,12 @@ impl RuntimeActor {
                         sparse_page
                     };
                     let candidate = managed_sparse_task_query_candidate_from_sqlite(row, page);
-                    candidates.entry(candidate.block_id).or_insert(candidate);
+                    if candidates.insert(candidate.block_id, candidate).is_some() {
+                        return Err(ManagedSparseTaskQueryFallback::CandidateAuthority);
+                    }
+                }
+                if fast_forwarded_masked_page {
+                    continue;
                 }
                 if len < BATCH {
                     break;
@@ -11775,11 +11853,10 @@ impl RuntimeActor {
         for candidate in candidates.into_values() {
             let dfs_order = sparse_task_query_dfs_order(
                 &candidate,
-                &overlay_structures,
-                &masked_page_ids,
+                &overlay_pages_by_id,
                 &read,
                 &mut structure_cache,
-                &mut metrics.ancestor_rows,
+                &mut metrics,
             )?;
             if !dfs_keys.insert((candidate.page_id, dfs_order.clone())) {
                 return Err(ManagedSparseTaskQueryFallback::Structure);
@@ -23762,23 +23839,27 @@ mod tests {
                 kind,
                 format,
                 preamble,
-                blocks,
+                structures,
+                candidates,
+                candidate_ids_by_marker,
             } => {
                 assert_eq!(name, "Overlay Authority");
                 assert_eq!(*kind, ManagedTextKind::Page);
                 assert_eq!(*format, Format::Md);
                 assert_eq!(preamble.as_deref(), Some("query:: overlay"));
-                assert_eq!(blocks.len(), 3);
-                assert!(blocks.iter().any(|(_, parent, _, content, _)| {
-                    parent.is_some()
-                        && content.contains("TODO [#A] child")
-                        && content.contains("SCHEDULED:")
-                        && content.contains("DEADLINE:")
+                assert_eq!(structures.len(), 3);
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates.iter().any(|(_, raw, _)| {
+                    raw.contains("TODO [#A] child")
+                        && raw.contains("SCHEDULED:")
+                        && raw.contains("DEADLINE:")
                 }));
-                assert!(blocks
+                assert!(candidates
                     .iter()
-                    .any(|(_, parent, _, content, _)| parent.is_some()
-                        && content == "TODO second root"));
+                    .any(|(_, raw, _)| raw == "TODO second root"));
+                assert_eq!(candidate_ids_by_marker.len(), 1);
+                assert_eq!(candidate_ids_by_marker[0].0, "TODO");
+                assert_eq!(candidate_ids_by_marker[0].1.len(), 2);
             }
             ManagedTaskQueryOverlayStateSnapshot::Incomplete => {
                 panic!("accepted exact page did not construct a shallow overlay")
@@ -23813,6 +23894,17 @@ mod tests {
         assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
         assert_eq!(counters.sparse_overlay_rows, 2, "{counters:?}");
         assert_eq!(counters.sparse_candidate_rows, 2, "{counters:?}");
+        assert_eq!(counters.sparse_sqlite_rows_fetched, 2, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_index_visits, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_candidate_visits, 2, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_structure_lookups, 4, "{counters:?}");
+        assert_eq!(
+            counters.sparse_overlay_raw_bytes_cloned,
+            "TODO [#A] child SCHEDULED: <2026-08-10 Mon> DEADLINE: <2026-08-12 Wed>".len()
+                + "TODO second root".len(),
+            "{counters:?}"
+        );
+        assert_eq!(counters.sparse_masked_page_fast_forwards, 1, "{counters:?}");
         assert_eq!(counters.sparse_ancestor_rows, 0, "{counters:?}");
         assert_eq!(counters.sparse_parser_rows, 2, "{counters:?}");
         assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
@@ -23943,6 +24035,19 @@ mod tests {
             "the sparse path must use the exact actor-local overlay rather than hydrating pages"
         );
         assert!(
+            sparse_query.contains("candidate_ids_by_marker.get(marker)"),
+            "the hot sparse path must enter each page through its exact marker index"
+        );
+        assert!(
+            !sparse_query.contains("overlay_pages.clone()")
+                && !sparse_query.contains("latest_task_query_overlay.clone()"),
+            "the sparse path must borrow overlay pages rather than cloning them"
+        );
+        assert!(
+            !sparse_query.contains("structures.values()"),
+            "the sparse path must never scan every hot block structure"
+        );
+        assert!(
             !sparse_query.contains("application_navigation_overlay_ready"),
             "the sparse path must not reparse the pending overlay at query time"
         );
@@ -24038,6 +24143,30 @@ mod tests {
             assert_eq!(counters.sparse_fallbacks, 0, "{query}: {counters:?}");
             assert!(counters.sparse_candidate_rows >= 2, "{query}: {counters:?}");
             assert_eq!(
+                counters.sparse_sqlite_rows_fetched, counters.sparse_candidate_rows,
+                "settled SQLite reads must stay candidate-row bounded: {query}: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_index_visits, 0,
+                "{query}: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_candidate_visits, 0,
+                "{query}: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_structure_lookups, 0,
+                "{query}: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_raw_bytes_cloned, 0,
+                "{query}: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_masked_page_fast_forwards, 0,
+                "{query}: {counters:?}"
+            );
+            assert_eq!(
                 counters.sparse_parser_rows, counters.sparse_candidate_rows,
                 "only enumerated task candidates may be parsed: {query}: {counters:?}"
             );
@@ -24121,6 +24250,12 @@ mod tests {
         assert_eq!(counters.sparse_completions, 1, "{counters:?}");
         assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
         assert_eq!(counters.sparse_candidate_rows, 1, "{counters:?}");
+        assert_eq!(counters.sparse_sqlite_rows_fetched, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_index_visits, 0, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_candidate_visits, 0, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_structure_lookups, 0, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_raw_bytes_cloned, 0, "{counters:?}");
+        assert_eq!(counters.sparse_masked_page_fast_forwards, 0, "{counters:?}");
         assert_eq!(counters.sparse_parser_rows, 1, "{counters:?}");
         assert_eq!(
             counters.sparse_ancestor_rows, 4,
@@ -24131,6 +24266,269 @@ mod tests {
         assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
         assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
         assert_eq!(counters.sparse_dto_constructions, 1, "{counters:?}");
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    fn assert_managed_sparse_task_query_hot_overlay_is_candidate_bounded(
+        total_blocks: usize,
+        label: &str,
+        seed: u128,
+    ) {
+        const MAX_ROWS: usize = 128;
+        const MAX_BYTES: usize = 1024 * 1024;
+        const TASK_RAW: &str = "TODO only hot task";
+        assert!(total_blocks >= 5);
+        let fixture = ActivationFixture::empty(label, seed);
+        let path = format!("notes/Sparse Hot {total_blocks}.md");
+        let page_name = format!("Sparse Hot {total_blocks}");
+        let mut body = String::with_capacity(total_blocks * 28);
+        for block in 0..total_blocks - 5 {
+            body.push_str(&format!("- unrelated hot block {block}\n"));
+        }
+        body.push_str(
+            "- ancestor one\n  - ancestor two\n    - ancestor three\n      - ancestor four\n        - DONE only hot task\n",
+        );
+        let file = fixture.graph_root.join(&path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, body.as_bytes()).unwrap();
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("hot-overlay fixture activates");
+        drive_initial_feed(&handle);
+
+        fn rewrite_task(blocks: &mut [BlockDto]) -> bool {
+            for block in blocks {
+                if block.raw == "DONE only hot task" {
+                    block.raw = TASK_RAW.into();
+                    return true;
+                }
+                if rewrite_task(&mut block.children) {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let (mut page, revision) = load_application_exact(&handle, &path);
+        assert_eq!(flatten_application_blocks(&page.blocks).len(), total_blocks);
+        assert!(rewrite_task(&mut page.blocks));
+        let _ = accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: path.clone(),
+                        revision,
+                    },
+                    page,
+                })
+                .unwrap(),
+            &page_name,
+            SyncPageKind::Page,
+        );
+        assert_eq!(handle.status().unwrap().managed_local_pending, 1);
+
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: "(task TODO)".into(),
+                max_rows: MAX_ROWS,
+                max_bytes: MAX_BYTES,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(managed),
+        } = outcome
+        else {
+            panic!("hot one-match sparse query returned the wrong outcome: {outcome:?}")
+        };
+        assert_managed_simple_query_matches_direct(
+            &format!("{total_blocks}-block hot one-match candidate receipt"),
+            managed,
+            Graph::open(&fixture.graph_root).run_query_bounded("(task TODO)", MAX_ROWS, MAX_BYTES),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
+        assert_eq!(counters.sparse_completions, 1, "{counters:?}");
+        assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
+        assert_eq!(counters.sparse_candidate_rows, 1, "{counters:?}");
+        assert_eq!(counters.sparse_parser_rows, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_rows, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_index_visits, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_candidate_visits, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_structure_lookups, 5, "{counters:?}");
+        assert_eq!(
+            counters.sparse_overlay_raw_bytes_cloned,
+            TASK_RAW.len(),
+            "{counters:?}"
+        );
+        assert_eq!(counters.sparse_sqlite_rows_fetched, 0, "{counters:?}");
+        assert_eq!(counters.sparse_masked_page_fast_forwards, 0, "{counters:?}");
+        assert_eq!(counters.sparse_ancestor_rows, 0, "{counters:?}");
+        assert_eq!(counters.sparse_dto_constructions, 1, "{counters:?}");
+        assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+        assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+        assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
+
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+    }
+
+    #[test]
+    fn managed_sparse_task_query_maximum_hot_overlay_is_candidate_bounded() {
+        // A complete application save can retain at most
+        // `MAX_SYNC_EDITOR_BLOCKS` (511) blocks: the 1,024-row mutation budget
+        // reserves two operations per block plus the page preamble. This is
+        // therefore the largest product-reachable hot overlay; the separate
+        // 20k regression covers settled SQLite state.
+        assert_managed_sparse_task_query_hot_overlay_is_candidate_bounded(
+            MAX_SYNC_EDITOR_BLOCKS,
+            "sync-runtime-sparse-task-query-hot-maximum",
+            0xa350,
+        );
+    }
+
+    #[test]
+    fn managed_sparse_task_query_fast_forwards_stale_masked_task_page() {
+        // The public complete-save limit also makes this the largest stale
+        // masked range that an existing application save can create.
+        const DENSE_TASKS: usize = MAX_SYNC_EDITOR_BLOCKS;
+        const BATCH: usize = 512;
+        const MAX_ROWS: usize = 1_024;
+        const MAX_BYTES: usize = 4 * 1024 * 1024;
+        const OVERLAY_RAW: &str = "TODO current overlay candidate";
+        let fixture = RuntimeHostFixture::safe("sync-runtime-sparse-task-query-masked-range");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+
+        let dense_body = (0..DENSE_TASKS)
+            .map(|block| format!("- TODO stale candidate {block}\n"))
+            .collect::<String>();
+        let first_path = "content/nested pages/Masked Range A.md";
+        let second_path = "content/nested pages/Masked Range B.md";
+        admit_external_page(&handle, &fixture, first_path, dense_body.as_bytes());
+        admit_external_page(&handle, &fixture, second_path, dense_body.as_bytes());
+        let first_id = load_editor_named(&handle, "Masked Range A", SyncPageKind::Page)
+            .page_id
+            .parse::<PageId>()
+            .unwrap();
+        let second_id = load_editor_named(&handle, "Masked Range B", SyncPageKind::Page)
+            .page_id
+            .parse::<PageId>()
+            .unwrap();
+        let (masked_path, masked_name, later_path, later_name, masked_page_id) =
+            if first_id < second_id {
+                (
+                    first_path,
+                    "Masked Range A",
+                    second_path,
+                    "Masked Range B",
+                    first_id,
+                )
+            } else {
+                (
+                    second_path,
+                    "Masked Range B",
+                    first_path,
+                    "Masked Range A",
+                    second_id,
+                )
+            };
+        admit_external_page(
+            &handle,
+            &fixture,
+            later_path,
+            b"- TODO later unmasked candidate\n",
+        );
+
+        let (mut page, revision) = load_application_exact(&handle, masked_path);
+        assert_eq!(page.blocks.len(), DENSE_TASKS);
+        for (index, block) in page.blocks.iter_mut().enumerate() {
+            block.raw = if index == 0 {
+                OVERLAY_RAW.into()
+            } else {
+                format!("unrelated current block {index}")
+            };
+        }
+        let _ = accepted_application_save(
+            &handle,
+            handle
+                .save_application_page(SyncApplicationPageSaveRequest {
+                    target: SyncApplicationPageSaveTarget::Existing {
+                        path: masked_path.into(),
+                        revision,
+                    },
+                    page,
+                })
+                .unwrap(),
+            masked_name,
+            SyncPageKind::Page,
+        );
+        let snapshot = handle.managed_task_query_overlay_snapshot().unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert!(matches!(
+            &snapshot.entries[0].state,
+            ManagedTaskQueryOverlayStateSnapshot::Complete { page_id, .. }
+                if *page_id == masked_page_id
+        ));
+
+        handle
+            .reset_managed_application_query_instrumentation()
+            .unwrap();
+        let outcome = handle
+            .application_navigation(SyncApplicationNavigationRequest::SimpleQuery {
+                query: "(task TODO)".into(),
+                max_rows: MAX_ROWS,
+                max_bytes: MAX_BYTES,
+            })
+            .unwrap();
+        let SyncApplicationNavigationOutcome::Loaded {
+            reply: SyncApplicationNavigationReply::SimpleQuery(managed),
+        } = outcome
+        else {
+            panic!("masked-range sparse query returned the wrong outcome: {outcome:?}")
+        };
+        assert!(managed.groups.iter().any(|group| group.page == later_name));
+        assert_managed_simple_query_matches_direct(
+            "masked stale task range preserves later unmasked page",
+            managed,
+            Graph::open(fixture.graph_root()).run_query_bounded("(task TODO)", MAX_ROWS, MAX_BYTES),
+        );
+        let counters = handle.managed_application_query_instrumentation().unwrap();
+        assert_eq!(counters.sparse_attempts, 1, "{counters:?}");
+        assert_eq!(counters.sparse_completions, 1, "{counters:?}");
+        assert_eq!(counters.sparse_fallbacks, 0, "{counters:?}");
+        assert_eq!(counters.sparse_candidate_rows, 2, "{counters:?}");
+        assert_eq!(counters.sparse_parser_rows, 2, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_rows, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_index_visits, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_candidate_visits, 1, "{counters:?}");
+        assert_eq!(counters.sparse_overlay_structure_lookups, 1, "{counters:?}");
+        assert_eq!(
+            counters.sparse_overlay_raw_bytes_cloned,
+            OVERLAY_RAW.len(),
+            "{counters:?}"
+        );
+        assert_eq!(
+            counters.sparse_sqlite_rows_fetched,
+            BATCH + 1,
+            "one bounded stale batch plus the later live row may cross SQLite: {counters:?}"
+        );
+        assert_eq!(counters.sparse_masked_page_fast_forwards, 1, "{counters:?}");
+        assert_eq!(counters.sparse_ancestor_rows, 0, "{counters:?}");
+        assert_eq!(counters.full_inventory_passes, 0, "{counters:?}");
+        assert_eq!(counters.result_page_hydrations, 0, "{counters:?}");
+        assert_eq!(counters.metadata_page_hydrations, 0, "{counters:?}");
+
+        drain_managed_local(&handle);
         assert!(matches!(
             handle.clean_shutdown().unwrap(),
             SyncShutdownOutcome::Safe(_)
@@ -44050,6 +44448,30 @@ mod tests {
                 "the settled indexed-query receipt must have no overlay candidates: {counters:?}"
             );
             assert_eq!(
+                counters.sparse_sqlite_rows_fetched, counters.sparse_candidate_rows,
+                "settled indexed-query SQLite reads must stay candidate-row bounded: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_index_visits, 0,
+                "settled indexed-query receipt must not visit a hot marker index: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_candidate_visits, 0,
+                "settled indexed-query receipt must not visit hot candidates: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_structure_lookups, 0,
+                "settled indexed-query receipt must not read hot structures: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_overlay_raw_bytes_cloned, 0,
+                "settled indexed-query receipt must not clone hot raw bytes: {counters:?}"
+            );
+            assert_eq!(
+                counters.sparse_masked_page_fast_forwards, 0,
+                "settled indexed-query receipt must not fast-forward masked pages: {counters:?}"
+            );
+            assert_eq!(
                 counters.sparse_dto_constructions, bounded_result_rows,
                 "indexed task query must construct DTOs only for its bounded result rows: {counters:?}"
             );
@@ -44135,7 +44557,7 @@ mod tests {
         let graph_search_p50 = startup_median(&graph_search_samples);
         let graph_search_p95 = startup_p95(&graph_search_samples);
         eprintln!(
-            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_sparse_attempts_max={} indexed_sparse_completions_max={} indexed_sparse_fallbacks_max={} indexed_sparse_candidates_max={} indexed_sparse_ancestors_max={} indexed_sparse_parser_rows_max={} indexed_sparse_overlay_rows_max={} indexed_sparse_dtos_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
+            "managed_query_search_gate fixture={label} pages={total_pages} samples={samples} indexed_p50_ms={:.3} indexed_p95_ms={:.3} regex_all_p50_ms={:.3} regex_all_p95_ms={:.3} graph_search_p50_ms={:.3} graph_search_p95_ms={:.3} indexed_sparse_attempts_max={} indexed_sparse_completions_max={} indexed_sparse_fallbacks_max={} indexed_sparse_candidates_max={} indexed_sparse_sqlite_rows_fetched_max={} indexed_sparse_ancestors_max={} indexed_sparse_parser_rows_max={} indexed_sparse_overlay_rows_max={} indexed_sparse_overlay_index_visits_max={} indexed_sparse_overlay_candidate_visits_max={} indexed_sparse_overlay_structure_lookups_max={} indexed_sparse_overlay_raw_bytes_cloned_max={} indexed_sparse_masked_page_fast_forwards_max={} indexed_sparse_dtos_max={} indexed_inventory_passes_max={} indexed_result_hydrations_max={} indexed_metadata_hydrations_max={} regex_all_inventory_passes_max={} regex_all_result_hydrations_max={} graph_search_inventory_passes_max={} graph_search_result_hydrations_max={}",
             startup_ms(indexed_p50),
             startup_ms(indexed_p95),
             startup_ms(regex_all_p50),
@@ -44146,9 +44568,21 @@ mod tests {
             max_query_gate_counter(&indexed_counters, |counters| counters.sparse_completions),
             max_query_gate_counter(&indexed_counters, |counters| counters.sparse_fallbacks),
             max_query_gate_counter(&indexed_counters, |counters| counters.sparse_candidate_rows),
+            max_query_gate_counter(&indexed_counters, |counters| counters
+                .sparse_sqlite_rows_fetched),
             max_query_gate_counter(&indexed_counters, |counters| counters.sparse_ancestor_rows),
             max_query_gate_counter(&indexed_counters, |counters| counters.sparse_parser_rows),
             max_query_gate_counter(&indexed_counters, |counters| counters.sparse_overlay_rows),
+            max_query_gate_counter(&indexed_counters, |counters| counters
+                .sparse_overlay_index_visits),
+            max_query_gate_counter(&indexed_counters, |counters| counters
+                .sparse_overlay_candidate_visits),
+            max_query_gate_counter(&indexed_counters, |counters| counters
+                .sparse_overlay_structure_lookups),
+            max_query_gate_counter(&indexed_counters, |counters| counters
+                .sparse_overlay_raw_bytes_cloned),
+            max_query_gate_counter(&indexed_counters, |counters| counters
+                .sparse_masked_page_fast_forwards),
             max_query_gate_counter(&indexed_counters, |counters| counters.sparse_dto_constructions),
             max_query_gate_counter(&indexed_counters, |counters| counters.full_inventory_passes),
             max_query_gate_counter(&indexed_counters, |counters| counters.result_page_hydrations),
