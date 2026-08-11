@@ -1880,12 +1880,12 @@
           "crates/tine-core/src/oplog/hot_engine.rs::semantically_wrong_current_path_rows_survive_a_restart_but_fail_before_join",
           "crates/tine-core/src/oplog/hot_engine.rs::schema_twelve_retained_marker_named_by_a_resume_point_refuses_and_fully_replays",
           "crates/tine-core/src/oplog/import.rs::exact_rename_adopts_graph_decoded_destination_name_before_authoring",
-          "crates/tine-core/tests/managed_sync.rs::delivered_rename_moves_the_page_and_rewrites_referrers_as_one_operation"
+          "crates/tine-core/src/oplog/hot_engine_integration_tests.rs::subtree_reorder_and_rename_referrer_transaction_preserve_atomic_semantics"
         ],
         "scenario": "sync.external-name-policy-authority",
         "failBefore": "proven"
       },
-      "notes": "The page and journal regressions change config.edn, reopen from archived authority, apply the external reconciliation transaction, reopen a second time, and assert PageId, accepted logical name, semantic kind, textual referrers, and new-path policy. Every authenticated current-path row is point-checked against exact materialized catalog PageId state before join or import consumption; wrong name digest or kind fails before execution material exists, including after retained-run adoption. Scratch schema 12 and authenticated current-path catalog schema 1 transition to 13 and 2; a schema-12 retained run named by a valid resume point is preserved, refused, and rebuilt only by full immutable-history replay. A real old-path to new-path move still adopts the destination decode, and explicit Tine rename remains the graph-wide RenamePagesAndRewriteReferrers operation."
+      "notes": "The page and journal regressions change config.edn, reopen from archived authority, apply the external reconciliation transaction, reopen a second time, and assert PageId, accepted logical name, semantic kind, textual referrers, and new-path policy. Every authenticated current-path row is point-checked against exact materialized catalog PageId state before join or import consumption; wrong name digest or kind fails before execution material exists, including after retained-run adoption. Scratch schema 12 and authenticated current-path catalog schema 1 transition to 13 and 2; a schema-12 retained run named by a valid resume point is preserved, refused, and rebuilt only by full immutable-history replay. A real old-path to new-path move still adopts the destination decode, and integration coverage keeps the graph-wide RenamePagesAndRewriteReferrers transaction atomic across page metadata, block references, and page-preamble rewrites."
     },
     {
       "id": "REG-SYNC-PROJECTION-R6-DETERMINISTIC-REFUSAL-LIVENESS-001",

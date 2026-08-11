@@ -1317,16 +1317,13 @@ mod tests {
         let dir = scratch("direct-with-inert-legacy-and-recovery");
         let page = dir.join("pages/representative.md");
         let recovery = dir.join(".tine-sync/recovery/v2-returned-from-desktop/receipt");
+        let v1 = dir.join(".tine-sync/v1");
         std::fs::write(&page, "- exact Direct Files bytes\n").unwrap();
-        let initial = Graph::open(&dir);
-        initial
-            .enable_managed_sync(uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
-            .unwrap();
-        drop(initial);
+        std::fs::create_dir_all(v1.join("genesis")).unwrap();
+        std::fs::write(v1.join("genesis/inert-v1-sentinel"), b"legacy v1 bytes\n").unwrap();
         std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
         std::fs::write(&recovery, "preserved provider recovery evidence\n").unwrap();
         let page_before = std::fs::read(&page).unwrap();
-        let v1 = dir.join(".tine-sync/v1");
         let v1_before = tree_bytes(&v1);
         let recovery_before = std::fs::read(&recovery).unwrap();
         let graph_before = tree_bytes(&dir);
