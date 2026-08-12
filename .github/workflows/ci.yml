@@ -194,6 +194,12 @@ jobs:
       - name: Graph-ownership plugin fixture is reproducible and routes runtime IDs
         run: npm run plugin:graph-ownership-fixture:check
 
+      # Its sibling above was gated; this one was referenced by no workflow at
+      # all, despite proving the signed control/revoked pair a revocation has to
+      # distinguish. 0.2 s (GH #331 sweep).
+      - name: Plugin revocation fixtures verify
+        run: npm run plugin:revocation-fixture:check
+
       - name: Launch plugins build and conform
         run: ./scripts/build-community-plugins.sh
 
