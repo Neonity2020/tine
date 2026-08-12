@@ -6731,16 +6731,6 @@ fn validate_private_directory(directory: &Dir, name: &str) -> Result<(), Enrollm
             "{name} is not an opened directory"
         )));
     }
-    #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: geteuid has no arguments or memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err(EnrollmentError::UnsafeNamespace(format!(
-            "{name} is not exclusively writable by the current user"
-        )));
-    }
     Ok(())
 }
 
@@ -7219,7 +7209,7 @@ fn validate_authoritative_file_with_link_gap(
     let link_count = authoritative_file_link_count(file)?;
     if link_count != 1 && !(allow_link_gap && link_count == 2) {
         return Err(EnrollmentError::UnsafeNamespace(format!(
-            "opened {name} has unsafe ownership or links"
+            "opened {name} has unexpected links"
         )));
     }
     Ok(())
@@ -7237,15 +7227,6 @@ fn validate_authoritative_file_without_link_count(
     ) {
         return Err(EnrollmentError::UnsafeNamespace(format!(
             "opened {name} is not a regular file"
-        )));
-    }
-    #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: geteuid has no arguments or memory-safety preconditions.
-        unsafe { libc::geteuid() }
-    {
-        return Err(EnrollmentError::UnsafeNamespace(format!(
-            "opened {name} has unsafe ownership or links"
         )));
     }
     Ok(())

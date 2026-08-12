@@ -40505,13 +40505,23 @@ mod tests {
     }
 
     #[test]
-    fn shared_provider_validation_is_not_unix_uid_coupled() {
-        let source = include_str!("oplog/wire.rs");
+    fn managed_storage_validation_is_not_unix_uid_coupled() {
         let uid_probe = ["gete", "uid"].concat();
-        assert!(
-            !source.contains(&uid_probe),
-            "shared provider admission must not depend on the Tine process uid"
-        );
+        for (module, source) in [
+            ("wire", include_str!("oplog/wire.rs")),
+            ("archive identity", include_str!("oplog/identity.rs")),
+            ("enrollment", include_str!("oplog/enrollment.rs")),
+            ("SQLite projection", include_str!("oplog/sqlite.rs")),
+            (
+                "projection receipts",
+                include_str!("oplog/projection_store.rs"),
+            ),
+        ] {
+            assert!(
+                !source.contains(&uid_probe),
+                "{module} admission must not depend on the Tine process uid"
+            );
+        }
     }
 
     #[test]

@@ -3651,13 +3651,9 @@ fn read_optional_mutation_authority_bounded(
         )));
     }
     #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
+    if metadata.nlink() != 1 {
         return Err(ProjectionStoreError::UnsafeEntry(format!(
-            "projection mutation authority has unsafe ownership or links: {name}"
+            "projection mutation authority has unexpected links: {name}"
         )));
     }
     #[cfg(windows)]
@@ -3827,13 +3823,9 @@ fn validate_mutation_authority_lease_file(
         )));
     }
     #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
+    if metadata.nlink() != 1 {
         return Err(ProjectionStoreError::UnsafeEntry(format!(
-            "projection mutation lease has unsafe ownership or links: {name}"
+            "projection mutation lease has unexpected links: {name}"
         )));
     }
     #[cfg(windows)]

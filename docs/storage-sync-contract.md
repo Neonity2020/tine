@@ -181,6 +181,31 @@ fallback.
    recovery, oplog write, or managed cache work occurs without the validated
    private binding or an explicit activation/join command.
 
+### 3.1 Refusal scenarios
+
+Every durable refusal or fail-closed validation must cite one of these stable
+scenario IDs in source. A transient condition that is safe to retry is not a
+durable refusal; a disposable cache failure must rebuild instead of appearing
+in this table.
+
+| Scenario ID | In-scope failure | Required response |
+| --- | --- | --- |
+| `MS-REF-CRASH-TRUNCATED` | Crash, power loss, or interrupted provider delivery leaves a canonical record or immutable object truncated/incomplete | Preserve authoritative bytes; retry if delivery may still be settling, otherwise diagnose the exact corrupt component |
+| `MS-REF-DISK-CORRUPT` | Disk/media error changes an immutable digest-addressed record or authoritative lifecycle record | Refuse the affected authority transition; retain recovery evidence and identify the component |
+| `MS-REF-SYNC-CONFLICT` | A file-sync provider supplies conflicting bytes for the same immutable identity or a provider cut changes during admission | Do not choose bytes by mtime; retry a moving cut or block a stable immutable collision |
+| `MS-REF-CONCURRENT-WRITER` | Another honest Tine process holds the exact enrollment/archive/SQLite OS lease | Refuse the second writer while the lock is held; reopening after release must work |
+| `MS-REF-STALE-GENERATION` | An honest concurrent operation advances a binding, frontier, lease identity, or generation after validation began | Abort/retry the stale operation; never publish under the superseded observation |
+| `MS-REF-UNSAFE-FS-KIND` | Sync delivery, filesystem damage, or an external tool replaces an expected directory/regular file with a symlink, special file, reparse point, or unexpected hard-link alias | Refuse access through the substituted entry without following it |
+| `MS-REF-MALFORMED-IMPORT` | Imported/shared Markdown, Org, descriptor, manifest, or operation bytes cannot be decoded within declared bounds | Leave source/authoritative history unchanged and report the bounded invalid component |
+| `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
+
+Unix UID equality and “only the current user may write this path” are
+deliberately absent. The threat model does not defend against a malicious actor
+who can already rewrite the user's private filesystem, and those checks reject
+honest Android shared storage, NFS, restored backups, containers, and shared
+groups. Capability-relative no-follow access, exact file identity, link count,
+OS locks, digests, generations, and decoders carry the in-scope invariants.
+
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
 15. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
 SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates

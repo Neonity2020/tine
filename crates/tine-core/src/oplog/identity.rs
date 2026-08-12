@@ -678,14 +678,10 @@ fn validate_archive_claim_handle(file: &File) -> std::io::Result<()> {
         ));
     }
     #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: geteuid has no arguments or memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
+    if metadata.nlink() != 1 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
-            "opened archive claim has unsafe ownership or links",
+            "opened archive claim has unexpected links",
         ));
     }
     #[cfg(windows)]

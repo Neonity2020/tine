@@ -671,13 +671,6 @@ impl ApplicationRuntimeRoot {
                 "application runtime root is not a real directory".into(),
             ));
         }
-        #[cfg(unix)]
-        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(ProjectionError::UnsafePath(
-                "application runtime root is not owned by the current user".into(),
-            ));
-        }
         Ok(Self { path })
     }
 
@@ -6494,13 +6487,6 @@ fn prepare_application_runtime_root(path: &Path) -> Result<PathBuf, ProjectionEr
             "application runtime root is not a real directory".into(),
         ));
     }
-    #[cfg(unix)]
-    // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(ProjectionError::UnsafePath(
-            "application runtime root is not owned by the current user".into(),
-        ));
-    }
     Ok(canonical)
 }
 
@@ -7531,15 +7517,6 @@ fn validate_owned_lease_directory(
             "{description} is not an opened directory"
         )));
     }
-    #[cfg(unix)]
-    // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-    if CapMetadataExt::uid(&metadata) != unsafe { libc::geteuid() }
-        || CapMetadataExt::mode(&metadata) & 0o022 != 0
-    {
-        return Err(ProjectionError::UnsafePath(format!(
-            "{description} is not exclusively writable by the current user"
-        )));
-    }
     Ok(())
 }
 
@@ -7939,13 +7916,9 @@ fn validate_opened_lease_file(file: &File, path: &Path) -> Result<(), Projection
         )));
     }
     #[cfg(unix)]
-    if metadata.uid() !=
-        // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-        unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
+    if metadata.nlink() != 1 {
         return Err(ProjectionError::UnsafePath(format!(
-            "opened SQLite applier lease {} has unsafe ownership or links",
+            "opened SQLite applier lease {} has unexpected links",
             path.display()
         )));
     }
