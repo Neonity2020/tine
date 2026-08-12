@@ -6648,6 +6648,27 @@
         "failBefore": "proven"
       },
       "notes": "Release run 31569006329 observed no keydown witness despite the expected header activeElement; the unchanged candidate passed the rerun and six focused repetitions. The journey now uses a real pointer action to transfer native focus, proves document focus/editor/caret readiness, and retries locally only when no key witness arrives. The suite runner may retry that isolated scenario once on the explicit E2E_NATIVE_INPUT_UNDELIVERED receipt. An unmodified ArrowDown witnessed on the expected header but failing to enter the first body block remains an immediate blocking product failure."
+    },
+    {
+      "id": "UI-E2E-GTK-UPLOAD-CHOOSER-READINESS-329",
+      "title": "The release E2E distinguishes an unready GTK upload chooser from an upload product failure",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [329],
+        "commits": []
+      },
+      "platforms": ["linux"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-pdf-logseq.mjs",
+          "scripts/test-release-pipeline.mjs"
+        ],
+        "scenario": "e2e.gtk-upload-chooser-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "The unchanged v0.6.93 candidate passed the same literal upload journey twice and failed once after a blind chooser activation/type/120ms sequence. The harness already launches Openbox, so a missing window manager was not the current cause. It now proves the chooser is visible and EWMH-active, submits the absolute path, observes closure, and only reactivates/sends Open while the chooser remains visibly mapped. The suite runner may retry the isolated scenario once only on E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED. If the chooser closes but the graph asset or Markdown write is absent, the existing blocking product assertion remains unchanged."
     }
   ]
 }

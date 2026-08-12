@@ -627,6 +627,53 @@ function assertNear(actual, expected, label, tolerance = 1.25) {
   }
 }
 
+function visibleGtkChooserIds() {
+  try {
+    return xdo("search", "--onlyvisible", "--name", "^Choose a file$").split(/\s+/).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function gtkChooserNativeState(id) {
+  let active = "";
+  let focus = "";
+  try { active = xdo("getactivewindow"); } catch {}
+  try { focus = xdo("getwindowfocus"); } catch {}
+  return { id, visible: visibleGtkChooserIds().includes(id), active, focus };
+}
+
+async function activateGtkChooser(id, source, phase) {
+  try {
+    xdo("windowactivate", "--sync", id);
+    xdo("windowfocus", "--sync", id);
+  } catch (error) {
+    throw new Error(`E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED ${phase} ${source}: ${JSON.stringify({
+      state: gtkChooserNativeState(id),
+      error: error?.stderr?.toString().trim() || error?.message || String(error),
+    })}`);
+  }
+  const deadline = Date.now() + 2_000;
+  let state = gtkChooserNativeState(id);
+  while (Date.now() < deadline) {
+    state = gtkChooserNativeState(id);
+    // Openbox's EWMH active window is the stable top-level readiness signal.
+    // X focus may name an internal GTK child and therefore is diagnostic only.
+    if (state.visible && state.active === id) return state;
+    await sleep(25);
+  }
+  throw new Error(`E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED ${phase} ${source}: ${JSON.stringify(state)}`);
+}
+
+async function waitForGtkChooserToClose(id, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!visibleGtkChooserIds().includes(id)) return true;
+    await sleep(25);
+  }
+  return false;
+}
+
 async function chooseGtkFile(source) {
   if (process.platform !== "linux") throw new Error("literal GTK file chooser automation is Linux-only");
   let raw;
@@ -639,7 +686,7 @@ async function chooseGtkFile(source) {
   const id = ids.at(-1);
   if (!id) throw new Error(`xdotool returned no GTK chooser window for ${source}`);
   const title = xdo("getwindowname", id);
-  xdo("windowactivate", "--sync", id);
+  const initial = await activateGtkChooser(id, source, "before-path");
   // GTK4's file chooser owns a focused child surface; XTEST reaches it only
   // through the active X11 window, not xdotool's --window XSendEvent path.
   xdo("key", "--clearmodifiers", "ctrl+l");
@@ -651,18 +698,18 @@ async function chooseGtkFile(source) {
       timeout: 5_000,
     });
   } catch {}
-  // GTK's location entry first resolves the absolute path; on the current
-  // rfd/GTK bridge it keeps the chooser open until the default Open accelerator
-  // is invoked afterwards. This is still entirely native X11 keyboard input.
+  // GTK's location entry may either accept the absolute path immediately or
+  // resolve it while keeping the chooser open for the default Open action.
+  // Observe that transition rather than assuming 120ms is enough on every host.
   xdo("key", "--clearmodifiers", "Return");
-  await sleep(120);
-  try {
-    const visible = xdo("search", "--onlyvisible", "--name", "^Choose a file$").split(/\s+/);
-    if (visible.includes(id)) xdo("key", "--clearmodifiers", "alt+o");
-  } catch {
-    // The first Return already accepted the path and closed the chooser.
+  if (!await waitForGtkChooserToClose(id, 2_000)) {
+    await activateGtkChooser(id, source, "before-open");
+    xdo("key", "--clearmodifiers", "alt+o");
+    if (!await waitForGtkChooserToClose(id, 2_000)) {
+      throw new Error(`E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED chooser-remained-open ${source}: ${JSON.stringify(gtkChooserNativeState(id))}`);
+    }
   }
-  return { id, title };
+  return { id, title, initial, closed: true };
 }
 
 async function closePdfWithNativePointer(id) {

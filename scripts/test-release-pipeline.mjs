@@ -775,6 +775,26 @@ assert.equal(
   false,
   "a delivered but ignored page-header ArrowDown must remain a product failure"
 );
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "pdf-logseq",
+    "E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED chooser-remained-open /tmp/source.pdf",
+    "",
+    false
+  ),
+  true,
+  "a mapped GTK chooser that never accepts native input is not retried"
+);
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "pdf-logseq",
+    "GTK-selected asset was not stored at /tmp/graph/assets/source.pdf",
+    "",
+    false
+  ),
+  false,
+  "a closed chooser followed by a missing asset must remain a product failure"
+);
 assert.match(
   printSecurity,
   /const driverArgs = webdriverServerArgs\([\s\S]*?DRIVER_PORT,[\s\S]*?NATIVE_PORT,[\s\S]*?WEBKIT_DRIVER/,

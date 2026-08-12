@@ -349,6 +349,7 @@ function isRetryableNativeHarnessFailure(id, output, errors, timedOut) {
   // ArrowDown, then records the capture-phase key event. Only a missing event is
   // transport infrastructure; a delivered-but-ignored key is a product failure.
   if (id === "page-properties") return /E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown/.test(combined);
+  if (id === "pdf-logseq") return /E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED/.test(combined);
   if (id !== "capture") return false;
   // Hosted Openbox occasionally leaves its active-window property pointing at
   // a frame destroyed during the short single-instance forwarder's teardown.
@@ -470,6 +471,8 @@ async function runScenario([id, script, extraEnv], contractEntry) {
         ? "WebDriver session became invalid or lost transport"
         : id === "page-properties"
           ? "native ArrowDown did not reach the proven-ready WebView"
+          : id === "pdf-logseq"
+            ? "native input did not reach the mapped and active GTK file chooser"
           : "hosted X11 active-window state raced a destroyed transient frame";
       process.stdout.write(`RETRY ${id}: ${reason}; retaining attempt 1\n`);
       process.stdout.write(`${output.slice(-1200)}\n${errors.slice(-1200)}\n`);
