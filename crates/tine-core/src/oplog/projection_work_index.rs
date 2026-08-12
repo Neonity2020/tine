@@ -1747,6 +1747,42 @@ impl ProjectionWorkIndex {
             .map(|state| state.status.into_public()))
     }
 
+    /// Authenticate and return the durable work rows for one exact accepted
+    /// batch together with their current statuses.
+    ///
+    /// This is intentionally a point lookup through the accepted witness. It
+    /// is used by correlated cold continuation recovery and must not become an
+    /// orphan/ready-work enumeration surface.
+    pub(crate) fn accepted_batch_work_statuses(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<(ProjectionWork, ProjectionWorkStatus)>, ProjectionWorkError> {
+        let (_, root) = self.load_head_root()?;
+        let bytes = self
+            .tree_lookup(root.accepted_root, &batch_key(batch_id))?
+            .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
+        let witness: AcceptedBatchWitness = decode_canonical(&bytes)?;
+        if witness.schema_version != INDEX_SCHEMA_VERSION
+            || witness.workspace_id != self.workspace_id
+            || witness.endpoint_id != self.endpoint_id
+            || witness.batch_id != batch_id
+            || !strictly_sorted(&witness.work_ids)
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        let mut rows = Vec::with_capacity(witness.work_ids.len());
+        for work_id in witness.work_ids {
+            let state = self
+                .load_state(&root, work_id)?
+                .ok_or(ProjectionWorkError::MissingWork(work_id))?;
+            if state.work.batch_id() != batch_id {
+                return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+            }
+            rows.push((state.work, state.status.into_public()));
+        }
+        Ok(rows)
+    }
+
     pub fn next(&self) -> Result<Option<ProjectionWork>, ProjectionWorkError> {
         Ok(self.ready_page(None, 1)?.work.into_iter().next())
     }

@@ -108,8 +108,8 @@ use crate::oplog::operational_coordinator::{
     TrustedLocalPreparationStageTimings,
 };
 use crate::oplog::operational_coordinator::{
-    LocalMutationBlockReason, LocalMutationCoordinatorState, LocalMutationRecovery,
-    LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
+    CorrelatedPublishedLocalResume, LocalMutationBlockReason, LocalMutationCoordinatorState,
+    LocalMutationRecovery, LocalPublishedContinuation, OperationalCoordinator, OperationalPhase,
     PreparedLocalMutationState, ProviderArchiveContinuation, ProviderArchiveIngress,
 };
 #[cfg(test)]
@@ -9121,6 +9121,9 @@ struct RuntimeActor {
     runtime: Option<PromotedLocalRuntime>,
     feed: Option<ExactExternalFeedState>,
     local_mutation: Option<PendingLocalMutation>,
+    /// Process-local ownership of a blocked correlated projection after its
+    /// reconstructed graph-text latch has been consumed into the exact feed.
+    correlated_move_feed_handoffs: BTreeSet<BatchId>,
     managed_local: Option<ManagedLocalRuntimeState>,
     move_episode_directory: Dir,
     #[cfg(test)]
@@ -10627,6 +10630,7 @@ impl RuntimeActor {
             runtime: Some(runtime),
             feed: Some(feed),
             local_mutation: None,
+            correlated_move_feed_handoffs: BTreeSet::new(),
             managed_local: Some(managed_local),
             move_episode_directory,
             #[cfg(test)]
@@ -13797,6 +13801,10 @@ impl RuntimeActor {
         if let Some(batch_id) = self.forced_next_move_episode_batch_id.take() {
             return batch_id;
         }
+        self.deterministic_application_move_batch_id(episode_id)
+    }
+
+    fn deterministic_application_move_batch_id(&self, episode_id: Uuid) -> BatchId {
         let mut batch_hasher = Sha256::new();
         batch_hasher.update(b"tine/application-move-episode-batch/v1\0");
         batch_hasher.update(self.binding.workspace_id().as_uuid().as_bytes());
@@ -14240,16 +14248,266 @@ impl RuntimeActor {
         &mut self,
         request: SyncApplicationMoveSubtreesRequest,
     ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
-        let mut last_deferred = None;
-        for _ in 0..MAX_EDITOR_SETTLE_TURNS {
-            match self.move_application_subtrees(request.clone())? {
-                outcome @ SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
-                    last_deferred = Some(outcome);
+        let episode_id = request.episode_id.clone();
+        let no_commit = |reason| SyncApplicationMoveSubtreesOutcome::NoCommit {
+            episode_id: episode_id.clone(),
+            reason,
+        };
+        let parsed_episode_id = Uuid::parse_str(&request.episode_id).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::MalformedPage,
+            )
+        })?;
+        let request_digest = application_move_request_digest(&request)?;
+        let episode = match self.load_application_move_episode(parsed_episode_id, request_digest)? {
+            Ok(ApplicationMoveEpisodeLookup::Complete(record)) => record,
+            // X1.5's same-actor sidecar-publication retry predates manifest
+            // publication. It retains the live actor's draft authority and is
+            // not the cold continuation path added here.
+            Ok(ApplicationMoveEpisodeLookup::Pending(_)) => {
+                let mut last_deferred = None;
+                for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+                    match self.move_application_subtrees(request.clone())? {
+                        outcome @ SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
+                            last_deferred = Some(outcome);
+                        }
+                        outcome => return Ok(outcome),
+                    }
                 }
-                outcome => return Ok(outcome),
+                return Ok(
+                    last_deferred.expect("bounded live move resolution executes at least one turn")
+                );
+            }
+            Ok(ApplicationMoveEpisodeLookup::Missing) => {
+                let batch_id = self.deterministic_application_move_batch_id(parsed_episode_id);
+                let exact_batch_exists = self
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.engine().archive_store())
+                    .is_some_and(|archive| {
+                        !matches!(
+                            archive.inspect_batch(batch_id),
+                            Ok(crate::oplog::BatchInspection::Absent)
+                                | Ok(crate::oplog::BatchInspection::Staged { .. })
+                        )
+                    });
+                let accepted = self.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.engine().accepted_batch_evidence(batch_id).is_ok()
+                });
+                return Ok(no_commit(if exact_batch_exists || accepted {
+                    SyncApplicationMoveConflict::BatchCollision
+                } else {
+                    SyncApplicationMoveConflict::EpisodeNotCommitted
+                }));
+            }
+            Err(reason) => return Ok(no_commit(reason)),
+        };
+        if self
+            .correlated_move_feed_handoffs
+            .contains(&episode.batch_id)
+        {
+            return self.settle_correlated_move_external_feed(&episode, episode_id);
+        }
+        // The same exact published continuation may still be retained in this
+        // actor after a fresh guarded conflict. The durable episode+manifest
+        // is the authority selected below; discard only that matching
+        // process-local shell so it cannot later retry after its latch is
+        // consumed into the exact feed. An unrelated pending mutation remains
+        // untouched and keeps ordinary serialization.
+        if self
+            .local_mutation
+            .as_ref()
+            .is_some_and(|pending| pending_local_identity(pending).0 == Some(episode.batch_id))
+        {
+            self.local_mutation.take();
+        }
+        if let Some(pending) = self.local_mutation.as_ref() {
+            let (batch_id, phase) = pending_local_identity(pending);
+            return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id,
+                state: SyncEditorDeferred::BlockedRecovery {
+                    batch_id: batch_id.map(|id| id.to_string()),
+                    phase,
+                    retained_publication: batch_id.is_some(),
+                },
+            });
+        }
+        if match self.application_move_accepted(&episode) {
+            Ok(accepted) => accepted,
+            Err(reason) => return Ok(no_commit(reason)),
+        } {
+            if self.application_move_projection_settled(&episode)? {
+                if self
+                    .record_local_authorship_receipt(episode.batch_id)
+                    .is_ok()
+                    && self.record_provider_publication(episode.batch_id).is_ok()
+                {
+                    return self.application_move_committed_outcome(&episode, true);
+                }
+                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                    episode_id,
+                    state: SyncEditorDeferred::BlockedRecovery {
+                        batch_id: Some(episode.batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::ProjectionDrain,
+                        retained_publication: true,
+                    },
+                });
             }
         }
-        Ok(last_deferred.expect("bounded move resolution executes at least one turn"))
+        let state = {
+            let Some(authority) = self.authority.as_mut() else {
+                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                    episode_id,
+                    state: SyncEditorDeferred::Revoked {
+                        batch_id: Some(episode.batch_id.to_string()),
+                        phase: SyncLocalMutationPhase::Bindings,
+                    },
+                });
+            };
+            let Some(runtime) = self.runtime.as_mut() else {
+                return Err(SyncApplicationPageRequestError::ActorUnavailable);
+            };
+            let mut session = runtime
+                .admit_promoted_mutation(authority, &self.graph)
+                .map_err(|_| {
+                    SyncApplicationPageRequestError::ActorRefusedAt("move_cold_resume_admission")
+                })?;
+            OperationalCoordinator::resume_correlated_published_local(
+                &mut session,
+                &self.graph,
+                &self.receipts,
+                episode.batch_id,
+                episode.manifest_fingerprint,
+                episode.lineage_digest,
+                episode.source_page_id,
+                episode.destination_page_id,
+            )
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_cold_resume"))?
+        };
+        match state {
+            CorrelatedPublishedLocalResume::NoCommit => {
+                Ok(no_commit(SyncApplicationMoveConflict::EpisodeNotCommitted))
+            }
+            CorrelatedPublishedLocalResume::GuardedConflict(conflict) => {
+                let observations = conflict
+                    .paths()
+                    .iter()
+                    .cloned()
+                    .map(WatcherObservation::ManagedPath);
+                let observed = match (self.feed.as_mut(), self.runtime.as_ref()) {
+                    (Some(feed), Some(runtime)) => feed.observe(&self.graph, runtime, observations),
+                    _ => Err(ExactExternalFeedObserveError::Terminal),
+                };
+                if observed.is_err() {
+                    self.latch_terminal(
+                        "correlated move projection conflict could not enter the exact feed".into(),
+                    );
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "move_guarded_conflict_feed",
+                    ));
+                }
+                self.correlated_move_feed_handoffs
+                    .insert(conflict.batch_id());
+                self.refresh_watcher();
+                self.settle_correlated_move_external_feed(&episode, episode_id)
+            }
+            CorrelatedPublishedLocalResume::State(state) => {
+                let outcome = self.retain_local_state(state, None);
+                match outcome {
+                    SyncLocalMutationOutcome::Durable { .. } => {
+                        self.application_move_committed_outcome(&episode, true)
+                    }
+                    outcome => Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                        episode_id,
+                        state: editor_deferred_from_local(outcome),
+                    }),
+                }
+            }
+        }
+    }
+
+    fn application_move_projection_settled(
+        &self,
+        episode: &ApplicationMoveEpisodeRecord,
+    ) -> Result<bool, SyncApplicationPageRequestError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let index = runtime.engine().projection_work_index().map_err(|_| {
+            SyncApplicationPageRequestError::ActorRefusedAt("move_projection_status")
+        })?;
+        let rows = index
+            .accepted_batch_work_statuses(episode.batch_id)
+            .map_err(|_| {
+                SyncApplicationPageRequestError::ActorRefusedAt("move_projection_status")
+            })?;
+        Ok(!rows.is_empty()
+            && rows
+                .iter()
+                .all(|(_, status)| matches!(status, crate::oplog::ProjectionWorkStatus::Completed)))
+    }
+
+    fn settle_correlated_move_external_feed(
+        &mut self,
+        episode: &ApplicationMoveEpisodeRecord,
+        episode_id: String,
+    ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
+        for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+            if self.application_move_projection_settled(episode)? {
+                if self
+                    .record_local_authorship_receipt(episode.batch_id)
+                    .is_err()
+                    || self.record_provider_publication(episode.batch_id).is_err()
+                {
+                    break;
+                }
+                self.correlated_move_feed_handoffs.remove(&episode.batch_id);
+                return self.application_move_committed_outcome(episode, true);
+            }
+            match self.tick_external_feed() {
+                SyncRuntimeTick::Terminal(_) => {
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "move_guarded_conflict_terminal",
+                    ))
+                }
+                SyncRuntimeTick::Blocked(_) | SyncRuntimeTick::RecoveryBlocked(_) => break,
+                _ => {}
+            }
+            if !self.last_watcher.pending {
+                if self
+                    .record_local_authorship_receipt(episode.batch_id)
+                    .is_err()
+                    || self.record_provider_publication(episode.batch_id).is_err()
+                {
+                    break;
+                }
+                match self.application_move_committed_outcome(episode, true) {
+                    Ok(outcome) => {
+                        self.correlated_move_feed_handoffs.remove(&episode.batch_id);
+                        return Ok(outcome);
+                    }
+                    Err(_) => {
+                        // A committed move whose external reconciliation
+                        // deleted either recorded PageId has no truthful DTO
+                        // outcome in X1.6. Retain ownership for process reopen.
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+            episode_id,
+            state: if self.last_watcher.pending {
+                SyncEditorDeferred::RetryableExternalWork
+            } else {
+                SyncEditorDeferred::BlockedRecovery {
+                    batch_id: Some(episode.batch_id.to_string()),
+                    phase: SyncLocalMutationPhase::ProjectionDrain,
+                    retained_publication: true,
+                }
+            },
+        })
     }
 
     fn application_move_committed_outcome(
@@ -25876,6 +26134,337 @@ mod tests {
             }
             assert_eq!(fixture.manifest_count(), manifests + 1, "{label}");
         }
+    }
+
+    #[test]
+    fn application_cross_page_move_immediate_cold_cuts_never_reauthor() {
+        for (label, point, committed, immediate_applied) in [
+            (
+                "cold-before-append",
+                OperationalFaultPoint::AfterFinalize,
+                false,
+                0,
+            ),
+            (
+                "cold-after-manifest",
+                OperationalFaultPoint::AfterManifest,
+                true,
+                0,
+            ),
+            (
+                "cold-projection",
+                OperationalFaultPoint::BeforeProjection,
+                true,
+                1,
+            ),
+        ] {
+            let fixture = RuntimeHostFixture::safe(&format!("application-move-{label}"));
+            let reopen_request = fixture.request();
+            let handle = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+            drive_initial_feed(&handle);
+            let request = simple_application_move_request(&handle, label);
+            let manifests = fixture.manifest_count();
+            let applied = fixture.applied_batch_count();
+            handle.install_repeated_operational_fault(point, 1).unwrap();
+
+            assert!(matches!(
+                handle.move_application_subtrees(request.clone()).unwrap(),
+                SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+            ));
+            // The cut is observed and the actor is dropped immediately. In
+            // particular, do not tick, query accepted state, or cleanly stop.
+            drop(handle);
+
+            assert_eq!(
+                fixture.manifest_count(),
+                manifests + usize::from(committed),
+                "{label}: immediate durable manifest count"
+            );
+            assert_eq!(
+                fixture.applied_batch_count(),
+                applied + immediate_applied,
+                "{label}: immediate accepted/SQLite count"
+            );
+            let immediate_source =
+                fs::read(fixture.graph_root().join(&request.source_path)).unwrap();
+            let immediate_destination =
+                fs::read(fixture.graph_root().join(&request.destination_path)).unwrap();
+            assert!(String::from_utf8_lossy(&immediate_source).contains("source root"));
+            assert!(!String::from_utf8_lossy(&immediate_destination).contains("source root"));
+            let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
+            assert_eq!(
+                reopened.status().unwrap().recovery,
+                Some(SyncRuntimeRecovery::TookOverCrashedUnsafe),
+                "{label}: cold replay must use the real crashed-unsafe lifecycle"
+            );
+            let observation = reopened
+                .resolve_application_move_subtrees(request.clone())
+                .unwrap();
+            if committed {
+                match observation.move_outcome {
+                    SyncApplicationMoveSubtreesOutcome::Committed {
+                        recovered: true,
+                        source,
+                        destination,
+                        ..
+                    } => {
+                        assert!(source.page.blocks.is_empty(), "{label}");
+                        assert_eq!(destination.page.blocks.len(), 2, "{label}");
+                        let source_bytes =
+                            fs::read(fixture.graph_root().join(&request.source_path)).unwrap();
+                        let destination_bytes =
+                            fs::read(fixture.graph_root().join(&request.destination_path)).unwrap();
+                        assert!(!String::from_utf8_lossy(&source_bytes).contains("source root"));
+                        assert!(String::from_utf8_lossy(&destination_bytes).contains("source root"));
+                    }
+                    other => panic!("{label}: cold resolution did not commit: {other:?}"),
+                }
+                assert_eq!(fixture.manifest_count(), manifests + 1, "{label}");
+                assert_eq!(fixture.applied_batch_count(), applied + 1, "{label}");
+            } else {
+                assert!(matches!(
+                    observation.move_outcome,
+                    SyncApplicationMoveSubtreesOutcome::NoCommit {
+                        reason: SyncApplicationMoveConflict::EpisodeNotCommitted,
+                        ..
+                    }
+                ));
+                assert_eq!(fixture.manifest_count(), manifests, "{label}");
+                assert_eq!(fixture.applied_batch_count(), applied, "{label}");
+                let (source, _) = load_application_logical(
+                    &reopened,
+                    &format!("{label} Source"),
+                    SyncPageKind::Page,
+                );
+                let (destination, _) = load_application_logical(
+                    &reopened,
+                    &format!("{label} Destination"),
+                    SyncPageKind::Page,
+                );
+                assert_eq!(source.blocks.len(), 1, "{label}");
+                assert_eq!(destination.blocks.len(), 1, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn application_cross_page_move_cold_guarded_conflict_transfers_to_exact_feed() {
+        let fixture = RuntimeHostFixture::safe("application-move-cold-guarded-transfer");
+        let reopen_request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "Cold Guarded Transfer");
+        let source_id =
+            load_editor_named(&handle, "Cold Guarded Transfer Source", SyncPageKind::Page).page_id;
+        let destination_id = load_editor_named(
+            &handle,
+            "Cold Guarded Transfer Destination",
+            SyncPageKind::Page,
+        )
+        .page_id;
+        let manifests = fixture.manifest_count();
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        drop(handle);
+
+        let external = b"- destination changed outside Tine\n";
+        fs::write(
+            fixture.graph_root().join(&request.destination_path),
+            external,
+        )
+        .unwrap();
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
+        let mut committed = None;
+        for _ in 0..128 {
+            let observation = reopened
+                .resolve_application_move_subtrees(request.clone())
+                .unwrap();
+            match observation.move_outcome {
+                outcome @ SyncApplicationMoveSubtreesOutcome::Committed { .. } => {
+                    committed = Some(outcome);
+                    break;
+                }
+                SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {}
+                other => panic!("guarded cold recovery failed closed unexpectedly: {other:?}"),
+            }
+        }
+        let SyncApplicationMoveSubtreesOutcome::Committed {
+            source,
+            destination,
+            recovered: true,
+            ..
+        } = committed.expect("guarded cold recovery must settle through the exact feed")
+        else {
+            unreachable!()
+        };
+        assert_eq!(source.page.name, "Cold Guarded Transfer Source");
+        assert_eq!(destination.page.name, "Cold Guarded Transfer Destination");
+        assert!(destination
+            .page
+            .blocks
+            .iter()
+            .any(|block| block.raw == "destination changed outside Tine"));
+        assert_eq!(
+            fs::read(fixture.graph_root().join(&request.destination_path)).unwrap(),
+            external
+        );
+        assert_eq!(
+            query_page_blocks(&reopened, &source_id).page.page_id,
+            source_id
+        );
+        assert_eq!(
+            query_page_blocks(&reopened, &destination_id).page.page_id,
+            destination_id
+        );
+        assert_eq!(fixture.manifest_count(), manifests + 2);
+    }
+
+    #[test]
+    fn application_cross_page_move_cold_external_delete_requires_reopen() {
+        let fixture = RuntimeHostFixture::safe("application-move-cold-delete");
+        let reopen_request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "Cold Delete");
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        drop(handle);
+        fs::remove_file(fixture.graph_root().join(&request.destination_path)).unwrap();
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
+        let mut bounded_reopen = false;
+        for _ in 0..128 {
+            let observation = reopened
+                .resolve_application_move_subtrees(request.clone())
+                .unwrap();
+            match observation.move_outcome {
+                SyncApplicationMoveSubtreesOutcome::Deferred {
+                    state:
+                        SyncEditorDeferred::BlockedRecovery {
+                            retained_publication: true,
+                            ..
+                        },
+                    ..
+                } => {
+                    bounded_reopen = true;
+                    break;
+                }
+                SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {}
+                SyncApplicationMoveSubtreesOutcome::Committed { .. } => {
+                    panic!("deleted affected page was reported as a committed DTO outcome")
+                }
+                other => panic!("deleted affected page lost retained ownership: {other:?}"),
+            }
+        }
+        assert!(
+            bounded_reopen,
+            "external deletion must require process reopen"
+        );
+    }
+
+    #[test]
+    fn application_cross_page_move_cold_resume_preserves_unrelated_external_queue() {
+        let fixture = RuntimeHostFixture::safe("application-move-cold-unrelated-queue");
+        let reopen_request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+        drive_initial_feed(&handle);
+        let (unrelated, _) = accepted_new_application_page(
+            &handle,
+            "Cold Unrelated Queue",
+            vec![BlockDto {
+                id: "temporary-unrelated".into(),
+                raw: "unrelated original".into(),
+                ..BlockDto::default()
+            }],
+        );
+        let request = simple_application_move_request(&handle, "Cold Local First");
+        let manifests = fixture.manifest_count();
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        drop(handle);
+        let external = b"- unrelated external edit\n";
+        fs::write(fixture.graph_root().join(&unrelated.path), external).unwrap();
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
+        let observation = reopened.resolve_application_move_subtrees(request).unwrap();
+        assert!(matches!(
+            observation.move_outcome,
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: true,
+                ..
+            }
+        ));
+        assert!(
+            reopened.status().unwrap().watcher.pending,
+            "correlated local resume must not consume unrelated startup work"
+        );
+        drive_initial_feed(&reopened);
+        let (current, _) = load_application_exact(&reopened, &unrelated.path);
+        assert_eq!(current.blocks[0].raw, "unrelated external edit");
+        assert_eq!(
+            fs::read(fixture.graph_root().join(&unrelated.path)).unwrap(),
+            external
+        );
+        assert_eq!(fixture.manifest_count(), manifests + 2);
+    }
+
+    #[test]
+    fn application_cross_page_move_cold_request_mismatch_cannot_adopt_manifest() {
+        let fixture = RuntimeHostFixture::safe("application-move-cold-request-mismatch");
+        let reopen_request = fixture.request();
+        let handle = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "Cold Request Mismatch");
+        let manifests = fixture.manifest_count();
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterManifest, 1)
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        drop(handle);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
+        let mut mismatch = request.clone();
+        mismatch.admission.application_page_max_depth -= 1;
+        assert!(matches!(
+            reopened
+                .resolve_application_move_subtrees(mismatch)
+                .unwrap()
+                .move_outcome,
+            SyncApplicationMoveSubtreesOutcome::NoCommit {
+                reason: SyncApplicationMoveConflict::EpisodeMismatch,
+                ..
+            }
+        ));
+        assert_eq!(fixture.manifest_count(), manifests + 1);
+        assert!(matches!(
+            reopened
+                .resolve_application_move_subtrees(request)
+                .unwrap()
+                .move_outcome,
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: true,
+                ..
+            }
+        ));
+        assert_eq!(fixture.manifest_count(), manifests + 1);
     }
 
     #[test]

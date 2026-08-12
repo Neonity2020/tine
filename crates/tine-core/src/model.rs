@@ -5611,6 +5611,34 @@ impl Graph {
         })
     }
 
+    /// Consume the ownerless process-local graph-text latch reconstructed by
+    /// crash-takeover projection recovery for one durably blocked published
+    /// batch. The caller must first authenticate that exact blocked work from
+    /// accepted history; this method only verifies the runtime binding and
+    /// performs the affine release.
+    pub(crate) fn consume_recovered_published_handoff(
+        &self,
+        endpoint: ProjectionEndpointBinding,
+    ) -> io::Result<()> {
+        let graph_resource_id = self.canonical_resource_id()?;
+        let binding = self.managed_write_binding()?;
+        if binding.resource_id != graph_resource_id
+            || endpoint.graph_resource_id() != graph_resource_id
+        {
+            return Err(managed_write_identity_mismatch_error());
+        }
+        let mut state = binding.gate.state.lock().unwrap();
+        if !state.handoff_held || state.active_writers != 0 {
+            return Err(handoff_write_blocked_error());
+        }
+        state.handoff_held = false;
+        #[cfg(test)]
+        {
+            state.handoff_releases += 1;
+        }
+        Ok(())
+    }
+
     fn admit_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {
         // Every graph-text write in this file passes through here, which is why
         // the read-only view is enforced at this one point rather than trusted

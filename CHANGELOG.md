@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **Experimental managed-storage cross-page move recovery now resumes the exact durable move after an immediate process loss.** The actor reconstructs only an episode-authenticated immutable local manifest, completes accepted SQLite/projection/provider work exactly once, and transfers a real external-edit conflict to the existing exact feed without overwriting the external bytes or reporting deleted affected pages as successful.
 
 ## [0.6.93] - 2026-08-11
 

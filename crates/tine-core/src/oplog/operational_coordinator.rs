@@ -26,10 +26,10 @@ use super::plan_affected_import;
 use super::shadow_projection::BootstrapProjectionAuthority;
 use super::{
     AcceptedBatchEvent, AuthorBatch, BatchDisposition, BatchId, BatchInspection, BatchOrigin,
-    ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, ObjectStore,
-    OperationTransaction, PreparedBatch, ProjectionEndpointBinding, ProjectionError,
-    ProjectionReceiptStore, RebuildSource, SessionId, ShardedHotEngine, SqliteFrontier,
-    TailOverlay, TailReservation,
+    ContentDigest, CrdtPeerId, ImportId, ImportPlan, ImportPlanStatus, LineageDigest, ObjectStore,
+    OperationTransaction, PageId, PreparedBatch, ProjectionEndpointBinding, ProjectionError,
+    ProjectionReceiptStore, ProjectionWork, ProjectionWorkStatus, RebuildSource, SessionId,
+    ShardedHotEngine, SqliteFrontier, TailOverlay, TailReservation,
 };
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
@@ -453,6 +453,27 @@ pub(crate) enum LocalMutationCoordinatorState {
     Revoked(RevokedLocalMutation),
 }
 
+pub(crate) struct CorrelatedGuardedProjectionConflict {
+    batch_id: BatchId,
+    paths: Vec<super::ManagedPath>,
+}
+
+impl CorrelatedGuardedProjectionConflict {
+    pub(crate) const fn batch_id(&self) -> BatchId {
+        self.batch_id
+    }
+
+    pub(crate) fn paths(&self) -> &[super::ManagedPath] {
+        &self.paths
+    }
+}
+
+pub(crate) enum CorrelatedPublishedLocalResume {
+    NoCommit,
+    GuardedConflict(CorrelatedGuardedProjectionConflict),
+    State(LocalMutationCoordinatorState),
+}
+
 impl LocalMutationCoordinatorState {
     fn blocked(error: OperationalCoordinatorError) -> Self {
         if error.revocation().is_some() {
@@ -744,6 +765,21 @@ impl PublishedContinuationCore {
             ));
         }
 
+        // A guarded projection conflict is deliberately removed from the
+        // ready-page index. Correlated cold recovery must authenticate this
+        // exact accepted batch before the generic ready scan, or it would
+        // mistake durable blocked ownership for successful completion.
+        if self.provider_ingress {
+            let blocked = correlated_blocked_work(engine, self.batch_id)?;
+            if !blocked.is_empty() {
+                return Err(OperationalCoordinatorError::retained_block(
+                    OperationalPhase::ProjectionDrain,
+                    "correlated published mutation has durable guarded projection conflict",
+                    RetainedBlockReason::GuardedProjectionConflict,
+                ));
+            }
+        }
+
         // ~39s of a 50s import is inside resume() but outside ArchiveStage
         // (F45). This loop is the largest remaining block; time it as a whole
         // rather than guessing which of its calls dominates.
@@ -896,6 +932,112 @@ impl PublishedContinuationCore {
         }
         Ok(self.batch_id)
     }
+}
+
+fn correlated_blocked_work(
+    engine: &ShardedHotEngine,
+    batch_id: BatchId,
+) -> Result<Vec<ProjectionWork>, OperationalCoordinatorError> {
+    let index = engine.projection_work_index().map_err(|error| {
+        OperationalCoordinatorError::new(OperationalPhase::ProjectionDrain, error.to_string())
+    })?;
+    let rows = match index.accepted_batch_work_statuses(batch_id) {
+        Ok(rows) => rows,
+        Err(super::projection_work_index::ProjectionWorkError::AcceptedWitnessMissing) => {
+            return Ok(Vec::new())
+        }
+        Err(error) => {
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::ProjectionDrain,
+                error.to_string(),
+            ))
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|(work, status)| (status == ProjectionWorkStatus::Blocked).then_some(work))
+        .collect())
+}
+
+fn construct_archive_continuation(
+    graph: &Graph,
+    engine: &ShardedHotEngine,
+    endpoint: ProjectionEndpointBinding,
+    archive: Arc<ObjectStore>,
+    batch_id: BatchId,
+    expected: Option<(BatchOrigin, ContentDigest)>,
+) -> Result<PublishedContinuationCore, OperationalCoordinatorError> {
+    let validated = match archive.inspect_batch(batch_id).map_err(|error| {
+        OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+    })? {
+        BatchInspection::Ready(validated) => validated,
+        BatchInspection::Absent | BatchInspection::Staged { .. } => {
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::Publication,
+                "archive continuation batch is not complete",
+            ));
+        }
+    };
+    let manifest_bytes = validated.manifest().encode().map_err(|error| {
+        OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+    })?;
+    let manifest_digest = ContentDigest::of(&manifest_bytes);
+    let origin = validated.manifest().origin();
+    if expected.is_some_and(|expected| expected != (origin, manifest_digest)) {
+        return Err(OperationalCoordinatorError::retained_block(
+            OperationalPhase::Publication,
+            "archive continuation manifest identity mismatch",
+            RetainedBlockReason::PublishedAuthentication,
+        ));
+    }
+    let retained_bytes =
+        validated
+            .objects()
+            .iter()
+            .try_fold(manifest_bytes.len(), |total, object| {
+                object
+                    .encode()
+                    .map_err(|error| {
+                        OperationalCoordinatorError::new(
+                            OperationalPhase::Publication,
+                            error.to_string(),
+                        )
+                    })
+                    .and_then(|bytes| {
+                        total.checked_add(bytes.len()).ok_or_else(|| {
+                            OperationalCoordinatorError::new(
+                                OperationalPhase::Publication,
+                                "archive continuation retained-byte count overflowed",
+                            )
+                        })
+                    })
+            })?;
+    let handoff = graph
+        .mint_handoff_safe(engine.workspace_id(), endpoint)
+        .map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+        })?;
+    let guard = handoff.into_publisher_guard();
+    guard
+        .verify_binding(graph, engine.workspace_id(), endpoint)
+        .map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
+        })?;
+    Ok(PublishedContinuationCore {
+        guard: guard.into_published_latch(),
+        endpoint,
+        archive,
+        batch_id,
+        origin,
+        manifest_digest,
+        retained_bytes,
+        reservation: None,
+        provider_ingress: true,
+        failure: OperationalCoordinatorError::new(
+            OperationalPhase::ArchiveStage,
+            "archive continuation has not completed its first bounded slice",
+        ),
+    })
 }
 
 fn require_accepted_stage_disposition(
@@ -1108,69 +1250,8 @@ impl OperationalCoordinator {
             )
         })?;
         let archive = verify_bindings(graph, receipts, engine, endpoint, None)?;
-        let validated = match archive.inspect_batch(batch_id).map_err(|error| {
-            OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
-        })? {
-            BatchInspection::Ready(validated) => validated,
-            BatchInspection::Absent | BatchInspection::Staged { .. } => {
-                return Err(OperationalCoordinatorError::new(
-                    OperationalPhase::Publication,
-                    "provider ingress batch is not complete",
-                ));
-            }
-        };
-        let manifest_bytes = validated.manifest().encode().map_err(|error| {
-            OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
-        })?;
-        let retained_bytes =
-            validated
-                .objects()
-                .iter()
-                .try_fold(manifest_bytes.len(), |total, object| {
-                    object
-                        .encode()
-                        .map_err(|error| {
-                            OperationalCoordinatorError::new(
-                                OperationalPhase::Publication,
-                                error.to_string(),
-                            )
-                        })
-                        .and_then(|bytes| {
-                            total.checked_add(bytes.len()).ok_or_else(|| {
-                                OperationalCoordinatorError::new(
-                                    OperationalPhase::Publication,
-                                    "provider ingress retained-byte count overflowed",
-                                )
-                            })
-                        })
-                })?;
-        let origin = validated.manifest().origin();
-        let handoff = graph
-            .mint_handoff_safe(engine.workspace_id(), endpoint)
-            .map_err(|error| {
-                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
-            })?;
-        let guard = handoff.into_publisher_guard();
-        guard
-            .verify_binding(graph, engine.workspace_id(), endpoint)
-            .map_err(|error| {
-                OperationalCoordinatorError::new(OperationalPhase::Bindings, error.to_string())
-            })?;
-        let mut core = PublishedContinuationCore {
-            guard: guard.into_published_latch(),
-            endpoint,
-            archive,
-            batch_id,
-            origin,
-            manifest_digest: ContentDigest::of(&manifest_bytes),
-            retained_bytes,
-            reservation: None,
-            provider_ingress: true,
-            failure: OperationalCoordinatorError::new(
-                OperationalPhase::ArchiveStage,
-                "provider ingress has not completed its first bounded slice",
-            ),
-        };
+        let mut core =
+            construct_archive_continuation(graph, engine, endpoint, archive, batch_id, None)?;
         match core.resume(&admission, graph, receipts, engine, database, tail) {
             Ok(_) => {
                 core.guard.complete();
@@ -1183,6 +1264,145 @@ impl OperationalCoordinator {
                 ))
             }
         }
+    }
+
+    /// Reconstruct one lost process-local continuation from an exact durable
+    /// application-move episode and its immutable local-mutation manifest.
+    /// This never enumerates ready/orphan batches and never publishes bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resume_correlated_published_local(
+        session: &mut PromotedRuntimeSession<'_>,
+        graph: &Graph,
+        receipts: &ProjectionReceiptStore,
+        batch_id: BatchId,
+        manifest_fingerprint: ContentDigest,
+        lineage_digest: LineageDigest,
+        source_page_id: PageId,
+        destination_page_id: PageId,
+    ) -> Result<CorrelatedPublishedLocalResume, OperationalCoordinatorError> {
+        let (admission, engine, database, tail) = session.parts().map_err(|refusal| {
+            OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
+        })?;
+        authorize_coordinator(&admission, graph, engine)?;
+        let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
+            OperationalCoordinatorError::new(
+                OperationalPhase::Bindings,
+                "engine has no enrolled projection endpoint",
+            )
+        })?;
+        let archive = verify_bindings(graph, receipts, engine, endpoint, None)?;
+        let inspection = archive.inspect_batch(batch_id).map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+        })?;
+        let validated = match inspection {
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Ok(CorrelatedPublishedLocalResume::NoCommit)
+            }
+            BatchInspection::Ready(validated) => validated,
+        };
+        let manifest = validated.manifest();
+        let manifest_bytes = manifest.encode().map_err(|error| {
+            OperationalCoordinatorError::new(OperationalPhase::Publication, error.to_string())
+        })?;
+        if manifest.batch_id() != batch_id
+            || manifest.workspace_id() != engine.workspace_id()
+            || manifest.lineage_digest() != lineage_digest
+            || manifest.origin() != BatchOrigin::LocalMutation
+            || ContentDigest::of(&manifest_bytes) != manifest_fingerprint
+        {
+            return Err(OperationalCoordinatorError::retained_block(
+                OperationalPhase::Publication,
+                "correlated application-move manifest identity mismatch",
+                RetainedBlockReason::PublishedAuthentication,
+            ));
+        }
+        let projection = super::projection_manifest::validate_projection_object_set(
+            manifest,
+            validated.objects(),
+        )
+        .map_err(|error| {
+            OperationalCoordinatorError::retained_block(
+                OperationalPhase::Publication,
+                error.to_string(),
+                RetainedBlockReason::PublishedAuthentication,
+            )
+        })?;
+        let mut affected = projection
+            .intents()
+            .iter()
+            .filter(|intent| intent.source_endpoint_id() == endpoint.endpoint_id())
+            .map(|intent| intent.page_id())
+            .collect::<Vec<_>>();
+        affected.sort_unstable();
+        affected.dedup();
+        let mut expected = vec![source_page_id, destination_page_id];
+        expected.sort_unstable();
+        expected.dedup();
+        if affected != expected || expected.len() != 2 {
+            return Err(OperationalCoordinatorError::retained_block(
+                OperationalPhase::Publication,
+                "correlated application-move affected pages differ from its episode",
+                RetainedBlockReason::PublishedAuthentication,
+            ));
+        }
+        drop(validated);
+        let preexisting_blocked = correlated_blocked_work(engine, batch_id)?;
+        if !preexisting_blocked.is_empty() {
+            graph
+                .consume_recovered_published_handoff(endpoint)
+                .map_err(|error| {
+                    OperationalCoordinatorError::retained_block(
+                        OperationalPhase::Bindings,
+                        error.to_string(),
+                        RetainedBlockReason::StableBinding,
+                    )
+                })?;
+            let mut paths = preexisting_blocked
+                .into_iter()
+                .map(|work| work.path().clone())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths.dedup();
+            return Ok(CorrelatedPublishedLocalResume::GuardedConflict(
+                CorrelatedGuardedProjectionConflict { batch_id, paths },
+            ));
+        }
+        let mut core = construct_archive_continuation(
+            graph,
+            engine,
+            endpoint,
+            archive,
+            batch_id,
+            Some((BatchOrigin::LocalMutation, manifest_fingerprint)),
+        )?;
+        let state = match core.resume(&admission, graph, receipts, engine, database, tail) {
+            Ok(batch_id) => {
+                core.guard.complete();
+                LocalMutationCoordinatorState::Active(LocalMutationCompletion { batch_id })
+            }
+            Err(error)
+                if error.retained_block_reason()
+                    == Some(&RetainedBlockReason::GuardedProjectionConflict) =>
+            {
+                let mut paths = correlated_blocked_work(engine, batch_id)?
+                    .into_iter()
+                    .map(|work| work.path().clone())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                paths.dedup();
+                // The exact feed cannot acquire graph-text write admission
+                // until this reconstructed local latch is consumed.
+                core.guard.complete();
+                return Ok(CorrelatedPublishedLocalResume::GuardedConflict(
+                    CorrelatedGuardedProjectionConflict { batch_id, paths },
+                ));
+            }
+            Err(error) => {
+                core.failure = error;
+                LocalMutationCoordinatorState::from_failed(LocalPublishedContinuation { core })
+            }
+        };
+        Ok(CorrelatedPublishedLocalResume::State(state))
     }
 
     pub(crate) fn retry_archive_batch(
