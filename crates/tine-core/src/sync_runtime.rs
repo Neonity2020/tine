@@ -26674,7 +26674,7 @@ mod tests {
         match observation.move_outcome {
             SyncApplicationMoveSubtreesOutcome::Committed {
                 episode_id,
-                recovered: true,
+                recovered: false,
                 source,
                 destination,
                 ..
@@ -27278,7 +27278,11 @@ mod tests {
 
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
         let mut mismatch = request.clone();
-        mismatch.admission.application_page_max_depth -= 1;
+        // Admission is current binding evidence rather than move semantics and
+        // is intentionally excluded from the retained request digest. Change a
+        // real semantic field so this test exercises episode mismatch instead
+        // of the separately covered admission-refresh path.
+        mismatch.placement = SyncApplicationMovePlacement::Root { position: 1 };
         let mismatch_outcome = reopened
             .resolve_application_move_subtrees(mismatch)
             .unwrap()
