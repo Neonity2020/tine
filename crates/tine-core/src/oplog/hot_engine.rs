@@ -10240,7 +10240,6 @@ impl ShardedHotEngine {
     /// and resource bindings. This deliberately does not claim process-restart
     /// writer exclusion: the managed-text latch is still process-local, and
     /// persisted enrollment owns reconstructing it before writer admission.
-    #[allow(dead_code)] // activated only by the later persisted-enrollment packet
     pub(crate) fn reconstruct_run_local_state(&mut self) -> Result<(), EngineError> {
         if self.scratch.is_none() {
             return Err(EngineError::Archive(

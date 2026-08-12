@@ -119,7 +119,6 @@ const BLOCK_CLAIM_INDEX_DIR: &str = "block-claim-index";
 const BLOCK_CLAIM_INDEX_FILE: &str = "pages.index";
 const LOGSEQ_CLAIM_INDEX_DIR: &str = "logseq-uuid-claim-index-v1";
 const PORTABLE_PATH_INDEX_DIR: &str = "portable-path-index-v1";
-#[allow(dead_code)] // opened by the intentionally unwired P2N2 foundation
 const PAGE_NAME_OWNERSHIP_INDEX_DIR: &str = "page-name-ownership-index-v1";
 const REFERENCE_CATALOG_DIR: &str = "reference-catalog-v2";
 const PROJECTION_WORK_DIR: &str = "projection-work-index-v1";
@@ -3322,7 +3321,6 @@ impl ObjectStore {
         ))
     }
 
-    #[allow(dead_code)] // activated only by later P2N2 acceptance wiring
     pub(crate) fn open_page_name_ownership_index(
         &self,
     ) -> Result<super::page_name_index::PageNameOwnershipStore, StoreError> {
