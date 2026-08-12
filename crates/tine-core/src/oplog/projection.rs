@@ -70,6 +70,7 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) fallback: usize,
     pub(crate) finalizer_post_state_render: usize,
     pub(crate) finalizer_predecessor_replay_render: usize,
+    pub(crate) capture_prepared_predecessor_use: usize,
     pub(crate) capture_sealed_pending_local_predecessor_success: usize,
     pub(crate) finalizer_sealed_pending_local_predecessor_use: usize,
     /// The two renders are separate evidence obligations.  Keep their timing
@@ -91,6 +92,7 @@ impl PreparedEditorProjectionInstrumentation {
         fallback: 0,
         finalizer_post_state_render: 0,
         finalizer_predecessor_replay_render: 0,
+        capture_prepared_predecessor_use: 0,
         capture_sealed_pending_local_predecessor_success: 0,
         finalizer_sealed_pending_local_predecessor_use: 0,
         accepted_render: std::time::Duration::ZERO,
@@ -148,6 +150,15 @@ pub(crate) fn note_capture_sealed_pending_local_predecessor_success() {
     note_prepared_editor_projection(|instrumentation| {
         instrumentation.capture_sealed_pending_local_predecessor_success = instrumentation
             .capture_sealed_pending_local_predecessor_success
+            .saturating_add(1);
+    });
+}
+
+pub(crate) fn note_capture_prepared_predecessor_use() {
+    #[cfg(test)]
+    note_prepared_editor_projection(|instrumentation| {
+        instrumentation.capture_prepared_predecessor_use = instrumentation
+            .capture_prepared_predecessor_use
             .saturating_add(1);
     });
 }
@@ -326,6 +337,7 @@ pub(crate) struct PreparedEditorProjection {
     requested_page: MaterializedPage,
     exact_base: Vec<u8>,
     candidate_base_layout: Vec<StructuralLayoutIdentity>,
+    capture_predecessor_annotations: Option<Vec<AnnotatedIdentity>>,
     before_candidate: Option<PreparedEditorProjectionBeforeCandidate>,
     rendered: RenderedProjection,
 }
@@ -375,6 +387,7 @@ impl PreparedEditorProjection {
             requested_page,
             exact_base,
             candidate_base_layout,
+            capture_predecessor_annotations: None,
             before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
                 // The caller binds the owned accepted page below.  Keeping the
                 // render here first lets the UI boundary use the same borrowed
@@ -436,6 +449,7 @@ impl PreparedEditorProjection {
             requested_page,
             exact_base: exact_base.clone(),
             candidate_base_layout,
+            capture_predecessor_annotations: Some(accepted_annotations.clone()),
             before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
                 accepted_page: None,
                 accepted_rendered: RenderedProjection {
@@ -468,6 +482,16 @@ impl PreparedEditorProjection {
             .expect("accepted editor projection remains available before draft")
             .accepted_rendered
             .target
+    }
+
+    /// Borrow the exact predecessor bytes and annotations carried by this
+    /// affine editor artifact. Capture may use these only after independently
+    /// binding them to the current managed-local overlay entry and semantic
+    /// pre-state; every other lane retains the complete projector replay.
+    pub(crate) fn accepted_predecessor_candidate(&self) -> Option<(&[u8], &[AnnotatedIdentity])> {
+        self.capture_predecessor_annotations
+            .as_deref()
+            .map(|annotations| (self.exact_base.as_slice(), annotations))
     }
 
     /// Replace the provisional accepted page with the exact editor-owned

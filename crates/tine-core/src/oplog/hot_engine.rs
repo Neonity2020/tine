@@ -79,8 +79,9 @@ use super::{
     OperationBatch, OperationObject, PageDelta, PageId, PageState, PortablePathKeyDigest,
     PreparedBatch, ProjectionClaimEvidence, ProjectionClaimParticipant, ProjectionCompletedReceipt,
     ProjectionCompletion, ProjectionEndpointId, ProjectionIntent, ProjectionIntentId,
-    ProjectionReceiptStore, ProjectionWork, ProjectionWorkIndex, ProjectionWorkTarget,
-    SemanticEffect, SemanticEffectDigest, SemanticError, SessionId, ValidatedBatch, WorkspaceId,
+    ProjectionPrecondition, ProjectionReceiptStore, ProjectionWork, ProjectionWorkIndex,
+    ProjectionWorkTarget, SemanticEffect, SemanticEffectDigest, SemanticError, SessionId,
+    ValidatedBatch, WorkspaceId,
 };
 use crate::{Graph, GraphTextScopeBinding};
 
@@ -16838,6 +16839,7 @@ impl ShardedHotEngine {
         path: &ManagedPath,
         page_id: PageId,
         before: &ProjectionPageState,
+        prepared_predecessor: Option<(&[u8], &[AnnotatedIdentity])>,
     ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
         let Some(entry) = self.local_overlay.entries.iter().rev().find(|entry| {
             entry.projection.intent.page_id() == page_id && entry.projection.intent.path() == path
@@ -16863,22 +16865,43 @@ impl ShardedHotEngine {
                 "managed-local predecessor is not the current semantic page state".into(),
             ));
         }
-        let replay = super::projection::plan_projection_with_layout_annotations(
-            self.workspace_id,
-            before,
-            Some(bytes),
-            Some(annotations),
-        )
-        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
-        if replay.target() != bytes || replay.intent().annotations() != annotations.as_slice() {
-            return Err(EngineError::ProjectionManifest(
-                "managed-local predecessor target is not its deterministic current rendering"
-                    .into(),
-            ));
-        }
+        let prepared_matches =
+            prepared_predecessor.is_some_and(|(prepared_bytes, prepared_annotations)| {
+                prepared_bytes == bytes.as_slice() && prepared_annotations == annotations.as_slice()
+            });
+        let predecessor_intent = if prepared_matches {
+            super::projection::note_capture_prepared_predecessor_use();
+            let description = BlobDescription::of(bytes);
+            ProjectionIntent::new(
+                self.workspace_id,
+                before.page.page_id,
+                path.clone(),
+                before.frontier.clone(),
+                before.claim_evidence.clone(),
+                ProjectionPrecondition::Base(description),
+                description,
+                annotations.clone(),
+            )
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+        } else {
+            let replay = super::projection::plan_projection_with_layout_annotations(
+                self.workspace_id,
+                before,
+                Some(bytes),
+                Some(annotations),
+            )
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            if replay.target() != bytes || replay.intent().annotations() != annotations.as_slice() {
+                return Err(EngineError::ProjectionManifest(
+                    "managed-local predecessor target is not its deterministic current rendering"
+                        .into(),
+                ));
+            }
+            replay.intent().clone()
+        };
         Ok(Some(CapabilityCapturedPriorProjection {
             bytes: bytes.clone(),
-            intent: replay.intent().clone(),
+            intent: predecessor_intent,
             completion: None,
             bootstrap_owner_binding: None,
             managed_local_authority: Some((entry.sequence, entry.batch_id)),
@@ -17127,6 +17150,10 @@ impl ShardedHotEngine {
         let mut captured_inputs = Vec::with_capacity(requirement_index.len());
         let mut sealed_pending_local_predecessor = None;
         let mut mismatches = Vec::new();
+        let prepared_predecessor = draft
+            .prepared_editor_projection
+            .as_ref()
+            .and_then(|prepared| prepared.accepted_predecessor_candidate());
         for indexed_path in requirement_index.entries() {
             let path = indexed_path.path(&draft.requirements);
             let roles = indexed_path.roles();
@@ -17154,7 +17181,12 @@ impl ShardedHotEngine {
                         .map(|before| (requirement.page_id, before))
                 })
                 .map(|(page_id, before)| {
-                    self.managed_local_projection_predecessor(path, page_id, before)
+                    self.managed_local_projection_predecessor(
+                        path,
+                        page_id,
+                        before,
+                        prepared_predecessor,
+                    )
                 })
                 .transpose()?
                 .flatten();

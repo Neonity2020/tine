@@ -66,6 +66,7 @@ use crate::oplog::enrollment::{
 use crate::oplog::exact_external_feed::{
     ExactExternalFeedDrain, ExactExternalFeedObserveError, ExactExternalFeedState,
 };
+use crate::oplog::hot_engine::AcceptedFrontierRoot;
 use crate::oplog::hot_engine::{ProjectionEndpointBinding, ProjectionStorageBinding};
 use crate::oplog::import::{
     prepare_inactive_bootstrap_import_with_progress, publish_install_verify_inactive_bootstrap,
@@ -508,6 +509,8 @@ struct ManagedApplicationSaveStageTimings {
     transaction_inner_finish_validate: Duration,
     transaction_outer_merge_finish_validate: Duration,
     editor_request_remainder: Duration,
+    hot_application_save_attempts: usize,
+    hot_application_save_reuses: usize,
     promoted_mutation_admission: Duration,
     application_outcome: Duration,
     response_target_parses: usize,
@@ -594,6 +597,8 @@ thread_local! {
             transaction_inner_finish_validate: Duration::ZERO,
             transaction_outer_merge_finish_validate: Duration::ZERO,
             editor_request_remainder: Duration::ZERO,
+            hot_application_save_attempts: 0,
+            hot_application_save_reuses: 0,
             promoted_mutation_admission: Duration::ZERO,
             application_outcome: Duration::ZERO,
             response_target_parses: 0,
@@ -8557,6 +8562,11 @@ struct ApplicationCurrentPage {
     editor: EditorCurrentPage,
 }
 
+struct HotApplicationSavePage {
+    accepted_frontier: AcceptedFrontierRoot,
+    current: ApplicationCurrentPage,
+}
+
 enum ApplicationExactLoad {
     Loaded(ApplicationCurrentPage),
     Missing,
@@ -9243,6 +9253,10 @@ struct RuntimeActor {
     #[cfg(test)]
     forced_next_move_episode_batch_id: Option<BatchId>,
     prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
+    /// Exact application response from the latest successful save, bound to
+    /// the accepted frontier that produced it. This is a single-page,
+    /// process-local acceleration candidate, never storage authority.
+    hot_application_save_page: Option<HotApplicationSavePage>,
     #[cfg(test)]
     managed_application_query_instrumentation:
         std::cell::Cell<ManagedApplicationQueryInstrumentation>,
@@ -10752,6 +10766,7 @@ impl RuntimeActor {
             #[cfg(test)]
             forced_next_move_episode_batch_id: None,
             prepared_application_reply: None,
+            hot_application_save_page: None,
             #[cfg(test)]
             managed_application_query_instrumentation: std::cell::Cell::new(
                 ManagedApplicationQueryInstrumentation::default(),
@@ -13586,6 +13601,76 @@ impl RuntimeActor {
         self.load_hot_application_exact_ready(&path)
     }
 
+    fn take_hot_application_save_exact_ready(
+        &mut self,
+        path: &str,
+        revision: &str,
+    ) -> Result<Option<ApplicationCurrentPage>, SyncApplicationPageRequestError> {
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.hot_application_save_attempts =
+                timings.hot_application_save_attempts.saturating_add(1);
+        });
+        let Some(hot) = self.hot_application_save_page.take() else {
+            return Ok(None);
+        };
+        if hot.current.revision != revision || hot.current.editor.page.path.as_str() != path {
+            return Ok(None);
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?;
+        let accepted_frontier = runtime
+            .engine()
+            .accepted_frontier_root()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        if accepted_frontier != hot.accepted_frontier {
+            return Ok(None);
+        }
+        let managed_path = ManagedPath::parse(path.to_owned()).map_err(|_| {
+            SyncApplicationPageRequestError::InvalidRequest(
+                SyncApplicationPageInvalidRequest::InvalidPath,
+            )
+        })?;
+        let exact_owner = runtime
+            .engine()
+            .current_page_at_path(&managed_path)
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        if !matches!(
+            exact_owner,
+            CurrentPageAtPath::ExactOwner(owner)
+                if owner.page_id() == hot.current.editor.page.page_id
+        ) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        note_application_save_stage(|timings| {
+            timings.hot_application_save_reuses =
+                timings.hot_application_save_reuses.saturating_add(1);
+        });
+        Ok(Some(hot.current))
+    }
+
+    fn retain_hot_application_save_page(
+        &mut self,
+        current: ApplicationCurrentPage,
+    ) -> Result<(PageDto, String), SyncApplicationPageRequestError> {
+        let response = (current.page.clone(), current.revision.clone());
+        let accepted_frontier = self
+            .runtime
+            .as_ref()
+            .ok_or(SyncApplicationPageRequestError::ActorUnavailable)?
+            .engine()
+            .accepted_frontier_root()
+            .map_err(|_| SyncApplicationPageRequestError::ActorRefused)?;
+        self.hot_application_save_page = Some(HotApplicationSavePage {
+            accepted_frontier,
+            current,
+        });
+        Ok(response)
+    }
+
     fn load_hot_application_exact_ready(
         &self,
         path: &ManagedPath,
@@ -13726,7 +13811,10 @@ impl RuntimeActor {
                 );
                 #[cfg(test)]
                 let load_started = Instant::now();
-                let load = self.load_application_save_exact_ready(path)?;
+                let load = match self.take_hot_application_save_exact_ready(path, revision)? {
+                    Some(current) => ApplicationExactLoad::Loaded(current),
+                    None => self.load_application_save_exact_ready(path)?,
+                };
                 #[cfg(test)]
                 note_application_save_stage(|timings| {
                     timings.exact_page_load = load_started.elapsed();
@@ -13876,10 +13964,11 @@ impl RuntimeActor {
                     Some(_) => return Err(SyncApplicationPageRequestError::ActorRefused),
                     None => self.reload_application_page(&page.path)?,
                 };
+                let (page, revision) = self.retain_hot_application_save_page(accepted)?;
                 Ok(SyncApplicationPageSaveOutcome::Saved {
                     batch_id,
-                    page: accepted.page,
-                    revision: accepted.revision,
+                    page,
+                    revision,
                 })
             }
             SyncEditorSaveOutcome::Unchanged { page, .. } => {
@@ -30805,6 +30894,7 @@ mod tests {
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
         assert_eq!(counters.finalizer_post_state_render, 0);
+        assert_eq!(counters.capture_prepared_predecessor_use, 0);
         assert_eq!(
             counters.finalizer_predecessor_replay_render, 1,
             "fail-before: the first save has no pending managed-local predecessor to seal"
@@ -30861,6 +30951,18 @@ mod tests {
         let instrumentation = handle
             .managed_application_save_instrumentation()
             .expect("consecutive save exposes capture-sealed instrumentation");
+        assert_eq!(
+            instrumentation
+                .application_stages
+                .hot_application_save_attempts,
+            1
+        );
+        assert_eq!(
+            instrumentation
+                .application_stages
+                .hot_application_save_reuses,
+            1
+        );
         let before_detail = instrumentation.local_mutation_detail;
         assert_eq!(
             before_detail.before_projection_full_materializations, 0,
@@ -30893,6 +30995,7 @@ mod tests {
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
         assert_eq!(counters.finalizer_post_state_render, 0);
+        assert_eq!(counters.capture_prepared_predecessor_use, 1);
         assert_eq!(
             counters.finalizer_predecessor_replay_render, 0,
             "pass-after: finalization must consume the capture-sealed predecessor instead of replaying it"
@@ -48031,6 +48134,8 @@ mod tests {
             duration!(transaction_inner_finish_validate),
             duration!(transaction_outer_merge_finish_validate),
             duration!(editor_request_remainder),
+            count!(hot_application_save_attempts),
+            count!(hot_application_save_reuses),
             count!(editor_block_id_resolution_passes),
             count!(editor_block_ids_visited),
             count!(editor_requested_current_map_builds),
