@@ -31,6 +31,7 @@ import type {
   SyncConflict,
   SyncConflictDiff,
   MergeDecision,
+  ManagedPageMutationPreflightResult,
   PrintOpts,
   SparseV2Status,
   SparseV2CancelResult,
@@ -288,6 +289,11 @@ export interface Backend {
     bindingGeneration: number,
     request: ManagedApplicationMoveSubtreesRequest,
   ): Promise<ManagedApplicationMoveSubtreesRecoveryResult>;
+  preflightManagedPageMutation(
+    page: PageDto,
+    baseRevision: string | null,
+    bindingGeneration: number,
+  ): Promise<ManagedPageMutationPreflightResult>;
   sparseV2Status(): Promise<SparseV2Status>;
   onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
   onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
@@ -862,6 +868,17 @@ class TauriBackend implements Backend {
       { bindingGeneration, request },
     );
   }
+  preflightManagedPageMutation(
+    page: PageDto,
+    baseRevision: string | null,
+    bindingGeneration: number,
+  ) {
+    return this.call<ManagedPageMutationPreflightResult>("preflight_managed_page_mutation", {
+      page,
+      baseRevision,
+      bindingGeneration,
+    });
+  }
   sparseV2Status() {
     return this.call<SparseV2Status>("sparse_v2_status");
   }
@@ -1397,6 +1414,11 @@ export function backend(): Backend {
     _backend = isTauri() ? new TauriBackend() : mockBackend();
   }
   return _backend;
+}
+
+/** Test-only backend injection for delayed/rejected native-boundary proofs. */
+export function __setBackendForTest(value: Backend | null): void {
+  if (import.meta.env.MODE === "test") _backend = value;
 }
 
 /** OG-visible graph property keys/values for the block editor. Kept separate

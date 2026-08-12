@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 ## [Unreleased]
 
 ### Fixed
+- **Sheet structure commands now stay atomic when experimental managed storage must validate them first.** Row and column changes, rectangular clear/cut/paste/fill/move, and edge growth are prepared as one detached page candidate. Direct Files still applies them synchronously; managed storage now refuses stale, oversized, unavailable, or overlapping commands before the live page, undo history, selection, or dirty state changes.
 
 - **Experimental managed-storage cross-page move recovery now resumes the exact durable move after an immediate process loss.** The actor reconstructs only an episode-authenticated immutable local manifest, completes accepted SQLite/projection/provider work exactly once, and transfers a real external-edit conflict to the existing exact feed without overwriting the external bytes or reporting deleted affected pages as successful.
 
