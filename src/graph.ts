@@ -6,7 +6,7 @@ import { managedStorageRuntime } from "./managedStorageRuntime";
 import { setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey, closePdf } from "./ui";
 import { resetStore, flushAll } from "./store";
 import { clearAssetBlobCache } from "./assetCache";
-import { resetTabsToJournals, openPage, restoreSession, flushSession, type PageTarget } from "./router";
+import { resetTabsToJournals, openPage, restoreSession, flushSession, route, sameRoute, type PageTarget } from "./router";
 import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
 import { journalTitle, localDayKey, setJournalTitleFormat } from "./journal";
 import { applyTemplateVars, prepareTemplateVars } from "./editor/templateVars";
@@ -80,6 +80,7 @@ export async function loadGraphPath(
   path: string,
   options: { forceRefresh?: boolean; transitionHeld?: boolean } = {}
 ): Promise<LoadGraphPathOutcome> {
+  const startedAt = performance.now();
   const ownsTransition = !options.transitionHeld;
   if (graphTransitioning() && ownsTransition) return { kind: "aborted" };
   if (ownsTransition) {
@@ -91,6 +92,7 @@ export async function loadGraphPath(
     await Promise.resolve();
   }
   try {
+  console.info(`[tine] frontend graph open: begin path=${path ? "explicit" : "default"}`);
   // Whether we're switching to a *different* graph than last time. Only then do
   // we drop the persisted right-sidebar items; reopening the same graph at
   // startup keeps them (and we prune stale block refs below).
@@ -139,6 +141,7 @@ export async function loadGraphPath(
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
     throw error;
   }
+  console.info(`[tine] frontend graph open: native binding ready at ${Math.round(performance.now() - startedAt)} ms`);
   if (result.kind === "focused_existing") {
     if (rebindsPdfOwner && prev) activatePdfOwnership(prev);
     if (clearedManagedRuntime) void managedStorageRuntime.refresh();
@@ -162,11 +165,11 @@ export async function loadGraphPath(
   }
   if (switching || !hadGraph) resetLeftSidebarSections();
   setGraphMeta(meta ?? null);
-  // Revoke every in-flight result from the previous binding NOW, before the
-  // awaited journal-template step. This is also required for same-root force
-  // refresh (restore): root equality cannot distinguish pre-restore DTOs from
-  // the freshly rebound graph. The second bump below refetches after a default
-  // template has been written, preserving #73's populated-first observation.
+  // Revoke every in-flight result from the previous binding NOW. This is also
+  // required for same-root force refresh (restore): root equality cannot
+  // distinguish pre-restore DTOs from the freshly rebound graph. A visible
+  // Journals surface performs template materialization before fetching its feed,
+  // preserving #73's populated-first observation without blocking graph open.
   bumpGraphEpoch();
   setWorkflow(meta?.preferred_workflow === "todo" ? "todo" : "now");
   setJournalTitleFormat(meta?.journal_page_title_format); // match this graph's journal titles
@@ -180,11 +183,9 @@ export async function loadGraphPath(
       // ignore
     }
   }
-  // A default journal template writes today's journal to disk. Do that before
-  // invalidating graph-backed resources so the first Journals refetch observes
-  // the populated file instead of caching the synthetic blank page (#73).
-  await ensureJournalTemplateForDay(new Date());
-  bumpGraphEpoch();
+  // A visible Journals surface owns template materialization and awaits it
+  // before fetching the feed (Page.tsx). Doing it here as well makes every graph
+  // open pay getPage/listTemplates, which can cold-scan a large Direct graph.
   void injectCustomCss();
   void loadAliases();
   if (!switching) void pruneSidebarBlocks();
@@ -203,13 +204,21 @@ export async function loadGraphPath(
     // session before the backend knew which graph this webview would own.
     await restoreSession();
   }
+  console.info(`[tine] frontend graph open: session restored at ${Math.round(performance.now() - startedAt)} ms`);
   // GH #245: a configured home page wins over the ordinary landing on an
   // ordinary open (first bind or graph switch) — not on a same-graph reload /
   // watcher refresh. Later explicit intents (quick capture, deep link) still
   // win by navigating after this.
   if (result.kind === "loaded" && (switching || !hadGraph)) {
-    await openConfiguredHomePage(meta.root);
+    const homeEpoch = graphEpoch();
+    const landingRoute = { ...route() };
+    void openConfiguredHomePage(meta.root, () =>
+      graphMeta()?.root === meta.root
+      && graphEpoch() === homeEpoch
+      && sameRoute(route(), landingRoute)
+    );
   }
+  console.info(`[tine] frontend graph open: interactive at ${Math.round(performance.now() - startedAt)} ms`);
   return { kind: result.kind, root: meta.root };
   } finally {
     if (ownsTransition) setGraphTransitioning(false);

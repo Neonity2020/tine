@@ -3002,14 +3002,17 @@
         "linux"
       ],
       "layer": "core-native",
-      "status": "reported",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src-tauri/src/graph.rs::tests::direct_large_graph_open_manual_benchmark",
-          "scripts/e2e-windows-direct-large-open.mjs"
+          "scripts/e2e-windows-direct-large-open.mjs",
+          "src/graphStartup.test.ts",
+          "src/homePage.test.ts",
+          "src/components/Page.test.tsx::Journals feed generation lifecycle"
         ]
       },
-      "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore does not reproduce the Windows report. Debug builds now emit phase and cumulative timings for canonicalization, private/shared storage discovery, asset approval, Direct core open, legacy store discovery, graph binding, backup scheduling, settings/title, and warm-cache scheduling. The focused Windows WebView2 scenario measures the load_graph interval on the same file-count shape and preserves phase diagnostics, but cannot duplicate the reporter's physical disk, antivirus, or 24.6 GB of real payload. Keep this reported until a current Windows trace identifies the missing filesystem or platform phase."
+      "notes": "The reporter measured 44.9 seconds inside the frontend load_graph call on Windows for about 13,000 pages and 25,884 files / 24.6 GB. The representative release benchmark creates 13,000 Markdown pages plus 12,884 sparse assets in 281 buckets (25.2 GiB apparent assets): current core open took 0.4 ms and the full current Linux app returned from load_graph in 65 ms; the released v0.6.90 Linux AppImage returned in 26 ms on the same fixture. Graph size alone therefore did not reproduce the Windows report. The frontend nevertheless performed two optional page-discovery operations synchronously after native binding: default-journal template discovery and configured-home-page lookup. Those may cold-scan a Direct graph and are unnecessary for first interaction. Visible Journals now owns and awaits template materialization before its first feed fetch, preserving #73, while graph open no longer duplicates that work. Configured-home lookup runs in the background and may navigate only if graph, epoch, and landing route are unchanged, so a slow result cannot override user navigation. Frontend phase logs now distinguish native binding, session restoration, and interactivity; native debug logs retain the lower-level phase timings. The Windows scenario and reporter retest remain valuable platform evidence, but the demonstrated synchronous graph-size-dependent frontend work is now removed and its ordering contracts are covered."
     },
     {
       "id": "REG-WINDOWS-MANAGED-ACTIVATION-292",
