@@ -6040,11 +6040,12 @@ mod tests {
                 .bind_recovered_history_after_pending_reconciliation_for_test(2, recovered_root),
             Err(ProjectionWorkError::HistoryBindingMismatch)
         ));
+        let current = fixture.index.engine_history_authority().unwrap();
         fixture
             .index
             .bind_recovered_history_after_pending_reconciliation_for_test(
-                1,
-                ContentDigest::of(b"projection-work-test-history-root"),
+                current.generation,
+                current.index_root,
             )
             .unwrap();
     }
