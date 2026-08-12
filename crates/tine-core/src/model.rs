@@ -33925,6 +33925,38 @@ mod tests {
         assert_post_retirement_foreign_destination(true);
     }
 
+    // Restored after `a5cf7c11 refactor: remove legacy managed sync model path`
+    // deleted it wholesale. Its second half called `migrate_sync_identities`,
+    // which that refactor legitimately removed — but the link-count parity
+    // above it is not legacy and is still load-bearing: the Direct creation
+    // census refuses `file.link_count != 1`, and on Windows that count comes
+    // from `GetFileInformationByHandle` on a handle opened BEFORE the hard link
+    // existed. If a held handle reported a stale 1, the hard-link refusal would
+    // be defeated on Windows only. The v1 half is dropped; the platform
+    // assertion is not.
+    #[cfg(windows)]
+    #[test]
+    fn projection_windows_held_handle_link_count_tracks_one_and_two_links() {
+        let dir = scratch("projection-windows-held-handle-link-count");
+        let target = dir.join("pages/Target.md");
+        let alias = dir.join("pages/Alias.md");
+        fs::write(&target, b"- retained\n").unwrap();
+        let file = fs::File::open(&target).unwrap();
+
+        assert_eq!(projection_file_link_count(&file).unwrap(), 1);
+        fs::hard_link(&target, &alias).unwrap();
+        assert_eq!(
+            projection_file_link_count(&file).unwrap(),
+            2,
+            "a held handle must observe the new link, or the creation census \
+             cannot refuse a hard-linked graph text file on Windows"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"- retained\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"- retained\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_handle_relative_noreplace_renames_the_exact_source() {
