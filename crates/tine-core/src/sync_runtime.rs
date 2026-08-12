@@ -21412,8 +21412,10 @@ impl RuntimeActor {
     }
 
     fn clean_shutdown(&mut self) -> Result<SyncShutdownOutcome, SyncRuntimeRequestError> {
-        if self.terminal.is_some() {
-            return Ok(SyncShutdownOutcome::Terminal(self.snapshot()));
+        if let Some(detail) = &self.terminal {
+            return Err(SyncRuntimeRequestError::ActorRefused(format!(
+                "clean shutdown refused by terminal runtime: {detail}"
+            )));
         }
         if self.local_mutation.is_some() {
             let outcome = self.advance_local_mutation_once();
@@ -25558,11 +25560,6 @@ mod tests {
         );
     }
 
-    // Quarantined for v0.6.92, not repaired: a revoked runtime still reports a
-    // clean shutdown carrying an adopted-safe handoff. The defect is real and
-    // open as GH #309; managed storage is experimental and off by default, so
-    // it does not hold the release. Un-ignore with the fix, not before.
-    #[ignore = "GH #309: revoked runtime reports a clean shutdown with an adopted-safe handoff"]
     #[test]
     fn authority_revocation_keeps_published_local_continuation_terminal_and_unsafe() {
         let fixture = RuntimeHostFixture::safe("sync-runtime-local-revoked-continuation");
@@ -32797,8 +32794,8 @@ mod tests {
             SyncRuntimeTick::Terminal(_)
         ));
         assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Terminal(_)
+            handle.clean_shutdown(),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
         ));
         assert_eq!(managed_local_journal_frames(&request).len(), 0);
 
@@ -37963,10 +37960,11 @@ mod tests {
             Err(SyncRuntimeRequestError::ActorRefused(_))
         ));
         assert!(matches!(
-            handle.clean_shutdown().unwrap(),
-            SyncShutdownOutcome::Terminal(_)
+            handle.clean_shutdown(),
+            Err(SyncRuntimeRequestError::ActorRefused(_))
         ));
 
+        drop(handle);
         let fresh = active_handle(SyncRuntimeHandle::open(request));
         assert_eq!(
             fresh.status().unwrap().recovery,
