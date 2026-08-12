@@ -1,3 +1,3 @@
-pub(crate) use super::authenticated_patricia::{
+pub(crate) use super::content_patricia::{
     PatriciaIndexRoot as LogseqClaimIndexRoot, PatriciaIndexStore as LogseqClaimIndexStore,
 };

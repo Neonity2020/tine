@@ -13,11 +13,11 @@ use std::time::Instant;
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 
-use super::authenticated_patricia::{
+use super::content_patricia::{
     CompletedPatriciaConstruction, PatriciaIndexConstruction, PatriciaIndexRoot, PatriciaIndexStore,
 };
 #[cfg(test)]
-use super::authenticated_patricia::{
+use super::content_patricia::{
     PatriciaIndexConstructionStats, PatriciaIndexStats, MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
 };
 use super::object_store::{

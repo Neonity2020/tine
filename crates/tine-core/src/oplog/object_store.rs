@@ -1606,7 +1606,7 @@ pub(crate) struct DetachedBootstrapPublicationSession {
 /// authored by one detached session is beneath its archive durability barrier.
 pub(crate) struct CompletedDetachedBootstrapPublication {
     physical: tine_storage::CompletedExactImmutablePublicationBatch,
-    packed_constructions: Option<[super::authenticated_patricia::CompletedPatriciaConstruction; 4]>,
+    packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 4]>,
     workspace_id: WorkspaceId,
     archive_identity: ControlDirectoryIdentity,
 }
@@ -1637,7 +1637,7 @@ impl CompletedDetachedBootstrapPublication {
         self.packed_constructions.as_ref().map(|constructions| {
             constructions
                 .each_ref()
-                .map(super::authenticated_patricia::CompletedPatriciaConstruction::stats)
+                .map(super::content_patricia::CompletedPatriciaConstruction::stats)
         })
     }
 }
@@ -1667,7 +1667,7 @@ impl DetachedBootstrapPublicationSession {
 
     pub(crate) fn finish(
         self,
-        packed_constructions: [super::authenticated_patricia::CompletedPatriciaConstruction; 4],
+        packed_constructions: [super::content_patricia::CompletedPatriciaConstruction; 4],
     ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
         self.finish_inner(Some(packed_constructions))
     }
@@ -1681,9 +1681,7 @@ impl DetachedBootstrapPublicationSession {
 
     fn finish_inner(
         self,
-        packed_constructions: Option<
-            [super::authenticated_patricia::CompletedPatriciaConstruction; 4],
-        >,
+        packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 4]>,
     ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
         let mut state = self.publisher.shared.state.lock().map_err(|_| {
             StoreError::Bootstrap(
@@ -1776,7 +1774,7 @@ impl LoadedBootstrapPartV1 {
 /// Every accepted bootstrap cold record binds four authenticated roots — the
 /// portable-path root, the page-name ownership root, the external UUID-claim
 /// root, and the reference-catalog root. Each has exactly one construction:
-/// the archive's durable authenticated Patricia stores. A detached session that
+/// the archive's durable content-addressed Patricia stores. A detached session that
 /// used the run-local ephemeral backends instead would bind roots the promoted
 /// runtime's durable stores can never open, so authoring takes this capability
 /// over the archive the bootstrap is installed into and promoted from.
@@ -3317,7 +3315,7 @@ impl ObjectStore {
     ) -> Result<super::portable_path_index::PortablePathIndexStore, StoreError> {
         ensure_directory_nofollow(&self.capability, PORTABLE_PATH_INDEX_DIR)?;
         Ok(super::portable_path_index::PortablePathIndexStore::new(
-            super::authenticated_patricia::PatriciaIndexStore::new(open_dir_nofollow(
+            super::content_patricia::PatriciaIndexStore::new(open_dir_nofollow(
                 &self.capability,
                 PORTABLE_PATH_INDEX_DIR,
             )?),

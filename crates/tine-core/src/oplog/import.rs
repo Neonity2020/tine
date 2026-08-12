@@ -10870,7 +10870,7 @@ mod tests {
     ///
     /// A bootstrap preparation is authored for exactly one archive: its
     /// accepted cold records bind catalog roots that live in that archive's
-    /// authenticated Patricia store, so installing it elsewhere fails closed.
+    /// content-addressed Patricia store, so installing it elsewhere fails closed.
     fn target_catalog(archive: &Path, workspace: WorkspaceId) -> BootstrapAuthoringCapability {
         ObjectStore::open(archive, workspace)
             .unwrap()
@@ -11094,7 +11094,7 @@ mod tests {
         assert_eq!(work.reference_fallback_document_reconstructions, 0);
         assert!(
             work.reference_catalog_peak_resident_bytes
-                <= super::super::authenticated_patricia::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+                <= super::super::content_patricia::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
             "private Patricia construction exceeded its fixed resident budget: {work:?}"
         );
         assert_eq!(

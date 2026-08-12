@@ -6,8 +6,8 @@
 //! Nothing here is wired to graph startup, enrollment, or mutation paths; the
 //! store persists only when explicitly opened on a caller-supplied root.
 
-pub(crate) mod authenticated_patricia;
 pub mod batch;
+pub(crate) mod content_patricia;
 // P2N4 bootstrap import evidence is a pure, inactive identity/validation
 // boundary.  Import execution and acceptance remain deliberately unwired.
 #[allow(dead_code)]

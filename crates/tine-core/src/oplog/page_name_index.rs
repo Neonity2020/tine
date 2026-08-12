@@ -7,7 +7,7 @@ use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::authenticated_patricia::{PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore};
+use super::content_patricia::{PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore};
 use super::object_store::{
     ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, read_optional_regular,
     DetachedBootstrapImmutablePublisher, StoreError,
@@ -1692,8 +1692,7 @@ impl PageNameOwnershipStore {
     pub(crate) fn finish_detached_construction(
         &self,
         root: &PageNameOwnershipRootV1,
-    ) -> Result<Option<super::authenticated_patricia::CompletedPatriciaConstruction>, StoreError>
-    {
+    ) -> Result<Option<super::content_patricia::CompletedPatriciaConstruction>, StoreError> {
         root.validate_version_and_shape()?;
         self.patricia
             .finish_detached_construction(root.patricia_root)
