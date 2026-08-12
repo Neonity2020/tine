@@ -14506,20 +14506,20 @@ impl RuntimeActor {
             // publication. It retains the live actor's draft authority and is
             // not the cold continuation path added here.
             Ok(ApplicationMoveEpisodeLookup::Pending(_)) => {
-                let mut last_deferred = None;
-                for _ in 0..MAX_EDITOR_SETTLE_TURNS {
-                    match self.move_application_subtrees(request.clone())? {
-                        outcome @ SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
-                            last_deferred = Some(outcome);
-                        }
-                        outcome => return Ok(outcome),
-                    }
-                }
-                return Ok(
-                    last_deferred.expect("bounded live move resolution executes at least one turn")
-                );
+                return self.settle_live_application_move_subtrees(request);
             }
             Ok(ApplicationMoveEpisodeLookup::Missing) => {
+                // The first move attempt can be blocked behind an unrelated
+                // retained local mutation before it authors an episode. In
+                // that same live actor, resolving the exact request must first
+                // settle that mutation and retry the move; otherwise a real
+                // stale-source conflict is collapsed into the misleading
+                // generic `EpisodeNotCommitted` result. A cold actor has no
+                // such local continuation and must never author a missing
+                // episode merely because the application asks for status.
+                if self.local_mutation.is_some() {
+                    return self.settle_live_application_move_subtrees(request);
+                }
                 let batch_id = self.deterministic_application_move_batch_id(parsed_episode_id);
                 let exact_batch_exists = self
                     .runtime
@@ -14645,6 +14645,22 @@ impl RuntimeActor {
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_cold_resume"))?
         };
         self.finish_correlated_move_resume(&episode, episode_id, state)
+    }
+
+    fn settle_live_application_move_subtrees(
+        &mut self,
+        request: SyncApplicationMoveSubtreesRequest,
+    ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
+        let mut last_deferred = None;
+        for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+            match self.move_application_subtrees(request.clone())? {
+                outcome @ SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
+                    last_deferred = Some(outcome);
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+        Ok(last_deferred.expect("bounded live move resolution executes at least one turn"))
     }
 
     fn finish_correlated_move_resume(
@@ -26284,6 +26300,29 @@ mod tests {
         )
     }
 
+    fn settled_application_move_observation(
+        handle: &SyncRuntimeHandle,
+        request: &SyncApplicationMoveSubtreesRequest,
+    ) -> SyncApplicationMoveSubtreesObservation {
+        let mut last_deferred = None;
+        for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+            let observation = handle
+                .resolve_application_move_subtrees(request.clone())
+                .unwrap();
+            if matches!(
+                observation.move_outcome,
+                SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+            ) {
+                last_deferred = Some(observation);
+            } else {
+                return observation;
+            }
+        }
+        panic!(
+            "application move observation did not settle within the bounded test budget; last={last_deferred:?}"
+        )
+    }
+
     fn query_page_blocks(handle: &SyncRuntimeHandle, page_id: &str) -> SyncPageWithBlocksDto {
         match handle
             .query(SyncRuntimeQueryRequest::LoadPage {
@@ -26475,13 +26514,13 @@ mod tests {
             observation.runtime_snapshot.lifecycle,
             SyncRuntimeLifecycle::Active
         );
-        assert!(matches!(
-            observation.move_outcome,
+        match observation.move_outcome {
             SyncApplicationMoveSubtreesOutcome::NoCommit {
                 ref episode_id,
                 reason: SyncApplicationMoveConflict::StaleSource,
-            } if episode_id == &request.episode_id
-        ));
+            } if episode_id == &request.episode_id => {}
+            other => panic!("same-actor resolution did not prove stale source: {other:?}"),
+        }
         assert_eq!(fixture.manifest_count(), manifests + 1);
     }
 
@@ -26526,22 +26565,25 @@ mod tests {
 
     #[test]
     fn application_cross_page_move_immediate_cold_cuts_never_reauthor() {
-        for (label, point, committed, immediate_applied) in [
+        for (label, point, cut_phase, committed, immediate_applied) in [
             (
                 "cold-before-append",
                 OperationalFaultPoint::AfterFinalize,
+                SyncLocalMutationPhase::Finalize,
                 false,
                 0,
             ),
             (
                 "cold-after-manifest",
                 OperationalFaultPoint::AfterManifest,
+                SyncLocalMutationPhase::Publication,
                 true,
                 0,
             ),
             (
                 "cold-projection",
                 OperationalFaultPoint::BeforeProjection,
+                SyncLocalMutationPhase::ProjectionDrain,
                 true,
                 1,
             ),
@@ -26555,10 +26597,25 @@ mod tests {
             let applied = fixture.applied_batch_count();
             handle.install_repeated_operational_fault(point, 1).unwrap();
 
-            assert!(matches!(
-                handle.move_application_subtrees(request.clone()).unwrap(),
-                SyncApplicationMoveSubtreesOutcome::Deferred { .. }
-            ));
+            let mut observed_cut = false;
+            for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+                match handle.move_application_subtrees(request.clone()).unwrap() {
+                    SyncApplicationMoveSubtreesOutcome::Deferred { state, .. } => {
+                        let phase = match state {
+                            SyncEditorDeferred::RetryableRetainedPublication { phase, .. }
+                            | SyncEditorDeferred::BlockedRecovery { phase, .. }
+                            | SyncEditorDeferred::Revoked { phase, .. } => Some(phase),
+                            SyncEditorDeferred::RetryableExternalWork => None,
+                        };
+                        if phase == Some(cut_phase) {
+                            observed_cut = true;
+                            break;
+                        }
+                    }
+                    other => panic!("{label}: move settled before injected cut: {other:?}"),
+                }
+            }
+            assert!(observed_cut, "{label}: injected cut was not reached");
             // The cut is observed and the actor is dropped immediately. In
             // particular, do not tick, query accepted state, or cleanly stop.
             drop(handle);
@@ -26585,9 +26642,7 @@ mod tests {
                 Some(SyncRuntimeRecovery::TookOverCrashedUnsafe),
                 "{label}: cold replay must use the real crashed-unsafe lifecycle"
             );
-            let observation = reopened
-                .resolve_application_move_subtrees(request.clone())
-                .unwrap();
+            let observation = settled_application_move_observation(&reopened, &request);
             if committed {
                 match observation.move_outcome {
                     SyncApplicationMoveSubtreesOutcome::Committed {
