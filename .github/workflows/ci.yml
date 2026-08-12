@@ -84,14 +84,11 @@ jobs:
       - name: Rust core tests
         run: cargo test -p tine-core
 
-      # The crate that produces the binary, not only the library under it. This
-      # was never executed by CI until GH #331; `cargo check -p tine` elsewhere
-      # compiles it but runs nothing, which hid a failing command-surface
-      # contract and five stale watcher tests across two releases.
-      - name: Rust app-crate tests
-        run: |
-          cargo test -p tine --lib
-          cargo test -p tine-plugin-sdk
+      # The app crate itself is gated in full CI, not here: linking it needs the
+      # GTK/WebKit toolchain, which is a slow install PRs should not pay for.
+      # The SDK has no system dependencies, so it is free to run everywhere.
+      - name: Plugin SDK tests
+        run: cargo test -p tine-plugin-sdk
 
   validate-windows-focused-test-input:
     name: CI dispatch input validation / Windows focused test scope
@@ -183,6 +180,21 @@ jobs:
       - name: Frontend tests (vitest)
         run: npm test
 
+      # No Linux job had ever BUILT the app crate — the Tauri shell is only
+      # `cargo check`ed on Windows and for Android — so nothing here installed
+      # its system libraries. Compile-time dependencies only: these tests are
+      # ordinary unit tests and open no window.
+      - name: Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev build-essential libssl-dev
+
+      # The crate that produces the binary, not only the library under it. It
+      # was never executed by CI until GH #331; `cargo check -p tine` compiles it
+      # but runs nothing, which hid a failing command-surface contract, an
+      # unreleased cross-page-move regression, and five stale watcher tests.
       - name: Rust app-crate tests
         run: |
           cargo test -p tine --lib
