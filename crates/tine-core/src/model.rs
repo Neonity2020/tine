@@ -47021,7 +47021,11 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("pages/New.md"), "- new body links [[Old]]\n").unwrap();
-        fs::write(dir.join("pages/Old___Child.md"), "- child of [[Old]]\n").unwrap();
+        // The default page filename format is Legacy, so a namespace slash is
+        // percent-encoded. Using the TripleLowbar spelling here made the file a
+        // literal `Old___Child` page and left the test's descendant assertion
+        // outside the behavior it claimed to exercise.
+        fs::write(dir.join("pages/Old%2FChild.md"), "- child of [[Old]]\n").unwrap();
         fs::write(dir.join("pages/Referrer.md"), "- see [[Old]] and #Old\n").unwrap();
         let graph = Graph::open(&dir);
 
@@ -47040,11 +47044,11 @@ mod tests {
             "- see [[New]] and #New\n"
         );
         assert_eq!(
-            fs::read_to_string(dir.join("pages/New___Child.md")).unwrap(),
+            fs::read_to_string(dir.join("pages/New%2FChild.md")).unwrap(),
             "- child of [[New]]\n"
         );
         assert!(!dir.join("pages/Old.md").exists());
-        assert!(!dir.join("pages/Old___Child.md").exists());
+        assert!(!dir.join("pages/Old%2FChild.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
