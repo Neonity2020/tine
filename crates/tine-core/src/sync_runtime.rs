@@ -16042,13 +16042,28 @@ impl RuntimeActor {
                             .editor_exact_base_read
                             .saturating_add(exact_base_started.elapsed());
                     });
-                    let prepared_editor_projection =
-                        PreparedEditorProjection::prepare(requested_page, &current.page, base)
-                            .map_err(|_| {
-                                SyncEditorRequestError::ActorRefusedAt(
-                                    "rendering the requested page edit",
-                                )
-                            })?;
+                    let hot_predecessor = runtime
+                        .engine()
+                        .current_local_projection_predecessor_annotations(
+                            current.page.page_id,
+                            &current.page.path,
+                            &base,
+                        );
+                    let prepared_editor_projection = match hot_predecessor {
+                        Some(annotations) => {
+                            PreparedEditorProjection::prepare_from_hot_predecessor(
+                                requested_page,
+                                base,
+                                annotations,
+                            )
+                        }
+                        None => {
+                            PreparedEditorProjection::prepare(requested_page, &current.page, base)
+                        }
+                    }
+                    .map_err(|_| {
+                        SyncEditorRequestError::ActorRefusedAt("rendering the requested page edit")
+                    })?;
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
                         let projection = prepared_editor_projection_instrumentation();
@@ -16058,8 +16073,9 @@ impl RuntimeActor {
                         timings.editor_target_projection_render = timings
                             .editor_target_projection_render
                             .saturating_add(projection.target_render);
-                        timings.editor_accepted_renders =
-                            timings.editor_accepted_renders.saturating_add(1);
+                        timings.editor_accepted_renders = timings
+                            .editor_accepted_renders
+                            .saturating_add(projection.accepted_renders);
                         timings.editor_accepted_rendered_blocks = timings
                             .editor_accepted_rendered_blocks
                             .saturating_add(projection.accepted_blocks_visited);
@@ -30769,6 +30785,10 @@ mod tests {
             .expect("ordinary save exposes prepared-projection instrumentation");
         let counters = instrumentation.prepared_editor_projection;
         assert_eq!(counters.created, 1);
+        assert_eq!(
+            counters.accepted_renders, 1,
+            "the first save has no process-local projection predecessor"
+        );
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
         assert_eq!(counters.finalizer_post_state_render, 0);
@@ -30835,6 +30855,10 @@ mod tests {
         );
         let counters = instrumentation.prepared_editor_projection;
         assert_eq!(counters.created, 1);
+        assert_eq!(
+            counters.accepted_renders, 0,
+            "the second save must reuse the exact hot-overlay predecessor annotations"
+        );
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
         assert_eq!(counters.finalizer_post_state_render, 0);
@@ -47611,12 +47635,11 @@ mod tests {
             (1, page_blocks)
         );
         assert_eq!(
-            (
-                stages.editor_accepted_renders,
-                stages.editor_accepted_rendered_blocks
-            ),
-            (1, page_blocks)
+            stages.editor_accepted_renders, prepared.accepted_renders,
+            "stage accounting must report whether predecessor rendering was actually required"
         );
+        assert!(stages.editor_accepted_renders <= 1);
+        assert_eq!(stages.editor_accepted_rendered_blocks, page_blocks);
         assert_eq!(
             (
                 stages.editor_target_renders,

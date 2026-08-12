@@ -77,6 +77,7 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     /// opaque "projection" cost.
     pub(crate) accepted_render: std::time::Duration,
     pub(crate) target_render: std::time::Duration,
+    pub(crate) accepted_renders: usize,
     pub(crate) accepted_blocks_visited: usize,
     pub(crate) target_blocks_visited: usize,
 }
@@ -93,6 +94,7 @@ impl PreparedEditorProjectionInstrumentation {
         finalizer_sealed_pending_local_predecessor_use: 0,
         accepted_render: std::time::Duration::ZERO,
         target_render: std::time::Duration::ZERO,
+        accepted_renders: 0,
         accepted_blocks_visited: 0,
         target_blocks_visited: 0,
     };
@@ -354,6 +356,7 @@ impl PreparedEditorProjection {
         #[cfg(test)]
         note_prepared_editor_projection(|instrumentation| {
             instrumentation.created = instrumentation.created.saturating_add(1);
+            instrumentation.accepted_renders = instrumentation.accepted_renders.saturating_add(1);
             instrumentation.accepted_render = instrumentation
                 .accepted_render
                 .saturating_add(accepted_elapsed);
@@ -376,6 +379,54 @@ impl PreparedEditorProjection {
                 // page for all ordinary request construction.
                 accepted_page: None,
                 accepted_rendered: accepted,
+            }),
+            rendered,
+        })
+    }
+
+    /// Prepare against the exact process-local predecessor already retained by
+    /// the hot overlay. The overlay annotations are only a rendering shortcut:
+    /// draft capture independently rechecks the same overlay entry, exact bytes,
+    /// page state and semantic before-snapshot before it can reuse them.
+    pub(crate) fn prepare_from_hot_predecessor(
+        requested_page: MaterializedPage,
+        exact_base: Vec<u8>,
+        accepted_annotations: Vec<AnnotatedIdentity>,
+    ) -> Result<Self, ProjectionError> {
+        let candidate_base_layout = structural_layout_identities(&accepted_annotations);
+        #[cfg(test)]
+        let target_started = std::time::Instant::now();
+        let rendered = render_projection_page_with_layout_identities(
+            &requested_page,
+            Some(&exact_base),
+            &candidate_base_layout,
+        )?;
+        #[cfg(test)]
+        let target_elapsed = target_started.elapsed();
+        #[cfg(test)]
+        note_prepared_editor_projection(|instrumentation| {
+            instrumentation.created = instrumentation.created.saturating_add(1);
+            instrumentation.target_render =
+                instrumentation.target_render.saturating_add(target_elapsed);
+            instrumentation.accepted_blocks_visited = instrumentation
+                .accepted_blocks_visited
+                .saturating_add(accepted_annotations.len());
+            instrumentation.target_blocks_visited = instrumentation
+                .target_blocks_visited
+                .saturating_add(requested_page.blocks.len());
+        });
+        Ok(Self {
+            requested_page,
+            exact_base: exact_base.clone(),
+            candidate_base_layout,
+            before_candidate: Some(PreparedEditorProjectionBeforeCandidate {
+                accepted_page: None,
+                accepted_rendered: RenderedProjection {
+                    target: exact_base,
+                    annotations: accepted_annotations,
+                    base_layout_identities: Vec::new(),
+                    generated_anchors: Vec::new(),
+                },
             }),
             rendered,
         })

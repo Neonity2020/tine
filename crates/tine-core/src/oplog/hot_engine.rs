@@ -7803,6 +7803,33 @@ impl fmt::Debug for ShardedHotEngine {
 }
 
 impl ShardedHotEngine {
+    /// Return the exact annotations of the process-local projection predecessor
+    /// when the latest durable-local overlay entry names this page, path and byte
+    /// sequence. This is rebuildable acceleration evidence, never authority;
+    /// draft capture re-authenticates the same entry before consuming it.
+    pub(crate) fn current_local_projection_predecessor_annotations(
+        &self,
+        page_id: PageId,
+        path: &ManagedPath,
+        exact_base: &[u8],
+    ) -> Option<Vec<AnnotatedIdentity>> {
+        let last = self.local_overlay.entries.last()?;
+        let intent = &last.projection.intent;
+        if last.batch_id != intent.source_batch_id()
+            || intent.page_id() != page_id
+            || intent.path() != path
+        {
+            return None;
+        }
+        let ManifestProjectionTarget::Present {
+            bytes, annotations, ..
+        } = intent.target()
+        else {
+            return None;
+        };
+        (bytes.as_slice() == exact_base).then(|| annotations.clone())
+    }
+
     pub fn new(
         workspace_id: WorkspaceId,
         lineage_digest: LineageDigest,
