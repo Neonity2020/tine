@@ -3065,6 +3065,35 @@
       "notes": "The original terminal combined two independent bookkeeping/scheduling defects. Exact-feed preflight accumulated parser estimates and every touched file's raw bytes as though all files were parsed and retained simultaneously; the estimate itself treated every source byte as a node in every parser, DTO, projection, and index allocation class. Preparation is actually serial and retains only the small semantic admission record. Initial construction had the same false parser estimate. Both paths now retain the hard 64 MiB source/batch and 1,000,000 parsed-node caps, check actual retained growth, and account only the currently live file buffer. Separately, the 16-unit coordinator resume budget made fixed reauthentication/reopen overhead dominate and required thousands of turns for one large page. The measured 256-unit bounded slice completes the full 20,000-block external-import and candidate-bounded query regression within its 64-turn contract while still yielding between slices. The regression also proves the sparse query reads the one matching block and its four ancestors rather than hydrating the page."
     },
     {
+      "id": "REG-ANDROID-STRUCTURAL-BLOCK-MOVE-312",
+      "title": "Move up and down crosses child-list edges like Logseq on Android and desktop",
+      "family": "outline-structural-movement",
+      "sources": {
+        "issues": [
+          312
+        ],
+        "commits": [],
+        "og": [
+          "src/main/frontend/handler/editor.cljs:1731-1753",
+          "src/main/frontend/modules/outliner/core.cljs:760-797",
+          "src/main/frontend/mobile/mobile_bar.cljs:99-100"
+        ]
+      },
+      "platforms": [
+        "android",
+        "desktop"
+      ],
+      "layer": "state-model",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/store.test.ts::OG structural block move parity",
+          "src/store.test.ts::cross-day move (journal feed as one list)"
+        ]
+      },
+      "notes": "Tine's mobile toolbar and desktop editor command already dispatched the same moveBlockFeed operation, but that operation only swapped siblings and stopped at every nested child-list edge. OG uses one shared move-up/down handler too. Its outliner rule swaps ordinary siblings; at a boundary, moving the last child down enters the next parent sibling as its first child, and moving that first child up enters the previous parent sibling as its last child. Tine now implements that same reversible structural rule while retaining root-level journal-feed crossing, subtree identity, inherited list-style semantics, caret-preserving keyed DOM movement, and one undo unit. The regression covers both directions, a child subtree, ordinary sibling movement with Undo/Redo, and the true top boundary."
+    },
+    {
       "id": "REG-CASE-INSENSITIVE-TRACKED-PATHS-280",
       "title": "A fresh checkout has no tracked paths that collide on a case-insensitive filesystem",
       "family": "build-portability",
