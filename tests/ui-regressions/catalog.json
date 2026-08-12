@@ -6669,6 +6669,27 @@
         "failBefore": "proven"
       },
       "notes": "The unchanged v0.6.93 candidate passed the same literal upload journey twice and failed once after a blind chooser activation/type/120ms sequence. The harness already launches Openbox, so a missing window manager was not the current cause. It now proves the chooser is visible and EWMH-active, submits the absolute path, observes closure, and only reactivates/sends Open while the chooser remains visibly mapped. The suite runner may retry the isolated scenario once only on E2E_NATIVE_CHOOSER_INPUT_UNDELIVERED. If the chooser closes but the graph asset or Markdown write is absent, the existing blocking product assertion remains unchanged."
+    },
+    {
+      "id": "UI-E2E-BLOCK-EMBED-CONTENT-READINESS-315",
+      "title": "The release E2E waits for semantic block-embed content before interacting with it",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [315],
+        "commits": []
+      },
+      "platforms": ["linux"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-block-embed.mjs",
+          "tests/ui-regressions/e2e-contracts.json"
+        ],
+        "scenario": "e2e.block-embed-semantic-content-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "The v0.6.92 journey clicked as soon as embed macro roots existed, while cross-page descendants populated asynchronously; adding an unrelated await moved the failure between disclosure and arrow/delete. The stable release journey now requires exactly one embedded root, its content and child disclosure control, the required child identity/text, and—where deletion/navigation needs it—the child's own descendants. Only then does it exercise real disclosure, Arrow navigation, deletion and Enter persistence. No timing or presentation detail is asserted, and the previously quarantined stateful-UX contract is restored to blocking stable coverage."
     }
   ]
 }

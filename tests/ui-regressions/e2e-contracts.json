@@ -31,8 +31,7 @@
    "nonRequirements": [
     "Exact indentation pixels or disclosure-icon artwork."
    ],
-   "stability": "quarantined",
-   "quarantineReason": "2026-08-11 (v0.6.92 candidate e7c73bcf): the journey has no readiness predicate for embedded content, so its failure point moves with timing. A DOM probe right after openTestPage found the exact failing selector matching (1 element, data-block-ref 66666666-... present inside the rendered embed), and a separate dump at the same point found the cross-page embed with its children not yet rendered. Two full-suite runs failed at exerciseArrowAndDelete; an instrumented run with one added await failed earlier instead, at exerciseDisclosure(CROSS) on .collapse-toggle.has-children. Embeds resolve their content asynchronously and the scenario clicks straight into it. That is a missing wait, not a lost user outcome. Keep running it for artifacts; restore release blocking only once it waits on a test-visible embed-content-ready boundary. Harness debt: GH #315."
+   "stability": "stable"
   },
   "scripts/e2e-block-ref-count.mjs": {
    "contracts": [

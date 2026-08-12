@@ -75,6 +75,43 @@ await sleep(2500);
 let browser;
 const rootSelector = (id) => `.block-embed-host .embed-block [data-block-ref="${id}"]`;
 
+async function embedContentState(id, { childId, childText } = {}) {
+  return browser.execute((rootId, expectedChildId, expectedChildText) => {
+    const selector = `.block-embed-host .embed-block [data-block-ref="${rootId}"]`;
+    const roots = [...document.querySelectorAll(selector)];
+    const root = roots[0];
+    const child = expectedChildId
+      ? root?.querySelector(`[data-block-ref="${expectedChildId}"]`)
+      : [...(root?.querySelectorAll(".ls-block") ?? [])]
+        .find((candidate) => (candidate.querySelector(":scope > .block-main .block-content")?.textContent ?? "").includes(expectedChildText ?? ""));
+    return {
+      roots: roots.length,
+      rootContent: root?.querySelector(":scope > .block-main .block-content")?.textContent?.trim() ?? null,
+      rootToggle: Boolean(root?.querySelector(":scope > .block-main .collapse-toggle.has-children")),
+      childFound: Boolean(child),
+      childContent: child?.querySelector(":scope > .block-main .block-content")?.textContent?.trim() ?? null,
+      childToggle: Boolean(child?.querySelector(":scope > .block-main .collapse-toggle.has-children")),
+      html: root?.outerHTML.slice(0, 3_000) ?? null,
+    };
+  }, id, childId ?? null, childText ?? null);
+}
+
+async function waitForEmbedContent(id, options) {
+  let last;
+  await browser.waitUntil(async () => {
+    last = await embedContentState(id, options);
+    return last.roots === 1
+      && Boolean(last.rootContent)
+      && last.rootToggle
+      && last.childFound
+      && (!options.childText || last.childContent?.includes(options.childText))
+      && (!options.childMustHaveChildren || last.childToggle);
+  }, {
+    timeout: 15_000,
+    timeoutMsg: `embed ${id} did not reach semantic content readiness: ${JSON.stringify(last)}`,
+  });
+}
+
 async function openTestPage() {
   await browser.$(".ls-block, .page-title").waitForExist({ timeout: 20_000 });
   for (const selector of ["a.page-ref=Block Embed Test", "span.page-ref=Block Embed Test", "*=Block Embed Test"]) {
@@ -84,9 +121,16 @@ async function openTestPage() {
   await browser.waitUntil(async () => (await browser.$("h1.page-title").getText()).trim() === "Block Embed Test", {
     timeout: 10_000, timeoutMsg: "Block Embed Test page did not open",
   });
-  await browser.$(`${rootSelector(CROSS)} .block-content`).waitForExist({ timeout: 10_000 });
-  await browser.$(`${rootSelector(NAV)} .block-content`).waitForExist({ timeout: 10_000 });
-  await browser.$(`${rootSelector(SAME)} .block-content`).waitForExist({ timeout: 10_000 });
+  // Page readiness only proves that the macro hosts mounted. Cross-page embed
+  // descendants resolve asynchronously, so wait for the exact semantic rows
+  // each journey will operate on instead of racing the first host paint (#315).
+  await waitForEmbedContent(CROSS, { childText: "Cross-page child block" });
+  await waitForEmbedContent(NAV, {
+    childId: NAV_CHILD,
+    childText: "Navigation-only child block",
+    childMustHaveChildren: true,
+  });
+  await waitForEmbedContent(SAME, { childText: "Same-page child block" });
 }
 
 async function exerciseDisclosure(id, childText) {
