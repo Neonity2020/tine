@@ -3462,8 +3462,26 @@ mod tests {
             .saturating_add(pack_files)
             .saturating_add(catalog_files)
             .saturating_add(head_files);
+        // `tine-storage` deliberately remains read-only for this measurement.
+        // Estimate the pure SHA-256 share by hashing the same aggregate byte
+        // volume in the same number of fresh digest invocations as the logical
+        // node publications. The remainder of the measured Patricia wall time
+        // is traversal, serialization, map maintenance, and publication I/O.
+        // This is an upper-bound estimate for removable hashing work, not a
+        // counterfactual implementation with content addressing disabled.
+        let sha_invocations = work.logical_node_writes.max(1);
+        let sha_bytes_per_invocation = work.packed_bytes.div_ceil(sha_invocations).max(1);
+        let sha_payload = vec![0x5a_u8; sha_bytes_per_invocation];
+        let sha_started = Instant::now();
+        let mut sha_sink = [0_u8; 32];
+        for _ in 0..sha_invocations {
+            use sha2::Digest as _;
+            sha_sink.copy_from_slice(&sha2::Sha256::digest(&sha_payload));
+            std::hint::black_box(sha_sink);
+        }
+        let sha_elapsed = sha_started.elapsed();
         eprintln!(
-            "construction_reverse_dense_scale pages={total_pages} pages_per_part={pages_per_part} parts={} prepare_ms={:.3} finish_ms={:.3} extraction_ms={:.3} posting_transition_publication_ms={:.3} facts_coverage_patricia_ms={:.3} reverse_patricia_ms={:.3} facts_coverage_reads={} reverse_reads={} prepared_sources={} fact_updates={} reverse_updates={} persistent_reads={} persistent_writes={} logical_node_writes={} loose_node_files={loose_node_files} pack_files={pack_files} catalog_files={catalog_files} head_files={head_files} immutable_publication_calls={} head_transitions={} durability_barriers={} packed_bytes={} current_packed_bytes={current_packed_bytes} capacity_fallbacks={} combined_peak_resident_bytes={} buffer_flushes={}",
+            "construction_reverse_dense_scale pages={total_pages} pages_per_part={pages_per_part} parts={} prepare_ms={:.3} finish_ms={:.3} extraction_ms={:.3} posting_transition_publication_ms={:.3} facts_coverage_patricia_ms={:.3} reverse_patricia_ms={:.3} sha_estimate_ms={:.3} sha_invocations={sha_invocations} sha_bytes_per_invocation={sha_bytes_per_invocation} facts_coverage_reads={} reverse_reads={} prepared_sources={} fact_updates={} reverse_updates={} persistent_reads={} persistent_writes={} logical_node_writes={} loose_node_files={loose_node_files} pack_files={pack_files} catalog_files={catalog_files} head_files={head_files} immutable_publication_calls={} head_transitions={} durability_barriers={} packed_bytes={} current_packed_bytes={current_packed_bytes} capacity_fallbacks={} combined_peak_resident_bytes={} buffer_flushes={}",
             checkpoints.len(),
             prepare_elapsed.as_secs_f64() * 1_000.0,
             finish_elapsed.as_secs_f64() * 1_000.0,
@@ -3471,6 +3489,7 @@ mod tests {
             work.posting_transition_publication_nanos as f64 / 1_000_000.0,
             work.facts_coverage_patricia_nanos as f64 / 1_000_000.0,
             work.reverse_patricia_nanos as f64 / 1_000_000.0,
+            sha_elapsed.as_secs_f64() * 1_000.0,
             work.facts_coverage_patricia_reads,
             work.reverse_patricia_reads,
             work.prepared_sources,
