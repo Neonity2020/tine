@@ -12,10 +12,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tine_core::model::{Graph, GraphMeta};
-use tine_core::sync_runtime::{
-    inspect_shared_enrollment_for_cold_discovery, inspect_shared_provider_cold_prefix,
-    SyncSharedProviderColdPrefix,
-};
 
 /// Reset the warm flag for a new graph load and return the new warm generation
 /// (passed to `warm_cache_async`, which only reports done if still current).
@@ -268,96 +264,6 @@ struct LoadedGraph {
     graph: Graph,
     meta: GraphMeta,
     launch_backup_done: bool,
-}
-
-const PARTIAL_PROVIDER_REFUSAL: &str =
-    "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry.";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColdSparseArchive {
-    Absent,
-    Joinable,
-    Partial,
-    Refused,
-}
-
-fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
-    refuse_unclaimed_sparse_archive_with(root, |shared| match inspect_shared_provider_cold_prefix(
-        shared,
-    )? {
-        SyncSharedProviderColdPrefix::Partial => Ok(false),
-        SyncSharedProviderColdPrefix::ReadyForDescriptorInspection => {
-            inspect_shared_enrollment_for_cold_discovery(shared)
-                .map(|descriptor| descriptor.is_some())
-                // A descriptor file can be observed between the provider's
-                // create and final write/rename.  Its malformed bytes are an
-                // incomplete arrival, not proof of hostile graph state.
-                .or(Ok(false))
-        }
-        SyncSharedProviderColdPrefix::Refused => {
-            Err("shared provider namespace is ambiguous or unsafe".into())
-        }
-    })
-}
-
-fn refuse_unclaimed_sparse_archive_with(
-    root: &Path,
-    inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
-) -> Result<(), String> {
-    const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
-    match inspect_unclaimed_sparse_archive(root, inspect_shared)? {
-        ColdSparseArchive::Absent | ColdSparseArchive::Joinable => Ok(()),
-        ColdSparseArchive::Partial => {
-            crate::debug::diag(
-                "sparse-v2 cold discovery: phase=provider_evidence; outcome=partial_provider_refusal",
-            );
-            Err(PARTIAL_PROVIDER_REFUSAL.into())
-        }
-        ColdSparseArchive::Refused => Err(REFUSAL.into()),
-    }
-}
-
-fn inspect_unclaimed_sparse_archive(
-    root: &Path,
-    inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
-) -> Result<ColdSparseArchive, String> {
-    let archive = root.join(".tine-sync/v2");
-    let metadata = match std::fs::symlink_metadata(&archive) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ColdSparseArchive::Absent)
-        }
-        Err(error) => {
-            return Err(format!(
-                "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(ColdSparseArchive::Refused);
-    }
-    let shared = archive.join("shared");
-    let shared_metadata = match std::fs::symlink_metadata(&shared) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ColdSparseArchive::Partial)
-        }
-        Err(error) => {
-            return Err(format!(
-                "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-            ))
-        }
-    };
-    if shared_metadata.file_type().is_symlink() || !shared_metadata.is_dir() {
-        return Ok(ColdSparseArchive::Refused);
-    }
-    // The canonical shared directory is the only path that carries discovery
-    // authority.  Temporary or future sibling entries under v2 are inert.
-    match inspect_shared(&shared) {
-        Ok(true) => Ok(ColdSparseArchive::Joinable),
-        Ok(false) => Ok(ColdSparseArchive::Partial),
-        Err(_) => Ok(ColdSparseArchive::Refused),
-    }
 }
 
 fn open_graph_for_load(
@@ -625,9 +531,11 @@ pub(crate) fn load_graph_for_label(
             window_label: owner,
         });
     }
-    let binding_record = state.sync_runtime.binding_record(app, &root_key)?;
+    let storage = state
+        .sync_runtime
+        .explicit_storage_selection(app, &root_key)?;
     graph_load_phase(started, &mut previous, "private storage discovery");
-    if let Some(record) = binding_record {
+    if let crate::sync_runtime::ExplicitStorageSelection::Managed(record) = storage {
         let meta = crate::sync_runtime::SyncRuntimeFacade::graph_meta(&record);
         let binding = state
             .sync_runtime
@@ -660,8 +568,9 @@ pub(crate) fn load_graph_for_label(
             application_page_admission: slot.application_page_admission(),
         });
     }
-    refuse_unclaimed_sparse_archive(&root_key)?;
-    graph_load_phase(started, &mut previous, "shared storage discovery");
+    // No private opt-in record means Direct Files, regardless of any synced
+    // `.tine-sync` bytes that happen to be present. Shared-provider discovery
+    // belongs only to the explicit "Join" action in Storage & sync.
     let direct = open_and_publish_direct_files(app, window_label, state, root_key)?;
     graph_load_phase(started, &mut previous, "Direct Files open and publish");
     Ok(LoadGraphResult::Loaded {
@@ -963,6 +872,54 @@ mod tests {
         (copied, !failed)
     }
 
+    /// Phase-1 quarantine witness for GH #249/#266/#267. A Direct Files graph
+    /// must treat the managed namespace as completely inert: neither graph open
+    /// nor ordinary page/block mutations may inspect, rewrite, or require its
+    /// shape. A regular-file sentinel is deliberate; any attempt to validate
+    /// `.tine-sync` as a managed directory makes the pre-fix code fail here.
+    #[test]
+    fn direct_files_workload_never_enters_or_touches_managed_storage() {
+        let dir = scratch("direct-managed-quarantine");
+        let sentinel = dir.join(".tine-sync");
+        let sentinel_bytes = b"managed namespace must remain opaque to Direct Files\n";
+        std::fs::write(&sentinel, sentinel_bytes).unwrap();
+
+        let graph = Graph::open_checked(&dir)
+            .expect("Direct Files open must not inspect the managed namespace");
+        assert!(graph
+            .create_markdown_page_if_absent("2026-07-23_18:01:20", "- parent\n  - nested block\n",)
+            .unwrap());
+        let mut page = graph
+            .load_named("2026-07-23_18:01:20", tine_core::model::PageKind::Page)
+            .unwrap()
+            .expect("created page");
+        page.blocks[0].raw = "edited parent".into();
+        graph.save_page(&page, page.rev.as_deref()).unwrap();
+        graph
+            .rename_page("2026-07-23_18:01:20", "Renamed Direct Page")
+            .unwrap();
+        graph
+            .delete_page("Renamed Direct Page", tine_core::model::PageKind::Page)
+            .unwrap();
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), sentinel_bytes);
+        let source = include_str!("graph.rs");
+        let load_start = source
+            .find("pub(crate) fn load_graph_for_label")
+            .expect("ordinary graph-load decision");
+        let load_end = source[load_start..]
+            .find("\n#[tauri::command]")
+            .map(|offset| load_start + offset)
+            .expect("end of ordinary graph-load decision");
+        let load = &source[load_start..load_end];
+        assert!(
+            !load.contains("inspect_shared_enrollment_for_cold_discovery")
+                && !load.contains("refuse_unclaimed_sparse_archive"),
+            "Direct Files selection still enters shared managed-storage discovery"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn remembered_startup_lookup_has_one_bounded_terminal_receipt_without_paths() {
         let dir = scratch("startup-lookup-diagnostics");
@@ -1059,179 +1016,6 @@ mod tests {
     }
 
     #[test]
-    fn unclaimed_sparse_archive_refuses_legacy_graph_open() {
-        let dir = scratch("unclaimed-sparse");
-        assert_eq!(refuse_unclaimed_sparse_archive(&dir), Ok(()));
-        std::fs::create_dir_all(dir.join(".tine-sync/v2")).unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn honest_cold_provider_prefixes_are_retryable_before_the_descriptor_arrives() {
-        for (tag, prefix) in [
-            ("outbox-absent", 0_u8),
-            ("enrollment-absent", 1),
-            ("enrollment-empty", 2),
-        ] {
-            let dir = scratch(&format!("cold-provider-prefix-{tag}"));
-            let page = dir.join("pages/representative.md");
-            let recovery = dir.join(".tine-sync/recovery/returned/receipt");
-            let shared = dir.join(".tine-sync/v2/shared");
-            std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
-            std::fs::write(&page, b"- unchanged Direct Files bytes\n").unwrap();
-            std::fs::write(&recovery, b"unchanged recovery bytes\n").unwrap();
-            match prefix {
-                // Syncthing may create the sibling provider tree before outbox.
-                0 => std::fs::create_dir_all(shared.join("inbox")).unwrap(),
-                // The provider may deliver another recognized outbox namespace
-                // before it delivers enrollment.
-                1 => std::fs::create_dir_all(shared.join("outbox/objects")).unwrap(),
-                // The enrollment directory itself may arrive before its one
-                // canonical descriptor file.
-                2 => {
-                    std::fs::create_dir_all(shared.join("outbox/objects")).unwrap();
-                    std::fs::create_dir_all(shared.join("outbox/enrollment")).unwrap();
-                }
-                _ => unreachable!(),
-            }
-            let page_before = std::fs::read(&page).unwrap();
-            let recovery_before = std::fs::read(&recovery).unwrap();
-
-            assert_eq!(
-                refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-                PARTIAL_PROVIDER_REFUSAL,
-                "{tag} is an honest provider prefix, not corrupt managed data"
-            );
-            assert_eq!(std::fs::read(&page).unwrap(), page_before);
-            assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
-            assert!(
-                !dir.join(".tine-sync/v1").exists(),
-                "a retryable cold refusal must not activate or create v1"
-            );
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[test]
-    fn cold_provider_incomplete_descriptor_is_retryable() {
-        let dir = scratch("cold-provider-invalid-enrollment");
-        let enrollment = dir.join(".tine-sync/v2/shared/outbox/enrollment");
-        std::fs::create_dir_all(&enrollment).unwrap();
-        std::fs::write(enrollment.join("shared-enrollment-v1.json"), b"{").unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL,
-            "a descriptor observed before its final write is an incomplete provider arrival"
-        );
-        std::fs::write(
-            enrollment.join("shared-enrollment-v1.sync-conflict.json"),
-            b"{",
-        )
-        .unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL,
-            "a sibling provider artifact must not turn an incomplete canonical descriptor into a permanent refusal"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn cold_provider_unsafe_canonical_kinds_refuse_but_unrelated_entries_retry() {
-        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
-
-        let non_directory = scratch("cold-provider-outbox-file");
-        let shared = non_directory.join(".tine-sync/v2/shared");
-        std::fs::create_dir_all(&shared).unwrap();
-        std::fs::write(shared.join("outbox"), b"not a directory").unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&non_directory).unwrap_err(),
-            REFUSAL
-        );
-        let _ = std::fs::remove_dir_all(non_directory);
-
-        let unknown = scratch("cold-provider-unknown-outbox-entry");
-        std::fs::create_dir_all(unknown.join(".tine-sync/v2/shared/outbox/unknown")).unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&unknown).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL
-        );
-        let _ = std::fs::remove_dir_all(unknown);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-
-            let symlinked = scratch("cold-provider-outbox-symlink");
-            let shared = symlinked.join(".tine-sync/v2/shared");
-            std::fs::create_dir_all(&shared).unwrap();
-            let target = symlinked.join("provider-outbox-target");
-            std::fs::create_dir_all(&target).unwrap();
-            symlink(&target, shared.join("outbox")).unwrap();
-            assert_eq!(
-                refuse_unclaimed_sparse_archive(&symlinked).unwrap_err(),
-                REFUSAL
-            );
-            let _ = std::fs::remove_dir_all(symlinked);
-        }
-    }
-
-    #[test]
-    fn cold_shared_discovery_uses_the_real_v2_shared_namespace() {
-        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
-        let dir = scratch("cold-shared-layout");
-        let v2 = dir.join(".tine-sync/v2");
-        let shared = v2.join("shared");
-        std::fs::create_dir_all(shared.join("outbox/enrollment")).unwrap();
-        std::fs::write(
-            shared.join("outbox/enrollment/shared-enrollment-v1.json"),
-            b"test descriptor bytes",
-        )
-        .unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |path| {
-                assert_eq!(path, shared);
-                Ok(true)
-            }),
-            Ok(())
-        );
-
-        std::fs::write(v2.join("unknown"), b"retain").unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)),
-            Ok(()),
-            "unrelated v2 provider artifacts do not override the canonical shared namespace"
-        );
-        std::fs::remove_file(v2.join("unknown")).unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(false)).unwrap_err(),
-            PARTIAL_PROVIDER_REFUSAL
-        );
-        assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Err("malformed".into())).unwrap_err(),
-            REFUSAL
-        );
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            std::fs::remove_dir_all(&shared).unwrap();
-            let target = dir.join("provider-target");
-            std::fs::create_dir_all(&target).unwrap();
-            symlink(&target, &shared).unwrap();
-            assert_eq!(
-                refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
-                REFUSAL
-            );
-        }
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn graph_load_snapshots_original_journal_filename_before_migration() {
         let dir = scratch("pre-migrate-backup");
         std::fs::create_dir_all(dir.join("logseq")).unwrap();
@@ -1271,42 +1055,6 @@ mod tests {
             "live graph was renamed"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn partial_provider_arrival_refuses_before_direct_open_without_mutating_the_graph() {
-        let dir = scratch("partial-provider-arrival");
-        let page = dir.join("pages/representative.md");
-        let recovery = dir.join(".tine-sync/recovery/v2-returned-from-desktop/receipt");
-        let partial_shared = dir.join(".tine-sync/v2/shared");
-        std::fs::create_dir_all(recovery.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&partial_shared).unwrap();
-        std::fs::write(&page, "- representative Direct Files bytes\n").unwrap();
-        std::fs::write(&recovery, "preserved recovery evidence\n").unwrap();
-        let page_before = std::fs::read(&page).unwrap();
-        let recovery_before = std::fs::read(&recovery).unwrap();
-
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            "Tine-managed storage sync data appears to still be arriving or is incomplete. Tine left this graph unchanged. Let your file-sync provider finish, then Retry."
-        );
-        assert_eq!(std::fs::read(&page).unwrap(), page_before);
-        assert_eq!(std::fs::read(&recovery).unwrap(), recovery_before);
-        assert!(
-            !dir.join(".tine-sync/v1").exists(),
-            "a partial v2 refusal must not invoke legacy activation"
-        );
-
-        let source = include_str!("graph.rs");
-        let load = &source[source
-            .find("pub(crate) fn load_graph_for_label")
-            .expect("ordinary graph-load decision")..];
-        assert!(
-            load.find("refuse_unclaimed_sparse_archive")
-                < load.find("open_and_publish_direct_files"),
-            "partial provider evidence must be refused before a Direct Files binding is installed"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2450,6 +2450,11 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
                         {enabling() ? "Setting up..." : "Enable Tine-managed storage..."}
                       </button>
                     </div>
+                    <div style={{ "margin-top": "6px" }}>
+                      <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>
+                        {sharing() ? "Joining..." : "Join an existing synced graph..."}
+                      </button>
+                    </div>
                   </Show>
                   <Show when={current().state === "joinable"}>
                     <button class="settings-btn" disabled={sharing()} onClick={() => void joinShare()}>

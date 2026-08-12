@@ -142,6 +142,36 @@ describe("Settings storage transitions", () => {
     expect(root.textContent).toContain("You can keep using Direct files in the meantime.");
     expect(root.textContent).toContain("Uses your graph’s Markdown or Org files directly.");
     expect(root.textContent).toContain("Enable Tine-managed storage");
+    expect(root.textContent).toContain("Join an existing synced graph");
+    dispose();
+  });
+
+  it("starts shared discovery only after an explicit Direct Files join action", async () => {
+    vi.spyOn(backend(), "sparseV2Status").mockResolvedValue(legacy());
+    vi.spyOn(backend(), "confirm").mockResolvedValue(true);
+    vi.spyOn(store, "flushAll").mockResolvedValue(true);
+    const join = vi.spyOn(backend(), "joinSparseV2Shared").mockRejectedValue(
+      new Error("managed join could not find a shared provider descriptor")
+    );
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <Settings />, root);
+    await showSparsePanel(root);
+
+    expect(join).not.toHaveBeenCalled();
+    const button = [...root.querySelectorAll("button")].find((candidate) =>
+      candidate.textContent?.includes("Join an existing synced graph")
+    ) as HTMLButtonElement;
+    button.click();
+    await tick();
+    await tick();
+
+    expect(join).toHaveBeenCalledTimes(1);
+    expect(toasts().at(-1)).toMatchObject({
+      message: "Couldn't join the synced graph: managed join could not find a shared provider descriptor",
+      sticky: true,
+    });
     dispose();
   });
 

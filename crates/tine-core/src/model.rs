@@ -5442,7 +5442,9 @@ impl Graph {
         validate_managed_dir(&graph.root, &graph.config.pages_dir, "pages")?;
         validate_managed_dir(&graph.root, "logseq", "logseq")?;
         validate_managed_dir(&graph.root, "publish", "publish")?;
-        validate_managed_dir(&graph.root, ".tine-sync", "managed sync")?;
+        // `.tine-sync` is not part of Direct Files authority. Managed-storage
+        // activation/join validates it at its explicit runtime boundary; an
+        // ordinary graph open must neither inspect nor require its shape.
         if let Some(resolved) = Self::external_assets_target(&graph.root)? {
             let approved = approved_assets.ok_or_else(|| {
                 io::Error::new(
