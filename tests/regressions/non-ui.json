@@ -3709,6 +3709,30 @@
         "failBefore": "proven"
       },
       "notes": "A cleanly shut down managed graph selected one retained scratch run through its newest canonical resume point. Deleting only disposable SQLite and corrupting that run's blobs.data reproduced the exact pre-fix terminal result: OpenRefused with 'SQLite materialization failed: immutable archive error: document scratch index failed: malformed scratch blob'. Reopen now recognizes only this typed reconstructible failure, validates the immutable bootstrap authority, preserves the malformed run byte-for-byte, creates a distinct fresh run, fully replays accepted immutable history, and rebuilds SQLite once. The regression proves recovery alone changes neither direct graph bytes nor immutable archive, engine-history, or projection-receipt evidence; then it loads Root.md through the public application API, accepts and reads back a real application save, drains it, proves append-only authority/receipt growth and the updated direct projection, and reaches Safe shutdown. Other malformed or second-attempt errors remain fail-closed."
+    },
+    {
+      "id": "REG-MANAGED-CLIPBOARD-ADMISSION-STALENESS-322",
+      "title": "An in-flight bulk paste never deletes a block the user typed into while it was awaiting, and never lands an insertion the page has meanwhile outgrown",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          322
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/clipboard.paste.test.ts"
+        ],
+        "scenario": "managed.clipboard-admission-recheck-after-await",
+        "failBefore": "proven"
+      },
+      "notes": "A managed paste caches its decisions during a synchronous preflight and then awaits a cut-source flush and a backend identity lookup. Two facts can change across those awaits. (1) Whether the target is an empty host the paste may REPLACE: if the user types into it while the paste is in flight, replacing it destroys that text. The empty-host decision is now recomputed from the live block at insertion time on both the managed and the Direct path, and the admitted plan assumes the host survives, so the realized block count can only be at or below the admitted one. (2) The page's size and the target's depth: the limit question is re-asked at consumption against the live tree, so an insertion admitted at 510 blocks is refused once the page has reached the cap. Both halves have a literal fail-before proof; before the fix the host block and the text typed into it were deleted outright."
     }
   ]
 }

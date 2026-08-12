@@ -2326,6 +2326,8 @@ interface InternalBulkInsertionAdmission extends BulkInsertionAdmission {
   bindingGeneration: number;
   authority: "managed_writable";
   plan: ManagedBulkInsertionPlan;
+  limits: ManagedBulkAdmissionLimits;
+  insertionRootDepthOffset: number;
 }
 
 export type ManagedBulkInsertionPreflight =
@@ -2350,6 +2352,35 @@ function boundedPageBlockCount(page: FeedPage, cap: number): number {
     for (let index = node.children.length - 1; index >= 0; index--) stack.push(node.children[index]);
   }
   return count;
+}
+
+/** The absolute depth an insertion's roots land at, derived from the live tree.
+ * Callers state their own root depth relative to the target; a token records the
+ * offset so the same question can be re-asked after an await (GH #322). */
+function insertionRootDepthBasis(targetId: string | null): number {
+  return targetId === null ? 1 : depthOf(targetId) + 1;
+}
+
+/** Re-answerable overflow question. Every input the caller can no longer affect
+ * lives in `plan`; everything that can move while a bulk route awaits — the
+ * page's current size and the target's depth — is read live here, so preflight
+ * and consumption apply the identical rule to different instants (GH #322). */
+function bulkInsertionOverflows(
+  pageName: string,
+  insertionRootDepth: number,
+  plan: ManagedBulkInsertionPlan,
+  limits: ManagedBulkAdmissionLimits,
+): boolean {
+  const page = pageByName(pageName);
+  if (!page) return true;
+  const currentBlocks = boundedPageBlockCount(page, limits.applicationSavePageBlocks + 1);
+  const exceedsBlockLimit =
+    currentBlocks - plan.removedOrReusedDescendants + plan.insertedDescendants
+      > limits.applicationSavePageBlocks;
+  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
+    && insertionRootDepth + plan.maximumInputRelativeDepth - 1 > limits.applicationPageMaxDepth;
+  const exceedsTextLimit = plan.insertedRawTextUtf8Bytes > limits.applicationPageRequestTextBytes;
+  return exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit;
 }
 
 /**
@@ -2384,15 +2415,7 @@ export function preflightManagedBulkInsertion(
     applicationPageMaxDepth: admission.application_page_max_depth,
   };
   const plan = buildPlan(limits);
-  const currentBlocks = boundedPageBlockCount(page, limits.applicationSavePageBlocks + 1);
-  const exceedsBlockLimit =
-    currentBlocks - plan.removedOrReusedDescendants + plan.insertedDescendants
-      > limits.applicationSavePageBlocks;
-  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
-    && plan.insertionRootDepth + plan.maximumInputRelativeDepth - 1
-      > limits.applicationPageMaxDepth;
-  const exceedsTextLimit = plan.insertedRawTextUtf8Bytes > limits.applicationPageRequestTextBytes;
-  if (exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit) {
+  if (bulkInsertionOverflows(pageName, plan.insertionRootDepth, plan, limits)) {
     return { kind: "refused", toast: managedBulkOverflowToast(limits.applicationSavePageBlocks) };
   }
 
@@ -2408,6 +2431,8 @@ export function preflightManagedBulkInsertion(
     bindingGeneration: admission.binding_generation,
     authority: admission.authority,
     plan,
+    limits,
+    insertionRootDepthOffset: plan.insertionRootDepth - insertionRootDepthBasis(targetId),
   };
   return { kind: "admitted", token };
 }
@@ -2434,6 +2459,15 @@ export function consumeManagedBulkInsertionAdmission(
     || pageInstanceGeneration(internal.targetPage) !== internal.targetGeneration
     || graphEpoch() !== internal.graphEpoch
     || (graphMeta()?.root ?? "") !== internal.graphRoot
+    // The page may have grown, or the target moved deeper, while the caller
+    // awaited. Identity checks alone cannot see that, so ask the limit question
+    // again against the tree we are about to mutate (GH #322).
+    || bulkInsertionOverflows(
+      internal.targetPage,
+      insertionRootDepthBasis(targetId) + internal.insertionRootDepthOffset,
+      internal.plan,
+      internal.limits,
+    )
   ) return false;
   internal.consumed = true;
   return true;
@@ -3811,17 +3845,18 @@ export function pasteClipboardPayload(
   const authority = captureClipboardPasteAuthority(targetId);
   if (!authority) return Promise.resolve(null);
 
-  let managedReuseEmptyHost: boolean | null = null;
-  const admission = preflightManagedBulkInsertion(targetId, (limits) => {
-    const target = doc.byId[targetId]!;
-    managedReuseEmptyHost = clipboardTargetReusesEmptyHost(target, formatForPage(target.page));
-    return managedBulkOutlinePlan(
-      slot.blocks,
-      depthOf(targetId) + 1,
-      managedReuseEmptyHost ? 1 : 0,
-      limits,
-    );
-  });
+  // Plan as if the host will NOT be reused. Whether an empty host is replaced is
+  // decided from the live block at insertion time, after this route's awaits, so
+  // no cached answer may authorize deleting a block the user has since typed
+  // into (GH #322). Assuming the host survives keeps the admitted block count an
+  // upper bound on the realized one either way; the cost is refusing a paste
+  // into an empty host on a page already exactly at the limit.
+  const admission = preflightManagedBulkInsertion(targetId, (limits) => managedBulkOutlinePlan(
+    slot.blocks,
+    depthOf(targetId) + 1,
+    0,
+    limits,
+  ));
   if (admission.kind === "refused") {
     reportManagedBulkInsertionRefusal(admission.toast);
     return Promise.resolve(null);
@@ -3884,9 +3919,10 @@ export function pasteClipboardPayload(
     if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, targetId)) {
       return null;
     }
-    const reuseEmptyHost = admission.kind === "admitted"
-      ? managedReuseEmptyHost!
-      : clipboardTargetReusesEmptyHost(doc.byId[targetId], formatForPage(doc.byId[targetId].page));
+    const reuseEmptyHost = clipboardTargetReusesEmptyHost(
+      doc.byId[targetId],
+      formatForPage(doc.byId[targetId].page),
+    );
     return insertClipboardBlocksSync(
       targetId,
       slot.blocks,
