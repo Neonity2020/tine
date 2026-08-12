@@ -84,6 +84,15 @@ jobs:
       - name: Rust core tests
         run: cargo test -p tine-core
 
+      # The crate that produces the binary, not only the library under it. This
+      # was never executed by CI until GH #331; `cargo check -p tine` elsewhere
+      # compiles it but runs nothing, which hid a failing command-surface
+      # contract and five stale watcher tests across two releases.
+      - name: Rust app-crate tests
+        run: |
+          cargo test -p tine --lib
+          cargo test -p tine-plugin-sdk
+
   validate-windows-focused-test-input:
     name: CI dispatch input validation / Windows focused test scope
     if: github.event_name == 'workflow_dispatch' && inputs.windows_test_name != '' && inputs.scope != 'windows'
@@ -173,6 +182,11 @@ jobs:
 
       - name: Frontend tests (vitest)
         run: npm test
+
+      - name: Rust app-crate tests
+        run: |
+          cargo test -p tine --lib
+          cargo test -p tine-plugin-sdk
 
       - name: Standalone plugin template builds and conforms
         run: npm run plugin:template-check

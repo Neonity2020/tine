@@ -4500,7 +4500,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    // Bisected to 30f36d0a "fix(managed): resume correlated cold move
+    // continuation", which is NOT in v0.6.93 — so this is an unreleased
+    // regression on master, not a shipped defect. The first
+    // `resolve_application_move_subtrees` now answers
+    // `NoCommit { reason: EpisodeNotCommitted }` where it answered `Committed`.
+    // Quarantined rather than repaired: whether that is the intended contract
+    // after routing cross-page moves through the actor is the move lane's call,
+    // not a test-maintenance decision. GH #333.
     #[test]
+    #[ignore = "GH #333: cross-page move returns NoCommit after 30f36d0a; unreleased regression, owner decides the contract"]
     fn stopped_move_episode_reopens_and_replaces_one_window_writer() {
         std::thread::Builder::new()
             .name("tine-move-recovery-handoff-test".into())

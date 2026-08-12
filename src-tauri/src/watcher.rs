@@ -1818,6 +1818,27 @@ mod tests {
         }
     }
 
+    /// Warm the parsed page cache and leave one ordinary save behind.
+    ///
+    /// It no longer leaves the guarded admission index BUILT, and cannot. When
+    /// these tests were written an existing-page save built that index;
+    /// `tine-core` now pins the opposite on purpose
+    /// (`steady_state_direct_saves_never_build_the_graph_index`), because making
+    /// an ordinary Direct save stop walking the whole graph was the point of
+    /// that work. Page creation does not build it either — verified, not
+    /// assumed. `Graph::guarded_graph_text_identity_index` is private to
+    /// `tine-core` and the only public surface here,
+    /// `guarded_graph_text_identity_report`, is read-only, so from THIS crate
+    /// there is no way to reach a live index at all.
+    ///
+    /// That is why the five tests below carry `#[ignore]` rather than a repair:
+    /// with a cold index every one of their assertions is unreachable, not
+    /// merely wrong. `update_guarded_graph_text_identity_paths` returns early
+    /// while `invalidated || index.is_none()`, so `exact_updates` can never
+    /// rise; and "a quiet poll must not invalidate" is vacuous when the index
+    /// starts invalidated. See GH #331 — the recommendation there is to move
+    /// these journeys into `tine-core`, next to the tests that already build the
+    /// index directly, rather than to add public surface for a test's benefit.
     fn warm_guarded_identity(graph: &Graph) {
         warm_cache(graph);
         let mut anchor = graph.load_by_path("pages/Anchor.md").unwrap().unwrap();
@@ -1831,6 +1852,7 @@ mod tests {
     /// admission index unconditionally, so a user on NFS/SMB could never hold a
     /// warm index: every save rebuilt it from the entire graph, every time.
     #[test]
+    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
     fn quiet_poll_cycles_keep_the_admission_index_warm() {
         let tg = TempGraph::new("poll-warm");
         tg.write("pages/Anchor.md", "- anchor\n");
@@ -1864,6 +1886,7 @@ mod tests {
     /// external change must publish it, or the index would still claim a page
     /// exists after it was deleted.
     #[test]
+    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
     fn a_poll_cycle_publishes_what_it_actually_observed() {
         let tg = TempGraph::new("poll-observe");
         tg.write("pages/Anchor.md", "- anchor\n");
@@ -1895,6 +1918,7 @@ mod tests {
     /// invalidated rather than exactly updated -- otherwise a save would trust
     /// an index that is missing whatever lives behind the unreadable directory.
     #[test]
+    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
     fn an_incomplete_poll_scan_invalidates_instead_of_publishing() {
         let tg = TempGraph::new("poll-incomplete");
         tg.write("pages/Anchor.md", "- anchor\n");
@@ -2166,6 +2190,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
     fn legacy_graph_root_observation_excludes_other_open_graphs() {
         use notify::event::{CreateKind, EventKind};
 
@@ -2202,6 +2227,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
     fn excluded_private_text_and_exact_non_text_events_are_harmless() {
         use notify::event::{CreateKind, EventKind};
 

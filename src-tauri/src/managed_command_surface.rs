@@ -162,6 +162,10 @@ const MANAGED_COMMAND_SURFACE: &[(&str, ManagedRouting)] = &[
     ("page_aliases", ManagedRouted),
     ("page_icons", ManagedRouted),
     ("page_print_html", ManagedRouted),
+    // Asks the sparse actor whether a whole detached page candidate would be
+    // accepted, before the frontend applies it. Managed-only by construction:
+    // it refuses unless the binding is exact and the authority is writable.
+    ("preflight_managed_page_mutation", ManagedRouted),
     ("prepare_tine_quit", NoGraphSlot),
     ("prepare_sparse_v2_share", NoGraphSlot),
     ("present_conflict_override", LegacyOnly),

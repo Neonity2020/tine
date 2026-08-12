@@ -37075,7 +37075,7 @@ mod tests {
     /// Starts small enough to settle, then drops the whole corpus in externally.
     /// Opt-in via `TINE_REAL_GRAPH`; corpus copied, never mutated.
     #[test]
-    #[ignore]
+    #[ignore = "manual real-graph probe: set TINE_REAL_GRAPH to a graph directory"]
     fn bulk_external_change_wedges_a_working_managed_graph() {
         let Some(source) = std::env::var_os("TINE_REAL_GRAPH") else {
             eprintln!("skipped: set TINE_REAL_GRAPH to a graph directory");
@@ -37215,7 +37215,7 @@ mod tests {
     ///
     /// Opt-in via `TINE_REAL_GRAPH`; the corpus is copied, never mutated.
     #[test]
-    #[ignore]
+    #[ignore = "manual real-graph measurement: set TINE_REAL_GRAPH to a graph directory"]
     fn real_graph_managed_activation_and_reopen_cost() {
         let Some(source) = std::env::var_os("TINE_REAL_GRAPH") else {
             eprintln!("skipped: set TINE_REAL_GRAPH to a graph directory");

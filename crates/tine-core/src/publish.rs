@@ -4304,7 +4304,7 @@ mod tests {
     /// `cargo test -p tine-core --lib -- --ignored gen_sample_export --nocapture`
     /// then open `file://$TMPDIR/tine-sample-export/publish/index.html`.
     #[test]
-    #[ignore]
+    #[ignore = "manual generator: writes a sample export tree for inspection"]
     fn gen_sample_export() {
         let dir = std::env::temp_dir().join("tine-sample-export");
         let _ = fs::remove_dir_all(&dir);

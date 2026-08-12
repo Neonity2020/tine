@@ -36789,7 +36789,7 @@ mod tests {
     /// `TINE_REAL_GRAPH=~/research/logseq-anonymized`. The corpus is copied, so
     /// the source is never mutated.
     #[test]
-    #[ignore]
+    #[ignore = "manual real-graph probe: set TINE_REAL_GRAPH to a graph directory"]
     fn real_graph_direct_save_does_not_rebuild_the_identity_index() {
         let Some(source) = std::env::var_os("TINE_REAL_GRAPH") else {
             eprintln!("skipped: set TINE_REAL_GRAPH to a graph directory");
