@@ -41,11 +41,14 @@ for (const graph of [GRAPH_A, GRAPH_B]) {
   fs.writeFileSync(path.join(graph, "pages", `${PAGE}.md`), `- ${MARKER}\n`);
   fs.writeFileSync(path.join(graph, "logseq", "config.edn"), '{:preferred-format "Markdown"}\n');
 }
-for (const xdg of [XDG_A, XDG_B]) {
+for (const [xdg, graph] of [[XDG_A, GRAPH_A], [XDG_B, GRAPH_B]]) {
   for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(xdg, dir), { recursive: true });
   const appData = path.join(xdg, "data", "page.tine.Tine");
   fs.mkdirSync(appData, { recursive: true });
-  fs.writeFileSync(path.join(appData, "tine-settings.json"), '{"native_window_frame":true}\n');
+  fs.writeFileSync(path.join(appData, "tine-settings.json"), `${JSON.stringify({
+    native_window_frame: true,
+    last_graph_path: fs.realpathSync(graph),
+  })}\n`);
 }
 
 function gitRevision() {
@@ -57,6 +60,8 @@ function deviceEnv(graph, xdg) {
   return {
     ...process.env,
     TINE_GRAPH: graph,
+    TINE_DEBUG: "1",
+    TINE_DEBUG_LOG: path.join(xdg, "tine-debug.log"),
     XDG_DATA_HOME: path.join(xdg, "data"),
     XDG_CONFIG_HOME: path.join(xdg, "config"),
     XDG_CACHE_HOME: path.join(xdg, "cache"),
@@ -74,6 +79,7 @@ let browser;
 let driver;
 let driverLog;
 let appPid;
+let bindingGeneration;
 let wm;
 let wmLog;
 let phase = "setup";
@@ -123,6 +129,96 @@ async function assertBody(text, label, timeout = 30_000) {
   });
 }
 
+async function getPage(name = PAGE) {
+  const page = await browser.executeAsync((pageName, done) => {
+    globalThis.__TAURI_INTERNALS__.invoke("get_page", {
+      name: pageName,
+      kind: "page",
+      bindingGeneration: Number(document.documentElement.dataset.e2eBindingGeneration),
+    })
+      .then(done, (error) => done({ error: String(error) }));
+  }, name);
+  if (page?.error || !page?.blocks?.[0]) {
+    throw new Error(`page ${JSON.stringify(name)} did not load: ${JSON.stringify(page)}`);
+  }
+  return page;
+}
+
+async function leaseCurrentGraph(graph) {
+  const result = await browser.executeAsync((path, done) => {
+    globalThis.__TAURI_INTERNALS__.invoke("load_graph", { path })
+      .then(done, (error) => done({ error: String(error) }));
+  }, graph);
+  if (result?.error || typeof result?.binding_generation !== "number") {
+    throw new Error(`current graph binding could not be leased: ${JSON.stringify(result)}`);
+  }
+  bindingGeneration = result.binding_generation;
+  await browser.execute((generation) => {
+    document.documentElement.dataset.e2eBindingGeneration = String(generation);
+  }, bindingGeneration);
+}
+
+async function assertPageContains(text, label, timeout = 30_000) {
+  await browser.waitUntil(async () => {
+    const page = await getPage();
+    return page.blocks.some((block) => block.raw?.includes(text));
+  }, { timeout, timeoutMsg: `${label} was not present in the loaded page: ${JSON.stringify(text)}` });
+}
+
+async function managedCall(command, args = {}) {
+  const result = await browser.executeAsync((cmd, commandArgs, done) => {
+    globalThis.__TAURI_INTERNALS__.invoke(cmd, {
+      ...commandArgs,
+      bindingGeneration: Number(document.documentElement.dataset.e2eBindingGeneration),
+    }).then(done, (error) => done({ error: String(error) }));
+  }, command, args);
+  if (result?.error) throw new Error(`${command} failed: ${result.error}`);
+  return result;
+}
+
+async function saveManagedRaw(raw) {
+  const page = await getPage();
+  page.blocks[0].raw = raw;
+  await managedCall("save_page", {
+    page,
+    baseRev: page.rev,
+    force: false,
+    conflictEpoch: null,
+    managedConflictObservation: null,
+  });
+}
+
+async function settleManaged(label, timeout = 60_000) {
+  const deadline = Date.now() + timeout;
+  let idleRounds = 0;
+  let latest;
+  while (Date.now() < deadline) {
+    await managedCall("sparse_v2_tick");
+    latest = await managedCall("sparse_v2_status");
+    const runtime = latest.runtime;
+    const idle = runtime?.provider_pending === 0
+      && runtime?.managed_local_pending === 0
+      && runtime?.watcher?.pending === false
+      && runtime?.watcher?.drain_in_flight === false;
+    idleRounds = idle ? idleRounds + 1 : 0;
+    if (idleRounds >= 2) return latest;
+    await sleep(100);
+  }
+  throw new Error(`${label} did not settle: ${JSON.stringify(latest)}`);
+}
+
+async function waitForManagedText(text, label, timeout = 60_000) {
+  const deadline = Date.now() + timeout;
+  let latest;
+  while (Date.now() < deadline) {
+    await managedCall("sparse_v2_tick");
+    latest = await getPage();
+    if (latest.blocks.some((block) => block.raw?.includes(text))) return latest;
+    await sleep(100);
+  }
+  throw new Error(`${label} did not arrive: ${JSON.stringify(latest)}`);
+}
+
 async function buttonContaining(text) {
   for (const button of await browser.$$("button")) {
     if ((await button.getText()).includes(text)) return button;
@@ -152,18 +248,33 @@ async function openSyncSettings() {
 }
 
 async function acceptNativeConfirmation(label, before) {
-  const dialogId = await waitFor(() => windowIds("^Tine$").find((id) => !before.has(id)), 15_000,
+  const dialogId = await waitFor(() => windowIds(".*").find((id) => !before.has(id)), 15_000,
     `${label} did not open the native confirmation dialog`);
   execFileSync(XDOTOOL, ["windowactivate", "--sync", dialogId], { env });
   execFileSync(XDOTOOL, ["key", "--clearmodifiers", "alt+y"], { env });
-  await waitFor(() => !windowIds("^Tine$").includes(dialogId), 12_000,
+  await waitFor(() => !windowIds(".*").includes(dialogId), 12_000,
     `${label} confirmation did not close`);
 }
 
 async function clickButtonAndConfirm(text, label) {
-  const button = await waitFor(() => buttonContaining(text), 15_000, `${text} action was not visible`);
-  const before = new Set(windowIds("^Tine$"));
-  await button.click();
+  if (text === "to Direct Files") {
+    const recoveryAction = await browser.$(".startup-recovery-actions button.danger");
+    await recoveryAction.waitForClickable({ timeout: 15_000 });
+    const before = new Set(windowIds(".*"));
+    await recoveryAction.click();
+    await acceptNativeConfirmation(label, before);
+    return;
+  }
+  await waitFor(() => buttonContaining(text), 15_000, `${text} action was not visible`);
+  const before = new Set(windowIds(".*"));
+  const clicked = await browser.execute((expected) => {
+    const button = [...document.querySelectorAll("button")]
+      .find((candidate) => candidate.textContent?.includes(expected));
+    if (!(button instanceof HTMLButtonElement)) return false;
+    button.click();
+    return true;
+  }, text);
+  if (!clicked) throw new Error(`${text} action disappeared before it could be clicked`);
   await acceptNativeConfirmation(label, before);
 }
 
@@ -191,6 +302,7 @@ async function connect(label, graph, xdg, recovery = false) {
   });
   await browser.$(recovery ? ".startup-recovery-overlay" : ".ls-block, .page-title, .journal-day")
     .waitForExist({ timeout: 90_000 });
+  if (!recovery) await leaseCurrentGraph(graph);
   const id = await waitFor(() => windowIds()[0], 15_000, `${label}: native Tine window did not appear`);
   appPid = Number(execFileSync(XDOTOOL, ["getwindowpid", id], { encoding: "utf8", env }).trim());
   receipt.milestones[label] = { graph, xdg };
@@ -213,6 +325,7 @@ async function stopCurrent() {
   try { if (appPid && processAlive(appPid)) process.kill(appPid, "SIGTERM"); } catch {}
   if (appPid) await waitFor(() => !processAlive(appPid), 15_000, "Tine did not stop between device turns");
   appPid = undefined;
+  bindingGeneration = undefined;
   try { if (driver?.pid) process.kill(-driver.pid, "SIGKILL"); } catch {}
   if (driver?.pid) await waitFor(() => driver.exitCode !== null || !processAlive(driver.pid), 8_000,
     "tauri-driver did not stop between device turns");
@@ -241,7 +354,7 @@ try {
 
   phase = "device-a-share";
   await connect("device-a", GRAPH_A, XDG_A);
-  await assertBody(MARKER, "device A source page");
+  await assertPageContains(MARKER, "device A source page");
   await openSyncSettings();
   await clickButtonAndConfirm("Enable Tine-managed storage...", "device-a-enable-managed");
   await assertBody("Tine-managed storage active", "device A managed activation", 120_000);
@@ -252,12 +365,33 @@ try {
 
   phase = "device-b-discovery-and-join";
   await connect("device-b-join", GRAPH_B, XDG_B);
-  await assertBody(MARKER, "device B source page");
+  await assertPageContains(MARKER, "device B source page");
   await openSyncSettings();
   await assertBody("Join this synced graph...", "device B joinable state");
   await clickButtonAndConfirm("Join this synced graph...", "device-b-join");
   await assertBody("Tine-managed storage active", "device B joined state", 120_000);
+  await leaseCurrentGraph(GRAPH_B);
   receipt.milestones.join = { openedWithoutLocalBinding: true, joined: true };
+  const fromB = `${MARKER} edited on device B`;
+  await saveManagedRaw(fromB);
+  await settleManaged("device B outbound edit");
+  await stopCurrent();
+
+  phase = "device-b-to-device-a";
+  copyProvider(GRAPH_B, GRAPH_A);
+  await connect("device-a-receive", GRAPH_A, XDG_A);
+  await waitForManagedText(fromB, "device B edit on device A");
+  const fromA = `${MARKER} edited on device A after B`;
+  await saveManagedRaw(fromA);
+  await settleManaged("device A outbound edit");
+  await stopCurrent();
+
+  phase = "device-a-to-device-b";
+  copyProvider(GRAPH_A, GRAPH_B);
+  await connect("device-b-receive", GRAPH_B, XDG_B);
+  await waitForManagedText(fromA, "device A edit on device B");
+  await settleManaged("device B after receiving A edit");
+  receipt.milestones.bidirectional = { bToA: true, aToB: true };
   await stopCurrent();
 
   phase = "fresh-device-direct-return";
@@ -266,13 +400,17 @@ try {
   for (const dir of ["data", "config", "cache"]) fs.mkdirSync(path.join(XDG_B, dir), { recursive: true });
   const appData = path.join(XDG_B, "data", "page.tine.Tine");
   fs.mkdirSync(appData, { recursive: true });
-  fs.writeFileSync(path.join(appData, "tine-settings.json"), '{"native_window_frame":true}\n');
+  fs.writeFileSync(path.join(appData, "tine-settings.json"), `${JSON.stringify({
+    native_window_frame: true,
+    last_graph_path: fs.realpathSync(GRAPH_B),
+  })}\n`);
   const descriptor = path.join(GRAPH_B, ".tine-sync", "v2", "shared", "outbox", "enrollment", "shared-enrollment-v1.json");
   fs.writeFileSync(descriptor, "{\n");
   await connect("device-b-cold-return", GRAPH_B, XDG_B, true);
   await assertBody("Tine-managed storage sync data appears to still be arriving or is incomplete", "fresh device B recovery screen");
-  await clickButtonAndConfirm("Return to Direct Files", "device-b-cold-return");
-  await assertBody(MARKER, "fresh device B source page after Direct Files return", 30_000);
+  await clickButtonAndConfirm("to Direct Files", "device-b-cold-return");
+  await leaseCurrentGraph(GRAPH_B);
+  await assertPageContains(MARKER, "fresh device B source page after Direct Files return", 30_000);
   if (fs.existsSync(path.join(GRAPH_B, ".tine-sync", "v2"))) {
     throw new Error("fresh-device Direct Files return left the live v2 namespace in place");
   }
@@ -280,11 +418,7 @@ try {
   if (!fs.existsSync(recoveryRoot) || fs.readdirSync(recoveryRoot).length === 0) {
     throw new Error("fresh-device Direct Files return did not preserve provider state");
   }
-  const page = await browser.executeAsync((done) => {
-    globalThis.__TAURI_INTERNALS__.invoke("get_page", { name: "Two Device Managed Sync" })
-      .then(done, (error) => done({ error: String(error) }));
-  });
-  if (page?.error || !page?.blocks?.[0]) throw new Error(`Direct Files page did not reopen: ${JSON.stringify(page)}`);
+  const page = await getPage();
   page.blocks[0].raw = `${MARKER} direct after return`;
   const revision = await browser.executeAsync((candidate, done) => {
     globalThis.__TAURI_INTERNALS__.invoke("save_page", {
@@ -293,6 +427,7 @@ try {
       force: false,
       conflictEpoch: null,
       managedConflictObservation: null,
+      bindingGeneration: Number(document.documentElement.dataset.e2eBindingGeneration),
     }).then(done, (error) => done({ error: String(error) }));
   }, page);
   if (revision?.error) throw new Error(`Direct Files save failed after return: ${revision.error}`);
@@ -302,14 +437,14 @@ try {
 
   receipt.result = "pass";
   fs.writeFileSync(path.join(ARTIFACTS, "sparse-v2-two-device-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
-  console.log(`PASS: sparse-v2 two-device discovery, join, and fresh-device Direct Files return held: ${JSON.stringify(receipt.milestones)}`);
+  console.log(`PASS: sparse-v2 two-device discovery, join, bidirectional edits, and fresh-device Direct Files return held: ${JSON.stringify(receipt.milestones)}`);
 } catch (error) {
   try { await browser?.saveScreenshot(path.join(ARTIFACTS, "failure.png")); } catch {}
   const failure = {
     testedCommit: receipt.testedCommit,
     journey: "sparse-v2-two-device",
     phase,
-    expected: "A fresh second device opens Joinable, can Join, and can instead return to writable Direct Files.",
+    expected: "A fresh second device opens Joinable, can Join, exchanges edits in both directions, and can instead return to writable Direct Files.",
     observed: String(error).split("\n").slice(0, 4).join(" | "),
     classification: /HARNESS UNAVAILABLE|tauri-driver|WebKit|xdotool|window manager|DISPLAY/i.test(String(error))
       ? "infrastructure"

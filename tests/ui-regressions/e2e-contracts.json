@@ -837,7 +837,7 @@
    "contracts": [
     {
      "class": "exact-safety-interoperability",
-     "userOutcome": "Two installations with separate private app data can discover and join one filesystem-synchronized managed graph; the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
+     "userOutcome": "Two installations with separate private app data can discover and join one filesystem-synchronized managed graph, exchange managed edits in both directions, and the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
      "blocking": true,
      "authority": "Tine cross-device managed-storage enrollment, provider synchronization, and Direct Files recovery contract"
     },
@@ -851,7 +851,7 @@
     "Filesystem provider delivery timing and managed bootstrap duration may vary within the scenario timeout."
    ],
    "nonRequirements": [
-    "Android UI chrome, a physical network provider, exact progress wording, or exact internal private-storage layout."
+    "Android UI chrome, a physical network provider, exact progress wording, exact synchronization latency, or exact internal private-storage layout."
    ],
    "stability": "burn-in"
   },
