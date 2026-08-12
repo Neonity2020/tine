@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   dirtyPages,
   flushAll,
+  flushPage,
+  holdManagedMovePages,
   isRetryableSaveFailure,
   markDirty,
+  requireManagedRuntimeReopen,
   resetSaveState,
   saveFailureDisposition,
   trackAssetWrite,
@@ -37,6 +40,31 @@ describe("asset write close barrier", () => {
     await expect(tracked).resolves.toBe("saved.png");
     await expect(flush).resolves.toBe(true);
     expect(flushed).toBe(true);
+  });
+});
+
+describe("managed move persistence barrier", () => {
+  it("refuses close and defers an ordinary page save until actor ownership releases", async () => {
+    resetSaveState();
+    const release = holdManagedMovePages(["Held page"]);
+    markDirty("Held page");
+
+    await expect(flushPage("Held page")).resolves.toBe(false);
+    await expect(flushAll()).resolves.toBe(false);
+    expect([...dirtyPages()]).toContain("Held page");
+
+    release();
+    await expect(flushAll()).resolves.toBe(true);
+    expect([...dirtyPages()]).not.toContain("Held page");
+  });
+
+  it("fails closed after unresolved actor recovery until the graph is reopened", async () => {
+    resetSaveState();
+    requireManagedRuntimeReopen();
+    await expect(flushAll()).resolves.toBe(false);
+
+    resetSaveState();
+    await expect(flushAll()).resolves.toBe(true);
   });
 });
 

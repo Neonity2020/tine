@@ -31,6 +31,7 @@ import { spaceAfterRefCompletion } from "../refCompletionSettings";
 import {
   doc,
   pageByName,
+  pageWritable,
   setRaw,
   setBlockProperty,
   makeOwnNumberedList,
@@ -412,7 +413,7 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
   const orderMarker = () => orderedListMarker(props.id);
   // An org page Tine can't round-trip is shown but NOT editable (Tine must never
   // rewrite it). Clicking a block doesn't enter the editor on such a page.
-  const readOnly = () => pageByName(node().page)?.readOnly ?? false;
+  const readOnly = () => !pageWritable(node().page);
   // A whole-block `{{embed ((uuid))}}` is a transparent host for the referenced
   // outline. Showing both this storage block's controls and the referenced root's
   // controls produces two consecutive bullets. Keep the referenced root controls
@@ -707,7 +708,7 @@ function Rendered(props: {
     const info = logbookInfo(node().raw);
     return info.seconds > 0 ? info : null;
   });
-  const readOnly = () => pageByName(node().page)?.readOnly ?? false;
+  const readOnly = () => !pageWritable(node().page);
 
   const macro = createMemo(() => detectMacro(node().raw));
 
@@ -1075,6 +1076,7 @@ export function Editor(props: { id: string }): JSX.Element {
   // returning to Tine resumes editing exactly where you left off.
   let savedSel: { start: number; end: number } | null = null;
   const node = () => doc.byId[props.id];
+  const readOnly = () => !node() || !pageWritable(node().page);
   const sheetInitialRaw = sheetCell ? node()?.raw ?? "" : null;
   // Page format drives in-block list markers (`-` is an org bullet, not md).
   const pageFmt = (): "md" | "org" => (pageByName(node().page)?.format === "org" ? "org" : "md");
@@ -3480,6 +3482,7 @@ export function Editor(props: { id: string }): JSX.Element {
         onSelect={updateSel}
         onMouseUp={updateSel}
         rows={1}
+        disabled={readOnly()}
       />
       <Show when={isCalc()}>
         <div class="calc-results">

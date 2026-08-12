@@ -52,6 +52,7 @@ import {
   reloadPage,
   forgetPage,
   pageByName,
+  pageMutationBusy,
   carryUnfinished,
   ensurePageLoaded,
   installCaptureScratchPage,
@@ -350,6 +351,7 @@ beforeEach(() => {
   setWorkflow("now");
   setGraphMeta(null);
   managedStorageRuntime.clear();
+  managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
   resetPaneLayoutToSingle({
     tabs: [{ history: [{ kind: "journals" }], pos: 0, pinned: false }],
     activeIndex: 0,
@@ -2021,6 +2023,363 @@ describe("target-relative drag persistence barrier (GH #240)", () => {
       expect(saved.slice(1).map((dto) => dto.blocks)).toEqual([[], []]);
     } finally {
       saveSpy.mockRestore();
+    }
+  });
+});
+
+describe("managed actor-owned cross-page moves", () => {
+  const page = (name: string, path: string, rev: string, blocks: BlockDto[], kind: "page" | "journal" = "page"): PageDto => ({
+    name, kind, title: name, pre_block: null, blocks, path, rev,
+  });
+
+  function managed() {
+    managedStorageRuntime.bind(7);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 7,
+      application_page_admission: {
+        binding_generation: 7,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+  }
+
+  it("does not publish or dirty either page before the actor accepts, then installs both DTOs once", async () => {
+    clearConflict("Source");
+    clearConflict("Destination");
+    setToasts([]);
+    await loadFeed([
+      page("Source", "pages/source.md", "source-r1", [{ id: "source", raw: "source", collapsed: false, children: [] }]),
+      page("Destination", "pages/destination.md", "destination-r1", [{ id: "target", raw: "target", collapsed: false, children: [] }]),
+    ]);
+    managed();
+    let resolve!: (value: any) => void;
+    const actor = new Promise<any>((done) => { resolve = done; });
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockReturnValue(actor);
+    const save = vi.spyOn(backend(), "savePage");
+    const counts = { publications: 0, dirtyMarks: 0, snapshots: 0 };
+    __setStoreMutationObserverForTest((observation) => {
+      if (observation.kind === "publication") counts.publications++;
+      else if (observation.kind === "dirty") counts.dirtyMarks++;
+      else if (observation.kind === "undo-snapshot") counts.snapshots++;
+    });
+    try {
+      const pending = moveBlock("source", null, 1, "Destination");
+      await vi.waitFor(() => expect(move, JSON.stringify(toasts())).toHaveBeenCalledTimes(1));
+      expect(pageByName("Source")!.roots).toEqual(["source"]);
+      expect(pageByName("Destination")!.roots).toEqual(["target"]);
+      expect(counts).toEqual({ publications: 0, dirtyMarks: 0, snapshots: 0 });
+      expect(save).not.toHaveBeenCalled();
+      resolve({
+        binding_generation: 7,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission,
+        outcome: {
+          status: "committed", episode_id: move.mock.calls[0][1].episode_id, batch_id: "batch", recovered: false,
+          source: { page: page("Source", "pages/source.md", "source-r2", []), revision: "source-r2" },
+          destination: {
+            page: page("Destination", "pages/destination.md", "destination-r2", [
+              { id: "target", raw: "target", collapsed: false, children: [] },
+              { id: "source", raw: "source", collapsed: false, children: [] },
+            ]),
+            revision: "destination-r2",
+          },
+        },
+      });
+      await pending;
+      expect(pageByName("Source")!.roots).toEqual([]);
+      expect(pageByName("Destination")!.roots).toEqual(["target", "source"]);
+      expect(counts).toEqual({ publications: 1, dirtyMarks: 0, snapshots: 0 });
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      __setStoreMutationObserverForTest(null);
+      move.mockRestore();
+      save.mockRestore();
+    }
+  });
+
+  it("keeps both pages unchanged on a typed no-commit conflict", async () => {
+    clearConflict("Source");
+    clearConflict("Destination");
+    setToasts([]);
+    await loadFeed([
+      page("Source", "pages/source.md", "source-r1", [{ id: "source", raw: "source", collapsed: false, children: [] }]),
+      page("Destination", "pages/destination.md", "destination-r1", [{ id: "target", raw: "target", collapsed: false, children: [] }]),
+    ]);
+    managed();
+    const before = [pageState("Source"), pageState("Destination")];
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (_binding, request) => ({
+      binding_generation: 7,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: { status: "no_commit", episode_id: request.episode_id, reason: "stale_source" },
+    }));
+    try {
+      await moveBlock("source", null, 1, "Destination");
+      expect([pageState("Source"), pageState("Destination")]).toEqual(before);
+      expect(move).toHaveBeenCalledTimes(1);
+    } finally {
+      move.mockRestore();
+    }
+  });
+
+  it("publishes only the recovered committed actor result after a deferred first observation", async () => {
+    clearConflict("Source");
+    clearConflict("Destination");
+    await loadFeed([
+      page("Source", "pages/source.md", "source-r1", [{ id: "source", raw: "source", collapsed: false, children: [] }]),
+      page("Destination", "pages/destination.md", "destination-r1", [{ id: "target", raw: "target", collapsed: false, children: [] }]),
+    ]);
+    managed();
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: { status: "deferred", episode_id: request.episode_id, state: { status: "retryable_external_work" } },
+    }));
+    const recover = vi.spyOn(backend(), "recoverManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      previous_binding_generation: binding,
+      binding_generation: binding,
+      status: managedStorageRuntime.snapshot().status!,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      episode_id: request.episode_id,
+      outcome: {
+        status: "committed",
+        episode_id: request.episode_id,
+        batch_id: "recovered-batch",
+        recovered: true,
+        source: { page: page("Source", "pages/source.md", "source-r2", []), revision: "source-r2" },
+        destination: {
+          page: page("Destination", "pages/destination.md", "destination-r2", [
+            { id: "target", raw: "target", collapsed: false, children: [] },
+            { id: "source", raw: "source", collapsed: false, children: [] },
+          ]),
+          revision: "destination-r2",
+        },
+      },
+    }));
+    const counts = { publications: 0 };
+    __setStoreMutationObserverForTest((observation) => {
+      if (observation.kind === "publication") counts.publications++;
+    });
+    try {
+      await moveBlock("source", null, 1, "Destination");
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(recover).toHaveBeenCalledTimes(1);
+      expect(pageByName("Source")!.roots).toEqual([]);
+      expect(pageByName("Destination")!.roots).toEqual(["target", "source"]);
+      expect(counts.publications).toBe(1);
+    } finally {
+      __setStoreMutationObserverForTest(null);
+      move.mockRestore();
+      recover.mockRestore();
+    }
+  });
+
+  it("fails closed and keeps both pages non-writable when actor recovery is blocked", async () => {
+    clearConflict("Source");
+    clearConflict("Destination");
+    await loadFeed([
+      page("Source", "pages/source.md", "source-r1", [{ id: "source", raw: "source", collapsed: false, children: [] }]),
+      page("Destination", "pages/destination.md", "destination-r1", [{ id: "target", raw: "target", collapsed: false, children: [] }]),
+    ]);
+    managed();
+    const deferred = (episode_id: string) => ({
+      status: "deferred" as const,
+      episode_id,
+      state: { status: "blocked_recovery" as const, batch_id: "blocked", phase: "projection_drain" as const, retained_publication: true },
+    });
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: deferred(request.episode_id),
+    }));
+    const recover = vi.spyOn(backend(), "recoverManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      previous_binding_generation: binding,
+      binding_generation: binding,
+      status: managedStorageRuntime.snapshot().status!,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      episode_id: request.episode_id,
+      outcome: deferred(request.episode_id),
+    }));
+    try {
+      await moveBlock("source", null, 1, "Destination");
+      expect(pageByName("Source")!.roots).toEqual(["source"]);
+      expect(pageByName("Destination")!.roots).toEqual(["target"]);
+      expect(pageMutationBusy("Source")).toBe(true);
+      expect(pageMutationBusy("Destination")).toBe(true);
+      await expect(flushAll()).resolves.toBe(false);
+    } finally {
+      move.mockRestore();
+      recover.mockRestore();
+    }
+  });
+
+  it("requires reopen when a same-graph page replacement outraces a committed response", async () => {
+    clearConflict("Source");
+    clearConflict("Destination");
+    await loadFeed([
+      page("Source", "pages/source.md", "source-r1", [{ id: "source", raw: "source", collapsed: false, children: [] }]),
+      page("Destination", "pages/destination.md", "destination-r1", [{ id: "target", raw: "target", collapsed: false, children: [] }]),
+    ]);
+    managed();
+    let resolve!: (value: any) => void;
+    const actor = new Promise<any>((done) => { resolve = done; });
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockReturnValue(actor);
+    try {
+      const pending = moveBlock("source", null, 1, "Destination");
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
+      await reloadPage(page("Source", "pages/source.md", "external-r2", [
+        { id: "source", raw: "external replacement", collapsed: false, children: [] },
+      ]));
+      resolve({
+        binding_generation: 7,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission,
+        outcome: {
+          status: "committed", episode_id: move.mock.calls[0][1].episode_id, batch_id: "committed", recovered: false,
+          source: { page: page("Source", "pages/source.md", "source-r3", []), revision: "source-r3" },
+          destination: {
+            page: page("Destination", "pages/destination.md", "destination-r3", [
+              { id: "target", raw: "target", collapsed: false, children: [] },
+              { id: "source", raw: "source", collapsed: false, children: [] },
+            ]),
+            revision: "destination-r3",
+          },
+        },
+      });
+      await pending;
+
+      expect(doc.byId.source.raw).toBe("external replacement");
+      expect(pageByName("Destination")!.roots).toEqual(["target"]);
+      expect(pageMutationBusy("Source")).toBe(true);
+      await expect(flushAll()).resolves.toBe(false);
+    } finally {
+      move.mockRestore();
+    }
+  });
+
+  it("routes Undo and Redo back through inverse and forward actor transactions", async () => {
+    clearConflict("Source");
+    clearConflict("Destination");
+    await loadFeed([
+      page("Source", "pages/source.md", "source-r1", [{ id: "source", raw: "source", collapsed: false, children: [] }]),
+      page("Destination", "pages/destination.md", "destination-r1", [{ id: "target", raw: "target", collapsed: false, children: [] }]),
+    ]);
+    managed();
+    let revision = 1;
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => {
+      revision++;
+      const forward = request.source_path === "pages/source.md";
+      return {
+        binding_generation: binding,
+        application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+        outcome: {
+          status: "committed" as const,
+          episode_id: request.episode_id,
+          batch_id: `batch-${revision}`,
+          recovered: false,
+          source: {
+            page: forward
+              ? page("Source", "pages/source.md", `source-r${revision}`, [])
+              : page("Destination", "pages/destination.md", `destination-r${revision}`, [{ id: "target", raw: "target", collapsed: false, children: [] }]),
+            revision: forward ? `source-r${revision}` : `destination-r${revision}`,
+          },
+          destination: {
+            page: forward
+              ? page("Destination", "pages/destination.md", `destination-r${revision}`, [
+                  { id: "target", raw: "target", collapsed: false, children: [] },
+                  { id: "source", raw: "source", collapsed: false, children: [] },
+                ])
+              : page("Source", "pages/source.md", `source-r${revision}`, [{ id: "source", raw: "source", collapsed: false, children: [] }]),
+            revision: forward ? `destination-r${revision}` : `source-r${revision}`,
+          },
+        },
+      };
+    });
+    const save = vi.spyOn(backend(), "savePage");
+    try {
+      await moveBlock("source", null, 1, "Destination");
+      expect(pageByName("Source")!.roots).toEqual([]);
+      undo();
+      await vi.waitFor(() => expect(pageByName("Source")!.roots).toEqual(["source"]));
+      await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(2));
+      expect(pageByName("Destination")!.roots).toEqual(["target"]);
+      redo();
+      await vi.waitFor(() => expect(pageByName("Source")!.roots).toEqual([]));
+      expect(pageByName("Destination")!.roots).toEqual(["target", "source"]);
+      expect(move).toHaveBeenCalledTimes(3);
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      move.mockRestore();
+      save.mockRestore();
+    }
+  });
+
+  it("routes a journal-boundary block move through one actor transaction and no page save", async () => {
+    const t1 = { id: "today", raw: "today", collapsed: false, children: [] };
+    const o1 = { id: "older", raw: "older", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [t1], "journal"),
+      page("Older", "journals/older.md", "older-r1", [o1], "journal"),
+    ]);
+    managed();
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed", episode_id: request.episode_id, batch_id: "journal-one", recovered: false,
+        source: { page: page("Older", "journals/older.md", "older-r2", [], "journal"), revision: "older-r2" },
+        destination: { page: page("Today", "journals/today.md", "today-r2", [t1, o1], "journal"), revision: "today-r2" },
+      },
+    }));
+    const save = vi.spyOn(backend(), "savePage");
+    try {
+      await expect(moveBlockFeed("older", -1)).resolves.toBe("crossed");
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(move.mock.calls[0][1].roots.map((root) => root.identity)).toEqual(["older"]);
+      expect(pageByName("Today")!.roots).toEqual(["today", "older"]);
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      move.mockRestore();
+      save.mockRestore();
+    }
+  });
+
+  it("routes a contiguous journal selection through one ordered actor transaction", async () => {
+    const t1 = { id: "today", raw: "today", collapsed: false, children: [] };
+    const o1 = { id: "older-1", raw: "older 1", collapsed: false, children: [] };
+    const o2 = { id: "older-2", raw: "older 2", collapsed: false, children: [] };
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [t1], "journal"),
+      page("Older", "journals/older.md", "older-r1", [o1, o2], "journal"),
+    ]);
+    managed();
+    selectBlock("older-1");
+    extendSelectionTo("older-2");
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed", episode_id: request.episode_id, batch_id: "journal-selection", recovered: false,
+        source: { page: page("Older", "journals/older.md", "older-r2", [], "journal"), revision: "older-r2" },
+        destination: { page: page("Today", "journals/today.md", "today-r2", [t1, o1, o2], "journal"), revision: "today-r2" },
+      },
+    }));
+    const save = vi.spyOn(backend(), "savePage");
+    try {
+      await moveSelectionItems(-1);
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(move.mock.calls[0][1].roots.map((root) => root.identity)).toEqual(["older-1", "older-2"]);
+      expect(pageByName("Today")!.roots).toEqual(["today", "older-1", "older-2"]);
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      move.mockRestore();
+      save.mockRestore();
     }
   });
 });

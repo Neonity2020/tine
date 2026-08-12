@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, takeEditorLease, type FeedPage } from "../store";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, takeEditorLease, pageMutationBusy, type FeedPage } from "../store";
 import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter } from "../panes";
 import {
@@ -719,7 +719,12 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
   };
 
   return (
-    <div class="page-section">
+    <div
+      class="page-section"
+      classList={{ "page-mutation-busy": pageMutationBusy(props.page.name) }}
+      inert={pageMutationBusy(props.page.name) ? true : undefined}
+      aria-busy={pageMutationBusy(props.page.name) ? "true" : undefined}
+    >
       <Show when={props.page.kind === "page"}>
         <NamespaceCrumb name={props.page.name} />
       </Show>
@@ -730,6 +735,7 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
             <input
               class="page-title-input"
               value={newName()}
+              disabled={pageMutationBusy(props.page.name)}
               ref={(el) => queueMicrotask(() => (el.focus(), el.select()))}
               onInput={(e) => setNewName(e.currentTarget.value)}
               onKeyDown={(e) => {

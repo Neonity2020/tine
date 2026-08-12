@@ -8,7 +8,19 @@
 
 import { createStore, produce, unwrap } from "solid-js/store";
 import { createSignal, createMemo, createRoot } from "solid-js";
-import type { ActivationIntent, BlockDto, EditorActivationHandle, Format, PageDto, PageKind, RefGroup } from "./types";
+import type {
+  ActivationIntent,
+  BlockDto,
+  EditorActivationHandle,
+  Format,
+  ManagedApplicationMovePlacement,
+  ManagedApplicationMoveRoot,
+  ManagedApplicationMoveSubtreesOutcome,
+  ManagedApplicationMoveSubtreesRequest,
+  PageDto,
+  PageKind,
+  RefGroup,
+} from "./types";
 import type { ClipboardBlock, ClipboardPayloadData, ClipboardPayloadSlot, ClipboardSourcePage } from "./clipboard";
 import {
   CLIPBOARD_PAYLOAD_MAX_BLOCKS,
@@ -85,6 +97,9 @@ import {
   isTombstonedFile,
   tombstoneCovers,
   graphBinding,
+  holdManagedMovePages,
+  requireManagedRuntimeReopen,
+  saveBaselineFor,
   forgetSaveState,
   resetSaveState,
   isSaving,
@@ -287,6 +302,11 @@ const editGenerations = new Map<string, number>();
 // user saw without authorising a new local transaction begun during an await.
 let editorTransactionClock = 0;
 const editorTransactionGenerations = new Map<string, number>();
+const [managedMoveBusyPages, setManagedMoveBusyPages] = createSignal<ReadonlySet<string>>(new Set());
+let managedMoveQueue: Promise<void> = Promise.resolve();
+let managedHistoryReplayRunning = false;
+let managedHistoryReplayEpoch = 0;
+const managedHistoryCommands: Array<"undo" | "redo"> = [];
 
 /** Current content-edit generation for a page. */
 export function editGeneration(name: string): number {
@@ -300,6 +320,16 @@ export function bumpEditGeneration(name: string): void {
 /** Current component-local editor-transaction generation for a page. */
 export function editorTransactionGeneration(name: string): number {
   return editorTransactionGenerations.get(name) ?? 0;
+}
+
+export function pageMutationBusy(name: string): boolean {
+  return managedMoveBusyPages().has(name);
+}
+
+function setManagedMoveBusy(pages: readonly string[], busy: boolean): void {
+  const next = new Set(managedMoveBusyPages());
+  for (const page of pages) busy ? next.add(page) : next.delete(page);
+  setManagedMoveBusyPages(next);
 }
 
 /** The page-instance generation WITHOUT creating one for a page that has none.
@@ -1120,6 +1150,10 @@ export function resetStore() {
   // storm of per-page retirements against a graph that is going away.
   clearAllEditorActivations();
   clearAllEditorLeases();
+  setManagedMoveBusyPages(new Set<string>());
+  managedHistoryReplayEpoch++;
+  managedHistoryReplayRunning = false;
+  managedHistoryCommands.length = 0;
   clearPendingHlsRefreshes();
   clearPendingBlockRefStamps();
   // Cancel pending/in-flight saves and clear all save guard state (timers, graph
@@ -1908,7 +1942,21 @@ interface RawEntry {
   instances: Record<string, number>;
   preservedIds?: string[];
 }
-type UndoEntry = SnapEntry | RawEntry;
+interface ManagedMoveHistorySpec {
+  sourcePage: string;
+  destinationPage: string;
+  roots: string[];
+  forwardPlacement: ManagedApplicationMovePlacement;
+  inversePlacement: ManagedApplicationMovePlacement;
+  forwardRewrites: Map<string, string>;
+  inverseRewrites: Map<string, string>;
+}
+interface ManagedMoveEntry extends ManagedMoveHistorySpec {
+  kind: "managed-move";
+  context: HistoryContext;
+  instances: Record<string, number>;
+}
+type UndoEntry = SnapEntry | RawEntry | ManagedMoveEntry;
 const undoStack: UndoEntry[] = [];
 let redoStack: UndoEntry[] = [];
 let lastUndoTag: string | null = null;
@@ -2082,6 +2130,7 @@ export function clearUndoHistory() {
  *  every page including this one). */
 function entryTouchesPage(e: UndoEntry, name: string): boolean {
   if (e.kind === "raw") return e.page === name;
+  if (e.kind === "managed-move") return e.sourcePage === name || e.destinationPage === name;
   return e.pages === null || e.pages.includes(name);
 }
 
@@ -2287,6 +2336,9 @@ function pushRawUndo(id: string, prevRaw: string) {
 
 /** Apply one entry and return its inverse (to push onto the opposite stack). */
 function applyEntry(e: UndoEntry): UndoEntry {
+  if (e.kind === "managed-move") {
+    throw new Error("managed move history must replay through the native actor");
+  }
   if (e.kind === "raw") {
     const node = doc.byId[e.id];
     const rootIndex = node?.originatedFromPageHeader
@@ -2393,38 +2445,130 @@ export function withUndoUnit<T>(tag: string, pages: string[], fn: () => T): T {
   }
 }
 
-export function undo() {
+function pushManagedMoveHistory(spec: ManagedMoveHistorySpec): void {
+  endMoveSelectionBurst();
+  advanceHistoryEpoch();
+  const pages = [spec.sourcePage, spec.destinationPage];
+  undoStack.push({
+    kind: "managed-move",
+    ...spec,
+    roots: [...spec.roots],
+    forwardRewrites: new Map(spec.forwardRewrites),
+    inverseRewrites: new Map(spec.inverseRewrites),
+    context: captureHistoryContext(),
+    instances: captureInstances(pages),
+  });
+  if (undoStack.length > 200) undoStack.shift();
+  redoStack = [];
+  lastUndoTag = "managed-move";
+}
+
+async function replayManagedMoveHistory(entry: ManagedMoveEntry, direction: "undo" | "redo") {
+  const undoing = direction === "undo";
+  const sourcePage = undoing ? entry.destinationPage : entry.sourcePage;
+  const destinationPage = undoing ? entry.sourcePage : entry.destinationPage;
+  const placement = undoing ? entry.inversePlacement : entry.forwardPlacement;
+  const rewrites = undoing ? entry.inverseRewrites : entry.forwardRewrites;
+  const success = await enqueueManagedCrossPageMove(
+    sourcePage,
+    destinationPage,
+    entry.roots,
+    placement,
+    rewrites,
+    false,
+  );
+  if (!success) {
+    (undoing ? undoStack : redoStack).push(entry);
+    return;
+  }
+  (undoing ? redoStack : undoStack).push({
+    ...entry,
+    context: captureHistoryContext(),
+    instances: captureInstances([entry.sourcePage, entry.destinationPage]),
+  });
+  lastUndoTag = null;
+  endEdit(direction);
+  restoreEntryContext(entry.context);
+}
+
+function performUndo(): Promise<void> | null {
   endMoveSelectionBurst();
   advanceHistoryEpoch();
   const entry = popHistoryEntry(undoStack);
-  if (!entry) return;
-  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
+  if (!entry) return null;
+  if (!entryIsReplayable(entry)) {
+    discardStaleHistory(entry);
+    return null;
+  }
+  if (entry.kind === "managed-move") {
+    return replayManagedMoveHistory(entry, "undo");
+  }
   redoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("undo");
   scheduleSave();
   restoreEntryContext(entry.context);
+  return null;
 }
 
-export function redo() {
+function performRedo(): Promise<void> | null {
   endMoveSelectionBurst();
   advanceHistoryEpoch();
   const entry = popHistoryEntry(redoStack);
-  if (!entry) return;
-  if (!entryIsReplayable(entry)) return discardStaleHistory(entry);
+  if (!entry) return null;
+  if (!entryIsReplayable(entry)) {
+    discardStaleHistory(entry);
+    return null;
+  }
+  if (entry.kind === "managed-move") {
+    return replayManagedMoveHistory(entry, "redo");
+  }
   if (entry.preservedIds && hasLoadedIdentityCollision(entry.preservedIds)) {
     // The selected prerequisite is already popped. A later redo snapshot cannot
     // remain valid without it, including in page-only mode where the tagged
     // entry may have been selected from the middle of the global stack.
     redoStack = [];
     pushToast("Redo skipped: a block with the same id now exists", "error");
-    return;
+    return null;
   }
   undoStack.push(applyEntry(entry));
   lastUndoTag = null;
   endEdit("redo");
   scheduleSave();
   restoreEntryContext(entry.context);
+  return null;
+}
+
+function submitHistoryCommand(direction: "undo" | "redo"): void {
+  if (managedHistoryReplayRunning) {
+    managedHistoryCommands.push(direction);
+    return;
+  }
+  const pending = direction === "undo" ? performUndo() : performRedo();
+  if (!pending) return;
+  managedHistoryReplayRunning = true;
+  const epoch = managedHistoryReplayEpoch;
+  void (async () => {
+    try {
+      await pending;
+      while (epoch === managedHistoryReplayEpoch) {
+        const next = managedHistoryCommands.shift();
+        if (!next) break;
+        const replay = next === "undo" ? performUndo() : performRedo();
+        if (replay) await replay;
+      }
+    } finally {
+      if (epoch === managedHistoryReplayEpoch) managedHistoryReplayRunning = false;
+    }
+  })();
+}
+
+export function undo() {
+  submitHistoryCommand("undo");
+}
+
+export function redo() {
+  submitHistoryCommand("redo");
 }
 
 /** Data replay and opposite-stack insertion are complete before this function is
@@ -3347,7 +3491,7 @@ export function blockPageReadOnly(id: string): boolean {
  * equally non-writable. */
 export function pageWritable(name: string): boolean {
   const page = pageByName(name);
-  return !!page && !page.readOnly && !page.guide;
+  return !!page && !page.readOnly && !page.guide && !pageMutationBusy(name);
 }
 
 export function blockWritable(id: string): boolean {
@@ -4871,14 +5015,6 @@ export async function moveBlock(
   // the caller didn't supply one (a same-page reorder).
   const newPage = newParent ? doc.byId[newParent].page : (targetPage ?? oldPage);
   if (!pageWritable(oldPage) || !pageWritable(newPage)) return;
-  // Cross-page drag: flush the source while it still holds the block, so a
-  // pre-existing pending save can't write the removal before the destination
-  // lands. Abort (no move) if the source can't be saved.
-  if (newPage !== oldPage && !(await prepareCrossPageSources([oldPage]))) {
-    pushToast(`Couldn't move — “${oldPage}” has unsaved changes that need resolving first.`, "error");
-    return;
-  }
-  if (!doc.byId[id]) return; // block vanished during the async flush
   const sourceFormat = formatForBlock(id);
   const destinationFormat = formatForPage(newPage);
   const inheritanceTarget = dropTargetId ?? newParent;
@@ -4887,6 +5023,35 @@ export async function moveBlock(
   const movedRaw = orderListTypeFromRaw(doc.byId[id].raw, sourceFormat) !== null
     ? doc.byId[id].raw
     : rawWithInheritedOrderListType(doc.byId[id].raw, destinationFormat, inheritanceTarget);
+  if (newPage !== oldPage) {
+    const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+    if (!admission || admission.authority === "managed_unavailable") {
+      pushToast("Can't move between pages while managed storage is changing state.", "error");
+      return;
+    }
+    if (admission.authority === "managed_writable") {
+      const rewrites = new Map<string, string>();
+      if (movedRaw !== doc.byId[id].raw) rewrites.set(id, movedRaw);
+      await enqueueManagedCrossPageMove(
+        oldPage,
+        newPage,
+        [id],
+        newParent === null
+          ? { placement: "root", position: index }
+          : { placement: "child", parent_identity: newParent, position: index },
+        rewrites,
+      );
+      return;
+    }
+  }
+  // Cross-page drag: flush the source while it still holds the block, so a
+  // pre-existing pending save can't write the removal before the destination
+  // lands. Abort (no move) if the source can't be saved.
+  if (newPage !== oldPage && !(await prepareCrossPageSources([oldPage]))) {
+    pushToast(`Couldn't move — “${oldPage}” has unsaved changes that need resolving first.`, "error");
+    return;
+  }
+  if (!doc.byId[id]) return; // block vanished during the async flush
   // Drag-move can cross pages → snapshot both source and destination.
   pushUndo("move", [...new Set([oldPage, newPage])]);
   setDoc(
@@ -5023,7 +5188,12 @@ export async function moveBlocksRelative(
   if (!plan) return false;
 
   const crossSources = plan.sourcePages.filter((page) => page !== plan!.destinationPage);
-  if (crossSources.length) {
+  const relativeAdmission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (crossSources.length && (!relativeAdmission || relativeAdmission.authority === "managed_unavailable")) {
+    pushToast("Can't move between pages while managed storage is changing state.", "error");
+    return false;
+  }
+  if (crossSources.length && relativeAdmission?.authority === "direct") {
     if (!(await prepareCrossPageSources(crossSources))) {
       pushToast("Couldn't move — a source page has unsaved changes that need resolving first.", "error");
       return false;
@@ -5052,6 +5222,28 @@ export async function moveBlocksRelative(
     return [id, raw];
   }));
   const affectedPages = [...new Set([plan.destinationPage, ...plan.sourcePages])];
+  if (crossSources.length) {
+    if (relativeAdmission?.authority === "managed_writable") {
+      if (crossSources.length !== 1 || plan.sourcePages.includes(plan.destinationPage)) {
+        pushToast("Managed cross-page moves currently require all selected roots to share one source page.", "error");
+        return false;
+      }
+      const target = doc.byId[targetId];
+      const siblings = target.parent === null
+        ? pageByName(target.page)!.roots
+        : doc.byId[target.parent].children;
+      const positionIndex = siblings.indexOf(targetId) + (position === "after" ? 1 : 0);
+      return enqueueManagedCrossPageMove(
+        crossSources[0],
+        plan.destinationPage,
+        plan.roots,
+        target.parent === null
+          ? { placement: "root", position: positionIndex }
+          : { placement: "child", parent_identity: target.parent, position: positionIndex },
+        movedRaw,
+      );
+    }
+  }
   pushUndo("move-selection-relative", affectedPages);
   setDoc(produce((state) => {
     const siblingsFor = (id: string): string[] => {
@@ -5200,6 +5392,321 @@ function persistCrossPage(dest: string, sources: string[]) {
   void flushPage(dest);
 }
 
+interface ManagedCrossPageMoveIntent {
+  sourcePage: string;
+  destinationPage: string;
+  roots: string[];
+  placement: ManagedApplicationMovePlacement;
+  rewrites: Map<string, string>;
+  graphBinding: number;
+  bindingGeneration: number;
+  sourceInstance: number;
+  destinationInstance: number;
+  sourceEditorGeneration: number;
+  destinationEditorGeneration: number;
+  rootNodes: Node[];
+  targetParentNode: Node | null;
+  history: ManagedMoveHistorySpec | null;
+}
+
+function managedMoveAdmission() {
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  return admission?.authority === "managed_writable" ? admission : null;
+}
+
+function blockTreeMetrics(ids: readonly string[]): { count: number; bytes: number; depth: number } | null {
+  let count = 0;
+  let bytes = 0;
+  let depth = 0;
+  const seen = new Set<string>();
+  const stack = ids.map((id) => ({ id, depth: 1 }));
+  while (stack.length) {
+    const current = stack.pop()!;
+    const node = doc.byId[current.id];
+    if (!node || seen.has(current.id)) return null;
+    seen.add(current.id);
+    count++;
+    bytes += new TextEncoder().encode(node.raw).byteLength;
+    depth = Math.max(depth, current.depth);
+    for (const child of node.children) stack.push({ id: child, depth: current.depth + 1 });
+  }
+  return { count, bytes, depth };
+}
+
+function pageTreeMetrics(pageName: string): { count: number; bytes: number; depth: number } | null {
+  const page = pageByName(pageName);
+  return page ? blockTreeMetrics(page.roots) : null;
+}
+
+function blockDepth(id: string): number | null {
+  let depth = 1;
+  let node = doc.byId[id];
+  const seen = new Set<string>();
+  while (node?.parent !== null) {
+    if (!node || seen.has(node.id)) return null;
+    seen.add(node.id);
+    node = doc.byId[node.parent];
+    depth++;
+  }
+  return node ? depth : null;
+}
+
+function installManagedMovedPages(source: PageDto, destination: PageDto): void {
+  setBaseRev(source.name, source.rev ?? null);
+  setBaseRev(destination.name, destination.rev ?? null);
+  setDoc(produce((state) => {
+    purgePageNodes(state, source.name);
+    purgePageNodes(state, destination.name);
+    for (const dto of [source, destination]) {
+      const page = toFeedPage(dto, state.byId);
+      const index = state.pages.findIndex((candidate) => candidate.name === dto.name);
+      if (index >= 0) state.pages[index] = page;
+      else state.pages.push(page);
+    }
+  }));
+  activatePageInstance(source.name);
+  activatePageInstance(destination.name);
+  invalidateUndoForPage(source.name);
+  invalidateUndoForPage(destination.name);
+  clearConflict(source.name);
+  clearConflict(destination.name);
+  invalidateAllMatrixDimensions();
+  bumpDataRev();
+}
+
+function managedMoveStillOwns(intent: ManagedCrossPageMoveIntent): boolean {
+  const admission = managedMoveAdmission();
+  return !!admission
+    && graphBinding() === intent.graphBinding
+    && admission.binding_generation === intent.bindingGeneration
+    && pageInstanceGeneration(intent.sourcePage) === intent.sourceInstance
+    && pageInstanceGeneration(intent.destinationPage) === intent.destinationInstance
+    && intent.roots.every((id, index) => {
+      const node = doc.byId[id];
+      return !!node && node.page === intent.sourcePage && unwrap(node) === intent.rootNodes[index];
+    })
+    && (intent.placement.placement === "root"
+      ? intent.targetParentNode === null
+      : !!doc.byId[intent.placement.parent_identity]
+        && unwrap(doc.byId[intent.placement.parent_identity]) === intent.targetParentNode
+        && doc.byId[intent.placement.parent_identity].page === intent.destinationPage);
+}
+
+function moveRefusal(outcome: ManagedApplicationMoveSubtreesOutcome): string {
+  if (outcome.status === "no_commit") return `Couldn't move blocks (${outcome.reason.replaceAll("_", " ")}). Nothing was changed.`;
+  return "Couldn't finish the managed move. Reopen Tine to recover the exact result safely.";
+}
+
+async function runManagedCrossPageMove(intent: ManagedCrossPageMoveIntent): Promise<boolean> {
+  if (!managedMoveStillOwns(intent)) return false;
+  if (hasEditorLease(intent.sourcePage) || hasEditorLease(intent.destinationPage)) {
+    pushToast("Finish editing the affected page before moving blocks between pages.", "error");
+    return false;
+  }
+  setManagedMoveBusy([intent.sourcePage, intent.destinationPage], true);
+  let releaseSaves = () => {};
+  let resolved = true;
+  try {
+    if (!managedMoveStillOwns(intent)
+      || editorTransactionGeneration(intent.sourcePage) !== intent.sourceEditorGeneration
+      || editorTransactionGeneration(intent.destinationPage) !== intent.destinationEditorGeneration
+      || hasEditorLease(intent.sourcePage)
+      || hasEditorLease(intent.destinationPage)) return false;
+    if (!(await flushPageToQuiescence(intent.sourcePage))
+      || !(await flushPageToQuiescence(intent.destinationPage))) {
+      pushToast("Couldn't move — finish saving the affected pages first.", "error");
+      return false;
+    }
+    if (!managedMoveStillOwns(intent)) return false;
+    releaseSaves = holdManagedMovePages([intent.sourcePage, intent.destinationPage]);
+    const admission = managedMoveAdmission()!;
+    const source = pageByName(intent.sourcePage);
+    const destination = pageByName(intent.destinationPage);
+    const sourceRevision = saveBaselineFor(intent.sourcePage);
+    const destinationRevision = saveBaselineFor(intent.destinationPage);
+    if (!source?.path || !destination?.path || !sourceRevision || !destinationRevision) return false;
+    const roots = blockTreeMetrics(intent.roots);
+    const destinationMetrics = pageTreeMetrics(intent.destinationPage);
+    const insertionDepth = intent.placement.placement === "root"
+      ? 1
+      : (() => {
+          const parentDepth = blockDepth(intent.placement.parent_identity);
+          return parentDepth === null ? null : parentDepth + 1;
+        })();
+    if (!roots || !destinationMetrics
+      || insertionDepth === null
+      || destinationMetrics.count + roots.count > admission.application_save_page_blocks
+      || destinationMetrics.bytes + roots.bytes > admission.application_page_request_text_bytes
+      || Math.max(destinationMetrics.depth, insertionDepth + roots.depth - 1) > admission.application_page_max_depth) {
+      pushToast("Can't move: the destination would exceed managed storage's page limits. Nothing was changed.", "error");
+      return false;
+    }
+    const request: ManagedApplicationMoveSubtreesRequest = {
+      episode_id: crypto.randomUUID(),
+      source_path: source.path,
+      source_revision: sourceRevision,
+      destination_path: destination.path,
+      destination_revision: destinationRevision,
+      roots: intent.roots.map((identity): ManagedApplicationMoveRoot => ({
+        identity,
+        raw_rewrite: intent.rewrites.has(identity)
+          ? { expected_raw: doc.byId[identity].raw, desired_raw: intent.rewrites.get(identity)! }
+          : null,
+      })),
+      placement: intent.placement,
+      admission: {
+        application_save_page_blocks: admission.application_save_page_blocks,
+        application_page_request_text_bytes: admission.application_page_request_text_bytes,
+        application_page_max_depth: admission.application_page_max_depth,
+      },
+    };
+    let result = await backend().moveManagedApplicationSubtrees(intent.bindingGeneration, request);
+    for (let recoveryTurns = 0; result.outcome.status === "deferred"; recoveryTurns++) {
+      if (recoveryTurns >= 8) {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal(result.outcome), "error");
+        return false;
+      }
+      const recovered = await backend().recoverManagedApplicationSubtrees(
+        result.binding_generation,
+        request,
+      );
+      if (recovered.binding_generation !== result.binding_generation
+        && !managedStorageRuntime.transitionMoveRecovery(
+          recovered,
+          request.episode_id,
+          result.binding_generation,
+          () => managedMoveStillOwns(intent),
+        )) {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal(recovered.outcome), "error");
+        return false;
+      }
+      result = {
+        binding_generation: recovered.binding_generation,
+        application_page_admission: recovered.application_page_admission,
+        outcome: recovered.outcome,
+      };
+      intent.bindingGeneration = recovered.binding_generation;
+      if (result.outcome.status === "deferred" && result.outcome.state.status === "blocked_recovery") {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal(result.outcome), "error");
+        return false;
+      }
+    }
+    if (result.outcome.status !== "committed") {
+      pushToast(moveRefusal(result.outcome), "error");
+      return false;
+    }
+    if (!managedMoveStillOwns(intent)) {
+      // A graph switch owns its replacement and may discard this old response.
+      // A same-graph page replacement cannot: the actor committed, but the
+      // frontend no longer knows whether that replacement is pre- or post-move.
+      // Keep both save lanes closed until reopen resolves the durable truth.
+      if (graphBinding() === intent.graphBinding
+        && managedMoveAdmission()?.binding_generation === intent.bindingGeneration) {
+        resolved = false;
+        requireManagedRuntimeReopen();
+        pushToast(moveRefusal({
+          status: "deferred",
+          episode_id: request.episode_id,
+          state: {
+            status: "blocked_recovery",
+            batch_id: result.outcome.batch_id,
+            phase: "projection_drain",
+            retained_publication: true,
+          },
+        }), "error");
+      }
+      return false;
+    }
+    installManagedMovedPages(
+      { ...result.outcome.source.page, rev: result.outcome.source.revision },
+      { ...result.outcome.destination.page, rev: result.outcome.destination.revision },
+    );
+    if (intent.history) pushManagedMoveHistory(intent.history);
+    return true;
+  } catch (error) {
+    pushToast(`Couldn't move blocks. (${String(error)})`, "error");
+    return false;
+  } finally {
+    if (resolved) {
+      releaseSaves();
+      setManagedMoveBusy([intent.sourcePage, intent.destinationPage], false);
+    }
+  }
+}
+
+function enqueueManagedCrossPageMove(
+  sourcePage: string,
+  destinationPage: string,
+  roots: readonly string[],
+  placement: ManagedApplicationMovePlacement,
+  rewrites: Map<string, string>,
+  recordHistory = true,
+): Promise<boolean> {
+  const admission = managedMoveAdmission();
+  const sourceInstance = pageInstanceGeneration(sourcePage);
+  const destinationInstance = pageInstanceGeneration(destinationPage);
+  if (!admission || sourceInstance === null || destinationInstance === null) return Promise.resolve(false);
+  const nodes = roots.map((id) => doc.byId[id]);
+  if (nodes.some((node) => !node || node.page !== sourcePage)) return Promise.resolve(false);
+  const originalParent = nodes[0].parent;
+  if (nodes.some((node) => node.parent !== originalParent)) {
+    pushToast("Managed multi-block moves require the selected roots to share one parent.", "error");
+    return Promise.resolve(false);
+  }
+  const originalSiblings = originalParent === null
+    ? pageByName(sourcePage)?.roots
+    : doc.byId[originalParent]?.children;
+  const originalPositions = nodes.map((node) => originalSiblings?.indexOf(node.id) ?? -1);
+  if (!originalSiblings
+    || originalPositions.some((position) => position < 0)
+    || originalPositions.some((position, index) => index > 0 && position !== originalPositions[index - 1] + 1)) {
+    pushToast("Managed multi-block moves require one contiguous selection.", "error");
+    return Promise.resolve(false);
+  }
+  const history: ManagedMoveHistorySpec | null = recordHistory ? {
+    sourcePage,
+    destinationPage,
+    roots: [...roots],
+    forwardPlacement: placement,
+    inversePlacement: originalParent === null
+      ? { placement: "root", position: originalPositions[0] }
+      : { placement: "child", parent_identity: originalParent, position: originalPositions[0] },
+    forwardRewrites: new Map(rewrites),
+    inverseRewrites: new Map(
+      roots
+        .filter((id) => rewrites.has(id))
+        .map((id) => [id, doc.byId[id].raw]),
+    ),
+  } : null;
+  const intent: ManagedCrossPageMoveIntent = {
+    sourcePage,
+    destinationPage,
+    roots: [...roots],
+    placement,
+    rewrites,
+    graphBinding: graphBinding(),
+    bindingGeneration: admission.binding_generation,
+    sourceInstance,
+    destinationInstance,
+    sourceEditorGeneration: editorTransactionGeneration(sourcePage),
+    destinationEditorGeneration: editorTransactionGeneration(destinationPage),
+    rootNodes: nodes.map((node) => unwrap(node)),
+    targetParentNode: placement.placement === "child"
+      ? (doc.byId[placement.parent_identity] ? unwrap(doc.byId[placement.parent_identity]) : null)
+      : null,
+    history,
+  };
+  const result = managedMoveQueue.then(() => runManagedCrossPageMove(intent));
+  managedMoveQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
 /** Before a cross-page move mutates memory, durably flush every SOURCE page while
  *  it still contains the blocks. Otherwise a save that was ALREADY pending/in-flight
  *  for a source (from an earlier, unrelated edit) can fire right after the in-memory
@@ -5266,6 +5773,21 @@ export async function moveBlockFeed(id: string, dir: 1 | -1): Promise<"within" |
   if (node.parent !== null) return "none"; // nested block at a child-list edge: stop
   const target = await feedNeighbor(node.page, dir);
   if (!target || !pageWritable(target)) return "none";
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (!admission || admission.authority === "managed_unavailable") {
+    pushToast("Can't move between pages while managed storage is changing state.", "error");
+    return "none";
+  }
+  if (admission.authority === "managed_writable") {
+    const position = dir === -1 ? pageByName(target)!.roots.length : 0;
+    return (await enqueueManagedCrossPageMove(
+      node.page,
+      target,
+      [id],
+      { placement: "root", position },
+      new Map(),
+    )) ? "crossed" : "none";
+  }
   if (!(await prepareCrossPageSources([node.page]))) return "none"; // source has unsaved edits → abort
   if (!doc.byId[id]) return "none"; // vanished during the flush
   pushUndo("move-cross", [node.page, target]);
@@ -5317,6 +5839,22 @@ export async function moveSelectionItems(dir: 1 | -1) {
   if (ids.some((id) => doc.byId[id].parent !== null || doc.byId[id].page !== page)) return;
   const target = await feedNeighbor(page, dir);
   if (!target || !pageWritable(target)) return;
+  const admission = managedStorageRuntime.snapshot().applicationPageAdmission;
+  if (!admission || admission.authority === "managed_unavailable") {
+    pushToast("Can't move between pages while managed storage is changing state.", "error");
+    return;
+  }
+  if (admission.authority === "managed_writable") {
+    const position = dir === -1 ? pageByName(target)!.roots.length : 0;
+    await enqueueManagedCrossPageMove(
+      page,
+      target,
+      ids,
+      { placement: "root", position },
+      new Map(),
+    );
+    return;
+  }
   if (!(await prepareCrossPageSources([page]))) return; // source has unsaved edits → abort
   pushUndo("move-sel-cross", [page, target]);
   crossMoveBlocks(ids, page, target, dir);

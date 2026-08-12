@@ -109,6 +109,11 @@ export type ManagedConflictObservationSnapshot = {
 
 const heldForcedSaves = new Map<string, ConflictObservation | null>();
 const heldByDest = new Map<string, string[]>();
+// Managed cross-page moves are actor-owned semantic transactions. While one is
+// unresolved, neither page may enter any ordinary/force/reobserve save lane:
+// that would race the actor with a second per-page semantic intent.
+const managedMoveHeldPages = new Set<string>();
+const managedMoveDeferredIntents = new Map<string, SaveIntent[]>();
 // Which conflict observation each banner is showing. "Keep mine" presents this
 // back so the override answers the conflict the USER SAW. Without it, a second
 // force request issued under one banner — a double click, the button is not
@@ -247,6 +252,35 @@ export function holdSourcesForDest(dest: string, sources: string[]) {
   if (srcs.length === 0) return;
   heldByDest.set(dest, srcs);
   for (const s of srcs) heldSources.add(s);
+}
+
+/** Hold every save intent for the exact affected pages until one managed move
+ * episode settles. The returned release is affine and safe to call repeatedly. */
+export function holdManagedMovePages(pages: readonly string[]): () => void {
+  const held = [...new Set(pages)];
+  for (const page of held) managedMoveHeldPages.add(page);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    let scheduleOrdinary = false;
+    for (const page of held) {
+      managedMoveHeldPages.delete(page);
+      const intents = managedMoveDeferredIntents.get(page) ?? [];
+      managedMoveDeferredIntents.delete(page);
+      for (const intent of intents) {
+        if (intent.kind === "ordinary") scheduleOrdinary = true;
+        else void enqueueSave(page, intent);
+      }
+    }
+    if (scheduleOrdinary) scheduleSave();
+  };
+}
+
+/** An unresolved actor append is durable but cannot safely coexist with new
+ * per-page saves. This also makes clean close/graph switch visibly refuse. */
+export function requireManagedRuntimeReopen(): void {
+  latchReopenRequired();
 }
 
 /** Track an optimistic asset write so flushAll/app-close waits for the bytes to
@@ -441,6 +475,8 @@ export function resetSaveState() {
   deletedPagePaths.clear();
   heldSources.clear();
   heldByDest.clear();
+  managedMoveHeldPages.clear();
+  managedMoveDeferredIntents.clear();
   transientFailures.clear();
   for (const timer of retryTimers.values()) clearTimeout(timer);
   retryTimers.clear();
@@ -838,6 +874,17 @@ async function doSave(
   // only when the caller enqueues it: another save may have been ahead of it.
   if (expectedCutSource && !cutSourceUsable(expectedCutSource)) return false;
   if (deletedPages.has(name)) return true; // tombstoned — never recreate a deleted page
+  if (managedMoveHeldPages.has(name)) {
+    const deferred = managedMoveDeferredIntents.get(name) ?? [];
+    // Flush loops may submit the same ordinary intent repeatedly while the
+    // actor owns the page. One retained ordinary intent is enough, while
+    // reobserve/force intents keep their order and captured authority.
+    if (intent.kind !== "ordinary" || !deferred.some((candidate) => candidate.kind === "ordinary")) {
+      deferred.push(intent);
+      managedMoveDeferredIntents.set(name, deferred);
+    }
+    return false;
+  }
   // A re-observation must reach the backend even though the page is clean or
   // already conflicted: those are exactly the states a banner leaves behind, and
   // only a fresh refusal can mint the authority the visible banner needs.
@@ -1190,6 +1237,7 @@ export function cutSourcePagesRetired(sources: readonly ClipboardSourcePage[]): 
  *  landed (no conflicts or errors), so the caller can abort a destructive
  *  transition rather than discard the un-saved edit. */
 export async function flushAll(): Promise<boolean> {
+  if (reopenRequired) return false;
   if (saveTimer) {
     clearTimeout(saveTimer);
     saveTimer = null;
@@ -1213,7 +1261,10 @@ export async function flushAll(): Promise<boolean> {
   // Success only if nothing is still pending AND there are no unresolved
   // conflicts (a conflicted page's edit is NOT on disk) — so a destructive
   // transition (graph switch / restore / close) can abort instead of discarding it.
-  return dirty.size === 0 && assetWriteChain.size === 0 && conflicts().length === 0;
+  return !reopenRequired
+    && dirty.size === 0
+    && assetWriteChain.size === 0
+    && conflicts().length === 0;
 }
 
 /** Resolve a save conflict by overwriting the on-disk file with the in-memory

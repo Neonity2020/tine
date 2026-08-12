@@ -3642,6 +3642,10 @@ textarea {
 .page-section {
   padding-bottom: 18px;
 }
+.page-section.page-mutation-busy {
+  cursor: wait;
+  opacity: 0.72;
+}
 
 .page-section + .page-section {
   margin-top: 6px;
