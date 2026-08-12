@@ -289,6 +289,10 @@ fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
         SyncSharedProviderColdPrefix::ReadyForDescriptorInspection => {
             inspect_shared_enrollment_for_cold_discovery(shared)
                 .map(|descriptor| descriptor.is_some())
+                // A descriptor file can be observed between the provider's
+                // create and final write/rename.  Its malformed bytes are an
+                // incomplete arrival, not proof of hostile graph state.
+                .or(Ok(false))
         }
         SyncSharedProviderColdPrefix::Refused => {
             Err("shared provider namespace is ambiguous or unsafe".into())
@@ -332,37 +336,24 @@ fn inspect_unclaimed_sparse_archive(
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(ColdSparseArchive::Refused);
     }
-    let mut entries = std::fs::read_dir(&archive).map_err(|error| {
-        format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
-    })?;
-    let Some(shared) = entries.next().transpose().map_err(|error| {
-        format!("Couldn't verify Tine-managed storage data before opening this graph: {error}")
-    })?
-    else {
-        return Ok(ColdSparseArchive::Partial);
+    let shared = archive.join("shared");
+    let shared_metadata = match std::fs::symlink_metadata(&shared) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ColdSparseArchive::Partial)
+        }
+        Err(error) => {
+            return Err(format!(
+                "Couldn't verify Tine-managed storage data before opening this graph: {error}"
+            ))
+        }
     };
-    if shared.file_name() != "shared"
-        || !shared
-            .file_type()
-            .map_err(|error| {
-                format!(
-                    "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-                )
-            })?
-            .is_dir()
-        || entries
-            .next()
-            .transpose()
-            .map_err(|error| {
-                format!(
-                    "Couldn't verify Tine-managed storage data before opening this graph: {error}"
-                )
-            })?
-            .is_some()
-    {
+    if shared_metadata.file_type().is_symlink() || !shared_metadata.is_dir() {
         return Ok(ColdSparseArchive::Refused);
     }
-    match inspect_shared(&shared.path()) {
+    // The canonical shared directory is the only path that carries discovery
+    // authority.  Temporary or future sibling entries under v2 are inert.
+    match inspect_shared(&shared) {
         Ok(true) => Ok(ColdSparseArchive::Joinable),
         Ok(false) => Ok(ColdSparseArchive::Partial),
         Err(_) => Ok(ColdSparseArchive::Refused),
@@ -1110,10 +1101,6 @@ mod tests {
             let page_before = std::fs::read(&page).unwrap();
             let recovery_before = std::fs::read(&recovery).unwrap();
 
-            assert!(
-                inspect_shared_enrollment_for_cold_discovery(&shared).is_err(),
-                "the real cold inspector must see the unfinished {tag} prefix"
-            );
             assert_eq!(
                 refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
                 PARTIAL_PROVIDER_REFUSAL,
@@ -1130,16 +1117,15 @@ mod tests {
     }
 
     #[test]
-    fn cold_provider_malformed_and_ambiguous_enrollment_stays_refused() {
-        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
+    fn cold_provider_incomplete_descriptor_is_retryable() {
         let dir = scratch("cold-provider-invalid-enrollment");
         let enrollment = dir.join(".tine-sync/v2/shared/outbox/enrollment");
         std::fs::create_dir_all(&enrollment).unwrap();
         std::fs::write(enrollment.join("shared-enrollment-v1.json"), b"{").unwrap();
         assert_eq!(
             refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            REFUSAL,
-            "a malformed canonical descriptor is not a retryable prefix"
+            PARTIAL_PROVIDER_REFUSAL,
+            "a descriptor observed before its final write is an incomplete provider arrival"
         );
         std::fs::write(
             enrollment.join("shared-enrollment-v1.sync-conflict.json"),
@@ -1148,14 +1134,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             refuse_unclaimed_sparse_archive(&dir).unwrap_err(),
-            REFUSAL,
-            "conflict copies remain ambiguous and must not be retried as prefixes"
+            PARTIAL_PROVIDER_REFUSAL,
+            "a sibling provider artifact must not turn an incomplete canonical descriptor into a permanent refusal"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn cold_provider_noncanonical_prefix_entries_stay_refused() {
+    fn cold_provider_unsafe_canonical_kinds_refuse_but_unrelated_entries_retry() {
         const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
 
         let non_directory = scratch("cold-provider-outbox-file");
@@ -1172,7 +1158,7 @@ mod tests {
         std::fs::create_dir_all(unknown.join(".tine-sync/v2/shared/outbox/unknown")).unwrap();
         assert_eq!(
             refuse_unclaimed_sparse_archive(&unknown).unwrap_err(),
-            REFUSAL
+            PARTIAL_PROVIDER_REFUSAL
         );
         let _ = std::fs::remove_dir_all(unknown);
 
@@ -1195,7 +1181,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_shared_discovery_requires_the_sole_real_v2_shared_namespace() {
+    fn cold_shared_discovery_uses_the_real_v2_shared_namespace() {
         const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
         let dir = scratch("cold-shared-layout");
         let v2 = dir.join(".tine-sync/v2");
@@ -1216,8 +1202,9 @@ mod tests {
 
         std::fs::write(v2.join("unknown"), b"retain").unwrap();
         assert_eq!(
-            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
-            REFUSAL
+            refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)),
+            Ok(()),
+            "unrelated v2 provider artifacts do not override the canonical shared namespace"
         );
         std::fs::remove_file(v2.join("unknown")).unwrap();
         assert_eq!(

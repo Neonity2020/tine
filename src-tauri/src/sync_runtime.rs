@@ -2043,20 +2043,22 @@ fn cancel_sparse_v2_at_paths(
     )
 }
 
-fn cold_binding_record_at(
-    private_root: &Path,
-    root_key: &Path,
-) -> Result<SparseV2ActivationRecord, String> {
+fn cold_recovery_graph_meta(private_root: &Path, root_key: &Path) -> Result<GraphMeta, String> {
     match read_binding_at(&private_root.join(SPARSE_BINDING_FILE), root_key) {
-        Ok(Some(record)) => Ok(record),
-        Ok(None) => Err(
-            "No local Tine-managed storage recovery binding was found for this remembered graph. Nothing was changed."
-                .into(),
-        ),
-        Err(_) => Err(
-            "The local Tine-managed storage recovery binding is incomplete or unreadable. Nothing was changed."
-                .into(),
-        ),
+        Ok(Some(record)) => Ok(SyncRuntimeFacade::graph_meta(&record)),
+        // A second device is expected to have shared graph-local state before
+        // it has any private binding.  The explicit Direct Files escape also
+        // has to work when a failed setup left that private binding corrupt.
+        // The Markdown graph supplies the reservation metadata; both the
+        // private directory (if any) and the complete graph-local v2 namespace
+        // are still archived byte-for-byte before Direct Files is published.
+        Ok(None) | Err(_) => tine_core::model::Graph::open_checked(root_key)
+            .map(|graph| graph.meta())
+            .map_err(|error| {
+                format!(
+                    "Tine could not verify the Markdown/Org graph before returning to Direct files: {error}. Nothing was changed."
+                )
+            }),
     }
 }
 
@@ -2155,15 +2157,8 @@ fn cancel_sparse_v2_cold_at_paths_with_archive(
             archive,
         );
     }
-    // This is deliberately before the reservation: a missing/corrupt binding
-    // is a persistent safe refusal, never permission to archive either side.
-    let record = cold_binding_record_at(private_root, &root_key)?;
-    let slot = reserve_cold_recovery_slot(
-        state,
-        label,
-        root_key,
-        SyncRuntimeFacade::graph_meta(&record),
-    )?;
+    let graph_meta = cold_recovery_graph_meta(private_root, &root_key)?;
+    let slot = reserve_cold_recovery_slot(state, label, root_key, graph_meta)?;
     cancel_sparse_v2_at_paths_with_archive(
         state,
         label,
@@ -2199,13 +2194,8 @@ fn cancel_sparse_v2_cold_at_paths_with_archive_and_publish(
             publish_direct,
         );
     }
-    let record = cold_binding_record_at(private_root, &root_key)?;
-    let slot = reserve_cold_recovery_slot(
-        state,
-        label,
-        root_key,
-        SyncRuntimeFacade::graph_meta(&record),
-    )?;
+    let graph_meta = cold_recovery_graph_meta(private_root, &root_key)?;
+    let slot = reserve_cold_recovery_slot(state, label, root_key, graph_meta)?;
     cancel_sparse_v2_at_paths_with_archive_and_publish(
         state,
         label,
@@ -3299,11 +3289,21 @@ mod tests {
     }
 
     #[test]
-    fn cold_return_refuses_missing_or_corrupt_binding_without_archiving() {
+    fn cold_return_archives_and_opens_direct_with_missing_or_corrupt_binding() {
         let missing = cold_fixture(Some("shadow_import"));
         std::fs::remove_file(missing.private_root.join(SPARSE_BINDING_FILE)).unwrap();
+        let missing_enrollment = missing
+            .graph_root
+            .join(".tine-sync/v2/shared/outbox/enrollment");
+        std::fs::create_dir_all(&missing_enrollment).unwrap();
+        std::fs::write(
+            missing_enrollment.join("shared-enrollment-v1.json"),
+            b"partially delivered descriptor",
+        )
+        .unwrap();
         let missing_before = snapshot_tree(&missing.private_root);
-        let missing_error = cancel_sparse_v2_cold_at_paths(
+        let missing_provider = snapshot_tree(&missing.graph_root.join(".tine-sync/v2"));
+        let missing_result = cancel_sparse_v2_cold_at_paths(
             &missing.state,
             "main",
             missing.graph_root.clone(),
@@ -3311,16 +3311,49 @@ mod tests {
             &missing.recovery_root,
             None,
         )
-        .unwrap_err();
-        assert!(missing_error.contains("No local Tine-managed storage recovery binding"));
-        assert_eq!(snapshot_tree(&missing.private_root), missing_before);
-        assert!(!missing.recovery_root.exists());
-        assert!(missing.state.graphs.read().unwrap().slot("main").is_none());
+        .unwrap();
+        assert!(matches!(
+            missing_result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!missing.private_root.exists());
+        assert_eq!(
+            snapshot_tree(
+                &std::fs::read_dir(&missing.recovery_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            ),
+            missing_before
+        );
+        assert!(!missing.graph_root.join(".tine-sync/v2").exists());
+        assert_eq!(
+            snapshot_tree(
+                &std::fs::read_dir(missing.graph_root.join(".tine-sync/recovery"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            ),
+            missing_provider
+        );
+        assert!(missing
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
 
         let corrupt = cold_fixture(Some("shadow_import"));
         std::fs::write(corrupt.private_root.join(SPARSE_BINDING_FILE), b"{").unwrap();
         let corrupt_before = snapshot_tree(&corrupt.private_root);
-        let corrupt_error = cancel_sparse_v2_cold_at_paths(
+        let corrupt_result = cancel_sparse_v2_cold_at_paths(
             &corrupt.state,
             "main",
             corrupt.graph_root.clone(),
@@ -3328,11 +3361,32 @@ mod tests {
             &corrupt.recovery_root,
             None,
         )
-        .unwrap_err();
-        assert!(corrupt_error.contains("incomplete or unreadable"));
-        assert_eq!(snapshot_tree(&corrupt.private_root), corrupt_before);
-        assert!(!corrupt.recovery_root.exists());
-        assert!(corrupt.state.graphs.read().unwrap().slot("main").is_none());
+        .unwrap();
+        assert!(matches!(
+            corrupt_result.status.availability,
+            SparseV2Availability::LegacyDefault
+        ));
+        assert!(!corrupt.private_root.exists());
+        assert_eq!(
+            snapshot_tree(
+                &std::fs::read_dir(&corrupt.recovery_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            ),
+            corrupt_before
+        );
+        assert!(corrupt
+            .state
+            .graphs
+            .read()
+            .unwrap()
+            .slot("main")
+            .unwrap()
+            .legacy_graph()
+            .is_ok());
     }
 
     #[test]

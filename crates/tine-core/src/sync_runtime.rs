@@ -133,9 +133,9 @@ use crate::oplog::simulator::{
     fail_next_provider_publication_after_physical_write,
 };
 use crate::oplog::simulator::{
-    inspect_cold_shared_provider_descriptor, inspect_cold_shared_provider_prefix,
-    inspect_shared_provider_descriptor, provider_transient_path, ColdSharedProviderPrefix,
-    SharedProviderFrontierHeadV1, SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
+    inspect_cold_shared_provider_prefix, inspect_shared_provider_descriptor,
+    provider_transient_path, ColdSharedProviderPrefix, SharedProviderFrontierHeadV1,
+    SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
     SharedProviderObservationCursor, SharedProviderPublicationCursor,
     SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
     SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
@@ -1387,7 +1387,12 @@ pub fn inspect_shared_enrollment(
 pub fn inspect_shared_enrollment_for_cold_discovery(
     provider_root: &Path,
 ) -> Result<Option<SyncSharedEnrollmentDescriptor>, String> {
-    inspect_cold_shared_provider_descriptor(provider_root)
+    // The canonical descriptor carries the authority.  Sibling provider
+    // artifacts are not authority and can legitimately be present while a
+    // filesystem sync is settling (temporary files, conflict copies, or newer
+    // append-only namespaces), so cold discovery must not require the
+    // enrollment directory to contain literally one entry.
+    inspect_shared_provider_descriptor(provider_root)
         .map_err(display)?
         .map(|bytes| SharedEnrollmentDescriptorV1::decode(&bytes).map_err(display))
         .transpose()?
@@ -40485,7 +40490,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_shared_descriptor_discovery_requires_one_canonical_supported_regular_file() {
+    fn cold_shared_descriptor_discovery_uses_the_canonical_supported_regular_file() {
         let fixture = ActivationFixture::nested_unicode("cold-conflict-control", 0xa185);
         let descriptor = activate_and_prepare_shared(&fixture);
         let enrollment = fixture.request.provider_root.join("outbox/enrollment");
@@ -40507,10 +40512,26 @@ mod tests {
             &descriptor.encoded,
         )
         .unwrap();
-
-        assert!(
-            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err(),
-            "the plain canonical-path inspection misses sibling conflict evidence and must not be used for cold discovery"
+        fs::write(fixture.request.provider_root.join(".nomedia"), b"").unwrap();
+        fs::write(
+            fixture
+                .request
+                .provider_root
+                .join("outbox/.syncthing.provider.tmp"),
+            b"partial provider artifact",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_shared_provider_cold_prefix(&fixture.request.provider_root).unwrap(),
+            SyncSharedProviderColdPrefix::ReadyForDescriptorInspection,
+            "non-authoritative provider artifacts must not hide a valid canonical descriptor"
+        );
+        assert_eq!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root)
+                .unwrap()
+                .unwrap(),
+            descriptor,
+            "cold discovery must use the canonical descriptor despite sibling artifacts"
         );
         fs::remove_file(
             enrollment.join("shared-enrollment-v1.sync-conflict-20260731-120000-ABCDEFG.json"),

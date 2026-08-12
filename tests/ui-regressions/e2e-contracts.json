@@ -833,6 +833,28 @@
    ],
    "stability": "burn-in"
   },
+  "scripts/e2e-sparse-v2-two-device.mjs": {
+   "contracts": [
+    {
+     "class": "exact-safety-interoperability",
+     "userOutcome": "Two installations with separate private app data can discover and join one filesystem-synchronized managed graph; the receiving device can instead explicitly return to writable Direct Files without deleting managed evidence.",
+     "blocking": true,
+     "authority": "Tine cross-device managed-storage enrollment, provider synchronization, and Direct Files recovery contract"
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "A provider-synchronized graph opens on a fresh second device as Joinable before that device has any local managed-storage binding.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Filesystem provider delivery timing and managed bootstrap duration may vary within the scenario timeout."
+   ],
+   "nonRequirements": [
+    "Android UI chrome, a physical network provider, exact progress wording, or exact internal private-storage layout."
+   ],
+   "stability": "burn-in"
+  },
   "scripts/e2e-windows-managed-storage.mjs": {
    "contracts": [
     {

@@ -1513,7 +1513,7 @@
     },
     {
       "id": "REG-SYNC-SPARSE-V2-COLD-JOIN-DISCOVERY-001",
-      "title": "A cold graph is joinable only from one complete canonical supported shared descriptor with no ambiguous v2 residue",
+      "title": "A new device discovers the canonical shared descriptor despite provider artifacts, and can always escape to Direct Files before it has a local binding",
       "family": "sync-data-safety",
       "sources": {
         "issues": [],
@@ -1533,7 +1533,7 @@
         "scenario": "sync.sparse-v2-cold-shared-descriptor-classifier",
         "failBefore": "proven"
       },
-      "notes": "Absent v2 remains an ordinary Direct files open. A real v2 directory whose sole top-level entry is a provider-capable shared namespace may be discovered only when its bounded enrollment namespace contains exactly the canonical supported descriptor. Partial, malformed, unsupported, symlinked, conflict-copy, sibling-descriptor, unsafe, unknown, or extra v2 evidence remains a hard refusal without creating a private binding, auto-joining, deleting, or reinterpreting bytes."
+      "notes": "Absent v2 remains an ordinary Direct Files open. Before Join, a second device is expected to have graph-local shared state but no app-private binding. Cold discovery follows the real canonical shared/outbox/enrollment/shared-enrollment-v1.json path: a valid supported descriptor makes the graph joinable even when non-authoritative provider temporary files, conflict copies, extra namespaces, or v2 siblings are present; missing or not-yet-decodable canonical bytes remain a retryable incomplete arrival; unsafe kinds on the canonical path still refuse. From any such cold refusal, confirmed Return to Direct Files derives reservation metadata from the Markdown graph when the private binding is missing or corrupt, archives all private and graph-local v2 bytes that exist, and publishes a real Direct Files slot instead of retrying the same failed open."
     },
     {
       "id": "REG-SYNC-SHARED-PROVIDER-R5-001",
