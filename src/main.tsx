@@ -20,7 +20,9 @@ import "pdfjs-dist/web/pdf_viewer.css";
 import "./styles/theme.css";
 import "./lsShimInstall";
 import "./styles/app.css";
+import { installEditableEmojiPlatform } from "./editableEmoji";
 
+installEditableEmojiPlatform();
 applyTheme();
 applyAccent();
 const communityExtensionsReady = startCommunityExtensions()

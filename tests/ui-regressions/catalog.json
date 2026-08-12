@@ -2122,28 +2122,30 @@
     },
     {
       "id": "UI-EDITABLE-EMOJI-COLRV1-001",
-      "title": "Editable emoji fields avoid the unsafe WebKitGTK system COLRv1 font path",
+      "title": "Editable emoji fields use native color faces on healthy platforms while avoiding the unsafe WebKitGTK COLRv1 path",
       "family": "gpu-rendering",
       "sources": {
         "issues": [
-          76
+          76,
+          293
         ],
         "commits": [
           "7ba8d74"
         ]
       },
       "platforms": [
-        "linux"
+        "all"
       ],
       "layer": "native",
-      "status": "closed",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/editableEmojiFont.test.ts"
         ],
         "scenario": null,
         "failBefore": "proven"
-      }
+      },
+      "notes": "GH #76 requires a bundled monochrome emoji face for native editable controls on desktop Linux because WebKitGTK's system COLRv1 path can abort the render process. The first safety fix applied that fallback to every platform, making status emoji monochrome and hard to distinguish in the Windows editor (GH #293). A pre-paint user-agent boundary now keeps the safe monochrome default for desktop Linux, while Windows selects Segoe UI Emoji, Apple platforms select Apple Color Emoji, and Android selects Noto Color Emoji before the bundled fallback. Rendered non-editing surfaces deliberately remain Twemoji SVGs; native input/textarea artwork can differ slightly, but color and semantic distinctions survive. Exact Windows paint awaits reporter confirmation; source tests freeze all platform classifications and font-stack order."
     },
     {
       "id": "UI-ZOOM-COLLAPSED-ROOT-001",

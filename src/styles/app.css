@@ -23,16 +23,29 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Native text controls cannot use the Twemoji <img> renderer. Keep the bundled
-   monochrome emoji face ahead of system fallback so WebKitGTK never reaches a
-   COLRv1 font's crashing Skia path (#76), but put our bundled text face first.
+/* Native text controls cannot use the Twemoji <img> renderer. Desktop Linux
+   keeps the bundled monochrome face so WebKitGTK never reaches the crashing
+   COLRv1 Skia path (#76). Healthy native platforms use their color face first
+   and retain Noto Emoji Variable as the safe last emoji fallback (GH #293).
    Noto Emoji also contains the keycap bases #, * and 0-9; putting it first gives
    ordinary source text emoji-width advances (for example `v 0 . 5 . 0`).
    !important is deliberate: several specialized editors use `font: inherit` or
    a monospace shorthand later in this file; safety must survive those rules. */
+:root {
+  --tine-editable-emoji-font: "Noto Emoji Variable";
+}
+html[data-editable-emoji="windows"] {
+  --tine-editable-emoji-font: "Segoe UI Emoji", "Noto Emoji Variable";
+}
+html[data-editable-emoji="apple"] {
+  --tine-editable-emoji-font: "Apple Color Emoji", "Noto Emoji Variable";
+}
+html[data-editable-emoji="android"] {
+  --tine-editable-emoji-font: "Noto Color Emoji", "Noto Emoji Variable";
+}
 input:not([type="checkbox"]):not([type="radio"]),
 textarea {
-  font-family: var(--tine-editable-font, "Inter", "Noto Emoji Variable", var(--ls-font-family)) !important;
+  font-family: var(--tine-editable-font, "Inter", var(--tine-editable-emoji-font), var(--ls-font-family)) !important;
 }
 
 .formula-editor-textarea,
@@ -40,7 +53,7 @@ textarea {
   /* Keep Noto ahead of the generic family here too: a generic may resolve to
      the crashing system color font before CSS considers a later family. */
   --tine-editable-font: "MonoLisa", "Fira Code", "JetBrains Mono", Menlo, Monaco,
-    Consolas, "Courier New", "Noto Emoji Variable", monospace;
+    Consolas, "Courier New", var(--tine-editable-emoji-font), monospace;
 }
 
 #root {
