@@ -1,0 +1,617 @@
+{
+  "schemaVersion": 1,
+  "version": "0.6.94",
+  "baseTag": "v0.6.93",
+  "focusedAudit": {
+    "required": false,
+    "reason": "This is a patch release containing bounded repairs and performance work to existing Direct Files, managed-storage, editor, and platform behaviors. It adds no new subsystem or broad interaction surface, so the permanent 0.x.0 audit loop and an additional focused change-cluster audit are not required. Exact regression, corpus, native E2E, performance, and full-CI gates still apply to the frozen candidate."
+  },
+  "items": [
+    {
+      "section": "Changed",
+      "text": "**Ordinary saves under experimental managed storage do substantially less repeated work.** The hot path now reuses parser-owned commit evidence, the exact accepted editor post-state, and the preceding projection when their identities still match; ordinary projection edits are patched instead of rebuilding the page. The proofs fail closed to the complete path whenever any prerequisite is stale or absent.",
+      "userVisible": false,
+      "regressions": [],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**A paste can no longer delete text you typed while it was still in flight.** Pasting into an empty block on a page under experimental managed storage decided *before* its background work whether that block was empty enough to be replaced. If you kept typing while the paste ran, that decision was already stale and the block — with everything you had just typed in it — was removed. The decision is now made from the live block at the moment of insertion, on both storage paths. The same paste also re-checks the page's size limit against the page it is actually about to change, so an insertion the page has since outgrown is refused instead of stranded (GH #322).",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-CLIPBOARD-ADMISSION-STALENESS-322"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Experimental managed storage now stops accepting large edits as soon as its writer starts failing.** If the background writer failed repeatedly, Tine kept reporting that the graph was writable — the failure notice is only sent once, and nothing else was sent afterwards — so pastes, drops and captures were accepted onto pages nothing could save, and were lost on reload. A writer failure now withdraws that permission immediately, and only a fresh confirmation from storage itself restores it (GH #324).",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-ADMISSION-REVOKED-ON-ACTOR-FAILURE-324"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Pasting a large table into a Sheet under experimental managed storage no longer changes the page before the size is checked.** Sheet paste had its own clipboard path that skipped the size check entirely, so a big CSV or TSV filled in the cells first and the refusal only arrived at save time, leaving an edit that could not be written. Sheet paste now goes through the same prepare-then-apply route as the other Sheet commands: the cells are built off to the side, storage validates the whole resulting page, and the Sheet you are looking at changes only if that succeeds (GH #320).",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-SHEET-PASTE-ADMISSION-320"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Dropping files while you are switching a graph to experimental managed storage no longer inserts them behind the switch.** A drop decided which storage path to use the instant it started, then read the files — and enabling managed storage takes long enough (it asks you to confirm) that the drop could finish afterwards and insert under the old decision, skipping every size check the new storage requires. Both the drop and the clipboard paste now re-prove the storage route, alongside the graph and the target block, immediately before they change anything (GH #325).",
+      "userVisible": true,
+      "regressions": [
+        "REG-BULK-ROUTE-FENCE-ACROSS-AWAIT-325"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Large pastes and captures under experimental managed storage are now measured against the whole page, not just the new text.** The size check that is supposed to refuse an insertion *before* the page changes only weighed the incoming text, so adding a little to an almost-full page was accepted and then could not be saved. It also let through text that landed exactly on the limit, which the writer counts as over. Both are fixed, and the estimate is deliberately conservative in the safe direction (GH #323).",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-BULK-INSERTION-BYTE-MODEL-323"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Sheet structure commands now stay atomic when experimental managed storage must validate them first.** Row and column changes, rectangular clear/cut/paste/fill/move, edge growth, and field renaming are prepared as one detached page candidate. Direct Files still applies them synchronously; managed storage now refuses stale, oversized, unavailable, or overlapping commands before the live page, undo history, selection, or dirty state changes.",
+      "userVisible": true,
+      "regressions": [
+        "UI-SHEET-FIELD-RENAME-001",
+        "REG-MANAGED-SHEET-PASTE-ADMISSION-320"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Experimental managed-storage cross-page move recovery now resumes the exact durable move after an immediate process loss.** The actor reconstructs only an episode-authenticated immutable local manifest, completes accepted SQLite/projection/provider work exactly once, and transfers a real external-edit conflict to the existing exact feed without overwriting the external bytes or reporting deleted affected pages as successful.",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-CROSS-PAGE-MOVE-RECOVERY-001"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**A managed-storage writer that has entered a terminal failure can no longer report a clean shutdown.** Tine keeps the graph protected and reports the unsaved state instead of letting close imply that durability was proven.",
+      "userVisible": true,
+      "regressions": [
+        "REG-SYNC-SPARSE-V2-APP-AUTHORITY-001",
+        "REG-MANAGED-ADMISSION-REVOKED-ON-ACTOR-FAILURE-324"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Parseable Markdown and Org that cannot be reproduced byte-for-byte can now be opened safely under experimental managed storage.** Tine preserves the original bytes and exposes the page read-only rather than rejecting activation or rewriting syntax it does not own.",
+      "userVisible": true,
+      "regressions": [
+        "REG-WINDOWS-MANAGED-ACTIVATION-292",
+        "REG-SYNC-EXTERNAL-SOURCE-ADMISSION-001"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Repeated moves under experimental managed storage keep the same live-resolution semantics as the editor.** The durable transaction follows the accepted current position instead of replaying an obsolete positional assumption.",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-CROSS-PAGE-MOVE-RECOVERY-001"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Direct Files now rechecks page-creation authority at the final publication boundary.** A page or portable-equivalent path created externally after the initial check is detected before Tine publishes, closing the remaining race documented with GH #321 without overwriting external bytes.",
+      "userVisible": true,
+      "regressions": [
+        "REG-CAPTURE-TWO-PASS-CONCURRENCY-001",
+        "REG-DIRECT-CREATE-RETAINED-SHADOW-LIMIT-249-266"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Multiline paste inside `$$ … $$` display math stays in the same block**, matching Enter inside the same construct instead of splitting the expression into outline blocks (GH #278).",
+      "userVisible": true,
+      "regressions": [
+        "UI-EDITOR-MATH-BLOCK-ENTER-278"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Task-marker clicks, full-screen images, and native text selection now target only what they should.** Clicking a task label uses Logseq's open-state toggle without removing `DONE`; generic `custom.css` image rules no longer constrain the lightbox; and selecting page text excludes Add block and reference-section interface labels (GH #259, GH #319, GH #328).",
+      "userVisible": true,
+      "regressions": [
+        "UI-TASK-MARKER-LABEL-CLICK-259",
+        "UI-LIGHTBOX-CUSTOM-CSS-GEOMETRY-319",
+        "UI-NATIVE-SELECTION-EXCLUDES-CHROME-328"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Large graphs finish their useful startup work sooner.** Optional home-page and related scans no longer delay opening the graph and are guarded against a late result replacing newer state (GH #266).",
+      "userVisible": true,
+      "regressions": [
+        "REG-DIRECT-LARGE-GRAPH-OPEN-266"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Experimental managed storage admits very large individual pages without false memory failures or thousands of tiny recovery resumptions.** A 20,000-block page is covered by the bounded import and recovery path (GH #311).",
+      "userVisible": true,
+      "regressions": [
+        "REG-MANAGED-LARGE-PAGE-ADMISSION-311"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Moving blocks across structural boundaries now matches Logseq on Android and desktop.** Up and Down cross child-list edges correctly instead of getting stuck or landing at the wrong hierarchy level (GH #312).",
+      "userVisible": true,
+      "regressions": [
+        "REG-ANDROID-STRUCTURAL-BLOCK-MOVE-312"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Renaming a page onto an existing page now offers a complete Logseq-compatible merge.** Content, links, aliases, open panes, and storage transactions move together instead of leaving the collision unresolved (GH #327).",
+      "userVisible": true,
+      "regressions": [
+        "REG-PAGE-RENAME-COLLISION-MERGE-327"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Property autocomplete can be completed entirely from the keyboard.** Suggestions open, filter, select, and accept consistently without requiring a pointer click (GH #306).",
+      "userVisible": true,
+      "regressions": [
+        "UI-PROPERTY-AUTOCOMPLETE-KEYBOARD-LIFECYCLE-306"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Dragging into a deeply nested target zone now makes the block a child of that target**, matching Logseq rather than flattening it beside the target (GH #326).",
+      "userVisible": true,
+      "regressions": [
+        "UI-BLOCK-DRAG-NESTED-DROP-326"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Middle-click opens a background tab in the pane that was already active.** Clicking a link rendered in another pane no longer steals pane ownership before opening the tab (GH #87).",
+      "userVisible": true,
+      "regressions": [
+        "UI-SPLIT-MIDDLE-CLICK-PANE-001"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Windows update checks now use the native trust store and ask separately before installing.** A successful check no longer turns immediately into an install, and certificate environments accepted by Windows no longer fail solely because the bundled TLS roots differ (GH #241).",
+      "userVisible": true,
+      "regressions": [
+        "UI-UPDATER-FAILURE-SURFACE-241"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Editable emoji use native color faces on healthy platforms again**, while the WebKitGTK COLRv1 crash-prone path remains avoided (GH #293).",
+      "userVisible": true,
+      "regressions": [
+        "UI-EDITABLE-EMOJI-COLRV1-001"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Bundled Inter exposes its OpenType stylistic sets and character variants to `custom.css` again** (GH #298).",
+      "userVisible": true,
+      "regressions": [
+        "UI-CUSTOM-CSS-INTER-OPENTYPE-298"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**Concurrent block embeds from the same source page all hydrate.** One embed finishing no longer causes its sibling to miss the source group and remain empty (GH #315).",
+      "userVisible": true,
+      "regressions": [
+        "UI-E2E-BLOCK-EMBED-CONTENT-READINESS-315"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "This is a correctness, compatibility, safety, or performance repair to an existing documented capability; it introduces no new user workflow or setting that the Guide must teach.",
+        "refs": []
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    },
+    {
+      "section": "Fixed",
+      "text": "**A fresh second device can join an experimental managed-sync graph, or leave it for Direct Files before it has a local binding.** Provider bookkeeping files no longer obscure the canonical shared descriptor, and the recovery action no longer merely restarts the same failure. The two-device release journey now proves setup, join, edits in both directions, convergence, restart, and the escape path.",
+      "userVisible": true,
+      "regressions": [
+        "REG-SYNC-SPARSE-V2-COLD-JOIN-DISCOVERY-001",
+        "REG-SYNC-SHARED-PROVIDER-R5-001"
+      ],
+      "docs": {
+        "status": "current",
+        "reason": "Features/Managed sync already documents the setup-then-join two-device flow and the Direct Files escape; this restores that documented flow rather than changing it.",
+        "refs": [
+          "crates/tine-core/src/templates/managed-sync.md",
+          "crates/tine-core/src/templates/troubleshooting-recovery.md"
+        ]
+      },
+      "website": {
+        "status": "not-applicable",
+        "reason": "This patch restores existing product behavior and changes no claim or standalone capability on the public marketing website.",
+        "refs": []
+      },
+      "blog": {
+        "status": "not-applicable",
+        "reason": "Patch release; the human-blog synchronization is a 0.x.0 editorial gate, while the changelog and release notes carry this repair.",
+        "refs": []
+      }
+    }
+  ]
+}

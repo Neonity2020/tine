@@ -3815,7 +3815,7 @@
         "all"
       ],
       "layer": "frontend-store",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/clipboard.paste.test.ts"
@@ -3839,7 +3839,7 @@
         "all"
       ],
       "layer": "frontend-store",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/store.test.ts"
@@ -3863,7 +3863,7 @@
         "all"
       ],
       "layer": "frontend-store",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/filedrop.test.ts",
@@ -3894,7 +3894,7 @@
         "all"
       ],
       "layer": "frontend-store",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/sheet/mutations.test.ts",
@@ -3919,7 +3919,7 @@
         "all"
       ],
       "layer": "frontend-native",
-      "status": "fixing",
+      "status": "covered",
       "coverage": {
         "tests": [
           "src/managedStorageRuntime.test.ts"
@@ -3928,6 +3928,34 @@
         "failBefore": "proven"
       },
       "notes": "sparse-v2-status -- the event carrying applicationPageAdmission -- was emitted only from the watcher's success arm. The Err arm emitted only sparse-v2-error, and suppressed even that when the message repeated, so a persistently failing actor emitted NOTHING after its first error and the last managed_writable admission stayed live indefinitely. Bulk insertions then passed preflight, consumed their token, mutated the page, and had no durable writer: the content is discarded on reload or crash, and the user keeps accumulating edits behind a failure instead of being refused before the first mutation. Two halves. The frontend revokes writability the moment it sees an error, because that is the signal that arrives even when nothing else does; only an authoritative status can restore it, and a tick alone cannot. A Direct admission is left untouched. The watcher additionally asks for status on the failure path and emits it when obtainable, so recovery is decided by the authority rather than by the absence of further errors. The frontend half has a literal fail-before proof; the watcher emit is a source-level change in the tick loop, which has no unit-test seam here."
+    },
+    {
+      "id": "REG-MANAGED-CROSS-PAGE-MOVE-RECOVERY-001",
+      "title": "A managed cross-page move resolves from live editor state and resumes the exact durable move after an immediate process loss",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": [
+          "ee817086",
+          "a37519ef"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::application_cross_page_move_same_actor_resolution_is_one_observation",
+          "crates/tine-core/src/sync_runtime.rs::application_cross_page_move_fault_cuts_recover_exactly_once",
+          "crates/tine-core/src/sync_runtime.rs::application_cross_page_move_immediate_cold_cuts_never_reauthor",
+          "crates/tine-core/src/sync_runtime.rs::application_cross_page_move_scaled_work_is_one_bounded_transaction"
+        ],
+        "scenario": "managed.cross-page-move-live-and-cold-resolution",
+        "failBefore": "proven"
+      },
+      "notes": "The managed move path is one exact, bounded transaction across the source and destination pages. Same-actor resolution first settles the request from the current live editor state; once an episode is durably published, cold recovery resumes that exact episode rather than authoring a replacement. Fault-cut tests cover immediate loss, exact-once completion, external conflict transfer, identity preservation, and bounded work."
     }
   ]
 }
