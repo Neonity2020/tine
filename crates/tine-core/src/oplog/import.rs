@@ -10329,8 +10329,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             crate::outline::parse_attempts(),
-            2,
-            "Markdown admission needs the original parse and canonical reparse"
+            1,
+            "Markdown admission retains exact source bytes and reuses the original parse; non-round-tripping syntax is exposed read-only"
         );
 
         let org_path = ManagedPath::parse("pages/reused.org").unwrap();
