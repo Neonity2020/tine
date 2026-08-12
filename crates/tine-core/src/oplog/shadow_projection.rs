@@ -45,6 +45,10 @@ use super::projection::{
 #[cfg(test)]
 use super::sqlite::OpenProjection;
 use super::sqlite::VerifiedBootstrapSqliteProjection;
+use super::sync_layout::{
+    COMMIT_MARKER_FILE, COMMIT_MARKER_STAGE_FILE, MANIFEST_FILE, PROOF_FILE, PROOF_STAGE_FILE,
+    SHADOW_ROOT_DIR as SHADOW_ROOT_DIRECTORY,
+};
 use super::{
     BlobDescription, CanonicalGraphResourceId, ContentDigest, DeviceId, LineageDigest, ManagedPath,
     ManagedTextKind, PageId, ProjectionEndpointId, ProjectionIntent, ProjectionPrecondition,
@@ -66,12 +70,6 @@ use crate::model::{
 const SHADOW_PROJECTION_SCHEMA_VERSION: u32 = 2;
 const SHADOW_PROOF_SCHEMA_VERSION: u32 = 1;
 const SHADOW_COMMIT_MARKER_SCHEMA_VERSION: u32 = 1;
-const SHADOW_ROOT_DIRECTORY: &str = "inactive-shadow-projections-v1";
-const MANIFEST_FILE: &str = "manifest.bin";
-const PROOF_FILE: &str = "proof.bin";
-const PROOF_STAGE_FILE: &str = ".proof.bin.staging";
-const COMMIT_MARKER_FILE: &str = "committed.bin";
-const COMMIT_MARKER_STAGE_FILE: &str = ".committed.bin.staging";
 const MANIFEST_MAGIC: &[u8; 8] = b"TINESH1\0";
 const PROOF_MAGIC: &[u8; 8] = b"TINESP1\0";
 const COMMIT_MARKER_MAGIC: &[u8; 8] = b"TINESC1\0";

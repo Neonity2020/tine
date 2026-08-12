@@ -40,6 +40,23 @@ use uuid::Uuid;
 
 use super::object_store::{ensure_directory_nofollow, open_dir_nofollow, sync_dir_required};
 use super::page_name_index::PageNameConflictEvidenceV1;
+use super::sync_layout::{
+    PROVIDER_DEVICE_AUTHORITY_FILE as PROVIDER_DEVICE_AUTHORITY_NAME,
+    PROVIDER_PENDING_PUBLICATION_DIR as PROVIDER_PENDING_PUBLICATION_NAMESPACE,
+    SHARED_ENROLLMENT_DIR as PROVIDER_ENROLLMENT_NAMESPACE,
+    SHARED_MANIFESTS_DIR as PROVIDER_MANIFESTS_NAMESPACE,
+    SHARED_OBJECTS_DIR as PROVIDER_OBJECTS_NAMESPACE,
+    SHARED_REMOVED_DIR as PROVIDER_REMOVED_NAMESPACE,
+    SHARED_RENAME_EVIDENCE_DIR as PROVIDER_RENAME_EVIDENCE_NAMESPACE,
+    SHARED_TEMP_DIR as PROVIDER_TEMP_NAMESPACE,
+};
+pub(crate) use super::sync_layout::{
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH,
+    SHARED_FRONTIER_HEADS_DIR as SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+    SHARED_MANIFEST_RECOVERY_BLOBS_DIR as SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+    SHARED_MANIFEST_RECOVERY_LINKS_DIR as SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+    SHARED_PUBLICATION_INTENTS_DIR as SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+};
 use super::{
     AuthorBatch, BatchDisposition, BatchId, BatchInspection, CanonicalSnapshot, CrdtPeerId,
     DeviceId, DocumentId, EngineError, EngineStatus, ImmutableHomeEvidence, LineageDigest,
@@ -100,7 +117,6 @@ pub const MAX_PROVIDER_JOURNAL_BYTES: usize = MAX_PROVIDER_JOURNAL_BLOB_BYTES
     + (MAX_PROVIDER_JOURNAL_PENDING + 1) * MAX_PROVIDER_JOURNAL_RECORD_BYTES;
 const PROVIDER_JOURNAL_SCHEMA_VERSION: u32 = 1;
 const PROVIDER_AUTHORITY_SCHEMA_VERSION: u32 = 1;
-const PROVIDER_DEVICE_AUTHORITY_NAME: &str = "provider-transaction.authority";
 const MAX_PROVIDER_AUTHORITY_BYTES: usize = 1024;
 /// Version 6 makes the frozen candidate identity required. A failure capsule
 /// is a replay receipt for one exact candidate, never an environment-derived
@@ -2272,13 +2288,6 @@ impl ProviderRuntime {
     }
 }
 
-pub(crate) const SHARED_ENROLLMENT_DESCRIPTOR_PATH: &str = "enrollment/shared-enrollment-v1.json";
-pub(crate) const SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE: &str = "frontier-heads-v1";
-pub(crate) const SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE: &str = "publication-intents-v1";
-pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE: &str =
-    "manifest-recovery-links-v1";
-pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE: &str =
-    "manifest-recovery-blobs-v1";
 pub(crate) const SHARED_PROVIDER_MANIFEST_RECOVERY_FORMAT_VERSION: u32 = 1;
 pub(crate) const SHARED_PROVIDER_ACCEPTED_MANIFEST_AUDIT_FORMAT_VERSION: u32 = 1;
 const SHARED_PROVIDER_FRONTIER_HEAD_SCHEMA_VERSION: u32 = 1;
@@ -2775,7 +2784,6 @@ pub(crate) enum SharedProviderObservation {
     Complete,
 }
 
-const PROVIDER_PENDING_PUBLICATION_NAMESPACE: &str = "pending-publication-v1";
 const PROVIDER_PENDING_PUBLICATION_BYTES: usize = 64;
 
 pub(crate) struct SharedProviderObservationCursor {
@@ -9099,13 +9107,6 @@ fn valid_provider_journal_id(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
-
-const PROVIDER_OBJECTS_NAMESPACE: &str = "objects";
-const PROVIDER_MANIFESTS_NAMESPACE: &str = "manifests";
-const PROVIDER_ENROLLMENT_NAMESPACE: &str = "enrollment";
-const PROVIDER_TEMP_NAMESPACE: &str = ".part";
-const PROVIDER_REMOVED_NAMESPACE: &str = "removed";
-const PROVIDER_RENAME_EVIDENCE_NAMESPACE: &str = "rename-evidence";
 
 /// Recognized provider-owned staging siblings carry no protocol authority.
 ///

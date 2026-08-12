@@ -13,6 +13,11 @@ use super::object_store::{
     DetachedBootstrapImmutablePublisher, StoreError,
 };
 use super::scratch_store::{ScratchLsmRoot, ScratchPageKind, ScratchStore};
+use super::sync_layout::{
+    PAGE_NAME_EXACT_BLOB_SUFFIX as EXACT_NAME_BLOB_SUFFIX,
+    PAGE_NAME_EXACT_NAMES_DIR as EXACT_NAMES_DIR, PAGE_NAME_NODES_DIR as NODES_DIR,
+    PAGE_NAME_STORE_CLAIM_FILE as STORE_CLAIM_FILE,
+};
 use super::{
     BatchCausalDot, BatchId, ContentDigest, DocumentCausalDigest, DocumentDependencies, DocumentId,
     FrontierV2, LogicalPageName, PageDelta, PageId, PageNameKeyDigest, PageState,
@@ -31,13 +36,9 @@ pub const MAX_PAGE_NAME_CONFLICT_PARTICIPANTS: usize = 100_000;
 pub const MAX_PAGE_NAME_CONFLICT_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EPHEMERAL_PAGE_NAME_RECORDS: usize = 4_096;
 
-const EXACT_NAME_BLOB_SUFFIX: &str = ".exact-page-name";
 const MAX_EXACT_NAME_BLOB_BYTES: u64 = 4 * 1024 * 1024 + 1024;
 const MAX_INLINE_EXACT_NAME_BYTES: usize = 64 * 1024;
 const PAGE_NAME_INDEX_DOMAIN: &[u8] = b"tine/page-name-ownership-index/v2";
-const STORE_CLAIM_FILE: &str = "page-name-index.claim";
-const NODES_DIR: &str = "nodes";
-const EXACT_NAMES_DIR: &str = "exact-names";
 
 /// Opaque bounded page-name view extracted from one authenticated exact
 /// catalog checkpoint.

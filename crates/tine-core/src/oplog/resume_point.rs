@@ -61,12 +61,12 @@ use super::object_store::{
     ResumeAdoptionAuthority, ResumePointEndpointBinding, StoreError,
 };
 use super::scratch_store::{ScratchAuthenticatedCatalogRoot, ScratchRoots};
+use super::sync_layout::RESUME_POINT_TEMP_PREFIX as PUBLICATION_TEMP_PREFIX;
+pub(crate) use super::sync_layout::{RESUME_POINT_DIR, RESUME_POINT_SUFFIX};
 use super::{BatchId, ContentDigest, SessionId, WorkspaceId};
 
 /// Directory of published resume points, beneath one endpoint's durable
 /// engine-history control directory.
-pub(crate) const RESUME_POINT_DIR: &str = "resume-points";
-pub(crate) const RESUME_POINT_SUFFIX: &str = ".resume-point";
 /// The first lifecycle-tagged resume-point format.
 ///
 /// Schema 1 encoded only an Unsafe session. Schema 2 adds an explicit
@@ -163,7 +163,6 @@ const RESUME_POINT_SEQUENCE_DIGITS: usize = 20;
 /// primitive (`object_store::publish_immutable`). A crash between the temp
 /// write and the rename leaves exactly this shape, so it is ignored by the
 /// scan rather than treated as an unclassifiable stranger.
-const PUBLICATION_TEMP_PREFIX: &str = ".tmp-";
 
 /// Why one resume point, or one strict resume-point proof, was refused.
 ///

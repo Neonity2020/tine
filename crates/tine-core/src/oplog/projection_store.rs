@@ -26,6 +26,19 @@ use super::object_store::{
     ensure_directory_nofollow, is_temp_name, open_dir_nofollow, publish_immutable_exact,
     read_optional_regular, require_regular_entry, sync_dir_required, StoreError,
 };
+use super::sync_layout::{
+    INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
+    MUTATION_AUTHORITY_LEASE_SUFFIX, MUTATION_AUTHORITY_SUFFIX,
+    PROJECTION_ATTEMPTS_DIR as ATTEMPTS_DIR, PROJECTION_BASES_DIR as BASES_DIR,
+    PROJECTION_CLEANUP_ROUND_DIRS as PENDING_CLEANUP_ROUND_DIRS,
+    PROJECTION_CLEANUP_ROUND_STATE_FILE as PENDING_CLEANUP_ROUND_STATE,
+    PROJECTION_COMPLETIONS_DIR as COMPLETIONS_DIR, PROJECTION_FORENSICS_DIR as FORENSICS_DIR,
+    PROJECTION_INTENTS_DIR as INTENTS_DIR,
+    PROJECTION_PENDING_CLEANUP_AUTHORITY_FILE as PENDING_CLEANUP_AUTHORITY,
+    PROJECTION_PENDING_CLEANUP_DIR as PENDING_CLEANUP_DIR,
+    PROJECTION_PENDING_CLEANUP_SUFFIX as PENDING_CLEANUP_SUFFIX,
+    PROJECTION_STORE_CLAIM_FILE as STORE_CLAIM_FILE, PROJECTION_STORE_INIT_FILE as STORE_INIT_FILE,
+};
 use super::{
     BaseBlob, BlobDescription, CapabilityCapturedProjectionInput,
     CapabilityCapturedProjectionState, ContentDigest, ManagedPath, ProjectionCompletedReceipt,
@@ -38,13 +51,6 @@ use super::{
 use crate::model::ProjectionRecoveryCleanup;
 use crate::model::{Graph, ProjectionRecoveryEvidence, ProjectionWriteProof};
 
-const STORE_CLAIM_FILE: &str = "projection-receipts.claim";
-const BASES_DIR: &str = "bases";
-const INTENTS_DIR: &str = "intents";
-const COMPLETIONS_DIR: &str = "completions";
-const ATTEMPTS_DIR: &str = "attempts";
-const FORENSICS_DIR: &str = "forensics";
-const STORE_INIT_FILE: &str = "projection-receipts.init";
 const STORE_CLAIM_MAGIC: &[u8; 8] = b"TINEPR5\0";
 const PRIOR_STORE_CLAIM_MAGICS: [&[u8; 8]; 2] = [b"TINEPR4\0", b"TINEPR3\0"];
 const STORE_INIT_MAGIC: &[u8; 8] = b"TINEPI5\0";
@@ -59,11 +65,6 @@ const MAX_PROJECTION_CATALOG_DIRECTORY_ENTRIES: usize = 4_000_000;
 const LOCAL_ATTEMPT_SCHEMA_VERSION: u32 = 1;
 const LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 2;
 const PRIOR_LOCAL_FORENSIC_SCHEMA_VERSION: u32 = 1;
-const PENDING_CLEANUP_SUFFIX: &str = ".projection-cleanup";
-const PENDING_CLEANUP_DIR: &str = ".pending-cleanup";
-const PENDING_CLEANUP_AUTHORITY: &str = ".pending-cleanup.authority";
-const PENDING_CLEANUP_ROUND_STATE: &str = "round-robin.state";
-const PENDING_CLEANUP_ROUND_DIRS: [&str; 2] = ["round-0", "round-1"];
 const PENDING_CLEANUP_ROUND_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_PENDING_CLEANUP_ROUND_STATE_BYTES: u64 = 4 * 1024;
 const PENDING_CLEANUP_MARKER_SCHEMA_VERSION: u32 = 1;
@@ -72,10 +73,6 @@ pub(crate) const PROJECTION_RECOVERY_GRACE_SECONDS: u64 = 24 * 60 * 60;
 pub(crate) const MAX_PENDING_PROJECTION_CLEANUP_PER_PASS: usize = 64;
 const INTENT_NAMESPACE_SCHEMA_VERSION: u32 = 1;
 const MUTATION_AUTHORITY_SCHEMA_VERSION: u32 = 1;
-const INTENT_NAMESPACE_RESERVATION_SUFFIX: &str = ".namespace-reservation";
-const INTENT_NAMESPACE_AUTHORITY_SUFFIX: &str = ".namespace-authority";
-const MUTATION_AUTHORITY_SUFFIX: &str = ".mutation-authority";
-const MUTATION_AUTHORITY_LEASE_SUFFIX: &str = ".mutation-authority.lock";
 const MAX_MUTATION_ATTEMPTS: usize = 1_000_000;
 const MAX_MUTATION_AUTHORITY_BYTES: usize = 64 * 1024 * 1024;
 

@@ -29,6 +29,11 @@ use super::object_store::{
     control_directory_identity, open_dir_nofollow, open_file_nofollow, sync_dir_required,
     BootstrapAggregateHistoryBindingV1,
 };
+use super::sync_layout::{
+    COMMIT_MARKER_FILE, COMMIT_MARKER_STAGE_FILE, MANIFEST_FILE,
+    MIGRATION_BACKUP_ROOT_DIR as BACKUP_ROOT_DIRECTORY, MIGRATION_PAYLOAD_DIR as PAYLOAD_DIRECTORY,
+    RESTORE_PROOF_FILE, RESTORE_PROOF_STAGE_FILE,
+};
 use super::{
     BlobDescription, CanonicalGraphResourceId, ContentDigest, ManagedPath, ManagedTextKind,
     WorkspaceId, DIFF_SCHEMA_VERSION, MANAGED_ENTITY_SET_VERSION, MANIFEST_ENCODING_VERSION,
@@ -46,13 +51,6 @@ use crate::model::{
 const BACKUP_SCHEMA_VERSION: u32 = 1;
 const RESTORE_PROOF_SCHEMA_VERSION: u32 = 1;
 const COMMIT_MARKER_SCHEMA_VERSION: u32 = 1;
-const BACKUP_ROOT_DIRECTORY: &str = "migration-source-backups-v1";
-const PAYLOAD_DIRECTORY: &str = "payload";
-const MANIFEST_FILE: &str = "manifest.bin";
-const RESTORE_PROOF_FILE: &str = "restore-proof.bin";
-const RESTORE_PROOF_STAGE_FILE: &str = ".restore-proof.bin.staging";
-const COMMIT_MARKER_FILE: &str = "committed.bin";
-const COMMIT_MARKER_STAGE_FILE: &str = ".committed.bin.staging";
 const MANIFEST_MAGIC: &[u8; 8] = b"TINEMB1\0";
 const RESTORE_PROOF_MAGIC: &[u8; 8] = b"TINERP1\0";
 const COMMIT_MARKER_MAGIC: &[u8; 8] = b"TINEMC1\0";

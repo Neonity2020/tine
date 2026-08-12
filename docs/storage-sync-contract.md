@@ -1,0 +1,182 @@
+# Managed storage and sync contract
+
+This document is the implementation contract for Tine's opt-in managed-storage
+runtime. Direct Files is the default product path and selects a mutually
+exclusive `Legacy(Graph)` runtime before graph open. When Direct Files is
+selected, no code below may inspect or modify `.tine-sync`, open an oplog,
+create managed scratch state, or start managed recovery.
+
+The authoritative layout names live in
+`crates/tine-core/src/oplog/sync_layout.rs`. Code must import names from that
+module rather than introducing another literal. Format/schema constants remain
+beside their codecs; scratch and SQLite format versions come from the pinned
+`tine-storage::formats` module.
+
+## 1. On-disk layout
+
+### 1.1 Shared graph-local provider
+
+The complete graph-local managed namespace is `.tine-sync/v2/shared/`. It is
+provider transport, not the application's local database. Each device writes
+to `outbox`; a file-sync provider delivers those immutable files into another
+device's `inbox`. Tine tolerates temporary and reordered delivery and does not
+interpret the mere presence of the directory as an opt-in marker.
+
+| Relative path under `shared/` | Writer | Reader | Format | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `inbox/`, `outbox/` | transport scaffold | `SharedProviderTransport` | directories | created on explicit activation/join; retained |
+| `{inbox,outbox}/enrollment/shared-enrollment-v1.json` | initiator | cold discovery and joiner | canonical JSON descriptor v1 | immutable identity for the shared graph |
+| `{inbox,outbox}/objects/<digest>.object` | publishing device | peer ingress/replay | immutable oplog object envelope | append-only; digest-addressed |
+| `{inbox,outbox}/manifests/<batch>.manifest` | publishing device | peer ingress/replay | canonical batch manifest | append-only commit object |
+| `{inbox,outbox}/frontier-heads-v1/<device>-<digest>.head` | each device | peer discovery | canonical JSON frontier head v1 | immutable heads; newer generations supersede discovery relevance |
+| `{inbox,outbox}/publication-intents-v1/<digest>.intent` | publishing device | interrupted-publication recovery | canonical JSON intent v1 | immutable; retired only after covered publication is proven |
+| `{inbox,outbox}/manifest-recovery-links-v1/<batch>.link` | publishing device | peer recovery | canonical JSON recovery link v1 | immutable |
+| `{inbox,outbox}/manifest-recovery-blobs-v1/<digest>.manifest` | publishing device | peer recovery | exact manifest bytes | immutable; digest-addressed |
+| `{inbox,outbox}/.part/` | provider transport | provider transport | temporary publication bytes | disposable after recovery |
+| `{inbox,outbox}/removed/` | provider transport | provider cleanup/audit | retired provider items | bounded cleanup evidence |
+| `{inbox,outbox}/rename-evidence/` | provider transport | provider recovery | interrupted-rename evidence | disposable after recovery |
+
+The device-private provider journal also has `pending-publication-v1/` and
+`provider-transaction.authority`; these never sync and cannot grant shared
+graph authority.
+
+### 1.2 Device-private app data
+
+Local managed state is deliberately outside the graph. The Tauri shell derives
+a private root for the exact graph and stores the following components there.
+Only the small binding is the opt-in marker; all caches may be reconstructed
+from the immutable archive.
+
+| Path below the graph's private root | Writer | Reader | Format | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `sparse-v2/binding.json` | Tauri explicit activation/join | ordinary startup selector | canonical JSON app binding v2 | durable local opt-in; deleted on Return to Direct Files |
+| `sparse-v2-recovery/` | Tauri recovery/escape flow | Tauri recovery | renamed private component trees | temporary crash recovery |
+| `archive/lineage.claim` | object store initialization | every archive open | fixed binary claim | durable authority identity |
+| `archive/archive-instance-v1.claim` | object store initialization | archive reopen | fixed binary claim v1 | durable local archive identity |
+| `archive/objects/`, `archive/batches/` | oplog publisher/import | replay/runtime | immutable object and manifest bytes | authoritative append-only oplog |
+| `archive/bootstrap-v1/{source-inventory-indexes,source-blob-indexes,source-chunks,parts,part-spans,part-object-packs,objects,evidence,aggregates,commits}/` | bootstrap import | archive open/rebuild | versioned immutable bootstrap records | authoritative bootstrap history |
+| `archive/engine-history/{nodes,roots}/` | hot engine | hot-engine reopen | content-addressed nodes/roots | authoritative accepted history |
+| `archive/engine-history/{engine-history.claim,engine-history.head,engine-history.transition.lock}` | hot engine | hot-engine reopen | claim/head/OS lock | current local writer/accepted-frontier control |
+| `archive/engine-history/*.history-root` | hot engine | retained-history lookup | sealed root record | immutable history evidence |
+| `archive/promoted-runtime.state` | promotion/recovery | runtime open | promoted state v2 | current promoted-runtime selector |
+| `archive/{block-claim-index,logseq-uuid-claim-index-v1,portable-path-index-v1,page-name-ownership-index-v1,reference-catalog-v2,projection-work-index-v1}/` | hot engine | point lookup/materialization | content-addressed Patricia/work indexes | derived from authoritative history; rebuildable |
+| `enrollment/sparse-storage/v2/local/enrollment/{authority-v1.claim,head,lease,records/*.enrollment}` | enrollment owner | startup/open | claim v2, record v6, checkpoint v3 | local lifecycle authority; lease is OS-owned |
+| `enrollment/.../local-activation-v1.reservation` | activation | activation recovery | reservation v1 | temporary until activation resolves |
+| `receipts/{projection-receipts.claim,projection-receipts.init,bases,intents,completions,attempts,forensics}/` | projector | recovery/readiness checks | projection store v5 and versioned rows | derived receipts and diagnostics |
+| `receipts/.pending-cleanup/{round-0,round-1,round-robin.state}` and suffix authority files | receipt cleanup | receipt cleanup | bounded cleanup queue | disposable maintenance state |
+| `archive/projection-work-index-v1/{projection-work.claim,projection-work.head,*.prepared,*.work-node,*.work-root}` | projector | projection drain/recovery | work-index v11 | derived, reconstructable |
+| `archive/engine-history/resume-points/*.resume-point` | clean/unsafe handoff | promoted-runtime recovery | resume point v2 | bounded retained recovery hints |
+| `reconciliation/{scan.sqlite,scan.sqlite-wal,scan.sqlite-shm,scan.sqlite-journal}` | reconciliation | reconciliation scheduler | SQLite baseline v3 | disposable |
+| `.tine-runtime/sqlite-workspaces/sqlite-applier.lock` | SQLite applier | SQLite applier | empty OS-lock file | disposable process coordination |
+| `projection/materialization.sqlite{,-wal,-shm}` | SQLite applier | managed queries/navigation | `tine-storage` SQLite schema 15 | disposable; mismatch causes one rebuild |
+| runtime scratch (`tine-storage::formats::SCRATCH_DIR` and its marker/lease/pages/blobs) | hot engine/import | hot engine/rebuild | scratch schema 13, page schema 1 | disposable; one run only |
+| `managed-local-journal-v1/` | actor fast durability lane | drain/recovery | journal frames/segments | durable until incorporated into oplog, then reclaimable |
+| `local-authorship-v1/` | actor publication | provider repair/recovery | receipt v1 | retained until corresponding publication is proven |
+| `inactive-bootstrap-publication-v1/` and its sealed/aggregate/part spools | bootstrap authoring | bootstrap install/recovery | versioned bootstrap staging | disposable after installation |
+| `inactive-shadow-projections-v1/{manifest.bin,proof.bin,committed.bin}` | shadow verifier | activation/promotion | shadow v2/proof v1 | retained activation proof; staging siblings are disposable |
+| `migration-source-backups-v1/payload/` plus manifest/proof/commit markers | activation backup | restore/recovery | backup/proof/commit v1 | retained safety backup |
+| `bootstrap-source-capture-v1/` plus manifest, sorted inventories and `source-chunks/` | source capture | bootstrap authoring | capture v1 | scratch evidence; disposable after successful activation |
+
+Temporary prefixes (`.tmp-`, `.head-tmp-`, `.record-tmp-`,
+`.authority-tmp-`) and `.staging` files have no authority until their named
+atomic publication completes. Unknown canonical-looking files are errors;
+recognized provider temporary files mean “delivery may still be settling.”
+
+## 2. Enrollment and synchronization state machine
+
+### 2.1 Actors and authority
+
+| Actor | Owns | Never owns |
+| --- | --- | --- |
+| Tauri selector | private binding and explicit Direct/Managed choice | oplog truth, enrollment history |
+| local enrollment owner | local lifecycle record and its OS writer lease | another device's state, graph Markdown truth |
+| managed actor (`SyncRuntimeHandle`) | admitted mutations, local journal drain, archive publication, projection scheduling | authority before a validated active enrollment |
+| initiator | creation/publication of the shared descriptor; initiator enrollment transition | joiner's private state |
+| joiner | its own local archive/enrollment after validating the exact shared descriptor and provider cut | rewriting the descriptor or adopting incomplete provider bytes |
+| provider transport | durable copy/rename/retirement of exact files | semantic acceptance; directory presence is not enrollment |
+| immutable oplog/archive | managed page/journal semantic truth | assets, PDF sidecars, config/settings |
+| SQLite, scratch, projection work/receipts | acceleration, reconstruction, diagnostics | semantic truth or permission to overwrite Markdown |
+
+Authority is transferred only by a validated, durably published record while
+the current owner retains the relevant lease/capability. A path name, a newer
+mtime, a cache row, or provider arrival alone never transfers authority. Any
+operation that observes a changed generation/descriptor/frontier must restart
+from that observation instead of completing under stale authority.
+
+### 2.2 Local lifecycle
+
+1. **Direct / absent** — no private binding; startup opens Direct Files and
+   does not inspect shared bytes.
+2. **ShadowImport** — explicit activation captures source files and prepares an
+   inactive immutable bootstrap. No managed graph writer exists.
+3. **VerifiedLocal** — bootstrap, backup, shadow projection, and SQLite proof
+   agree. Authority is still inactive.
+4. **LocalActive** — promotion publishes the accepted runtime state; the actor
+   acquires enrollment/archive leases and becomes the sole managed writer.
+5. **Blocked / incompatible / corrupt / ambiguous** — typed terminal or
+   retryable evidence; no fallback writer is silently admitted.
+6. **StoppedSafe / StoppedCrashed / Terminal** — clean drain publishes a safe
+   handoff; crash recovery may resume its own unsafe state, adopt a safe
+   handoff, or take over a crashed unsafe state after validation.
+
+Activation diagnostics run in this order: source capture; bootstrap import
+preparation; immutable install; backup proof; SQLite open/build; shadow byte
+verification; promotion/authority confirmation; reconciliation baseline and
+actor open. Progress reporting is observational and never creates a timeout
+fallback.
+
+### 2.3 Sharing lifecycle
+
+1. **LocalActive → SharePrepared (initiator).** The initiator seals and
+   publishes the one shared descriptor, then records the matching local phase.
+2. **Direct/explicit join → Joining (joiner).** The joiner reads that exact
+   descriptor, observes two stable bounded provider cuts, validates every
+   required manifest/object/recovery link, and constructs its private archive.
+3. **SharePrepared/Joining → SharedActive.** Each device records its role
+   (`Initiator` or `Joiner`) in its own enrollment. The descriptor remains the
+   shared identity; local endpoint/device IDs remain local.
+4. **SharedActive operation.** A local edit is durably journaled, authored into
+   the oplog, accepted locally, projected, then published as objects → intent →
+   manifest/recovery copy → covering frontier head. Peers admit only complete,
+   validated batches and apply them in causal order.
+5. **Interrupted transfer.** Missing/temporary/reordered bytes remain pending;
+   exact immutable collisions or inconsistent stable cuts block. A retry
+   resumes from durable observations rather than inventing state.
+
+## 3. Invariants and versioning
+
+1. The threat is crash, power loss, torn write, and interrupted/reordered file
+   sync—not a malicious byte-forging actor. Content digests detect accidental
+   damage and name immutable content; they are not a security authenticator.
+   The sole `hmac::verify` call remains only for frozen legacy enrollment
+   history compatibility.
+2. The immutable oplog is the source of truth for managed page/journal content,
+   IDs, names/paths, references, and properties. Markdown is a projection when
+   managed mode is active. Assets, PDF sidecars, `config.edn`, and app settings
+   retain their separate authorities.
+3. SQLite, reconciliation databases, scratch, Patricia lookup indexes,
+   projection-work indexes, and transient receipts are disposable. Deleting or
+   version-mismatching one may cause exactly one bounded rebuild, never a second
+   rebuild on the following open. A complete rebuild must be linear in graph
+   size and finish within 10 seconds on the release corpus.
+4. Authoritative bytes are append-only or atomically replaced under an exact
+   observed-generation/lease check. A cache cannot authorize oplog mutation or
+   Markdown overwrite.
+5. Shared publication is closed: a manifest names its complete object set, and
+   a frontier head may advertise it only after all prerequisites and recovery
+   evidence are durable.
+6. A joiner must be able to reconstruct all device-private state from a
+   complete shared archive. Local app data is not synchronized and must not be
+   required from the initiator.
+7. Simulator/test code may import production wire/storage code. Production may
+   not import the `simulator` compatibility module.
+8. Direct Files remains isolated: no passive `.tine-sync` discovery, managed
+   recovery, oplog write, or managed cache work occurs without the validated
+   private binding or an explicit activation/join command.
+
+Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
+15. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
+SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates
+only that derived representation and costs one rebuild; it must not migrate or
+reinterpret authoritative oplog bytes. Authoritative format changes require an
+explicit versioned migration and cannot be treated as a cache rebuild.

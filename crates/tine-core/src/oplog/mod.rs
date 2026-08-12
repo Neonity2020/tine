@@ -70,6 +70,7 @@ pub(crate) mod shadow_projection;
 pub mod simulator;
 pub mod sqlite;
 pub mod sqlite_materialization;
+pub mod sync_layout;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;

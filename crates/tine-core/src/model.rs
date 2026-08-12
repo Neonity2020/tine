@@ -15,6 +15,14 @@ use crate::oplog::projection_store::{
     ProjectionCleanupRetirementAuthority, ProjectionMutationAuthority,
     ProjectionRecoveryEvidencePublisher, MAX_PROJECTION_EVIDENCE_BYTES,
 };
+use crate::oplog::sync_layout::{
+    BOOTSTRAP_SOURCE_CAPTURE_CHUNKS_DIR as BOOTSTRAP_SOURCE_CHUNK_DIRECTORY,
+    BOOTSTRAP_SOURCE_CAPTURE_DIR as BOOTSTRAP_SOURCE_CAPTURE_DIRECTORY,
+    BOOTSTRAP_SOURCE_CAPTURE_MANIFEST_FILE as BOOTSTRAP_SOURCE_MANIFEST,
+    BOOTSTRAP_SOURCE_CHUNKS_FILE as BOOTSTRAP_SOURCE_CHUNKS,
+    BOOTSTRAP_SOURCE_ENTRIES_FILE as BOOTSTRAP_SOURCE_ENTRIES,
+    BOOTSTRAP_SOURCE_INVENTORY_FILE as BOOTSTRAP_SOURCE_INVENTORY,
+};
 use crate::oplog::{
     managed_component_is_portable, BlobDescription, CanonicalGraphResourceId, ContentDigest,
     LocalProjectionEvidenceRecord, ManagedPath, ManagedTextKind, PortablePathKey,
@@ -25731,12 +25739,6 @@ const BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const BOOTSTRAP_SOURCE_MAX_SORT_RUNS: u64 = 4096;
 const BOOTSTRAP_SOURCE_MERGE_INPUTS: usize = 32;
 const BOOTSTRAP_SOURCE_CURSOR_BUFFER_BYTES: usize = 64 * 1024;
-const BOOTSTRAP_SOURCE_CAPTURE_DIRECTORY: &str = "bootstrap-source-capture-v1";
-const BOOTSTRAP_SOURCE_MANIFEST: &str = "capture-manifest.bin";
-const BOOTSTRAP_SOURCE_INVENTORY: &str = "inventory.sorted";
-const BOOTSTRAP_SOURCE_ENTRIES: &str = "entries.sorted";
-const BOOTSTRAP_SOURCE_CHUNKS: &str = "chunks.sorted";
-const BOOTSTRAP_SOURCE_CHUNK_DIRECTORY: &str = "source-chunks";
 
 #[cfg(test)]
 thread_local! {

@@ -48,6 +48,20 @@ use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::sqlite::{ProjectionError, WorkspaceRuntimeProof};
+#[cfg(test)]
+use super::sync_layout::BLOCK_CLAIM_INDEX_DIR;
+use super::sync_layout::{
+    ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_BOOTSTRAP_DIR as BOOTSTRAP_DIR,
+    ARCHIVE_OBJECTS_DIR as OBJECTS_DIR, BLOCK_CLAIM_INDEX_FILE, BOOTSTRAP_AGGREGATES_DIR,
+    BOOTSTRAP_COMMITS_DIR, BOOTSTRAP_EVIDENCE_DIR, BOOTSTRAP_OBJECTS_DIR, BOOTSTRAP_PARTS_DIR,
+    BOOTSTRAP_PART_PACKS_DIR, BOOTSTRAP_PART_SPANS_DIR, BOOTSTRAP_SOURCE_BLOB_DIR,
+    BOOTSTRAP_SOURCE_CHUNKS_DIR, BOOTSTRAP_SOURCE_INVENTORY_DIR, ENGINE_HISTORY_CLAIM_FILE,
+    ENGINE_HISTORY_DIR, ENGINE_HISTORY_HEAD_FILE, ENGINE_HISTORY_NODES_DIR,
+    ENGINE_HISTORY_ROOTS_DIR, ENGINE_HISTORY_ROOT_SUFFIX, ENGINE_HISTORY_TRANSITION_LOCK_FILE,
+    LINEAGE_CLAIM_FILE, LOGSEQ_CLAIM_INDEX_DIR, PAGE_NAME_OWNERSHIP_INDEX_DIR,
+    PORTABLE_PATH_INDEX_DIR, PROJECTION_WORK_DIR, PROMOTED_RUNTIME_STATE_FILE,
+    REFERENCE_CATALOG_DIR,
+};
 use super::watcher_queue::WatcherQuiescedProof;
 use super::{
     bootstrap_import::{
@@ -69,29 +83,8 @@ use super::{
 };
 use crate::model::HandoffSafe;
 
-const OBJECTS_DIR: &str = "objects";
-const BATCHES_DIR: &str = "batches";
-const BOOTSTRAP_DIR: &str = "bootstrap-v1";
-const BOOTSTRAP_SOURCE_INVENTORY_DIR: &str = "source-inventory-indexes";
-const BOOTSTRAP_SOURCE_BLOB_DIR: &str = "source-blob-indexes";
-const BOOTSTRAP_SOURCE_CHUNKS_DIR: &str = "source-chunks";
-const BOOTSTRAP_PARTS_DIR: &str = "parts";
-const BOOTSTRAP_PART_SPANS_DIR: &str = "part-spans";
-const BOOTSTRAP_PART_PACKS_DIR: &str = "part-object-packs";
-const BOOTSTRAP_OBJECTS_DIR: &str = "objects";
-const BOOTSTRAP_EVIDENCE_DIR: &str = "evidence";
-const BOOTSTRAP_AGGREGATES_DIR: &str = "aggregates";
-const BOOTSTRAP_COMMITS_DIR: &str = "commits";
 const MAX_BOOTSTRAP_PART_PACK_BYTES: u64 =
     MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART + 4 * MAX_OPERATIONS_PER_BOOTSTRAP_PART as u64;
-const LINEAGE_CLAIM_FILE: &str = "lineage.claim";
-const ENGINE_HISTORY_DIR: &str = "engine-history";
-const ENGINE_HISTORY_NODES_DIR: &str = "nodes";
-const ENGINE_HISTORY_ROOTS_DIR: &str = "roots";
-const ENGINE_HISTORY_CLAIM_FILE: &str = "engine-history.claim";
-const ENGINE_HISTORY_HEAD_FILE: &str = "engine-history.head";
-const ENGINE_HISTORY_TRANSITION_LOCK_FILE: &str = "engine-history.transition.lock";
-const ENGINE_HISTORY_ROOT_SUFFIX: &str = ".history-root";
 
 /// Retained, O(1)-memory enumeration of immutable manifest commit markers.
 ///
@@ -104,7 +97,6 @@ pub(crate) struct ObjectStoreManifestCursor {
 const ENGINE_HISTORY_ROOT_SCHEMA_VERSION: u32 = 8;
 /// Device-local promoted-runtime state, published beside the endpoint's durable
 /// engine history.
-const PROMOTED_RUNTIME_STATE_FILE: &str = "promoted-runtime.state";
 /// The first honest promoted-runtime state format. No earlier experimental
 /// bytes were ever published, and any other value is rejected rather than
 /// reinterpreted.
@@ -114,14 +106,6 @@ const MAX_ENGINE_HISTORY_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_ENGINE_HISTORY_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 const ENGINE_HISTORY_INDEX_SCHEMA_VERSION: u32 = 1;
 pub(crate) const ENGINE_HISTORY_RADIX_DEPTH: u8 = 32;
-#[cfg(test)]
-const BLOCK_CLAIM_INDEX_DIR: &str = "block-claim-index";
-const BLOCK_CLAIM_INDEX_FILE: &str = "pages.index";
-const LOGSEQ_CLAIM_INDEX_DIR: &str = "logseq-uuid-claim-index-v1";
-const PORTABLE_PATH_INDEX_DIR: &str = "portable-path-index-v1";
-const PAGE_NAME_OWNERSHIP_INDEX_DIR: &str = "page-name-ownership-index-v1";
-const REFERENCE_CATALOG_DIR: &str = "reference-catalog-v2";
-const PROJECTION_WORK_DIR: &str = "projection-work-index-v1";
 const BLOCK_CLAIM_INDEX_SCHEMA_VERSION: u32 = 1;
 const BLOCK_CLAIM_RADIX_DEPTH: u8 = 32;
 // Large replay batches touch most hash prefixes. Keeping tens of thousands of

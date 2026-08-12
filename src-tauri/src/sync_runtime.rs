@@ -11,6 +11,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tine_core::model::GraphMeta;
+use tine_core::oplog::sync_layout::{
+    PRIVATE_BINDING_DIR as SPARSE_BINDING_DIR, PRIVATE_BINDING_FILE as SPARSE_BINDING_FILE,
+    PRIVATE_RECOVERY_DIR as SPARSE_RECOVERY_DIR, PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR,
+    SHARED_ENROLLMENT_DIR, SHARED_FRONTIER_HEADS_DIR, SHARED_MANIFESTS_DIR,
+    SHARED_MANIFEST_RECOVERY_BLOBS_DIR, SHARED_MANIFEST_RECOVERY_LINKS_DIR, SHARED_OBJECTS_DIR,
+    SHARED_PUBLICATION_INTENTS_DIR, SHARED_REMOVED_DIR, SHARED_RENAME_EVIDENCE_DIR,
+    SHARED_TEMP_DIR,
+};
 use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
@@ -28,9 +36,6 @@ use tine_core::sync_runtime::{
 use uuid::Uuid;
 
 const BINDING_SCHEMA_VERSION: u32 = 2;
-const SPARSE_BINDING_DIR: &str = "sparse-v2";
-const SPARSE_BINDING_FILE: &str = "binding.json";
-const SPARSE_RECOVERY_DIR: &str = "sparse-v2-recovery";
 static BINDING_WRITE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -716,18 +721,18 @@ enum ProviderNamespaceEvidence {
     SharedOrUnknown,
 }
 
-const PROVIDER_SCAFFOLD_TREES: [&str; 2] = ["inbox", "outbox"];
+const PROVIDER_SCAFFOLD_TREES: [&str; 2] = [PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR];
 const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 10] = [
-    "objects",
-    "manifests",
-    "enrollment",
-    "frontier-heads-v1",
-    "publication-intents-v1",
-    "manifest-recovery-links-v1",
-    "manifest-recovery-blobs-v1",
-    ".part",
-    "removed",
-    "rename-evidence",
+    SHARED_OBJECTS_DIR,
+    SHARED_MANIFESTS_DIR,
+    SHARED_ENROLLMENT_DIR,
+    SHARED_FRONTIER_HEADS_DIR,
+    SHARED_PUBLICATION_INTENTS_DIR,
+    SHARED_MANIFEST_RECOVERY_LINKS_DIR,
+    SHARED_MANIFEST_RECOVERY_BLOBS_DIR,
+    SHARED_TEMP_DIR,
+    SHARED_REMOVED_DIR,
+    SHARED_RENAME_EVIDENCE_DIR,
 ];
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {

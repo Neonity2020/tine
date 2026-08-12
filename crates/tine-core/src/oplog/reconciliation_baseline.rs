@@ -8,6 +8,11 @@
 //! private, device-local application runtime root and may discard it whenever
 //! it is unavailable.
 
+use super::sync_layout::{
+    RECONCILIATION_DATABASE_FILE as DATABASE_FILE,
+    RECONCILIATION_DATABASE_SIDECARS as DATABASE_SIDECAR_FILES,
+    RECONCILIATION_DIR as RECONCILIATION_DIRECTORY,
+};
 use super::{
     object_store::{ensure_directory_nofollow, open_dir_nofollow, sync_dir_required},
     projection_work_index::DurablyPublishedProjectionCompletion,
@@ -45,10 +50,6 @@ pub(crate) const MAX_BASELINE_AGGREGATE_PATH_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_BASELINE_BLOCKED_REASON_BYTES: usize = 4096;
 const MAX_SCHEMA_OBJECTS: i64 = 32;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
-const RECONCILIATION_DIRECTORY: &str = "reconciliation";
-const DATABASE_FILE: &str = "scan.sqlite";
-const DATABASE_SIDECAR_FILES: &[&str] =
-    &["scan.sqlite-journal", "scan.sqlite-wal", "scan.sqlite-shm"];
 
 const BINDING_DDL: &str = "
 CREATE TABLE binding (
