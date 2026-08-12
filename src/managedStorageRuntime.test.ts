@@ -1,11 +1,28 @@
 import { describe, expect, it, vi } from "vitest";
 import { createManagedStorageRuntimeBridge, managedStorageRuntimeErrorMessage } from "./managedStorageRuntime";
 import type {
+  ManagedApplicationMoveSubtreesRecoveryResult,
   SparseV2RuntimeStatus,
   SparseV2RuntimeStatusEvent,
   SparseV2Status,
   SparseV2Tick,
 } from "./types";
+
+function recovery(
+  previousBinding: number,
+  binding: number,
+  episodeId = "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1",
+): ManagedApplicationMoveSubtreesRecoveryResult {
+  const status = active(binding);
+  return {
+    previous_binding_generation: previousBinding,
+    binding_generation: binding,
+    status,
+    application_page_admission: status.application_page_admission,
+    episode_id: episodeId,
+    outcome: { status: "no_commit", episode_id: episodeId, reason: "episode_not_committed" },
+  };
+}
 
 function runtime(lastTick: SparseV2Tick | null = null): SparseV2RuntimeStatus {
   return {
@@ -196,5 +213,37 @@ describe("managed-storage runtime event bridge", () => {
     bridge.bind(63, active(63).application_page_admission);
     expect(bridge.receiveRuntimeStatus(runtimeEvent(61, "active"))).toBe(false);
     expect(bridge.snapshot().applicationPageAdmission).toEqual(active(63).application_page_admission);
+  });
+
+  it("accepts a recovery handoff only behind the live episode and page-instance owner", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(71)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+    const episode = "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1";
+    bridge.bind(71, active(71).application_page_admission);
+
+    expect(bridge.transitionMoveRecovery(recovery(71, 72, episode), episode, 71, () => false)).toBe(false);
+    expect(bridge.snapshot().bindingGeneration).toBe(71);
+
+    const mismatchedAdmission = recovery(71, 72, episode);
+    mismatchedAdmission.application_page_admission = {
+      binding_generation: 72,
+      authority: "managed_unavailable",
+    };
+    expect(bridge.transitionMoveRecovery(mismatchedAdmission, episode, 71, () => true)).toBe(false);
+    expect(bridge.snapshot().bindingGeneration).toBe(71);
+
+    const handoff = recovery(71, 72, episode);
+    expect(bridge.transitionMoveRecovery(handoff, episode, 71, () => true)).toBe(true);
+    expect(bridge.snapshot().bindingGeneration).toBe(72);
+    expect(bridge.receiveRuntimeStatus(runtimeEvent(71, "active"))).toBe(false);
+    expect(bridge.transitionMoveRecovery(handoff, episode, 71, () => true)).toBe(false);
+
+    bridge.bind(73, active(73).application_page_admission);
+    expect(bridge.transitionMoveRecovery(recovery(72, 74, episode), episode, 72, () => true)).toBe(false);
+    expect(bridge.snapshot().bindingGeneration).toBe(73);
   });
 });

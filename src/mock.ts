@@ -4,7 +4,7 @@
 
 import { notifyGraphRebound } from "./modeHooks";
 import type { Backend, GpuEnv, DebugInfo, InstalledPluginRecord, PluginRegistryCacheEnvelope, ReferencedPageNames } from "./backend";
-import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
+import type { ActivationExpectedRevision, BacklinkFilterContext, BacklinkFilterTarget, BlockDto, BlockPreview, GuideCopyResult, GuidePage, Highlight, ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesRequest, ManagedApplicationMoveSubtreesResult, PageDto, PageEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, SavePageResult, SparseV2Status } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { MARKER_RE } from "./markers";
@@ -904,6 +904,31 @@ export function mockBackend(): Backend {
       return {
         binding_generation: bindingGeneration,
         application_page_admission: { binding_generation: bindingGeneration, authority: "direct" },
+        outcome: {
+          status: "no_commit",
+          episode_id: request.episode_id,
+          reason: "admission_changed",
+        },
+      };
+    },
+    async recoverManagedApplicationSubtrees(
+      bindingGeneration: number,
+      request: ManagedApplicationMoveSubtreesRequest,
+    ): Promise<ManagedApplicationMoveSubtreesRecoveryResult> {
+      const applicationPageAdmission = {
+        binding_generation: bindingGeneration,
+        authority: "managed_unavailable" as const,
+      };
+      return {
+        previous_binding_generation: bindingGeneration,
+        binding_generation: bindingGeneration,
+        status: {
+          ...sparseV2,
+          binding_generation: bindingGeneration,
+          application_page_admission: applicationPageAdmission,
+        },
+        application_page_admission: applicationPageAdmission,
+        episode_id: request.episode_id,
         outcome: {
           status: "no_commit",
           episode_id: request.episode_id,

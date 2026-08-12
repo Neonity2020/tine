@@ -380,6 +380,17 @@ export interface ManagedApplicationMoveSubtreesResult {
   outcome: ManagedApplicationMoveSubtreesOutcome;
 }
 
+/** Exact X1.5 replay observation. A successor generation is present only when
+ * the predecessor actor was already stopped and recovery reopened it. */
+export interface ManagedApplicationMoveSubtreesRecoveryResult {
+  previous_binding_generation: number;
+  binding_generation: number;
+  status: SparseV2Status;
+  application_page_admission: ApplicationPageAdmission;
+  episode_id: string;
+  outcome: ManagedApplicationMoveSubtreesOutcome;
+}
+
 export type SparseV2Status = SparseV2Availability & {
   runtime: SparseV2RuntimeStatus | null;
   can_activate: boolean;

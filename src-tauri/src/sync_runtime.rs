@@ -16,6 +16,7 @@ use tine_core::oplog::{
 };
 use tine_core::sync_runtime::{
     inspect_shared_enrollment_for_cold_discovery, SyncAmbiguousEvidence,
+    SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
     SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationProgress,
     SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
     SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
@@ -218,7 +219,7 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
     .map_err(|error| format!("Couldn't save Tine-managed storage setup: {error}"))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum SparseV2Availability {
     LegacyDefault,
@@ -439,7 +440,7 @@ fn retryable_binding(stage: &str, detail: String) -> SparseV2Binding {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2WatcherStatusDto {
     latest_enqueue: u64,
     acknowledged: u64,
@@ -451,14 +452,14 @@ pub(crate) struct SparseV2WatcherStatusDto {
     sequence_exhausted: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2TickDto {
     state: String,
     detail: Option<String>,
     epoch: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2RuntimeStatusDto {
     lifecycle: String,
     recovery: Option<String>,
@@ -474,7 +475,7 @@ pub(crate) struct SparseV2RuntimeStatusDto {
     managed_local_stage: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct SparseV2StatusDto {
     #[serde(flatten)]
     availability: SparseV2Availability,
@@ -568,6 +569,43 @@ impl SparseV2StatusDto {
             } else {
                 crate::state::ApplicationPageAdmission::managed_unavailable(binding_generation)
             },
+        }
+    }
+
+    fn from_binding_observation(
+        binding: &SparseV2Binding,
+        binding_generation: u64,
+        snapshot: SyncRuntimeStatusSnapshot,
+    ) -> Self {
+        let availability = match snapshot.lifecycle {
+            SyncRuntimeLifecycle::StoppedSafe => SparseV2Availability::Retryable {
+                stage: "local_active".into(),
+                detail: "Tine-managed storage stopped safely and needs to be reopened.".into(),
+            },
+            SyncRuntimeLifecycle::StoppedCrashed => SparseV2Availability::Retryable {
+                stage: "local_active".into(),
+                detail: "Tine-managed storage needs to be reopened after it stopped unexpectedly."
+                    .into(),
+            },
+            SyncRuntimeLifecycle::Active | SyncRuntimeLifecycle::Terminal => {
+                binding.availability().clone()
+            }
+        };
+        let can_retry = matches!(availability, SparseV2Availability::Retryable { .. });
+        let application_page_admission =
+            crate::state::ApplicationPageAdmission::from_managed_runtime_lifecycle(
+                binding_generation,
+                &snapshot.lifecycle,
+            );
+        Self {
+            availability,
+            runtime: Some(runtime_status(snapshot)),
+            can_activate: false,
+            can_retry,
+            can_cancel: false,
+            cancel_reason: None,
+            binding_generation,
+            application_page_admission,
         }
     }
 }
@@ -819,6 +857,24 @@ fn cancel_warning(binding: &SparseV2Binding, provider_namespace: &Path) -> Optio
             Err(_) => shared_or_unknown = true,
         }
     }
+    shared_or_unknown.then(|| {
+        "Managed storage may contain shared or pending provider state. Tine will archive the complete private managed-storage state before reopening this graph with Direct files. Other devices will not receive further managed-storage updates from this device.".into()
+    })
+}
+
+fn cancel_warning_for_observation(
+    binding: &SparseV2Binding,
+    provider_namespace: &Path,
+    snapshot: &SyncRuntimeStatusSnapshot,
+) -> Option<String> {
+    let provider_evidence = provider_namespace_evidence(provider_namespace)
+        .unwrap_or(ProviderNamespaceEvidence::SharedOrUnknown);
+    let shared_or_unknown = binding_names_shared_state(binding)
+        || provider_evidence == ProviderNamespaceEvidence::SharedOrUnknown
+        || snapshot.shared_role.is_some()
+        || snapshot.shared_phase.is_some()
+        || (snapshot.provider_pending != 0
+            && provider_evidence == ProviderNamespaceEvidence::SharedOrUnknown);
     shared_or_unknown.then(|| {
         "Managed storage may contain shared or pending provider state. Tine will archive the complete private managed-storage state before reopening this graph with Direct files. Other devices will not receive further managed-storage updates from this device.".into()
     })
@@ -1262,6 +1318,148 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
     // exact writer retained by the slot that will service `save_page`.
     status.application_page_admission = slot.application_page_admission();
     Ok(status)
+}
+
+fn sparse_v2_status_for_observation(
+    slot: &crate::state::GraphSlot,
+    snapshot: SyncRuntimeStatusSnapshot,
+) -> Result<SparseV2StatusDto, String> {
+    let binding = slot
+        .sparse_binding()
+        .ok_or_else(|| "managed cross-page move recovery requires managed storage".to_owned())?;
+    let cancel_reason =
+        cancel_warning_for_observation(binding, &slot.root_key.join(".tine-sync/v2"), &snapshot);
+    let mut status =
+        SparseV2StatusDto::from_binding_observation(binding, slot.binding_generation, snapshot);
+    status.can_cancel = true;
+    status.cancel_reason = cancel_reason;
+    Ok(status)
+}
+
+fn move_outcome_episode_id(outcome: &SyncApplicationMoveSubtreesOutcome) -> &str {
+    match outcome {
+        SyncApplicationMoveSubtreesOutcome::Committed { episode_id, .. }
+        | SyncApplicationMoveSubtreesOutcome::NoCommit { episode_id, .. }
+        | SyncApplicationMoveSubtreesOutcome::Deferred { episode_id, .. } => episode_id,
+    }
+}
+
+fn move_recovery_result(
+    previous_binding_generation: u64,
+    slot: &crate::state::GraphSlot,
+    expected_episode_id: &str,
+    outcome: SyncApplicationMoveSubtreesOutcome,
+    snapshot: SyncRuntimeStatusSnapshot,
+) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    if move_outcome_episode_id(&outcome) != expected_episode_id {
+        return Err("managed cross-page move recovery returned a different episode".into());
+    }
+    if snapshot.lifecycle != SyncRuntimeLifecycle::Active {
+        return Err(
+            "managed cross-page move recovery requires process reopen after a terminal runtime"
+                .into(),
+        );
+    }
+    let status = sparse_v2_status_for_observation(slot, snapshot)?;
+    let application_page_admission = status.application_page_admission.clone();
+    Ok(
+        crate::commands::ManagedApplicationMoveSubtreesRecoveryResult {
+            previous_binding_generation,
+            binding_generation: slot.binding_generation,
+            status,
+            application_page_admission,
+            episode_id: expected_episode_id.to_owned(),
+            outcome,
+        },
+    )
+}
+
+fn recover_managed_application_subtrees_with(
+    state: &crate::state::AppState,
+    label: &str,
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+    reopen: impl FnOnce(&Path) -> Result<(SparseV2Binding, tine_core::model::GraphMeta), String>,
+) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    let _transition = state.graph_load.lock().unwrap();
+    let predecessor = crate::state::slot_for_bound_window(state, label, Some(binding_generation))?;
+    let root = predecessor.root_key.clone();
+    let action = predecessor
+        .sparse_binding()
+        .ok_or_else(|| "managed cross-page move recovery requires managed storage".to_owned())?
+        .action();
+
+    match action {
+        SparseV2BindingAction::ReturnRetained => {
+            let handle = predecessor.sparse_runtime().ok_or_else(|| {
+                "managed cross-page move recovery has no retained actor".to_owned()
+            })?;
+            let observation = handle
+                .resolve_application_move_subtrees(request.clone())
+                .map_err(|error| error.to_string())?;
+            let result = move_recovery_result(
+                binding_generation,
+                &predecessor,
+                &request.episode_id,
+                observation.move_outcome,
+                observation.runtime_snapshot,
+            )?;
+            crate::state::poke_watcher(state);
+            Ok(result)
+        }
+        SparseV2BindingAction::ReopenActive => {
+            let (binding, graph_meta) = reopen(&root)?;
+            let successor = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+                binding,
+                root.clone(),
+                graph_meta,
+            ));
+            let observation = successor
+                .sparse_runtime()
+                .ok_or_else(|| {
+                    "managed cross-page move recovery could not reopen an active actor".to_owned()
+                })?
+                .resolve_application_move_subtrees(request.clone())
+                .map_err(|error| error.to_string())?;
+            let result = move_recovery_result(
+                binding_generation,
+                &successor,
+                &request.episode_id,
+                observation.move_outcome,
+                observation.runtime_snapshot,
+            )?;
+
+            state.graphs.write().unwrap().replace_if_current(
+                label,
+                binding_generation,
+                &root,
+                Arc::clone(&successor),
+            )?;
+            crate::state::poke_watcher(state);
+            Ok(result)
+        }
+        SparseV2BindingAction::ActivateOrResume => {
+            Err("managed cross-page move recovery cannot activate an incomplete runtime".into())
+        }
+    }
+}
+
+pub(crate) fn recover_managed_application_subtrees_blocking(
+    app: &tauri::AppHandle,
+    label: &str,
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+) -> Result<crate::commands::ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    let state = app.state::<crate::state::AppState>();
+    recover_managed_application_subtrees_with(&state, label, binding_generation, request, |root| {
+        let record = state
+            .sync_runtime
+            .binding_record(app, root)?
+            .ok_or_else(|| "Tine-managed storage setup is missing.".to_owned())?;
+        let graph_meta = SyncRuntimeFacade::graph_meta(&record);
+        let binding = state.sync_runtime.open_record(app, &record)?;
+        Ok((binding, graph_meta))
+    })
 }
 
 #[tauri::command]
@@ -2569,6 +2767,7 @@ mod tests {
     use std::collections::BTreeMap;
     use tine_core::model::Graph;
     use tine_core::sync_runtime::{
+        SyncApplicationMoveAdmission, SyncApplicationMovePlacement, SyncApplicationMoveRoot,
         SyncApplicationPageLoadOutcome, SyncApplicationPageLoadRequest,
         SyncApplicationPageSaveOutcome, SyncApplicationPageSaveRequest,
         SyncApplicationPageSaveTarget, SyncApplicationPageSelector, SyncEditorBlockDto,
@@ -4296,6 +4495,234 @@ mod tests {
         ));
         assert!(matches!(
             clean_shutdown_slot(&reopened_slot).unwrap(),
+            CleanShutdownSlot::Safe
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stopped_move_episode_reopens_and_replaces_one_window_writer() {
+        std::thread::Builder::new()
+            .name("tine-move-recovery-handoff-test".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(stopped_move_episode_reopens_and_replaces_one_window_writer_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn stopped_move_episode_reopens_and_replaces_one_window_writer_inner() {
+        let root =
+            std::env::temp_dir().join(format!("tine-move-recovery-handoff-{}", Uuid::new_v4()));
+        let graph_root = root.join("graph");
+        let private = root.join("private");
+        let source_path = "pages/Recovery Source.md";
+        let destination_path = "pages/Recovery Destination.md";
+        std::fs::create_dir_all(graph_root.join("pages")).unwrap();
+        std::fs::create_dir_all(graph_root.join("journals")).unwrap();
+        std::fs::write(graph_root.join(source_path), b"- source root\n").unwrap();
+        std::fs::write(graph_root.join(destination_path), b"- destination root\n").unwrap();
+
+        let meta = Graph::open(&graph_root).meta();
+        let record = SparseV2ActivationRecord::new(&graph_root, meta.clone(), DeviceId::new());
+        let activation_request = SyncLocalActivationRequest {
+            graph_root: graph_root.clone(),
+            archive_root: private.join("archive"),
+            enrollment_root: private.join("enrollment"),
+            receipt_root: private.join("receipts"),
+            database_path: private.join("projection/materialization.sqlite"),
+            application_runtime_root: private.join("runtime"),
+            migration_backup_root: private.join("migration-backup"),
+            capture_root: private.join("capture"),
+            preparation_root: private.join("preparation"),
+            provider_root: graph_root.join(".tine-sync/v2/shared"),
+            provider_journal_root: private.join("provider/device/journal"),
+            identities: SyncLocalActivationIdentities {
+                workspace_id: record.workspace_id,
+                lineage_digest: record.lineage_digest,
+                catalog_document_id: record.catalog_document_id,
+                endpoint_id: record.endpoint_id,
+                device_id: record.device_id,
+                preparation_id: record.preparation_id,
+                session_id: record.activation_session_id,
+            },
+        };
+        let open_request = SyncRuntimeOpenRequest {
+            profile: SyncStorageProfile::ExperimentalLocal,
+            graph_root: activation_request.graph_root.clone(),
+            enrollment_root: activation_request.enrollment_root.clone(),
+            archive_root: activation_request.archive_root.clone(),
+            receipt_root: activation_request.receipt_root.clone(),
+            database_path: activation_request.database_path.clone(),
+            application_runtime_root: activation_request.application_runtime_root.clone(),
+            migration_backup_root: activation_request.migration_backup_root.clone(),
+            provider_root: activation_request.provider_root.clone(),
+            provider_journal_root: activation_request.provider_journal_root.clone(),
+        };
+
+        let activated = SyncRuntimeHandle::activate_or_resume_local(activation_request);
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let predecessor = Arc::new(crate::state::GraphSlot::from_sparse_v2(
+            SparseV2Binding::from_activation(activated),
+            graph_root.clone(),
+            meta.clone(),
+        ));
+        let state = crate::state::AppState {
+            graphs: std::sync::RwLock::new(crate::state::GraphRegistry::default()),
+            graph_load: Mutex::new(()),
+            watch_ctl: Mutex::new(None),
+            last_focused: Mutex::new(None),
+            capture_graph: Mutex::new(None),
+            startup_recovery: Mutex::new(std::collections::HashMap::new()),
+            sync_runtime: SyncRuntimeFacade,
+            #[cfg(desktop)]
+            next_window: std::sync::atomic::AtomicU64::new(1),
+        };
+        state
+            .graphs
+            .write()
+            .unwrap()
+            .bind("main".into(), Arc::clone(&predecessor))
+            .unwrap();
+        let handle = predecessor.sparse_runtime().unwrap();
+        for _ in 0..128 {
+            let status = handle.status().unwrap();
+            if !status.watcher.pending && status.provider_pending == 0 {
+                break;
+            }
+            handle.tick().unwrap();
+        }
+        let source = match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: source_path.into(),
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("source page did not load: {other:?}"),
+        };
+        let destination = match handle
+            .load_application_page(SyncApplicationPageLoadRequest {
+                page: SyncApplicationPageSelector::ExactPath {
+                    path: destination_path.into(),
+                },
+            })
+            .unwrap()
+        {
+            SyncApplicationPageLoadOutcome::Loaded { page, revision } => (page, revision),
+            other => panic!("destination page did not load: {other:?}"),
+        };
+        let request = SyncApplicationMoveSubtreesRequest {
+            episode_id: Uuid::new_v4().to_string(),
+            source_path: source.0.path.clone(),
+            source_revision: source.1,
+            destination_path: destination.0.path.clone(),
+            destination_revision: destination.1,
+            roots: vec![SyncApplicationMoveRoot {
+                identity: source.0.blocks[0].id.clone(),
+                raw_rewrite: None,
+            }],
+            placement: SyncApplicationMovePlacement::Root { position: 0 },
+            admission: SyncApplicationMoveAdmission {
+                application_save_page_blocks: tine_core::sync_runtime::MAX_SYNC_EDITOR_BLOCKS,
+                application_page_request_text_bytes:
+                    tine_core::sync_runtime::MAX_SYNC_EDITOR_REQUEST_BYTES,
+                application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
+            },
+        };
+        let committed = handle
+            .resolve_application_move_subtrees(request.clone())
+            .unwrap();
+        assert!(matches!(
+            committed.move_outcome,
+            SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ));
+        assert!(matches!(
+            clean_shutdown_slot(&predecessor).unwrap(),
+            CleanShutdownSlot::Safe
+        ));
+        assert_eq!(
+            predecessor.sparse_binding().unwrap().action(),
+            SparseV2BindingAction::ReopenActive
+        );
+        let previous_generation = predecessor.binding_generation;
+
+        let failed = recover_managed_application_subtrees_with(
+            &state,
+            "main",
+            previous_generation,
+            request.clone(),
+            |_| Err("pre-publication reopen failure".into()),
+        );
+        assert_eq!(failed.unwrap_err(), "pre-publication reopen failure");
+        assert_eq!(
+            state
+                .graphs
+                .read()
+                .unwrap()
+                .slot("main")
+                .unwrap()
+                .binding_generation,
+            previous_generation
+        );
+
+        let result = recover_managed_application_subtrees_with(
+            &state,
+            "main",
+            previous_generation,
+            request.clone(),
+            |_| {
+                let opened = SyncRuntimeHandle::open(open_request.clone());
+                assert_eq!(opened.status, SyncRuntimeOpenStatus::Active);
+                Ok((SparseV2Binding::from_open(opened), meta.clone()))
+            },
+        )
+        .unwrap();
+        assert_eq!(result.previous_binding_generation, previous_generation);
+        assert_ne!(result.binding_generation, previous_generation);
+        assert_eq!(result.episode_id, request.episode_id);
+        assert_eq!(
+            result.application_page_admission.binding_generation,
+            result.binding_generation
+        );
+        assert_eq!(
+            result.status.application_page_admission,
+            result.application_page_admission
+        );
+        let result_generation = result.binding_generation;
+        match result.outcome {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                recovered: true,
+                source,
+                destination,
+                ..
+            } => {
+                assert!(source.page.blocks.is_empty());
+                assert_eq!(destination.page.blocks.len(), 2);
+            }
+            other => panic!("reopened episode did not resolve: {other:?}"),
+        }
+        let current = state.graphs.read().unwrap().slot("main").unwrap();
+        assert_eq!(current.binding_generation, result_generation);
+        assert_eq!(
+            predecessor
+                .sparse_runtime()
+                .unwrap()
+                .status()
+                .unwrap()
+                .lifecycle,
+            SyncRuntimeLifecycle::StoppedSafe
+        );
+        let duplicate = SyncRuntimeHandle::open(open_request);
+        assert!(matches!(
+            duplicate.status,
+            SyncRuntimeOpenStatus::OpenRefused { .. }
+        ));
+        assert!(duplicate.handle.is_none());
+        assert!(matches!(
+            clean_shutdown_slot(&current).unwrap(),
             CleanShutdownSlot::Safe
         ));
         let _ = std::fs::remove_dir_all(root);

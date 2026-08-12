@@ -33,12 +33,27 @@ pub(crate) struct ManagedApplicationMoveSubtreesResult {
     pub(crate) outcome: SyncApplicationMoveSubtreesOutcome,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ManagedApplicationMoveSubtreesRecoveryResult {
+    pub(crate) previous_binding_generation: u64,
+    pub(crate) binding_generation: u64,
+    pub(crate) status: crate::sync_runtime::SparseV2StatusDto,
+    pub(crate) application_page_admission: crate::state::ApplicationPageAdmission,
+    pub(crate) episode_id: String,
+    pub(crate) outcome: SyncApplicationMoveSubtreesOutcome,
+}
+
 #[cfg(test)]
 mod managed_application_move_wire_tests {
-    use super::ManagedApplicationMoveSubtreesResult;
+    use super::{
+        ManagedApplicationMoveSubtreesRecoveryResult, ManagedApplicationMoveSubtreesResult,
+    };
     use crate::state::{ApplicationPageAdmission, ApplicationPageAdmissionAuthority};
     use tine_core::model::{Format, PageDto, PageKind};
-    use tine_core::sync_runtime::{SyncApplicationMoveSubtreesOutcome, SyncApplicationMovedPage};
+    use tine_core::sync_runtime::{
+        SyncApplicationMoveConflict, SyncApplicationMoveSubtreesOutcome, SyncApplicationMovedPage,
+        SyncEditorDeferred, SyncLocalMutationPhase,
+    };
 
     #[test]
     fn bounded_tauri_move_result_json_round_trips() {
@@ -57,18 +72,18 @@ mod managed_application_move_wire_tests {
         };
         let source = page("Source");
         let destination = page("Destination");
-        let result = ManagedApplicationMoveSubtreesResult {
+        let episode_id = "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1";
+        let admission = ApplicationPageAdmission {
             binding_generation: 17,
-            application_page_admission: ApplicationPageAdmission {
-                binding_generation: 17,
-                authority: ApplicationPageAdmissionAuthority::ManagedWritable {
-                    application_save_page_blocks: 511,
-                    application_page_request_text_bytes: 1_048_576,
-                    application_page_max_depth: 128,
-                },
+            authority: ApplicationPageAdmissionAuthority::ManagedWritable {
+                application_save_page_blocks: 511,
+                application_page_request_text_bytes: 1_048_576,
+                application_page_max_depth: 128,
             },
-            outcome: SyncApplicationMoveSubtreesOutcome::Committed {
-                episode_id: "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a1".into(),
+        };
+        let outcomes = vec![
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id: episode_id.into(),
                 batch_id: "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a2".into(),
                 recovered: true,
                 source: SyncApplicationMovedPage {
@@ -80,14 +95,103 @@ mod managed_application_move_wire_tests {
                     revision: "destination-revision".into(),
                 },
             },
-        };
-        let bytes = serde_json::to_vec(&result).unwrap();
-        assert!(bytes.len() < 16 * 1024);
-        let decoded: ManagedApplicationMoveSubtreesResult = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            serde_json::to_value(decoded).unwrap(),
-            serde_json::to_value(result).unwrap()
-        );
+            SyncApplicationMoveSubtreesOutcome::NoCommit {
+                episode_id: episode_id.into(),
+                reason: SyncApplicationMoveConflict::EpisodeNotCommitted,
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::RetryableExternalWork,
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::RetryableRetainedPublication {
+                    batch_id: "019d2e53-3cf0-7a31-a19b-1bdf47b7d3a3".into(),
+                    phase: SyncLocalMutationPhase::ArchiveStage,
+                },
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::BlockedRecovery {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::ProjectionDrain,
+                    retained_publication: true,
+                },
+            },
+            SyncApplicationMoveSubtreesOutcome::Deferred {
+                episode_id: episode_id.into(),
+                state: SyncEditorDeferred::Revoked {
+                    batch_id: None,
+                    phase: SyncLocalMutationPhase::Bindings,
+                },
+            },
+        ];
+        let status: crate::sync_runtime::SparseV2StatusDto =
+            serde_json::from_value(serde_json::json!({
+                "state": "active",
+                "runtime": {
+                    "lifecycle": "active",
+                    "recovery": "adopted_safe_handoff",
+                    "watcher": {
+                        "latest_enqueue": 0,
+                        "acknowledged": 0,
+                        "drain_in_flight": false,
+                        "pending": false,
+                        "pending_requires_full_scan": false,
+                        "deferred": false,
+                        "quiescing": false,
+                        "sequence_exhausted": false
+                    },
+                    "last_tick": null,
+                    "detail": null,
+                    "shared_role": null,
+                    "shared_phase": null,
+                    "provider_pending": 0,
+                    "managed_local_pending": 0,
+                    "managed_local_checkpointed_sequence": 0,
+                    "managed_local_next_sequence": 0,
+                    "managed_local_stage": null
+                },
+                "can_activate": false,
+                "can_retry": false,
+                "can_cancel": true,
+                "cancel_reason": null,
+                "binding_generation": 17,
+                "application_page_admission": serde_json::to_value(&admission).unwrap()
+            }))
+            .unwrap();
+
+        for outcome in outcomes {
+            let result = ManagedApplicationMoveSubtreesResult {
+                binding_generation: 17,
+                application_page_admission: admission.clone(),
+                outcome: outcome.clone(),
+            };
+            let bytes = serde_json::to_vec(&result).unwrap();
+            assert!(bytes.len() < 16 * 1024);
+            let decoded: ManagedApplicationMoveSubtreesResult =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(result).unwrap()
+            );
+
+            let recovery = ManagedApplicationMoveSubtreesRecoveryResult {
+                previous_binding_generation: 16,
+                binding_generation: 17,
+                status: status.clone(),
+                application_page_admission: admission.clone(),
+                episode_id: episode_id.into(),
+                outcome,
+            };
+            let bytes = serde_json::to_vec(&recovery).unwrap();
+            let decoded: ManagedApplicationMoveSubtreesRecoveryResult =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(recovery).unwrap()
+            );
+        }
     }
 }
 
@@ -1190,6 +1294,31 @@ pub(crate) async fn move_managed_application_subtrees(
         };
         crate::state::poke_watcher(&state);
         Ok(result)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// X1.5 recovery handoff for one exact, already-issued managed move episode.
+/// The helper owns graph lifecycle serialization and may replace only an
+/// already-stopped retained actor with one recovered successor.
+#[tauri::command]
+pub(crate) async fn recover_managed_application_subtrees(
+    binding_generation: u64,
+    request: SyncApplicationMoveSubtreesRequest,
+    state: GraphContext<'_>,
+) -> Result<ManagedApplicationMoveSubtreesRecoveryResult, String> {
+    let (app, label, context_generation) = owned_graph_context(state)?;
+    if context_generation != binding_generation {
+        return Err("managed cross-page move recovery belongs to a stale graph binding".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::sync_runtime::recover_managed_application_subtrees_blocking(
+            &app,
+            &label,
+            binding_generation,
+            request,
+        )
     })
     .await
     .map_err(|error| error.to_string())?

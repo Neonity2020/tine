@@ -503,6 +503,34 @@ impl GraphRegistry {
         Ok(())
     }
 
+    /// Publish one prepared successor only while the exact predecessor is
+    /// still installed for this window and canonical root. All overlap checks
+    /// happen before `bind` mutates either registry index, making this the one
+    /// final linearization point for managed-runtime recovery handoff.
+    pub(crate) fn replace_if_current(
+        &mut self,
+        window: &str,
+        expected_generation: u64,
+        expected_root: &Path,
+        successor: Arc<GraphSlot>,
+    ) -> Result<(), String> {
+        let current = self
+            .by_window
+            .get(window)
+            .ok_or_else(|| "stale-graph-binding".to_owned())?;
+        if current.binding_generation != expected_generation || current.root_key != expected_root {
+            return Err("stale-graph-binding".into());
+        }
+        if successor.root_key != expected_root
+            || successor.binding_generation == expected_generation
+        {
+            return Err(
+                "managed recovery successor does not replace the expected graph binding".into(),
+            );
+        }
+        self.bind(window.to_owned(), successor)
+    }
+
     pub(crate) fn remove(&mut self, window: &str) -> Option<Arc<GraphSlot>> {
         let slot = self.by_window.remove(window)?;
         slot.background_cancelled
@@ -1196,6 +1224,33 @@ mod tests {
         registry.bind("main".into(), graph(&base)).unwrap();
         assert!(registry.bind("graph-1".into(), graph(&base)).is_err());
         assert!(registry.slot("graph-1").is_none());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn registry_stale_replacement_preserves_the_newer_slot() {
+        let base = std::env::temp_dir().join(format!("tine-registry-cas-{}", uuid::Uuid::new_v4()));
+        let mut registry = GraphRegistry::default();
+        let predecessor = graph(&base);
+        let expected_generation = predecessor.binding_generation;
+        registry.bind("main".into(), predecessor).unwrap();
+
+        let competitor = graph(&base);
+        registry
+            .bind("main".into(), Arc::clone(&competitor))
+            .unwrap();
+        let stale_successor = graph(&base);
+        assert_eq!(
+            registry
+                .replace_if_current("main", expected_generation, &base, stale_successor)
+                .unwrap_err(),
+            "stale-graph-binding"
+        );
+        assert_eq!(
+            registry.slot("main").unwrap().binding_generation,
+            competitor.binding_generation
+        );
+        assert_eq!(registry.owner(&base).as_deref(), Some("main"));
         let _ = std::fs::remove_dir_all(base);
     }
 

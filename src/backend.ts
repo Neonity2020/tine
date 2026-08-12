@@ -7,6 +7,7 @@ import type {
   ActivationExpectedRevision,
   ActivationIntent,
   ApplicationPageAdmission,
+  ManagedApplicationMoveSubtreesRecoveryResult,
   ManagedApplicationMoveSubtreesRequest,
   ManagedApplicationMoveSubtreesResult,
   AdvancedQueryResult,
@@ -282,6 +283,11 @@ export interface Backend {
     bindingGeneration: number,
     request: ManagedApplicationMoveSubtreesRequest,
   ): Promise<ManagedApplicationMoveSubtreesResult>;
+  /** Resolve one exact deferred move episode without routing a new gesture. */
+  recoverManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ): Promise<ManagedApplicationMoveSubtreesRecoveryResult>;
   sparseV2Status(): Promise<SparseV2Status>;
   onSparseV2Status(cb: (event: SparseV2RuntimeStatusEvent) => void): Promise<() => void>;
   onSparseV2Tick(cb: (event: SparseV2TickEvent) => void): Promise<() => void>;
@@ -846,6 +852,15 @@ class TauriBackend implements Backend {
       bindingGeneration,
       request,
     });
+  }
+  recoverManagedApplicationSubtrees(
+    bindingGeneration: number,
+    request: ManagedApplicationMoveSubtreesRequest,
+  ) {
+    return this.call<ManagedApplicationMoveSubtreesRecoveryResult>(
+      "recover_managed_application_subtrees",
+      { bindingGeneration, request },
+    );
   }
   sparseV2Status() {
     return this.call<SparseV2Status>("sparse_v2_status");

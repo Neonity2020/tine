@@ -2,6 +2,7 @@ import { createSignal, type Accessor } from "solid-js";
 import { backend, type Backend } from "./backend";
 import type {
   ApplicationPageAdmission,
+  ManagedApplicationMoveSubtreesRecoveryResult,
   SparseV2ErrorEvent,
   SparseV2RuntimeStatus,
   SparseV2RuntimeStatusEvent,
@@ -39,6 +40,14 @@ const initialSnapshot = (): ManagedStorageRuntimeSnapshot => ({
 
 function isFailureTick(tick: SparseV2Tick): boolean {
   return ["recovery_blocked", "blocked", "terminal", "failed"].includes(tick.state);
+}
+
+function admissionsAgree(left: ApplicationPageAdmission, right: ApplicationPageAdmission): boolean {
+  if (left.binding_generation !== right.binding_generation || left.authority !== right.authority) return false;
+  if (left.authority !== "managed_writable" || right.authority !== "managed_writable") return true;
+  return left.application_save_page_blocks === right.application_save_page_blocks
+    && left.application_page_request_text_bytes === right.application_page_request_text_bytes
+    && left.application_page_max_depth === right.application_page_max_depth;
 }
 
 /**
@@ -95,6 +104,23 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
       error: null,
     });
     return true;
+  };
+
+  /** X2 supplies the synchronous busy-token/graph/page-instance ownership
+   * check. This bridge adds no episode state machine; it only validates the
+   * native handoff envelope immediately before the existing atomic transition. */
+  const transitionMoveRecovery = (
+    result: ManagedApplicationMoveSubtreesRecoveryResult,
+    expectedEpisodeId: string,
+    expectedPreviousBinding: number,
+    ownsRecovery: () => boolean,
+  ): boolean => {
+    if (!ownsRecovery()) return false;
+    if (result.previous_binding_generation !== expectedPreviousBinding) return false;
+    if (result.episode_id !== expectedEpisodeId || result.outcome.episode_id !== expectedEpisodeId) return false;
+    if (result.binding_generation !== result.status.binding_generation) return false;
+    if (!admissionsAgree(result.application_page_admission, result.status.application_page_admission)) return false;
+    return transitionTo(result.status, expectedPreviousBinding);
   };
 
   const receiveRuntimeStatus = (event: SparseV2RuntimeStatusEvent): boolean => {
@@ -171,6 +197,7 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
     bind,
     clear,
     transitionTo,
+    transitionMoveRecovery,
     receiveStatus,
     receiveRuntimeStatus,
     receiveTick,
