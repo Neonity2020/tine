@@ -450,7 +450,7 @@ assert.equal(yamlScalar(androidTestJava, "uses", 8), "actions/setup-java@v4");
 assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "distribution", 10), "temurin");
 assert.equal(yamlScalar(yamlBlock(androidTestJava, "with", 8), "java-version", 10), '"17"');
 const androidTestNode = yamlNamedStep(androidTestApk, "Set up Node 20");
-assert.equal(yamlScalar(androidTestNode, "uses", 8), "actions/setup-node@v4");
+assert.equal(yamlScalar(androidTestNode, "uses", 8), "actions/setup-node@v5");
 assert.equal(yamlScalar(yamlBlock(androidTestNode, "with", 8), "node-version", 10), "20");
 const androidTestRust = yamlNamedStep(androidTestApk, "Set up Rust 1.96.0");
 assert.equal(yamlScalar(androidTestRust, "uses", 8), "dtolnay/rust-toolchain@1.96.0");
