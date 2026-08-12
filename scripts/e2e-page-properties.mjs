@@ -208,6 +208,7 @@ async function pageArrowDownCapsule(phase) {
     const active = document.activeElement;
     return {
       phase: failurePhase,
+      documentHasFocus: document.hasFocus(),
       preKey: window.__tinePageArrowDownPreKey ?? null,
       keyWitness: window.__tinePageArrowDownKeyWitness ?? null,
       active: {
@@ -228,6 +229,7 @@ async function preparePageHeaderArrowDown(expectedValue) {
     }
     const active = document.activeElement;
     const preKey = {
+      documentHasFocus: document.hasFocus(),
       isPageHeader: active === header,
       value: active instanceof HTMLTextAreaElement ? active.value : null,
       selection: active instanceof HTMLTextAreaElement ? [active.selectionStart, active.selectionEnd] : null,
@@ -268,6 +270,77 @@ async function preparePageHeaderArrowDown(expectedValue) {
     }, { capture: true, once: true });
     return preKey;
   }, expectedValue);
+}
+
+async function pageHeaderArrowDownReachedBody() {
+  return browser.execute(() => {
+    const active = document.activeElement;
+    return active instanceof HTMLTextAreaElement
+      && active.closest(".page-blocks") !== null
+      && active.classList.contains("block-editor")
+      && active.value === "Example content block";
+  });
+}
+
+function deliveredExpectedArrowDown(capsule, expectedValue) {
+  const witness = capsule?.keyWitness;
+  return witness?.key === "ArrowDown"
+    && witness.target?.value === expectedValue
+    && Object.values(witness.flags ?? {}).every((flag) => flag === false || flag === true)
+    && !witness.flags?.shift
+    && !witness.flags?.ctrl
+    && !witness.flags?.alt
+    && !witness.flags?.meta
+    && !witness.flags?.repeat
+    && !witness.flags?.composing;
+}
+
+async function drivePageHeaderArrowDown(expectedValue) {
+  const attempts = [];
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    // JS focus alone can produce an activeElement inside a background WebView.
+    // A real WebDriver pointer click first transfers native focus to the app;
+    // preparePageHeaderArrowDown then restores the semantic end-of-header caret.
+    const header = await browser.$(".page-blocks textarea.block-editor");
+    await header.click();
+    const preKey = await preparePageHeaderArrowDown(expectedValue);
+    if (
+      !preKey.documentHasFocus
+      || !preKey.isPageHeader
+      || preKey.value !== expectedValue
+      || preKey.selection?.[0] !== expectedValue.length
+      || preKey.selection?.[1] !== expectedValue.length
+    ) {
+      attempts.push(await pageArrowDownCapsule(`readiness-${attempt}`));
+      await sleep(75);
+      continue;
+    }
+
+    await nativeArrowDown();
+    const deadline = Date.now() + 1_250;
+    let capsule;
+    while (Date.now() < deadline) {
+      if (await pageHeaderArrowDownReachedBody()) return;
+      capsule = await pageArrowDownCapsule(`post-key-${attempt}`);
+      if (capsule.keyWitness) break;
+      await sleep(25);
+    }
+    // Once the expected unmodified ArrowDown has reached the expected header,
+    // give reactive focus handoff the remainder of the bounded observation turn.
+    if (deliveredExpectedArrowDown(capsule, expectedValue)) {
+      while (Date.now() < deadline) {
+        if (await pageHeaderArrowDownReachedBody()) return;
+        await sleep(25);
+      }
+      throw new Error(`PAGE_HEADER_ARROWDOWN_DELIVERED_BUT_IGNORED ${JSON.stringify(await pageArrowDownCapsule(`delivered-${attempt}`))}`);
+    }
+    attempts.push(capsule ?? await pageArrowDownCapsule(`undelivered-${attempt}`));
+    await sleep(75);
+  }
+  // The release runner may retry this isolated scenario once. Do not retry a
+  // delivered semantic failure: only this explicit no-delivery/readiness token
+  // is classified as hosted native-input infrastructure.
+  throw new Error(`E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown ${JSON.stringify(attempts)}`);
 }
 
 async function replaceHeaderLikeUser(editor, replacement, selection = null) {
@@ -419,29 +492,7 @@ try {
   if ((await headerEditor.getValue()) !== editedHeader) {
     throw new Error(`native page-header replacement did not preserve the intended value: ${JSON.stringify({ replacementTrace, actual: await headerEditor.getValue() })}`);
   }
-  const arrowDownPreKey = await preparePageHeaderArrowDown(editedHeader);
-  if (
-    !arrowDownPreKey.isPageHeader
-    || arrowDownPreKey.value !== editedHeader
-    || arrowDownPreKey.selection?.[0] !== editedHeader.length
-    || arrowDownPreKey.selection?.[1] !== editedHeader.length
-  ) {
-    throw new Error(JSON.stringify(await pageArrowDownCapsule("pre-key")));
-  }
-  try {
-    await nativeArrowDown();
-    await browser.waitUntil(() => browser.execute(() => {
-      const active = document.activeElement;
-      return active instanceof HTMLTextAreaElement
-        && active.closest(".page-blocks") !== null
-        && active.classList.contains("block-editor")
-        && active.value === "Example content block";
-    }), {
-      timeout: 5_000,
-    });
-  } catch {
-    throw new Error(JSON.stringify(await pageArrowDownCapsule("post-key")));
-  }
+  await drivePageHeaderArrowDown(editedHeader);
   await browser.execute(() => {
     const editor = document.querySelector(".page-blocks textarea.block-editor");
     editor?.focus();

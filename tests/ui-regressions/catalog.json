@@ -6627,6 +6627,27 @@
         "failBefore": "proven"
       },
       "notes": "The custom CSS property itself reached the computed style correctly; the bundled @fontsource/inter per-script static subsets lacked ss02 and every other Inter stylistic set. Tine now ships the audited full upstream Inter 4.1 variable faces under the same public Inter family name, preserving existing themes and user CSS while restoring ss01-ss08 and cv01-cv14. The regression pins both upstream font hashes and verifies the public family and variable-weight declarations; the production build separately proves Vite emits both faces."
+    },
+    {
+      "id": "UI-E2E-PAGE-HEADER-ARROWDOWN-READINESS-330",
+      "title": "The release E2E distinguishes undelivered native ArrowDown input from broken page-header traversal",
+      "family": "e2e-harness",
+      "sources": {
+        "issues": [330],
+        "commits": []
+      },
+      "platforms": ["linux", "windows"],
+      "layer": "native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "scripts/e2e-page-properties.mjs",
+          "scripts/test-release-pipeline.mjs"
+        ],
+        "scenario": "e2e.page-header-arrow-down-delivery-readiness",
+        "failBefore": "proven"
+      },
+      "notes": "Release run 31569006329 observed no keydown witness despite the expected header activeElement; the unchanged candidate passed the rerun and six focused repetitions. The journey now uses a real pointer action to transfer native focus, proves document focus/editor/caret readiness, and retries locally only when no key witness arrives. The suite runner may retry that isolated scenario once on the explicit E2E_NATIVE_INPUT_UNDELIVERED receipt. An unmodified ArrowDown witnessed on the expected header but failing to enter the first body block remains an immediate blocking product failure."
     }
   ]
 }

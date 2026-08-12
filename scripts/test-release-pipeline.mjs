@@ -755,6 +755,26 @@ assert.equal(
   false,
   "arbitrary Quick Capture assertion failures must not be retried"
 );
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "page-properties",
+    "E2E_NATIVE_INPUT_UNDELIVERED page-properties ArrowDown []",
+    "",
+    false
+  ),
+  true,
+  "a proven-ready page-properties WebView that receives no key event is not retried"
+);
+assert.equal(
+  isRetryableNativeHarnessFailure(
+    "page-properties",
+    "PAGE_HEADER_ARROWDOWN_DELIVERED_BUT_IGNORED {}",
+    "",
+    false
+  ),
+  false,
+  "a delivered but ignored page-header ArrowDown must remain a product failure"
+);
 assert.match(
   printSecurity,
   /const driverArgs = webdriverServerArgs\([\s\S]*?DRIVER_PORT,[\s\S]*?NATIVE_PORT,[\s\S]*?WEBKIT_DRIVER/,
