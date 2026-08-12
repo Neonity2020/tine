@@ -5902,7 +5902,8 @@
       "family": "editor/slash",
       "sources": {
         "issues": [
-          225
+          225,
+          238
         ],
         "commits": []
       },
@@ -5919,7 +5920,7 @@
         "scenario": "editor.slash-task-set-marker",
         "failBefore": "proven"
       },
-      "notes": "Task rows used to be literal insertions. They now clear the slash trigger and call the shared setMarker primitive like OG, covering every supported marker, plain and already-task blocks, multiline/property content, priority placement, Markdown/Org, one commit, and end-of-block caret placement."
+      "notes": "Task rows used to be literal insertions. They now clear the slash trigger and call the shared setMarker primitive like OG, covering every supported marker, plain and already-task blocks, multiline/property content, priority placement, Markdown/Org, one commit, and end-of-block caret placement. GH #238 was filed after this repair reached master but before its first release; the same test proves its /later, /now and /todo-at-end report post-fixed without a second implementation."
     },
     {
       "id": "UI-NAMESPACE-REFERENCE-ONLY-DESCENDANTS-229",
