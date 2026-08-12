@@ -356,7 +356,13 @@ fn inspect_unclaimed_sparse_archive(
     match inspect_shared(&shared) {
         Ok(true) => Ok(ColdSparseArchive::Joinable),
         Ok(false) => Ok(ColdSparseArchive::Partial),
-        Err(_) => Ok(ColdSparseArchive::Refused),
+        // Preserve a local filesystem/validation failure.  Collapsing this to
+        // Refused (and then to a generic recovery message) previously made a
+        // legitimate Android shared-storage incompatibility look exactly like
+        // provider bytes that were still arriving.
+        Err(error) => Err(format!(
+            "Couldn't validate Tine-managed sync data on this device: {error}"
+        )),
     }
 }
 
@@ -1213,7 +1219,7 @@ mod tests {
         );
         assert_eq!(
             refuse_unclaimed_sparse_archive_with(&dir, |_| Err("malformed".into())).unwrap_err(),
-            REFUSAL
+            "Couldn't validate Tine-managed sync data on this device: malformed"
         );
 
         #[cfg(unix)]

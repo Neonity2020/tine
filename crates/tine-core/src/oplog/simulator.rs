@@ -9185,7 +9185,7 @@ fn open_provider_directory(parent: &Dir, name: &str) -> Result<Dir, ScenarioErro
     Ok(directory)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 fn validate_provider_directory_owner(directory: &Dir, name: &str) -> Result<(), ScenarioError> {
     let metadata = directory
         .try_clone()
@@ -9200,7 +9200,12 @@ fn validate_provider_directory_owner(directory: &Dir, name: &str) -> Result<(), 
     Ok(())
 }
 
-#[cfg(not(unix))]
+// Android's shared-storage layer does not promise that stat(2)'s uid is the
+// application uid.  Access is authorized by Android's scoped-storage/SAF
+// boundary instead, so the desktop Unix owner check rejects legitimate graph
+// directories there.  We still retain capability-relative, no-follow opens and
+// regular-file validation below.
+#[cfg(any(not(unix), target_os = "android"))]
 fn validate_provider_directory_owner(_directory: &Dir, _name: &str) -> Result<(), ScenarioError> {
     Ok(())
 }
@@ -9337,10 +9342,11 @@ fn validate_provider_regular_file_with_link_count(
         .metadata()
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
     // SAFETY: geteuid has no preconditions.
-    if !metadata.is_file()
-        || (require_single_link && metadata.nlink() != 1)
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
+    #[cfg(not(target_os = "android"))]
+    let wrong_owner = metadata.uid() != unsafe { libc::geteuid() };
+    #[cfg(target_os = "android")]
+    let wrong_owner = false;
+    if !metadata.is_file() || (require_single_link && metadata.nlink() != 1) || wrong_owner {
         return Err(ScenarioError::UnsafeProviderEntry(path.into()));
     }
     Ok(metadata)

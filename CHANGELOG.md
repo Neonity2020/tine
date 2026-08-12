@@ -63,7 +63,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Concurrent block embeds from the same source page all hydrate.** One embed finishing no longer causes its sibling to miss the source group and remain empty (GH #315).
 
-- **A fresh second device can join an experimental managed-sync graph, or leave it for Direct Files before it has a local binding.** Provider bookkeeping files no longer obscure the canonical shared descriptor, and the recovery action no longer merely restarts the same failure. The two-device release journey now proves setup, join, edits in both directions, convergence, restart, and the escape path.
+- **A fresh second device can join an experimental managed-sync graph, including from Android shared storage, or leave it for Direct Files before it has a local binding.** Provider bookkeeping files no longer obscure the canonical shared descriptor; Android no longer applies a desktop Unix owner-ID rule that its shared-storage layer does not promise; and local filesystem failures are no longer mislabeled as sync data that is still arriving. The two-device release journey proves setup, join, edits in both directions, convergence, restart, and the escape path, while the signed Android candidate compiles the platform-specific storage path.
 
 ## [0.6.93] - 2026-08-12
 

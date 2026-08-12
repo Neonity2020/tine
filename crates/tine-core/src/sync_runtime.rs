@@ -1392,12 +1392,21 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
     // filesystem sync is settling (temporary files, conflict copies, or newer
     // append-only namespaces), so cold discovery must not require the
     // enrollment directory to contain literally one entry.
-    inspect_shared_provider_descriptor(provider_root)
-        .map_err(display)?
-        .map(|bytes| SharedEnrollmentDescriptorV1::decode(&bytes).map_err(display))
-        .transpose()?
-        .map(SyncSharedEnrollmentDescriptor::from_core)
-        .transpose()
+    let Some(bytes) = inspect_shared_provider_descriptor(provider_root).map_err(display)? else {
+        return Ok(None);
+    };
+    // File-sync providers may expose the canonical filename before its final
+    // bytes arrive.  Only decoding/record-validation failures are therefore a
+    // retryable partial arrival.  Filesystem validation failures are local
+    // platform errors and must remain visible to the caller instead of being
+    // mislabeled as an unfinished sync.
+    let Ok(descriptor) = SharedEnrollmentDescriptorV1::decode(&bytes) else {
+        return Ok(None);
+    };
+    match SyncSharedEnrollmentDescriptor::from_core(descriptor) {
+        Ok(descriptor) => Ok(Some(descriptor)),
+        Err(_) => Ok(None),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -40543,8 +40552,10 @@ mod tests {
         .unwrap();
 
         fs::write(&canonical, b"{").unwrap();
-        assert!(
-            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err()
+        assert_eq!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).unwrap(),
+            None,
+            "a canonical filename may become visible before its final descriptor bytes"
         );
         fs::write(&canonical, &descriptor.encoded).unwrap();
 
@@ -40559,10 +40570,20 @@ mod tests {
         .expect("shared descriptor schema field");
         *schema = serde_json::Value::from(u64::MAX);
         fs::write(&canonical, serde_json::to_vec(&unsupported).unwrap()).unwrap();
-        assert!(
-            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err()
+        assert_eq!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).unwrap(),
+            None,
+            "an incomplete or unsupported descriptor remains retryable while provider delivery settles"
         );
         fs::write(&canonical, &descriptor.encoded).unwrap();
+
+        let extra_link = enrollment.join("descriptor-hard-link");
+        fs::hard_link(&canonical, &extra_link).unwrap();
+        assert!(
+            inspect_shared_enrollment_for_cold_discovery(&fixture.request.provider_root).is_err(),
+            "local filesystem validation errors must not be mislabeled as partial provider delivery"
+        );
+        fs::remove_file(extra_link).unwrap();
 
         #[cfg(unix)]
         {
