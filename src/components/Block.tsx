@@ -3304,7 +3304,12 @@ export function Editor(props: { id: string }): JSX.Element {
       return;
     }
     const start = ref.selectionStart;
-    const syntaxSensitive = sheetCell || isCalc() || caretInFence(ref.value, start) || caretOnOpeningFence(ref.value, start);
+    const syntaxSensitive =
+      sheetCell ||
+      isCalc() ||
+      caretInFence(ref.value, start) ||
+      caretOnOpeningFence(ref.value, start) ||
+      caretInDisplayMath(ref.value, start);
     const slot = peekClipboardSlot();
     if (!syntaxSensitive) {
       if (slot && text !== "" && normalize(text) === normalize(slot.text)) {

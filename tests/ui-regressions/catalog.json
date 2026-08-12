@@ -6266,7 +6266,7 @@
     },
     {
       "id": "UI-EDITOR-MATH-BLOCK-ENTER-278",
-      "title": "Enter inside a multi-line $$ \u2026 $$ environment keeps the block together instead of splitting it",
+      "title": "Enter and multiline paste inside a $$ \u2026 $$ environment keep the block together instead of splitting it",
       "family": "editor-enter",
       "sources": {
         "issues": [
@@ -6280,15 +6280,16 @@
         "macos"
       ],
       "layer": "render",
-      "status": "released",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/Block.mathBlockEnter.test.tsx"
+          "src/components/Block.mathBlockEnter.test.tsx",
+          "src/components/Block.multilinePaste.test.tsx"
         ],
         "scenario": "editor.enter-inside-display-math-stays-in-block",
         "failBefore": "proven"
       },
-      "notes": "DELIBERATE DIVERGENCE FROM OG, approved by Martin 2026-08-09. OG's Enter dwim (frontend/util/thingatpt.cljs admonition&src-at-point) recognises only ``` and #+BEGIN_, so OG also splits the bullet and breaks the environment; the reporter is asking for an improvement, not restored parity. Scope is the editor's Enter decision only (src/editor/fences.ts caretInDisplayMath): the parser, the on-disk bytes and property classification are untouched. Necessity gate proven \u2014 the new tests fail on the pre-fix tree."
+      "notes": "DELIBERATE DIVERGENCE FROM OG, approved by Martin 2026-08-09. OG's Enter dwim (frontend/util/thingatpt.cljs admonition&src-at-point) recognises only ``` and #+BEGIN_, so OG also splits the bullet and breaks the environment; the reporter is asking for an improvement, not restored parity. The v0.6.92 Enter fix was too narrow: the reporter's post-release follow-up proved that pasting LaTeX containing a blank line into the same environment still segmented it into outline blocks. The shared syntax-sensitive editor decision now uses caretInDisplayMath for paste as well as Enter, including selection replacement; ordinary blank-line prose still segments normally. The parser, on-disk bytes and property classification remain untouched. Necessity gate proven: the exact reporter paste tests fail before the paste predicate is widened."
     },
     {
       "id": "UI-NAV-REVEAL-COLLAPSED-BLOCK-258",
