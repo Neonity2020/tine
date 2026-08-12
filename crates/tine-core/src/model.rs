@@ -36765,6 +36765,104 @@ mod tests {
         (graph_a, graph_b)
     }
 
+    /// Poll mode publishes an exact empty set when a complete scan observes no
+    /// changes. That must advance the exact feed without poisoning or rebuilding
+    /// an already-live identity index.
+    #[test]
+    fn quiet_external_observation_keeps_guarded_identity_warm() {
+        let dir = scratch("guarded-identity-quiet-observation");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        guarded_test_prime_identity(&graph);
+        let before = graph.guarded_graph_text_identity_report();
+
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), false)
+            .unwrap();
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert!(!after.invalidated, "{after:?}");
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(after.exact_updates, before.exact_updates + 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An exact watcher observation updates the retained semantic owner without
+    /// rebuilding the complete index.
+    #[test]
+    fn exact_external_observation_updates_guarded_identity() {
+        let dir = scratch("guarded-identity-exact-observation");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        guarded_test_prime_identity(&graph);
+        let before = graph.guarded_graph_text_identity_report();
+
+        let external = dir.join("Root note.md");
+        fs::write(&external, b"title:: Root note\n\n- external\n").unwrap();
+        graph
+            .observe_graph_text_external_paths(std::iter::once(external.as_path()), false)
+            .unwrap();
+
+        let after = graph.guarded_graph_text_identity_report();
+        assert!(!after.invalidated, "{after:?}");
+        assert_eq!(after.complete_builds, before.complete_builds);
+        assert_eq!(after.exact_updates, before.exact_updates + 1);
+        let _identity = graph.lock_graph_text_identity_mutation().unwrap();
+        let index = graph.guarded_graph_text_identity_index().unwrap();
+        assert!(index
+            .paths_by_semantic_key
+            .contains_key(&(0, crate::refs::page_key("Root note"))));
+        assert_eq!(
+            graph.guarded_graph_text_identity_report().complete_builds,
+            before.complete_builds
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An incomplete poll scan cannot publish an exact final state. Its
+    /// uncertainty invalidates the retained generation so no later write trusts
+    /// partial evidence.
+    #[test]
+    fn uncertain_external_observation_invalidates_guarded_identity() {
+        let dir = scratch("guarded-identity-uncertain-observation");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        guarded_test_prime_identity(&graph);
+        assert!(!graph.guarded_graph_text_identity_report().invalidated);
+
+        graph
+            .observe_graph_text_external_paths(std::iter::empty::<&Path>(), true)
+            .unwrap();
+
+        assert!(graph.guarded_graph_text_identity_report().invalidated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Watcher routing is resource scoped: observing graph A must not mutate a
+    /// separate graph B's retained identity generation.
+    #[test]
+    fn external_observation_isolated_between_graph_resources() {
+        let dir_a = scratch("guarded-identity-resource-a");
+        let dir_b = scratch("guarded-identity-resource-b");
+        fs::write(dir_a.join("pages/Anchor.md"), b"- anchor A\n").unwrap();
+        fs::write(dir_b.join("pages/Anchor.md"), b"- anchor B\n").unwrap();
+        let graph_a = Graph::open(&dir_a);
+        let graph_b = Graph::open(&dir_b);
+        guarded_test_prime_identity(&graph_a);
+        guarded_test_prime_identity(&graph_b);
+        let before_b = graph_b.guarded_graph_text_identity_report();
+
+        let external_a = dir_a.join("Observed.md");
+        fs::write(&external_a, b"- observed A\n").unwrap();
+        graph_a
+            .observe_graph_text_external_paths(std::iter::once(external_a.as_path()), false)
+            .unwrap();
+
+        assert_eq!(graph_b.guarded_graph_text_identity_report(), before_b);
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
     fn copy_tree(source: &Path, destination: &Path) {
         fs::create_dir_all(destination).unwrap();
         for entry in fs::read_dir(source).unwrap() {

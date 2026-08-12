@@ -540,11 +540,22 @@ fn publish_poll_observation(
     snap: &HashMap<PathBuf, FileStamp>,
     snapshot: &GraphTextSnapshot,
 ) {
-    let changed = changed_since_snapshot(snap, &snapshot.files);
-    let _ = graph.observe_graph_text_external_paths(
-        changed.iter().map(PathBuf::as_path),
+    let (changed, uncertain) = poll_observation(snap, snapshot);
+    let _ =
+        graph.observe_graph_text_external_paths(changed.iter().map(PathBuf::as_path), uncertain);
+}
+
+/// Reduce a poll scan to the literal observation published to `tine-core`.
+/// Keeping this calculation pure lets the watcher crate prove its routing
+/// contract without requiring access to the core's private retained index.
+fn poll_observation(
+    snap: &HashMap<PathBuf, FileStamp>,
+    snapshot: &GraphTextSnapshot,
+) -> (Vec<PathBuf>, bool) {
+    (
+        changed_since_snapshot(snap, &snapshot.files),
         !snapshot.complete,
-    );
+    )
 }
 
 fn reconcile_pending(
@@ -1818,28 +1829,9 @@ mod tests {
         }
     }
 
-    /// Warm the parsed page cache and leave one ordinary save behind.
-    ///
-    /// It no longer leaves the guarded admission index BUILT, and cannot. When
-    /// these tests were written an existing-page save built that index;
-    /// `tine-core` now pins the opposite on purpose
-    /// (`steady_state_direct_saves_never_build_the_graph_index`), because making
-    /// an ordinary Direct save stop walking the whole graph was the point of
-    /// that work. Page creation does not build it either — verified, not
-    /// assumed. `Graph::guarded_graph_text_identity_index` is private to
-    /// `tine-core` and the only public surface here,
-    /// `guarded_graph_text_identity_report`, is read-only, so from THIS crate
-    /// there is no way to reach a live index at all.
-    ///
-    /// That is why the five tests below carry `#[ignore]` rather than a repair:
-    /// with a cold index every one of their assertions is unreachable, not
-    /// merely wrong. `update_guarded_graph_text_identity_paths` returns early
-    /// while `invalidated || index.is_none()`, so `exact_updates` can never
-    /// rise; and "a quiet poll must not invalidate" is vacuous when the index
-    /// starts invalidated. See GH #331 — the recommendation there is to move
-    /// these journeys into `tine-core`, next to the tests that already build the
-    /// index directly, rather than to add public surface for a test's benefit.
-    fn warm_guarded_identity(graph: &Graph) {
+    /// Warm the parsed page cache and exercise one ordinary Direct save. This
+    /// deliberately does not build the core's optional complete identity index.
+    fn warm_direct_graph(graph: &Graph) {
         warm_cache(graph);
         let mut anchor = graph.load_by_path("pages/Anchor.md").unwrap().unwrap();
         anchor.blocks[0].raw = "warm guarded identity".to_owned();
@@ -1848,69 +1840,38 @@ mod tests {
             .expect("warm guarded identity save");
     }
 
-    /// F2, poll half. A poll-mode cycle used to invalidate the whole guarded
-    /// admission index unconditionally, so a user on NFS/SMB could never hold a
-    /// warm index: every save rebuilt it from the entire graph, every time.
+    /// A quiet poll must publish an exact empty observation rather than an
+    /// uncertain one. Whether that preserves a live guarded index belongs to
+    /// `tine-core` and is tested beside the private index builder there.
     #[test]
-    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
-    fn quiet_poll_cycles_keep_the_admission_index_warm() {
+    fn quiet_poll_cycles_publish_an_exact_empty_observation() {
         let tg = TempGraph::new("poll-warm");
         tg.write("pages/Anchor.md", "- anchor\n");
         tg.write("Root note.md", "- root\n");
         let graph = Graph::open(&tg.root);
-        warm_guarded_identity(&graph);
-
-        let before = graph.guarded_graph_text_identity_report();
-        assert!(
-            !before.invalidated && before.complete_builds >= 1,
-            "the save should have left a live index: {before:?}"
-        );
-
-        let mut snap = collect_graph_text_files(&graph).files;
+        let snap = collect_graph_text_files(&graph).files;
         for _ in 0..3 {
-            reconcile_pending(&graph, &mut snap, &HashSet::new(), true, true);
+            let current = collect_graph_text_files(&graph);
+            let (changed, uncertain) = poll_observation(&snap, &current);
+            assert!(changed.is_empty());
+            assert!(!uncertain);
         }
-
-        let after = graph.guarded_graph_text_identity_report();
-        assert!(
-            !after.invalidated,
-            "a poll cycle that found nothing must not invalidate the index: {after:?}"
-        );
-        assert_eq!(
-            after.complete_builds, before.complete_builds,
-            "a poll cycle must not force the next save to rebuild the whole graph"
-        );
     }
 
-    /// The other half of the same policy: a poll cycle that DID observe an
-    /// external change must publish it, or the index would still claim a page
-    /// exists after it was deleted.
+    /// The other half of the same policy: a poll cycle that did observe an
+    /// external change must publish its exact path. Applying that path to a
+    /// live guarded index is tested inside `tine-core`.
     #[test]
-    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
-    fn a_poll_cycle_publishes_what_it_actually_observed() {
+    fn a_poll_cycle_reports_what_it_actually_observed() {
         let tg = TempGraph::new("poll-observe");
         tg.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&tg.root);
-        warm_guarded_identity(&graph);
-        let before = graph.guarded_graph_text_identity_report();
-
-        // An external creation the poll cycle is about to find.
+        let snap = collect_graph_text_files(&graph).files;
         tg.write("Root note.md", "title:: Root note\n\n- external\n");
-        let mut snap = collect_graph_text_files(&graph).files;
-        snap.remove(&tg.path("Root note.md"));
-        reconcile_pending(&graph, &mut snap, &HashSet::new(), true, true);
-
-        let after = graph.guarded_graph_text_identity_report();
-        assert!(
-            !after.invalidated,
-            "an exactly-observed change must not fall back to invalidation: {after:?}"
-        );
-        assert!(
-            after.exact_updates > before.exact_updates,
-            "the observed path must reach the index as an exact update: {after:?}"
-        );
-        // And the index now owns that name, so a colliding create is refused.
-        assert_new_page_refused(&graph, "Root note");
+        let current = collect_graph_text_files(&graph);
+        let (changed, uncertain) = poll_observation(&snap, &current);
+        assert!(!uncertain);
+        assert_eq!(changed, vec![tg.path("Root note.md")]);
     }
 
     /// The fallback half. If the rescan could not read part of the graph, what
@@ -1918,22 +1879,16 @@ mod tests {
     /// invalidated rather than exactly updated -- otherwise a save would trust
     /// an index that is missing whatever lives behind the unreadable directory.
     #[test]
-    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
-    fn an_incomplete_poll_scan_invalidates_instead_of_publishing() {
+    fn an_incomplete_poll_scan_publishes_uncertainty() {
         let tg = TempGraph::new("poll-incomplete");
         tg.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&tg.root);
-        warm_guarded_identity(&graph);
-        assert!(!graph.guarded_graph_text_identity_report().invalidated);
-
-        let mut complete = collect_graph_text_files(&graph);
-        complete.complete = false;
-        publish_poll_observation(&graph, &complete.files.clone(), &complete);
-
-        assert!(
-            graph.guarded_graph_text_identity_report().invalidated,
-            "a scan that could not read the whole graph must not leave the index trusted"
-        );
+        let snap = collect_graph_text_files(&graph).files;
+        let mut incomplete = collect_graph_text_files(&graph);
+        incomplete.complete = false;
+        let (changed, uncertain) = poll_observation(&snap, &incomplete);
+        assert!(changed.is_empty());
+        assert!(uncertain);
     }
 
     /// The same thing end to end, where the walk itself decides. Root ignores
@@ -1981,7 +1936,7 @@ mod tests {
             let graph_dir = TempGraph::new(&format!("root-text-{extension}"));
             graph_dir.write("pages/Anchor.md", "- anchor\n");
             let graph = Graph::open(&graph_dir.root);
-            warm_guarded_identity(&graph);
+            warm_direct_graph(&graph);
 
             let created_rel = format!("nonstandard/deep/Physical Name.{extension}");
             graph_dir.write(
@@ -2065,7 +2020,7 @@ mod tests {
             graph_dir.write("pages/Anchor.md", "- anchor\n");
             let observer = Graph::open(&graph_dir.root);
             let guarded = Graph::open(&graph_dir.root);
-            warm_guarded_identity(&guarded);
+            warm_direct_graph(&guarded);
             graph_dir.write(
                 "nonstandard/deep/Physical.md",
                 &format!("title:: Epoch {case}\n\n- external\n"),
@@ -2136,7 +2091,7 @@ mod tests {
         let graph_dir = TempGraph::new("windows-any-kinds");
         graph_dir.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&graph_dir.root);
-        warm_guarded_identity(&graph);
+        warm_direct_graph(&graph);
 
         graph_dir.write("pages/External.md", "- external\n");
         let path = graph_dir.path("pages/External.md");
@@ -2190,8 +2145,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
-    fn legacy_graph_root_observation_excludes_other_open_graphs() {
+    fn legacy_graph_root_observation_routes_only_to_the_owning_graph() {
         use notify::event::{CreateKind, EventKind};
 
         let graph_a_dir = TempGraph::new("root-owner-a");
@@ -2200,7 +2154,6 @@ mod tests {
         graph_b_dir.write("pages/Anchor.md", "- anchor B\n");
         let graph_a = Graph::open(&graph_a_dir.root);
         let graph_b = Graph::open(&graph_b_dir.root);
-        warm_guarded_identity(&graph_b);
 
         graph_b_dir.write(
             "nonstandard/deep/Stale.md",
@@ -2216,26 +2169,25 @@ mod tests {
             &graph_a_dir.root,
             Some(&event_a),
         ));
+        let graph_b_observation =
+            legacy_graph_text_observation(&graph_b, &graph_b_dir.root, Some(&event_a));
+        assert!(!graph_b_observation.relevant);
+        assert!(!graph_b_observation.uncertain);
+        assert!(graph_b_observation.exact_paths.is_empty());
         assert!(!observe_legacy_graph_text_event(
             &graph_b,
             &graph_b_dir.root,
             Some(&event_a),
         ));
-        graph_b
-            .save_page(&new_page("Must Stay Stale"), None)
-            .expect("an event owned by graph A must not invalidate graph B");
     }
 
     #[test]
-    #[ignore = "GH #331: needs a live guarded admission index, which no operation reachable from this crate can build; see warm_guarded_identity"]
-    fn excluded_private_text_and_exact_non_text_events_are_harmless() {
+    fn excluded_private_text_and_exact_non_text_events_are_not_published() {
         use notify::event::{CreateKind, EventKind};
 
         let graph_dir = TempGraph::new("excluded-private");
         graph_dir.write("pages/Anchor.md", "- anchor\n");
         let graph = Graph::open(&graph_dir.root);
-        warm_guarded_identity(&graph);
-
         for (relative, claimed) in [
             (".tine-sync/private/Sync.md", "Excluded Sync"),
             ("assets/private/Asset.org", "Excluded Asset"),
@@ -2251,10 +2203,11 @@ mod tests {
             assert!(observation.relevant, "{relative}");
             assert!(!observation.uncertain, "{relative}");
             assert!(observation.exact_paths.is_empty(), "{relative}");
-            observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&event));
-            graph
-                .save_page(&new_page(claimed), None)
-                .expect("excluded text must not become a retained graph-text owner");
+            assert!(observe_legacy_graph_text_event(
+                &graph,
+                &graph_dir.root,
+                Some(&event)
+            ));
         }
 
         graph_dir.write(
@@ -2269,10 +2222,11 @@ mod tests {
         let observation = legacy_graph_text_observation(&graph, &graph_dir.root, Some(&non_text));
         assert!(!observation.uncertain);
         assert!(observation.exact_paths.is_empty());
-        observe_legacy_graph_text_event(&graph, &graph_dir.root, Some(&non_text));
-        graph
-            .save_page(&new_page("Exact Non Text Is Harmless"), None)
-            .expect("an exact non-text event must not invalidate retained identity");
+        assert!(observe_legacy_graph_text_event(
+            &graph,
+            &graph_dir.root,
+            Some(&non_text)
+        ));
 
         for relative in [".tine-sync", "assets", "logseq/bak", ".hidden"] {
             let private_directory = event(
