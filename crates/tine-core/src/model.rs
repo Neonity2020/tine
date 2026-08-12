@@ -20265,6 +20265,44 @@ impl Graph {
         exact_target: &[u8],
         append: impl FnOnce() -> Result<A, E>,
     ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
+        self.commit_existing_page_with_journal_inner(
+            page,
+            base_rev,
+            expected_base,
+            exact_target,
+            None,
+            append,
+        )
+    }
+
+    pub(crate) fn commit_existing_page_with_journal_evidence<A, E>(
+        &self,
+        page: &PageDto,
+        base_rev: &str,
+        expected_base: &[u8],
+        exact_target: &[u8],
+        evidence: Option<&crate::oplog::trusted_local_commit::TrustedLocalResponseEvidence>,
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
+        self.commit_existing_page_with_journal_inner(
+            page,
+            base_rev,
+            expected_base,
+            exact_target,
+            evidence,
+            append,
+        )
+    }
+
+    fn commit_existing_page_with_journal_inner<A, E>(
+        &self,
+        page: &PageDto,
+        base_rev: &str,
+        expected_base: &[u8],
+        exact_target: &[u8],
+        evidence: Option<&crate::oplog::trusted_local_commit::TrustedLocalResponseEvidence>,
+        append: impl FnOnce() -> Result<A, E>,
+    ) -> Result<JournalPageProjectionOutcome<A>, JournalPageCommitError<E>> {
         #[cfg(test)]
         let validation_started = std::time::Instant::now();
         if page.guide {
@@ -20297,6 +20335,7 @@ impl Graph {
                 base_rev,
                 expected_base,
                 exact_target,
+                evidence,
                 path,
                 cache,
             )
@@ -20505,6 +20544,7 @@ impl Graph {
         base_rev: &str,
         expected_base: &[u8],
         exact_target: &[u8],
+        evidence: Option<&crate::oplog::trusted_local_commit::TrustedLocalResponseEvidence>,
         path: PathBuf,
         cache: bool,
     ) -> io::Result<VerifiedJournalPageProjection<'a>> {
@@ -20526,6 +20566,10 @@ impl Graph {
                 "unchanged existing pages do not require a journal projection",
             ));
         }
+        let target_revision = content_rev(exact_target);
+        let trusted_semantics = evidence.is_some_and(|evidence| {
+            evidence.validates_projection(page, base_rev, &target_revision)
+        });
 
         let validation =
             self.validate_graph_text_target(write, &path, Some((page.kind, &page.name)))?;
@@ -20554,25 +20598,27 @@ impl Graph {
             ));
         }
         let managed_path = ManagedPath::parse(self.rel_path(&path)).map_err(|_| bad_path())?;
-        let parsed_base =
-            self.parse_external_document(&managed_path, expected_base.as_bytes(), false)?;
-        let parsed_target =
-            self.parse_external_document(&managed_path, exact_target.as_bytes(), false)?;
-        #[cfg(test)]
-        JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| {
-            pairs.set(pairs.get().saturating_add(1));
-        });
-        let resolved_target =
-            parsed_target.resolve_identity(Some(AcceptedExternalDocumentIdentity {
-                name: &page.name,
-                kind: page.kind,
-                explicit_title: parsed_base.explicit_title.as_deref(),
-            }));
-        if resolved_target.name != page.name || resolved_target.kind != page.kind {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "journal projection target does not preserve its accepted semantic identity",
-            ));
+        if !trusted_semantics {
+            let parsed_base =
+                self.parse_external_document(&managed_path, expected_base.as_bytes(), false)?;
+            let parsed_target =
+                self.parse_external_document(&managed_path, exact_target.as_bytes(), false)?;
+            #[cfg(test)]
+            JOURNAL_PROJECTION_GUARDED_PARSE_PAIRS.with(|pairs| {
+                pairs.set(pairs.get().saturating_add(1));
+            });
+            let resolved_target =
+                parsed_target.resolve_identity(Some(AcceptedExternalDocumentIdentity {
+                    name: &page.name,
+                    kind: page.kind,
+                    explicit_title: parsed_base.explicit_title.as_deref(),
+                }));
+            if resolved_target.name != page.name || resolved_target.kind != page.kind {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "journal projection target does not preserve its accepted semantic identity",
+                ));
+            }
         }
         if loaded.content != expected_base
             || loaded.revision != base_rev
@@ -20595,15 +20641,18 @@ impl Graph {
             ));
         }
 
-        let (_, serialized) = self.serialize_page_dto_for_path(page, &path, Some(expected_base))?;
-        let exact_target_matches_guarded_page = serialized == exact_target
-            || (Format::from_path(&path) == Format::Md
-                && guarded_markdown_documents_match(&serialized, exact_target));
-        if !exact_target_matches_guarded_page {
-            return Err(projection_semantic_refusal(
-                io::ErrorKind::InvalidData,
-                "journal target differs from strict guarded page serialization",
-            ));
+        if !trusted_semantics {
+            let (_, serialized) =
+                self.serialize_page_dto_for_path(page, &path, Some(expected_base))?;
+            let exact_target_matches_guarded_page = serialized == exact_target
+                || (Format::from_path(&path) == Format::Md
+                    && guarded_markdown_documents_match(&serialized, exact_target));
+            if !exact_target_matches_guarded_page {
+                return Err(projection_semantic_refusal(
+                    io::ErrorKind::InvalidData,
+                    "journal target differs from strict guarded page serialization",
+                ));
+            }
         }
 
         let index = self.validate_current_graph_text_collision_strict(
@@ -20664,7 +20713,7 @@ impl Graph {
                 expected_identity: loaded.file_identity,
                 expected_parent_identity,
                 target: exact_target.to_owned(),
-                revision: content_rev(exact_target),
+                revision: target_revision,
                 cache,
             },
         })

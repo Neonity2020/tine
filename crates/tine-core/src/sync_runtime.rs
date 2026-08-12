@@ -16197,6 +16197,11 @@ impl RuntimeActor {
                     };
                     let trusted_target_evidence = TrustedLocalResponseEvidence::new(
                         trusted_target_page.clone(),
+                        current_application.page.rev.clone().ok_or(
+                            SyncEditorRequestError::ActorRefusedAt(
+                                "constructing the accepted application page",
+                            ),
+                        )?,
                         parsed_target_revision,
                     );
                     trusted_target_page.rev = current_application.page.rev.clone();
@@ -30804,8 +30809,8 @@ mod tests {
         );
         assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 0);
         assert_eq!(
-            instrumentation.guarded_graph_validation_parse_pairs, 1,
-            "reuse must still execute Graph's guarded base/target validation parse pair"
+            instrumentation.guarded_graph_validation_parse_pairs, 0,
+            "the parser-owned immediate response receipt must avoid Graph's adjacent parse/serialize re-proof"
         );
         let before_detail = instrumentation.local_mutation_detail;
         assert_eq!(
@@ -30892,8 +30897,8 @@ mod tests {
         );
         assert_eq!(counters.finalizer_sealed_pending_local_predecessor_use, 1);
         assert_eq!(
-            instrumentation.guarded_graph_validation_parse_pairs, 1,
-            "the sealed fast path preserves Graph's guarded base/target validation parse pair"
+            instrumentation.guarded_graph_validation_parse_pairs, 0,
+            "the sealed fast path consumes the parser-owned immediate response receipt"
         );
         let (second_saved, second_revision) = match second_saved {
             SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),

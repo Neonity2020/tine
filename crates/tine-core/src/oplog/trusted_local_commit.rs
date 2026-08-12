@@ -153,16 +153,70 @@ pub(crate) enum TrustedLocalCommitOutcome {
 /// and may be retained only by an immediately durable trusted commit.
 pub(crate) struct TrustedLocalResponseEvidence {
     page: PageDto,
+    accepted_base_revision: String,
     parsed_target_revision: String,
 }
 
 impl TrustedLocalResponseEvidence {
-    pub(crate) fn new(page: PageDto, parsed_target_revision: String) -> Self {
+    pub(crate) fn new(
+        page: PageDto,
+        accepted_base_revision: String,
+        parsed_target_revision: String,
+    ) -> Self {
         Self {
             page,
+            accepted_base_revision,
             parsed_target_revision,
         }
     }
+
+    /// One-use semantic receipt for the immediately adjacent Graph commit.
+    /// Construction follows an exact target parse, identity resolution, and
+    /// DTO conversion in the actor. Decoded/restarted records never have this
+    /// process-local value and therefore retain Graph's complete parser and
+    /// guarded-serialization validation.
+    pub(crate) fn validates_projection(
+        &self,
+        page: &PageDto,
+        base_revision: &str,
+        target_revision: &str,
+    ) -> bool {
+        self.accepted_base_revision == base_revision
+            && self.parsed_target_revision == target_revision
+            && page_dto_equal_except_revision(&self.page, page)
+    }
+}
+
+fn page_dto_equal_except_revision(left: &PageDto, right: &PageDto) -> bool {
+    left.name == right.name
+        && left.kind == right.kind
+        && left.title == right.title
+        && left.pre_block == right.pre_block
+        && left.format == right.format
+        && left.read_only == right.read_only
+        && left.path == right.path
+        && left.activation == right.activation
+        && left.guide == right.guide
+        && block_dtos_equal(&left.blocks, &right.blocks)
+}
+
+fn block_dtos_equal(left: &[crate::BlockDto], right: &[crate::BlockDto]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id
+                && left.raw == right.raw
+                && left.collapsed == right.collapsed
+                && left.breadcrumb == right.breadcrumb
+                && left.page_property == right.page_property
+                && left.marker == right.marker
+                && left.priority == right.priority
+                && left.heading_level == right.heading_level
+                && left.scheduled == right.scheduled
+                && left.deadline == right.deadline
+                && left.tags == right.tags
+                && left.properties == right.properties
+                && block_dtos_equal(&left.children, &right.children)
+        })
 }
 
 /// Journal-committed operation whose exact graph target is durable and whose
@@ -406,11 +460,12 @@ impl TrustedLocalCommitCoordinator {
 
         #[cfg(test)]
         let graph_started = Instant::now();
-        let graph_outcome = match graph.commit_existing_page_with_journal(
+        let graph_outcome = match graph.commit_existing_page_with_journal_evidence(
             page,
             base_revision,
             expected_base,
             exact_target,
+            response_evidence.as_ref(),
             || append_managed_local_record(journal, &prepared),
         ) {
             Ok(outcome) => outcome,
@@ -994,6 +1049,7 @@ mod tests {
         let prepared = prepared_edit(&mut fixture, 1_200_110, 1);
         let evidence = TrustedLocalResponseEvidence::new(
             page.clone(),
+            base_revision.clone(),
             "deliberately-not-the-prepared-target-revision".into(),
         );
 
