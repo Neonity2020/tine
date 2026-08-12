@@ -2296,7 +2296,7 @@
     },
     {
       "id": "UI-SPLIT-MIDDLE-CLICK-PANE-001",
-      "title": "Middle-clicked page links open a tab in their source pane",
+      "title": "Middle-clicked page links open a background tab in the pane that was already active",
       "family": "split-navigation",
       "sources": {
         "issues": [
@@ -2308,14 +2308,16 @@
         "all"
       ],
       "layer": "render",
-      "status": "closed",
+      "status": "covered",
       "coverage": {
         "tests": [
-          "src/render/clickSpans.test.tsx"
+          "src/render/clickSpans.test.tsx",
+          "src/paneTracker.test.tsx"
         ],
         "scenario": null,
         "failBefore": "proven"
-      }
+      },
+      "notes": "The first fix for GH #87 encoded the source pane as the destination, contradicting both the original report and the reporter's reopened clarification: a background tab belongs to the pane that was active before the gesture, even when the clicked link is in another pane or the sidebar. The global pointer tracker also treated middle-button pointerdown as pane activation, making the destination depend on event order. Middle pointerdown now preserves pane focus, page-reference anchors prevent incidental middle-button DOM focus, and page references plus page titles use the focused-router facade for their background tab. The regression explicitly renders the link in one registered split while another is active and proves only the active pane gains the tab."
     },
     {
       "id": "UI-BLOCK-EMBED-ROOT-BULLET-001",

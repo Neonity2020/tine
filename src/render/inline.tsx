@@ -317,7 +317,7 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
         // Shift+click opens the page in the sidebar (via `open`); suppress the
         // browser's native shift-range-selection so the main editor's text isn't
         // selected as a side effect (GH #42).
-        onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
+        onMouseDown={(e) => { if (e.shiftKey || e.button === 1) e.preventDefault(); }}
         onClick={open}
         onMouseEnter={peek.anchorEnter}
         onMouseLeave={peek.anchorLeave}
@@ -325,11 +325,9 @@ export function PageRef(props: { name: string; alias?: JSX.Element; tag?: boolea
           if (e.button === 1) {
             e.preventDefault();
             e.stopPropagation();
-            // Middle-click belongs to the pane that rendered the link. Relying
-            // on the globally focused router races pointer-focus tracking and
-            // sent split-view tabs to the previously focused/top pane (GH #87).
-            if (pane) pane.router.openPageInNewTab(targetName(), kind());
-            else openPageInNewTab(targetName(), kind());
+            // A background tab belongs to the pane that was already active, not
+            // necessarily the pane containing this link (GH #87).
+            openPageInNewTab(targetName(), kind());
           }
         }}
         onContextMenu={(e) => {
