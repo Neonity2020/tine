@@ -5,7 +5,7 @@
     "purpose": "Last pre-Sheets and pre-split-view patch release; never advances automatically."
   },
   "previousRelease": {
-    "ref": "v0.6.92",
+    "ref": "v0.6.93",
     "purpose": "Most recently published release. Advance immediately after publication; a tagged candidate automatically compares with the preceding tag."
   },
   "reliability": {
@@ -14,11 +14,20 @@
     "maxCalibrationSpreadPct": 25
   },
   "storageMode": {
-    "modes": ["direct", "managed"],
+    "modes": [
+      "direct",
+      "managed"
+    ],
     "operations": {
-      "coldOpenMs": { "label": "cold open" },
-      "saveMs": { "label": "edited-page save" },
-      "keystrokeP95Ms": { "label": "steady keystroke p95" }
+      "coldOpenMs": {
+        "label": "cold open"
+      },
+      "saveMs": {
+        "label": "edited-page save"
+      },
+      "keystrokeP95Ms": {
+        "label": "steady keystroke p95"
+      }
     }
   },
   "metrics": {

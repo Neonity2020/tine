@@ -17,7 +17,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/components/ContextMenu.test.tsx",
@@ -5806,7 +5806,7 @@
         "all"
       ],
       "layer": "native",
-      "status": "reported",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/sheet/config.test.ts",
@@ -5816,7 +5816,7 @@
         "scenario": "sheets.table-stable-column-resize",
         "failBefore": "proven"
       },
-      "notes": "The table-only tine.table-widths grammar URI-encodes stable title/FieldId keys, rejects malformed values, and bounds serialized pixels. Pointer-edge tests cover live preview, one guarded owner-property commit, cancel, independent reset, field reorder, remount, duplicate surfaces, and both block/page homes. The native sheet journey now expresses horizontal usability and durable reset without making exact pixels authoritative, but the local candidate run stopped before its first check because the initial .ls-block never appeared; keep this reported until that observation runs. Coordinate-grid tine.col-widths remains unchanged."
+      "notes": "The table-only tine.table-widths grammar URI-encodes stable title/FieldId keys, rejects malformed values, and bounds serialized pixels. Pointer-edge tests cover live preview, one guarded owner-property commit, cancel, independent reset, field reorder, remount, duplicate surfaces, and both block/page homes. The native sheet journey now expresses horizontal usability and durable reset without making exact pixels authoritative, but the local candidate run stopped before its first check because the initial .ls-block never appeared; keep this reported until that observation runs. Coordinate-grid tine.col-widths remains unchanged. 2026-08-12: the held observation ran. scripts/e2e-sheets.mjs PASSED in the linux-release catalog against the v0.6.93 candidate binary (appSha256 75b3c2e9\u2026, commit 651d605e), in both ordinary and strict release mode, so the row advances past `reported`. Released in v0.6.93."
     },
     {
       "id": "UI-SHEET-TABLE-COLUMN-REORDER-217",
@@ -6442,7 +6442,7 @@
         "macos"
       ],
       "layer": "render",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/startupRecovery.test.ts",
@@ -6468,7 +6468,7 @@
         "all"
       ],
       "layer": "unit",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/store.test.ts"
@@ -6492,7 +6492,7 @@
         "all"
       ],
       "layer": "unit",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/clipboard.paste.test.ts"

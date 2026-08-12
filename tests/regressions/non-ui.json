@@ -20,7 +20,7 @@
         "all"
       ],
       "layer": "frontend-store",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/filedrop.test.ts",
@@ -47,7 +47,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::cold_graph_creation_repairs_identity_evidence_once",
@@ -2457,7 +2457,7 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::missing_target_creation_ignores_the_retained_shadow_peak_limit",
@@ -3700,7 +3700,7 @@
         "android"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs::managed_reopen_rebuilds_after_malformed_retained_scratch_blob"
