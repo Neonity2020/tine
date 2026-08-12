@@ -8,10 +8,10 @@
 //! projection-work state are disposable derived data.
 
 pub mod batch;
-pub(crate) mod content_patricia;
 #[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod bootstrap_import;
 pub(crate) mod causal_index;
+pub(crate) mod content_patricia;
 pub(crate) mod dependency_queue;
 #[allow(dead_code)] // mixed live/runtime and diagnostic surface
 pub(crate) mod discovery;
@@ -42,10 +42,6 @@ pub(crate) mod loro_store;
 pub(crate) mod migration_backup;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
-#[allow(dead_code)] // mixed live/runtime and proof/test surface
-pub(crate) mod shadow_projection;
-#[allow(dead_code)] // mixed live/runtime and recovery/test surface
-pub(crate) mod trusted_local_commit;
 #[allow(dead_code)] // mixed live/runtime and test-construction surface
 pub(crate) mod page_name_index;
 pub(crate) mod portable_path_index;
@@ -69,12 +65,17 @@ pub mod reference_catalog;
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub mod semantic;
+#[allow(dead_code)] // mixed live/runtime and proof/test surface
+pub(crate) mod shadow_projection;
 pub mod simulator;
 pub mod sqlite;
 pub mod sqlite_materialization;
+#[allow(dead_code)] // mixed live/runtime and recovery/test surface
+pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
 #[allow(dead_code)] // mixed live/runtime and test instrumentation surface
 pub(crate) mod watcher_queue;
+pub(crate) mod wire;
 
 /// Diagnostic trace gates, resolved once per process.
 ///

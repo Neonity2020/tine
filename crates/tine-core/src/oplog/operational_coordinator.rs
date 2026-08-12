@@ -2809,7 +2809,7 @@ pub(crate) mod simulator_harness {
         OperationalCoordinator, OperationalCoordinatorState, OperationalFaultPoint,
     };
     use crate::oplog::hot_engine::AcceptedFrontierRoot;
-    use crate::oplog::simulator::{
+    use crate::oplog::wire::{
         publish_bootstrap_prepared_for_simulator_fixture, CoordinatorAction,
         CoordinatorDurableBoundary, CoordinatorExpectedState, CoordinatorFailureWitness,
         CoordinatorFault, CoordinatorHandoffState, CoordinatorObservation, CoordinatorOracle,

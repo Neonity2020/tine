@@ -127,22 +127,6 @@ use crate::oplog::reconciliation_baseline::{
 use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection;
 #[cfg(test)]
 use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
-#[cfg(test)]
-use crate::oplog::simulator::{
-    fail_next_pending_publication_marker_creation,
-    fail_next_provider_publication_after_physical_write,
-};
-use crate::oplog::simulator::{
-    inspect_cold_shared_provider_prefix, inspect_shared_provider_descriptor,
-    provider_transient_path, ColdSharedProviderPrefix, SharedProviderFrontierHeadV1,
-    SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
-    SharedProviderObservationCursor, SharedProviderPublicationCursor,
-    SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
-    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
-    SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
-    SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
-};
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 #[cfg(test)]
 use crate::oplog::sqlite::{
@@ -160,6 +144,22 @@ use crate::oplog::trusted_local_commit::{
     TrustedLocalResponseEvidence, TrustedLocalRestartProjectionOutcome,
 };
 use crate::oplog::watcher_queue::WatcherObservation;
+#[cfg(test)]
+use crate::oplog::wire::{
+    fail_next_pending_publication_marker_creation,
+    fail_next_provider_publication_after_physical_write,
+};
+use crate::oplog::wire::{
+    inspect_cold_shared_provider_prefix, inspect_shared_provider_descriptor,
+    provider_transient_path, ColdSharedProviderPrefix, SharedProviderFrontierHeadV1,
+    SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
+    SharedProviderObservationCursor, SharedProviderPublicationCursor,
+    SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+    SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+};
 use crate::oplog::{
     classify_managed_local_anchor, decode_managed_local_record, managed_local_v2_anchor_name,
     parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlockId, BlockLocation,
