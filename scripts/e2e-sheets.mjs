@@ -48,7 +48,7 @@ const GRID_MD = [
   "  tine.filter:: true || occurrence > 1",
   "  tine.group-by:: prop:occurrence",
   "  tine.col-aggregates:: prop:occurrence=sum;prop:severity=max",
-  "\t- WAIT row one",
+  "\t- TODO row one",
   "\t  topic:: infra",
   "\t  shipped:: false",
   "\t  label:: other",
@@ -769,7 +769,7 @@ try {
   });
   await sleep(2400);
   const diskMarker = fs.readFileSync(JFILE, "utf8");
-  check("marker pill single-click cycled table state", markerClick.clicked && diskMarker.includes("- LATER row one"), JSON.stringify({ markerClick, diskMarker }));
+  check("marker pill single-click toggled the open pair", markerClick.clicked && diskMarker.includes("- DOING row one"), JSON.stringify({ markerClick, diskMarker }));
   check("marker pill click selected without editing", markerClick.selected && !markerClick.editing, JSON.stringify(markerClick));
 
   // --- N27: aggregate picker is an in-DOM menu (a native <select>'s WebKitGTK
