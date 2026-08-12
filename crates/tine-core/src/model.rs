@@ -8643,6 +8643,34 @@ impl Graph {
         self.validate_direct_creation_proof_before_mutation(permit, path, &proof)?;
         let temp = create_projection_temp(target.parent(), &target.filename, bytes)?;
         managed_write_before_mutation_hook()?;
+        let live_files = match self.capture_direct_creation_census(permit) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = target.parent().remove_file(&temp);
+                return Err(error);
+            }
+        };
+        if live_files != proof.files {
+            let _ = target.parent().remove_file(&temp);
+            if editor_episode.is_some() && self.managed_exists(permit, path)? {
+                return Err(self.observe_editor_conflict(
+                    permit,
+                    path,
+                    editor_episode,
+                    EditorConflictSite::CreatePublicationCollision,
+                ));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "graph text files changed before creation publication",
+            ));
+        }
+        if let Err(error) =
+            self.validate_graph_text_portable_aliases_path_local(permit, &proof.target, true)
+        {
+            let _ = target.parent().remove_file(&temp);
+            return Err(error);
+        }
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != proof.generation {
             let _ = target.parent().remove_file(&temp);
             return Err(io::Error::new(
@@ -35660,7 +35688,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            2
         );
         assert!(graph.cache.read().unwrap().is_some());
         let _ = fs::remove_dir_all(&dir);
@@ -35695,7 +35723,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            2
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -35750,7 +35778,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            2
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -35891,7 +35919,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            4
         );
         assert_eq!(*graph.page_build_test.joined.lock().unwrap(), 0);
         assert_eq!(
@@ -36255,7 +36283,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            2
+            3
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -36319,7 +36347,7 @@ mod tests {
                 .page_build_test
                 .censuses
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1
+            2
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -40861,9 +40889,10 @@ mod tests {
     }
 
     /// A content-only existing save must carry the already-warm semantic
-    /// evidence forward. The immediately following creation may stream one
-    /// census, but may not rebuild/capture/parse the graph to recover evidence
-    /// that the existing save already proved unchanged.
+    /// evidence forward. The immediately following creation may stream its
+    /// evidence and final-publication censuses, but may not rebuild, retain, or
+    /// parse the graph to recover evidence that the existing save already
+    /// proved unchanged.
     #[test]
     fn identity_preserving_existing_save_keeps_creation_evidence_warm() {
         let dir = scratch("existing-save-then-create-warm-evidence");
@@ -40903,8 +40932,8 @@ mod tests {
             .expect("warm evidence must authorize the noncolliding creation");
         let after = graph.guarded_graph_text_identity_report();
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.direct_creation_censuses, 1);
-        assert_eq!(counters.direct_creation_files_hashed, 2);
+        assert_eq!(counters.direct_creation_censuses, 2);
+        assert_eq!(counters.direct_creation_files_hashed, 4);
         assert_eq!(counters.builder_enumerations, 0);
         assert_eq!(counters.parser_invocations, 0);
         assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
@@ -41129,10 +41158,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The whole validation/publication path consumes one streaming census and
-    /// no managed retained-capture, complete-index, or parse work.
+    /// The whole validation/publication path consumes an evidence census and a
+    /// final publication census, but no managed retained-capture,
+    /// complete-index, or parse work.
     #[test]
-    fn missing_target_creation_has_one_census_and_zero_shadow_or_parse_work() {
+    fn missing_target_creation_has_two_censuses_and_zero_shadow_or_parse_work() {
         let dir = scratch("missing-target-one-streaming-census");
         for index in 0..24 {
             fs::write(
@@ -41159,8 +41189,8 @@ mod tests {
             .unwrap();
         let after = graph.guarded_graph_text_identity_report();
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.direct_creation_censuses, 1);
-        assert_eq!(counters.direct_creation_files_hashed, 25);
+        assert_eq!(counters.direct_creation_censuses, 2);
+        assert_eq!(counters.direct_creation_files_hashed, 50);
         assert_eq!(counters.builder_enumerations, 0);
         assert_eq!(counters.parser_invocations, 0);
         assert_eq!(
@@ -41207,8 +41237,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A generation change during the one census fails closed. Creation neither
-    /// retries the census nor mutates the target.
+    /// A generation change during the first evidence census fails closed.
+    /// Creation neither reaches the final census nor mutates the target.
     #[test]
     fn cache_generation_change_during_creation_census_fails_without_retry() {
         let dir = scratch("creation-census-generation-change");
@@ -41433,6 +41463,92 @@ mod tests {
             b"- anchor\n"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_portable_alias_creator_wins_before_creation_publication() {
+        let dir = scratch("creation-external-portable-alias-race");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Raced.md");
+        let alias = dir.join("pages/raced.md");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let alias = alias.clone();
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(alias, b"external winner\n")));
+        });
+
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Raced"), None)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read(&alias).unwrap(), b"external winner\n");
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_semantic_owner_creator_wins_before_creation_publication() {
+        let dir = scratch("creation-external-semantic-owner-race");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Raced Semantic.md");
+        let owner = dir.join("pages/External.md");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let owner = owner.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(owner, b"title:: Raced Semantic\n\n- external winner\n")
+            }));
+        });
+
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Raced Semantic"), None)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(
+            fs::read(&owner).unwrap(),
+            b"title:: Raced Semantic\n\n- external winner\n"
+        );
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_portable_symlink_alias_refuses_creation_publication() {
+        let dir = scratch("creation-external-portable-symlink-alias-race");
+        fs::write(dir.join("pages/Anchor.md"), b"- anchor\n").unwrap();
+        let outside = dir.with_extension("external-symlink-owner");
+        fs::write(&outside, b"external winner\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let target = dir.join("pages/Raced.md");
+        let alias = dir.join("pages/raced.md");
+        MANAGED_WRITE_BEFORE_MUTATION.with(|hook| {
+            let alias = alias.clone();
+            let outside = outside.clone();
+            *hook.borrow_mut() = Some(Box::new(move || std::os::unix::fs::symlink(outside, alias)));
+        });
+
+        let error = graph
+            .save_page(&direct_save_bench_new_page("Raced"), None)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::AlreadyExists
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"external winner\n");
+        assert!(alias.is_symlink());
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&outside);
     }
 
     /// GH #267 / F3. Leave a deterministic whole-graph capture race armed and
