@@ -3782,6 +3782,37 @@
         "failBefore": "proven"
       },
       "notes": "A file drop reads the storage route once, synchronously, then does its I/O. On the Direct branch that I/O could still be running when the user finished enabling managed storage, and the continuation then inserted an unbounded outline through insertOutlineAfter with no admission at all -- exactly the mutate-first failure the admission work exists to prevent. Graph activation flips this authority inside its own graphTransitioning window, so the existing transitioning check only stopped continuations resuming DURING the switch, not the far more likely ones resuming just after it (a native confirm dialog sits inside that window). The route is now part of the shared continuation fence used by both the drop and the clipboard paste: authority and binding generation are captured with the graph epoch, root, target node, page and page-instance generation, and re-proved before any mutation. The Direct drop also stops reading further files the moment the fence breaks, which additionally removes a TypeError path when the target block was deleted mid-drop. Fail-before proven by removing the fence: the drop imported the asset and inserted."
+    },
+    {
+      "id": "REG-MANAGED-SHEET-PASTE-ADMISSION-320",
+      "title": "Pasting into a Sheet's cells under managed storage is validated by the storage authority before the live page changes",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          320
+        ],
+        "commits": [
+          "6ba116f4",
+          "65881fb8",
+          "e958b853",
+          "226afed8",
+          "0537d138"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/sheet/mutations.test.ts",
+          "src/sheet/selection.test.ts"
+        ],
+        "scenario": "managed.sheet-paste-validated-before-mutation",
+        "failBefore": "proven"
+      },
+      "notes": "Sheets have their own clipboard path -- handleSheetPasteEvent -> splatStructuralSheetSelection / pasteTextIntoSheetSelection -- which reached none of preflightManagedBulkInsertion's call sites, so a large CSV/TSV paste materialized an unbounded number of blocks and the limit was only discovered at save time, stranding a partial edit. Resolved not by adding the frontend advisory admission the issue proposed, but by the stronger atomic-plan route: every cell is built in a DETACHED page candidate, the whole resulting page goes to preflight_managed_page_mutation, and the live page, undo history, selection and dirty state change only after the authority accepts. That native preflight applies the real block, depth and byte bounds (validate_application_save_request), so the check is made by the authority itself rather than by a frontend lower bound. Fail-before established at source against v0.6.93, where pasteTextIntoSheetSelection mutated the live document inside withSheetUndo via ensureGridRows/materializeCell/writeCellVisible with no admission and no candidate; that code path no longer exists, so the new test could not be run against it unchanged."
     }
   ]
 }
