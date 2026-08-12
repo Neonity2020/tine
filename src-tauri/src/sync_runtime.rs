@@ -4500,16 +4500,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    // Bisected to 30f36d0a "fix(managed): resume correlated cold move
-    // continuation", which is NOT in v0.6.93 — so this is an unreleased
-    // regression on master, not a shipped defect. The first
-    // `resolve_application_move_subtrees` now answers
-    // `NoCommit { reason: EpisodeNotCommitted }` where it answered `Committed`.
-    // Quarantined rather than repaired: whether that is the intended contract
-    // after routing cross-page moves through the actor is the move lane's call,
-    // not a test-maintenance decision. GH #333.
     #[test]
-    #[ignore = "GH #333: cross-page move returns NoCommit after 30f36d0a; unreleased regression, owner decides the contract"]
     fn stopped_move_episode_reopens_and_replaces_one_window_writer() {
         std::thread::Builder::new()
             .name("tine-move-recovery-handoff-test".into())
@@ -4641,11 +4632,13 @@ mod tests {
                 application_page_max_depth: tine_core::sync_runtime::MAX_SYNC_EDITOR_DEPTH,
             },
         };
-        let committed = handle
-            .resolve_application_move_subtrees(request.clone())
-            .unwrap();
+        // The ordinary move surface creates and commits the durable episode.
+        // `resolve_application_move_subtrees` is recovery-only: asking it to
+        // resolve a missing episode must remain a NoCommit rather than
+        // silently initiating a user mutation (GH #333).
+        let committed = handle.move_application_subtrees(request.clone()).unwrap();
         assert!(matches!(
-            committed.move_outcome,
+            committed,
             SyncApplicationMoveSubtreesOutcome::Committed { .. }
         ));
         assert!(matches!(
