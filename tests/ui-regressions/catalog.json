@@ -6560,6 +6560,27 @@
         "failBefore": "reconstructed"
       },
       "notes": "The superseded per-id predicate rescanned every loaded key and every loaded raw for each incoming identity, so cost grew with candidates times page size. The batched helper is asserted through an explicit work receipt (src/clipboardWorkProbe.ts): 200+ preserved-ID paste and redo candidates each record exactly one loaded_identity_pass, and incoming_identity_ids_checked stays fixed as the loaded document grows. Fail-closed behaviour is unchanged and independently asserted: an internally duplicated moved payload is rejected before the loaded document is consulted, and both the Markdown id:: and Org :id: raw forms are still matched without requiring an Org drawer. Fail-before is reconstructed from the superseded source at v0.6.92, not from a red run executed at release time."
+    },
+    {
+      "id": "UI-PROPERTY-AUTOCOMPLETE-KEYBOARD-LIFECYCLE-306",
+      "title": "Property autocomplete remains usable when authored entirely from the keyboard",
+      "family": "editor-autocomplete",
+      "sources": {
+        "issues": [306],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/autocomplete.test.ts",
+          "src/components/Block.propertyAutocomplete.test.tsx"
+        ],
+        "scenario": "editor.property-autocomplete-keyboard-lifecycle",
+        "failBefore": "proven"
+      },
+      "notes": "OG moves the caret before a line-opening :: delimiter and searches the property name to its left. Tine previously left the caret after ::, so the first name character produced malformed ::a text, closed the popup, and could surface repeated backend error notifications. Coverage exercises the real input-event lifecycle: :: moves the caret left; typed characters filter without closing; Create is discoverable at the top; selection enters value search; a directly authored key:: followed by space also enters value search; and comma starts a new value search with already-authored values excluded. Facet lookup failure is contained to the optional autocomplete surface and cannot reject the editor input event."
     }
   ]
 }

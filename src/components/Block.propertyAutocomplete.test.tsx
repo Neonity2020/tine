@@ -45,6 +45,63 @@ function enter(textarea: HTMLTextAreaElement) {
 }
 
 describe("property name/value autocomplete", () => {
+  it("keeps the OG line-opening :: workflow live through name and comma-separated values (GH #306)", async () => {
+    vi.spyOn(backend(), "queryFacets").mockResolvedValue([
+      ["alpha", ["one", "two"]],
+      ["beta", ["three"]],
+    ]);
+    loadSingle(page(""));
+    startEditing("property-authoring", 0);
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Property authoring")?.roots ?? []}>{(id) => <Block id={id} />}</For>
+    ));
+
+    try {
+      const textarea = root.querySelector("textarea.block-editor") as HTMLTextAreaElement;
+      inputAt(textarea, "::", 2);
+      await vi.waitFor(() => expect(textarea.selectionStart).toBe(0));
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("alpha"));
+
+      inputAt(textarea, "alp::", 3);
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe('Create "alp"'));
+      expect([...document.body.querySelectorAll(".autocomplete .ac-label")].map((el) => el.textContent))
+        .toEqual(['Create "alp"', "alpha"]);
+
+      inputAt(textarea, "alpha::", 5);
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("alpha"));
+      enter(textarea);
+      await vi.waitFor(() => expect(textarea.value).toBe("alpha:: "));
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("one"));
+
+      enter(textarea);
+      await vi.waitFor(() => expect(textarea.value).toBe("alpha:: one"));
+      inputAt(textarea, "alpha:: one,", "alpha:: one,".length);
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("two"));
+      expect(document.body.textContent).not.toContain("one");
+    } finally {
+      dispose();
+    }
+  });
+
+  it("opens value suggestions when a directly-authored property is followed by a space (GH #306)", async () => {
+    vi.spyOn(backend(), "queryFacets").mockResolvedValue([["alpha", ["one"]]]);
+    loadSingle(page(""));
+    startEditing("property-authoring", 0);
+    const { root, dispose } = mount(() => (
+      <For each={pageByName("Property authoring")?.roots ?? []}>{(id) => <Block id={id} />}</For>
+    ));
+
+    try {
+      const textarea = root.querySelector("textarea.block-editor") as HTMLTextAreaElement;
+      inputAt(textarea, "alpha::", "alpha::".length);
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("alpha"));
+      inputAt(textarea, "alpha:: ", "alpha:: ".length);
+      await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("one"));
+    } finally {
+      dispose();
+    }
+  });
+
   it("replaces only the property span, then offers values for the canonical key", async () => {
     const facets = vi.spyOn(backend(), "queryFacets").mockResolvedValue([
       ["alpha", ["one", "two"]],
@@ -52,15 +109,15 @@ describe("property name/value autocomplete", () => {
       ["template", ["My template"]],
       ["title", ["Page title"]],
     ]);
-    loadSingle(page("prefix\nalp:: suffix"));
-    startEditing("property-authoring", "prefix\nalp::".length);
+    loadSingle(page("prefix\nalpha:: suffix"));
+    startEditing("property-authoring", "prefix\nalpha::".length);
     const { root, dispose } = mount(() => (
       <For each={pageByName("Property authoring")?.roots ?? []}>{(id) => <Block id={id} />}</For>
     ));
 
     try {
       const textarea = root.querySelector("textarea.block-editor") as HTMLTextAreaElement;
-      inputAt(textarea, "prefix\nalp:: suffix", "prefix\nalp::".length);
+      inputAt(textarea, "prefix\nalpha:: suffix", "prefix\nalpha::".length);
       await vi.waitFor(() => expect(document.body.querySelector(".autocomplete .ac-label")?.textContent).toBe("alpha"));
       expect(facets).toHaveBeenCalledWith(true);
 
