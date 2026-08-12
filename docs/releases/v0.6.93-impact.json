@@ -146,7 +146,7 @@
     },
     {
       "section": "Fixed",
-      "text": "**Direct Files can create a page or journal immediately after opening a graph.** A cold parsed-page cache was treated as evidence that the requested name already existed, so ordinary creation could be refused until background warming happened to finish. Creation now joins one bounded, generation-coherent identity build and proceeds only from its published evidence; malformed owners, generation drift, aliases, links, symlinks, and external creator races still fail closed without overwriting bytes (GH #318).",
+      "text": "**Direct Files can create a page or journal immediately after opening a graph.** A cold parsed-page cache was treated as evidence that the requested name already existed, so ordinary creation could be refused until background warming happened to finish. Creation now joins one bounded, generation-coherent identity build and proceeds only from its published evidence; malformed owners, generation drift, aliases, links, symlinks, and an external creator of the same file still fail closed without overwriting bytes (GH #318).",
       "userVisible": true,
       "regressions": [
         "REG-DIRECT-COLD-CREATION-318"
@@ -288,7 +288,7 @@
     },
     {
       "section": "Fixed",
-      "text": "**Creating a page in Direct Files no longer stalls and then refuses the save on a large graph** (part of GH #249, GH #266 and GH #267). The creation path ran the managed-storage shadow-import capture twice, retaining and parsing every graph file before it could answer whether one filename was safe. On affected graphs that ended in `precheck.limit`, stranded the new edit, and made graph transitions or close wait behind repeated failed flushes. Creation now checks one non-retaining streaming census—without applying the retained-shadow cumulative-byte ceiling—against the already parsed, generation-current Direct Files index and passes that single proof to the no-replace publisher. Creation still refuses an existing target, portable case/NFC aliases of that target (including ancestor directories), semantic owners, hard links, symlinks, and external creator races without overwriting their bytes; existing exact-target saves retain their prior path-local traversal behavior.",
+      "text": "**Creating a page in Direct Files no longer stalls and then refuses the save on a large graph** (part of GH #249, GH #266 and GH #267). The creation path ran the managed-storage shadow-import capture twice, retaining and parsing every graph file before it could answer whether one filename was safe. On affected graphs that ended in `precheck.limit`, stranded the new edit, and made graph transitions or close wait behind repeated failed flushes. Creation now checks one non-retaining streaming census—without applying the retained-shadow cumulative-byte ceiling—against the already parsed, generation-current Direct Files index and passes that single proof to the no-replace publisher. Creation still refuses an existing target, portable case/NFC aliases of that target (including ancestor directories), semantic owners, hard links, symlinks, and an external creator of the same file without overwriting their bytes; existing exact-target saves retain their prior path-local traversal behavior. A conflicting *different* path created by another process inside the final publication window is still not detected, which is long-standing behaviour rather than new here (GH #321).",
       "userVisible": true,
       "regressions": [
         "REG-DIRECT-CREATE-RETAINED-SHADOW-LIMIT-249-266"
