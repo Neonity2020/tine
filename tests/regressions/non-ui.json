@@ -3013,7 +3013,7 @@
     },
     {
       "id": "REG-WINDOWS-MANAGED-ACTIVATION-292",
-      "title": "Managed storage activation on a large Windows graph either becomes active or leaves Direct Files usable",
+      "title": "Managed storage admits parseable non-roundtripping source files byte-exactly and exposes them read-only",
       "family": "managed-storage-activation",
       "sources": {
         "issues": [
@@ -3025,13 +3025,17 @@
         "windows"
       ],
       "layer": "real-app",
-      "status": "reported",
+      "status": "covered",
       "coverage": {
         "tests": [
+          "crates/tine-core/src/oplog/import.rs::source_admission_accepts_non_round_tripping_markdown_as_exact_read_only_source",
+          "crates/tine-core/src/oplog/import.rs::inactive_bootstrap_accepts_non_round_tripping_markdown_as_exact_read_only_source",
+          "crates/tine-core/src/model.rs::consumed_external_document_dto_matches_exact_parse_across_formats_and_identity",
+          "src/managedDiagnostics.test.ts",
           "scripts/e2e-windows-managed-storage.mjs"
         ]
       },
-      "notes": "The reporter saw activation fail on Windows 11 with about 13,000 pages, after which pages were unavailable until returning to Direct Files. The focused hosted-Windows WebView2 scenario drives the real Settings activation on a 13,000-page nested Unicode Markdown/Org graph, verifies byte-preserved source files, opens a nested page under managed storage, returns to Direct Files, and reopens the page. Keep this reported until hosted execution either reproduces the failure or records a repeatable pass that sharply narrows the remaining Windows 11 or graph-content evidence gap."
+      "notes": "The reporter's trace identified the content-specific blocker after source capture: one parseable Markdown file changed block structure under parse/reserialize, and managed import rejected the entire graph even though its error already described the file as byte-preserved and read-only. Tine already admitted the equivalent Org state. Managed import and inactive bootstrap now admit either format as an exact source, while the shared exact-page DTO parser independently recomputes structural editability and marks non-roundtripping Markdown or Org read-only. Existing application/save gates consume that format-neutral flag, so these bytes can be shown but never rewritten. Tests preserve the exact source through both import paths and prove the DTO read-only bit. The UI diagnostic sanitizer now redacts graph-relative source paths while retaining the actual causal reason instead of replacing the whole message with a generic unsafe-detail fallback. The hosted Windows large-graph scenario remains useful platform coverage, but the reporter's demonstrated content cause is now covered deterministically."
     },
     {
       "id": "REG-CASE-INSENSITIVE-TRACKED-PATHS-280",

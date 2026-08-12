@@ -168,7 +168,7 @@ export interface FeedPage {
   roots: string[];
   /** On-disk format (drives org vs markdown inline rendering). */
   format: Format;
-  /** True for an org page Tine can't round-trip — shown but not editable. */
+  /** True for a source page Tine can't round-trip — shown but not editable. */
   readOnly: boolean;
   /** Bundled in-app Guide page: read-only and ephemeral. */
   guide: boolean;

@@ -66,7 +66,7 @@ export interface PageDto {
   rev?: string | null;
   /** Format this page is stored in (drives org vs markdown inline rendering). */
   format?: Format;
-  /** True for an org page Tine can't round-trip byte-for-byte: shown but not
+  /** True for a source page Tine can't structurally round-trip: shown but not
    *  editable, so Tine never rewrites (and risks corrupting) it. */
   read_only?: boolean;
   /** Graph-root-relative path of the file this page was loaded from

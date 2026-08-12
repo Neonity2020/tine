@@ -533,9 +533,9 @@ pub(crate) struct ParsedExternalDocument {
     pub(crate) effective: PageEntry,
     pub(crate) parsed: doc::ParsedDocument,
     pub(crate) revision: String,
-    /// `None` when the caller only needs read-compatible semantics. Import
-    /// requests the existing byte-round-trip admission proof and receives
-    /// `Some(true)` or fails closed before this value can be consumed.
+    /// `None` when the caller only needs read-compatible semantics. Import-grade
+    /// parsing records whether the source is structurally editable, but a false
+    /// result is now an exact read-only source rather than an admission failure.
     pub(crate) source_round_trips: Option<bool>,
 }
 
@@ -579,8 +579,10 @@ impl ParsedExternalDocument {
         content: &str,
     ) -> io::Result<PageDto> {
         let mut dto = page_dto_checked(&self.effective, &self.parsed.document)?;
-        dto.read_only =
-            self.format == Format::Org && !crate::org::org_editable_parsed(content, &self.parsed);
+        dto.read_only = match self.format {
+            Format::Md => !doc::markdown_structurally_round_trips_parsed(content, &self.parsed),
+            Format::Org => !crate::org::org_editable_parsed(content, &self.parsed),
+        };
         dto.rev = Some(self.revision);
         dto.path = path.as_str().to_owned();
         Ok(dto)
@@ -33008,6 +33010,14 @@ mod tests {
                 "Plain",
                 PageKind::Page,
                 false,
+            ),
+            (
+                "markdown-read-only",
+                "pages/Read Only.md",
+                "- root\r  ```\r  - fake\r  ```",
+                "Read Only",
+                PageKind::Page,
+                true,
             ),
             (
                 "org-editable-properties",

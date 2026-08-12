@@ -7695,7 +7695,6 @@ fn parse_external_nodes(
     bytes: &[u8],
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<ParsedExternalTree, ImportBlock> {
-    let is_org = path.is_org();
     let parsed = graph
         .parse_external_document(path, bytes, true)
         .map_err(|error| {
@@ -7706,13 +7705,6 @@ fn parse_external_nodes(
             )
         })?;
     enforce_outline_limits(path, &parsed.parsed, instrumentation.parsed_nodes)?;
-    if !is_org && parsed.source_round_trips != Some(true) {
-        return Err(authority_block(
-            ImportBlockReason::UnsafeInput,
-            Some(path),
-            "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure",
-        ));
-    }
     let tree = flatten_document(path, parsed.parsed, instrumentation)?;
     Ok(ParsedExternalTree {
         tree,
@@ -7742,18 +7734,10 @@ fn parse_nodes(
         )
     })?;
     enforce_outline_limits(path, &parsed, instrumentation.parsed_nodes)?;
-    // Org already has a read-only application mode, so bootstrap may admit a
-    // parseable Org document that Tine's serializer cannot edit. Exact-source
-    // projection separately proves that these bytes describe the accepted
-    // semantics. Markdown has no equivalent read-only contract and therefore
-    // remains fail-closed when its structure cannot round-trip (GH #310).
-    if !is_org && !crate::doc::markdown_structurally_round_trips_parsed(text, &parsed) {
-        return Err(authority_block(
-            ImportBlockReason::UnsafeInput,
-            Some(path),
-            "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure",
-        ));
-    }
+    // Parseable sources are admissible even when Tine's serializer cannot
+    // reproduce their structure. The exact-source projection preserves their
+    // bytes, and the application DTO marks either Markdown or Org read-only at
+    // the parser boundary so no editor/save path can reserialize them.
     flatten_document(path, parsed, instrumentation)
 }
 
@@ -8989,16 +8973,15 @@ mod tests {
     }
 
     #[test]
-    fn source_admission_still_blocks_non_round_tripping_markdown() {
+    fn source_admission_accepts_non_round_tripping_markdown_as_exact_read_only_source() {
         let source = "- root\r  ```\r  - fake\r  ```";
         let fixture = SnapshotFixture::new("non-round-tripping-markdown", &["pages/a.md"]);
         let target = fixture.graph_root.join("pages/a.md");
         fs::write(&target, source).unwrap();
 
         let plan = fixture.plan(&["pages/a.md"]);
-        assert_eq!(plan.status(), ImportPlanStatus::Blocked, "{plan:?}");
-        assert_eq!(plan.blocks()[0].reason, ImportBlockReason::UnsafeInput);
-        assert!(plan.execution_material().is_err());
+        assert_eq!(plan.status(), ImportPlanStatus::Reconcile, "{plan:?}");
+        assert!(plan.execution_material().is_ok());
         assert_eq!(fs::read(target).unwrap(), source.as_bytes());
     }
 
@@ -11475,7 +11458,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_bootstrap_still_blocks_non_round_tripping_markdown() {
+    fn inactive_bootstrap_accepts_non_round_tripping_markdown_as_exact_read_only_source() {
         let source = "- root\r  ```\r  - fake\r  ```";
         let root = TestRoot::new("bootstrap-non-round-tripping-markdown");
         let graph_root = root.path().join("graph");
@@ -11492,19 +11475,18 @@ mod tests {
             .unwrap();
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a13));
 
-        assert!(matches!(
-            prepare_inactive_bootstrap_import(
-                &graph,
-                capture,
-                workspace,
-                LineageDigest::of(b"inactive-bootstrap-markdown-admission"),
-                DocumentId::from_uuid(Uuid::from_u128(0x5a14)),
-                ReferenceCatalogPolicyV1::default(),
-                &target_catalog(&root.path().join("archive"), workspace),
-                &preparation_scratch,
-            ),
-            Err(BootstrapStreamingImportError::InvalidSource(_))
-        ));
+        let prepared = prepare_inactive_bootstrap_import(
+            &graph,
+            capture,
+            workspace,
+            LineageDigest::of(b"inactive-bootstrap-markdown-admission"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a14)),
+            ReferenceCatalogPolicyV1::default(),
+            &target_catalog(&root.path().join("archive"), workspace),
+            &preparation_scratch,
+        )
+        .expect("parseable non-round-tripping Markdown remains an exact read-only source");
+        assert!(prepared.instrumentation().operations > 0);
         assert_eq!(fs::read(target).unwrap(), source.as_bytes());
     }
 
