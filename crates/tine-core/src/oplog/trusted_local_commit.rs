@@ -188,34 +188,90 @@ impl TrustedLocalResponseEvidence {
 }
 
 fn page_dto_equal_except_revision(left: &PageDto, right: &PageDto) -> bool {
-    left.name == right.name
-        && left.kind == right.kind
-        && left.title == right.title
-        && left.pre_block == right.pre_block
-        && left.format == right.format
-        && left.read_only == right.read_only
-        && left.path == right.path
-        && left.activation == right.activation
-        && left.guide == right.guide
-        && block_dtos_equal(&left.blocks, &right.blocks)
+    let PageDto {
+        name: left_name,
+        kind: left_kind,
+        title: left_title,
+        pre_block: left_pre_block,
+        blocks: left_blocks,
+        rev: _,
+        format: left_format,
+        read_only: left_read_only,
+        path: left_path,
+        activation: left_activation,
+        guide: left_guide,
+    } = left;
+    let PageDto {
+        name: right_name,
+        kind: right_kind,
+        title: right_title,
+        pre_block: right_pre_block,
+        blocks: right_blocks,
+        rev: _,
+        format: right_format,
+        read_only: right_read_only,
+        path: right_path,
+        activation: right_activation,
+        guide: right_guide,
+    } = right;
+    left_name == right_name
+        && left_kind == right_kind
+        && left_title == right_title
+        && left_pre_block == right_pre_block
+        && left_format == right_format
+        && left_read_only == right_read_only
+        && left_path == right_path
+        && left_activation == right_activation
+        && left_guide == right_guide
+        && block_dtos_equal(left_blocks, right_blocks)
 }
 
 fn block_dtos_equal(left: &[crate::BlockDto], right: &[crate::BlockDto]) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
-            left.id == right.id
-                && left.raw == right.raw
-                && left.collapsed == right.collapsed
-                && left.breadcrumb == right.breadcrumb
-                && left.page_property == right.page_property
-                && left.marker == right.marker
-                && left.priority == right.priority
-                && left.heading_level == right.heading_level
-                && left.scheduled == right.scheduled
-                && left.deadline == right.deadline
-                && left.tags == right.tags
-                && left.properties == right.properties
-                && block_dtos_equal(&left.children, &right.children)
+            let crate::BlockDto {
+                id: left_id,
+                raw: left_raw,
+                collapsed: left_collapsed,
+                children: left_children,
+                breadcrumb: left_breadcrumb,
+                page_property: left_page_property,
+                marker: left_marker,
+                priority: left_priority,
+                heading_level: left_heading_level,
+                scheduled: left_scheduled,
+                deadline: left_deadline,
+                tags: left_tags,
+                properties: left_properties,
+            } = left;
+            let crate::BlockDto {
+                id: right_id,
+                raw: right_raw,
+                collapsed: right_collapsed,
+                children: right_children,
+                breadcrumb: right_breadcrumb,
+                page_property: right_page_property,
+                marker: right_marker,
+                priority: right_priority,
+                heading_level: right_heading_level,
+                scheduled: right_scheduled,
+                deadline: right_deadline,
+                tags: right_tags,
+                properties: right_properties,
+            } = right;
+            left_id == right_id
+                && left_raw == right_raw
+                && left_collapsed == right_collapsed
+                && left_breadcrumb == right_breadcrumb
+                && left_page_property == right_page_property
+                && left_marker == right_marker
+                && left_priority == right_priority
+                && left_heading_level == right_heading_level
+                && left_scheduled == right_scheduled
+                && left_deadline == right_deadline
+                && left_tags == right_tags
+                && left_properties == right_properties
+                && block_dtos_equal(left_children, right_children)
         })
 }
 
