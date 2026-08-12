@@ -26110,20 +26110,44 @@ mod tests {
         name: &str,
         blocks: Vec<BlockDto>,
     ) -> (PageDto, String) {
+        accepted_new_application_page_kind(handle, name, SyncPageKind::Page, blocks)
+    }
+
+    fn accepted_new_application_page_kind(
+        handle: &SyncRuntimeHandle,
+        name: &str,
+        page_kind: SyncPageKind,
+        blocks: Vec<BlockDto>,
+    ) -> (PageDto, String) {
         accepted_application_save(
             handle,
             handle
                 .save_application_page(SyncApplicationPageSaveRequest {
                     target: SyncApplicationPageSaveTarget::New {
                         name: name.into(),
-                        page_kind: SyncPageKind::Page,
+                        page_kind,
                     },
-                    page: new_application_page(name, SyncPageKind::Page, None, blocks),
+                    page: new_application_page(name, page_kind, None, blocks),
                 })
                 .unwrap(),
             name,
-            SyncPageKind::Page,
+            page_kind,
         )
+    }
+
+    fn application_move_test_root(label: &str, descendants: usize) -> BlockDto {
+        BlockDto {
+            id: format!("temporary-{label}"),
+            raw: label.to_owned(),
+            children: (0..descendants)
+                .map(|index| BlockDto {
+                    id: format!("temporary-{label}-{index}"),
+                    raw: format!("{label} descendant {index}"),
+                    ..BlockDto::default()
+                })
+                .collect(),
+            ..BlockDto::default()
+        }
     }
 
     fn accepted_application_move(
@@ -27310,6 +27334,174 @@ mod tests {
             other => panic!("cold reopen did not resolve episode: {other:?}"),
         }
         assert_eq!(fixture.manifest_count(), manifests_before + 1);
+    }
+
+    #[test]
+    fn application_cross_page_move_scaled_work_is_one_bounded_transaction() {
+        struct Case {
+            label: &'static str,
+            page_kind: SyncPageKind,
+            roots: usize,
+            descendants_per_root: usize,
+            place_as_child: bool,
+        }
+
+        for case in [
+            Case {
+                label: "deep-pointer",
+                page_kind: SyncPageKind::Page,
+                roots: 1,
+                descendants_per_root: 100,
+                place_as_child: true,
+            },
+            Case {
+                label: "fifty-journal-roots",
+                page_kind: SyncPageKind::Journal,
+                roots: 50,
+                descendants_per_root: 0,
+                place_as_child: false,
+            },
+            Case {
+                label: "three-journal-subtrees",
+                page_kind: SyncPageKind::Journal,
+                roots: 3,
+                descendants_per_root: 100,
+                place_as_child: false,
+            },
+        ] {
+            let fixture = RuntimeHostFixture::safe(case.label);
+            let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+            drive_initial_feed(&handle);
+            let (source_name, destination_name) = match case.page_kind {
+                SyncPageKind::Page => (
+                    format!("{} Source", case.label),
+                    format!("{} Destination", case.label),
+                ),
+                SyncPageKind::Journal => ("Jul 28th, 2026".to_owned(), "Jul 27th, 2026".to_owned()),
+            };
+            let source_blocks = (0..case.roots)
+                .map(|index| {
+                    application_move_test_root(
+                        &format!("{} root {index}", case.label),
+                        case.descendants_per_root,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (source, source_revision) = accepted_new_application_page_kind(
+                &handle,
+                &source_name,
+                case.page_kind,
+                source_blocks,
+            );
+            let (destination, destination_revision) = accepted_new_application_page_kind(
+                &handle,
+                &destination_name,
+                case.page_kind,
+                vec![application_move_test_root("destination parent", 0)],
+            );
+            drive_initial_feed(&handle);
+
+            let source_identities = source
+                .blocks
+                .iter()
+                .map(|block| block.id.clone())
+                .collect::<Vec<_>>();
+            let placement = if case.place_as_child {
+                SyncApplicationMovePlacement::Child {
+                    parent_identity: destination.blocks[0].id.clone(),
+                    position: 0,
+                }
+            } else {
+                SyncApplicationMovePlacement::Root { position: 0 }
+            };
+            let request = SyncApplicationMoveSubtreesRequest {
+                episode_id: Uuid::new_v4().to_string(),
+                source_path: source.path,
+                source_revision,
+                destination_path: destination.path,
+                destination_revision,
+                roots: source_identities
+                    .iter()
+                    .map(|identity| SyncApplicationMoveRoot {
+                        identity: identity.clone(),
+                        raw_rewrite: None,
+                    })
+                    .collect(),
+                placement,
+                admission: application_move_admission(),
+            };
+
+            let manifests_before = fixture.manifest_count();
+            let sqlite_before = fixture.applied_batch_count();
+            let engine_before = handle.engine_instrumentation().unwrap();
+            let started = Instant::now();
+            let outcome = accepted_application_move(&handle, &request);
+            let elapsed = started.elapsed();
+            let (source_after, destination_after) = match outcome {
+                SyncApplicationMoveSubtreesOutcome::Committed {
+                    source,
+                    destination,
+                    ..
+                } => (source.page, destination.page),
+                other => panic!("{} did not settle: {other:?}", case.label),
+            };
+            let engine_after = handle.engine_instrumentation().unwrap();
+
+            assert!(source_after.blocks.is_empty(), "{}", case.label);
+            let moved = if case.place_as_child {
+                &destination_after.blocks[0].children
+            } else {
+                &destination_after.blocks[..case.roots]
+            };
+            assert_eq!(
+                moved
+                    .iter()
+                    .map(|block| block.id.as_str())
+                    .collect::<Vec<_>>(),
+                source_identities
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                "{}",
+                case.label,
+            );
+            assert_eq!(
+                fixture.manifest_count(),
+                manifests_before + 1,
+                "{}",
+                case.label
+            );
+            assert_eq!(
+                fixture.applied_batch_count(),
+                sqlite_before + 1,
+                "{}",
+                case.label
+            );
+            assert_eq!(
+                engine_after.prepare_transactions,
+                engine_before.prepare_transactions + 1,
+                "{} authored more than one semantic transaction",
+                case.label,
+            );
+            assert_eq!(
+                engine_after.external_range_scans, engine_before.external_range_scans,
+                "{} entered a graph-wide external range scan",
+                case.label,
+            );
+            assert_eq!(
+                engine_after.prospective_catalog_shape_entry_visits,
+                engine_before.prospective_catalog_shape_entry_visits,
+                "{} scanned the graph catalog while planning the move",
+                case.label,
+            );
+            eprintln!(
+                "application_cross_page_move_receipt case={} roots={} descendants={} elapsed_ms={:.3} manifests=1 sqlite_batches=1 semantic_transactions=1",
+                case.label,
+                case.roots,
+                case.roots.saturating_mul(case.descendants_per_root),
+                elapsed.as_secs_f64() * 1_000.0,
+            );
+        }
     }
 
     #[test]

@@ -2382,6 +2382,83 @@ describe("managed actor-owned cross-page moves", () => {
       save.mockRestore();
     }
   });
+
+  it("routes 50 journal roots through one move command and no ordinary save", async () => {
+    const today = { id: "today", raw: "today", collapsed: false, children: [] };
+    const older = Array.from({ length: 50 }, (_, index) => ({
+      id: `older-${index}`,
+      raw: `older ${index}`,
+      collapsed: false,
+      children: [],
+    }));
+    await loadFeed([
+      page("Today", "journals/today.md", "today-r1", [today], "journal"),
+      page("Older", "journals/older.md", "older-r1", older, "journal"),
+    ]);
+    managed();
+    selectBlock(older[0].id);
+    extendSelectionTo(older[older.length - 1].id);
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed", episode_id: request.episode_id, batch_id: "journal-fifty", recovered: false,
+        source: { page: page("Older", "journals/older.md", "older-r2", [], "journal"), revision: "older-r2" },
+        destination: { page: page("Today", "journals/today.md", "today-r2", [today, ...older], "journal"), revision: "today-r2" },
+      },
+    }));
+    const save = vi.spyOn(backend(), "savePage");
+    try {
+      await moveSelectionItems(-1);
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(move.mock.calls[0][1].roots.map((root) => root.identity)).toEqual(older.map((block) => block.id));
+      expect(pageByName("Today")!.roots).toEqual(["today", ...older.map((block) => block.id)]);
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      move.mockRestore();
+      save.mockRestore();
+    }
+  });
+
+  it("routes three 100-descendant pointer subtrees through one move command", async () => {
+    const roots = Array.from({ length: 3 }, (_, rootIndex) => ({
+      id: `source-${rootIndex}`,
+      raw: `source ${rootIndex}`,
+      collapsed: true,
+      children: Array.from({ length: 100 }, (_, childIndex) => ({
+        id: `source-${rootIndex}-${childIndex}`,
+        raw: `child ${rootIndex}-${childIndex}`,
+        collapsed: false,
+        children: [],
+      })),
+    }));
+    const target = { id: "target", raw: "target", collapsed: false, children: [] };
+    await loadFeed([
+      page("Source", "pages/source.md", "source-r1", roots),
+      page("Destination", "pages/destination.md", "destination-r1", [target]),
+    ]);
+    managed();
+    const move = vi.spyOn(backend(), "moveManagedApplicationSubtrees").mockImplementation(async (binding, request) => ({
+      binding_generation: binding,
+      application_page_admission: managedStorageRuntime.snapshot().applicationPageAdmission!,
+      outcome: {
+        status: "committed", episode_id: request.episode_id, batch_id: "pointer-deep", recovered: false,
+        source: { page: page("Source", "pages/source.md", "source-r2", []), revision: "source-r2" },
+        destination: { page: page("Destination", "pages/destination.md", "destination-r2", [...roots, target]), revision: "destination-r2" },
+      },
+    }));
+    const save = vi.spyOn(backend(), "savePage");
+    try {
+      await expect(moveBlocksRelative(roots.map((root) => root.id), target.id, "before")).resolves.toBe(true);
+      expect(move).toHaveBeenCalledTimes(1);
+      expect(move.mock.calls[0][1].roots.map((root) => root.identity)).toEqual(roots.map((root) => root.id));
+      expect(pageByName("Destination")!.roots).toEqual([...roots.map((root) => root.id), "target"]);
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      move.mockRestore();
+      save.mockRestore();
+    }
+  });
 });
 
 describe("selection indent is single-page (ds8-2)", () => {
