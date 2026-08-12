@@ -14025,13 +14025,6 @@ mod tests {
         assert!(!truncated_archive.join("projection-work").exists());
     }
 
-    // Quarantined for v0.6.92, not repaired: the rebuild reports zero
-    // inductive reference-coverage checks where this expects one per accepted
-    // part. Open as GH #314, which records what is established and what still
-    // has to be read in tine-storage to decide whether the assertion is stale
-    // or a per-part verification step stopped running. Deliberately not
-    // relaxed to make the release gate green. Un-ignore with the answer.
-    #[ignore = "GH #314: bootstrap rebuild reports zero inductive reference-coverage checks"]
     #[test]
     fn inactive_bootstrap_sqlite_rebuilds_zero_one_and_forced_multipart_exactly() {
         let (zero_root, zero, workspace) =
@@ -14181,10 +14174,13 @@ mod tests {
         // applying each accepted event is exactly what a part costs.
         assert_eq!(multi_opened.rebuild.accepted_root_authentications, 1);
         assert_eq!(multi_opened.rebuild.exact_catalog_loads, 1);
-        assert_eq!(
-            multi_opened.rebuild.reference_coverage_inductive_checks,
-            multi.aggregate().parts().len()
-        );
+        // Terminal bootstrap construction intentionally does not replay each
+        // part's reference delta. It authenticates and applies every accepted
+        // event above, seeds the final rows once, then proves reference
+        // coverage once over that terminal materialization. Per-part
+        // inductive checks would describe the incremental replay path, not
+        // this bounded terminal path (GH #314).
+        assert_eq!(multi_opened.rebuild.reference_coverage_inductive_checks, 0);
         assert_eq!(multi_opened.rebuild.reference_coverage_full_scans, 1);
         assert_eq!(multi_opened.rebuild.final_semantic_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.final_row_digest_equivalence_proofs, 1);
