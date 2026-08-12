@@ -48717,6 +48717,79 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "manual release benchmark: settled broad reconciliation and safe shutdown"]
+    fn managed_reconciliation_and_shutdown_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_reconciliation_and_shutdown_manual_benchmark -- --ignored --nocapture"
+        );
+        let total_pages = std::env::var("TINE_MANAGED_RECONCILIATION_BENCH_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|pages| *pages >= 4)
+            .unwrap_or(1_000);
+        let blocks_per_page = std::env::var("TINE_MANAGED_RECONCILIATION_BENCH_BLOCKS_PER_PAGE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|blocks| *blocks > 0)
+            .unwrap_or(1);
+        let fixture = ActivationFixture::scaled_with_blocks(
+            &format!("managed-reconciliation-{total_pages}"),
+            0xa0fa + total_pages as u128,
+            total_pages - 3,
+            blocks_per_page,
+        );
+        let exact_source = user_graph_bytes(&fixture.graph_root);
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("activation retains a runtime");
+        drive_initial_feed(&handle);
+
+        handle
+            .observe_watcher(vec![SyncWatcherObservation::RescanRequired])
+            .unwrap();
+        let reconciliation_started = Instant::now();
+        let mut turns = 0usize;
+        while handle.status().unwrap().watcher.pending {
+            turns = turns.saturating_add(1);
+            assert!(
+                turns <= 1_024,
+                "settled broad reconciliation exceeded the bounded turn budget"
+            );
+            match handle.tick().unwrap() {
+                SyncRuntimeTick::Terminal(detail) | SyncRuntimeTick::Failed(detail) => {
+                    panic!("settled broad reconciliation failed: {detail}")
+                }
+                _ => {}
+            }
+        }
+        let reconciliation = reconciliation_started.elapsed();
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            exact_source,
+            "settled reconciliation must preserve every graph byte"
+        );
+
+        let shutdown_started = Instant::now();
+        let shutdown = handle.clean_shutdown();
+        let shutdown_elapsed = shutdown_started.elapsed();
+        assert!(matches!(shutdown, Ok(SyncShutdownOutcome::Safe(_))));
+        assert_eq!(
+            user_graph_bytes(&fixture.graph_root),
+            exact_source,
+            "safe shutdown after reconciliation must preserve every graph byte"
+        );
+        eprintln!(
+            "managed_reconciliation_shutdown_bench total_pages={} blocks_per_page={} turns={} reconciliation_ms={:.3} shutdown_ms={:.3}",
+            total_pages,
+            blocks_per_page,
+            turns,
+            startup_ms(reconciliation),
+            startup_ms(shutdown_elapsed),
+        );
+    }
+
     fn remove_resume_points(root: &Path) -> usize {
         let mut removed = 0;
         let mut directories = vec![root.to_path_buf()];
