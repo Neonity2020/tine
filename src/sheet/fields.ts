@@ -11,7 +11,7 @@ import {
 import { facetsFromDto, facetsOf, inlineText, parseBody, tagIdentityKey, type Facets } from "../render/facets";
 import { isRenderHiddenProp } from "../render/block";
 import { leadingMarker, nextMarker, setMarker } from "../editor/marker";
-import { cycleMarkerSmart } from "../editor/repeat";
+import { cycleMarkerSmart, toggleMarkerLabel } from "../editor/repeat";
 import { MARKERS } from "../markers";
 import { MARKER_RE } from "../markers";
 import { workflow, timetrackingEnabled, logbookWithSecondSupport } from "../ui";
@@ -341,6 +341,20 @@ export function cycleField(id: string, field: "state" | "priority"): boolean {
   const cur = facetsForBlock(id)?.priority ?? null;
   const next = cur === "A" ? "B" : cur === "B" ? "C" : cur === "C" ? null : "A";
   return writeField(id, "priority", next ?? "");
+}
+
+export function toggleStateMarkerLabel(id: string): boolean {
+  if (blockPageReadOnly(id)) return false;
+  const node = doc.byId[id];
+  if (!node) return false;
+  const raw = toggleMarkerLabel(node.raw, {
+    format: formatForBlock(id),
+    enabled: timetrackingEnabled(),
+    withSeconds: logbookWithSecondSupport(),
+  });
+  if (raw === null) return false;
+  setRaw(id, raw, { timetracking: false });
+  return true;
 }
 
 export function groupKeyForBlock(id: string, field: FieldId): string | null {

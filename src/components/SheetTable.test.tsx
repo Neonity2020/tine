@@ -1504,7 +1504,7 @@ describe("SheetTable", () => {
     dispose();
   });
 
-  it("state marker click cycles the marker, selects the cell, and does not edit", () => {
+  it("state marker click toggles the open pair, selects the cell, and does not edit", () => {
     loadTableDoc();
     const { root, dispose } = mount(() => <Block id="table" />);
 
@@ -1514,6 +1514,9 @@ describe("SheetTable", () => {
     expect(cellSel()).toEqual({ kind: "cell", gridId: "table", row: 0, col: 1 });
     expect(cell(root, 0, 1).classList.contains("sheet-cell-selected")).toBe(true);
     expect(editingId()).toBeNull();
+
+    (cell(root, 0, 1).querySelector(".block-marker") as HTMLElement).click();
+    expect(doc.byId.r1.raw.split("\n")[0]).toBe("TODO [#A] Ship #sheets");
     dispose();
   });
 

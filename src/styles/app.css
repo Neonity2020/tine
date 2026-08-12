@@ -1804,6 +1804,7 @@ textarea {
 
 .references-header.clickable {
   cursor: pointer;
+  -webkit-user-select: none;
   user-select: none;
 }
 
@@ -3665,6 +3666,8 @@ textarea {
   cursor: text;
   text-align: left;
   padding-left: 34px;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .page-trailing-block-target span {
   opacity: 0;
@@ -4273,9 +4276,11 @@ textarea {
   border-radius: 4px;
   background: color-mix(in srgb, currentColor 15%, transparent);
   color: var(--marker-color);
-  cursor: pointer;
+  cursor: default;
   vertical-align: 1px;
 }
+
+.block-marker.marker-clickable { cursor: pointer; }
 
 /* GFM `[ ]`/`[x]` checklist checkbox (distinct from TODO markers). */
 .block-checkbox {
@@ -6343,9 +6348,12 @@ body.file-drop-active::after {
   justify-content: center;
   cursor: zoom-out;
 }
-.lightbox-img {
+.lightbox-overlay > img.lightbox-img {
+  width: auto;
+  height: auto;
   max-width: 92vw;
   max-height: 92vh;
+  object-fit: contain;
   border-radius: 6px;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
   cursor: default;
@@ -6751,6 +6759,8 @@ img.emoji {
   display: flex;
   align-items: center;
   gap: 8px;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .reference-filter-toggle {

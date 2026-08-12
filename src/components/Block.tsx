@@ -148,7 +148,7 @@ import { openInNewTab } from "../router";
 import { blockRefCount } from "../blockRefCounts";
 import { BlockReferences } from "./BlockReferences";
 import { editorCommandFor, isPermittedTabGesture, isTabLikeEvent } from "../keybindings";
-import { cycleMarkerSmart, toggleTaskDone } from "../editor/repeat";
+import { cycleMarkerSmart, markerLabelClickable, toggleMarkerLabel, toggleTaskDone } from "../editor/repeat";
 import { setMarker } from "../editor/marker";
 import { registerTransientLayer } from "../transientLayers";
 
@@ -818,9 +818,10 @@ function Rendered(props: {
       <Show when={facets().marker}>
         <span
           class={`block-marker marker-${facets().marker?.toLowerCase()}`}
+          classList={{ "marker-clickable": markerLabelClickable(facets().marker) }}
           onClick={(e) => {
             e.stopPropagation();
-            cycleBlockMarker(props.id);
+            toggleBlockMarkerLabel(props.id);
           }}
         >
           {facets().marker}
@@ -881,13 +882,15 @@ function Rendered(props: {
   );
 }
 
-// Cycle the task marker on a block (OG order), used by the marker chip click.
-function cycleBlockMarker(id: string) {
-  const { raw } = cycleMarkerSmart(doc.byId[id].raw, workflow(), {
+// Marker-label clicks follow OG's separate two-state toggle. Keyboard marker
+// cycling remains cycleMarkerSmart and may still reach DONE / no marker.
+function toggleBlockMarkerLabel(id: string) {
+  const raw = toggleMarkerLabel(doc.byId[id].raw, {
     format: formatForBlockId(id),
     enabled: timetrackingEnabled(),
     withSeconds: logbookWithSecondSupport(),
   });
+  if (raw === null) return;
   setRaw(id, raw, { timetracking: false });
 }
 

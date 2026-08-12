@@ -6292,6 +6292,64 @@
       "notes": "DELIBERATE DIVERGENCE FROM OG, approved by Martin 2026-08-09. OG's Enter dwim (frontend/util/thingatpt.cljs admonition&src-at-point) recognises only ``` and #+BEGIN_, so OG also splits the bullet and breaks the environment; the reporter is asking for an improvement, not restored parity. The v0.6.92 Enter fix was too narrow: the reporter's post-release follow-up proved that pasting LaTeX containing a blank line into the same environment still segmented it into outline blocks. The shared syntax-sensitive editor decision now uses caretInDisplayMath for paste as well as Enter, including selection replacement; ordinary blank-line prose still segments normally. The parser, on-disk bytes and property classification remain untouched. Necessity gate proven: the exact reporter paste tests fail before the paste predicate is widened."
     },
     {
+      "id": "UI-TASK-MARKER-LABEL-CLICK-259",
+      "title": "Clicking a task marker label uses Logseq's open-state toggle and never removes DONE",
+      "family": "editor-task-markers",
+      "sources": {
+        "issues": [259],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/repeat.test.ts",
+          "src/components/Block.markerClick.test.tsx",
+          "src/components/SheetTable.test.tsx"
+        ],
+        "scenario": "editor.task-marker-label-click",
+        "failBefore": "proven"
+      },
+      "notes": "OG source at 6e7afa8eb separates marker-switch (components/block.cljs:1861) from keyboard cycle-marker-state (util/marker.cljs:40): label clicks toggle TODO/DOING and LATER/NOW, while DONE is not clickable; keyboard cycling may still reach DONE and then remove the marker. Tine had wired both block and Sheet label clicks to its keyboard cycle, so clicking DONE silently removed completion. The click helper is now separate, preserves the existing logbook transition machinery, and is shared by ordinary blocks and Sheet state cells. Keyboard and checkbox behavior are unchanged. The reporter confirmed this exact OG behavior and accepted it."
+    },
+    {
+      "id": "UI-LIGHTBOX-CUSTOM-CSS-GEOMETRY-319",
+      "title": "Generic custom.css image sizing does not constrain the full-screen lightbox",
+      "family": "image-lightbox",
+      "sources": {
+        "issues": [319],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src/components/Lightbox.customCss.test.tsx"],
+        "scenario": "image.lightbox-custom-css-geometry",
+        "failBefore": "proven"
+      },
+      "notes": "Graph custom.css intentionally loads after Tine's stylesheet, so a generic `img { width: 320px; height: auto }` thumbnail rule also constrained `.lightbox-img`. The lightbox now owns its geometry through the more-specific `.lightbox-overlay > img.lightbox-img` rule with auto width/height, viewport maxima and object-fit contain. A later generic img rule remains effective for inline thumbnails but loses only on the dedicated lightbox surface; users can still target `.lightbox-img` explicitly if desired."
+    },
+    {
+      "id": "UI-NATIVE-SELECTION-EXCLUDES-CHROME-328",
+      "title": "Native page selections exclude Add block and reference-section UI labels",
+      "family": "native-text-selection",
+      "sources": {
+        "issues": [328],
+        "commits": []
+      },
+      "platforms": ["android", "linux", "macos", "windows"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": ["src/styles/uiChromeSelection.test.ts"],
+        "scenario": "selection.page-content-excludes-ui-chrome",
+        "failBefore": "proven"
+      },
+      "notes": "The reporter's concrete copied suffixes are UI labels, not page content: `+ Add block`, `Linked References`, and `Unlinked References`. The trailing target and every references header now opt out of native selection in both standard and WebKit-prefixed CSS, so mouse/touch selection can cross the page without copying application chrome. This deliberately does not attempt nonstandard region-containment semantics; actual reference block content remains selectable."
+    },
+    {
       "id": "UI-NAV-REVEAL-COLLAPSED-BLOCK-258",
       "title": "Navigating to a block nested inside collapsed parents expands its ancestors, scrolls to it and highlights it",
       "family": "navigation",

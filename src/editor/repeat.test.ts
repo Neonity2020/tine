@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { hasRepeater, rollRepeat, cycleMarkerSmart, toggleTaskDone } from "./repeat";
+import { hasRepeater, markerLabelClickable, rollRepeat, cycleMarkerSmart, toggleMarkerLabel, toggleTaskDone } from "./repeat";
 
 describe("repeaters", () => {
   it("detects a repeater on scheduled/deadline", () => {
@@ -26,6 +26,17 @@ describe("repeaters", () => {
   it("cycleMarkerSmart behaves normally for non-repeating tasks", () => {
     const { raw } = cycleMarkerSmart("DOING jog", "todo");
     expect(raw).toBe("DONE jog");
+  });
+
+  it("marker-label clicks use Logseq's two-state toggle instead of the keyboard cycle", () => {
+    expect(toggleMarkerLabel("TODO buy milk")).toBe("DOING buy milk");
+    expect(toggleMarkerLabel("DOING buy milk")).toBe("TODO buy milk");
+    expect(toggleMarkerLabel("LATER buy milk")).toBe("NOW buy milk");
+    expect(toggleMarkerLabel("NOW buy milk")).toBe("LATER buy milk");
+    expect(toggleMarkerLabel("DONE buy milk")).toBeNull();
+    expect(toggleMarkerLabel("CANCELED buy milk")).toBeNull();
+    expect(["TODO", "DOING", "LATER", "NOW"].every(markerLabelClickable)).toBe(true);
+    expect(markerLabelClickable("DONE")).toBe(false);
   });
 
   it("toggleTaskDone checks an open task to DONE and unchecks back to the open marker", () => {

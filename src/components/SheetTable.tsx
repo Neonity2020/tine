@@ -50,6 +50,7 @@ import {
   fieldLabel,
   isFormulaField,
   readField,
+  toggleStateMarkerLabel,
   writeField,
   type FieldId,
   type FieldValue,
@@ -79,6 +80,7 @@ import {
 } from "../sheet/formulaEval";
 import type { FormulaValue } from "../sheet/formula";
 import { isPlainDecimalNumber, parseIsoDateLike } from "../sheet/typed";
+import { markerLabelClickable } from "../editor/repeat";
 import {
   openActionContextMenu,
   openDatePicker,
@@ -1578,7 +1580,7 @@ function FieldCell(props: {
     props.freezeColumns();
     select();
     if (!editable()) return;
-    if (props.field === "state") cycleField(props.row.id, "state");
+    if (props.field === "state") toggleStateMarkerLabel(props.row.id);
     else if (props.field === "priority") cycleField(props.row.id, "priority");
     else if (props.field === "scheduled" || props.field === "deadline") {
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -1765,6 +1767,7 @@ function FieldValueView(props: {
       <Show when={props.field === "state"}>
         <span
           class={`block-marker marker-${(props.value?.raw ?? "").toLowerCase()}`}
+          classList={{ "marker-clickable": markerLabelClickable(props.value?.raw) }}
           onClick={props.onControlClick}
           onDblClick={stopControlDoubleClick}
         >
