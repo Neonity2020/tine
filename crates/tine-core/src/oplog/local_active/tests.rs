@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::model::Graph;
-use crate::oplog::authenticated_patricia::{
+use crate::oplog::content_patricia::{
     fail_next_patricia_reclamation_for_test, PatriciaReclamationFailureForTest,
 };
 use crate::oplog::enrollment::{
@@ -17,7 +17,7 @@ use crate::oplog::enrollment::{
 };
 use crate::oplog::hot_engine::{
     fail_next_ephemeral_bootstrap_predecessor_restore_for_test, take_last_admitted_local_author,
-    AcceptedFrontierRoot, AuthenticatedPatriciaIndexKind, PackedPatriciaMaintenanceOutcome,
+    AcceptedFrontierRoot, ContentPatriciaIndexKind, PackedPatriciaMaintenanceOutcome,
     ProjectionEndpointBinding, ProjectionStorageBinding, MAX_EPHEMERAL_BLOCK_CLAIMS,
 };
 use crate::oplog::identity::ARCHIVE_INSTANCE_CLAIM_FILE;
@@ -3447,7 +3447,7 @@ fn the_bootstrap_ancestry_proof_is_bounded_by_the_changed_radix_paths() {
 ///
 /// A non-empty inactive bootstrap binds a `reference_catalog_root` into every
 /// accepted cold record. That root has exactly one construction — the target
-/// archive's durable authenticated Patricia store — so every bound root must be
+/// archive's durable content-addressed Patricia store — so every bound root must be
 /// fully openable from a *fresh* archive open that holds no process-local
 /// engine, candidate, or in-memory catalog, both while the bootstrap is still
 /// inactive and after the runtime is promoted and its history has advanced.
@@ -7472,10 +7472,10 @@ fn packed_patricia_maintenance_is_post_commit_complete_and_best_effort() {
                 assert_eq!(
                     packed.indexes.each_ref().map(|index| index.kind),
                     [
-                        AuthenticatedPatriciaIndexKind::LogseqUuidClaims,
-                        AuthenticatedPatriciaIndexKind::PortablePaths,
-                        AuthenticatedPatriciaIndexKind::PageNames,
-                        AuthenticatedPatriciaIndexKind::ReferenceCatalog,
+                        ContentPatriciaIndexKind::LogseqUuidClaims,
+                        ContentPatriciaIndexKind::PortablePaths,
+                        ContentPatriciaIndexKind::PageNames,
+                        ContentPatriciaIndexKind::ReferenceCatalog,
                     ]
                 );
                 assert_eq!(

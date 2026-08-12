@@ -1,5 +1,11 @@
 #![allow(clippy::result_large_err)]
 
+//! Content-addressed Patricia indexes used for bounded, scan-free lookup.
+//!
+//! Digests identify immutable nodes and detect accidental corruption from
+//! crashes, torn writes, or interrupted file transfer. They are not an
+//! authentication boundary and do not defend against a byte-forging actor.
+
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -65,9 +71,12 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
             Self::Ordinary => {
                 publish_immutable_exact(dir, filename, bytes, "Logseq UUID claim index node")
             }
-            Self::Detached(publisher) => {
-                publisher.publish(dir, filename, bytes, "authenticated Patricia index node")
-            }
+            Self::Detached(publisher) => publisher.publish(
+                dir,
+                filename,
+                bytes,
+                "content-addressed Patricia index node",
+            ),
         };
         result.map_err(tine_storage::PatriciaPublicationError::new)
     }
@@ -93,7 +102,7 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
             dir,
             filename,
             bytes,
-            "authenticated Patricia construction prerequisite",
+            "content-addressed Patricia construction prerequisite",
         )
         .map_err(tine_storage::PatriciaPublicationError::new)
     }
@@ -105,7 +114,7 @@ impl tine_storage::PatriciaNodePublisher for CorePatriciaPublisher {
         publication.commit().map_err(|error| {
             let error = match error {
                 tine_storage::FilesystemError::ByteCollision => StoreError::ImmutableCollision(
-                    "authenticated Patricia construction prerequisite",
+                    "content-addressed Patricia construction prerequisite",
                 ),
                 error => filesystem_error_without_collision(error),
             };
@@ -536,7 +545,7 @@ fn map_storage_error(error: tine_storage::PatriciaError) -> StoreError {
         tine_storage::PatriciaError::Publication(error) => {
             error.downcast::<StoreError>().unwrap_or_else(|_| {
                 StoreError::Bootstrap(
-                    "authenticated Patricia publisher returned an unknown error".into(),
+                    "content-addressed Patricia publisher returned an unknown error".into(),
                 )
             })
         }

@@ -1,10 +1,10 @@
 //! Admitted local semantic mutation and one-shot external reconciliation
 //! through one sealed authoritative and derived-state drain.
 //!
-//! This remains crate-private and deliberately has no startup, enrollment, or
-//! application-routing surface.
+//! The managed runtime owns this crate-private coordinator and invokes it for
+//! admitted local edits, provider ingress, recovery, and derived-state drains.
 
-#![allow(dead_code)] // activated only by the later persisted-enrollment packet
+#![allow(dead_code)] // mixed production coordinator and fault-injection surface
 
 use std::fmt;
 use std::sync::Arc;
@@ -2809,7 +2809,7 @@ pub(crate) mod simulator_harness {
         OperationalCoordinator, OperationalCoordinatorState, OperationalFaultPoint,
     };
     use crate::oplog::hot_engine::AcceptedFrontierRoot;
-    use crate::oplog::simulator::{
+    use crate::oplog::wire::{
         publish_bootstrap_prepared_for_simulator_fixture, CoordinatorAction,
         CoordinatorDurableBoundary, CoordinatorExpectedState, CoordinatorFailureWitness,
         CoordinatorFault, CoordinatorHandoffState, CoordinatorObservation, CoordinatorOracle,

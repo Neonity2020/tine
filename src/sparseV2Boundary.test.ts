@@ -39,6 +39,7 @@ describe("Tine-managed storage app boundary", () => {
       "Retry setup",
       "Tine-managed storage active",
       "Set up sync with another device...",
+      "Join an existing synced graph...",
       "Join this synced graph...",
       "Return to Direct files",
     ]) {

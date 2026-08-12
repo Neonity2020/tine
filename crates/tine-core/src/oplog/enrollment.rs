@@ -68,6 +68,16 @@ use super::shadow_projection::{
 use super::sqlite::{
     OpenProjection, ProjectionError, VerifiedBootstrapSqliteProjection, WorkspaceRuntimeProof,
 };
+use super::sync_layout::{
+    ENROLLMENT_AUTHORITY_FILE as AUTHORITY_FILE,
+    ENROLLMENT_AUTHORITY_TEMP_PREFIX as AUTHORITY_TEMP_PREFIX,
+    ENROLLMENT_DIR as ENROLLMENT_DIRECTORY, ENROLLMENT_HEAD_FILE as HEAD_FILE,
+    ENROLLMENT_HEAD_TEMP_PREFIX as HEAD_TEMP_PREFIX, ENROLLMENT_LEASE_FILE as LEASE_FILE,
+    ENROLLMENT_LOCAL_DIR as LOCAL_DIRECTORY, ENROLLMENT_RECORDS_DIR as RECORDS_DIRECTORY,
+    ENROLLMENT_RECORD_SUFFIX as RECORD_SUFFIX, ENROLLMENT_RECORD_TEMP_PREFIX as RECORD_TEMP_PREFIX,
+    ENROLLMENT_STORAGE_DIR as SPARSE_STORAGE_DIRECTORY,
+    ENROLLMENT_VERSION_DIR as STORAGE_VERSION_DIRECTORY, LOCAL_ACTIVATION_RESERVATION_FILE,
+};
 use super::{
     BatchId, BlobDescription, CanonicalArchiveResourceId, CanonicalGraphResourceId, ContentDigest,
     DeviceId, DocumentId, GraphTextScopeBinding, ImportId, LineageDigest, ObjectStore,
@@ -95,20 +105,7 @@ pub(crate) const MAX_ENROLLMENT_AUDIT_PAGE: usize = 64;
 pub(crate) const MAX_ENROLLMENT_NAMESPACE_ENTRIES: usize = 2048;
 pub(crate) const MAX_BLOCKED_REASON_CODE_BYTES: usize = 64;
 
-const SPARSE_STORAGE_DIRECTORY: &str = "sparse-storage";
-const STORAGE_VERSION_DIRECTORY: &str = "v2";
-const LOCAL_DIRECTORY: &str = "local";
-const ENROLLMENT_DIRECTORY: &str = "enrollment";
-const RECORDS_DIRECTORY: &str = "records";
-const LEASE_FILE: &str = "lease";
-const AUTHORITY_FILE: &str = "authority-v1.claim";
-const HEAD_FILE: &str = "head";
-const RECORD_SUFFIX: &str = ".enrollment";
 const HEAD_BYTES: usize = 65;
-const HEAD_TEMP_PREFIX: &str = ".head-tmp-";
-const RECORD_TEMP_PREFIX: &str = ".record-tmp-";
-const AUTHORITY_TEMP_PREFIX: &str = ".authority-tmp-";
-const LOCAL_ACTIVATION_RESERVATION_FILE: &str = "local-activation-v1.reservation";
 const MAX_LOCAL_ACTIVATION_RESERVATION_BYTES: usize = 4 * 1024;
 const ENROLLMENT_AUTHORITY_SCHEMA_V1: u32 = 1;
 const ENROLLMENT_AUTHORITY_SCHEMA_VERSION: u32 = 2;
@@ -11251,7 +11248,7 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_simulator_formats() {
+    fn enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_wire_scenarios() {
         fn visit(directory: &Path, files: &mut Vec<PathBuf>) {
             for entry in fs::read_dir(directory).unwrap() {
                 let entry = entry.unwrap();
@@ -11282,8 +11279,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["enrollment_legacy_hmac.rs", "simulator.rs"],
-            "keyed enrollment compatibility must stay isolated; simulator is a deterministic test format"
+            vec!["enrollment_legacy_hmac.rs", "wire.rs"],
+            "keyed enrollment compatibility must stay isolated; wire contains the deterministic scenario format"
         );
         let legacy = fs::read_to_string(root.join("enrollment_legacy_hmac.rs")).unwrap();
         let legacy_production = legacy.split("#[cfg(test)]").next().unwrap();

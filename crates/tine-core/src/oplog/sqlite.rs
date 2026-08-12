@@ -68,6 +68,11 @@ use super::import::{
 };
 use super::object_store::ValidatedBootstrapPublicationV1;
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
+use super::sync_layout::{
+    SQLITE_APPLIER_LOCK_FILE as SQLITE_APPLIER_LEASE_FILE,
+    SQLITE_RUNTIME_DIR as OBJECT_STORE_LEASE_NAMESPACE,
+    SQLITE_WORKSPACES_DIR as SQLITE_WORKSPACE_LEASE_NAMESPACE,
+};
 use super::{
     BatchCausalDot, BatchId, BatchInspection, BlockId, CausalPeerId, ContentDigest,
     DocumentDependencies, DocumentId, FrontierV2, LineageDigest, LogseqUuid, LogseqUuidResolution,
@@ -88,9 +93,6 @@ const PROJECTION_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 /// are drained into materialization chunks, so this only caps how many
 /// authenticated catalog rows the builder owns at once.
 pub(crate) const TERMINAL_CATALOG_CURSOR_PAGE_ROWS: usize = 128;
-const OBJECT_STORE_LEASE_NAMESPACE: &str = ".tine-runtime";
-const SQLITE_WORKSPACE_LEASE_NAMESPACE: &str = "sqlite-workspaces";
-const SQLITE_APPLIER_LEASE_FILE: &str = "sqlite-applier.lock";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProjectionClaim {

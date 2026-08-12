@@ -34,6 +34,11 @@ use super::object_store::{
     open_dir_nofollow, publish_immutable_exact, read_optional_regular, sync_dir_required,
     StoreError,
 };
+use super::sync_layout::{
+    PROJECTION_WORK_CLAIM_FILE as CLAIM_FILE, PROJECTION_WORK_HEAD_FILE as HEAD_FILE,
+    PROJECTION_WORK_NODE_SUFFIX as NODE_SUFFIX, PROJECTION_WORK_PREPARED_SUFFIX as PREPARED_SUFFIX,
+    PROJECTION_WORK_ROOT_SUFFIX as ROOT_SUFFIX,
+};
 use super::{
     BatchId, BlobDescription, ContentDigest, FrontierV2, LogicalCompletionId, ManagedPath,
     ManifestObjectRef, PageId, PortablePathIndexRoot, PortablePathKeyDigest, ProjectionEndpointId,
@@ -115,11 +120,6 @@ const MAX_PREFLIGHT_BYTES: usize = 512 * 1024 * 1024;
 // its encoded representation; postcard's growing output Vec has capacity less
 // than twice the final canonical length.
 const BOUNDED_CANONICAL_DECODE_ALLOCATION_FACTOR: u64 = 3;
-const CLAIM_FILE: &str = "projection-work.claim";
-const HEAD_FILE: &str = "projection-work.head";
-const PREPARED_SUFFIX: &str = ".prepared";
-const NODE_SUFFIX: &str = ".work-node";
-const ROOT_SUFFIX: &str = ".work-root";
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProjectionWorkId([u8; 32]);

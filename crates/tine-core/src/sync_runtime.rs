@@ -127,22 +127,6 @@ use crate::oplog::reconciliation_baseline::{
 use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection;
 #[cfg(test)]
 use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
-#[cfg(test)]
-use crate::oplog::simulator::{
-    fail_next_pending_publication_marker_creation,
-    fail_next_provider_publication_after_physical_write,
-};
-use crate::oplog::simulator::{
-    inspect_cold_shared_provider_prefix, inspect_shared_provider_descriptor,
-    provider_transient_path, ColdSharedProviderPrefix, SharedProviderFrontierHeadV1,
-    SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
-    SharedProviderObservationCursor, SharedProviderPublicationCursor,
-    SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
-    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
-    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
-    SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
-    SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
-};
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 #[cfg(test)]
 use crate::oplog::sqlite::{
@@ -150,6 +134,10 @@ use crate::oplog::sqlite::{
     BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
 };
 use crate::oplog::sqlite_materialization::MaterializedTaskCandidateBlockRow;
+use crate::oplog::sync_layout::{
+    LOCAL_AUTHORSHIP_RECEIPT_DIR as LOCAL_AUTHORSHIP_RECEIPT_NAMESPACE,
+    MANAGED_LOCAL_JOURNAL_DIR as MANAGED_LOCAL_JOURNAL_NAMESPACE,
+};
 #[cfg(test)]
 use crate::oplog::trusted_local_commit::{
     last_commit_stage_timings, TrustedLocalCommitStageTimings,
@@ -160,6 +148,22 @@ use crate::oplog::trusted_local_commit::{
     TrustedLocalResponseEvidence, TrustedLocalRestartProjectionOutcome,
 };
 use crate::oplog::watcher_queue::WatcherObservation;
+#[cfg(test)]
+use crate::oplog::wire::{
+    fail_next_pending_publication_marker_creation,
+    fail_next_provider_publication_after_physical_write,
+};
+use crate::oplog::wire::{
+    inspect_cold_shared_provider_prefix, inspect_shared_provider_descriptor,
+    provider_transient_path, ColdSharedProviderPrefix, SharedProviderFrontierHeadV1,
+    SharedProviderManifestRecoveryLinkV1, SharedProviderObservation,
+    SharedProviderObservationCursor, SharedProviderPublicationCursor,
+    SharedProviderPublicationIntentV1, SharedProviderTransport, MAX_PROVIDER_RESCAN_ENTRIES,
+    SHARED_ENROLLMENT_DESCRIPTOR_PATH, SHARED_PROVIDER_FRONTIER_HEADS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_BLOBS_NAMESPACE,
+    SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
+    SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
+};
 use crate::oplog::{
     classify_managed_local_anchor, decode_managed_local_record, managed_local_v2_anchor_name,
     parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlockId, BlockLocation,
@@ -185,7 +189,6 @@ const RUNTIME_OPEN_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);
 #[cfg(test)]
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_secs(30);
-const MANAGED_LOCAL_JOURNAL_NAMESPACE: &str = "managed-local-journal-v1";
 const MANAGED_LOCAL_CHECKPOINT_BYTES: u64 = 4096;
 const MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION: u32 = 1;
 const MANAGED_LOCAL_GENERATION_ANCHOR_BYTES: u64 = 8192;
@@ -281,7 +284,6 @@ const MAX_PROVIDER_INTENT_RETIREMENT_PROBES_PER_TICK: usize = 16;
 const MAX_PROVIDER_RECOVERY_EXACT_QUEUE: usize = 256;
 const MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK: usize = 16;
 const LOCAL_AUTHORSHIP_RECEIPT_SCHEMA_VERSION: u32 = 1;
-const LOCAL_AUTHORSHIP_RECEIPT_NAMESPACE: &str = "local-authorship-v1";
 const MAX_LOCAL_AUTHORSHIP_RECEIPT_BYTES: u64 = 4096;
 static LOCAL_AUTHORSHIP_RECEIPT_LOCK: Mutex<()> = Mutex::new(());
 /// Maximum top-level operations plus nested rename rows in one submission.
@@ -40503,6 +40505,16 @@ mod tests {
     }
 
     #[test]
+    fn shared_provider_validation_is_not_unix_uid_coupled() {
+        let source = include_str!("oplog/wire.rs");
+        let uid_probe = ["gete", "uid"].concat();
+        assert!(
+            !source.contains(&uid_probe),
+            "shared provider admission must not depend on the Tine process uid"
+        );
+    }
+
+    #[test]
     fn cold_shared_descriptor_discovery_uses_the_canonical_supported_regular_file() {
         let fixture = ActivationFixture::nested_unicode("cold-conflict-control", 0xa185);
         let descriptor = activate_and_prepare_shared(&fixture);
@@ -40699,6 +40711,53 @@ mod tests {
         receiver_joining
             .join_shared(descriptor)
             .expect("receiver SharedActive");
+        drop(receiver_joining);
+
+        let initiator_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&initiator.request)));
+        let receiver_handle =
+            active_handle(SyncRuntimeHandle::open(reopen_request(&receiver.request)));
+        settle_shared_provider(&initiator_handle);
+        settle_shared_provider(&receiver_handle);
+        (initiator, receiver, initiator_handle, receiver_handle)
+    }
+
+    fn joined_shared_pair_from_graph_copy(
+        label: &str,
+        seed: u128,
+        source: &Path,
+    ) -> (
+        ActivationFixture,
+        ActivationFixture,
+        SyncRuntimeHandle,
+        SyncRuntimeHandle,
+    ) {
+        let initiator =
+            ActivationFixture::copied_graph(&format!("{label}-initiator"), seed, source);
+        let mut receiver =
+            ActivationFixture::copied_graph(&format!("{label}-receiver"), seed, source);
+        for graph_root in [&initiator.graph_root, &receiver.graph_root] {
+            let managed = graph_root.join(".tine-sync");
+            if managed.exists() {
+                fs::remove_dir_all(managed).unwrap();
+            }
+        }
+        receiver.request.identities.endpoint_id =
+            ProjectionEndpointId::from_uuid(Uuid::from_u128(seed + 0x10));
+        receiver.request.identities.device_id = DeviceId::from_uuid(Uuid::from_u128(seed + 0x11));
+        receiver.request.identities.session_id = SessionId::from_uuid(Uuid::from_u128(seed + 0x12));
+
+        let descriptor = activate_and_prepare_shared(&initiator);
+        copy_provider_tree(
+            &initiator.request.provider_root,
+            &receiver.request.provider_root,
+        );
+        let receiver_active = SyncRuntimeHandle::activate_or_resume_local(receiver.request.clone());
+        let receiver_joining = receiver_active.handle.expect("receiver LocalActive");
+        drive_initial_feed(&receiver_joining);
+        receiver_joining
+            .join_shared(descriptor)
+            .unwrap_or_else(|error| panic!("real-corpus receiver could not join: {error}"));
         drop(receiver_joining);
 
         let initiator_handle =
@@ -47511,6 +47570,136 @@ mod tests {
             receipt.total_ms < 10_000,
             "real-graph managed activation exceeded 10 seconds: {receipt:?}"
         );
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: committed edit to peer-visible latency on two graph copies"]
+    fn managed_two_device_sync_latency_real_corpora_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_two_device_sync_latency_real_corpora_manual_benchmark -- --ignored --nocapture"
+        );
+        const EDITS: usize = 50;
+        let corpora = [
+            ("tine-test", "TINE_SYNC_LATENCY_TINE_TEST", 0xa0e0_u128),
+            (
+                "logseq-anonymized",
+                "TINE_SYNC_LATENCY_LOGSEQ_ANONYMIZED",
+                0xa1e0_u128,
+            ),
+        ];
+
+        for (label, variable, seed) in corpora {
+            let source = real_graph_copy_source_from_env(variable);
+            let (author, receiver, author_handle, receiver_handle) =
+                joined_shared_pair_from_graph_copy(label, seed, &source);
+            let mut latency_us = Vec::with_capacity(EDITS);
+            for index in 0..EDITS {
+                let operation_seed = seed + 0x1_000 + index as u128 * 8;
+                let (batch_id, page_id, ..) = submit_shared_page(
+                    &author_handle,
+                    operation_seed,
+                    &format!("Sync latency {label} {index}"),
+                    &format!("pages/sync-latency-{label}-{index}.md"),
+                    &format!("committed sync latency marker {label} {index}"),
+                );
+                let committed = std::time::Instant::now();
+                publish_shared_batch(&author_handle, &author, batch_id);
+                settle_shared_provider(&author_handle);
+                let delivered = copy_provider_batch(
+                    &author,
+                    &receiver,
+                    batch_id,
+                    ProviderBatchDelivery::Complete,
+                );
+                receiver_handle
+                    .observe_provider_paths(delivered, false)
+                    .unwrap();
+
+                let mut visible = false;
+                for _ in 0..1_024 {
+                    let tick = receiver_handle.tick().unwrap();
+                    assert!(
+                        !matches!(
+                            tick,
+                            SyncRuntimeTick::RecoveryBlocked(_)
+                                | SyncRuntimeTick::Blocked(_)
+                                | SyncRuntimeTick::Terminal(_)
+                                | SyncRuntimeTick::Failed(_)
+                        ),
+                        "peer admission failed for {label} edit {index}: {tick:?}"
+                    );
+                    visible = matches!(
+                        receiver_handle
+                            .query(SyncRuntimeQueryRequest::LoadPage {
+                                page_id: page_id.to_string(),
+                                block_limit: 4,
+                            })
+                            .unwrap(),
+                        SyncRuntimeQueryReply::PageWithBlocks(Some(_))
+                    );
+                    if visible {
+                        break;
+                    }
+                }
+                assert!(visible, "peer did not expose {label} edit {index}");
+                latency_us.push(committed.elapsed().as_micros() as u64);
+            }
+
+            latency_us.sort_unstable();
+            let percentile = |percent: usize| latency_us[(latency_us.len() - 1) * percent / 100];
+            let mean_us = latency_us.iter().copied().sum::<u64>() / latency_us.len() as u64;
+            eprintln!(
+                "managed_sync_latency corpus={label} edits={EDITS} min_us={} p50_us={} p95_us={} max_us={} mean_us={mean_us}",
+                latency_us[0],
+                percentile(50),
+                percentile(95),
+                latency_us[latency_us.len() - 1],
+            );
+            assert!(matches!(
+                author_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+            assert!(matches!(
+                receiver_handle.clean_shutdown(),
+                Ok(SyncShutdownOutcome::Safe(_))
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark: activation of one 5k/10k/20k-block page"]
+    fn managed_activation_single_page_block_scale_manual_benchmark() {
+        assert!(
+            !cfg!(debug_assertions),
+            "this receipt is release-only; run cargo test -p tine-core --release managed_activation_single_page_block_scale_manual_benchmark -- --ignored --nocapture"
+        );
+        for (index, blocks) in [5_000_usize, 10_000, 20_000].into_iter().enumerate() {
+            let fixture = ActivationFixture::empty(
+                &format!("manual-single-page-{blocks}"),
+                0xa2e0 + index as u128 * 0x10,
+            );
+            let mut body = String::with_capacity(blocks.saturating_mul(96));
+            for block in 0..blocks {
+                body.push_str(&format!(
+                    "- {} single-page block {block} references [[Single page scale]] and #[[scale-tag]]\n  priority:: {}\n",
+                    if block % 2 == 0 { "TODO" } else { "DONE" },
+                    if block % 3 == 0 { "A" } else { "B" },
+                ));
+            }
+            fs::create_dir_all(fixture.graph_root.join("pages")).unwrap();
+            fs::write(fixture.graph_root.join("pages/single-page-scale.md"), body).unwrap();
+            let receipt = activate_with_scale_receipt(&fixture);
+            eprintln!(
+                "activation_single_page blocks={blocks} total_ms={} source_bytes={} phases={:?} construction={:?}",
+                receipt.total_ms,
+                receipt.source_bytes,
+                receipt.phase_ms,
+                receipt.construction,
+            );
+            assert_eq!(receipt.source_files, 1, "{receipt:?}");
+            assert_eq!(receipt.blocks, blocks, "{receipt:?}");
+        }
     }
 
     #[test]

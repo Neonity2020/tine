@@ -148,19 +148,21 @@ const BOOTSTRAP_STREAM_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const BOOTSTRAP_STREAM_SORT_FAN_IN: usize = 4;
 const BOOTSTRAP_STREAM_MAX_SORT_RUNS: usize = 4096;
 const BOOTSTRAP_STREAM_FRAME_BYTES: usize = 64 * 1024 * 1024 + 1024 * 1024;
-const BOOTSTRAP_STREAM_DIRECTORY: &str = "inactive-bootstrap-publication-v1";
-const BOOTSTRAP_STREAM_SEAL: &str = "sealed.commit";
-const BOOTSTRAP_STREAM_AGGREGATE: &str = "aggregate.bin";
-const BOOTSTRAP_STREAM_COMMIT: &str = "commit.bin";
-const BOOTSTRAP_STREAM_INVENTORY_PAGES: &str = "source-inventory-pages";
-const BOOTSTRAP_STREAM_BLOB_PAGES: &str = "source-blob-pages";
-const BOOTSTRAP_STREAM_PARTS: &str = "parts";
-const BOOTSTRAP_STREAM_PART_MANIFEST: &str = "manifest.bin";
-const BOOTSTRAP_STREAM_PART_EVIDENCE: &str = "evidence.bin";
-const BOOTSTRAP_STREAM_PART_SPANS: &str = "spans.bin";
-const BOOTSTRAP_STREAM_PART_OBJECTS: &str = "objects.frames";
-const BOOTSTRAP_STREAM_OPERATION_SPOOL: &str = "operations.sorted";
-const BOOTSTRAP_STREAM_BOUNDARY_SPOOL: &str = "part-boundaries.frames";
+use super::sync_layout::{
+    BOOTSTRAP_STREAM_AGGREGATE_FILE as BOOTSTRAP_STREAM_AGGREGATE,
+    BOOTSTRAP_STREAM_BLOB_PAGES_DIR as BOOTSTRAP_STREAM_BLOB_PAGES,
+    BOOTSTRAP_STREAM_BOUNDARY_SPOOL_FILE as BOOTSTRAP_STREAM_BOUNDARY_SPOOL,
+    BOOTSTRAP_STREAM_COMMIT_FILE as BOOTSTRAP_STREAM_COMMIT,
+    BOOTSTRAP_STREAM_DIR as BOOTSTRAP_STREAM_DIRECTORY,
+    BOOTSTRAP_STREAM_INVENTORY_PAGES_DIR as BOOTSTRAP_STREAM_INVENTORY_PAGES,
+    BOOTSTRAP_STREAM_OPERATION_SPOOL_FILE as BOOTSTRAP_STREAM_OPERATION_SPOOL,
+    BOOTSTRAP_STREAM_PARTS_DIR as BOOTSTRAP_STREAM_PARTS,
+    BOOTSTRAP_STREAM_PART_EVIDENCE_FILE as BOOTSTRAP_STREAM_PART_EVIDENCE,
+    BOOTSTRAP_STREAM_PART_MANIFEST_FILE as BOOTSTRAP_STREAM_PART_MANIFEST,
+    BOOTSTRAP_STREAM_PART_OBJECTS_FILE as BOOTSTRAP_STREAM_PART_OBJECTS,
+    BOOTSTRAP_STREAM_PART_SPANS_FILE as BOOTSTRAP_STREAM_PART_SPANS,
+    BOOTSTRAP_STREAM_SEAL_FILE as BOOTSTRAP_STREAM_SEAL,
+};
 const BOOTSTRAP_STREAM_MAX_MANIFEST_BYTES: usize = MAX_PREPARED_MANIFEST_BYTES_PER_BOOTSTRAP_PART;
 /// Fixed per-operation allowance for the before/after and membership fields
 /// added by the existing semantic-effect encoder. The operation's own
@@ -10870,7 +10872,7 @@ mod tests {
     ///
     /// A bootstrap preparation is authored for exactly one archive: its
     /// accepted cold records bind catalog roots that live in that archive's
-    /// authenticated Patricia store, so installing it elsewhere fails closed.
+    /// content-addressed Patricia store, so installing it elsewhere fails closed.
     fn target_catalog(archive: &Path, workspace: WorkspaceId) -> BootstrapAuthoringCapability {
         ObjectStore::open(archive, workspace)
             .unwrap()
@@ -11094,7 +11096,7 @@ mod tests {
         assert_eq!(work.reference_fallback_document_reconstructions, 0);
         assert!(
             work.reference_catalog_peak_resident_bytes
-                <= super::super::authenticated_patricia::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+                <= super::super::content_patricia::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
             "private Patricia construction exceeded its fixed resident budget: {work:?}"
         );
         assert_eq!(

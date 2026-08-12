@@ -48,6 +48,20 @@ use super::scratch_store::MAX_RETAINED_SCRATCH_RUNS;
 use super::shadow_projection::PromotedBootstrapProjectionBindingV1;
 use super::simulator::SimulatorBootstrapFixtureIngress;
 use super::sqlite::{ProjectionError, WorkspaceRuntimeProof};
+#[cfg(test)]
+use super::sync_layout::BLOCK_CLAIM_INDEX_DIR;
+use super::sync_layout::{
+    ARCHIVE_BATCHES_DIR as BATCHES_DIR, ARCHIVE_BOOTSTRAP_DIR as BOOTSTRAP_DIR,
+    ARCHIVE_OBJECTS_DIR as OBJECTS_DIR, BLOCK_CLAIM_INDEX_FILE, BOOTSTRAP_AGGREGATES_DIR,
+    BOOTSTRAP_COMMITS_DIR, BOOTSTRAP_EVIDENCE_DIR, BOOTSTRAP_OBJECTS_DIR, BOOTSTRAP_PARTS_DIR,
+    BOOTSTRAP_PART_PACKS_DIR, BOOTSTRAP_PART_SPANS_DIR, BOOTSTRAP_SOURCE_BLOB_DIR,
+    BOOTSTRAP_SOURCE_CHUNKS_DIR, BOOTSTRAP_SOURCE_INVENTORY_DIR, ENGINE_HISTORY_CLAIM_FILE,
+    ENGINE_HISTORY_DIR, ENGINE_HISTORY_HEAD_FILE, ENGINE_HISTORY_NODES_DIR,
+    ENGINE_HISTORY_ROOTS_DIR, ENGINE_HISTORY_ROOT_SUFFIX, ENGINE_HISTORY_TRANSITION_LOCK_FILE,
+    LINEAGE_CLAIM_FILE, LOGSEQ_CLAIM_INDEX_DIR, PAGE_NAME_OWNERSHIP_INDEX_DIR,
+    PORTABLE_PATH_INDEX_DIR, PROJECTION_WORK_DIR, PROMOTED_RUNTIME_STATE_FILE,
+    REFERENCE_CATALOG_DIR,
+};
 use super::watcher_queue::WatcherQuiescedProof;
 use super::{
     bootstrap_import::{
@@ -69,29 +83,8 @@ use super::{
 };
 use crate::model::HandoffSafe;
 
-const OBJECTS_DIR: &str = "objects";
-const BATCHES_DIR: &str = "batches";
-const BOOTSTRAP_DIR: &str = "bootstrap-v1";
-const BOOTSTRAP_SOURCE_INVENTORY_DIR: &str = "source-inventory-indexes";
-const BOOTSTRAP_SOURCE_BLOB_DIR: &str = "source-blob-indexes";
-const BOOTSTRAP_SOURCE_CHUNKS_DIR: &str = "source-chunks";
-const BOOTSTRAP_PARTS_DIR: &str = "parts";
-const BOOTSTRAP_PART_SPANS_DIR: &str = "part-spans";
-const BOOTSTRAP_PART_PACKS_DIR: &str = "part-object-packs";
-const BOOTSTRAP_OBJECTS_DIR: &str = "objects";
-const BOOTSTRAP_EVIDENCE_DIR: &str = "evidence";
-const BOOTSTRAP_AGGREGATES_DIR: &str = "aggregates";
-const BOOTSTRAP_COMMITS_DIR: &str = "commits";
 const MAX_BOOTSTRAP_PART_PACK_BYTES: u64 =
     MAX_BATCH_OBJECT_BYTES_PER_BOOTSTRAP_PART + 4 * MAX_OPERATIONS_PER_BOOTSTRAP_PART as u64;
-const LINEAGE_CLAIM_FILE: &str = "lineage.claim";
-const ENGINE_HISTORY_DIR: &str = "engine-history";
-const ENGINE_HISTORY_NODES_DIR: &str = "nodes";
-const ENGINE_HISTORY_ROOTS_DIR: &str = "roots";
-const ENGINE_HISTORY_CLAIM_FILE: &str = "engine-history.claim";
-const ENGINE_HISTORY_HEAD_FILE: &str = "engine-history.head";
-const ENGINE_HISTORY_TRANSITION_LOCK_FILE: &str = "engine-history.transition.lock";
-const ENGINE_HISTORY_ROOT_SUFFIX: &str = ".history-root";
 
 /// Retained, O(1)-memory enumeration of immutable manifest commit markers.
 ///
@@ -104,7 +97,6 @@ pub(crate) struct ObjectStoreManifestCursor {
 const ENGINE_HISTORY_ROOT_SCHEMA_VERSION: u32 = 8;
 /// Device-local promoted-runtime state, published beside the endpoint's durable
 /// engine history.
-const PROMOTED_RUNTIME_STATE_FILE: &str = "promoted-runtime.state";
 /// The first honest promoted-runtime state format. No earlier experimental
 /// bytes were ever published, and any other value is rejected rather than
 /// reinterpreted.
@@ -114,15 +106,6 @@ const MAX_ENGINE_HISTORY_RECORD_BYTES: u64 = 1024 * 1024;
 const MAX_ENGINE_HISTORY_INDEX_BYTES: u64 = 2 * 1024 * 1024;
 const ENGINE_HISTORY_INDEX_SCHEMA_VERSION: u32 = 1;
 pub(crate) const ENGINE_HISTORY_RADIX_DEPTH: u8 = 32;
-#[cfg(test)]
-const BLOCK_CLAIM_INDEX_DIR: &str = "block-claim-index";
-const BLOCK_CLAIM_INDEX_FILE: &str = "pages.index";
-const LOGSEQ_CLAIM_INDEX_DIR: &str = "logseq-uuid-claim-index-v1";
-const PORTABLE_PATH_INDEX_DIR: &str = "portable-path-index-v1";
-#[allow(dead_code)] // opened by the intentionally unwired P2N2 foundation
-const PAGE_NAME_OWNERSHIP_INDEX_DIR: &str = "page-name-ownership-index-v1";
-const REFERENCE_CATALOG_DIR: &str = "reference-catalog-v2";
-const PROJECTION_WORK_DIR: &str = "projection-work-index-v1";
 const BLOCK_CLAIM_INDEX_SCHEMA_VERSION: u32 = 1;
 const BLOCK_CLAIM_RADIX_DEPTH: u8 = 32;
 // Large replay batches touch most hash prefixes. Keeping tens of thousands of
@@ -1606,7 +1589,7 @@ pub(crate) struct DetachedBootstrapPublicationSession {
 /// authored by one detached session is beneath its archive durability barrier.
 pub(crate) struct CompletedDetachedBootstrapPublication {
     physical: tine_storage::CompletedExactImmutablePublicationBatch,
-    packed_constructions: Option<[super::authenticated_patricia::CompletedPatriciaConstruction; 4]>,
+    packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 4]>,
     workspace_id: WorkspaceId,
     archive_identity: ControlDirectoryIdentity,
 }
@@ -1637,7 +1620,7 @@ impl CompletedDetachedBootstrapPublication {
         self.packed_constructions.as_ref().map(|constructions| {
             constructions
                 .each_ref()
-                .map(super::authenticated_patricia::CompletedPatriciaConstruction::stats)
+                .map(super::content_patricia::CompletedPatriciaConstruction::stats)
         })
     }
 }
@@ -1667,7 +1650,7 @@ impl DetachedBootstrapPublicationSession {
 
     pub(crate) fn finish(
         self,
-        packed_constructions: [super::authenticated_patricia::CompletedPatriciaConstruction; 4],
+        packed_constructions: [super::content_patricia::CompletedPatriciaConstruction; 4],
     ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
         self.finish_inner(Some(packed_constructions))
     }
@@ -1681,9 +1664,7 @@ impl DetachedBootstrapPublicationSession {
 
     fn finish_inner(
         self,
-        packed_constructions: Option<
-            [super::authenticated_patricia::CompletedPatriciaConstruction; 4],
-        >,
+        packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 4]>,
     ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
         let mut state = self.publisher.shared.state.lock().map_err(|_| {
             StoreError::Bootstrap(
@@ -1776,7 +1757,7 @@ impl LoadedBootstrapPartV1 {
 /// Every accepted bootstrap cold record binds four authenticated roots — the
 /// portable-path root, the page-name ownership root, the external UUID-claim
 /// root, and the reference-catalog root. Each has exactly one construction:
-/// the archive's durable authenticated Patricia stores. A detached session that
+/// the archive's durable content-addressed Patricia stores. A detached session that
 /// used the run-local ephemeral backends instead would bind roots the promoted
 /// runtime's durable stores can never open, so authoring takes this capability
 /// over the archive the bootstrap is installed into and promoted from.
@@ -3317,14 +3298,13 @@ impl ObjectStore {
     ) -> Result<super::portable_path_index::PortablePathIndexStore, StoreError> {
         ensure_directory_nofollow(&self.capability, PORTABLE_PATH_INDEX_DIR)?;
         Ok(super::portable_path_index::PortablePathIndexStore::new(
-            super::authenticated_patricia::PatriciaIndexStore::new(open_dir_nofollow(
+            super::content_patricia::PatriciaIndexStore::new(open_dir_nofollow(
                 &self.capability,
                 PORTABLE_PATH_INDEX_DIR,
             )?),
         ))
     }
 
-    #[allow(dead_code)] // activated only by later P2N2 acceptance wiring
     pub(crate) fn open_page_name_ownership_index(
         &self,
     ) -> Result<super::page_name_index::PageNameOwnershipStore, StoreError> {

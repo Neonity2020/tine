@@ -11,6 +11,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tine_core::model::GraphMeta;
+use tine_core::oplog::sync_layout::{
+    PRIVATE_BINDING_DIR as SPARSE_BINDING_DIR, PRIVATE_BINDING_FILE as SPARSE_BINDING_FILE,
+    PRIVATE_RECOVERY_DIR as SPARSE_RECOVERY_DIR, PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR,
+    SHARED_ENROLLMENT_DIR, SHARED_FRONTIER_HEADS_DIR, SHARED_MANIFESTS_DIR,
+    SHARED_MANIFEST_RECOVERY_BLOBS_DIR, SHARED_MANIFEST_RECOVERY_LINKS_DIR, SHARED_OBJECTS_DIR,
+    SHARED_PUBLICATION_INTENTS_DIR, SHARED_REMOVED_DIR, SHARED_RENAME_EVIDENCE_DIR,
+    SHARED_TEMP_DIR,
+};
 use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
@@ -28,9 +36,6 @@ use tine_core::sync_runtime::{
 use uuid::Uuid;
 
 const BINDING_SCHEMA_VERSION: u32 = 2;
-const SPARSE_BINDING_DIR: &str = "sparse-v2";
-const SPARSE_BINDING_FILE: &str = "binding.json";
-const SPARSE_RECOVERY_DIR: &str = "sparse-v2-recovery";
 static BINDING_WRITE: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -716,18 +721,18 @@ enum ProviderNamespaceEvidence {
     SharedOrUnknown,
 }
 
-const PROVIDER_SCAFFOLD_TREES: [&str; 2] = ["inbox", "outbox"];
+const PROVIDER_SCAFFOLD_TREES: [&str; 2] = [PROVIDER_INBOX_DIR, PROVIDER_OUTBOX_DIR];
 const PROVIDER_SCAFFOLD_NAMESPACES: [&str; 10] = [
-    "objects",
-    "manifests",
-    "enrollment",
-    "frontier-heads-v1",
-    "publication-intents-v1",
-    "manifest-recovery-links-v1",
-    "manifest-recovery-blobs-v1",
-    ".part",
-    "removed",
-    "rename-evidence",
+    SHARED_OBJECTS_DIR,
+    SHARED_MANIFESTS_DIR,
+    SHARED_ENROLLMENT_DIR,
+    SHARED_FRONTIER_HEADS_DIR,
+    SHARED_PUBLICATION_INTENTS_DIR,
+    SHARED_MANIFEST_RECOVERY_LINKS_DIR,
+    SHARED_MANIFEST_RECOVERY_BLOBS_DIR,
+    SHARED_TEMP_DIR,
+    SHARED_REMOVED_DIR,
+    SHARED_RENAME_EVIDENCE_DIR,
 ];
 
 fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
@@ -883,7 +888,30 @@ fn cancel_warning_for_observation(
 #[derive(Default)]
 pub(crate) struct SyncRuntimeFacade;
 
+/// The sole ordinary graph-open decision for storage authority.
+///
+/// A validated private binding is the durable, device-local proof that Martin
+/// explicitly enabled managed storage for this graph. Its absence means Direct
+/// Files. In particular, graph-local `.tine-sync` bytes are never consulted to
+/// infer or force managed mode; they are inspected only after the user invokes
+/// the explicit join flow.
+pub(crate) enum ExplicitStorageSelection {
+    DirectFiles,
+    Managed(SparseV2ActivationRecord),
+}
+
 impl SyncRuntimeFacade {
+    pub(crate) fn explicit_storage_selection(
+        &self,
+        app: &tauri::AppHandle,
+        graph_root: &Path,
+    ) -> Result<ExplicitStorageSelection, String> {
+        Ok(match self.binding_record(app, graph_root)? {
+            Some(record) => ExplicitStorageSelection::Managed(record),
+            None => ExplicitStorageSelection::DirectFiles,
+        })
+    }
+
     pub(crate) fn binding_record(
         &self,
         app: &tauri::AppHandle,
@@ -1303,16 +1331,11 @@ fn sparse_v2_status_for_slot(slot: &crate::state::GraphSlot) -> Result<SparseV2S
             status.cancel_reason = cancel_warning(binding, &slot.root_key.join(".tine-sync/v2"));
             status
         }
-        None => {
-            match inspect_shared_enrollment_for_cold_discovery(
-                &slot.root_key.join(".tine-sync/v2/shared"),
-            )? {
-                Some(descriptor) => {
-                    SparseV2StatusDto::joinable(slot.binding_generation, &descriptor)
-                }
-                None => SparseV2StatusDto::legacy(slot.binding_generation),
-            }
-        }
+        // Status is observational and runs on every ordinary graph bind. It
+        // must not turn Direct Files into an implicit managed-storage probe.
+        // The explicit Join command performs provider discovery after the user
+        // asks for it.
+        None => SparseV2StatusDto::legacy(slot.binding_generation),
     };
     // Status names describe enrollment/recovery. This record describes the
     // exact writer retained by the slot that will service `save_page`.
@@ -3116,20 +3139,20 @@ mod tests {
     }
 
     #[test]
-    fn joinable_shared_descriptor_still_serializes_direct_application_admission() {
+    fn direct_status_does_not_inspect_an_existing_shared_descriptor() {
         std::thread::Builder::new()
-            .name("tine-joinable-direct-admission-test".into())
+            .name("tine-direct-status-quarantine-test".into())
             .stack_size(32 * 1024 * 1024)
-            .spawn(joinable_shared_descriptor_still_serializes_direct_application_admission_inner)
+            .spawn(direct_status_does_not_inspect_an_existing_shared_descriptor_inner)
             .unwrap()
             .join()
             .unwrap();
     }
 
-    fn joinable_shared_descriptor_still_serializes_direct_application_admission_inner() {
+    fn direct_status_does_not_inspect_an_existing_shared_descriptor_inner() {
         let mut fixture = RollbackFixture::new(Some("shadow_import"));
         fixture.make_active();
-        let descriptor = fixture
+        fixture
             .slot
             .sparse_runtime()
             .expect("active fixture must retain its runtime")
@@ -3145,8 +3168,7 @@ mod tests {
         let status = sparse_v2_status_for_slot(&direct).unwrap();
         assert!(matches!(
             status.availability,
-            SparseV2Availability::Joinable { ref descriptor_digest }
-                if descriptor_digest == &descriptor.descriptor_digest
+            SparseV2Availability::LegacyDefault
         ));
         assert_eq!(
             serde_json::to_value(status).unwrap()["application_page_admission"],

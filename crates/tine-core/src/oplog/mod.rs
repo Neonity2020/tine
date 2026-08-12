@@ -1,32 +1,29 @@
-//! Candidate primitives and fenced storage substrate for Tine's sparse-first
-//! operation log.
+//! Production storage substrate for Tine's opt-in managed-storage runtime.
 //!
-//! The batch and object bytes enforce a deterministic candidate encoding, but
-//! that encoding is not frozen until the later receipt and engine work lands.
-//! Nothing here is wired to graph startup, enrollment, or mutation paths; the
-//! store persists only when explicitly opened on a caller-supplied root.
+//! Enrollment, activation, mutation, projection, reconciliation, SQLite
+//! materialization, and shared-provider synchronization are composed by
+//! `crate::sync_runtime`. Direct Files does not enter this module tree: the
+//! application selects that mutually exclusive runtime before opening a graph.
+//! Immutable operation/object bytes are authoritative; SQLite, scratch, and
+//! projection-work state are disposable derived data.
 
-pub(crate) mod authenticated_patricia;
 pub mod batch;
-// P2N4 bootstrap import evidence is a pure, inactive identity/validation
-// boundary.  Import execution and acceptance remain deliberately unwired.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod bootstrap_import;
 pub(crate) mod causal_index;
+pub(crate) mod content_patricia;
 pub(crate) mod dependency_queue;
-// P2.N11 discovery remains read-only and is consumed only by the explicit,
-// inactive `sync_runtime` host.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and diagnostic surface
 pub(crate) mod discovery;
 pub(crate) mod document_state;
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and retained compatibility surface
 pub(crate) mod enrollment;
 // The only keyed enrollment compatibility code.  Current enrollment state is
 // integrity-checked, while immutable v1/v5 history remains verifiable.
 pub(crate) mod enrollment_legacy_hmac;
 pub(crate) use enrollment_legacy_hmac as legacy_enrollment_verifier;
 pub(crate) mod evidence_index;
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test instrumentation surface
 pub(crate) mod exact_external_feed;
 pub(crate) mod external_import;
 pub mod hot_engine;
@@ -34,27 +31,18 @@ pub mod hot_engine;
 mod hot_engine_integration_tests;
 pub mod identity;
 pub mod import;
-// P2N7 composes the single VerifiedLocal -> LocalActive runtime boundary. It
-// is deliberately not reachable from startup, Tauri, or a watcher yet.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_active;
-#[allow(dead_code)] // routed by the later sync-runtime lane
+#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_journal_drain;
-// Schema-2 authority is deliberately inert until the managed-runtime rollover
-// packet wires this codec and selector into startup and mutation.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and retained format-decoder surface
 pub(crate) mod local_journal_v2_anchor;
 pub(crate) mod loro_store;
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod migration_backup;
 pub mod object_store;
 pub(crate) mod operational_coordinator;
-#[allow(dead_code)]
-pub(crate) mod shadow_projection;
-#[allow(dead_code)] // routed by the later sync-runtime lane
-pub(crate) mod trusted_local_commit;
-// P2N2 I1-I3 deliberately expose a foundation seam without activating it.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test-construction surface
 pub(crate) mod page_name_index;
 pub(crate) mod portable_path_index;
 pub mod projection;
@@ -62,42 +50,33 @@ pub mod projection_manifest;
 pub mod projection_store;
 pub mod projection_work_index;
 pub mod receipt;
-// P2N4I installs a device-local disposable substrate without activating scans.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and diagnostic/test surface
 pub(crate) mod reconciliation_baseline;
-// P2N4K persists stable-scan evidence into the disposable baseline without
-// activating scanning, scheduling, importing, or session execution.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test-composition surface
 pub(crate) mod reconciliation_baseline_adapter;
-// P2N4J bridges stable discovery evidence to the existing point-revalidated
-// coordinator without activating a scanner or scheduler.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test-composition surface
 pub(crate) mod reconciliation_import;
-// P2N4I keeps the scheduler/scan boundary crate-private and inactive.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test instrumentation surface
 pub(crate) mod reconciliation_scan;
-// P2N4K composes one inactive endpoint scheduler with the existing scan and
-// coordinator paths. It deliberately adds no lifecycle or persistence owner.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test-composition surface
 pub(crate) mod reconciliation_session;
 pub mod reference_catalog;
-// P2N9 owns the runtime resume-point format, its publication, and the retained
-// scratch-run reclamation it authorizes. It is deliberately inert: nothing in
-// startup, enrollment, the coordinator, or Tauri reads or publishes a resume
-// point yet, and an RRP never authorizes a write, frontier, or projection.
-#[allow(dead_code)]
+#[allow(dead_code)] // retained recovery format plus test construction surface
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
 pub mod semantic;
+#[allow(dead_code)] // mixed live/runtime and proof/test surface
+pub(crate) mod shadow_projection;
 pub mod simulator;
 pub mod sqlite;
 pub mod sqlite_materialization;
+pub mod sync_layout;
+#[allow(dead_code)] // mixed live/runtime and recovery/test surface
+pub(crate) mod trusted_local_commit;
 pub(crate) mod uuid_claim_index;
-// P2N9 W5a owns the graph-text watcher event queue inside the core so its drain
-// becomes provable. It is deliberately not wired to LocalActive, enrollment,
-// startup, or Tauri: this packet only builds the primitive and its proof.
-#[allow(dead_code)]
+#[allow(dead_code)] // mixed live/runtime and test instrumentation surface
 pub(crate) mod watcher_queue;
+pub(crate) mod wire;
 
 /// Diagnostic trace gates, resolved once per process.
 ///

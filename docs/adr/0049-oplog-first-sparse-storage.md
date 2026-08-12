@@ -193,12 +193,12 @@ versions are:
 | Block-claim record / index | 2 / 1 |
 | Logseq claim record | 1 |
 | Engine-history record / durable root / index | 7 / 5 / 1 |
-| Engine scratch / scratch page | 9 / 1 |
+| Engine scratch / scratch page | 13 / 1 |
 | Manifested projection intent / annotated base | 2 / 1 |
 | Projection work row / index | 3 / 10 |
 | Projection-store claim | 5 |
 | Materialization input | 2 |
-| SQLite schema | 8 |
+| SQLite schema | 15 |
 | External-import observation | 1 |
 | Reconciliation diff and `ImportId` | 2 |
 | Simulator scenario / failure capsule | 3 / 2 |
@@ -206,22 +206,26 @@ versions are:
 | Causal index / document state / external document state | 1 / 1 / 1 |
 | Projection checkpoint | 1 |
 
-Materialization input and SQLite advance to versions 2 and 8 so page-name
+The authoritative current scratch and SQLite versions are exported by the pinned
+`tine-storage` crate in `src/formats.rs` as `SCRATCH_SCHEMA_VERSION`,
+`SCRATCH_PAGE_SCHEMA_VERSION`, and `SQLITE_SCHEMA_VERSION`; this descriptive table
+must be updated whenever that pin changes. Materialization input and the original
+SQLite packet advanced to versions 2 and 8 so page-name
 materialization becomes oplog-authoritative without reinterpreting earlier inputs
 or reusable databases. External-import observation and reconciliation diff/`ImportId`
 bytes deliberately retain versions 1 and 2. Generic checkpoint and Loro-node schemas
 likewise remain unchanged. Page-name ownership's exact-name blob/reference,
 ownership record/root/store, and exact catalog-frontier binding start at v1 in its
 foundation packet; reference-semantics and reverse-index formats start at v1 when
-their owning packets land. Engine scratch advances to version 9 for the new
-page-name catalog-frontier point kind. None of these bytes are activated for graph
-startup, old experimental-v2 reinterpretation, or production writes; unsupported old
-bytes require upgrade and fail closed. In particular, the I1-I3 foundation has no
-production constructor for an authenticated exact-catalog page-name checkpoint and
+their owning packets land. Later storage packets advanced engine scratch to version
+13 and SQLite to version 15; the exported `tine-storage` constants above are the
+source of truth. Unsupported old bytes require a disposable-cache rebuild or an
+explicit archive migration as appropriate. In particular, the I1-I3 foundation had
+no production constructor for a content-addressed exact-catalog page-name checkpoint and
 no crate-visible publisher for catalog-frontier evidence. Reconstruction and binding
-publication remain module-private until a later packet supplies authenticated
+publication remain module-private until a later packet supplies content-addressed
 exact-catalog decoding/validation that can mint the opaque checkpoint value; callers
-cannot promote supplied IDs, digests, entries, or scratch bytes into authenticated
+cannot promote supplied IDs, digests, entries, or scratch bytes into content-addressed
 frontier evidence.
 
 Each semantic `OperationBatch` has exactly one manifest. The manifest contains all

@@ -37,8 +37,8 @@ const MAX_AUTHENTICATED_CATALOG_VALUE_BYTES: usize = 8 * 1024;
 /// A batch checkpoints its exact current root before the next mutation could
 /// exceed this overlay budget. The per-node charge includes conservative map
 /// and allocator overhead; catalog values add their exact resident bytes.
-const AUTHENTICATED_BATCH_MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
-const AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD: usize = 256;
+const CONTENT_ADDRESSED_BATCH_MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+const CONTENT_ADDRESSED_BATCH_NODE_RESIDENCY_OVERHEAD: usize = 256;
 #[cfg(test)]
 pub(crate) const AUTHENTICATED_CATALOG_MAX_DEPTH: usize = MAX_AUTHENTICATED_MAP_DEPTH;
 pub(crate) const AUTHENTICATED_POINT_MAX_DEPTH: usize = 256;
@@ -569,7 +569,12 @@ impl<'a> AuthenticatedMapBatch<'a> {
         kind: ScratchPageKind,
         root: &ScratchAuthenticatedMapRoot,
     ) -> Result<Self, ScratchError> {
-        Self::with_residency_limit(store, kind, root, AUTHENTICATED_BATCH_MAX_RESIDENT_BYTES)
+        Self::with_residency_limit(
+            store,
+            kind,
+            root,
+            CONTENT_ADDRESSED_BATCH_MAX_RESIDENT_BYTES,
+        )
     }
 
     fn with_residency_limit(
@@ -598,7 +603,7 @@ impl<'a> AuthenticatedMapBatch<'a> {
     }
 
     fn upsert(&mut self, key: [u8; 16], value_digest: ContentDigest) -> Result<(), ScratchError> {
-        let max_insert_residency = AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD
+        let max_insert_residency = CONTENT_ADDRESSED_BATCH_NODE_RESIDENCY_OVERHEAD
             .saturating_mul(MAX_AUTHENTICATED_MAP_DEPTH + 2);
         if self.resident_bytes > self.max_resident_bytes.saturating_sub(max_insert_residency) {
             self.checkpoint()?;
@@ -626,7 +631,7 @@ impl<'a> AuthenticatedMapBatch<'a> {
             return Err(ScratchError::IndexCapacity);
         }
         let Some(current) = current else {
-            self.charge_node(key, AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD)?;
+            self.charge_node(key, CONTENT_ADDRESSED_BATCH_NODE_RESIDENCY_OVERHEAD)?;
             return Ok((
                 self.stage(AuthenticatedMapBatchNode {
                     key,
@@ -703,7 +708,7 @@ impl<'a> AuthenticatedMapBatch<'a> {
         let node = self
             .store
             .read_authenticated_map_node(self.kind, &persisted)?;
-        self.charge_node(node.key, AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD)?;
+        self.charge_node(node.key, CONTENT_ADDRESSED_BATCH_NODE_RESIDENCY_OVERHEAD)?;
         Ok(AuthenticatedMapBatchNode {
             key: node.key,
             value_digest: node.value_digest,
@@ -807,7 +812,7 @@ impl<'a> AuthenticatedCatalogBatch<'a> {
         store: &'a ScratchStore,
         root: &ScratchAuthenticatedCatalogRoot,
     ) -> Result<Self, ScratchError> {
-        Self::with_residency_limit(store, root, AUTHENTICATED_BATCH_MAX_RESIDENT_BYTES)
+        Self::with_residency_limit(store, root, CONTENT_ADDRESSED_BATCH_MAX_RESIDENT_BYTES)
     }
 
     fn with_residency_limit(
@@ -837,7 +842,7 @@ impl<'a> AuthenticatedCatalogBatch<'a> {
         if value.is_empty() || value.len() > MAX_AUTHENTICATED_CATALOG_VALUE_BYTES {
             return Err(ScratchError::MalformedPage);
         }
-        let max_insert_residency = (AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD
+        let max_insert_residency = (CONTENT_ADDRESSED_BATCH_NODE_RESIDENCY_OVERHEAD
             + MAX_AUTHENTICATED_CATALOG_VALUE_BYTES)
             .saturating_mul(MAX_AUTHENTICATED_MAP_DEPTH + 2);
         if self.resident_bytes > self.max_resident_bytes.saturating_sub(max_insert_residency) {
@@ -868,7 +873,7 @@ impl<'a> AuthenticatedCatalogBatch<'a> {
         let Some(current) = current else {
             self.charge_node(
                 key,
-                AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD + value.len(),
+                CONTENT_ADDRESSED_BATCH_NODE_RESIDENCY_OVERHEAD + value.len(),
             )?;
             return Ok((
                 self.stage(AuthenticatedCatalogBatchNode {
@@ -947,7 +952,7 @@ impl<'a> AuthenticatedCatalogBatch<'a> {
         let node = self.store.read_authenticated_catalog_node(&persisted)?;
         self.charge_node(
             node.key,
-            AUTHENTICATED_BATCH_NODE_RESIDENCY_OVERHEAD + node.value.len(),
+            CONTENT_ADDRESSED_BATCH_NODE_RESIDENCY_OVERHEAD + node.value.len(),
         )?;
         Ok(AuthenticatedCatalogBatchNode {
             key: node.key,

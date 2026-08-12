@@ -19,12 +19,12 @@ use tine_storage::{
 };
 use uuid::Uuid;
 
-use super::authenticated_patricia::{
-    PatriciaIndexReclamationError, PatriciaIndexReclamationReport, PatriciaIndexStore,
-};
 use super::bootstrap_import::{
     BootstrapImportPartEvidenceV1, BootstrapPartDescriptorV1, BootstrapPartitionProfileV1,
     BootstrapProfileDigestV1, MAX_OPERATIONS_PER_BOOTSTRAP_PART,
+};
+use super::content_patricia::{
+    PatriciaIndexReclamationError, PatriciaIndexReclamationReport, PatriciaIndexStore,
 };
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::identity::BootstrapPartId;
@@ -2724,7 +2724,7 @@ impl DetachedBootstrapCandidate {
 /// dependency queue, accepted-frontier working roots — and is destroyed with
 /// the session. The reference catalog is deliberately *not* isolated: its root
 /// is bound into every accepted cold history record, so it must be built in the
-/// same durable authenticated Patricia store the promoted runtime later opens.
+/// same durable content-addressed Patricia store the promoted runtime later opens.
 /// The caller therefore supplies an explicit
 /// [`BootstrapAuthoringCapability`] over the target archive.
 #[allow(dead_code)]
@@ -2876,7 +2876,7 @@ impl DetachedBootstrapAuthoringSession {
                 indexes.portable_path_index(),
                 indexes.logseq_claim_index(),
                 indexes.page_name_index(),
-                super::authenticated_patricia::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
+                super::content_patricia::DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
             )
         };
         let (scratch_root, scratch, block_claim_index) = match ephemeral_scratch {
@@ -3165,15 +3165,14 @@ impl DetachedBootstrapAuthoringSession {
         let publication_started = trace_enabled.then(Instant::now);
         let index_durability = match self.publication {
             Some(publication) => {
-                let require_completion = |completion: Option<
-                    super::authenticated_patricia::CompletedPatriciaConstruction,
-                >| {
-                    completion.ok_or_else(|| {
-                        EngineError::Archive(
-                            "detached bootstrap Patricia construction is incomplete".into(),
-                        )
-                    })
-                };
+                let require_completion =
+                    |completion: Option<super::content_patricia::CompletedPatriciaConstruction>| {
+                        completion.ok_or_else(|| {
+                            EngineError::Archive(
+                                "detached bootstrap Patricia construction is incomplete".into(),
+                            )
+                        })
+                    };
                 let packed_constructions = [
                     require_completion(reference_construction)?,
                     require_completion(portable_path_construction)?,
@@ -3309,7 +3308,7 @@ where
     }
     // Replay reproduces the accepted roots the installed cold records bind, so
     // it must use the same durable construction authoring used: this exact
-    // archive's authenticated Patricia stores.
+    // archive's content-addressed Patricia stores.
     let indexes = store
         .bootstrap_authoring_capability()
         .map_err(|error| EngineError::Archive(error.to_string()))?;
@@ -6305,19 +6304,19 @@ impl fmt::Display for RetainedScratchResumeFailure {
     }
 }
 
-/// The complete authenticated Patricia inventory owned by a store-backed hot
+/// The complete content-addressed Patricia inventory owned by a store-backed hot
 /// engine. Keeping this closed list beside the shared builder makes adding a
 /// fifth store impossible without updating both ordinary ownership and
 /// maintenance accounting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AuthenticatedPatriciaIndexKind {
+pub(crate) enum ContentPatriciaIndexKind {
     LogseqUuidClaims,
     PortablePaths,
     PageNames,
     ReferenceCatalog,
 }
 
-impl AuthenticatedPatriciaIndexKind {
+impl ContentPatriciaIndexKind {
     const ALL: [Self; 4] = [
         Self::LogseqUuidClaims,
         Self::PortablePaths,
@@ -6335,7 +6334,7 @@ pub(crate) enum PackedPatriciaMaintenanceOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PackedPatriciaIndexMaintenance {
-    pub(crate) kind: AuthenticatedPatriciaIndexKind,
+    pub(crate) kind: ContentPatriciaIndexKind,
     pub(crate) outcome: PackedPatriciaMaintenanceOutcome,
 }
 
@@ -6344,20 +6343,15 @@ pub(crate) struct PackedPatriciaMaintenanceReport {
     pub(crate) indexes: [PackedPatriciaIndexMaintenance; 4],
 }
 
-struct AuthenticatedPatriciaIndexes<'a> {
+struct ContentPatriciaIndexes<'a> {
     stores: [Option<&'a PatriciaIndexStore>; 4],
 }
 
-impl<'a> AuthenticatedPatriciaIndexes<'a> {
+impl<'a> ContentPatriciaIndexes<'a> {
     fn iter(
         &'a self,
-    ) -> impl Iterator<
-        Item = (
-            AuthenticatedPatriciaIndexKind,
-            Option<&'a PatriciaIndexStore>,
-        ),
-    > + 'a {
-        AuthenticatedPatriciaIndexKind::ALL
+    ) -> impl Iterator<Item = (ContentPatriciaIndexKind, Option<&'a PatriciaIndexStore>)> + 'a {
+        ContentPatriciaIndexKind::ALL
             .into_iter()
             .zip(self.stores.iter().copied())
     }
@@ -8054,8 +8048,8 @@ impl ShardedHotEngine {
     /// Build the complete maintenance inventory from the same live store
     /// handles ordinary engine work owns. No path is reopened and no directory
     /// is enumerated while constructing this view.
-    fn authenticated_patricia_indexes(&self) -> AuthenticatedPatriciaIndexes<'_> {
-        AuthenticatedPatriciaIndexes {
+    fn content_patricia_indexes(&self) -> ContentPatriciaIndexes<'_> {
+        ContentPatriciaIndexes {
             stores: [
                 self.logseq_claim_index.as_deref(),
                 self.portable_path_index
@@ -8078,7 +8072,7 @@ impl ShardedHotEngine {
     pub(crate) fn reclaim_unreachable_packed_patricia_files(
         &self,
     ) -> PackedPatriciaMaintenanceReport {
-        let inventory = self.authenticated_patricia_indexes();
+        let inventory = self.content_patricia_indexes();
         let mut indexes = inventory
             .iter()
             .map(|(kind, store)| PackedPatriciaIndexMaintenance {
@@ -8094,7 +8088,7 @@ impl ShardedHotEngine {
                         }
                     },
                     None => PackedPatriciaMaintenanceOutcome::Unavailable(
-                        "authenticated Patricia store is unavailable".to_owned(),
+                        "content-addressed Patricia store is unavailable".to_owned(),
                     ),
                 },
             });
@@ -8110,7 +8104,7 @@ impl ShardedHotEngine {
 
     #[cfg(test)]
     pub(crate) fn packed_patricia_reclamation_attempts(&self) -> usize {
-        self.authenticated_patricia_indexes()
+        self.content_patricia_indexes()
             .iter()
             .filter_map(|(_, store)| store)
             .map(PatriciaIndexStore::reclamation_attempts)
@@ -10246,7 +10240,6 @@ impl ShardedHotEngine {
     /// and resource bindings. This deliberately does not claim process-restart
     /// writer exclusion: the managed-text latch is still process-local, and
     /// persisted enrollment owns reconstructing it before writer admission.
-    #[allow(dead_code)] // activated only by the later persisted-enrollment packet
     pub(crate) fn reconstruct_run_local_state(&mut self) -> Result<(), EngineError> {
         if self.scratch.is_none() {
             return Err(EngineError::Archive(
