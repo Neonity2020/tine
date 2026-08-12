@@ -163,7 +163,28 @@ export function createManagedStorageRuntimeBridge(api: RuntimeEventBackend = bac
 
   const receiveError = (event: SparseV2ErrorEvent): boolean => {
     if (!accepts(event.binding_generation)) return false;
-    setSnapshot((current) => current.error === event.message ? current : { ...current, error: event.message });
+    setSnapshot((current) => {
+      // A `managed_writable` admission is evidence that a live actor will save
+      // what we accept. A failing tick withdraws that evidence, so writability
+      // is revoked here rather than left standing until some later status
+      // happens to arrive — the native watcher suppresses a repeated error, so
+      // a persistently failing actor may send nothing else at all (GH #324).
+      // Only an authoritative status can restore it.
+      const admission = current.applicationPageAdmission;
+      const revoked: ApplicationPageAdmission | null =
+        admission?.authority === "managed_writable"
+          ? { binding_generation: admission.binding_generation, authority: "managed_unavailable" }
+          : admission;
+      if (current.error === event.message && revoked === admission) return current;
+      return {
+        ...current,
+        error: event.message,
+        applicationPageAdmission: revoked,
+        status: current.status && revoked
+          ? { ...current.status, application_page_admission: revoked }
+          : current.status,
+      };
+    });
     return true;
   };
 

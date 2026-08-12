@@ -3813,6 +3813,30 @@
         "failBefore": "proven"
       },
       "notes": "Sheets have their own clipboard path -- handleSheetPasteEvent -> splatStructuralSheetSelection / pasteTextIntoSheetSelection -- which reached none of preflightManagedBulkInsertion's call sites, so a large CSV/TSV paste materialized an unbounded number of blocks and the limit was only discovered at save time, stranding a partial edit. Resolved not by adding the frontend advisory admission the issue proposed, but by the stronger atomic-plan route: every cell is built in a DETACHED page candidate, the whole resulting page goes to preflight_managed_page_mutation, and the live page, undo history, selection and dirty state change only after the authority accepts. That native preflight applies the real block, depth and byte bounds (validate_application_save_request), so the check is made by the authority itself rather than by a frontend lower bound. Fail-before established at source against v0.6.93, where pasteTextIntoSheetSelection mutated the live document inside withSheetUndo via ensureGridRows/materializeCell/writeCellVisible with no admission and no candidate; that code path no longer exists, so the new test could not be run against it unchanged."
+    },
+    {
+      "id": "REG-MANAGED-ADMISSION-REVOKED-ON-ACTOR-FAILURE-324",
+      "title": "A writable page admission does not outlive the evidence that a live actor can save what it admits",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          324
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/managedStorageRuntime.test.ts"
+        ],
+        "scenario": "managed.admission-revoked-on-actor-failure",
+        "failBefore": "proven"
+      },
+      "notes": "sparse-v2-status -- the event carrying applicationPageAdmission -- was emitted only from the watcher's success arm. The Err arm emitted only sparse-v2-error, and suppressed even that when the message repeated, so a persistently failing actor emitted NOTHING after its first error and the last managed_writable admission stayed live indefinitely. Bulk insertions then passed preflight, consumed their token, mutated the page, and had no durable writer: the content is discarded on reload or crash, and the user keeps accumulating edits behind a failure instead of being refused before the first mutation. Two halves. The frontend revokes writability the moment it sees an error, because that is the signal that arrives even when nothing else does; only an authoritative status can restore it, and a tick alone cannot. A Direct admission is left untouched. The watcher additionally asks for status on the failure path and emits it when obtainable, so recovery is decided by the authority rather than by the absence of further errors. The frontend half has a literal fail-before proof; the watcher emit is a source-level change in the tick loop, which has no unit-test seam here."
     }
   ]
 }
