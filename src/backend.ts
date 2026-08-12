@@ -437,7 +437,7 @@ export interface Backend {
   ): Promise<"authorised" | "superseded" | "withdrawn">;
   /** Append the blocks of `src` (graph-root-relative path) onto `dst`, then trash
    *  `src` — fold a duplicate-day stray into the canonical day (#21). */
-  mergePages(src: string, dst: string): Promise<void>;
+  mergePages(src: string, dst: string, rename?: { from: string; to: string }): Promise<void>;
   /** Move a stray file (graph-root-relative path) to a uniquely-named page so it
    *  stops colliding and becomes normally navigable (#21). */
   renameFileToPage(path: string, newName: string): Promise<void>;
@@ -1168,8 +1168,13 @@ class TauriBackend implements Backend {
       conflictEpoch,
     });
   }
-  mergePages(src: string, dst: string) {
-    return this.call<void>("merge_pages", { src, dst });
+  mergePages(src: string, dst: string, rename?: { from: string; to: string }) {
+    return this.call<void>("merge_pages", {
+      src,
+      dst,
+      renameFrom: rename?.from ?? null,
+      renameTo: rename?.to ?? null,
+    });
   }
   renameFileToPage(path: string, newName: string) {
     return this.call<void>("rename_file_to_page", { path, newName });

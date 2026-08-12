@@ -3094,6 +3094,34 @@
       "notes": "Tine's mobile toolbar and desktop editor command already dispatched the same moveBlockFeed operation, but that operation only swapped siblings and stopped at every nested child-list edge. OG uses one shared move-up/down handler too. Its outliner rule swaps ordinary siblings; at a boundary, moving the last child down enters the next parent sibling as its first child, and moving that first child up enters the previous parent sibling as its last child. Tine now implements that same reversible structural rule while retaining root-level journal-feed crossing, subtree identity, inherited list-style semantics, caret-preserving keyed DOM movement, and one undo unit. The regression covers both directions, a child subtree, ordinary sibling movement with Undo/Redo, and the true top boundary."
     },
     {
+      "id": "REG-PAGE-RENAME-COLLISION-MERGE-327",
+      "title": "Renaming a page onto an existing page offers the Logseq-compatible complete merge",
+      "family": "page-identity-mutation",
+      "sources": {
+        "issues": [
+          327
+        ],
+        "commits": [],
+        "og": [
+          "src/main/frontend/components/page.cljs:244-266",
+          "src/main/frontend/handler/page.cljs:568-645"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/graph.test.tsx::page rename collisions",
+          "crates/tine-core/src/model.rs::tests::rename_collision_merges_content_and_rewrites_graph_refs",
+          "crates/tine-core/src/sync_runtime.rs::tests::application_graph_mutations_are_atomic_and_namespace_complete"
+        ]
+      },
+      "notes": "The previous Tine title editor sent every edit through ordinary rename, whose correct collision guard surfaced only a backend error. OG instead asks whether to merge. The parity behavior is broader than appending two files: Cancel mutates nothing; confirmation appends the source outline after the destination, retains non-conflicting Markdown page properties, rewrites references in the source, destination and every external referrer, renames source namespace descendants to the destination namespace, removes the source, refreshes all open editor state and navigates to the destination. Managed Storage composes the SQLite-indexed exact referrer plan, descendant renames, destination edit and source deletion into one semantic transaction. Direct Files commits the recoverable source-to-trash merge before invoking its existing transactional graph-wide rename/ref rewrite, so a later failure cannot lose either page's bytes. Duplicate-journal merge remains unchanged and never rewrites page identities."
+    },
+    {
       "id": "REG-CASE-INSENSITIVE-TRACKED-PATHS-280",
       "title": "A fresh checkout has no tracked paths that collide on a case-insensitive filesystem",
       "family": "build-portability",

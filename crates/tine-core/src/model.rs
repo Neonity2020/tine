@@ -12217,6 +12217,21 @@ impl Graph {
         self.config.preferred_format
     }
 
+    pub(crate) fn rewrite_page_refs_for_names(
+        &self,
+        raw: &str,
+        renames: &std::collections::HashMap<String, String>,
+        is_org: bool,
+    ) -> String {
+        let inline = crate::refs::rename_refs_multi_with_format(
+            raw,
+            renames,
+            is_org,
+            self.config.file_name_format,
+        );
+        crate::refs::rename_tags_property_multi(&inline, renames, is_org)
+    }
+
     /// List all pages and journals in the graph.
     pub fn list_pages(&self) -> Vec<PageEntry> {
         let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
@@ -13092,6 +13107,24 @@ impl Graph {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Logseq-compatible title collision: merge the old page into the existing
+    /// destination, then rewrite old-name references (and rename old/* namespace
+    /// descendants) exactly as an ordinary rename does. The merge is committed
+    /// first so an interruption can never delete or overwrite user content; its
+    /// source remains recoverable in typed trash. A later reference-rewrite error
+    /// is reported rather than hidden, and retrying `rename_page_expected` is safe
+    /// because the source file has already left the live graph.
+    pub fn merge_pages_after_rename(
+        &self,
+        src_rel: &str,
+        dst_rel: &str,
+        old: &str,
+        new: &str,
+    ) -> io::Result<()> {
+        self.merge_pages(src_rel, dst_rel)?;
+        self.rename_page_expected(old, new, None)
     }
 
     /// Turn a stray file into a normal, uniquely-named page by moving it to
@@ -46976,6 +47009,42 @@ mod tests {
         let trash = dir.join("logseq").join(".tine-trash");
         let kept = fs::read_dir(&trash).unwrap().flatten().count();
         assert_eq!(kept, 1, "stray sits in the recoverable trash");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_collision_merges_content_and_rewrites_graph_refs() {
+        let dir = scratch("rename-collision-merge");
+        fs::write(
+            dir.join("pages/Old.md"),
+            "- old body links [[Old]] and [[Old/Child]]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pages/New.md"), "- new body links [[Old]]\n").unwrap();
+        fs::write(dir.join("pages/Old___Child.md"), "- child of [[Old]]\n").unwrap();
+        fs::write(dir.join("pages/Referrer.md"), "- see [[Old]] and #Old\n").unwrap();
+        let graph = Graph::open(&dir);
+
+        graph
+            .merge_pages_after_rename("pages/Old.md", "pages/New.md", "Old", "New")
+            .unwrap();
+
+        let merged = fs::read_to_string(dir.join("pages/New.md")).unwrap();
+        assert!(merged.contains("new body links [[New]]"), "{merged}");
+        assert!(
+            merged.contains("old body links [[New]] and [[New/Child]]"),
+            "{merged}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/Referrer.md")).unwrap(),
+            "- see [[New]] and #New\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("pages/New___Child.md")).unwrap(),
+            "- child of [[New]]\n"
+        );
+        assert!(!dir.join("pages/Old.md").exists());
+        assert!(!dir.join("pages/Old___Child.md").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -325,6 +325,28 @@ export function refreshAfterRename(from: string, to: string, exactTarget?: PageT
   void Promise.all([refreshAliases(), refreshPageIdentities()]);
 }
 
+export async function renameOrMergePage(
+  from: string,
+  to: string,
+  sourcePath?: string,
+): Promise<"renamed" | "merged" | "cancelled"> {
+  const destination = await backend().getPage(to, "page");
+  let exactSourcePath = sourcePath;
+  if (!exactSourcePath) exactSourcePath = (await backend().getPage(from, "page"))?.path;
+  if (destination?.path && destination.path !== exactSourcePath) {
+    if (!globalThis.confirm(`Page “${to}” already exists. Merge “${from}” into it?`)) {
+      return "cancelled";
+    }
+    if (!exactSourcePath) {
+      throw new Error(`Couldn't identify the source file for “${from}”.`);
+    }
+    await backend().mergePages(exactSourcePath, destination.path, { from, to });
+    return "merged";
+  }
+  await backend().renamePage(from, to, exactSourcePath);
+  return "renamed";
+}
+
 export type JournalTemplateEnsureResult = "ready" | "deferred" | "stale";
 
 interface JournalTemplateOwner {

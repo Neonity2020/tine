@@ -49,6 +49,8 @@ async function loadHarness(
       application_page_admission: DIRECT_ADMISSION,
     })),
     getPage: vi.fn(async () => existing),
+    renamePage: vi.fn(async () => {}),
+    mergePages: vi.fn(async () => {}),
     getAppString: vi.fn(async (_key: string, fallback: string) => fallback),
     setAppString: vi.fn(async (_key: string, _value: string) => {}),
     listTemplates: vi.fn(async () => [
@@ -123,8 +125,13 @@ async function loadHarness(
     openPage: vi.fn(),
     restoreSession: vi.fn(async () => {}),
     flushSession: vi.fn(async () => {}),
+    route: vi.fn(() => ({ kind: "journals" })),
+    sameRoute: vi.fn((left, right) => JSON.stringify(left) === JSON.stringify(right)),
   }));
-  vi.doMock("./panes", () => ({ resetPaneLayoutToSingle: vi.fn() }));
+  vi.doMock("./panes", () => ({
+    resetPaneLayoutToSingle: vi.fn(),
+    removePageTargetAcrossPanes: vi.fn(),
+  }));
   vi.doMock("./journal", () => ({
     journalTitle: () => "Jul 10th, 2026",
     localDayKey: (date = new Date()) =>
@@ -140,9 +147,9 @@ async function loadHarness(
   vi.doMock("./guide", () => ({ maybeShowGuideAnnouncement: vi.fn() }));
   vi.doMock("./editorController", () => ({ endEdit: vi.fn() }));
 
-  const { ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, switchGraph } = await import("./graph");
+  const { ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph } = await import("./graph");
   return {
-    ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, switchGraph,
+    ensureJournalTemplateForDay, loadGraphPath, refreshAliases, refreshPageIdentities, renameOrMergePage, switchGraph,
     api, events, setAliasMap, pushToast,
     drainPdfWork, retirePdfOwnership, activatePdfOwnership, closePdf,
     applyTemplateVars, prepareTemplateVars,
@@ -223,6 +230,57 @@ afterEach(() => {
   vi.resetModules();
 });
 
+describe("page rename collisions", () => {
+  it("asks before merging into a real existing page and carries rename identities", async () => {
+    const destination: PageDto = {
+      name: "A",
+      kind: "page",
+      title: "A",
+      pre_block: null,
+      blocks: [],
+      path: "pages/A.md",
+    };
+    const harness = await loadHarness(destination);
+    const confirm = vi.fn(() => true);
+    vi.spyOn(globalThis, "confirm").mockImplementation(confirm);
+
+    await expect(harness.renameOrMergePage("B", "A", "pages/B.md")).resolves.toBe("merged");
+
+    expect(confirm).toHaveBeenCalledWith("Page “A” already exists. Merge “B” into it?");
+    expect(harness.api.mergePages).toHaveBeenCalledWith(
+      "pages/B.md",
+      "pages/A.md",
+      { from: "B", to: "A" },
+    );
+    expect(harness.api.renamePage).not.toHaveBeenCalled();
+  });
+
+  it("cancels without mutating either page", async () => {
+    const destination: PageDto = {
+      name: "A",
+      kind: "page",
+      title: "A",
+      pre_block: null,
+      blocks: [],
+      path: "pages/A.md",
+    };
+    const harness = await loadHarness(destination);
+    vi.spyOn(globalThis, "confirm").mockReturnValue(false);
+
+    await expect(harness.renameOrMergePage("B", "A", "pages/B.md")).resolves.toBe("cancelled");
+    expect(harness.api.mergePages).not.toHaveBeenCalled();
+    expect(harness.api.renamePage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the ordinary rename path when the destination has no file", async () => {
+    const harness = await loadHarness(null);
+
+    await expect(harness.renameOrMergePage("B", "C", "pages/B.md")).resolves.toBe("renamed");
+    expect(harness.api.renamePage).toHaveBeenCalledWith("B", "C", "pages/B.md");
+    expect(harness.api.mergePages).not.toHaveBeenCalled();
+  });
+});
+
 describe("default journal template graph bind", () => {
   it("loads real page identities once and lets them win colliding aliases", async () => {
     const { loadGraphPath, refreshAliases, refreshPageIdentities, api, setAliasMap } = await loadHarness(null, undefined, true, true);
@@ -298,23 +356,24 @@ describe("default journal template graph bind", () => {
     expect(setAliasMap).not.toHaveBeenLastCalledWith(expect.objectContaining({ stale: "Stale" }));
   });
 
-  it("invalidates stale loads before awaiting template work, then refreshes after save", async () => {
-    const { loadGraphPath, events } = await loadHarness(null);
+  it("materializes on the visible-journal request without reopening the graph", async () => {
+    const { loadGraphPath, ensureJournalTemplateForDay, events } = await loadHarness(null);
 
     await loadGraphPath(META.root);
+    await ensureJournalTemplateForDay(new Date());
 
     expect(events).toEqual([
       `activate-pdf:${META.root}`,
       "bump-epoch",
       "save-template",
-      "bump-epoch",
     ]);
   });
 
   it("routes default-journal template blocks through the shared variable expander", async () => {
-    const { loadGraphPath, api, applyTemplateVars, prepareTemplateVars } = await loadHarness(null);
+    const { loadGraphPath, ensureJournalTemplateForDay, api, applyTemplateVars, prepareTemplateVars } = await loadHarness(null);
 
     await loadGraphPath(META.root);
+    await ensureJournalTemplateForDay(new Date());
 
     expect(prepareTemplateVars).toHaveBeenCalledOnce();
     expect(applyTemplateVars).toHaveBeenCalledWith("Template body", "Jul 10th, 2026");
@@ -336,9 +395,10 @@ describe("default journal template graph bind", () => {
       blocks: [{ id: "empty", raw: "", collapsed: false, children: [] }],
       rev: "empty-journal-rev",
     };
-    const { loadGraphPath, api } = await loadHarness(existing);
+    const { loadGraphPath, ensureJournalTemplateForDay, api } = await loadHarness(existing);
 
     await loadGraphPath(META.root);
+    await ensureJournalTemplateForDay(new Date());
 
     expect(api.savePage).toHaveBeenCalledWith(expect.any(Object), "empty-journal-rev", false);
   });
@@ -352,9 +412,10 @@ describe("default journal template graph bind", () => {
       blocks: [{ id: "existing", raw: "user content", collapsed: false, children: [] }],
       rev: "existing-rev",
     };
-    const { loadGraphPath, api } = await loadHarness(existing);
+    const { loadGraphPath, ensureJournalTemplateForDay, api } = await loadHarness(existing);
 
     await loadGraphPath(META.root);
+    await ensureJournalTemplateForDay(new Date());
 
     expect(api.listTemplates).not.toHaveBeenCalled();
     expect(api.savePage).not.toHaveBeenCalled();

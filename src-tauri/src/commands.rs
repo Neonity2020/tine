@@ -4412,6 +4412,8 @@ mod application_page_authority_tests {
 pub(crate) async fn merge_pages(
     src: String,
     dst: String,
+    rename_from: Option<String>,
+    rename_to: Option<String>,
     state: GraphContext<'_>,
 ) -> Result<(), String> {
     let (app, label, binding_generation) = owned_graph_context(state)?;
@@ -4423,12 +4425,21 @@ pub(crate) async fn merge_pages(
                 SyncApplicationGraphMutationRequest::MergePages {
                     source_path: src,
                     destination_path: dst,
+                    rename_from,
+                    rename_to,
                 },
             )),
-            None => slot
-                .legacy_graph()?
-                .merge_pages(&src, &dst)
-                .map_err(|e| e.to_string()),
+            None => match (rename_from.as_deref(), rename_to.as_deref()) {
+                (Some(old), Some(new)) => slot
+                    .legacy_graph()?
+                    .merge_pages_after_rename(&src, &dst, old, new)
+                    .map_err(|e| e.to_string()),
+                (None, None) => slot
+                    .legacy_graph()?
+                    .merge_pages(&src, &dst)
+                    .map_err(|e| e.to_string()),
+                _ => Err("merge rename requires both source and destination names".into()),
+            },
         }
     })
     .await

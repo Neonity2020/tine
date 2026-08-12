@@ -20,7 +20,7 @@ import {
 } from "../ui";
 import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, openInNewTab, pageTargetMatchesLoaded, type PageTarget } from "../router";
 import { removePageTargetAcrossPanes } from "../panes";
-import { refreshAfterRename } from "../graph";
+import { refreshAfterRename, renameOrMergePage } from "../graph";
 import { backend } from "../backend";
 import { carryDay } from "../carry";
 import { journalTitle } from "../journal";
@@ -1030,14 +1030,14 @@ function RenamePage(props: {
         pushToast("Couldn't save pending edits — resolve the conflict before renaming.", "error");
         return;
       }
-      if (props.path) await backend().renamePage(from, next, props.path);
-      else await backend().renamePage(from, next);
+      const outcome = await renameOrMergePage(from, next, props.path);
+      if (outcome === "cancelled") return;
       // Backend rewrote refs across pages via the self-write guard (no watcher
       // reload) → in-memory pages are stale; reset + reload so a stale save can't
       // revert the rename.
       refreshAfterRename(from, next, { name: from, pageKind: kind, ...(props.path ? { path: props.path } : {}) });
       openPage(next, kind);
-      pushToast(`Renamed to “${next}”`, "success");
+      pushToast(outcome === "merged" ? `Merged into “${next}”` : `Renamed to “${next}”`, "success");
     } catch (e) {
       pushToast(`Rename failed: ${String(e)}`, "error");
     }

@@ -9,7 +9,7 @@ import {
 } from "../ui";
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
-import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename } from "../graph";
+import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename, renameOrMergePage } from "../graph";
 import { Block, OutlineScopeContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
@@ -704,8 +704,8 @@ function PageSection(props: { page: FeedPage }): JSX.Element {
         alert("Couldn't save pending edits — resolve the conflict before renaming.");
         return;
       }
-      if (props.page.path) await backend().renamePage(props.page.name, next, props.page.path);
-      else await backend().renamePage(props.page.name, next);
+      const outcome = await renameOrMergePage(props.page.name, next, props.page.path);
+      if (outcome === "cancelled") return;
       // The backend rewrote refs across many pages via the self-write guard (no
       // watcher reload), so every in-memory page is now potentially stale; reset
       // + reload so a stale copy can't be saved back and revert the rename.
