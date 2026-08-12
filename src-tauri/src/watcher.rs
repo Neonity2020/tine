@@ -1255,6 +1255,25 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                             );
                             graph.last_error = Some(message);
                         }
+                        // The success arm is not the only place the frontend's
+                        // page admission may move. Without this, a persistently
+                        // failing actor emits nothing at all after its first
+                        // error — the repeat suppression above sees to that —
+                        // and the last `managed_writable` admission stays live
+                        // indefinitely, letting bulk edits accumulate behind a
+                        // writer that cannot save them (GH #324). The status
+                        // call is the authority on writability and fails closed
+                        // on its own when no application handle is active; the
+                        // frontend additionally revokes writability the moment
+                        // it sees the error, so a status this call cannot obtain
+                        // does not leave the old one standing.
+                        if let Ok(status) = graph.handle.status() {
+                            let _ = app.emit_to(
+                                label,
+                                "sparse-v2-status",
+                                sparse_v2_runtime_status_event(graph.binding_generation, status),
+                            );
+                        }
                     }
                 }
             }

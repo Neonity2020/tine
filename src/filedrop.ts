@@ -10,6 +10,8 @@ import { assetFileName, assetMarkdown } from "./media";
 import { matrixGridNode, delimitedCellCount } from "./sheet/conversions";
 import { parseDelimitedText, type DelimitedKind } from "./sheet/tsv";
 import {
+  bulkRouteFenceCurrent,
+  captureBulkRouteFence,
   consumeManagedBulkInsertionAdmission,
   depthOf,
   doc,
@@ -88,8 +90,17 @@ async function materializeManagedDrop(afterId: string, plan: readonly PlannedDro
 }
 
 async function insertDroppedFilesDirect(afterId: string, paths: readonly string[]): Promise<void> {
+  // Direct Files does its IO one file at a time, so this routine can be mid-read
+  // when the user finishes switching the graph to managed storage. The route it
+  // chose is only true for as long as the fence holds; resuming past it would
+  // insert an unbounded outline with no admission at all (GH #325).
+  const fence = captureBulkRouteFence(afterId);
+  if (!fence) return;
   const nodes: OutlineNode[] = [];
   for (const path of paths) {
+    // Stop reading further files the moment the fence breaks: the outline can no
+    // longer be inserted, and the target block may already be gone.
+    if (!bulkRouteFenceCurrent(fence)) break;
     const kind = delimitedKind(path);
     if (kind) {
       const text = await backend().readTextFile(path);
@@ -104,7 +115,8 @@ async function insertDroppedFilesDirect(afterId: string, paths: readonly string[
     }
     const orig = basename(path) || undefined;
     const saved = await trackAssetWrite(backend().importAsset(path, assetFileName(orig)));
-    const page = pageByName(doc.byId[afterId].page);
+    if (!bulkRouteFenceCurrent(fence)) break;
+    const page = pageByName(fence.targetPage);
     nodes.push({
       raw: assetMarkdown(saved, {
         label: orig,
@@ -115,6 +127,10 @@ async function insertDroppedFilesDirect(afterId: string, paths: readonly string[
     });
   }
   if (!nodes.length) return;
+  if (!bulkRouteFenceCurrent(fence)) {
+    pushToast("Couldn't insert the dropped files: this graph changed while they were being read.", "error");
+    return;
+  }
   withUndoUnit("file-drop", [doc.byId[afterId].page], () => insertOutlineAfter(afterId, nodes));
   pushToast(`Inserted ${nodes.length} file${nodes.length === 1 ? "" : "s"}`, "success");
 }

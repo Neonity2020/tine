@@ -22,6 +22,7 @@ import {
   flushPage,
   forgetPage,
   historyPageOnlyMode,
+  insertEmptyChildBlock,
   loadFeed,
   loadSingle,
   markDirty,
@@ -361,6 +362,56 @@ describe("clipboard payload insertion and identity validation", () => {
 
     expect(roots("Paste")).toHaveLength(2);
     expect(doc.byId[HOST].raw).toBe("target");
+  });
+
+  it("does not delete text typed into the empty host while a managed paste is awaiting", async () => {
+    await seed([
+      page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
+      page("Target", [block(HOST, "")]),
+    ]);
+    const payload = buildClipboardPayload([ID1])!;
+    await record("cut", "- source", payload);
+    deleteBlock(ID1);
+    bindManagedWritable();
+    let release!: (value: (null)[]) => void;
+    vi.mocked(backend().resolveBlocks).mockReturnValue(new Promise((resolve) => { release = resolve; }));
+
+    const pending = paste(HOST);
+    await vi.waitFor(() => expect(backend().resolveBlocks).toHaveBeenCalled());
+    setRaw(HOST, "typed while the paste was in flight");
+    release([null]);
+    await pending;
+
+    expect(doc.byId[HOST]).toBeDefined();
+    expect(doc.byId[HOST].raw).toBe("typed while the paste was in flight");
+    expect(roots("Target")).toEqual([HOST, ID1]);
+  });
+
+  it("refuses an admitted managed paste when the page grows past the limit during its awaits", async () => {
+    const target = generatedId(99_996);
+    await seed([
+      page("Source", [block(ID1, `source\nid:: ${ID1}`)]),
+      page("Paste", [
+        ...Array.from({ length: 509 }, (_, index) => block(generatedId(index + 1), `existing ${index}`)),
+        block(target, "target"),
+      ]),
+    ]);
+    const payload = buildClipboardPayload([ID1])!;
+    await record("cut", "- source", payload);
+    deleteBlock(ID1);
+    bindManagedWritable();
+    let release!: (value: (null)[]) => void;
+    vi.mocked(backend().resolveBlocks).mockReturnValue(new Promise((resolve) => { release = resolve; }));
+
+    const pending = paste(target);
+    await vi.waitFor(() => expect(backend().resolveBlocks).toHaveBeenCalled());
+    // 510 -> 511 blocks: the admitted one-block plan would now land on 512.
+    expect(insertEmptyChildBlock(target, 0)).not.toBeNull();
+    release([null]);
+
+    await expect(pending).resolves.toBeNull();
+    expect(pageNodeCount("Paste")).toBe(511);
+    expect(doc.byId[ID1]).toBeUndefined();
   });
 
   it("refuses a private clipboard paste while managed storage has no writable route", async () => {

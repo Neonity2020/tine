@@ -20,7 +20,7 @@
         "all"
       ],
       "layer": "frontend-store",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "src/filedrop.test.ts",
@@ -47,7 +47,7 @@
         "all"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::cold_graph_creation_repairs_identity_evidence_once",
@@ -2457,7 +2457,7 @@
         "windows"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/model.rs::missing_target_creation_ignores_the_retained_shadow_peak_limit",
@@ -3700,7 +3700,7 @@
         "android"
       ],
       "layer": "core-native",
-      "status": "covered",
+      "status": "released",
       "coverage": {
         "tests": [
           "crates/tine-core/src/sync_runtime.rs::managed_reopen_rebuilds_after_malformed_retained_scratch_blob"
@@ -3709,6 +3709,134 @@
         "failBefore": "proven"
       },
       "notes": "A cleanly shut down managed graph selected one retained scratch run through its newest canonical resume point. Deleting only disposable SQLite and corrupting that run's blobs.data reproduced the exact pre-fix terminal result: OpenRefused with 'SQLite materialization failed: immutable archive error: document scratch index failed: malformed scratch blob'. Reopen now recognizes only this typed reconstructible failure, validates the immutable bootstrap authority, preserves the malformed run byte-for-byte, creates a distinct fresh run, fully replays accepted immutable history, and rebuilds SQLite once. The regression proves recovery alone changes neither direct graph bytes nor immutable archive, engine-history, or projection-receipt evidence; then it loads Root.md through the public application API, accepts and reads back a real application save, drains it, proves append-only authority/receipt growth and the updated direct projection, and reaches Safe shutdown. Other malformed or second-attempt errors remain fail-closed."
+    },
+    {
+      "id": "REG-MANAGED-CLIPBOARD-ADMISSION-STALENESS-322",
+      "title": "An in-flight bulk paste never deletes a block the user typed into while it was awaiting, and never lands an insertion the page has meanwhile outgrown",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          322
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/clipboard.paste.test.ts"
+        ],
+        "scenario": "managed.clipboard-admission-recheck-after-await",
+        "failBefore": "proven"
+      },
+      "notes": "A managed paste caches its decisions during a synchronous preflight and then awaits a cut-source flush and a backend identity lookup. Two facts can change across those awaits. (1) Whether the target is an empty host the paste may REPLACE: if the user types into it while the paste is in flight, replacing it destroys that text. The empty-host decision is now recomputed from the live block at insertion time on both the managed and the Direct path, and the admitted plan assumes the host survives, so the realized block count can only be at or below the admitted one. (2) The page's size and the target's depth: the limit question is re-asked at consumption against the live tree, so an insertion admitted at 510 blocks is refused once the page has reached the cap. Both halves have a literal fail-before proof; before the fix the host block and the text typed into it were deleted outright."
+    },
+    {
+      "id": "REG-MANAGED-BULK-INSERTION-BYTE-MODEL-323",
+      "title": "The frontend's bulk-insertion byte model is a true lower bound on the native save-request charge, including what the page already holds",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          323
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/store.test.ts"
+        ],
+        "scenario": "managed.bulk-insertion-byte-lower-bound",
+        "failBefore": "proven"
+      },
+      "notes": "The point of admitting a bulk insertion in the frontend is to refuse it BEFORE the page is mutated, so the model must never admit something validate_editor_save_request will reject. It did, two ways. It compared only the INSERTED raw text against the advertised limit, ignoring the page the request also carries, so a small insertion into a nearly full page was admitted and then unsaveable. And it compared with strict greater-than, so an insertion of exactly the advertised byte count was admitted even though the native charge additionally includes the page name/id, the base revision, the preamble and every block's key and parent key, and is therefore necessarily over. The check now sums a bounded census of the existing page (content plus block and parent key bytes, deliberately omitting the page-level terms so the estimate stays a lower bound rather than a guess) with the inserted text, and refuses at the boundary. Fail-before proven by restoring the old comparison: both refusals became admissions."
+    },
+    {
+      "id": "REG-BULK-ROUTE-FENCE-ACROSS-AWAIT-325",
+      "title": "A bulk insertion that selected a storage route synchronously cannot resume onto a different one after its I/O",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          325
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/filedrop.test.ts",
+          "src/clipboard.paste.test.ts"
+        ],
+        "scenario": "managed.bulk-route-fence-across-await",
+        "failBefore": "proven"
+      },
+      "notes": "A file drop reads the storage route once, synchronously, then does its I/O. On the Direct branch that I/O could still be running when the user finished enabling managed storage, and the continuation then inserted an unbounded outline through insertOutlineAfter with no admission at all -- exactly the mutate-first failure the admission work exists to prevent. Graph activation flips this authority inside its own graphTransitioning window, so the existing transitioning check only stopped continuations resuming DURING the switch, not the far more likely ones resuming just after it (a native confirm dialog sits inside that window). The route is now part of the shared continuation fence used by both the drop and the clipboard paste: authority and binding generation are captured with the graph epoch, root, target node, page and page-instance generation, and re-proved before any mutation. The Direct drop also stops reading further files the moment the fence breaks, which additionally removes a TypeError path when the target block was deleted mid-drop. Fail-before proven by removing the fence: the drop imported the asset and inserted."
+    },
+    {
+      "id": "REG-MANAGED-SHEET-PASTE-ADMISSION-320",
+      "title": "Pasting into a Sheet's cells under managed storage is validated by the storage authority before the live page changes",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          320
+        ],
+        "commits": [
+          "6ba116f4",
+          "65881fb8",
+          "e958b853",
+          "226afed8",
+          "0537d138"
+        ]
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/sheet/mutations.test.ts",
+          "src/sheet/selection.test.ts"
+        ],
+        "scenario": "managed.sheet-paste-validated-before-mutation",
+        "failBefore": "proven"
+      },
+      "notes": "Sheets have their own clipboard path -- handleSheetPasteEvent -> splatStructuralSheetSelection / pasteTextIntoSheetSelection -- which reached none of preflightManagedBulkInsertion's call sites, so a large CSV/TSV paste materialized an unbounded number of blocks and the limit was only discovered at save time, stranding a partial edit. Resolved not by adding the frontend advisory admission the issue proposed, but by the stronger atomic-plan route: every cell is built in a DETACHED page candidate, the whole resulting page goes to preflight_managed_page_mutation, and the live page, undo history, selection and dirty state change only after the authority accepts. That native preflight applies the real block, depth and byte bounds (validate_application_save_request), so the check is made by the authority itself rather than by a frontend lower bound. Fail-before established at source against v0.6.93, where pasteTextIntoSheetSelection mutated the live document inside withSheetUndo via ensureGridRows/materializeCell/writeCellVisible with no admission and no candidate; that code path no longer exists, so the new test could not be run against it unchanged."
+    },
+    {
+      "id": "REG-MANAGED-ADMISSION-REVOKED-ON-ACTOR-FAILURE-324",
+      "title": "A writable page admission does not outlive the evidence that a live actor can save what it admits",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          324
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/managedStorageRuntime.test.ts"
+        ],
+        "scenario": "managed.admission-revoked-on-actor-failure",
+        "failBefore": "proven"
+      },
+      "notes": "sparse-v2-status -- the event carrying applicationPageAdmission -- was emitted only from the watcher's success arm. The Err arm emitted only sparse-v2-error, and suppressed even that when the message repeated, so a persistently failing actor emitted NOTHING after its first error and the last managed_writable admission stayed live indefinitely. Bulk insertions then passed preflight, consumed their token, mutated the page, and had no durable writer: the content is discarded on reload or crash, and the user keeps accumulating edits behind a failure instead of being refused before the first mutation. Two halves. The frontend revokes writability the moment it sees an error, because that is the signal that arrives even when nothing else does; only an authoritative status can restore it, and a tick alone cannot. A Direct admission is left untouched. The watcher additionally asks for status on the failure path and emits it when obtainable, so recovery is decided by the authority rather than by the absence of further errors. The frontend half has a literal fail-before proof; the watcher emit is a source-level change in the tick loop, which has no unit-test seam here."
     }
   ]
 }

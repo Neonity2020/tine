@@ -246,4 +246,52 @@ describe("managed-storage runtime event bridge", () => {
     expect(bridge.transitionMoveRecovery(recovery(72, 74, episode), episode, 72, () => true)).toBe(false);
     expect(bridge.snapshot().bindingGeneration).toBe(73);
   });
+  it("revokes a writable admission when the actor reports an error, and restores it only from a status", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(61)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+
+    bridge.bind(61);
+    expect(bridge.receiveStatus(active(61))).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({ authority: "managed_writable" });
+
+    // The native watcher suppresses a REPEATED error, so a persistently failing
+    // actor may send nothing else at all after this one (GH #324).
+    expect(bridge.receiveError({ binding_generation: 61, message: "actor tick failed" })).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 61,
+      authority: "managed_unavailable",
+    });
+    expect(bridge.snapshot().status?.application_page_admission).toEqual({
+      binding_generation: 61,
+      authority: "managed_unavailable",
+    });
+
+    // A tick alone is not evidence of a writer; only an authoritative status is.
+    expect(bridge.receiveTick({ binding_generation: 61, tick: { state: "idle", detail: null, epoch: null } })).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({ authority: "managed_unavailable" });
+
+    expect(bridge.receiveStatus(active(61))).toBe(true);
+    expect(bridge.snapshot().applicationPageAdmission).toMatchObject({ authority: "managed_writable" });
+  });
+
+  it("leaves a Direct admission alone when a managed error arrives", () => {
+    const bridge = createManagedStorageRuntimeBridge({
+      sparseV2Status: vi.fn().mockResolvedValue(active(62)),
+      onSparseV2Status: async () => () => {},
+      onSparseV2Tick: async () => () => {},
+      onSparseV2Error: async () => () => {},
+    });
+
+    bridge.bind(62, { binding_generation: 62, authority: "direct" });
+    expect(bridge.receiveError({ binding_generation: 62, message: "actor tick failed" })).toBe(true);
+
+    expect(bridge.snapshot().applicationPageAdmission).toEqual({
+      binding_generation: 62,
+      authority: "direct",
+    });
+  });
 });

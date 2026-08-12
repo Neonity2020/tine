@@ -250,6 +250,36 @@ describe("sheet structural mutations", () => {
     },
   );
 
+  // GH #320 reported that pasting into a Sheet's cells materializes an unbounded
+  // number of blocks with no admission at all, so the limit is only discovered at
+  // save time with a partial edit already on the page. The atomic-plan route
+  // answers it: every cell is built in a detached candidate, the authority sees
+  // the WHOLE resulting page, and the live page changes only on acceptance.
+  it("submits a large CSV sheet paste for validation and leaves the page untouched when refused", async () => {
+    const gridId = loadGrid();
+    const before = pageToDto("Sheet");
+    bindManaged();
+    const base = mockBackend();
+    let candidateBlocks = 0;
+    __setBackendForTest({
+      ...base,
+      preflightManagedPageMutation: async (page) => {
+        const count = (blocks: readonly BlockDto[]): number =>
+          blocks.reduce((total, block) => total + 1 + count(block.children), 0);
+        candidateBlocks = count(page.blocks);
+        return { status: "refused" };
+      },
+    });
+    const csv = Array.from({ length: 400 }, (_, row) => `a${row}\tb${row}\tc${row}`).join("\n");
+
+    pasteTextIntoSheetSelection({ kind: "cell", gridId, row: 0, col: 0 }, csv, () => {});
+    await settle();
+
+    expect(candidateBlocks).toBeGreaterThan(1_200);
+    expect(pageToDto("Sheet")).toEqual(before);
+    expect(doc.byId[gridId].children).toHaveLength(3);
+  });
+
   it("finalizes a deeply immutable effect authority and revokes retained builder references", () => {
     const gridId = loadGrid();
     let retained: Parameters<Parameters<typeof createPageMutationPlan>[2]>[0] | null = null;

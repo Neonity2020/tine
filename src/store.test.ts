@@ -425,6 +425,89 @@ describe("managed quick-capture admission", () => {
       savePage.mockRestore();
     }
   });
+
+  function bindManagedPage(name: string, raws: string[]): void {
+    loadSingle({
+      name,
+      kind: "page",
+      title: name,
+      pre_block: null,
+      blocks: raws.map((raw, index) => ({
+        id: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, "0")}`,
+        raw,
+        collapsed: false,
+        children: [],
+      })),
+    });
+    managedStorageRuntime.bind(1);
+    managedStorageRuntime.receiveStatus({
+      state: "active",
+      runtime: null,
+      can_activate: false,
+      can_retry: false,
+      can_cancel: false,
+      cancel_reason: null,
+      binding_generation: 1,
+      application_page_admission: {
+        binding_generation: 1,
+        authority: "managed_writable",
+        application_save_page_blocks: 511,
+        application_page_request_text_bytes: 1_048_576,
+        application_page_max_depth: 128,
+      },
+    } as any);
+  }
+
+  // The native validator charges the page name, the base revision and every
+  // block's keys on top of the content, so an insertion that merely REACHES the
+  // advertised byte limit is already over it once the request is built.
+  it("refuses a capture whose text exactly reaches the advertised request byte limit", async () => {
+    setToasts([]);
+    bindManagedPage("Bytes", ["anchor"]);
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+
+    const captured = await captureToPage("Bytes", `- ${"a".repeat(1_048_576)}`);
+
+    expect(captured).toBe(false);
+    expect(pageByName("Bytes")!.roots).toHaveLength(1);
+    expect(savePage).not.toHaveBeenCalled();
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Can't insert: this page would exceed Tine-managed storage's 511-block or request-size limit. Nothing was changed.",
+    ]);
+    savePage.mockRestore();
+  });
+
+  // 1_048_400 content bytes + a 36-byte block id leaves the page itself inside
+  // the 1_048_576-byte limit; only the 200 further bytes push it over. So this
+  // fails exactly when existing page content is left out of the model.
+  it("counts what the page already holds, so a small capture into a nearly full page is refused", async () => {
+    setToasts([]);
+    bindManagedPage("Bytes", ["b".repeat(1_048_400)]);
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+
+    const captured = await captureToPage("Bytes", `- ${"c".repeat(200)}`);
+
+    expect(captured).toBe(false);
+    expect(pageByName("Bytes")!.roots).toHaveLength(1);
+    expect(savePage).not.toHaveBeenCalled();
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Can't insert: this page would exceed Tine-managed storage's 511-block or request-size limit. Nothing was changed.",
+    ]);
+    savePage.mockRestore();
+  });
+
+  it("still admits a capture that leaves the page comfortably inside both limits", async () => {
+    setToasts([]);
+    bindManagedPage("Bytes", ["anchor"]);
+    const savePage = vi.spyOn(backend(), "savePage").mockResolvedValue("capture-rev");
+
+    const captured = await captureToPage("Bytes", "- ordinary note");
+
+    expect(captured).toBe(true);
+    expect(pageByName("Bytes")!.roots).toHaveLength(2);
+    expect(toasts()).toEqual([]);
+    savePage.mockRestore();
+  });
 });
 
 describe("ordered list (logseq.order-list-type)", () => {

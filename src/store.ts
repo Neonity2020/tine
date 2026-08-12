@@ -2326,6 +2326,8 @@ interface InternalBulkInsertionAdmission extends BulkInsertionAdmission {
   bindingGeneration: number;
   authority: "managed_writable";
   plan: ManagedBulkInsertionPlan;
+  limits: ManagedBulkAdmissionLimits;
+  insertionRootDepthOffset: number;
 }
 
 export type ManagedBulkInsertionPreflight =
@@ -2339,17 +2341,86 @@ const managedBulkOverflowToast = (limit: number): string =>
 const managedBulkUnavailableToast =
   "Can't insert while Tine-managed storage is changing state. Nothing was changed.";
 
-function boundedPageBlockCount(page: FeedPage, cap: number): number {
-  let count = 0;
+interface BoundedPageCensus {
+  blocks: number;
+  requestTextUtf8Bytes: number;
+}
+
+/** One bounded walk answering both page-sized questions an admission asks.
+ *
+ * `requestTextUtf8Bytes` is a deliberate LOWER BOUND on what the native
+ * validator charges for saving this page (`validate_editor_save_request`,
+ * crates/tine-core/src/sync_runtime.rs). That charge is per block — its key,
+ * its parent's key, and its content — plus the page name/id, the base revision
+ * and any preamble. Existing blocks are counted here with all three per-block
+ * terms; the page-level terms and the inserted blocks' request-local keys are
+ * not modelled, because they are not known here and omitting them keeps this a
+ * lower bound rather than a guess. Under-counting means we may still admit
+ * something the actor refuses; over-counting would refuse saves that are
+ * genuinely fine, which is the worse error (GH #323). */
+function boundedPageCensus(
+  page: FeedPage,
+  blockCap: number,
+  textByteCap: number,
+): BoundedPageCensus {
+  const encoder = new TextEncoder();
+  let blocks = 0;
+  let requestTextUtf8Bytes = 0;
   const stack = [...page.roots];
-  while (stack.length && count < cap) {
+  while (stack.length && blocks < blockCap && requestTextUtf8Bytes < textByteCap) {
     const id = stack.pop()!;
     const node = doc.byId[id];
     if (!node) continue;
-    count++;
+    blocks++;
+    requestTextUtf8Bytes = Math.min(
+      textByteCap,
+      requestTextUtf8Bytes
+        + encoder.encode(node.raw).byteLength
+        + id.length
+        + (node.parent === null ? 0 : node.parent.length),
+    );
     for (let index = node.children.length - 1; index >= 0; index--) stack.push(node.children[index]);
   }
-  return count;
+  return { blocks, requestTextUtf8Bytes };
+}
+
+/** The absolute depth an insertion's roots land at, derived from the live tree.
+ * Callers state their own root depth relative to the target; a token records the
+ * offset so the same question can be re-asked after an await (GH #322). */
+function insertionRootDepthBasis(targetId: string | null): number {
+  return targetId === null ? 1 : depthOf(targetId) + 1;
+}
+
+/** Re-answerable overflow question. Every input the caller can no longer affect
+ * lives in `plan`; everything that can move while a bulk route awaits — the
+ * page's current size and the target's depth — is read live here, so preflight
+ * and consumption apply the identical rule to different instants (GH #322). */
+function bulkInsertionOverflows(
+  pageName: string,
+  insertionRootDepth: number,
+  plan: ManagedBulkInsertionPlan,
+  limits: ManagedBulkAdmissionLimits,
+): boolean {
+  const page = pageByName(pageName);
+  if (!page) return true;
+  const census = boundedPageCensus(
+    page,
+    limits.applicationSavePageBlocks + 1,
+    limits.applicationPageRequestTextBytes + 1,
+  );
+  const exceedsBlockLimit =
+    census.blocks - plan.removedOrReusedDescendants + plan.insertedDescendants
+      > limits.applicationSavePageBlocks;
+  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
+    && insertionRootDepth + plan.maximumInputRelativeDepth - 1 > limits.applicationPageMaxDepth;
+  // The save request carries the WHOLE page, so an insertion is charged on top
+  // of what the page already holds. `>=` rather than `>`: the native charge also
+  // includes the page name/id and base revision, which are never empty, so a
+  // lower bound that merely reaches the limit is already over it (GH #323).
+  const exceedsTextLimit =
+    census.requestTextUtf8Bytes + plan.insertedRawTextUtf8Bytes
+      >= limits.applicationPageRequestTextBytes;
+  return exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit;
 }
 
 /**
@@ -2384,15 +2455,7 @@ export function preflightManagedBulkInsertion(
     applicationPageMaxDepth: admission.application_page_max_depth,
   };
   const plan = buildPlan(limits);
-  const currentBlocks = boundedPageBlockCount(page, limits.applicationSavePageBlocks + 1);
-  const exceedsBlockLimit =
-    currentBlocks - plan.removedOrReusedDescendants + plan.insertedDescendants
-      > limits.applicationSavePageBlocks;
-  const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
-    && plan.insertionRootDepth + plan.maximumInputRelativeDepth - 1
-      > limits.applicationPageMaxDepth;
-  const exceedsTextLimit = plan.insertedRawTextUtf8Bytes > limits.applicationPageRequestTextBytes;
-  if (exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit) {
+  if (bulkInsertionOverflows(pageName, plan.insertionRootDepth, plan, limits)) {
     return { kind: "refused", toast: managedBulkOverflowToast(limits.applicationSavePageBlocks) };
   }
 
@@ -2408,6 +2471,8 @@ export function preflightManagedBulkInsertion(
     bindingGeneration: admission.binding_generation,
     authority: admission.authority,
     plan,
+    limits,
+    insertionRootDepthOffset: plan.insertionRootDepth - insertionRootDepthBasis(targetId),
   };
   return { kind: "admitted", token };
 }
@@ -2434,6 +2499,15 @@ export function consumeManagedBulkInsertionAdmission(
     || pageInstanceGeneration(internal.targetPage) !== internal.targetGeneration
     || graphEpoch() !== internal.graphEpoch
     || (graphMeta()?.root ?? "") !== internal.graphRoot
+    // The page may have grown, or the target moved deeper, while the caller
+    // awaited. Identity checks alone cannot see that, so ask the limit question
+    // again against the tree we are about to mutate (GH #322).
+    || bulkInsertionOverflows(
+      internal.targetPage,
+      insertionRootDepthBasis(targetId) + internal.insertionRootDepthOffset,
+      internal.plan,
+      internal.limits,
+    )
   ) return false;
   internal.consumed = true;
   return true;
@@ -3692,20 +3766,34 @@ function liveDocReferences(id: string): boolean {
   return Object.values(doc.byId).some((node) => reference.test(node.raw));
 }
 
-interface ClipboardPasteAuthority {
+/** What a bulk insertion route decided against, so a continuation resuming after
+ * an await can prove it is still talking about the same block, the same page
+ * instance, the same graph AND the same storage route.
+ *
+ * The storage route is part of it because a route is selected synchronously and
+ * acted on later: a drop or paste that chose Direct Files can still be reading
+ * a file while the user finishes turning managed storage on, and would then
+ * insert without the admission the managed route requires (GH #325). Graph
+ * activation flips this authority inside its own transitioning window, so
+ * `graphTransitioning` alone stops only continuations that resume DURING the
+ * switch, not the ones that resume just after it. */
+export interface BulkRouteFence {
   epoch: number;
   root: string;
   targetId: string;
   targetNode: Node;
   targetPage: string;
   targetGeneration: number;
+  routeAuthority: string | null;
+  routeBindingGeneration: number | null;
 }
 
-function captureClipboardPasteAuthority(targetId: string): ClipboardPasteAuthority | null {
+export function captureBulkRouteFence(targetId: string): BulkRouteFence | null {
   const target = doc.byId[targetId];
   if (!target || graphTransitioning()) return null;
   const targetGeneration = pageInstanceGeneration(target.page);
   if (targetGeneration === null) return null;
+  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
   return {
     epoch: graphEpoch(),
     root: graphMeta()?.root ?? "",
@@ -3713,18 +3801,23 @@ function captureClipboardPasteAuthority(targetId: string): ClipboardPasteAuthori
     targetNode: unwrap(target),
     targetPage: target.page,
     targetGeneration,
+    routeAuthority: route?.authority ?? null,
+    routeBindingGeneration: route?.binding_generation ?? null,
   };
 }
 
-function clipboardPasteAuthorityCurrent(authority: ClipboardPasteAuthority): boolean {
-  const target = doc.byId[authority.targetId];
+export function bulkRouteFenceCurrent(fence: BulkRouteFence): boolean {
+  const target = doc.byId[fence.targetId];
+  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
   return !graphTransitioning()
-    && graphEpoch() === authority.epoch
-    && (graphMeta()?.root ?? "") === authority.root
+    && graphEpoch() === fence.epoch
+    && (graphMeta()?.root ?? "") === fence.root
     && !!target
-    && unwrap(target) === authority.targetNode
-    && target.page === authority.targetPage
-    && pageInstanceGeneration(authority.targetPage) === authority.targetGeneration;
+    && unwrap(target) === fence.targetNode
+    && target.page === fence.targetPage
+    && pageInstanceGeneration(fence.targetPage) === fence.targetGeneration
+    && (route?.authority ?? null) === fence.routeAuthority
+    && (route?.binding_generation ?? null) === fence.routeBindingGeneration;
 }
 
 function clipboardTargetReusesEmptyHost(target: Node, targetFormat: Format): boolean {
@@ -3808,20 +3901,21 @@ export function pasteClipboardPayload(
   targetId: string,
   slot: ClipboardPayloadSlot,
 ): Promise<string | null> {
-  const authority = captureClipboardPasteAuthority(targetId);
+  const authority = captureBulkRouteFence(targetId);
   if (!authority) return Promise.resolve(null);
 
-  let managedReuseEmptyHost: boolean | null = null;
-  const admission = preflightManagedBulkInsertion(targetId, (limits) => {
-    const target = doc.byId[targetId]!;
-    managedReuseEmptyHost = clipboardTargetReusesEmptyHost(target, formatForPage(target.page));
-    return managedBulkOutlinePlan(
-      slot.blocks,
-      depthOf(targetId) + 1,
-      managedReuseEmptyHost ? 1 : 0,
-      limits,
-    );
-  });
+  // Plan as if the host will NOT be reused. Whether an empty host is replaced is
+  // decided from the live block at insertion time, after this route's awaits, so
+  // no cached answer may authorize deleting a block the user has since typed
+  // into (GH #322). Assuming the host survives keeps the admitted block count an
+  // upper bound on the realized one either way; the cost is refusing a paste
+  // into an empty host on a page already exactly at the limit.
+  const admission = preflightManagedBulkInsertion(targetId, (limits) => managedBulkOutlinePlan(
+    slot.blocks,
+    depthOf(targetId) + 1,
+    0,
+    limits,
+  ));
   if (admission.kind === "refused") {
     reportManagedBulkInsertionRefusal(admission.toast);
     return Promise.resolve(null);
@@ -3855,7 +3949,7 @@ export function pasteClipboardPayload(
         recordClipboardPhaseForTest("source-retirement");
       }
       preserveIds = await flushCutSourcePages(grant!.sourcePages);
-      if (preserveIds && !clipboardPasteAuthorityCurrent(authority)) return null;
+      if (preserveIds && !bulkRouteFenceCurrent(authority)) return null;
     }
     if (preserveIds) {
       try {
@@ -3872,7 +3966,7 @@ export function pasteClipboardPayload(
 
     // Final JS-single-thread section: every authority and retirement check is
     // synchronous and insertion follows immediately with no await boundary.
-    if (!clipboardPasteAuthorityCurrent(authority)) return null;
+    if (!bulkRouteFenceCurrent(authority)) return null;
     if (preserveIds) {
       if (import.meta.env.MODE === "test") {
         recordClipboardWorkForTest("final_identity_guard_phases");
@@ -3884,9 +3978,10 @@ export function pasteClipboardPayload(
     if (admission.kind === "admitted" && !consumeManagedBulkInsertionAdmission(admission.token, targetId)) {
       return null;
     }
-    const reuseEmptyHost = admission.kind === "admitted"
-      ? managedReuseEmptyHost!
-      : clipboardTargetReusesEmptyHost(doc.byId[targetId], formatForPage(doc.byId[targetId].page));
+    const reuseEmptyHost = clipboardTargetReusesEmptyHost(
+      doc.byId[targetId],
+      formatForPage(doc.byId[targetId].page),
+    );
     return insertClipboardBlocksSync(
       targetId,
       slot.blocks,
