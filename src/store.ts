@@ -2341,17 +2341,47 @@ const managedBulkOverflowToast = (limit: number): string =>
 const managedBulkUnavailableToast =
   "Can't insert while Tine-managed storage is changing state. Nothing was changed.";
 
-function boundedPageBlockCount(page: FeedPage, cap: number): number {
-  let count = 0;
+interface BoundedPageCensus {
+  blocks: number;
+  requestTextUtf8Bytes: number;
+}
+
+/** One bounded walk answering both page-sized questions an admission asks.
+ *
+ * `requestTextUtf8Bytes` is a deliberate LOWER BOUND on what the native
+ * validator charges for saving this page (`validate_editor_save_request`,
+ * crates/tine-core/src/sync_runtime.rs). That charge is per block — its key,
+ * its parent's key, and its content — plus the page name/id, the base revision
+ * and any preamble. Existing blocks are counted here with all three per-block
+ * terms; the page-level terms and the inserted blocks' request-local keys are
+ * not modelled, because they are not known here and omitting them keeps this a
+ * lower bound rather than a guess. Under-counting means we may still admit
+ * something the actor refuses; over-counting would refuse saves that are
+ * genuinely fine, which is the worse error (GH #323). */
+function boundedPageCensus(
+  page: FeedPage,
+  blockCap: number,
+  textByteCap: number,
+): BoundedPageCensus {
+  const encoder = new TextEncoder();
+  let blocks = 0;
+  let requestTextUtf8Bytes = 0;
   const stack = [...page.roots];
-  while (stack.length && count < cap) {
+  while (stack.length && blocks < blockCap && requestTextUtf8Bytes < textByteCap) {
     const id = stack.pop()!;
     const node = doc.byId[id];
     if (!node) continue;
-    count++;
+    blocks++;
+    requestTextUtf8Bytes = Math.min(
+      textByteCap,
+      requestTextUtf8Bytes
+        + encoder.encode(node.raw).byteLength
+        + id.length
+        + (node.parent === null ? 0 : node.parent.length),
+    );
     for (let index = node.children.length - 1; index >= 0; index--) stack.push(node.children[index]);
   }
-  return count;
+  return { blocks, requestTextUtf8Bytes };
 }
 
 /** The absolute depth an insertion's roots land at, derived from the live tree.
@@ -2373,13 +2403,23 @@ function bulkInsertionOverflows(
 ): boolean {
   const page = pageByName(pageName);
   if (!page) return true;
-  const currentBlocks = boundedPageBlockCount(page, limits.applicationSavePageBlocks + 1);
+  const census = boundedPageCensus(
+    page,
+    limits.applicationSavePageBlocks + 1,
+    limits.applicationPageRequestTextBytes + 1,
+  );
   const exceedsBlockLimit =
-    currentBlocks - plan.removedOrReusedDescendants + plan.insertedDescendants
+    census.blocks - plan.removedOrReusedDescendants + plan.insertedDescendants
       > limits.applicationSavePageBlocks;
   const exceedsDepthLimit = plan.maximumInputRelativeDepth > 0
     && insertionRootDepth + plan.maximumInputRelativeDepth - 1 > limits.applicationPageMaxDepth;
-  const exceedsTextLimit = plan.insertedRawTextUtf8Bytes > limits.applicationPageRequestTextBytes;
+  // The save request carries the WHOLE page, so an insertion is charged on top
+  // of what the page already holds. `>=` rather than `>`: the native charge also
+  // includes the page name/id and base revision, which are never empty, so a
+  // lower bound that merely reaches the limit is already over it (GH #323).
+  const exceedsTextLimit =
+    census.requestTextUtf8Bytes + plan.insertedRawTextUtf8Bytes
+      >= limits.applicationPageRequestTextBytes;
   return exceedsBlockLimit || exceedsDepthLimit || exceedsTextLimit;
 }
 

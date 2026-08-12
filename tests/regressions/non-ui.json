@@ -3733,6 +3733,30 @@
         "failBefore": "proven"
       },
       "notes": "A managed paste caches its decisions during a synchronous preflight and then awaits a cut-source flush and a backend identity lookup. Two facts can change across those awaits. (1) Whether the target is an empty host the paste may REPLACE: if the user types into it while the paste is in flight, replacing it destroys that text. The empty-host decision is now recomputed from the live block at insertion time on both the managed and the Direct path, and the admitted plan assumes the host survives, so the realized block count can only be at or below the admitted one. (2) The page's size and the target's depth: the limit question is re-asked at consumption against the live tree, so an insertion admitted at 510 blocks is refused once the page has reached the cap. Both halves have a literal fail-before proof; before the fix the host block and the text typed into it were deleted outright."
+    },
+    {
+      "id": "REG-MANAGED-BULK-INSERTION-BYTE-MODEL-323",
+      "title": "The frontend's bulk-insertion byte model is a true lower bound on the native save-request charge, including what the page already holds",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          323
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/store.test.ts"
+        ],
+        "scenario": "managed.bulk-insertion-byte-lower-bound",
+        "failBefore": "proven"
+      },
+      "notes": "The point of admitting a bulk insertion in the frontend is to refuse it BEFORE the page is mutated, so the model must never admit something validate_editor_save_request will reject. It did, two ways. It compared only the INSERTED raw text against the advertised limit, ignoring the page the request also carries, so a small insertion into a nearly full page was admitted and then unsaveable. And it compared with strict greater-than, so an insertion of exactly the advertised byte count was admitted even though the native charge additionally includes the page name/id, the base revision, the preamble and every block's key and parent key, and is therefore necessarily over. The check now sums a bounded census of the existing page (content plus block and parent key bytes, deliberately omitting the page-level terms so the estimate stays a lower bound rather than a guess) with the inserted text, and refuses at the boundary. Fail-before proven by restoring the old comparison: both refusals became admissions."
     }
   ]
 }
