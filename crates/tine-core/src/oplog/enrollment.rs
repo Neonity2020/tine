@@ -11248,7 +11248,7 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_simulator_formats() {
+    fn enrollment_keyed_auth_source_guard_isolated_to_legacy_verification_and_wire_scenarios() {
         fn visit(directory: &Path, files: &mut Vec<PathBuf>) {
             for entry in fs::read_dir(directory).unwrap() {
                 let entry = entry.unwrap();
@@ -11279,8 +11279,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["enrollment_legacy_hmac.rs", "simulator.rs"],
-            "keyed enrollment compatibility must stay isolated; simulator is a deterministic test format"
+            vec!["enrollment_legacy_hmac.rs", "wire.rs"],
+            "keyed enrollment compatibility must stay isolated; wire contains the deterministic scenario format"
         );
         let legacy = fs::read_to_string(root.join("enrollment_legacy_hmac.rs")).unwrap();
         let legacy_production = legacy.split("#[cfg(test)]").next().unwrap();

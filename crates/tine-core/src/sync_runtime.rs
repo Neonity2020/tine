@@ -134,6 +134,10 @@ use crate::oplog::sqlite::{
     BootstrapSqliteRebuildInstrumentation, FullDigestScanInstrumentation,
 };
 use crate::oplog::sqlite_materialization::MaterializedTaskCandidateBlockRow;
+use crate::oplog::sync_layout::{
+    LOCAL_AUTHORSHIP_RECEIPT_DIR as LOCAL_AUTHORSHIP_RECEIPT_NAMESPACE,
+    MANAGED_LOCAL_JOURNAL_DIR as MANAGED_LOCAL_JOURNAL_NAMESPACE,
+};
 #[cfg(test)]
 use crate::oplog::trusted_local_commit::{
     last_commit_stage_timings, TrustedLocalCommitStageTimings,
@@ -185,7 +189,6 @@ const RUNTIME_OPEN_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(10);
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_millis(50);
 #[cfg(test)]
 const MANAGED_LOCAL_IDLE_TICK: Duration = Duration::from_secs(30);
-const MANAGED_LOCAL_JOURNAL_NAMESPACE: &str = "managed-local-journal-v1";
 const MANAGED_LOCAL_CHECKPOINT_BYTES: u64 = 4096;
 const MANAGED_LOCAL_GENERATION_ANCHOR_SCHEMA_VERSION: u32 = 1;
 const MANAGED_LOCAL_GENERATION_ANCHOR_BYTES: u64 = 8192;
@@ -281,7 +284,6 @@ const MAX_PROVIDER_INTENT_RETIREMENT_PROBES_PER_TICK: usize = 16;
 const MAX_PROVIDER_RECOVERY_EXACT_QUEUE: usize = 256;
 const MAX_PROVIDER_ACCEPTED_AUDIT_PROBES_PER_TICK: usize = 16;
 const LOCAL_AUTHORSHIP_RECEIPT_SCHEMA_VERSION: u32 = 1;
-const LOCAL_AUTHORSHIP_RECEIPT_NAMESPACE: &str = "local-authorship-v1";
 const MAX_LOCAL_AUTHORSHIP_RECEIPT_BYTES: u64 = 4096;
 static LOCAL_AUTHORSHIP_RECEIPT_LOCK: Mutex<()> = Mutex::new(());
 /// Maximum top-level operations plus nested rename rows in one submission.
