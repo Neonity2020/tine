@@ -488,6 +488,7 @@ struct ManagedApplicationSaveStageTimings {
     editor_page_id_and_block_id_resolution: Duration,
     editor_requested_page_build: Duration,
     editor_exact_base_read: Duration,
+    editor_projection_preparation: Duration,
     editor_accepted_projection_render: Duration,
     editor_target_projection_render: Duration,
     editor_target_byte_clone: Duration,
@@ -573,6 +574,7 @@ thread_local! {
             editor_page_id_and_block_id_resolution: Duration::ZERO,
             editor_requested_page_build: Duration::ZERO,
             editor_exact_base_read: Duration::ZERO,
+            editor_projection_preparation: Duration::ZERO,
             editor_accepted_projection_render: Duration::ZERO,
             editor_target_projection_render: Duration::ZERO,
             editor_target_byte_clone: Duration::ZERO,
@@ -670,8 +672,7 @@ fn checked_editor_request_remainder(timings: &ManagedApplicationSaveStageTimings
         timings.editor_page_id_and_block_id_resolution,
         timings.editor_requested_page_build,
         timings.editor_exact_base_read,
-        timings.editor_accepted_projection_render,
-        timings.editor_target_projection_render,
+        timings.editor_projection_preparation,
         timings.editor_target_byte_clone,
         timings.editor_accepted_baseline_parse,
         timings.editor_requested_target_parse,
@@ -16042,6 +16043,8 @@ impl RuntimeActor {
                             .editor_exact_base_read
                             .saturating_add(exact_base_started.elapsed());
                     });
+                    #[cfg(test)]
+                    let projection_preparation_started = Instant::now();
                     let hot_predecessor = runtime
                         .engine()
                         .current_local_projection_predecessor_annotations(
@@ -16067,6 +16070,9 @@ impl RuntimeActor {
                     })?;
                     #[cfg(test)]
                     note_application_save_stage(|timings| {
+                        timings.editor_projection_preparation = timings
+                            .editor_projection_preparation
+                            .saturating_add(projection_preparation_started.elapsed());
                         let projection = prepared_editor_projection_instrumentation();
                         timings.editor_accepted_projection_render = timings
                             .editor_accepted_projection_render
@@ -48005,6 +48011,7 @@ mod tests {
             duration!(editor_page_id_and_block_id_resolution),
             duration!(editor_requested_page_build),
             duration!(editor_exact_base_read),
+            duration!(editor_projection_preparation),
             duration!(editor_accepted_projection_render),
             duration!(editor_target_projection_render),
             duration!(editor_target_byte_clone),
