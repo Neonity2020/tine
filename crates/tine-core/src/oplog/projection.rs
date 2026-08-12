@@ -78,6 +78,7 @@ pub(crate) struct PreparedEditorProjectionInstrumentation {
     pub(crate) accepted_render: std::time::Duration,
     pub(crate) target_render: std::time::Duration,
     pub(crate) accepted_renders: usize,
+    pub(crate) incremental_target_patches: usize,
     pub(crate) accepted_blocks_visited: usize,
     pub(crate) target_blocks_visited: usize,
 }
@@ -95,6 +96,7 @@ impl PreparedEditorProjectionInstrumentation {
         accepted_render: std::time::Duration::ZERO,
         target_render: std::time::Duration::ZERO,
         accepted_renders: 0,
+        incremental_target_patches: 0,
         accepted_blocks_visited: 0,
         target_blocks_visited: 0,
     };
@@ -390,17 +392,29 @@ impl PreparedEditorProjection {
     /// page state and semantic before-snapshot before it can reuse them.
     pub(crate) fn prepare_from_hot_predecessor(
         requested_page: MaterializedPage,
+        accepted_page: &MaterializedPage,
         exact_base: Vec<u8>,
         accepted_annotations: Vec<AnnotatedIdentity>,
     ) -> Result<Self, ProjectionError> {
         let candidate_base_layout = structural_layout_identities(&accepted_annotations);
         #[cfg(test)]
         let target_started = std::time::Instant::now();
-        let rendered = render_projection_page_with_layout_identities(
+        let incremental = incremental_markdown_content_projection(
+            accepted_page,
             &requested_page,
-            Some(&exact_base),
-            &candidate_base_layout,
+            &exact_base,
+            &accepted_annotations,
         )?;
+        #[cfg(test)]
+        let used_incremental = incremental.is_some();
+        let rendered = match incremental {
+            Some(rendered) => rendered,
+            None => render_projection_page_with_layout_identities(
+                &requested_page,
+                Some(&exact_base),
+                &candidate_base_layout,
+            )?,
+        };
         #[cfg(test)]
         let target_elapsed = target_started.elapsed();
         #[cfg(test)]
@@ -408,6 +422,9 @@ impl PreparedEditorProjection {
             instrumentation.created = instrumentation.created.saturating_add(1);
             instrumentation.target_render =
                 instrumentation.target_render.saturating_add(target_elapsed);
+            instrumentation.incremental_target_patches = instrumentation
+                .incremental_target_patches
+                .saturating_add(usize::from(used_incremental));
             instrumentation.accepted_blocks_visited = instrumentation
                 .accepted_blocks_visited
                 .saturating_add(accepted_annotations.len());
@@ -508,6 +525,193 @@ impl PreparedEditorProjection {
             instrumentation.fallback = instrumentation.fallback.saturating_add(1);
         });
     }
+}
+
+/// Patch ordinary Markdown block bodies directly into the exact hot
+/// predecessor. This lane is deliberately narrow: page metadata, membership,
+/// ordering, identity, and Logseq-ID policy must be unchanged. Every patch is
+/// parsed back as exactly one block before it can become projection evidence;
+/// anything unusual takes the complete projector.
+fn incremental_markdown_content_projection(
+    accepted_page: &MaterializedPage,
+    requested_page: &MaterializedPage,
+    exact_base: &[u8],
+    accepted_annotations: &[AnnotatedIdentity],
+) -> Result<Option<RenderedProjection>, ProjectionError> {
+    if !accepted_page.path.is_markdown()
+        || accepted_page.page_id != requested_page.page_id
+        || accepted_page.home_document_id != requested_page.home_document_id
+        || accepted_page.name != requested_page.name
+        || accepted_page.path != requested_page.path
+        || accepted_page.kind != requested_page.kind
+        || accepted_page.preamble != requested_page.preamble
+        || accepted_page.blocks.len() != requested_page.blocks.len()
+        || accepted_page.blocks.len() != accepted_annotations.len()
+    {
+        return Ok(None);
+    }
+
+    let accepted_by_id = accepted_page
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    let requested_by_id = requested_page
+        .blocks
+        .iter()
+        .map(|block| (block.block_id, block))
+        .collect::<HashMap<_, _>>();
+    if accepted_by_id.len() != accepted_page.blocks.len()
+        || requested_by_id.len() != requested_page.blocks.len()
+        || accepted_by_id
+            .keys()
+            .any(|id| !requested_by_id.contains_key(id))
+    {
+        return Ok(None);
+    }
+
+    let mut replacements = HashMap::<BlockId, Vec<u8>>::new();
+    let use_crlf = exact_base.windows(2).any(|window| window == b"\r\n");
+    for (block_id, accepted) in &accepted_by_id {
+        let requested = requested_by_id[block_id];
+        if accepted.home_document_id != requested.home_document_id
+            || accepted.parent != requested.parent
+            || accepted.order != requested.order
+            || accepted.logseq_uuid != requested.logseq_uuid
+            || accepted.logseq_identity_origin != requested.logseq_identity_origin
+            || accepted.logseq_uuid.is_some()
+            || accepted.logseq_identity_origin.is_some()
+        {
+            return Ok(None);
+        }
+        if accepted.content != requested.content {
+            replacements.insert(*block_id, Vec::new());
+        }
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ordered = accepted_annotations.iter().enumerate().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|(_, annotation)| annotation.span().start());
+    let mut cursor = 0_usize;
+    let mut target = Vec::with_capacity(exact_base.len());
+    let mut shifted_spans = HashMap::<BlockId, StructuralSpan>::new();
+    for (_, annotation) in ordered {
+        let span = annotation.span();
+        let start =
+            usize::try_from(span.start()).map_err(|_| ProjectionError::ProjectionTooLarge)?;
+        let end = usize::try_from(span.end()).map_err(|_| ProjectionError::ProjectionTooLarge)?;
+        if start < cursor || end < start || end > exact_base.len() {
+            return Ok(None);
+        }
+        target.extend_from_slice(&exact_base[cursor..start]);
+        let shifted_start = target.len();
+        if replacements.contains_key(&annotation.block_id()) {
+            let accepted = accepted_by_id[&annotation.block_id()];
+            let requested = requested_by_id[&annotation.block_id()];
+            let Some(replacement) = render_incremental_markdown_block(
+                &exact_base[start..end],
+                &accepted.content,
+                &requested.content,
+                use_crlf,
+            ) else {
+                return Ok(None);
+            };
+            target.extend_from_slice(&replacement);
+            replacements.insert(annotation.block_id(), replacement);
+        } else {
+            target.extend_from_slice(&exact_base[start..end]);
+        }
+        let shifted_end = target.len();
+        if shifted_spans
+            .insert(
+                annotation.block_id(),
+                StructuralSpan::new(
+                    u64::try_from(shifted_start)
+                        .map_err(|_| ProjectionError::ProjectionTooLarge)?,
+                    u64::try_from(shifted_end).map_err(|_| ProjectionError::ProjectionTooLarge)?,
+                )?,
+            )
+            .is_some()
+        {
+            return Ok(None);
+        }
+        cursor = end;
+    }
+    if replacements.values().any(Vec::is_empty) {
+        return Ok(None);
+    }
+    target.extend_from_slice(&exact_base[cursor..]);
+
+    let annotations = accepted_annotations
+        .iter()
+        .map(|annotation| {
+            Ok(AnnotatedIdentity::new(
+                annotation.locator().clone(),
+                *shifted_spans
+                    .get(&annotation.block_id())
+                    .ok_or(ProjectionError::SpanInstrumentationMismatch)?,
+                annotation.block_id(),
+                annotation.logseq_uuid(),
+            ))
+        })
+        .collect::<Result<Vec<_>, ProjectionError>>()?;
+    Ok(Some(RenderedProjection {
+        target,
+        annotations,
+        base_layout_identities: structural_layout_identities(accepted_annotations),
+        generated_anchors: Vec::new(),
+    }))
+}
+
+fn render_incremental_markdown_block(
+    accepted_source: &[u8],
+    accepted_content: &str,
+    requested_content: &str,
+    use_crlf: bool,
+) -> Option<Vec<u8>> {
+    let accepted_text = std::str::from_utf8(accepted_source).ok()?;
+    let parsed = crate::doc::try_parse_with_source_spans(accepted_text).ok()?;
+    if parsed.document.pre_block.is_some()
+        || parsed.document.roots.len() != 1
+        || !parsed.document.roots[0].children.is_empty()
+        || parsed.document.roots[0].raw != accepted_content
+    {
+        return None;
+    }
+    let first_line = accepted_text
+        .split_once('\n')
+        .map_or(accepted_text, |(line, _)| line);
+    let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
+    let indent_len = first_line.len() - first_line.trim_start_matches([' ', '\t']).len();
+    let indent = &first_line[..indent_len];
+    let bullet = &first_line[indent_len..];
+    if bullet != "-" && !bullet.starts_with("- ") {
+        return None;
+    }
+    let newline = if use_crlf { "\r\n" } else { "\n" };
+    let mut output = String::with_capacity(accepted_source.len() + requested_content.len());
+    for (index, line) in requested_content.split('\n').enumerate() {
+        if index > 0 {
+            output.push_str(newline);
+            output.push_str(indent);
+            output.push_str("  ");
+        } else {
+            output.push_str(indent);
+            output.push('-');
+            if !line.is_empty() {
+                output.push(' ');
+            }
+        }
+        output.push_str(line.strip_suffix('\r').unwrap_or(line));
+    }
+    let reparsed = crate::doc::try_parse_with_source_spans(&output).ok()?;
+    (reparsed.document.pre_block.is_none()
+        && reparsed.document.roots.len() == 1
+        && reparsed.document.roots[0].children.is_empty()
+        && reparsed.document.roots[0].raw == requested_content)
+        .then(|| output.into_bytes())
 }
 
 fn materialized_page_projection_identity_equal(
@@ -3513,6 +3717,68 @@ mod tests {
             Some(base.intent().annotations()),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn incremental_markdown_content_projection_matches_complete_crlf_projector() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
+        let state = structural_layout_state(
+            "pages/incremental.md",
+            vec![
+                (81_001, None, "a", "alpha".into(), None),
+                (81_002, None, "b", "omega".into(), None),
+            ],
+        );
+        let canonical = plan_projection(workspace, &state, None).unwrap();
+        let crlf = String::from_utf8(canonical.target().to_vec())
+            .unwrap()
+            .replace('\n', "\r\n")
+            .into_bytes();
+        let accepted = plan_projection(workspace, &state, Some(&crlf)).unwrap();
+        assert_eq!(accepted.target(), crlf);
+
+        let mut requested = state.page.clone();
+        requested.blocks[0].content = "alpha edited\ncontinuation".into();
+        let incremental = incremental_markdown_content_projection(
+            &state.page,
+            &requested,
+            &crlf,
+            accepted.intent().annotations(),
+        )
+        .unwrap()
+        .expect("ordinary content edit uses the incremental projector");
+        let complete = render_projection_page_with_layout_identities(
+            &requested,
+            Some(&crlf),
+            &structural_layout_identities(accepted.intent().annotations()),
+        )
+        .unwrap();
+        assert_eq!(incremental.target, complete.target);
+        assert_eq!(incremental.annotations, complete.annotations);
+        assert_eq!(incremental.generated_anchors, complete.generated_anchors);
+    }
+
+    #[test]
+    fn incremental_markdown_content_projection_refuses_structural_change() {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(80_002));
+        let state = structural_layout_state(
+            "pages/incremental-structure.md",
+            vec![
+                (82_001, None, "a", "alpha".into(), None),
+                (82_002, None, "b", "omega".into(), None),
+            ],
+        );
+        let accepted = plan_projection(workspace, &state, None).unwrap();
+        let mut requested = state.page.clone();
+        requested.blocks[1].parent = Some(requested.blocks[0].block_id);
+        assert!(incremental_markdown_content_projection(
+            &state.page,
+            &requested,
+            accepted.target(),
+            accepted.intent().annotations(),
+        )
+        .unwrap()
+        .is_none());
     }
 
     fn assert_prepared_editor_projection_matches_ordinary_fallback(

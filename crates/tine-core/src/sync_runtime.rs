@@ -16053,6 +16053,7 @@ impl RuntimeActor {
                         Some(annotations) => {
                             PreparedEditorProjection::prepare_from_hot_predecessor(
                                 requested_page,
+                                &current.page,
                                 base,
                                 annotations,
                             )
@@ -30789,6 +30790,7 @@ mod tests {
             counters.accepted_renders, 1,
             "the first save has no process-local projection predecessor"
         );
+        assert_eq!(counters.incremental_target_patches, 0);
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
         assert_eq!(counters.finalizer_post_state_render, 0);
@@ -30858,6 +30860,10 @@ mod tests {
         assert_eq!(
             counters.accepted_renders, 0,
             "the second save must reuse the exact hot-overlay predecessor annotations"
+        );
+        assert_eq!(
+            counters.incremental_target_patches, 1,
+            "the second content-only edit must patch the exact predecessor instead of serializing the page"
         );
         assert_eq!(counters.reused, 1);
         assert_eq!(counters.fallback, 0);
