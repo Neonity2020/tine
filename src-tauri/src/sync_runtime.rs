@@ -2422,11 +2422,20 @@ fn join_sparse_v2_shared_blocking(
     label: &str,
     binding_generation: u64,
 ) -> Result<SparseV2StatusDto, String> {
+    fn join_failure(stage: &str, error: impl std::fmt::Display) -> String {
+        let detail = error.to_string();
+        crate::debug::diag(format!(
+            "managed sync join failed: stage={stage}; detail={detail}"
+        ));
+        format!("managed sync join failed at {stage}: {detail}")
+    }
+
     let state = app.state::<crate::state::AppState>();
     let _transition = state.graph_load.lock().unwrap();
     let slot = crate::state::slot_for_bound_window(&state, label, Some(binding_generation))?;
     let descriptor =
-        inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))?
+        inspect_shared_enrollment_for_cold_discovery(&slot.root_key.join(".tine-sync/v2/shared"))
+            .map_err(|error| join_failure("provider discovery", error))?
             .ok_or("This graph does not yet contain sync data from another device.")?;
     if slot.sparse_binding().is_some() {
         let record = state
@@ -2435,7 +2444,7 @@ fn join_sparse_v2_shared_blocking(
             .ok_or("Tine-managed storage setup is missing.")?;
         active_handle(&slot)?
             .join_shared(descriptor)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| join_failure("provider scan", error))?;
         let reopened = match state.sync_runtime.open_record(app, &record) {
             Ok(binding) => binding,
             Err(error) => {
@@ -2450,7 +2459,7 @@ fn join_sparse_v2_shared_blocking(
                     .unwrap()
                     .bind(label.to_string(), replacement)?;
                 crate::state::poke_watcher(&state);
-                return Err(error);
+                return Err(join_failure("runtime reopen", error));
             }
         };
         let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(
@@ -2504,7 +2513,7 @@ fn join_sparse_v2_shared_blocking(
             .unwrap()
             .bind(label.to_string(), Arc::clone(&slot))?;
         crate::state::poke_watcher(&state);
-        return Err(error);
+        return Err(join_failure("binding publication", error));
     }
     let activated = match state.sync_runtime.activate_record(app, &record) {
         Ok(activated) => activated,
@@ -2526,7 +2535,7 @@ fn join_sparse_v2_shared_blocking(
                 .unwrap()
                 .bind(label.to_string(), replacement)?;
             crate::state::poke_watcher(&state);
-            return Err(error);
+            return Err(join_failure("local activation", error));
         }
     };
     let Some(handle) = activated.handle() else {
@@ -2559,7 +2568,7 @@ fn join_sparse_v2_shared_blocking(
             .unwrap()
             .bind(label.to_string(), replacement)?;
         crate::state::poke_watcher(&state);
-        return Err(error.to_string());
+        return Err(join_failure("provider scan", error));
     }
     let binding = match state.sync_runtime.open_record(app, &record) {
         Ok(binding) => binding,
@@ -2575,7 +2584,7 @@ fn join_sparse_v2_shared_blocking(
                 .unwrap()
                 .bind(label.to_string(), replacement)?;
             crate::state::poke_watcher(&state);
-            return Err(error);
+            return Err(join_failure("runtime reopen", error));
         }
     };
     let replacement = Arc::new(crate::state::GraphSlot::from_sparse_v2(

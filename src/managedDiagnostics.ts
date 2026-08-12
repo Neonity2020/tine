@@ -15,6 +15,7 @@ export function safeManagedErrorDetail(error: unknown): string {
     .replace(/\b[A-Za-z]:\\(?:[^\\\s"'<>]+\\)*[^\\\s"'<>]*/gu, "[path]")
     .replace(/(^|[\s("'=])\/(?:[^/\s"'<>]+\/)*[^/\s"'<>]*/gu, "$1[path]")
     .replace(/(^|[\s("'=])(?:[^:"'<>]+\/)+[^:"'<>]+\.(?:md|markdown|org)(?=:)/giu, "$1[path]")
+    .replace(/\b(?:objects|manifests|enrollment|frontier-heads-v1|publication-intents-v1|manifest-recovery-links-v1|manifest-recovery-blobs-v1|pending-publication-v1|temporary|removed|rename-evidence)(?:\/[^\s"'<>:;,()]+)+/giu, "[provider path]")
     .replace(/\b(?:https?|ssh):\/\/[^\s"'<>]+/giu, "[link]")
     .replace(/\b(authorization|bearer|token|secret|password)\b(?:\s*[:=]\s*|\s+)[^\s,;]+/giu, "$1 [redacted]")
     .replace(/"[^"]*"|'[^']*'/gu, (quoted) => (
