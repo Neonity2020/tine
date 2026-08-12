@@ -1251,6 +1251,8 @@ struct ManagedTextWriteState {
 struct GraphTextIdentityMutationState {
     owner: Option<std::thread::ThreadId>,
     depth: usize,
+    #[cfg(test)]
+    waiters: usize,
     /// Resource-wide version of every graph-text identity transition observed
     /// under this authority. Per-Graph indexes may be reused only at this exact
     /// epoch; their scope and configuration remain instance-local.
@@ -1276,8 +1278,20 @@ impl ManagedTextWriteGate {
     fn lock_identity_mutation(&self) -> GraphTextIdentityMutationGuard<'_> {
         let caller = std::thread::current().id();
         let mut state = self.identity_mutation.lock().unwrap();
+        #[cfg(test)]
+        let mut registered_waiter = false;
         while state.owner.as_ref().is_some_and(|owner| owner != &caller) {
+            #[cfg(test)]
+            if !registered_waiter {
+                state.waiters += 1;
+                registered_waiter = true;
+                self.identity_mutation_changed.notify_all();
+            }
             state = self.identity_mutation_changed.wait(state).unwrap();
+        }
+        #[cfg(test)]
+        if registered_waiter {
+            state.waiters -= 1;
         }
         if state.owner.is_none() {
             state.owner = Some(caller);
@@ -2354,10 +2368,12 @@ pub struct Graph {
     /// captures this before reading disk and rebuilds if a mutation raced it
     /// (which would otherwise install stale content over a concurrent save).
     cache_gen: std::sync::atomic::AtomicU64,
-    /// Serializes whole-graph cache builds so a racing warmup/search/query parses
-    /// the graph ONCE, not once per caller. Held only during the build (not the
-    /// cache lock), so it never blocks readers of an already-built cache.
-    build_lock: std::sync::Mutex<()>,
+    /// One explicit whole-graph cache-build flight. Owners parse without holding
+    /// this mutex; joiners wait on the flight's own notification and therefore
+    /// never wait while holding cache or index locks.
+    page_build_flight: std::sync::Mutex<Option<Arc<PageBuildFlight>>>,
+    #[cfg(test)]
+    page_build_test: PageBuildTestState,
     /// Cached `alias:: → canonical + owning path` records, derived from the page cache. Rebuilt
     /// lazily and dropped whenever the page cache mutates (the only time aliases
     /// can change). Avoids re-scanning the whole graph for aliases on every page
@@ -3456,6 +3472,15 @@ struct DirectCreationProof {
     files: std::collections::BTreeMap<ManagedPath, DirectCreationCensusFile>,
 }
 
+enum DirectCreationEvidence {
+    Cold,
+    Warm {
+        generation: u64,
+        identity_index: Arc<EffectiveIdentityIndex>,
+        disk_revs: std::collections::HashMap<PathBuf, String>,
+    },
+}
+
 const REFERENCE_SIGNATURE_WORDS: usize = 64; // 4096 bits = 512 bytes/page
 
 #[derive(Clone)]
@@ -3696,6 +3721,109 @@ pub(crate) struct ReferenceCandidatePages {
 struct PageCacheBuild {
     pages: Vec<ParsedPage>,
     failures: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageCacheInstallOutcome {
+    Installed,
+    AlreadyAvailable,
+    GenerationDrift,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageBuildOutcome {
+    Installed,
+    AlreadyAvailable,
+    GenerationDrift,
+    Cancelled,
+    Failed,
+}
+
+impl PageBuildOutcome {
+    fn installed(self) -> bool {
+        matches!(self, Self::Installed | Self::AlreadyAvailable)
+    }
+
+    fn creation_error(self) -> io::Error {
+        let message = match self {
+            Self::GenerationDrift => "Direct creation identity repair crossed a cache generation",
+            Self::Cancelled => "Direct creation identity repair joined a cancelled cache build",
+            Self::Failed => "Direct creation identity repair joined a failed cache build",
+            Self::Installed | Self::AlreadyAvailable => {
+                "Direct creation identity repair completed without coherent evidence"
+            }
+        };
+        io::Error::new(io::ErrorKind::Interrupted, message)
+    }
+}
+
+impl From<PageCacheInstallOutcome> for PageBuildOutcome {
+    fn from(outcome: PageCacheInstallOutcome) -> Self {
+        match outcome {
+            PageCacheInstallOutcome::Installed => Self::Installed,
+            PageCacheInstallOutcome::AlreadyAvailable => Self::AlreadyAvailable,
+            PageCacheInstallOutcome::GenerationDrift => Self::GenerationDrift,
+        }
+    }
+}
+
+struct PageBuildFlight {
+    expected_generation: u64,
+    outcome: std::sync::Mutex<Option<PageBuildOutcome>>,
+    completed: std::sync::Condvar,
+}
+
+impl PageBuildFlight {
+    fn new(expected_generation: u64) -> Self {
+        Self {
+            expected_generation,
+            outcome: std::sync::Mutex::new(None),
+            completed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn complete(&self, outcome: PageBuildOutcome) {
+        *self.outcome.lock().unwrap() = Some(outcome);
+        self.completed.notify_all();
+    }
+
+    fn wait(&self) -> PageBuildOutcome {
+        let mut outcome = self.outcome.lock().unwrap();
+        while outcome.is_none() {
+            outcome = self.completed.wait(outcome).unwrap();
+        }
+        outcome.expect("completed page build flight has an outcome")
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PageBuildTestState {
+    owner_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    joined: std::sync::Mutex<usize>,
+    joined_changed: std::sync::Condvar,
+    force_warm_failure: std::sync::atomic::AtomicBool,
+    drift_before_install: std::sync::atomic::AtomicBool,
+    enumerations: std::sync::atomic::AtomicUsize,
+    parses: std::sync::atomic::AtomicUsize,
+    installs: std::sync::atomic::AtomicUsize,
+    censuses: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+struct PageBuildTestPause {
+    reached: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(test)]
+impl PageBuildTestPause {
+    fn new() -> Self {
+        Self {
+            reached: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
 }
 
 type ParsedPage = (PageEntry, Document, String);
@@ -5524,7 +5652,9 @@ impl Graph {
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
-            build_lock: std::sync::Mutex::new(()),
+            page_build_flight: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            page_build_test: PageBuildTestState::default(),
             alias_cache: RwLock::new(None),
             block_index: RwLock::new(None),
             reference_candidate_index: RwLock::new(None),
@@ -7614,9 +7744,77 @@ impl Graph {
         Ok(entries)
     }
 
-    /// Bind the warm parsed ownership cache to one current filesystem census.
-    /// This is deliberately a fail-fast proof constructor: it never warms,
-    /// rebuilds, parses, retries, or enters the retained shadow-import capture.
+    /// Read the parsed ownership evidence once. A clean missing page cache is
+    /// repairable; failure-bearing cold evidence and partial or incoherent warm
+    /// publication remain hard refusals rather than authority to rebuild around
+    /// an unexplained gap.
+    fn direct_creation_evidence(&self) -> io::Result<DirectCreationEvidence> {
+        let cache = self.cache.read().unwrap();
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let Some(pages) = cache.as_ref() else {
+            let published_failures = !self.page_index_failures.read().unwrap().is_empty();
+            let retained_failures = self
+                .effective_identity_index
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|index| !index.failures.is_empty());
+            if published_failures || retained_failures {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "failure-bearing cold identity evidence cannot authorize name-only creation",
+                ));
+            }
+            return Ok(DirectCreationEvidence::Cold);
+        };
+        let identity_index = self
+            .effective_identity_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "graph has unknown effective identities for name-only creation",
+                )
+            })?;
+        let failures = self.page_index_failures.read().unwrap().clone();
+        let disk_revs = self.disk_revs.read().unwrap().clone();
+        let cached_paths = pages
+            .iter()
+            .map(|(entry, _)| entry.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if identity_index.generation() != generation
+            || identity_index.failures != failures
+            || identity_index.physical_paths != cached_paths
+            || disk_revs.len() != cached_paths.len()
+            || !disk_revs.keys().all(|path| cached_paths.contains(path))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "parsed identity and disk revision evidence is not one coherent generation",
+            ));
+        }
+        if !failures.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
+                    failures.len()
+                ),
+            ));
+        }
+        Ok(DirectCreationEvidence::Warm {
+            generation,
+            identity_index,
+            disk_revs,
+        })
+    }
+
+    /// Bind one coherent parsed ownership generation to one current filesystem
+    /// census. Cold evidence may own or join exactly one cache-build flight; the
+    /// second evidence read must be warm, and there is never a repair retry.
     fn direct_creation_proof(
         &self,
         permit: &ManagedTextWritePermit,
@@ -7624,54 +7822,31 @@ impl Graph {
         kind: PageKind,
         name: &str,
     ) -> io::Result<(DirectCreationProof, bool)> {
-        let (generation, identity_index, disk_revs) = {
-            let cache = self.cache.read().unwrap();
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            let pages = cache.as_ref().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "cold graph has no parsed identity evidence for name-only creation",
-                )
-            })?;
-            let identity_index = self
-                .effective_identity_index
-                .read()
-                .unwrap()
-                .as_ref()
-                .map(Arc::clone)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "graph has unknown effective identities for name-only creation",
-                    )
-                })?;
-            let failures = self.page_index_failures.read().unwrap().clone();
-            let disk_revs = self.disk_revs.read().unwrap().clone();
-            let cached_paths = pages
-                .iter()
-                .map(|(entry, _)| entry.path.clone())
-                .collect::<std::collections::HashSet<_>>();
-            if identity_index.generation() != generation
-                || identity_index.failures != failures
-                || identity_index.physical_paths != cached_paths
-                || disk_revs.len() != cached_paths.len()
-                || !disk_revs.keys().all(|path| cached_paths.contains(path))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "parsed identity and disk revision evidence is not one coherent generation",
-                ));
+        let evidence = match self.direct_creation_evidence()? {
+            DirectCreationEvidence::Warm {
+                generation,
+                identity_index,
+                disk_revs,
+            } => DirectCreationEvidence::Warm {
+                generation,
+                identity_index,
+                disk_revs,
+            },
+            DirectCreationEvidence::Cold => {
+                let outcome = self.repair_page_cache_once(permit);
+                if !outcome.installed() {
+                    return Err(outcome.creation_error());
+                }
+                self.direct_creation_evidence()?
             }
-            if !failures.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
-                        failures.len()
-                    ),
-                ));
-            }
-            (generation, identity_index, disk_revs)
+        };
+        let DirectCreationEvidence::Warm {
+            generation,
+            identity_index,
+            disk_revs,
+        } = evidence
+        else {
+            return Err(PageBuildOutcome::Failed.creation_error());
         };
 
         let target = ManagedPath::parse(self.rel_path(target)).map_err(|error| {
@@ -7769,6 +7944,10 @@ impl Graph {
         }
 
         count_direct_creation_census();
+        #[cfg(test)]
+        self.page_build_test
+            .censuses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut files = std::collections::BTreeMap::new();
         let mut pending = vec![PendingDirectory {
             directory: self.managed_permit_root(permit)?.try_clone()?,
@@ -13785,31 +13964,53 @@ impl Graph {
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 
-    fn parse_page_entry_retained(&self, entry: PageEntry) -> PageParseResult {
-        let permit = match self.admit_retained_managed_text_writer() {
-            Ok(permit) => permit,
-            Err(_) => return Err(entry.rel_path),
-        };
+    fn parse_page_entry_with_permit(
+        &self,
+        permit: &ManagedTextWritePermit,
+        entry: PageEntry,
+    ) -> PageParseResult {
         let content = match self.managed_read_optional_text_with_identity(&permit, &entry.path) {
             Ok(Some((content, _))) => content,
             _ => return Err(entry.rel_path),
         };
+        #[cfg(test)]
+        self.page_build_test
+            .parses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         isolate_page_parse(entry, &self.journal_format, |entry| {
             Some(parse_page_content(entry, &content))
         })
     }
 
-    /// Read+parse every page from disk (skipping unreadable files). Used to build
-    /// the in-memory cache on first use — the on-demand `with_pages` build a user
-    /// ACTIVELY WAITS ON when they navigate before the background warm finishes
-    /// (NOT the paced thermal `warm_cache`, which keeps its own serial loop).
+    fn page_build_entries(
+        &self,
+        permit: &ManagedTextWritePermit,
+    ) -> Result<Vec<PageEntry>, String> {
+        #[cfg(test)]
+        self.page_build_test
+            .enumerations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.graph_text_entries(permit)
+            .map_err(|error| format!("graph-text-scope: {error}"))
+    }
+
+    /// Enumerate, read and parse every page from disk once (recording unreadable
+    /// files as failures). Used by the fast owner of the shared page-build flight;
+    /// the paced warmer has the same inventory/parse boundary below.
     ///
     /// The per-file work (read → content_rev → parse → assign uuids) is independent,
     /// so on a large graph we fan it across cores. Result order is irrelevant: the
     /// cache is searched by `(kind, name)`, never by position.
-    fn load_all_pages(&self) -> PageCacheBuild {
-        let entries = self.list_pages();
-        let listing_failures = self.page_index_failures.read().unwrap().clone();
+    fn load_all_pages_with_permit(&self, permit: &ManagedTextWritePermit) -> PageCacheBuild {
+        let entries = match self.page_build_entries(permit) {
+            Ok(entries) => entries,
+            Err(failure) => {
+                return PageCacheBuild {
+                    pages: Vec::new(),
+                    failures: vec![failure],
+                };
+            }
+        };
         let entry_count = entries.len();
         let workers = page_cache_worker_count();
         // Small graphs (or a single core): serial — the parse is fast and thread
@@ -13817,9 +14018,8 @@ impl Graph {
         if workers <= 1 || entries.len() < 64 {
             let mut built = PageCacheBuild::with_capacity(entries.len());
             for entry in entries {
-                built.collect(self.parse_page_entry_retained(entry));
+                built.collect(self.parse_page_entry_with_permit(permit, entry));
             }
-            built.failures.extend(listing_failures);
             return built;
         }
         let per = (entries.len() + workers - 1) / workers;
@@ -13840,7 +14040,7 @@ impl Graph {
                     s.spawn(move || {
                         let mut built = PageCacheBuild::with_capacity(chunk.len());
                         for entry in chunk {
-                            built.collect(self.parse_page_entry_retained(entry));
+                            built.collect(self.parse_page_entry_with_permit(permit, entry));
                         }
                         built
                     })
@@ -13855,15 +14055,93 @@ impl Graph {
                     ),
                 }
             }
-            built.failures.extend(listing_failures);
             built
         })
+    }
+
+    fn claim_page_build(&self, expected_generation: u64) -> (Arc<PageBuildFlight>, bool) {
+        let mut active = self.page_build_flight.lock().unwrap();
+        if let Some(flight) = active.as_ref() {
+            #[cfg(test)]
+            {
+                let mut joined = self.page_build_test.joined.lock().unwrap();
+                *joined += 1;
+                self.page_build_test.joined_changed.notify_all();
+            }
+            return (Arc::clone(flight), false);
+        }
+        // Close the gap between a caller's earlier cold-cache observation and
+        // flight publication. Holding the flight registry makes this decision
+        // atomic with a finishing owner clearing its active flight. The nested
+        // order is flight -> cache; installation holds only cache and releases it
+        // before `finish_page_build` takes flight, so there is no inverse nesting.
+        let completed = {
+            let cache = self.cache.read().unwrap();
+            let current_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            if current_generation != expected_generation {
+                Some(PageBuildOutcome::GenerationDrift)
+            } else if cache.is_some() {
+                Some(PageBuildOutcome::AlreadyAvailable)
+            } else {
+                None
+            }
+        };
+        if let Some(outcome) = completed {
+            let flight = Arc::new(PageBuildFlight::new(expected_generation));
+            flight.complete(outcome);
+            return (flight, false);
+        }
+        let flight = Arc::new(PageBuildFlight::new(expected_generation));
+        *active = Some(Arc::clone(&flight));
+        drop(active);
+        #[cfg(test)]
+        if let Some(pause) = self.page_build_test.owner_pause.lock().unwrap().clone() {
+            pause.reached.wait();
+            pause.release.wait();
+        }
+        (flight, true)
+    }
+
+    fn finish_page_build(&self, flight: &Arc<PageBuildFlight>, outcome: PageBuildOutcome) {
+        flight.complete(outcome);
+        let mut active = self.page_build_flight.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            *active = None;
+        }
+    }
+
+    fn repair_page_cache_once(&self, permit: &ManagedTextWritePermit) -> PageBuildOutcome {
+        let expected_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let (flight, owner) = self.claim_page_build(expected_generation);
+        if !owner {
+            return flight.wait();
+        }
+        let built = self.load_all_pages_with_permit(permit);
+        let outcome = PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+        self.finish_page_build(&flight, outcome);
+        outcome
     }
 
     /// Install a freshly-built whole-graph snapshot atomically: the parsed pages
     /// into the cache, their on-disk revs into `disk_revs`. Cache set BEFORE
     /// disk_revs so a reader never observes a fresh rev paired with a stale cache.
-    fn install_built(&self, built: PageCacheBuild) {
+    fn install_built(
+        &self,
+        expected_generation: u64,
+        built: PageCacheBuild,
+    ) -> PageCacheInstallOutcome {
+        #[cfg(test)]
+        if self
+            .page_build_test
+            .drift_before_install
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.cache_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         let PageCacheBuild {
             pages: built,
             mut failures,
@@ -13879,23 +14157,36 @@ impl Graph {
             .map(|(e, d, _)| (e, Arc::new(d)))
             .collect();
         let index = build_page_cache_index(&pages);
-        // Publish cache + revs atomically under the cache lock (cache → disk_revs
-        // order), so no reader observes a fresh rev paired with a stale cache.
-        let mut guard = self.cache.write().unwrap();
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let reference_index = ReferenceCandidateIndex::build(generation, &pages).ok();
+        let reference_index = ReferenceCandidateIndex::build(expected_generation, &pages).ok();
         let effective_index = Arc::new(build_effective_identity_index(
-            generation,
+            expected_generation,
             &pages,
             failures.clone(),
         ));
+        let page_list = pages.iter().map(|(entry, _)| entry.clone()).collect();
+        // Publish cache + revs atomically under the cache lock (cache → disk_revs
+        // order), but only at the exact generation the owner parsed. A cache that
+        // another publisher already supplied is likewise never overwritten.
+        let mut guard = self.cache.write().unwrap();
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != expected_generation {
+            return PageCacheInstallOutcome::GenerationDrift;
+        }
+        if guard.is_some() {
+            return PageCacheInstallOutcome::AlreadyAvailable;
+        }
         *guard = Some(Arc::new(pages));
         *self.cache_index.write().unwrap() = Some(index);
         *self.reference_candidate_index.write().unwrap() = reference_index;
         *self.disk_revs.write().unwrap() = revs;
         *self.effective_identity_index.write().unwrap() = Some(effective_index);
         *self.page_index_failures.write().unwrap() = failures;
+        *self.page_list_cache.write().unwrap() = Some((expected_generation, page_list));
+        #[cfg(test)]
+        self.page_build_test
+            .installs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
+        PageCacheInstallOutcome::Installed
     }
 
     /// Run `f` over every parsed page, building the cache on first use.
@@ -13907,38 +14198,32 @@ impl Graph {
     /// use copy-on-write under `cache.write()` when a scan still holds an older
     /// snapshot.
     pub fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
-        let snapshot = {
-            let guard = self.cache.read().unwrap();
-            guard.as_ref().map(Arc::clone)
-        };
-        if let Some(snapshot) = snapshot {
-            return f(snapshot.as_slice());
-        }
-        // Single-flight build: serialize builders on `build_lock` (NOT the cache
-        // lock) so the whole-graph parse happens once, not once per racing caller,
-        // and so we never hold the cache write lock during the slow parse.
-        use std::sync::atomic::Ordering;
-        let _bl = self.build_lock.lock().unwrap();
-        if self.cache.read().unwrap().is_none() {
-            loop {
-                let gen0 = self.cache_gen.load(Ordering::Acquire);
-                let built = self.load_all_pages();
-                // If a save/remove raced our read (its cache mutation no-op'd
-                // because the cache was still None), its disk write is already
-                // done — rebuild so we don't install a stale snapshot. We hold
-                // build_lock, so no other builder competes.
-                if self.cache_gen.load(Ordering::Acquire) == gen0 {
-                    self.install_built(built);
-                    break;
-                }
+        loop {
+            let snapshot = {
+                let guard = self.cache.read().unwrap();
+                guard.as_ref().map(Arc::clone)
+            };
+            if let Some(snapshot) = snapshot {
+                return f(snapshot.as_slice());
+            }
+            // Admission precedes flight ownership. Query callers retain their
+            // historical retry semantics, while Direct creation uses the bounded
+            // `repair_page_cache_once` entry point instead.
+            let permit = match self.admit_retained_managed_text_writer() {
+                Ok(permit) => permit,
+                Err(_) => return f(&[]),
+            };
+            let expected_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            let (flight, owner) = self.claim_page_build(expected_generation);
+            if owner {
+                let built = self.load_all_pages_with_permit(&permit);
+                let outcome =
+                    PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+                self.finish_page_build(&flight, outcome);
+            } else {
+                let _ = flight.wait();
             }
         }
-        drop(_bl);
-        let snapshot = {
-            let guard = self.cache.read().unwrap();
-            guard.as_ref().map(Arc::clone).unwrap()
-        };
-        f(snapshot.as_slice())
     }
 
     /// Eagerly build the page cache plus graph-open derived maps (call once after
@@ -13966,73 +14251,99 @@ impl Graph {
     }
 
     fn warm_page_cache_cancellable(&self, cancelled: &impl Fn() -> bool) -> bool {
-        use std::sync::atomic::Ordering;
         if cancelled() {
             return false;
         }
         if self.cache.read().unwrap().is_some() {
             return true; // already built (e.g. by a query) — nothing to warm
         }
-        // Build PACED and WITHOUT holding build_lock during the parse: on a
-        // thermally throttled laptop the warm would otherwise peg a core in one
-        // burst right after launch, competing with first scrolling/typing/the
-        // first agenda query. Parse into a LOCAL vec in small chunks with a brief
-        // yield between them, so the load is spread out and an on-demand
-        // `with_pages` (a user query) can still take build_lock and build fast
-        // without waiting on our sleeps. If it wins, we discard our work.
-        let gen0 = self.cache_gen.load(Ordering::Acquire);
-        let entries = self.list_pages();
-        let listing_failures = self.page_index_failures.read().unwrap().clone();
-        let mut built = PageCacheBuild::with_capacity(entries.len());
-        built.failures.extend(listing_failures);
         let permit = match self.admit_retained_managed_text_writer() {
             Ok(permit) => permit,
             Err(_) => return false,
         };
+        let expected_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let (flight, owner) = self.claim_page_build(expected_generation);
+        if !owner {
+            return flight.wait().installed() && !cancelled();
+        }
+        if cancelled() {
+            self.finish_page_build(&flight, PageBuildOutcome::Cancelled);
+            return false;
+        }
+        // Build PACED without holding the flight mutex during the parse: on a
+        // thermally throttled laptop the warm would otherwise peg a core in one
+        // burst right after launch, competing with first scrolling/typing/the
+        // first agenda query. Joiners wait for this same generation instead of
+        // duplicating its parse.
+        let entries = match self.page_build_entries(&permit) {
+            Ok(entries) => entries,
+            Err(failure) => {
+                let built = PageCacheBuild {
+                    pages: Vec::new(),
+                    failures: vec![failure],
+                };
+                let outcome =
+                    PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+                self.finish_page_build(&flight, outcome);
+                return outcome.installed() && !cancelled();
+            }
+        };
+        let mut built = PageCacheBuild::with_capacity(entries.len());
         let mut baselines: Vec<(PathBuf, ContentDigest, String)> =
             Vec::with_capacity(entries.len());
         for (i, e) in entries.into_iter().enumerate() {
             if cancelled() {
+                self.finish_page_build(&flight, PageBuildOutcome::Cancelled);
                 return false;
             }
-            if let Ok(Some((content, identity))) =
-                self.managed_read_optional_text_with_identity(&permit, &e.path)
-            {
-                let path = e.path.clone();
-                let revision = content_rev(&content);
-                let indexed = built.collect(isolate_page_parse(e, &self.journal_format, |entry| {
-                    Some(parse_page_content(entry, &content))
-                }));
-                if indexed {
-                    baselines.push((path, identity, revision));
+            match self.managed_read_optional_text_with_identity(&permit, &e.path) {
+                Ok(Some((content, identity))) => {
+                    let path = e.path.clone();
+                    let revision = content_rev(&content);
+                    #[cfg(test)]
+                    self.page_build_test
+                        .parses
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let indexed =
+                        built.collect(isolate_page_parse(e, &self.journal_format, |entry| {
+                            Some(parse_page_content(entry, &content))
+                        }));
+                    if indexed {
+                        baselines.push((path, identity, revision));
+                    }
                 }
+                _ => built.failures.push(e.rel_path),
             }
             if i % 24 == 23 {
-                if self.cache.read().unwrap().is_some() {
-                    return true; // a query built the cache while we parsed
-                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
+        }
+        #[cfg(test)]
+        if self
+            .page_build_test
+            .force_warm_failure
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.finish_page_build(&flight, PageBuildOutcome::Failed);
+            return false;
         }
         for (path, identity, revision) in &baselines {
             match self.managed_read_optional_text_with_identity(&permit, path) {
                 Ok(Some((content, current_identity)))
                     if current_identity == *identity && content_rev(&content) == *revision => {}
-                _ => return false,
+                _ => {
+                    self.finish_page_build(&flight, PageBuildOutcome::Failed);
+                    return false;
+                }
             }
         }
         if cancelled() {
+            self.finish_page_build(&flight, PageBuildOutcome::Cancelled);
             return false;
         }
-        // Install only if nobody else built it and no Tine save/remove raced our
-        // reads (its cache mutation would have no-op'd against the None cache, so
-        // its disk write must be folded in by a rebuild — defer to the next
-        // on-demand build rather than install a stale snapshot).
-        let _bl = self.build_lock.lock().unwrap();
-        if self.cache.read().unwrap().is_none() && self.cache_gen.load(Ordering::Acquire) == gen0 {
-            self.install_built(built);
-        }
-        !cancelled()
+        let outcome = PageBuildOutcome::from(self.install_built(flight.expected_generation, built));
+        self.finish_page_build(&flight, outcome);
+        outcome.installed() && !cancelled()
     }
 
     /// Discard the cache; it rebuilds on the next whole-graph query. Use when an
@@ -14583,8 +14894,15 @@ impl Graph {
         if let Some(pages) = guard.as_ref() {
             *self.reference_candidate_index.write().unwrap() =
                 ReferenceCandidateIndex::build(newgen, pages).ok();
+            *self.effective_identity_index.write().unwrap() =
+                Some(Arc::new(build_effective_identity_index(
+                    newgen,
+                    pages,
+                    self.page_index_failures.read().unwrap().clone(),
+                )));
         } else {
             *self.reference_candidate_index.write().unwrap() = None;
+            *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
         {
@@ -33712,6 +34030,38 @@ mod tests {
         assert_post_retirement_foreign_destination(true);
     }
 
+    // Restored after `a5cf7c11 refactor: remove legacy managed sync model path`
+    // deleted it wholesale. Its second half called `migrate_sync_identities`,
+    // which that refactor legitimately removed — but the link-count parity
+    // above it is not legacy and is still load-bearing: the Direct creation
+    // census refuses `file.link_count != 1`, and on Windows that count comes
+    // from `GetFileInformationByHandle` on a handle opened BEFORE the hard link
+    // existed. If a held handle reported a stale 1, the hard-link refusal would
+    // be defeated on Windows only. The v1 half is dropped; the platform
+    // assertion is not.
+    #[cfg(windows)]
+    #[test]
+    fn projection_windows_held_handle_link_count_tracks_one_and_two_links() {
+        let dir = scratch("projection-windows-held-handle-link-count");
+        let target = dir.join("pages/Target.md");
+        let alias = dir.join("pages/Alias.md");
+        fs::write(&target, b"- retained\n").unwrap();
+        let file = fs::File::open(&target).unwrap();
+
+        assert_eq!(projection_file_link_count(&file).unwrap(), 1);
+        fs::hard_link(&target, &alias).unwrap();
+        assert_eq!(
+            projection_file_link_count(&file).unwrap(),
+            2,
+            "a held handle must observe the new link, or the creation census \
+             cannot refuse a hard-linked graph text file on Windows"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"- retained\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"- retained\n");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_handle_relative_noreplace_renames_the_exact_source() {
@@ -35161,53 +35511,579 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn empty_cold_graph_fails_closed_then_warm_evidence_advances_incrementally() {
-        let dir = scratch("cold-empty-effective-identity");
-        let graph = Graph::open(&dir);
-        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
-        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        let cold = markdown_page_dto("Cold Refused", "Cold Refused", "- body\n").unwrap();
-        assert_eq!(
-            graph.save_page(&cold, None).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert!(!dir.join("pages/Cold Refused.md").exists());
-        graph.warm_cache();
-        for name in ["First Cold", "Second Cold"] {
-            let page = markdown_page_dto(name, name, "- body\n").unwrap();
-            graph.save_page(&page, None).unwrap();
+    fn reset_page_build_test_counters(graph: &Graph) {
+        graph
+            .page_build_test
+            .enumerations
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        graph
+            .page_build_test
+            .parses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        graph
+            .page_build_test
+            .installs
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        graph
+            .page_build_test
+            .censuses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        *graph.page_build_test.joined.lock().unwrap() = 0;
+    }
+
+    fn wait_for_page_build_join(graph: &Graph) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut joined = graph.page_build_test.joined.lock().unwrap();
+        while *joined == 0 {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("creator did not join the active page build");
+            let (next, timeout) = graph
+                .page_build_test
+                .joined_changed
+                .wait_timeout(joined, remaining)
+                .unwrap();
+            joined = next;
+            assert!(
+                !timeout.timed_out(),
+                "creator did not join the active page build"
+            );
         }
-        assert!(dir.join("pages/First Cold.md").is_file());
-        assert!(dir.join("pages/Second Cold.md").is_file());
+    }
+
+    fn wait_for_identity_mutation_waiter(graph: &Graph) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let gate = &graph
+            .managed_write_binding()
+            .expect("test graph has managed writer binding")
+            .gate;
+        let mut state = gate.identity_mutation.lock().unwrap();
+        while state.waiters == 0 {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .expect("second creator did not reach resource identity serialization");
+            let (next, timeout) = gate
+                .identity_mutation_changed
+                .wait_timeout(state, remaining)
+                .unwrap();
+            state = next;
+            assert!(
+                !timeout.timed_out(),
+                "second creator did not reach resource identity serialization"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_graph_creation_repairs_identity_evidence_once() {
+        let dir = scratch("cold-generation-creation-repair");
+        for index in 0..4 {
+            fs::write(
+                dir.join("pages").join(format!("Existing {index}.md")),
+                format!("title:: Existing {index}\n\n- body\n"),
+            )
+            .unwrap();
+        }
+        let graph = Graph::open(&dir);
+        reset_page_build_test_counters(&graph);
+
+        let page = markdown_page_dto("Cold Created", "Cold Created", "- body\n").unwrap();
+        graph.save_page(&page, None).unwrap();
+
+        assert!(dir.join("pages/Cold Created.md").is_file());
         assert_eq!(
-            GRAPH_TEXT_CONTENT_READS.with(Cell::get),
-            2,
-            "each write performs only its own post-publication receipt reread"
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
-        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "one generation build parses each existing document once"
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(graph.cache.read().unwrap().is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn failed_unknown_and_stale_effective_identity_evidence_blocks_name_only_creation() {
-        // A cold nonempty graph has no effective-title evidence yet. Fail closed
-        // without turning save into the warm-cache all-content parse pass.
-        let dir = scratch("cold-unknown-effective-identity");
-        fs::write(dir.join("pages/Unknown.md"), "- unknown\n").unwrap();
+    fn empty_cold_graph_uses_the_bounded_build_before_creation() {
+        let dir = scratch("cold-empty-effective-identity");
         let graph = Graph::open(&dir);
-        GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(0));
-        GRAPH_TEXT_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
-        let fresh = markdown_page_dto("Cold Creation", "Cold Creation", "- no\n").unwrap();
-        assert_eq!(
-            graph.save_page(&fresh, None).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert!(!dir.join("pages/Cold Creation.md").exists());
-        assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
-        assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
-        let _ = fs::remove_dir_all(&dir);
+        reset_page_build_test_counters(&graph);
+        let cold = markdown_page_dto("Cold Created", "Cold Created", "- body\n").unwrap();
 
+        graph.save_page(&cold, None).unwrap();
+
+        assert!(dir.join("pages/Cold Created.md").is_file());
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_cold_creation_joins_a_paused_paced_warm() {
+        let dir = scratch("cold-creation-joins-warm");
+        for index in 0..3 {
+            fs::write(
+                dir.join("pages").join(format!("Existing {index}.md")),
+                format!("- body {index}\n"),
+            )
+            .unwrap();
+        }
+        let graph = Arc::new(Graph::open(&dir));
+        reset_page_build_test_counters(&graph);
+        let pause = Arc::new(PageBuildTestPause::new());
+        *graph.page_build_test.owner_pause.lock().unwrap() = Some(Arc::clone(&pause));
+        let warm_graph = Arc::clone(&graph);
+        let warm = std::thread::spawn(move || warm_graph.warm_page_cache_cancellable(&|| false));
+        pause.reached.wait();
+
+        let creator_graph = Arc::clone(&graph);
+        let creator = std::thread::spawn(move || {
+            creator_graph.save_page(
+                &markdown_page_dto("Joined Creator", "Joined Creator", "- body\n").unwrap(),
+                None,
+            )
+        });
+        wait_for_page_build_join(&graph);
+        pause.release.wait();
+
+        assert!(warm.join().unwrap());
+        creator.join().unwrap().unwrap();
+        assert!(dir.join("pages/Joined Creator.md").is_file());
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_direct_creation_proofs_join_one_build_and_census_independently() {
+        let dir = scratch("concurrent-direct-creation-proofs");
+        fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
+        let graph = Arc::new(Graph::open(&dir));
+        reset_page_build_test_counters(&graph);
+        let pause = Arc::new(PageBuildTestPause::new());
+        *graph.page_build_test.owner_pause.lock().unwrap() = Some(Arc::clone(&pause));
+
+        let first_graph = Arc::clone(&graph);
+        let first = std::thread::spawn(move || {
+            let permit = first_graph.admit_retained_managed_text_writer()?;
+            first_graph.direct_creation_proof(
+                &permit,
+                &first_graph.root.join("pages/First Proof.md"),
+                PageKind::Page,
+                "First Proof",
+            )
+        });
+        pause.reached.wait();
+        let second_graph = Arc::clone(&graph);
+        let second = std::thread::spawn(move || {
+            let permit = second_graph.admit_retained_managed_text_writer()?;
+            second_graph.direct_creation_proof(
+                &permit,
+                &second_graph.root.join("pages/Second Proof.md"),
+                PageKind::Page,
+                "Second Proof",
+            )
+        });
+        wait_for_page_build_join(&graph);
+        pause.release.wait();
+
+        let (first_proof, first_owned_elsewhere) = first.join().unwrap().unwrap();
+        let (second_proof, second_owned_elsewhere) = second.join().unwrap().unwrap();
+        assert!(!first_owned_elsewhere);
+        assert!(!second_owned_elsewhere);
+        assert_eq!(first_proof.generation, second_proof.generation);
+        assert_ne!(first_proof.target, second_proof.target);
+        assert_eq!(first_proof.files.len(), 1);
+        assert_eq!(second_proof.files.len(), 1);
+        assert_eq!(*graph.page_build_test.joined.lock().unwrap(), 1);
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .installs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn racing_save_page_creators_serialize_and_reuse_one_published_build() {
+        let dir = scratch("racing-cold-creators");
+        fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
+        let graph = Arc::new(Graph::open(&dir));
+        reset_page_build_test_counters(&graph);
+        let pause = Arc::new(PageBuildTestPause::new());
+        *graph.page_build_test.owner_pause.lock().unwrap() = Some(Arc::clone(&pause));
+
+        let first_graph = Arc::clone(&graph);
+        let first = std::thread::spawn(move || {
+            first_graph.save_page(
+                &markdown_page_dto("First Racer", "First Racer", "- first\n").unwrap(),
+                None,
+            )
+        });
+        pause.reached.wait();
+        let second_graph = Arc::clone(&graph);
+        let second = std::thread::spawn(move || {
+            second_graph.save_page(
+                &markdown_page_dto("Second Racer", "Second Racer", "- second\n").unwrap(),
+                None,
+            )
+        });
+        wait_for_identity_mutation_waiter(&graph);
+        assert_eq!(
+            *graph.page_build_test.joined.lock().unwrap(),
+            0,
+            "save_page serializes creators before either can join the other's flight"
+        );
+        pause.release.wait();
+
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert!(dir.join("pages/First Racer.md").is_file());
+        assert!(dir.join("pages/Second Racer.md").is_file());
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .installs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "serialized creators reuse one published cold-cache build"
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(*graph.page_build_test.joined.lock().unwrap(), 0);
+        assert_eq!(
+            graph
+                .effective_identity_index
+                .read()
+                .unwrap()
+                .as_ref()
+                .expect("serialized saves retain published identity evidence")
+                .generation(),
+            graph.cache_generation()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn late_page_build_claim_after_completed_install_is_non_owner() {
+        let dir = scratch("late-page-build-claim");
+        fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
+        let graph = Graph::open(&dir);
+        reset_page_build_test_counters(&graph);
+        assert!(matches!(
+            graph.direct_creation_evidence().unwrap(),
+            DirectCreationEvidence::Cold
+        ));
+        let expected_generation = graph.cache_generation();
+        let permit = graph.admit_retained_managed_text_writer().unwrap();
+
+        assert_eq!(
+            graph.repair_page_cache_once(&permit),
+            PageBuildOutcome::Installed
+        );
+        assert!(graph.page_build_flight.lock().unwrap().is_none());
+        let before = (
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            graph
+                .page_build_test
+                .installs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+
+        // This expected generation was captured with the earlier cold evidence,
+        // but the actual claim happens only after the first flight has finished.
+        let (late_flight, owner) = graph.claim_page_build(expected_generation);
+
+        assert!(!owner);
+        assert_eq!(late_flight.wait(), PageBuildOutcome::AlreadyAvailable);
+        assert!(graph.page_build_flight.lock().unwrap().is_none());
+        graph.invalidate_cache_after_tine_mutation();
+        let (drifted_flight, owner) = graph.claim_page_build(expected_generation);
+        assert!(!owner);
+        assert_eq!(drifted_flight.wait(), PageBuildOutcome::GenerationDrift);
+        assert!(graph.page_build_flight.lock().unwrap().is_none());
+        assert_eq!(
+            (
+                graph
+                    .page_build_test
+                    .enumerations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                graph
+                    .page_build_test
+                    .parses
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                graph
+                    .page_build_test
+                    .installs
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            before,
+            "a late completed claim must not enumerate, parse, or install again"
+        );
+        assert_eq!(before, (1, 1, 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generation_drift_before_direct_install_refuses_without_retry_or_census() {
+        let dir = scratch("cold-creation-install-drift");
+        fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
+        let graph = Graph::open(&dir);
+        reset_page_build_test_counters(&graph);
+        graph
+            .page_build_test
+            .drift_before_install
+            .store(true, std::sync::atomic::Ordering::Release);
+        let target = dir.join("pages/Drift Refused.md");
+
+        let error = graph
+            .save_page(
+                &markdown_page_dto("Drift Refused", "Drift Refused", "- no\n").unwrap(),
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(!target.exists());
+        assert!(graph.cache.read().unwrap().is_none());
+        assert!(graph.cache_index.read().unwrap().is_none());
+        assert!(graph.effective_identity_index.read().unwrap().is_none());
+        assert!(graph.disk_revs.read().unwrap().is_empty());
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_or_cancelled_warm_flight_wakes_creator_without_takeover() {
+        for failed in [false, true] {
+            let dir = scratch(if failed {
+                "joined-failed-warm"
+            } else {
+                "joined-cancelled-warm"
+            });
+            fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
+            let graph = Arc::new(Graph::open(&dir));
+            reset_page_build_test_counters(&graph);
+            let pause = Arc::new(PageBuildTestPause::new());
+            *graph.page_build_test.owner_pause.lock().unwrap() = Some(Arc::clone(&pause));
+            graph
+                .page_build_test
+                .force_warm_failure
+                .store(failed, std::sync::atomic::Ordering::Release);
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let warm_graph = Arc::clone(&graph);
+            let warm_cancelled = Arc::clone(&cancelled);
+            let warm = std::thread::spawn(move || {
+                warm_graph.warm_page_cache_cancellable(&|| {
+                    warm_cancelled.load(std::sync::atomic::Ordering::Acquire)
+                })
+            });
+            pause.reached.wait();
+            let creator_graph = Arc::clone(&graph);
+            let creator = std::thread::spawn(move || {
+                creator_graph.save_page(
+                    &markdown_page_dto("No Takeover", "No Takeover", "- no\n").unwrap(),
+                    None,
+                )
+            });
+            wait_for_page_build_join(&graph);
+            if !failed {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+            }
+            pause.release.wait();
+
+            assert!(!warm.join().unwrap());
+            let error = creator.join().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+            assert!(!dir.join("pages/No Takeover.md").exists());
+            assert!(graph.cache.read().unwrap().is_none());
+            assert_eq!(
+                graph
+                    .page_build_test
+                    .enumerations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                usize::from(failed)
+            );
+            assert_eq!(
+                graph
+                    .page_build_test
+                    .censuses
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn install_built_publishes_only_at_its_exact_generation() {
+        for drift in [false, true] {
+            let dir = scratch(if drift {
+                "install-boundary-drift"
+            } else {
+                "install-boundary-exact"
+            });
+            fs::write(dir.join("pages/Existing.md"), "- existing\n").unwrap();
+            let graph = Graph::open(&dir);
+            let permit = graph.admit_retained_managed_text_writer().unwrap();
+            let expected = graph.cache_generation();
+            let built = graph.load_all_pages_with_permit(&permit);
+            if drift {
+                graph
+                    .cache_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+
+            let outcome = graph.install_built(expected, built);
+
+            if drift {
+                assert_eq!(outcome, PageCacheInstallOutcome::GenerationDrift);
+                assert!(graph.cache.read().unwrap().is_none());
+                assert!(graph.cache_index.read().unwrap().is_none());
+                assert!(graph.reference_candidate_index.read().unwrap().is_none());
+                assert!(graph.disk_revs.read().unwrap().is_empty());
+                assert!(graph.effective_identity_index.read().unwrap().is_none());
+            } else {
+                assert_eq!(outcome, PageCacheInstallOutcome::Installed);
+                assert!(graph.cache.read().unwrap().is_some());
+                assert!(graph.cache_index.read().unwrap().is_some());
+                assert_eq!(graph.disk_revs.read().unwrap().len(), 1);
+                let identity = graph
+                    .effective_identity_index
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .cloned()
+                    .unwrap();
+                assert_eq!(identity.generation(), expected);
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn failed_and_stale_effective_identity_evidence_blocks_name_only_creation() {
         // A failed identity can hide any effective title, so it blocks only the
         // ambiguous name-only creation path. An unrelated exact owner remains
         // writable through its retained bytes/revision/file identity.
@@ -35253,6 +36129,186 @@ mod tests {
         assert!(!dir.join("pages/Could Be Hidden.md").exists());
         assert_eq!(GRAPH_TEXT_CONTENT_READS.with(Cell::get), 0);
         assert_eq!(GRAPH_TEXT_PARSE_ATTEMPTS.with(Cell::get), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broad_invalidation_rebuilds_current_titles_once_before_creation() {
+        let dir = scratch("broad-invalidation-current-title");
+        let owner = dir.join("pages/Physical Owner.md");
+        fs::write(&owner, "title:: Old Identity\n\n- owner\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        reset_page_build_test_counters(&graph);
+        fs::write(&owner, "title:: Current Identity\n\n- owner\n").unwrap();
+        graph.invalidate_cache();
+
+        let collision = graph
+            .save_page(
+                &markdown_page_dto("Current Identity", "Current Identity", "- no\n").unwrap(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(
+            collision.kind(),
+            io::ErrorKind::AlreadyExists,
+            "{collision}"
+        );
+        assert!(!dir.join("pages/Current Identity.md").exists());
+        assert_eq!(
+            fs::read_to_string(&owner).unwrap(),
+            "title:: Current Identity\n\n- owner\n"
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        graph
+            .save_page(
+                &markdown_page_dto(
+                    "Unrelated After Repair",
+                    "Unrelated After Repair",
+                    "- yes\n",
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(dir.join("pages/Unrelated After Repair.md").is_file());
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the repaired normal cache serves the later creation"
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_cache_removal_keeps_current_effective_identity_evidence() {
+        let dir = scratch("exact-removal-identity-coherence");
+        let removed = dir.join("pages/Removed.md");
+        fs::write(&removed, "title:: Removed Identity\n\n- before\n").unwrap();
+        fs::write(dir.join("pages/Survivor.md"), "- survivor\n").unwrap();
+        let graph = Graph::open(&dir);
+        graph.warm_cache();
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.path == removed)
+            .unwrap();
+        reset_page_build_test_counters(&graph);
+        fs::remove_file(&removed).unwrap();
+
+        graph.cache_remove_path(&entry);
+
+        let generation = graph.cache_generation();
+        let identity = graph
+            .effective_identity_index
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .expect("exact removal keeps a warm identity index");
+        assert_eq!(identity.generation(), generation);
+        assert!(!identity.physical_paths.contains(&removed));
+        assert!(!identity
+            .owners
+            .contains_key(&page_cache_key(PageKind::Page, "Removed Identity")));
+
+        graph
+            .save_page(
+                &markdown_page_dto("Removed Identity", "Removed Identity", "- recreated\n")
+                    .unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(dir.join("pages/Removed Identity.md").is_file());
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cold_malformed_owner_refuses_without_census_or_mutation() {
+        let dir = scratch("cold-malformed-owner");
+        let malformed = dir.join("pages/Malformed.md");
+        fs::write(&malformed, [0xff, 0xfe, b'\n']).unwrap();
+        let graph = Graph::open(&dir);
+        reset_page_build_test_counters(&graph);
+        let target = dir.join("pages/Must Not Exist.md");
+
+        let error = graph
+            .save_page(
+                &markdown_page_dto("Must Not Exist", "Must Not Exist", "- no\n").unwrap(),
+                None,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(fs::read(&malformed).unwrap(), [0xff, 0xfe, b'\n']);
+        assert!(!target.exists());
+        assert_eq!(graph.page_index_failures(), vec!["pages/Malformed.md"]);
+        assert_eq!(
+            graph
+                .page_build_test
+                .enumerations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            graph
+                .page_build_test
+                .censuses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

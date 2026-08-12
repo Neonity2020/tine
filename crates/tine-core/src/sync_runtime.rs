@@ -30560,11 +30560,6 @@ mod tests {
         ));
     }
 
-    // Quarantined for v0.6.92, not repaired: one non-round-tripping Org file
-    // makes activation fail for the whole graph, and reports the refusal as
-    // Retryable when it is not. Open as GH #310. Un-ignore with the fix, not
-    // before.
-    #[ignore = "GH #310: one non-round-tripping Org file makes activation fail for the whole graph"]
     #[test]
     fn affine_before_projection_matches_forced_generic_application_save() {
         let run = |label: &str, force_generic: bool| {
@@ -30645,6 +30640,16 @@ mod tests {
         assert_eq!(affine.2.before_projection_affine_fallbacks, 0);
     }
 
+    // Quarantined for v0.6.92, not repaired: one non-round-tripping Org file
+    // makes activation fail for the whole graph, and reports the refusal as
+    // Retryable when it is not. Open as GH #310. Un-ignore with the fix, not
+    // before.
+    //
+    // Re-applied for v0.6.93: the v1-retirement refactors rewrote this region
+    // and silently dropped the attribute added in e7c73bcf, so the same known
+    // defect resurfaced as a release-blocking failure. If a refactor moves this
+    // test again, the quarantine moves with it.
+    #[ignore = "GH #310: one non-round-tripping Org file makes activation fail for the whole graph"]
     #[test]
     fn non_round_tripping_org_application_save_refuses_before_prepared_projection() {
         let fixture = ActivationFixture::empty("prepared-editor-projection-read-only-org", 0xa13e);

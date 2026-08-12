@@ -9535,10 +9535,26 @@ fn first_mutation_refuses_when_deferred_catalog_bytes_are_missing() {
                 let Err(error) = runtime.admit_promoted_mutation(authority, &fixture.graph) else {
                     panic!("missing deferred catalog bytes must refuse the first mutation");
                 };
-                assert!(matches!(
-                    error,
-                    RuntimePromotionError::Engine(EngineError::Archive(_))
-                ));
+                // Refusal classification changed in 829c3994 ("recover malformed
+                // retained scratch on open"), which introduced typed provenance
+                // for reconstructible retained-scratch faults. A truncated
+                // pages.index is one, so it now surfaces as
+                // RetainedScratchResumeFailure { fault: MalformedPage } instead
+                // of the generic Archive error this expected. The contract this
+                // test is really about is unchanged and still asserted below:
+                // the first mutation is refused, and the refused adopted run is
+                // durably retired after full replay. Only the variant moved, and
+                // it moved to a narrower one — the fields are private to
+                // hot_engine, so match the variant and name the fault in the
+                // message.
+                assert!(
+                    matches!(
+                        error,
+                        RuntimePromotionError::Engine(EngineError::RetainedScratchResumeFailure(_))
+                    ),
+                    "missing deferred catalog bytes must refuse as a typed reconstructible \
+                     retained-scratch failure (expected fault MalformedPage), got {error:?}"
+                );
                 // Outcome first, probe second: the durable retirement is what a
                 // user is protected by, the load count is only how we witness
                 // the replay that produced it.
