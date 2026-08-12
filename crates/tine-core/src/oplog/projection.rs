@@ -1115,26 +1115,16 @@ fn plan_exact_source_projection(
             ExactSourceSemanticDifference::UnsupportedSourceLayout(error.to_string()),
         )
     })?;
-    let source_is_importable = match format {
-        ProjectionFormat::Markdown => {
-            crate::doc::markdown_structurally_round_trips_parsed(source_text, &parsed)
-        }
-        ProjectionFormat::Org => crate::org::org_editable_parsed(source_text, &parsed),
-    };
-    if !source_is_importable {
+    if matches!(format, ProjectionFormat::Markdown)
+        && !crate::doc::markdown_structurally_round_trips_parsed(source_text, &parsed)
+    {
         return Err(ExactSourceProjectionError::Semantic(
-            ExactSourceSemanticDifference::UnsupportedSourceLayout(match format {
-                ProjectionFormat::Markdown => {
-                    "Markdown parsing and format-preserving serialization change its semantic document"
-                }
-                ProjectionFormat::Org => {
-                    "Org heading structure does not round-trip through the editable representation"
-                }
-            }
-            .into()),
+            ExactSourceSemanticDifference::UnsupportedSourceLayout(
+                "Markdown parsing and format-preserving serialization change its semantic document"
+                    .into(),
+            ),
         ));
     }
-
     let mut metadata = ProjectionMetadata::with_capacity(state.page.blocks.len());
     let accepted = build_page_document(
         &state.page,

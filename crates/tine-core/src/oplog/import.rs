@@ -7706,15 +7706,11 @@ fn parse_external_nodes(
             )
         })?;
     enforce_outline_limits(path, &parsed.parsed, instrumentation.parsed_nodes)?;
-    if parsed.source_round_trips != Some(true) {
+    if !is_org && parsed.source_round_trips != Some(true) {
         return Err(authority_block(
             ImportBlockReason::UnsafeInput,
             Some(path),
-            if is_org {
-                "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
-            } else {
-                "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure"
-            },
+            "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure",
         ));
     }
     let tree = flatten_document(path, parsed.parsed, instrumentation)?;
@@ -7746,20 +7742,16 @@ fn parse_nodes(
         )
     })?;
     enforce_outline_limits(path, &parsed, instrumentation.parsed_nodes)?;
-    let source_admitted = if is_org {
-        crate::org::org_editable_parsed(text, &parsed)
-    } else {
-        crate::doc::markdown_structurally_round_trips_parsed(text, &parsed)
-    };
-    if !source_admitted {
+    // Org already has a read-only application mode, so bootstrap may admit a
+    // parseable Org document that Tine's serializer cannot edit. Exact-source
+    // projection separately proves that these bytes describe the accepted
+    // semantics. Markdown has no equivalent read-only contract and therefore
+    // remains fail-closed when its structure cannot round-trip (GH #310).
+    if !is_org && !crate::doc::markdown_structurally_round_trips_parsed(text, &parsed) {
         return Err(authority_block(
             ImportBlockReason::UnsafeInput,
             Some(path),
-            if is_org {
-                "external Org source is byte-preserved and read-only because its heading structure is not editable and does not round-trip exactly"
-            } else {
-                "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure"
-            },
+            "external Markdown source is byte-preserved and read-only because parsing and reserialization change its block structure",
         ));
     }
     flatten_document(path, parsed, instrumentation)
@@ -8973,7 +8965,7 @@ mod tests {
     }
 
     #[test]
-    fn source_admission_blocks_non_round_tripping_org_before_material() {
+    fn source_admission_accepts_non_round_tripping_org_as_exact_read_only_source() {
         for (label, path, source) in [(
             "skipped-org-admission",
             "pages/a.org",
@@ -8985,16 +8977,29 @@ mod tests {
             let plan = fixture.plan(&[path]);
             assert_eq!(
                 plan.status(),
-                ImportPlanStatus::Blocked,
+                ImportPlanStatus::Reconcile,
                 "{label}: {plan:?}"
             );
-            assert_eq!(plan.blocks()[0].reason, ImportBlockReason::UnsafeInput);
             assert!(
-                plan.execution_material().is_err(),
-                "{label} exposed semantic execution material"
+                plan.execution_material().is_ok(),
+                "{label} did not expose semantic execution material"
             );
             assert_eq!(fs::read(target).unwrap(), source.as_bytes());
         }
+    }
+
+    #[test]
+    fn source_admission_still_blocks_non_round_tripping_markdown() {
+        let source = "- root\r  ```\r  - fake\r  ```";
+        let fixture = SnapshotFixture::new("non-round-tripping-markdown", &["pages/a.md"]);
+        let target = fixture.graph_root.join("pages/a.md");
+        fs::write(&target, source).unwrap();
+
+        let plan = fixture.plan(&["pages/a.md"]);
+        assert_eq!(plan.status(), ImportPlanStatus::Blocked, "{plan:?}");
+        assert_eq!(plan.blocks()[0].reason, ImportBlockReason::UnsafeInput);
+        assert!(plan.execution_material().is_err());
+        assert_eq!(fs::read(target).unwrap(), source.as_bytes());
     }
 
     #[test]
@@ -11433,7 +11438,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_bootstrap_refuses_non_round_tripping_org_before_operations() {
+    fn inactive_bootstrap_accepts_non_round_tripping_org_as_exact_read_only_source() {
         for (label, path, source) in [(
             "bootstrap-skipped-org",
             "pages/skipped.org",
@@ -11453,7 +11458,7 @@ mod tests {
                 .capture_inactive_bootstrap_sources(&capture_scratch)
                 .unwrap();
             let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a11));
-            let result = prepare_inactive_bootstrap_import(
+            let prepared = prepare_inactive_bootstrap_import(
                 &graph,
                 capture,
                 workspace,
@@ -11462,16 +11467,45 @@ mod tests {
                 ReferenceCatalogPolicyV1::default(),
                 &target_catalog(&root.path().join("archive"), workspace),
                 &preparation_scratch,
-            );
-            let Err(BootstrapStreamingImportError::InvalidSource(detail)) = result else {
-                panic!("{label} constructed bootstrap publication");
-            };
-            assert!(
-                detail.starts_with(&format!("{path}: ")),
-                "{label} omitted the graph-relative source path: {detail}"
-            );
+            )
+            .unwrap_or_else(|error| panic!("{label} refused exact read-only source: {error:?}"));
+            assert!(prepared.instrumentation().operations > 0);
             assert_eq!(fs::read(target).unwrap(), source.as_bytes());
         }
+    }
+
+    #[test]
+    fn inactive_bootstrap_still_blocks_non_round_tripping_markdown() {
+        let source = "- root\r  ```\r  - fake\r  ```";
+        let root = TestRoot::new("bootstrap-non-round-tripping-markdown");
+        let graph_root = root.path().join("graph");
+        let target = graph_root.join("pages/a.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, source).unwrap();
+        let graph = Graph::open(&graph_root);
+        let capture_scratch = root.path().join("capture-scratch");
+        let preparation_scratch = root.path().join("preparation-scratch");
+        fs::create_dir(&capture_scratch).unwrap();
+        fs::create_dir(&preparation_scratch).unwrap();
+        let capture = graph
+            .capture_inactive_bootstrap_sources(&capture_scratch)
+            .unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5a13));
+
+        assert!(matches!(
+            prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                LineageDigest::of(b"inactive-bootstrap-markdown-admission"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5a14)),
+                ReferenceCatalogPolicyV1::default(),
+                &target_catalog(&root.path().join("archive"), workspace),
+                &preparation_scratch,
+            ),
+            Err(BootstrapStreamingImportError::InvalidSource(_))
+        ));
+        assert_eq!(fs::read(target).unwrap(), source.as_bytes());
     }
 
     #[test]

@@ -741,7 +741,7 @@ fn nested_edits_retain_structure_and_unequal_duplicate_gaps_never_guess() {
 }
 
 #[test]
-fn non_round_tripping_org_blocks_before_external_execution() {
+fn non_round_tripping_org_reaches_read_only_external_execution() {
     let org = AuthorityFixture::one_page(
         "skipped-org-level-admission",
         "pages/page.org",
@@ -750,7 +750,15 @@ fn non_round_tripping_org_blocks_before_external_execution() {
     let skipped = b"* parent changed\n*** child\n";
     org.overwrite("pages/page.org", skipped);
     let org_plan = org.plan(&["pages/page.org"]);
-    assert!(blocked_reasons(&org_plan).contains(&ImportBlockReason::UnsafeInput));
+    assert_eq!(
+        org_plan.status(),
+        ImportPlanStatus::Reconcile,
+        "{org_plan:?}"
+    );
+    assert!(
+        org_plan.blocks().is_empty(),
+        "read-only Org must not expose refusal blocks"
+    );
     assert_eq!(
         fs::read(org.graph_root.join("pages/page.org")).unwrap(),
         skipped
