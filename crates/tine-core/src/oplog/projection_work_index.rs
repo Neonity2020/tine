@@ -17,6 +17,7 @@
 //! crate-private module can only receive one from a successful authenticated
 //! terminal transition; it cannot construct a parallel metadata packet.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{ErrorKind, Write};
 use std::str::FromStr;
@@ -38,6 +39,44 @@ use super::{
     ManifestObjectRef, PageId, PortablePathIndexRoot, PortablePathKeyDigest, ProjectionEndpointId,
     ProjectionIntentId, WorkspaceId, PORTABLE_PATH_KEY_VERSION,
 };
+
+/// Opaque exact-batch evidence for the only nonterminal projection rows that a
+/// correlated external-import capability may expose.  Ready is admitted only
+/// as a companion of a durable Blocked sibling in the same accepted witness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AcceptedCorrelatedProjection {
+    Blocked {
+        work: ProjectionWork,
+        observed: BlobDescription,
+        intent_id: ProjectionIntentId,
+    },
+    Ready {
+        work: ProjectionWork,
+    },
+}
+
+impl AcceptedCorrelatedProjection {
+    pub(crate) fn work(&self) -> &ProjectionWork {
+        match self {
+            Self::Blocked { work, .. } | Self::Ready { work } => work,
+        }
+    }
+
+    pub(crate) const fn blocked_evidence(&self) -> Option<(BlobDescription, ProjectionIntentId)> {
+        match self {
+            Self::Blocked {
+                observed,
+                intent_id,
+                ..
+            } => Some((*observed, *intent_id)),
+            Self::Ready { .. } => None,
+        }
+    }
+
+    pub(crate) const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+}
 
 const WORK_SCHEMA_VERSION: u32 = 3;
 // v10 orders ready work by portable path and retires an occupied spelling
@@ -1444,21 +1483,40 @@ impl ProjectionWorkIndex {
                 let Some(mut state) = index.load_state(&root, *work_id)? else {
                     return Err(ProjectionWorkError::MissingWork(*work_id));
                 };
-                if !matches!(state.status, StoredWorkStatus::Ready) {
-                    continue;
-                }
                 let by = prepared
                     .work
                     .iter()
                     .find(|candidate| {
                         candidate.path() == state.work.path()
+                            && candidate.page_id() == state.work.page_id()
                             && candidate.work_id() != state.work.work_id()
                     })
-                    .map(ProjectionWork::work_id)
+                    .cloned()
                     .ok_or(ProjectionWorkError::BindingMismatch)?;
-                root = index.remove_ready(root, &state.work)?;
+                match &state.status {
+                    StoredWorkStatus::Ready => {
+                        root = index.remove_ready(root, &state.work)?;
+                    }
+                    StoredWorkStatus::Blocked {
+                        observed: Some(observed),
+                        intent_id: Some(_),
+                    } if by.endpoint_id() == state.work.endpoint_id()
+                        && matches!(by.target(), ProjectionWorkTarget::Present(target) if target == *observed) =>
+                    {
+                        // `prepare_projection_work_for_batch` nominates this
+                        // row only from the runtime-only exact correlated
+                        // registry and only after proving frontier dominance.
+                        // Acceptance rechecks every durable identity/digest
+                        // binding atomically with the successor witness.
+                    }
+                    StoredWorkStatus::Blocked { .. } => {
+                        return Err(ProjectionWorkError::BindingMismatch)
+                    }
+                    StoredWorkStatus::Completed { .. }
+                    | StoredWorkStatus::Superseded { .. } => continue,
+                }
                 state.status = StoredWorkStatus::Superseded {
-                    by,
+                    by: by.work_id(),
                     accepted_batch: batch_id,
                     manifest_fingerprint,
                     engine_history_root,
@@ -1518,11 +1576,12 @@ impl ProjectionWorkIndex {
         batch_id: BatchId,
         manifest_fingerprint: ContentDigest,
     ) -> Result<(), ProjectionWorkError> {
+        let before = self.engine_history_authority()?;
         self.accept_batch_at_history_for_test(
             batch_id,
             manifest_fingerprint,
-            1,
-            ContentDigest::of(b"projection-work-test-history-root"),
+            before.generation.saturating_add(1),
+            ContentDigest::of(batch_id.as_uuid().as_bytes()),
         )
     }
 
@@ -1781,6 +1840,97 @@ impl ProjectionWorkIndex {
             rows.push((state.work, state.status.into_public()));
         }
         Ok(rows)
+    }
+
+    /// Point-join one exact accepted batch through durable supersession until
+    /// every original row terminates in a truthful completion.
+    pub(crate) fn accepted_batch_settled_through_supersession(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<bool, ProjectionWorkError> {
+        let (_, root) = self.load_head_root()?;
+        let bytes = self
+            .tree_lookup(root.accepted_root, &batch_key(batch_id))?
+            .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
+        let witness: AcceptedBatchWitness = decode_canonical(&bytes)?;
+        if witness.schema_version != INDEX_SCHEMA_VERSION
+            || witness.workspace_id != self.workspace_id
+            || witness.endpoint_id != self.endpoint_id
+            || witness.batch_id != batch_id
+            || !strictly_sorted(&witness.work_ids)
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        // Every supersession requires a prior accepting root transition. The
+        // current root generation is therefore a conservative upper bound on
+        // the number of accepted work hops without enumerating history.
+        let maximum_hops = usize::try_from(root.generation)
+            .unwrap_or(usize::MAX)
+            .max(witness.work_ids.len());
+        for original in witness.work_ids {
+            let mut current = self
+                .load_state(&root, original)?
+                .ok_or(ProjectionWorkError::MissingWork(original))?;
+            let mut visited = BTreeSet::new();
+            let mut hops = 0usize;
+            loop {
+                match &current.status {
+                    StoredWorkStatus::Completed { .. } => break,
+                    StoredWorkStatus::Ready | StoredWorkStatus::Blocked { .. } => return Ok(false),
+                    StoredWorkStatus::Superseded {
+                        by,
+                        accepted_batch,
+                        manifest_fingerprint,
+                        engine_history_root,
+                    } => {
+                        if hops >= maximum_hops
+                            || !visited.insert(current.work.work_id())
+                            || *engine_history_root
+                                == super::object_store::EngineHistoryStore::empty_root()
+                        {
+                            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+                        }
+                        let successor = self
+                            .load_state(&root, *by)?
+                            .ok_or(ProjectionWorkError::MissingWork(*by))?;
+                        if successor.work.endpoint_id() != current.work.endpoint_id()
+                            || successor.work.page_id() != current.work.page_id()
+                            || successor.work.path() != current.work.path()
+                            || successor.work.batch_id() != *accepted_batch
+                            || !matches!(successor.work.target(), ProjectionWorkTarget::Present(_))
+                        {
+                            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+                        }
+                        let successor_witness = self
+                            .tree_lookup(root.accepted_root, &batch_key(*accepted_batch))?
+                            .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
+                        let successor_witness: AcceptedBatchWitness =
+                            decode_canonical(&successor_witness)?;
+                        if successor_witness.schema_version != INDEX_SCHEMA_VERSION
+                            || successor_witness.workspace_id != self.workspace_id
+                            || successor_witness.endpoint_id != self.endpoint_id
+                            || successor_witness.batch_id != *accepted_batch
+                            || successor_witness.manifest_fingerprint != *manifest_fingerprint
+                            || !strictly_sorted(&successor_witness.work_ids)
+                            || successor_witness.work_ids.binary_search(by).is_err()
+                        {
+                            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+                        }
+                        let prepared = self.load_prepared(*accepted_batch)?;
+                        if prepared.manifest_fingerprint != *manifest_fingerprint
+                            || ContentDigest::of(&encode_canonical(&prepared)?)
+                                != successor_witness.prepared_digest
+                            || !prepared.work.iter().any(|work| work == &successor.work)
+                        {
+                            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+                        }
+                        current = successor;
+                        hops = hops.saturating_add(1);
+                    }
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn next(&self) -> Result<Option<ProjectionWork>, ProjectionWorkError> {
@@ -2142,6 +2292,70 @@ impl ProjectionWorkIndex {
             return Err(ProjectionWorkError::AcceptedWitnessMismatch);
         }
         Ok(Some(state.work))
+    }
+
+    /// Point-read the Blocked rows and their exact Ready companions for one
+    /// accepted batch.  The accepted witness is rebound to its immutable
+    /// pending-source root and prepared batch, and at least one durable Blocked
+    /// sibling is required before any Ready row can escape.
+    pub(crate) fn accepted_batch_correlated_projections(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<AcceptedCorrelatedProjection>, ProjectionWorkError> {
+        let (_, root) = self.load_head_root()?;
+        let witness = self
+            .tree_lookup(root.accepted_root, &batch_key(batch_id))?
+            .ok_or(ProjectionWorkError::AcceptedWitnessMissing)?;
+        let witness: AcceptedBatchWitness = decode_canonical(&witness)?;
+        if witness.schema_version != INDEX_SCHEMA_VERSION
+            || witness.workspace_id != self.workspace_id
+            || witness.endpoint_id != self.endpoint_id
+            || witness.batch_id != batch_id
+            || !strictly_sorted(&witness.work_ids)
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        let source_root = self.load_root(witness.pending_root_digest)?;
+        let pending = self
+            .tree_lookup(source_root.pending_root, &batch_key(witness.batch_id))?
+            .ok_or(ProjectionWorkError::PendingActivationMissing)?;
+        let pending: ProjectionPendingActivation = decode_canonical(&pending)?;
+        self.require_pending_binding(&pending)?;
+        self.require_pending_prepared(&pending)?;
+        if pending.batch_id != witness.batch_id
+            || pending.manifest_fingerprint != witness.manifest_fingerprint
+            || pending.prepared_digest != witness.prepared_digest
+            || pending.work_ids != witness.work_ids
+        {
+            return Err(ProjectionWorkError::AcceptedWitnessMismatch);
+        }
+        let mut rows = Vec::new();
+        let mut has_blocked = false;
+        for work_id in witness.work_ids {
+            let state = self
+                .load_state(&root, work_id)?
+                .ok_or(ProjectionWorkError::MissingWork(work_id))?;
+            match state.status {
+                StoredWorkStatus::Blocked {
+                    observed: Some(observed),
+                    intent_id: Some(intent_id),
+                } => {
+                    has_blocked = true;
+                    rows.push(AcceptedCorrelatedProjection::Blocked {
+                        work: state.work,
+                        observed,
+                        intent_id,
+                    });
+                }
+                StoredWorkStatus::Ready => {
+                    rows.push(AcceptedCorrelatedProjection::Ready { work: state.work });
+                }
+                StoredWorkStatus::Blocked { .. }
+                | StoredWorkStatus::Completed { .. }
+                | StoredWorkStatus::Superseded { .. } => {}
+            }
+        }
+        Ok(has_blocked.then_some(rows).unwrap_or_default())
     }
 
     #[cfg(test)]
@@ -5941,13 +6155,24 @@ mod tests {
             ))
             .unwrap();
 
-        let superseded = fixture.work(3, "pages/superseded.md");
+        let superseded_page = PageId::from_uuid(Uuid::from_u128(81_003));
+        let superseded = fixture.work_for_page(
+            3,
+            "pages/superseded.md",
+            superseded_page,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"old")),
+        );
         let fingerprint = fixture.prepare(&superseded);
         fixture
             .index
             .accept_batch(superseded.batch_id(), fingerprint)
             .unwrap();
-        let replacement = fixture.work(4, "pages/superseded.md");
+        let replacement = fixture.work_for_page(
+            4,
+            "pages/superseded.md",
+            superseded_page,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"new")),
+        );
         let fingerprint = fixture.prepare_superseding(&replacement, &[superseded.work_id()]);
         fixture
             .index
@@ -6092,14 +6317,25 @@ mod tests {
     #[test]
     fn accepted_causal_activation_is_the_only_supersession_path() {
         let fixture = Fixture::new("causal-supersession");
-        let older = fixture.work(1, "pages/same.md");
+        let page_id = PageId::from_uuid(Uuid::from_u128(82_001));
+        let older = fixture.work_for_page(
+            1,
+            "pages/same.md",
+            page_id,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"older")),
+        );
         let older_fingerprint = fixture.prepare(&older);
         fixture
             .index
             .accept_batch(older.batch_id(), older_fingerprint)
             .unwrap();
 
-        let newer = fixture.work(2, "pages/same.md");
+        let newer = fixture.work_for_page(
+            2,
+            "pages/same.md",
+            page_id,
+            ProjectionWorkTarget::Present(BlobDescription::of(b"newer")),
+        );
         let newer_fingerprint = ContentDigest::of(newer.batch_id().as_uuid().as_bytes());
         fixture
             .index

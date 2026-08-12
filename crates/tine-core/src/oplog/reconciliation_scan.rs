@@ -1353,10 +1353,29 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                             ))
                         }
                         None => match self
-                            .cached_bootstrap_fallback(cursor.engine_binding, semantic.page_id())?
+                            .engine
+                            .correlated_blocked_external_expected_path(semantic.path())
+                            .map_err(map_engine_expected_failure)?
                         {
-                            Some(row) => Resolution::CachedBootstrap(row),
-                            None => Resolution::MaterializeBootstrap,
+                            Some((work, description))
+                                if work.page_id() == semantic.page_id()
+                                    && exceptions.latest_batch(semantic.page_id())
+                                        == Some(work.batch_id()) =>
+                            {
+                                Resolution::Projection(description)
+                            }
+                            Some(_) => {
+                                return Err(ExpectedPathSourceFailure::CorruptField(
+                                    ExpectedPathCorruptField::ProjectionAcceptedWitness,
+                                ))
+                            }
+                            None => match self.cached_bootstrap_fallback(
+                                cursor.engine_binding,
+                                semantic.page_id(),
+                            )? {
+                                Some(row) => Resolution::CachedBootstrap(row),
+                                None => Resolution::MaterializeBootstrap,
+                            },
                         },
                     }
                 } else {
@@ -1613,6 +1632,31 @@ impl<'a> JoinedAuthenticatedExpectedPathSource<'a> {
                     let ProjectionWorkTarget::Present(description) = work.target() else {
                         return Err(ExpectedPathSourceFailure::Missing);
                     };
+                    return Ok(AuthenticatedExpectedPath {
+                        page_id: row.page_id(),
+                        path: row.path().clone(),
+                        kind: row.kind(),
+                        accepted_name_digest: row.accepted_name_digest(),
+                        description,
+                        owner_binding: joined_owner_binding(
+                            source_commitment,
+                            row.page_id(),
+                            row.path(),
+                        ),
+                    });
+                }
+                if let Some((work, description)) = self
+                    .engine
+                    .correlated_blocked_external_expected_path(row.path())
+                    .map_err(map_engine_expected_failure)?
+                {
+                    if work.page_id() != row.page_id()
+                        || exceptions.latest_batch(row.page_id()) != Some(work.batch_id())
+                    {
+                        return Err(ExpectedPathSourceFailure::CorruptField(
+                            ExpectedPathCorruptField::ProjectionAcceptedWitness,
+                        ));
+                    }
                     return Ok(AuthenticatedExpectedPath {
                         page_id: row.page_id(),
                         path: row.path().clone(),

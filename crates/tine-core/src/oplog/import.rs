@@ -57,8 +57,9 @@ use super::{
     LogicalCompletionId, LogicalPageName, LogseqIdentityMutation, LogseqUuid, ManagedPath,
     ManagedTextKind, ObjectKind, OperationBatch, OperationObject, OperationTransaction, PageId,
     ProjectionCompletedReceipt, ProjectionCompletion, ProjectionIntent, ProjectionReceiptStore,
-    ProjectionStoreError, ReferenceCatalogPolicyV1, SemanticOperation, SessionId, ShardedHotEngine,
-    StructuralLocator, StructuralSpan, WorkspaceId, DIFF_SCHEMA_VERSION,
+    ProjectionStoreError, ProjectionWorkId, ProjectionWorkTarget, ReferenceCatalogPolicyV1,
+    SemanticOperation, SessionId, ShardedHotEngine, StructuralLocator, StructuralSpan, WorkspaceId,
+    DIFF_SCHEMA_VERSION,
 };
 use crate::model::{
     path_is_sync_conflict, resolve_external_document_identity, AcceptedExternalDocumentIdentity,
@@ -4322,6 +4323,7 @@ struct ReceiptBackedPage {
     completion: ProjectionCompletion,
     replayed_target: ExactBytes,
     page: super::MaterializedPage,
+    source: ReceiptBaseSource,
 }
 
 impl ReceiptBackedPage {
@@ -4391,6 +4393,23 @@ struct AffectedReceiptEntry {
     bootstrap_base: Option<ExactBytes>,
     intent: ProjectionIntent,
     completion: ProjectionCompletion,
+    source: ReceiptBaseSource,
+}
+
+/// In-memory provenance for a sealed import predecessor.  The correlated
+/// Blocked variant is deliberately not serialized and can only be created
+/// from the registry-gated hot-engine packet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReceiptBaseSource {
+    Completed,
+    Bootstrap,
+    CorrelatedBlocked {
+        work_id: ProjectionWorkId,
+        observed: BlobDescription,
+    },
+    CorrelatedReady {
+        work_id: ProjectionWorkId,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -5138,6 +5157,13 @@ fn capture_affected_catalog(
     requested_paths: &[ManagedPath],
     instrumentation: &mut ImportInstrumentation,
 ) -> Result<(AffectedReceiptCatalog, CatalogAuthority), ImportBlock> {
+    let endpoint = engine.projection_endpoint_binding().ok_or_else(|| {
+        authority_block(
+            ImportBlockReason::AuthorityUnavailable,
+            None,
+            "affected catalog requires an enrolled projection endpoint",
+        )
+    })?;
     let (_, work_index) = engine.enrolled_projection_runtime().map_err(|error| {
         authority_block(
             ImportBlockReason::AuthorityUnavailable,
@@ -5229,6 +5255,7 @@ fn capture_affected_catalog(
                 bootstrap_base: None,
                 intent,
                 completion,
+                source: ReceiptBaseSource::Completed,
             });
             captured_entries = captured_entries.saturating_add(1);
         }
@@ -5343,10 +5370,262 @@ fn capture_affected_catalog(
                         bootstrap_base: Some(base),
                         intent,
                         completion,
+                        source: ReceiptBaseSource::Bootstrap,
                     });
                     captured_entries = captured_entries.saturating_add(1);
                 }
             }
+        }
+
+        if let Some(correlated) =
+            engine
+                .correlated_projection_import_base(path)
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        format!("correlated projection registry lookup failed: {error}"),
+                    )
+                })?
+        {
+            let work = correlated.work();
+            if work.workspace_id() != engine.workspace_id()
+                || work.endpoint_id() != endpoint.endpoint_id
+                || work.graph_resource_id() != endpoint.graph_resource_id
+                || work.path() != path
+            {
+                return Err(authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    "correlated work does not match the enrolled endpoint and path",
+                ));
+            }
+            let (intent, base, source) = if let Some((observed, intent_id)) =
+                correlated.blocked_evidence()
+            {
+                let intent = receipts
+                    .load_intent(intent_id)
+                    .map_err(|error| {
+                        authority_block(
+                            ImportBlockReason::CorruptBase,
+                            Some(path),
+                            format!("correlated Blocked intent is invalid: {error}"),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        authority_block(
+                            ImportBlockReason::MissingBase,
+                            Some(path),
+                            "correlated Blocked work lacks its immutable projection intent",
+                        )
+                    })?;
+                if intent.id().ok() != Some(intent_id) {
+                    return Err(authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        "correlated Blocked intent ID differs from its durable work row",
+                    ));
+                }
+                let base = receipts.load_base(&intent).map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        format!("correlated Blocked immutable base is invalid: {error}"),
+                    )
+                })?;
+                (
+                    intent,
+                    base,
+                    ReceiptBaseSource::CorrelatedBlocked {
+                        work_id: work.work_id(),
+                        observed,
+                    },
+                )
+            } else {
+                if !correlated.is_ready() {
+                    return Err(authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        "correlated projection capability has no supported status",
+                    ));
+                }
+                let archive = engine.archive_store().ok_or_else(|| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        "correlated Ready work has no enrolled accepted archive",
+                    )
+                })?;
+                let inspection = archive.inspect_batch(work.batch_id()).map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        format!("correlated Ready accepted batch is invalid: {error}"),
+                    )
+                })?;
+                let validated = match inspection {
+                    super::BatchInspection::Ready(validated) => validated,
+                    super::BatchInspection::Absent | super::BatchInspection::Staged { .. } => {
+                        return Err(authority_block(
+                            ImportBlockReason::CorruptBase,
+                            Some(path),
+                            "correlated Ready accepted batch is absent or incomplete",
+                        ));
+                    }
+                };
+                let manifest_bytes = validated.manifest().encode().map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        error.to_string(),
+                    )
+                })?;
+                if ContentDigest::of(&manifest_bytes) != correlated.manifest_fingerprint() {
+                    return Err(authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        "correlated Ready manifest fingerprint changed",
+                    ));
+                }
+                let decoded = super::projection::decode_manifested_projection_work(archive, work)
+                    .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        format!("correlated Ready manifested work is invalid: {error}"),
+                    )
+                })?;
+                if decoded.target_bytes().is_none() {
+                    return Err(authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        "correlated Ready companion has an absent target",
+                    ));
+                }
+                let intent = decoded.receiver_local_intent().clone();
+                let base = decoded
+                    .annotated_base()
+                    .map(|base| {
+                        super::BaseBlob::from_parts(base.description(), base.bytes().to_vec())
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        authority_block(
+                            ImportBlockReason::CorruptBase,
+                            Some(path),
+                            format!("correlated Ready receiver-local base is invalid: {error}"),
+                        )
+                    })?;
+                (
+                    intent,
+                    base,
+                    ReceiptBaseSource::CorrelatedReady {
+                        work_id: work.work_id(),
+                    },
+                )
+            };
+            if intent.workspace_id() != engine.workspace_id()
+                || intent.page_id() != work.page_id()
+                || intent.path() != path
+                || intent.frontier() != work.post_frontier()
+                || ProjectionWorkTarget::Present(intent.target()) != work.target()
+            {
+                return Err(authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    "correlated import intent does not match its durable work row",
+                ));
+            }
+            let current = engine
+                .materialize_page_for_projection(work.page_id())
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::AuthorityUnavailable,
+                        Some(path),
+                        format!("correlated Blocked PageId cannot be materialized: {error}"),
+                    )
+                })?;
+            if current.page.page_id != work.page_id() || current.page.path != *path {
+                return Err(authority_block(
+                    ImportBlockReason::ConflictingLocalTail,
+                    Some(path),
+                    "correlated Blocked PageId no longer owns its exact path",
+                ));
+            }
+            let replay = plan_projection(
+                engine.workspace_id(),
+                &current,
+                base.as_ref().map(super::BaseBlob::bytes),
+            )
+            .map_err(|error| {
+                authority_block(
+                    ImportBlockReason::AuthorityUnavailable,
+                    Some(path),
+                    format!("correlated Blocked base cannot be replayed: {error}"),
+                )
+            })?;
+            let (replayed_intent, expected_local_bytes) = replay.into_intent_and_target();
+            if replayed_intent != intent
+                || BlobDescription::of(&expected_local_bytes) != intent.target()
+            {
+                return Err(authority_block(
+                    ImportBlockReason::ConflictingLocalTail,
+                    Some(path),
+                    "correlated Blocked base does not recreate its immutable projection intent",
+                ));
+            }
+            let completion = ProjectionCompletion::for_intent(&intent, &expected_local_bytes)
+                .map_err(|error| {
+                    authority_block(
+                        ImportBlockReason::CorruptBase,
+                        Some(path),
+                        format!("correlated Blocked dependency is invalid: {error}"),
+                    )
+                })?;
+            let intent_bytes = intent.encode().map_err(|error| {
+                authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    error.to_string(),
+                )
+            })?;
+            let completion_bytes = completion.encode().map_err(|error| {
+                authority_block(
+                    ImportBlockReason::CorruptBase,
+                    Some(path),
+                    error.to_string(),
+                )
+            })?;
+            instrumentation.catalog_entries = instrumentation.catalog_entries.saturating_add(1);
+            instrumentation.catalog_bytes_hashed = instrumentation
+                .catalog_bytes_hashed
+                .saturating_add(intent_bytes.len() as u64)
+                .saturating_add(completion_bytes.len() as u64);
+            hasher.update(b"correlated-projection-base\0");
+            hasher.update(work.work_id().as_bytes());
+            match &source {
+                ReceiptBaseSource::CorrelatedBlocked { observed, .. } => {
+                    hasher.update(b"blocked\0");
+                    hasher.update(observed.sha256());
+                    hasher.update(observed.byte_length().to_be_bytes());
+                }
+                ReceiptBaseSource::CorrelatedReady { .. } => hasher.update(b"ready\0"),
+                ReceiptBaseSource::Completed | ReceiptBaseSource::Bootstrap => unreachable!(),
+            }
+            hasher.update((intent_bytes.len() as u64).to_be_bytes());
+            hasher.update(intent_bytes);
+            hasher.update((completion_bytes.len() as u64).to_be_bytes());
+            hasher.update(completion_bytes);
+            entries.push(AffectedReceiptEntry {
+                completed: None,
+                bootstrap_base: base.map(|base| {
+                    ExactBytes::from_description(base.bytes().to_vec(), base.description())
+                }),
+                intent,
+                completion,
+                source,
+            });
+            captured_entries = captured_entries.saturating_add(1);
         }
         catalog.by_path.insert(path.clone(), entries);
     }
@@ -5704,6 +5983,7 @@ fn capture_import_scope(
                     completion: live.completion().clone(),
                     replayed_target: ExactBytes::from_description(bytes, live.intent().target()),
                     page: current.state().page.clone(),
+                    source: ReceiptBaseSource::Completed,
                 }),
             );
             continue;
@@ -5762,9 +6042,16 @@ fn capture_import_scope(
                 slot.insert(replay.into_intent_and_target());
             }
             let (replayed_intent, _) = &replay_cache[&base_key];
-            if entry.intent.matches_replay_except_frontier(replayed_intent)
-                && (entry.bootstrap_base.is_none()
-                    || entry.intent.frontier() == &current.state().frontier)
+            let correlated = matches!(
+                entry.source,
+                ReceiptBaseSource::CorrelatedBlocked { .. }
+                    | ReceiptBaseSource::CorrelatedReady { .. }
+            );
+            if (correlated && entry.intent == *replayed_intent)
+                || (!correlated
+                    && entry.intent.matches_replay_except_frontier(replayed_intent)
+                    && (entry.bootstrap_base.is_none()
+                        || entry.intent.frontier() == &current.state().frontier))
             {
                 if exact.is_some() {
                     return Err(authority_block(
@@ -5783,6 +6070,20 @@ fn capture_import_scope(
                 "no durable completion/base exactly matches the current accepted affected frontier",
             ));
         };
+        if let ReceiptBaseSource::CorrelatedBlocked { observed, .. } = entry.source {
+            if inventory
+                .entries()
+                .get(path)
+                .and_then(RawObservation::description)
+                != Some(observed)
+            {
+                return Err(authority_block(
+                    ImportBlockReason::ConflictingLocalTail,
+                    Some(path),
+                    "retained raw inventory differs from the durable correlated Blocked observation",
+                ));
+            }
+        }
         let replayed_target = replay_cache
             .remove(&base_key)
             .expect("exact replay key remains cached")
@@ -5807,6 +6108,7 @@ fn capture_import_scope(
                     entry.intent.target(),
                 ),
                 page: current.state().page.clone(),
+                source: entry.source.clone(),
             }),
         );
     }

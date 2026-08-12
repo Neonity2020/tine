@@ -113,6 +113,65 @@ pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CorrelatedExternalReconciliationCapability {
+    manifest_fingerprint: ContentDigest,
+    affected_page_ids: BTreeSet<PageId>,
+}
+
+/// Opaque import-base nomination minted only through an authenticated
+/// correlated-batch capability. A Ready variant requires a durable Blocked
+/// sibling in the same exact accepted witness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CorrelatedProjectionImportBase {
+    Blocked {
+        work: ProjectionWork,
+        observed: BlobDescription,
+        intent_id: ProjectionIntentId,
+        manifest_fingerprint: ContentDigest,
+    },
+    Ready {
+        work: ProjectionWork,
+        manifest_fingerprint: ContentDigest,
+    },
+}
+
+impl CorrelatedProjectionImportBase {
+    pub(crate) fn work(&self) -> &ProjectionWork {
+        match self {
+            Self::Blocked { work, .. } | Self::Ready { work, .. } => work,
+        }
+    }
+
+    pub(crate) const fn blocked_evidence(&self) -> Option<(BlobDescription, ProjectionIntentId)> {
+        match self {
+            Self::Blocked {
+                observed,
+                intent_id,
+                ..
+            } => Some((*observed, *intent_id)),
+            Self::Ready { .. } => None,
+        }
+    }
+
+    pub(crate) const fn manifest_fingerprint(&self) -> ContentDigest {
+        match self {
+            Self::Blocked {
+                manifest_fingerprint,
+                ..
+            }
+            | Self::Ready {
+                manifest_fingerprint,
+                ..
+            } => *manifest_fingerprint,
+        }
+    }
+
+    pub(crate) const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+}
+
 /// Test-only, per-thread attribution for the ordinary trusted-local authoring
 /// path.  This is deliberately an observation receipt, not engine state: it
 /// is reset by the trusted-local coordinator and is absent from release
@@ -3603,6 +3662,7 @@ struct CapabilityCapturedPriorProjection {
     /// Finalization repeats the same live-layout proof, not a canonical
     /// historical re-render that could reject harmless preserved trivia.
     pub(crate) receipt_backed_live_authority: bool,
+    pub(crate) correlated_authority: Option<CorrelatedProjectionImportBase>,
 }
 
 impl CapabilityCapturedPriorProjection {
@@ -3612,11 +3672,14 @@ impl CapabilityCapturedPriorProjection {
             self.bootstrap_owner_binding,
             self.managed_local_authority,
             self.receipt_backed_live_authority,
+            &self.correlated_authority,
         ) {
-            (Some(completion), None, None, _) => completion
+            (Some(completion), None, None, _, None) => completion
                 .validate_against(&self.intent)
                 .map_err(|error| EngineError::ProjectionManifest(error.to_string())),
-            (None, Some(_), None, false) | (None, None, Some(_), false) => Ok(()),
+            (None, Some(_), None, false, None)
+            | (None, None, Some(_), false, None)
+            | (None, None, None, false, Some(_)) => Ok(()),
             _ => Err(EngineError::ProjectionManifest(
                 "captured prior projection has ambiguous authority".into(),
             )),
@@ -3716,6 +3779,7 @@ impl CapabilityCapturedProjectionInput {
                     bootstrap_owner_binding: None,
                     managed_local_authority: None,
                     receipt_backed_live_authority: false,
+                    correlated_authority: None,
                 }),
             },
         };
@@ -3898,6 +3962,7 @@ impl CaptureSealedPendingLocalPredecessor {
         if prior.completion.is_some()
             || prior.bootstrap_owner_binding.is_some()
             || prior.receipt_backed_live_authority
+            || prior.correlated_authority.is_some()
             || before.page.page_id != requirement.page_id
             || before.page.path != requirement.path
             || current != Some(prior.bytes.as_slice())
@@ -7539,6 +7604,12 @@ pub struct ShardedHotEngine {
     projection_endpoint: Option<ProjectionEndpointBinding>,
     projection_receipt_store_id: Option<super::ProjectionReceiptStoreId>,
     projection_work_index: Option<Arc<ProjectionWorkIndex>>,
+    /// Runtime-only exact Blocked batches transferred by correlated local
+    /// recovery into the existing external feed. This is repopulated from
+    /// authenticated accepted work on every cold reopen; it is not a durable
+    /// continuation or a generic blocked-work discovery surface.
+    external_reconciliation_blocked_batches:
+        BTreeMap<BatchId, CorrelatedExternalReconciliationCapability>,
     scratch: Option<Arc<ScratchStore>>,
     /// Durable identity of the retained run this engine owns, when it was
     /// opened through the retained entry points. Absent for the ordinary
@@ -7762,6 +7833,7 @@ impl ShardedHotEngine {
             projection_endpoint: None,
             projection_receipt_store_id: None,
             projection_work_index: None,
+            external_reconciliation_blocked_batches: BTreeMap::new(),
             scratch: None,
             retained_scratch: None,
             scratch_roots: ScratchRoots::default(),
@@ -10398,6 +10470,136 @@ impl ShardedHotEngine {
         self.projection_work_index.as_deref().ok_or_else(|| {
             EngineError::ProjectionWork("engine has no enrolled projection work index".into())
         })
+    }
+
+    pub(crate) fn register_correlated_blocked_external_reconciliation(
+        &mut self,
+        batch_id: BatchId,
+        manifest_fingerprint: ContentDigest,
+        affected_page_ids: [PageId; 2],
+    ) -> Result<(), EngineError> {
+        let archive = self.archive_store.as_ref().ok_or_else(|| {
+            EngineError::ProjectionWork(
+                "correlated external reconciliation has no enrolled archive".into(),
+            )
+        })?;
+        let validated = match archive
+            .inspect_batch(batch_id)
+            .map_err(|error| EngineError::Archive(error.to_string()))?
+        {
+            BatchInspection::Ready(validated) => validated,
+            BatchInspection::Absent | BatchInspection::Staged { .. } => {
+                return Err(EngineError::ProjectionWork(
+                    "correlated external reconciliation batch is not archive-ready".into(),
+                ));
+            }
+        };
+        if batch_fingerprint(&validated) != manifest_fingerprint {
+            return Err(EngineError::ProjectionWork(
+                "correlated external reconciliation manifest binding mismatch".into(),
+            ));
+        }
+        let affected_page_ids = BTreeSet::from(affected_page_ids);
+        if affected_page_ids.len() != 2 {
+            return Err(EngineError::ProjectionWork(
+                "correlated external reconciliation affected PageIds are not exact".into(),
+            ));
+        }
+        let rows = self
+            .projection_work_index()?
+            .accepted_batch_correlated_projections(batch_id)
+            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?;
+        if rows.is_empty()
+            || rows
+                .iter()
+                .any(|row| !affected_page_ids.contains(&row.work().page_id()))
+        {
+            return Err(EngineError::ProjectionWork(
+                "correlated external reconciliation rows lack the exact affected/Blocked binding"
+                    .into(),
+            ));
+        }
+        self.external_reconciliation_blocked_batches.insert(
+            batch_id,
+            CorrelatedExternalReconciliationCapability {
+                manifest_fingerprint,
+                affected_page_ids,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn correlated_blocked_external_expected_path(
+        &self,
+        path: &super::ManagedPath,
+    ) -> Result<Option<(ProjectionWork, super::BlobDescription)>, EngineError> {
+        let index = self.projection_work_index()?;
+        let mut matched = None;
+        for (batch_id, capability) in &self.external_reconciliation_blocked_batches {
+            for blocked in index
+                .accepted_batch_correlated_projections(*batch_id)
+                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+            {
+                let Some((_observed, _intent_id)) = blocked.blocked_evidence() else {
+                    continue;
+                };
+                let work = blocked.work();
+                if work.path() != path || !capability.affected_page_ids.contains(&work.page_id()) {
+                    continue;
+                }
+                let ProjectionWorkTarget::Present(expected) = work.target() else {
+                    return Err(EngineError::ProjectionWork(
+                        "correlated Blocked expected path has an absent target".into(),
+                    ));
+                };
+                if matched.replace((work.clone(), expected)).is_some() {
+                    return Err(EngineError::ProjectionWork(
+                        "multiple correlated Blocked batches name one external path".into(),
+                    ));
+                }
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Return one exact nonterminal import base only while its authenticated
+    /// correlated batch retains a durable Blocked sibling.
+    pub(crate) fn correlated_projection_import_base(
+        &self,
+        path: &super::ManagedPath,
+    ) -> Result<Option<CorrelatedProjectionImportBase>, EngineError> {
+        let index = self.projection_work_index()?;
+        let mut matched = None;
+        for (batch_id, capability) in &self.external_reconciliation_blocked_batches {
+            for candidate in index
+                .accepted_batch_correlated_projections(*batch_id)
+                .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+            {
+                let work = candidate.work();
+                if work.path() != path || !capability.affected_page_ids.contains(&work.page_id()) {
+                    continue;
+                }
+                let candidate = match candidate.blocked_evidence() {
+                    Some((observed, intent_id)) => CorrelatedProjectionImportBase::Blocked {
+                        work: work.clone(),
+                        observed,
+                        intent_id,
+                        manifest_fingerprint: capability.manifest_fingerprint,
+                    },
+                    None if candidate.is_ready() => CorrelatedProjectionImportBase::Ready {
+                        work: work.clone(),
+                        manifest_fingerprint: capability.manifest_fingerprint,
+                    },
+                    None => continue,
+                };
+                if matched.replace(candidate).is_some() {
+                    return Err(EngineError::ProjectionWork(
+                        "multiple correlated capabilities name one import base".into(),
+                    ));
+                }
+            }
+        }
+        Ok(matched)
     }
 
     pub const fn projection_endpoint_binding(&self) -> Option<ProjectionEndpointBinding> {
@@ -16600,6 +16802,7 @@ impl ShardedHotEngine {
             bootstrap_owner_binding: None,
             managed_local_authority: Some((entry.sequence, entry.batch_id)),
             receipt_backed_live_authority: false,
+            correlated_authority: None,
         }))
     }
 
@@ -16635,6 +16838,102 @@ impl ShardedHotEngine {
                 "managed-local predecessor authority does not bind the captured exact target"
                     .into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn correlated_projection_predecessor(
+        &self,
+        receipts: &ProjectionReceiptStore,
+        path: &ManagedPath,
+        page_id: PageId,
+        before: &ProjectionPageState,
+    ) -> Result<Option<CapabilityCapturedPriorProjection>, EngineError> {
+        let Some(capability) = self.correlated_projection_import_base(path)? else {
+            return Ok(None);
+        };
+        let work = capability.work();
+        if work.page_id() != page_id
+            || before.page.page_id != page_id
+            || before.page.path != *path
+            || before.frontier != *work.post_frontier()
+        {
+            return Err(EngineError::ProjectionManifest(
+                "correlated predecessor does not match the current semantic PageId/path/frontier"
+                    .into(),
+            ));
+        }
+        let archive = self.archive_store().ok_or_else(|| {
+            EngineError::ProjectionManifest(
+                "correlated predecessor has no enrolled accepted archive".into(),
+            )
+        })?;
+        let decoded = super::projection::decode_manifested_projection_work(archive, work)
+            .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        let bytes = decoded.target_bytes().ok_or_else(|| {
+            EngineError::ProjectionManifest(
+                "correlated predecessor unexpectedly has an absent target".into(),
+            )
+        })?;
+        let intent = decoded.receiver_local_intent().clone();
+        if let Some((_observed, intent_id)) = capability.blocked_evidence() {
+            let durable_intent = receipts
+                .load_intent(intent_id)
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?
+                .ok_or_else(|| {
+                    EngineError::ProjectionManifest(
+                        "correlated Blocked predecessor lacks its durable receipt intent".into(),
+                    )
+                })?;
+            let durable_base = receipts
+                .load_base(&durable_intent)
+                .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+            if durable_intent != intent
+                || durable_base.as_ref().map(super::BaseBlob::bytes)
+                    != decoded.annotated_base().map(AnnotatedProjectionBase::bytes)
+            {
+                return Err(EngineError::ProjectionManifest(
+                    "correlated Blocked predecessor receipt differs from archived work".into(),
+                ));
+            }
+        }
+        let replay = super::projection::plan_projection(
+            self.workspace_id,
+            before,
+            decoded.annotated_base().map(AnnotatedProjectionBase::bytes),
+        )
+        .map_err(|error| EngineError::ProjectionManifest(error.to_string()))?;
+        if replay.intent() != &intent || replay.target() != bytes {
+            return Err(EngineError::ProjectionManifest(
+                "correlated predecessor is not the canonical current semantic projection".into(),
+            ));
+        }
+        Ok(Some(CapabilityCapturedPriorProjection {
+            bytes: bytes.to_vec(),
+            intent,
+            completion: None,
+            bootstrap_owner_binding: None,
+            managed_local_authority: None,
+            receipt_backed_live_authority: false,
+            correlated_authority: Some(capability),
+        }))
+    }
+
+    fn validate_correlated_projection_authority(
+        &self,
+        path: &ManagedPath,
+        prior: &CapabilityCapturedPriorProjection,
+    ) -> Result<(), EngineError> {
+        let Some(captured) = &prior.correlated_authority else {
+            return Ok(());
+        };
+        let fresh = self.correlated_projection_import_base(path)?;
+        if fresh.as_ref() != Some(captured)
+            || captured.work().page_id() != prior.intent.page_id()
+            || captured.work().path() != prior.intent.path()
+            || captured.work().post_frontier() != prior.intent.frontier()
+        {
+            return Err(EngineError::AuthorDraftStale);
         }
         Ok(())
     }
@@ -16778,6 +17077,24 @@ impl ShardedHotEngine {
                 })
                 .transpose()?
                 .flatten();
+            let correlated_prior = if external {
+                roles
+                    .semantic_predecessor
+                    .and_then(|requirement_index| {
+                        let requirement = &draft.requirements[requirement_index];
+                        draft.pages[&requirement.page_id]
+                            .before
+                            .as_ref()
+                            .map(|before| (requirement.page_id, before))
+                    })
+                    .map(|(page_id, before)| {
+                        self.correlated_projection_predecessor(receipts, path, page_id, before)
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             let prior = if let Some(prior) = managed_prior {
                 authority_matches = true;
                 Some(prior)
@@ -16820,6 +17137,7 @@ impl ShardedHotEngine {
                         bootstrap_owner_binding: None,
                         managed_local_authority: None,
                         receipt_backed_live_authority: true,
+                        correlated_authority: None,
                     })
                 } else if let Some(authority) = match completed.as_slice() {
                     [authority]
@@ -16868,8 +17186,12 @@ impl ShardedHotEngine {
                             bootstrap_owner_binding: None,
                             managed_local_authority: None,
                             receipt_backed_live_authority: false,
+                            correlated_authority: None,
                         })
                     }
+                } else if let Some(prior) = correlated_prior {
+                    authority_matches = true;
+                    Some(prior)
                 } else if completed.is_empty() {
                     let baseline = bootstrap
                         .map(|bootstrap| bootstrap.baseline_at(path))
@@ -16921,6 +17243,7 @@ impl ShardedHotEngine {
                                 bootstrap_owner_binding: Some(baseline.owner_binding()),
                                 managed_local_authority: None,
                                 receipt_backed_live_authority: false,
+                                correlated_authority: None,
                             })
                         }
                     } else {
@@ -17249,6 +17572,7 @@ impl ShardedHotEngine {
             if let Some(prior) = prior {
                 prior.validate_authority()?;
                 self.validate_managed_local_projection_authority(path, prior)?;
+                self.validate_correlated_projection_authority(path, prior)?;
                 let before = roles
                     .semantic_predecessor
                     .and_then(|index| {
@@ -19178,6 +19502,31 @@ impl ShardedHotEngine {
                         superseded.push(older.work_id());
                     }
                 }
+                if let ProjectionWorkTarget::Present(target) = row.target() {
+                    for blocked_batch in self.external_reconciliation_blocked_batches.keys() {
+                        for blocked in index
+                            .accepted_batch_correlated_projections(*blocked_batch)
+                            .map_err(|error| EngineError::ProjectionWork(error.to_string()))?
+                        {
+                            let Some((observed, _intent_id)) = blocked.blocked_evidence() else {
+                                continue;
+                            };
+                            let older = blocked.work();
+                            let dominates = self.projection_transition_frontier_dominates(
+                                row.post_frontier(),
+                                older.post_frontier(),
+                            )?;
+                            if older.endpoint_id() == row.endpoint_id()
+                                && older.page_id() == row.page_id()
+                                && older.path() == row.path()
+                                && target == observed
+                                && dominates
+                            {
+                                superseded.push(older.work_id());
+                            }
+                        }
+                    }
+                }
             }
             work.push(row);
         }
@@ -19584,6 +19933,49 @@ impl ShardedHotEngine {
         Ok(true)
     }
 
+    /// A page transition can stop depending on a document (for example when a
+    /// subtree moves away from the page). In that case the document correctly
+    /// disappears from the page's compact projection frontier even though the
+    /// authoring batch still causally descends from its former head.
+    fn projection_transition_frontier_dominates(
+        &self,
+        newer: &FrontierV2,
+        older: &FrontierV2,
+    ) -> Result<bool, EngineError> {
+        let direct_heads = newer
+            .documents()
+            .iter()
+            .flat_map(|document| document.direct_dependency_heads().iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut ancestry = None;
+        for old in older.documents() {
+            if let Ok(index) = newer
+                .documents()
+                .binary_search_by_key(&old.document_id(), DocumentDependencies::document_id)
+            {
+                if !self.document_dependencies_dominate(&newer.documents()[index], old)? {
+                    return Ok(false);
+                }
+                continue;
+            }
+            if old.direct_dependency_heads().is_empty() {
+                return Ok(false);
+            }
+            let ancestry = match &ancestry {
+                Some(ancestry) => ancestry,
+                None => ancestry.insert(self.projection_direct_head_ancestry(&direct_heads)?),
+            };
+            if !old
+                .direct_dependency_heads()
+                .iter()
+                .all(|head| direct_heads.contains(head) || ancestry.contains_key(head))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn document_dependencies_dominate(
         &self,
         newer: &DocumentDependencies,
@@ -19624,8 +20016,19 @@ impl ShardedHotEngine {
         {
             return Ok(true);
         }
-        let ancestry = match self.collect_batch_ancestry(&direct_heads, self.is_blocked()) {
-            Ok(ancestry) => ancestry,
+        let ancestry = self.projection_direct_head_ancestry(&direct_heads)?;
+        Ok(older
+            .direct_dependency_heads()
+            .iter()
+            .all(|head| direct_heads.contains(head) || ancestry.contains_key(head)))
+    }
+
+    fn projection_direct_head_ancestry(
+        &self,
+        direct_heads: &BTreeSet<BatchId>,
+    ) -> Result<BTreeMap<BatchId, OperationBatch>, EngineError> {
+        match self.collect_batch_ancestry(direct_heads, self.is_blocked()) {
+            Ok(ancestry) => Ok(ancestry),
             Err(EngineError::MissingDependency(candidate))
                 if direct_heads.contains(&candidate)
                     && matches!(self.statuses.get(&candidate), Some(ArchiveStatus::Staged)) =>
@@ -19639,14 +20042,10 @@ impl ShardedHotEngine {
                     .iter()
                     .copied()
                     .collect();
-                self.collect_batch_ancestry(&dependencies, self.is_blocked())?
+                self.collect_batch_ancestry(&dependencies, self.is_blocked())
             }
             Err(error) => return Err(error),
-        };
-        Ok(older
-            .direct_dependency_heads()
-            .iter()
-            .all(|head| direct_heads.contains(head) || ancestry.contains_key(head)))
+        }
     }
 
     pub fn materialize_page(&self, page_id: PageId) -> Result<MaterializedPage, EngineError> {

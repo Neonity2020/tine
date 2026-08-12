@@ -1652,6 +1652,137 @@ fn block_manifested_projection_work(
         .map_err(|error| ProjectionError::Work(error.to_string()))
 }
 
+/// Read-only, content-addressed decoding of one exact accepted projection work
+/// row.  It constructs the receiver-local intent exactly once for the normal
+/// executor, correlated import planning, and correlated successor capture.
+#[derive(Clone, Debug)]
+pub(crate) struct DecodedManifestedProjectionWork {
+    manifested: ManifestedProjectionIntent,
+    receiver_local_intent: ProjectionIntent,
+    annotated_base: Option<AnnotatedProjectionBase>,
+    target: Option<Vec<u8>>,
+    guarded_layout: GuardedProjectionLayout,
+}
+
+impl DecodedManifestedProjectionWork {
+    pub(crate) const fn manifested(&self) -> &ManifestedProjectionIntent {
+        &self.manifested
+    }
+
+    pub(crate) const fn receiver_local_intent(&self) -> &ProjectionIntent {
+        &self.receiver_local_intent
+    }
+
+    pub(crate) const fn annotated_base(&self) -> Option<&AnnotatedProjectionBase> {
+        self.annotated_base.as_ref()
+    }
+
+    pub(crate) fn target_bytes(&self) -> Option<&[u8]> {
+        self.target.as_deref()
+    }
+
+    const fn guarded_layout(&self) -> &GuardedProjectionLayout {
+        &self.guarded_layout
+    }
+}
+
+pub(crate) fn decode_manifested_projection_work(
+    archive: &ObjectStore,
+    work: &ProjectionWork,
+) -> Result<DecodedManifestedProjectionWork, ProjectionError> {
+    let intent_object = archive
+        .read_object(work.intent().content_digest())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if intent_object.kind() != ObjectKind::ProjectionIntent
+        || intent_object.document_id() != work.intent().document_id()
+        || !intent_object.descriptor().is_ok_and(|descriptor| {
+            descriptor.content_digest() == work.intent().content_digest()
+                && descriptor.encoded_byte_length() == work.intent().encoded_byte_length()
+        })
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let manifested = ManifestedProjectionIntent::decode(intent_object.payload())
+        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+    if manifested.workspace_id() != work.workspace_id()
+        || manifested.source_batch_id() != work.batch_id()
+        || manifested.source_endpoint_id() != work.endpoint_id()
+        || manifested.page_id() != work.page_id()
+        || manifested.path() != work.path()
+        || manifested.portable_path_index_root() != work.portable_path_index_root()
+        || manifested.post_frontier() != work.post_frontier()
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let (description, target, annotations) = match manifested.target() {
+        ManifestProjectionTarget::Absent => (super::BlobDescription::of(&[]), None, Vec::new()),
+        ManifestProjectionTarget::Present {
+            description,
+            bytes,
+            annotations,
+        } => (*description, Some(bytes.clone()), annotations.clone()),
+    };
+    if work.target()
+        != target.as_ref().map_or(ProjectionWorkTarget::Absent, |_| {
+            ProjectionWorkTarget::Present(description)
+        })
+    {
+        return Err(ProjectionError::WorkIntentMismatch);
+    }
+    let annotated_base = match manifested.precondition() {
+        ManifestProjectionPrecondition::Absent => None,
+        ManifestProjectionPrecondition::Present { base } => {
+            let base_object = archive
+                .read_object(base.content_digest())
+                .map_err(|error| ProjectionError::Archive(error.to_string()))?;
+            if base_object.kind() != ObjectKind::AnnotatedBaseBlob
+                || base_object.document_id() != base.document_id()
+                || !base_object.descriptor().is_ok_and(|descriptor| {
+                    descriptor.content_digest() == base.content_digest()
+                        && descriptor.encoded_byte_length() == base.encoded_byte_length()
+                })
+            {
+                return Err(ProjectionError::WorkIntentMismatch);
+            }
+            Some(
+                AnnotatedProjectionBase::decode(base_object.payload())
+                    .map_err(|error| ProjectionError::Archive(error.to_string()))?,
+            )
+        }
+    };
+    let guarded_layout = if target.is_some() {
+        GuardedProjectionLayout::from_authenticated_annotations(
+            annotated_base
+                .as_ref()
+                .map(AnnotatedProjectionBase::annotations),
+            &annotations,
+        )
+    } else {
+        GuardedProjectionLayout::empty()
+    };
+    let receiver_local_intent = ProjectionIntent::new(
+        manifested.workspace_id(),
+        manifested.page_id(),
+        manifested.path().clone(),
+        manifested.post_frontier().clone(),
+        manifested.claim_evidence().to_vec(),
+        annotated_base
+            .as_ref()
+            .map_or(ProjectionPrecondition::Absent, |base| {
+                ProjectionPrecondition::Base(base.description())
+            }),
+        description,
+        annotations,
+    )?;
+    Ok(DecodedManifestedProjectionWork {
+        manifested,
+        receiver_local_intent,
+        annotated_base,
+        target,
+        guarded_layout,
+    })
+}
+
 fn execute_manifested_projection_work_with_runtime(
     graph: &Graph,
     receipts: &ProjectionReceiptStore,
@@ -1693,100 +1824,12 @@ fn execute_manifested_projection_work_with_runtime(
     ) {
         return Err(ProjectionError::WorkNotReady);
     }
-    // Read the one object this work names, not the batch that contains it.
-    //
-    // The previous shape asked the archive to `inspect_batch(work.batch_id())`
-    // and then linearly scanned the result for an object whose digest it was
-    // already holding. `inspect_batch` reads, SHA-256s and decodes *every*
-    // object the manifest requires, so a single document's projection cost
-    // O(whole batch) and a whole import cost O(n^2): measured at 3.59 GB of
-    // read+SHA-256 to import 300 files of a ~1.3 MB corpus, scaling as n^1.79.
-    //
-    // Nothing is trusted here that was not already established. The object is
-    // content-addressed, so the digest in the authenticated work row pins its
-    // identity exactly as the scan did. Batch *completeness* is proved once at
-    // acceptance -- `hot_engine.rs:13120-13127` admits a batch to the archive
-    // only on `BatchInspection::Ready`, and a projection work row reaches
-    // `Ready` only inside `accept_batch_at_history` -- so re-deriving it per
-    // document was re-derivation, not protection. A missing object still fails
-    // closed, now as an archive read error rather than an incompleteness error.
-    let intent_object = archive
-        .read_object(work.intent().content_digest())
-        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
-    if intent_object.kind() != ObjectKind::ProjectionIntent
-        || intent_object.document_id() != work.intent().document_id()
-        || !intent_object.descriptor().is_ok_and(|descriptor| {
-            descriptor.content_digest() == work.intent().content_digest()
-                && descriptor.encoded_byte_length() == work.intent().encoded_byte_length()
-        })
-    {
-        return Err(ProjectionError::WorkIntentMismatch);
-    }
-    let intent_object = &intent_object;
-    let manifested = ManifestedProjectionIntent::decode(intent_object.payload())
-        .map_err(|error| ProjectionError::Archive(error.to_string()))?;
-    if manifested.source_endpoint_id() != work.endpoint_id()
-        || manifested.page_id() != work.page_id()
-        || manifested.path() != work.path()
-        || manifested.post_frontier() != work.post_frontier()
-    {
-        return Err(ProjectionError::WorkIntentMismatch);
-    }
-    let (description, target, annotations) = match manifested.target() {
-        ManifestProjectionTarget::Absent => (super::BlobDescription::of(&[]), None, Vec::new()),
-        ManifestProjectionTarget::Present {
-            description,
-            bytes,
-            annotations,
-        } => (*description, Some(bytes.as_slice()), annotations.clone()),
-    };
-    let expected_base = match manifested.precondition() {
-        ManifestProjectionPrecondition::Absent => None,
-        ManifestProjectionPrecondition::Present { base } => {
-            // Same one-object read as the intent above, same argument.
-            let base_object = archive
-                .read_object(base.content_digest())
-                .map_err(|error| ProjectionError::Archive(error.to_string()))?;
-            if base_object.kind() != ObjectKind::AnnotatedBaseBlob
-                || base_object.document_id() != base.document_id()
-                || !base_object.descriptor().is_ok_and(|descriptor| {
-                    descriptor.content_digest() == base.content_digest()
-                        && descriptor.encoded_byte_length() == base.encoded_byte_length()
-                })
-            {
-                return Err(ProjectionError::WorkIntentMismatch);
-            }
-            let base_object = &base_object;
-            Some(
-                AnnotatedProjectionBase::decode(base_object.payload())
-                    .map_err(|error| ProjectionError::Archive(error.to_string()))?,
-            )
-        }
-    };
-    let guarded_layout = if target.is_some() {
-        GuardedProjectionLayout::from_authenticated_annotations(
-            expected_base
-                .as_ref()
-                .map(AnnotatedProjectionBase::annotations),
-            &annotations,
-        )
-    } else {
-        GuardedProjectionLayout::empty()
-    };
-    let local_attempt_intent = ProjectionIntent::new(
-        manifested.workspace_id(),
-        manifested.page_id(),
-        manifested.path().clone(),
-        manifested.post_frontier().clone(),
-        manifested.claim_evidence().to_vec(),
-        expected_base
-            .as_ref()
-            .map_or(ProjectionPrecondition::Absent, |base| {
-                ProjectionPrecondition::Base(base.description())
-            }),
-        description,
-        annotations,
-    )?;
+    let decoded = decode_manifested_projection_work(archive, work)?;
+    let manifested = decoded.manifested();
+    let target = decoded.target_bytes();
+    let expected_base = decoded.annotated_base();
+    let guarded_layout = decoded.guarded_layout();
+    let local_attempt_intent = decoded.receiver_local_intent().clone();
     // Projecting one document costs ~95ms uniformly (F46), which is far too slow
     // for ~1.2KB of bytes and points at durable-write barriers rather than work.
     // This is the first of several durable receipt steps per document; time it to
@@ -1794,7 +1837,7 @@ fn execute_manifested_projection_work_with_runtime(
     let intent_started = super::phase_trace_enabled().then(std::time::Instant::now);
     receipts.publish_intent(
         &local_attempt_intent,
-        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+        expected_base.map(AnnotatedProjectionBase::bytes),
     )?;
     if let Some(started) = intent_started {
         eprintln!(
@@ -1820,14 +1863,14 @@ fn execute_manifested_projection_work_with_runtime(
             (Some(handoff), Some(target)) => handoff.recover_page_projection_with_layout(
                 graph,
                 manifested.path().as_str(),
-                expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                expected_base.map(AnnotatedProjectionBase::bytes),
                 target,
                 &guarded_layout,
                 &mut authority,
             ),
             (None, Some(target)) => graph.recover_page_projection_with_layout(
                 manifested.path().as_str(),
-                expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                expected_base.map(AnnotatedProjectionBase::bytes),
                 target,
                 &guarded_layout,
                 &mut authority,
@@ -1913,14 +1956,14 @@ fn execute_manifested_projection_work_with_runtime(
                     (Some(handoff), target) => handoff.recover_page_projection_with_layout(
                         graph,
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,
                     ),
                     (None, target) => graph.recover_page_projection_with_layout(
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,
@@ -1943,14 +1986,14 @@ fn execute_manifested_projection_work_with_runtime(
                     (Some(handoff), Some(target)) => handoff.write_page_projection_with_layout(
                         graph,
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,
                     ),
                     (None, Some(target)) => graph.write_page_projection_with_layout(
                         manifested.path().as_str(),
-                        expected_base.as_ref().map(AnnotatedProjectionBase::bytes),
+                        expected_base.map(AnnotatedProjectionBase::bytes),
                         target,
                         &guarded_layout,
                         &mut authority,

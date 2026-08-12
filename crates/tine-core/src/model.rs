@@ -1243,6 +1243,8 @@ struct ManagedTextWriteState {
     handoff_held: bool,
     #[cfg(test)]
     handoff_releases: usize,
+    #[cfg(test)]
+    recovered_handoff_reconstructions: usize,
 }
 
 #[derive(Default)]
@@ -5611,12 +5613,66 @@ impl Graph {
         })
     }
 
-    /// Consume the ownerless process-local graph-text latch reconstructed by
-    /// crash-takeover projection recovery for one durably blocked published
-    /// batch. The caller must first authenticate that exact blocked work from
-    /// accepted history; this method only verifies the runtime binding and
-    /// performs the affine release.
-    pub(crate) fn consume_recovered_published_handoff(
+    /// Reacquire the process-local latch for an already-authenticated
+    /// published continuation. Unlike ordinary minting, a held latch is the
+    /// expected same-process crash residue and is adopted rather than treated
+    /// as a competing writer. Callers must authenticate the exact immutable
+    /// manifest before entering this narrow recovery seam.
+    pub(crate) fn reconstruct_published_handoff_safe(
+        &self,
+        workspace_id: WorkspaceId,
+        endpoint: ProjectionEndpointBinding,
+    ) -> io::Result<HandoffSafe> {
+        let graph_resource_id = self.canonical_resource_id()?;
+        let binding = self.managed_write_binding()?;
+        if binding.resource_id != graph_resource_id
+            || endpoint.graph_resource_id() != graph_resource_id
+        {
+            return Err(managed_write_identity_mismatch_error());
+        }
+        let reconstructed = {
+            let mut state = binding.gate.state.lock().unwrap();
+            if state.active_writers != 0 {
+                return Err(handoff_write_blocked_error());
+            }
+            if state.handoff_held {
+                false
+            } else {
+                state.handoff_held = true;
+                #[cfg(test)]
+                {
+                    state.recovered_handoff_reconstructions += 1;
+                }
+                true
+            }
+        };
+        if let Err(error) = handoff_mint_after_reservation_hook() {
+            if reconstructed {
+                binding.gate.release_handoff();
+            }
+            return Err(error);
+        }
+        Ok(HandoffSafe {
+            gate: Some(Arc::clone(&binding.gate)),
+            instance_token: Arc::clone(&self.handoff_instance_token),
+            binding: HandoffBindingEvidence {
+                workspace_id,
+                endpoint,
+                graph_resource_id,
+            },
+        })
+    }
+
+    /// Reconstruct, when necessary, and consume the process-local graph-text
+    /// latch for one exact durably blocked published batch.
+    ///
+    /// A second cold reopen has no process-local gate state even though the
+    /// accepted projection row remains durably `Blocked`. The caller must first
+    /// authenticate that exact row from accepted history. Under this gate's
+    /// single-writer mutex we then reacquire the missing local latch, if and
+    /// only if it is absent, and consume it before the external feed is
+    /// admitted. This is deliberately not a general startup recovery API.
+    pub(crate) fn reconstruct_and_consume_recovered_published_handoff(
         &self,
         endpoint: ProjectionEndpointBinding,
     ) -> io::Result<()> {
@@ -5628,8 +5684,15 @@ impl Graph {
             return Err(managed_write_identity_mismatch_error());
         }
         let mut state = binding.gate.state.lock().unwrap();
-        if !state.handoff_held || state.active_writers != 0 {
+        if state.active_writers != 0 {
             return Err(handoff_write_blocked_error());
+        }
+        if !state.handoff_held {
+            state.handoff_held = true;
+            #[cfg(test)]
+            {
+                state.recovered_handoff_reconstructions += 1;
+            }
         }
         state.handoff_held = false;
         #[cfg(test)]
@@ -5673,6 +5736,20 @@ impl Graph {
             .lock()
             .unwrap()
             .handoff_releases
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_text_handoff_state(&self) -> (usize, bool, usize, usize) {
+        let binding = self
+            .managed_write_binding()
+            .expect("test graph has managed writer binding");
+        let state = binding.gate.state.lock().unwrap();
+        (
+            state.active_writers,
+            state.handoff_held,
+            state.handoff_releases,
+            state.recovered_handoff_reconstructions,
+        )
     }
 
     fn admit_retained_managed_text_writer(&self) -> io::Result<ManagedTextWritePermit> {

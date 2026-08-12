@@ -4351,6 +4351,34 @@ impl SyncRuntimeHandle {
     }
 
     #[cfg(test)]
+    fn install_correlated_move_after_blocked_fault(&self) -> Result<(), SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::InstallCorrelatedMoveAfterBlockedFault {
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)
+    }
+
+    #[cfg(test)]
+    fn accepted_batch_projection_statuses(
+        &self,
+        batch_id: BatchId,
+    ) -> Result<Vec<(PageId, crate::oplog::ProjectionWorkStatus)>, SyncRuntimeRequestError> {
+        let _operation = self.inner.operation.lock().unwrap();
+        let (reply_sender, reply_receiver) = mpsc::channel();
+        self.send(ActorRequest::AcceptedBatchProjectionStatuses {
+            batch_id,
+            reply: reply_sender,
+        })?;
+        reply_receiver
+            .recv()
+            .map_err(|_| SyncRuntimeRequestError::ActorUnavailable)?
+    }
+
+    #[cfg(test)]
     fn force_next_move_episode_batch_id(
         &self,
         batch_id: BatchId,
@@ -7260,6 +7288,15 @@ enum ActorRequest {
     #[cfg(test)]
     InstallMoveEpisodePublicationAfterWriteFault { reply: mpsc::Sender<()> },
     #[cfg(test)]
+    InstallCorrelatedMoveAfterBlockedFault { reply: mpsc::Sender<()> },
+    #[cfg(test)]
+    AcceptedBatchProjectionStatuses {
+        batch_id: BatchId,
+        reply: mpsc::Sender<
+            Result<Vec<(PageId, crate::oplog::ProjectionWorkStatus)>, SyncRuntimeRequestError>,
+        >,
+    },
+    #[cfg(test)]
     ForceNextMoveEpisodeBatchId {
         batch_id: BatchId,
         reply: mpsc::Sender<()>,
@@ -7631,6 +7668,36 @@ fn run_actor_loop(
             ActorRequest::InstallMoveEpisodePublicationAfterWriteFault { reply } => {
                 actor.fail_next_move_episode_publication_after_write = true;
                 let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::InstallCorrelatedMoveAfterBlockedFault { reply } => {
+                actor.fail_next_correlated_move_after_blocked = true;
+                let _ = reply.send(());
+                false
+            }
+            #[cfg(test)]
+            ActorRequest::AcceptedBatchProjectionStatuses { batch_id, reply } => {
+                let result = actor
+                    .runtime
+                    .as_ref()
+                    .ok_or(SyncRuntimeRequestError::ActorUnavailable)
+                    .and_then(|runtime| {
+                        let index = runtime.engine().projection_work_index().map_err(|error| {
+                            SyncRuntimeRequestError::ActorRefused(error.to_string())
+                        })?;
+                        index
+                            .accepted_batch_work_statuses(batch_id)
+                            .map(|rows| {
+                                rows.into_iter()
+                                    .map(|(work, status)| (work.page_id(), status))
+                                    .collect()
+                            })
+                            .map_err(|error| {
+                                SyncRuntimeRequestError::ActorRefused(error.to_string())
+                            })
+                    });
+                let _ = reply.send(result);
                 false
             }
             #[cfg(test)]
@@ -9128,6 +9195,8 @@ struct RuntimeActor {
     move_episode_directory: Dir,
     #[cfg(test)]
     fail_next_move_episode_publication_after_write: bool,
+    #[cfg(test)]
+    fail_next_correlated_move_after_blocked: bool,
     #[cfg(test)]
     forced_next_move_episode_batch_id: Option<BatchId>,
     prepared_application_reply: Option<(String, ApplicationCurrentPage)>,
@@ -10635,6 +10704,8 @@ impl RuntimeActor {
             move_episode_directory,
             #[cfg(test)]
             fail_next_move_episode_publication_after_write: false,
+            #[cfg(test)]
+            fail_next_correlated_move_after_blocked: false,
             #[cfg(test)]
             forced_next_move_episode_batch_id: None,
             prepared_application_reply: None,
@@ -14308,18 +14379,59 @@ impl RuntimeActor {
         {
             return self.settle_correlated_move_external_feed(&episode, episode_id);
         }
-        // The same exact published continuation may still be retained in this
-        // actor after a fresh guarded conflict. The durable episode+manifest
-        // is the authority selected below; discard only that matching
-        // process-local shell so it cannot later retry after its latch is
-        // consumed into the exact feed. An unrelated pending mutation remains
-        // untouched and keeps ordinary serialization.
-        if self
+        let matching_live_continuation = self
             .local_mutation
             .as_ref()
-            .is_some_and(|pending| pending_local_identity(pending).0 == Some(episode.batch_id))
-        {
-            self.local_mutation.take();
+            .is_some_and(|pending| pending_local_identity(pending).0 == Some(episode.batch_id));
+        if matching_live_continuation {
+            let Some(PendingLocalMutation::Published(continuation)) = self.local_mutation.take()
+            else {
+                unreachable!("only a published local continuation carries a batch identity")
+            };
+            let phase = map_local_phase(continuation.phase());
+            let state = {
+                let Some(authority) = self.authority.as_mut() else {
+                    self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                    return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                        episode_id,
+                        state: SyncEditorDeferred::Revoked {
+                            batch_id: Some(episode.batch_id.to_string()),
+                            phase,
+                        },
+                    });
+                };
+                let Some(runtime) = self.runtime.as_mut() else {
+                    self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                    return Err(SyncApplicationPageRequestError::ActorUnavailable);
+                };
+                let mut session = match runtime.admit_promoted_mutation(authority, &self.graph) {
+                    Ok(session) => session,
+                    Err(_) => {
+                        self.local_mutation = Some(PendingLocalMutation::Published(continuation));
+                        return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
+                            episode_id,
+                            state: SyncEditorDeferred::BlockedRecovery {
+                                batch_id: Some(episode.batch_id.to_string()),
+                                phase,
+                                retained_publication: true,
+                            },
+                        });
+                    }
+                };
+                OperationalCoordinator::resume_correlated_live_local(
+                    &mut session,
+                    &self.graph,
+                    &self.receipts,
+                    continuation,
+                    episode.batch_id,
+                    episode.manifest_fingerprint,
+                    episode.lineage_digest,
+                    episode.source_page_id,
+                    episode.destination_page_id,
+                )
+                .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_live_resume"))?
+            };
+            return self.finish_correlated_move_resume(&episode, episode_id, state);
         }
         if let Some(pending) = self.local_mutation.as_ref() {
             let (batch_id, phase) = pending_local_identity(pending);
@@ -14331,28 +14443,6 @@ impl RuntimeActor {
                     retained_publication: batch_id.is_some(),
                 },
             });
-        }
-        if match self.application_move_accepted(&episode) {
-            Ok(accepted) => accepted,
-            Err(reason) => return Ok(no_commit(reason)),
-        } {
-            if self.application_move_projection_settled(&episode)? {
-                if self
-                    .record_local_authorship_receipt(episode.batch_id)
-                    .is_ok()
-                    && self.record_provider_publication(episode.batch_id).is_ok()
-                {
-                    return self.application_move_committed_outcome(&episode, true);
-                }
-                return Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
-                    episode_id,
-                    state: SyncEditorDeferred::BlockedRecovery {
-                        batch_id: Some(episode.batch_id.to_string()),
-                        phase: SyncLocalMutationPhase::ProjectionDrain,
-                        retained_publication: true,
-                    },
-                });
-            }
         }
         let state = {
             let Some(authority) = self.authority.as_mut() else {
@@ -14384,11 +14474,29 @@ impl RuntimeActor {
             )
             .map_err(|_| SyncApplicationPageRequestError::ActorRefusedAt("move_cold_resume"))?
         };
+        self.finish_correlated_move_resume(&episode, episode_id, state)
+    }
+
+    fn finish_correlated_move_resume(
+        &mut self,
+        episode: &ApplicationMoveEpisodeRecord,
+        episode_id: String,
+        state: CorrelatedPublishedLocalResume,
+    ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
         match state {
             CorrelatedPublishedLocalResume::NoCommit => {
-                Ok(no_commit(SyncApplicationMoveConflict::EpisodeNotCommitted))
+                Ok(SyncApplicationMoveSubtreesOutcome::NoCommit {
+                    episode_id,
+                    reason: SyncApplicationMoveConflict::EpisodeNotCommitted,
+                })
             }
             CorrelatedPublishedLocalResume::GuardedConflict(conflict) => {
+                #[cfg(test)]
+                if std::mem::take(&mut self.fail_next_correlated_move_after_blocked) {
+                    return Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                        "move_after_durable_blocked",
+                    ));
+                }
                 let observations = conflict
                     .paths()
                     .iter()
@@ -14409,13 +14517,13 @@ impl RuntimeActor {
                 self.correlated_move_feed_handoffs
                     .insert(conflict.batch_id());
                 self.refresh_watcher();
-                self.settle_correlated_move_external_feed(&episode, episode_id)
+                self.settle_correlated_move_external_feed(episode, episode_id)
             }
             CorrelatedPublishedLocalResume::State(state) => {
                 let outcome = self.retain_local_state(state, None);
                 match outcome {
                     SyncLocalMutationOutcome::Durable { .. } => {
-                        self.application_move_committed_outcome(&episode, true)
+                        self.application_move_committed_outcome(episode, true)
                     }
                     outcome => Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
                         episode_id,
@@ -14438,14 +14546,11 @@ impl RuntimeActor {
             SyncApplicationPageRequestError::ActorRefusedAt("move_projection_status")
         })?;
         let rows = index
-            .accepted_batch_work_statuses(episode.batch_id)
+            .accepted_batch_settled_through_supersession(episode.batch_id)
             .map_err(|_| {
                 SyncApplicationPageRequestError::ActorRefusedAt("move_projection_status")
             })?;
-        Ok(!rows.is_empty()
-            && rows
-                .iter()
-                .all(|(_, status)| matches!(status, crate::oplog::ProjectionWorkStatus::Completed)))
+        Ok(rows)
     }
 
     fn settle_correlated_move_external_feed(
@@ -14474,27 +14579,9 @@ impl RuntimeActor {
                 SyncRuntimeTick::Blocked(_) | SyncRuntimeTick::RecoveryBlocked(_) => break,
                 _ => {}
             }
-            if !self.last_watcher.pending {
-                if self
-                    .record_local_authorship_receipt(episode.batch_id)
-                    .is_err()
-                    || self.record_provider_publication(episode.batch_id).is_err()
-                {
-                    break;
-                }
-                match self.application_move_committed_outcome(episode, true) {
-                    Ok(outcome) => {
-                        self.correlated_move_feed_handoffs.remove(&episode.batch_id);
-                        return Ok(outcome);
-                    }
-                    Err(_) => {
-                        // A committed move whose external reconciliation
-                        // deleted either recorded PageId has no truthful DTO
-                        // outcome in X1.6. Retain ownership for process reopen.
-                        break;
-                    }
-                }
-            }
+            // Queue quiescence is not settlement proof. The original exact
+            // work must be Completed or authenticate a Superseded chain ending
+            // at the completed external successor before any committed DTO.
         }
         Ok(SyncApplicationMoveSubtreesOutcome::Deferred {
             episode_id,
@@ -25881,7 +25968,7 @@ mod tests {
         request: &SyncApplicationMoveSubtreesRequest,
     ) -> SyncApplicationMoveSubtreesOutcome {
         let mut last_deferred = None;
-        for _ in 0..128 {
+        for _ in 0..512 {
             match handle.move_application_subtrees(request.clone()).unwrap() {
                 outcome @ SyncApplicationMoveSubtreesOutcome::Committed { .. } => return outcome,
                 outcome @ SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
@@ -26278,8 +26365,75 @@ mod tests {
             external,
         )
         .unwrap();
-        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
+        let first_reopen = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+        first_reopen
+            .install_correlated_move_after_blocked_fault()
+            .unwrap();
+        let first_gate_before = Graph::open(fixture.graph_root());
+        let (_, held_before_conflict, releases_before_conflict, reconstructions_before_conflict) =
+            first_gate_before.managed_text_handoff_state();
+        assert!(
+            held_before_conflict,
+            "cold continuation owns the local latch"
+        );
+        drop(first_gate_before);
+        let mut cut_after_blocked = false;
+        for _ in 0..128 {
+            match first_reopen.resolve_application_move_subtrees(request.clone()) {
+                Err(SyncApplicationPageRequestError::ActorRefusedAt(
+                    "move_after_durable_blocked",
+                )) => {
+                    cut_after_blocked = true;
+                    break;
+                }
+                Ok(SyncApplicationMoveSubtreesObservation {
+                    move_outcome: SyncApplicationMoveSubtreesOutcome::Deferred { .. },
+                    ..
+                }) => {}
+                other => panic!("first reopen did not stop after durable Blocked: {other:?}"),
+            }
+        }
+        assert!(cut_after_blocked);
+        let first_gate = Graph::open(fixture.graph_root());
+        let (active_writers, handoff_held, releases, reconstructions) =
+            first_gate.managed_text_handoff_state();
+        assert_eq!(active_writers, 0, "feed cut retains no graph writer");
+        assert!(
+            !handoff_held,
+            "local latch is released before feed admission"
+        );
+        assert_eq!(
+            releases,
+            releases_before_conflict + 1,
+            "fresh guarded conflict consumes one latch"
+        );
+        assert_eq!(
+            reconstructions, reconstructions_before_conflict,
+            "the guarded-conflict cut does not mint another latch"
+        );
+        drop(first_gate);
+        drop(first_reopen);
+
+        let reopened = active_handle(SyncRuntimeHandle::open(reopen_request.clone()));
+        assert_eq!(
+            reopened.status().unwrap().recovery,
+            Some(SyncRuntimeRecovery::TookOverCrashedUnsafe)
+        );
+        let second_gate_before = Graph::open(fixture.graph_root());
+        let (
+            second_active_before,
+            second_held_before,
+            second_releases_before,
+            second_rebuilds_before,
+        ) = second_gate_before.managed_text_handoff_state();
+        assert_eq!(second_active_before, 0);
+        assert!(
+            !second_held_before,
+            "a second cold graph begins without a local latch"
+        );
+        drop(second_gate_before);
         let mut committed = None;
+        let mut last_deferred = None;
         for _ in 0..128 {
             let observation = reopened
                 .resolve_application_move_subtrees(request.clone())
@@ -26289,16 +26443,31 @@ mod tests {
                     committed = Some(outcome);
                     break;
                 }
-                SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {}
+                outcome @ SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
+                    last_deferred = Some(outcome)
+                }
                 other => panic!("guarded cold recovery failed closed unexpectedly: {other:?}"),
             }
         }
         let SyncApplicationMoveSubtreesOutcome::Committed {
+            batch_id,
             source,
             destination,
             recovered: true,
             ..
-        } = committed.expect("guarded cold recovery must settle through the exact feed")
+        } = committed.unwrap_or_else(|| {
+            let batch_id = match last_deferred.as_ref() {
+                Some(SyncApplicationMoveSubtreesOutcome::Deferred {
+                    state: SyncEditorDeferred::BlockedRecovery { batch_id: Some(batch_id), .. },
+                    ..
+                }) => BatchId::from_uuid(Uuid::parse_str(batch_id).unwrap()),
+                _ => panic!("missing retained batch in {last_deferred:?}; status={:?}", reopened.status().unwrap()),
+            };
+            let projection = reopened.accepted_batch_projection_statuses(batch_id).unwrap();
+            panic!(
+                "guarded cold recovery must settle through the exact feed: {last_deferred:?}; status={:?}; source={source_id}; destination={destination_id}; projection={projection:?}", reopened.status().unwrap()
+            )
+        })
         else {
             unreachable!()
         };
@@ -26321,6 +26490,51 @@ mod tests {
             query_page_blocks(&reopened, &destination_id).page.page_id,
             destination_id
         );
+        let second_gate_after = Graph::open(fixture.graph_root());
+        let (active_after, held_after, releases_after, rebuilds_after) =
+            second_gate_after.managed_text_handoff_state();
+        assert_eq!(active_after, 0);
+        assert!(!held_after);
+        assert_eq!(
+            (releases_after, rebuilds_after),
+            (second_releases_before + 2, second_rebuilds_before + 1),
+            "one reconstructed continuation release plus one ordinary successor release"
+        );
+        let batch_id = BatchId::from_uuid(Uuid::parse_str(&batch_id).unwrap());
+        let projection = reopened
+            .accepted_batch_projection_statuses(batch_id)
+            .unwrap();
+        assert_eq!(projection.len(), 2, "one exact two-page projection set");
+        assert_eq!(
+            projection
+                .iter()
+                .map(|(page_id, _)| *page_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                PageId::from_uuid(Uuid::parse_str(&source_id).unwrap()),
+                PageId::from_uuid(Uuid::parse_str(&destination_id).unwrap()),
+            ])
+        );
+        let source_page_id = PageId::from_uuid(Uuid::parse_str(&source_id).unwrap());
+        let destination_page_id = PageId::from_uuid(Uuid::parse_str(&destination_id).unwrap());
+        let status_for = |page_id| {
+            projection
+                .iter()
+                .find_map(|(candidate, status)| (*candidate == page_id).then_some(status))
+                .unwrap()
+        };
+        assert!(matches!(
+            status_for(source_page_id),
+            crate::oplog::ProjectionWorkStatus::Completed
+                | crate::oplog::ProjectionWorkStatus::Superseded { .. }
+        ));
+        assert!(matches!(
+            status_for(destination_page_id),
+            crate::oplog::ProjectionWorkStatus::Superseded { .. }
+        ));
+        assert!(reopened
+            .accepted_batch_projection_statuses(batch_id)
+            .is_ok());
         assert_eq!(fixture.manifest_count(), manifests + 2);
     }
 
@@ -26401,14 +26615,31 @@ mod tests {
         fs::write(fixture.graph_root().join(&unrelated.path), external).unwrap();
 
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
-        let observation = reopened.resolve_application_move_subtrees(request).unwrap();
-        assert!(matches!(
-            observation.move_outcome,
-            SyncApplicationMoveSubtreesOutcome::Committed {
-                recovered: true,
-                ..
+        let mut observation = reopened
+            .resolve_application_move_subtrees(request.clone())
+            .unwrap();
+        for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+            if matches!(
+                observation.move_outcome,
+                SyncApplicationMoveSubtreesOutcome::Committed { .. }
+            ) {
+                break;
             }
-        ));
+            observation = reopened
+                .resolve_application_move_subtrees(request.clone())
+                .unwrap();
+        }
+        assert!(
+            matches!(
+                &observation.move_outcome,
+                SyncApplicationMoveSubtreesOutcome::Committed {
+                    recovered: true,
+                    ..
+                }
+            ),
+            "outcome={:?}",
+            observation.move_outcome
+        );
         assert!(
             reopened.status().unwrap().watcher.pending,
             "correlated local resume must not consume unrelated startup work"
@@ -26443,16 +26674,20 @@ mod tests {
         let reopened = active_handle(SyncRuntimeHandle::open(reopen_request));
         let mut mismatch = request.clone();
         mismatch.admission.application_page_max_depth -= 1;
-        assert!(matches!(
-            reopened
-                .resolve_application_move_subtrees(mismatch)
-                .unwrap()
-                .move_outcome,
-            SyncApplicationMoveSubtreesOutcome::NoCommit {
-                reason: SyncApplicationMoveConflict::EpisodeMismatch,
-                ..
-            }
-        ));
+        let mismatch_outcome = reopened
+            .resolve_application_move_subtrees(mismatch)
+            .unwrap()
+            .move_outcome;
+        assert!(
+            matches!(
+                &mismatch_outcome,
+                SyncApplicationMoveSubtreesOutcome::NoCommit {
+                    reason: SyncApplicationMoveConflict::EpisodeMismatch,
+                    ..
+                } | SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+            ),
+            "mismatched request must neither commit nor adopt: {mismatch_outcome:?}"
+        );
         assert_eq!(fixture.manifest_count(), manifests + 1);
         assert!(matches!(
             reopened
