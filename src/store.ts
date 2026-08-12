@@ -5816,7 +5816,7 @@ function relativeMovePlan(capturedIds: readonly string[], targetId: string): Rel
 export async function moveBlocksRelative(
   capturedIds: readonly string[],
   targetId: string,
-  position: "before" | "after",
+  position: "before" | "after" | "child",
 ): Promise<boolean> {
   let plan = relativeMovePlan(capturedIds, targetId);
   if (!plan) return false;
@@ -5863,17 +5863,23 @@ export async function moveBlocksRelative(
         return false;
       }
       const target = doc.byId[targetId];
-      const siblings = target.parent === null
-        ? pageByName(target.page)!.roots
-        : doc.byId[target.parent].children;
-      const positionIndex = siblings.indexOf(targetId) + (position === "after" ? 1 : 0);
+      const siblings = position === "child"
+        ? target.children
+        : target.parent === null
+          ? pageByName(target.page)!.roots
+          : doc.byId[target.parent].children;
+      const positionIndex = position === "child"
+        ? siblings.length
+        : siblings.indexOf(targetId) + (position === "after" ? 1 : 0);
       return enqueueManagedCrossPageMove(
         crossSources[0],
         plan.destinationPage,
         plan.roots,
-        target.parent === null
-          ? { placement: "root", position: positionIndex }
-          : { placement: "child", parent_identity: target.parent, position: positionIndex },
+        position === "child"
+          ? { placement: "child", parent_identity: targetId, position: positionIndex }
+          : target.parent === null
+            ? { placement: "root", position: positionIndex }
+            : { placement: "child", parent_identity: target.parent, position: positionIndex },
         movedRaw,
       );
     }
@@ -5892,12 +5898,13 @@ export async function moveBlocksRelative(
     }
 
     const target = state.byId[targetId];
-    const destination = target.parent === null
+    const destinationParent = position === "child" ? targetId : target.parent;
+    const destination = destinationParent === null
       ? state.pages.find((page) => page.name === target.page)!.roots
-      : state.byId[target.parent].children;
-    const targetIndex = destination.indexOf(targetId);
+      : state.byId[destinationParent].children;
+    const targetIndex = position === "child" ? destination.length : destination.indexOf(targetId);
     for (const id of plan!.roots) {
-      state.byId[id].parent = target.parent;
+      state.byId[id].parent = destinationParent;
       state.byId[id].raw = movedRaw.get(id)!;
     }
     destination.splice(targetIndex + (position === "after" ? 1 : 0), 0, ...plan!.roots);

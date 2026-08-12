@@ -6581,6 +6581,27 @@
         "failBefore": "proven"
       },
       "notes": "OG moves the caret before a line-opening :: delimiter and searches the property name to its left. Tine previously left the caret after ::, so the first name character produced malformed ::a text, closed the popup, and could surface repeated backend error notifications. Coverage exercises the real input-event lifecycle: :: moves the caret left; typed characters filter without closing; Create is discoverable at the top; selection enters value search; a directly authored key:: followed by space also enters value search; and comma starts a new value search with already-authored values excluded. Facet lookup failure is contained to the optional autocomplete surface and cannot reject the editor input event."
+    },
+    {
+      "id": "UI-BLOCK-DRAG-NESTED-DROP-326",
+      "title": "Dragging a block into the deep target zone makes it a child of that block",
+      "family": "outline-drag-drop",
+      "sources": {
+        "issues": [326],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/editor/blockDrag.test.ts",
+          "src/store.test.ts"
+        ],
+        "scenario": "outline.drag-to-nest-selected-subtrees",
+        "failBefore": "proven"
+      },
+      "notes": "Tine's pointer drag implementation exposed only before/after sibling targets, so Windows was not exceptional: no platform could express OG's nested drop. OG 6e7afa8eb chooses :nested when the pointer is more than 50px inside the target block and moves the dragged roots under that target. The shared pointer path now uses that same intent threshold and a distinct child indicator. The target-relative store transaction accepts child placement for one or many normalized selected roots, appends them after existing children, preserves subtrees, page reassignment and order-list inheritance, rejects self/descendant cycles through the existing plan, and remains one undo/redo unit. Cross-page managed moves transmit the equivalent child placement to the storage actor."
     }
   ]
 }

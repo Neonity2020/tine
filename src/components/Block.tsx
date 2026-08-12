@@ -26,6 +26,7 @@ import { pluginManager } from "../plugins/manager";
 import { bindPluginBlockSnapshot, isPluginGraphOwnerCurrent } from "../plugins/ownership";
 import { autoPairInsertOnInput, wrapSelectionEdit, doubleRefKind, backspacePairEdit, SELECTION_WRAP } from "../editor/autopair";
 import { typoTypeReplace } from "../render/typography";
+import { blockDropPosition, type BlockDropPosition } from "../editor/blockDrag";
 import { linkAutocompletePolicy } from "../editor/linkDefault";
 import { spellcheckEnabled } from "../spellcheckSettings";
 import { spaceAfterRefCompletion } from "../refCompletionSettings";
@@ -233,7 +234,7 @@ function bodyContainsQueryMacro(raw: string): boolean {
 
 // Pointer-based drag reorder (HTML5 DnD is unreliable in WebKitGTK).
 const [dragId, setDragId] = createSignal<string | null>(null);
-const [dropInd, setDropInd] = createSignal<{ id: string; before: boolean } | null>(null);
+const [dropInd, setDropInd] = createSignal<{ id: string; position: BlockDropPosition } | null>(null);
 let dragMoved = false;
 
 function beginDrag(id: string, e: MouseEvent) {
@@ -256,7 +257,10 @@ function beginDrag(id: string, e: MouseEvent) {
     const tid = el?.dataset.blockId;
     if (tid) {
       const main = el!.querySelector(".block-main")!.getBoundingClientRect();
-      setDropInd({ id: tid, before: ev.clientY < main.top + main.height / 2 });
+      setDropInd({
+        id: tid,
+        position: blockDropPosition(ev.clientX, ev.clientY, el!.getBoundingClientRect(), main),
+      });
     } else {
       setDropInd(null);
     }
@@ -266,7 +270,7 @@ function beginDrag(id: string, e: MouseEvent) {
     document.removeEventListener("mouseup", onUp);
     const ind = dropInd();
     if (dragMoved && ind && doc.byId[ind.id]) {
-      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.before ? "before" : "after");
+      void moveBlocksRelative(capturedIds ?? [id], ind.id, ind.position);
     }
     setDragId(null);
     setDropInd(null);
@@ -445,8 +449,9 @@ export function Block(props: { id: string; hideRefCount?: boolean; forceExpanded
           // editing, apply the same offset only when the hidden-props-stripped editor
           // value is still a single line; multi-line heading blocks edit at body size.
           [`bullet-h${headingLevel()}`]: headingLevel() != null && (!editing() || editorIsUniline()),
-          "drop-before": dropInd()?.id === props.id && dropInd()?.before === true,
-          "drop-after": dropInd()?.id === props.id && dropInd()?.before === false,
+          "drop-before": dropInd()?.id === props.id && dropInd()?.position === "before",
+          "drop-after": dropInd()?.id === props.id && dropInd()?.position === "after",
+          "drop-child": dropInd()?.id === props.id && dropInd()?.position === "child",
           dragging: dragId() === props.id,
           selected: isSelected(props.id),
           // Marks the row being edited; drives dim-mode's active-block spotlight.

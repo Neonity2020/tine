@@ -1993,6 +1993,29 @@ describe("target-relative multi-root drag (GH #240)", () => {
     expect(pageState("Test")).toEqual(after);
   });
 
+  it("appends selected roots as children of the target with exact undo/redo (GH #326)", async () => {
+    const first = blk("first");
+    const secondChild = blk("second child");
+    const second = blk("second", [secondChild]);
+    const existingChild = blk("existing child");
+    const target = blk("target", [existingChild]);
+    load([first, second, target]);
+    const before = pageState("Test");
+
+    expect(await moveBlocksRelative([first.id, second.id], target.id, "child")).toBe(true);
+    expect(pageByName("Test")!.roots).toEqual([target.id]);
+    expect(doc.byId[target.id].children).toEqual([existingChild.id, first.id, second.id]);
+    expect(doc.byId[first.id].parent).toBe(target.id);
+    expect(doc.byId[second.id].parent).toBe(target.id);
+    expect(doc.byId[secondChild.id]).toMatchObject({ parent: second.id, page: "Test" });
+    const after = pageState("Test");
+
+    undo();
+    expect(pageState("Test")).toEqual(before);
+    redo();
+    expect(pageState("Test")).toEqual(after);
+  });
+
   it.each([
     ["target is a moved root", "same"],
     ["target is inside a moved subtree", "descendant"],
