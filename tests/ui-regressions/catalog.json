@@ -6606,6 +6606,26 @@
         "failBefore": "proven"
       },
       "notes": "Tine's pointer drag implementation exposed only before/after sibling targets, so Windows was not exceptional: no platform could express OG's nested drop. OG 6e7afa8eb chooses :nested when the pointer is more than 50px inside the target block and moves the dragged roots under that target. The shared pointer path now uses that same intent threshold and a distinct child indicator. The target-relative store transaction accepts child placement for one or many normalized selected roots, appends them after existing children, preserves subtrees, page reassignment and order-list inheritance, rejects self/descendant cycles through the existing plan, and remains one undo/redo unit. Cross-page managed moves transmit the equivalent child placement to the storage actor."
+    },
+    {
+      "id": "UI-CUSTOM-CSS-INTER-OPENTYPE-298",
+      "title": "Custom CSS can enable Inter OpenType stylistic sets and character variants",
+      "family": "custom-css",
+      "sources": {
+        "issues": [298],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/interFont.test.ts"
+        ],
+        "scenario": "custom-css.bundled-inter-retains-opentype-features",
+        "failBefore": "proven"
+      },
+      "notes": "The custom CSS property itself reached the computed style correctly; the bundled @fontsource/inter per-script static subsets lacked ss02 and every other Inter stylistic set. Tine now ships the audited full upstream Inter 4.1 variable faces under the same public Inter family name, preserving existing themes and user CSS while restoring ss01-ss08 and cv01-cv14. The regression pins both upstream font hashes and verifies the public family and variable-weight declarations; the production build separately proves Vite emits both faces."
     }
   ]
 }

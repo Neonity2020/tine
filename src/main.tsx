@@ -7,10 +7,9 @@ import { applyTheme, applyAccent, pushToast } from "./ui";
 import { startCommunityExtensions } from "./plugins/startup";
 import { isTauri } from "./backend";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import "@fontsource/inter/400.css";
-import "@fontsource/inter/500.css";
-import "@fontsource/inter/600.css";
-import "@fontsource/inter/700.css";
+// Full upstream Inter variable fonts retain OpenType stylistic sets/character
+// variants. Fontsource's per-script static subsets stripped them (GH #298).
+import "./styles/inter.css";
 // Display emoji are Twemoji SVG <img>s (see render/emoji.tsx). Native editable
 // controls cannot contain images, so they use this monochrome font instead of a
 // system COLRv1 font, whose WebKitGTK/Skia path can abort the render process (#76).
