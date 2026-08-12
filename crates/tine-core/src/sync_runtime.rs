@@ -28209,11 +28209,9 @@ mod tests {
         ));
     }
 
-    // Quarantined for v0.6.92, not repaired: a 20,000-block page exceeds the
-    // initial shadow peak build memory bound and drives the external feed
-    // terminal, after reporting Recovering for thousands of ticks. Open as
-    // GH #311. Un-ignore with the fix, not before.
-    #[ignore = "GH #311: a 20,000-block page drives the external feed terminal on a shadow-build memory bound"]
+    // GH #311: this used to exceed a source-derived shadow-build estimate and,
+    // with the 16-unit continuation budget, needed thousands of fixed-overhead
+    // actor turns before exposing that terminal reason.
     #[test]
     fn managed_sparse_task_query_one_match_in_twenty_thousand_blocks_is_candidate_bounded() {
         const MAX_ROWS: usize = 128;

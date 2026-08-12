@@ -3041,6 +3041,30 @@
       "notes": "The reporter's trace identified the content-specific blocker after source capture: one parseable Markdown file changed block structure under parse/reserialize, and managed import rejected the entire graph even though its error already described the file as byte-preserved and read-only. Tine already admitted the equivalent Org state. Managed import and inactive bootstrap now admit either format as an exact source, while the shared exact-page DTO parser independently recomputes structural editability and marks non-roundtripping Markdown or Org read-only. Existing application/save gates consume that format-neutral flag, so these bytes can be shown but never rewritten. Tests preserve the exact source through both import paths and prove the DTO read-only bit. The UI diagnostic sanitizer now redacts graph-relative source paths while retaining the actual causal reason instead of replacing the whole message with a generic unsafe-detail fallback. The hosted Windows large-graph scenario remains useful platform coverage, but the reporter's demonstrated content cause is now covered deterministically."
     },
     {
+      "id": "REG-MANAGED-LARGE-PAGE-ADMISSION-311",
+      "title": "A 20,000-block managed page is admitted without a false memory terminal or thousands of tiny resumptions",
+      "family": "managed-storage-external-import",
+      "sources": {
+        "issues": [
+          311
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "core-native",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::tests::managed_sparse_task_query_one_match_in_twenty_thousand_blocks_is_candidate_bounded",
+          "crates/tine-core/src/model.rs::tests::admission_memory_preflights_capture_maps_parser_event_and_overflow",
+          "crates/tine-core/src/model.rs::tests::staged_exact_feed_post_preflight_actual_charges_poison_before_overrun"
+        ]
+      },
+      "notes": "The original terminal combined two independent bookkeeping/scheduling defects. Exact-feed preflight accumulated parser estimates and every touched file's raw bytes as though all files were parsed and retained simultaneously; the estimate itself treated every source byte as a node in every parser, DTO, projection, and index allocation class. Preparation is actually serial and retains only the small semantic admission record. Initial construction had the same false parser estimate. Both paths now retain the hard 64 MiB source/batch and 1,000,000 parsed-node caps, check actual retained growth, and account only the currently live file buffer. Separately, the 16-unit coordinator resume budget made fixed reauthentication/reopen overhead dominate and required thousands of turns for one large page. The measured 256-unit bounded slice completes the full 20,000-block external-import and candidate-bounded query regression within its 64-turn contract while still yielding between slices. The regression also proves the sparse query reads the one matching block and its four ancestors rather than hydrating the page."
+    },
+    {
       "id": "REG-CASE-INSENSITIVE-TRACKED-PATHS-280",
       "title": "A fresh checkout has no tracked paths that collide on a case-insensitive filesystem",
       "family": "build-portability",

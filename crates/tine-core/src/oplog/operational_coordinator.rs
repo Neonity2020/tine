@@ -33,7 +33,30 @@ use super::{
 };
 
 const CRDT_PEER_PROBE_BUDGET: u64 = 8;
-const RESUME_OPERATION_BUDGET: usize = 16;
+const RESUME_OPERATION_BUDGET: usize = 256;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RESUME_OPERATION_BUDGET: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct TestResumeOperationBudgetGuard(Option<usize>);
+
+#[cfg(test)]
+impl Drop for TestResumeOperationBudgetGuard {
+    fn drop(&mut self) {
+        TEST_RESUME_OPERATION_BUDGET.set(self.0);
+    }
+}
+
+#[cfg(test)]
+fn test_resume_operation_budget(value: usize) -> TestResumeOperationBudgetGuard {
+    let prior = TEST_RESUME_OPERATION_BUDGET.replace(Some(value));
+    TestResumeOperationBudgetGuard(prior)
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,13 +115,18 @@ impl ResumeBudget {
         }
     }
 
-    /// The per-slice operation budget. A converging 300-file import takes 168
-    /// continuation slices at ~277 ms each (F41), i.e. ~1.8 files per slice, and
-    /// the per-slice cost is almost all fixed overhead — so this constant sets
-    /// the import's total cost. `TINE_RESUME_BUDGET` exists to measure that
-    /// trade-off (total time vs per-slice latency and peak memory) rather than
-    /// to be tuned in production; the default is unchanged.
+    /// The per-slice operation budget. The former value of 16 made fixed
+    /// reauthentication/reopen overhead dominate: a 300-file import needed 168
+    /// ~277 ms slices, and one legitimate 20,000-block page needed thousands.
+    /// 256 retains bounded yields while amortizing that fixed work; the large
+    /// page regression completes within 64 actor turns instead of remaining in
+    /// Recovering until an unrelated memory bound eventually fired (#311).
+    /// `TINE_RESUME_BUDGET` remains available for measured trade-off probes.
     fn budget() -> usize {
+        #[cfg(test)]
+        if let Some(value) = TEST_RESUME_OPERATION_BUDGET.get() {
+            return value;
+        }
         std::env::var("TINE_RESUME_BUDGET")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -5585,6 +5613,7 @@ mod tests {
 
     #[test]
     fn sqlite_budget_boundary_retains_handoff_and_resumes_without_republication() {
+        let _budget = test_resume_operation_budget(16);
         const PREEXISTING: usize = 20;
         let mut fixture = Fixture::new("bounded-sqlite-resume");
         for index in 0..PREEXISTING {

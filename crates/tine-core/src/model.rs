@@ -3275,7 +3275,6 @@ enum PreparedGraphTextAdmissionFinalState {
 #[derive(Default)]
 struct GraphTextExactFeedBatchActualCharges {
     raw_bytes: u64,
-    parser_bytes: u64,
     prepared_growth: u64,
 }
 
@@ -3306,14 +3305,15 @@ impl GraphTextExactFeedBatchActualCharges {
             .ok_or_else(|| initial_shadow_limit_error("peak build memory"))
     }
 
-    fn ensure_aggregate_work_peak(
+    fn ensure_work_peak(
         &self,
         index: &CompleteGraphTextAdmissionIndex,
         batch_scratch: u64,
+        working_bytes: u64,
     ) -> io::Result<()> {
         ensure_graph_text_peak_limit(
             self.live_preparation_bytes(index, batch_scratch)?,
-            checked_add_bytes(self.raw_bytes, self.parser_bytes)?,
+            working_bytes,
             index.peak_limit,
         )
     }
@@ -3330,23 +3330,10 @@ impl GraphTextExactFeedBatchActualCharges {
             ));
         }
         self.raw_bytes = checked_add_bytes(self.raw_bytes, raw_bytes)?;
-        self.ensure_aggregate_work_peak(index, batch_scratch)
-    }
-
-    fn reserve_parser(
-        &mut self,
-        index: &CompleteGraphTextAdmissionIndex,
-        batch_scratch: u64,
-        parser_bytes: u64,
-    ) -> io::Result<()> {
-        let next = checked_add_bytes(self.parser_bytes, parser_bytes)?;
-        let prior = self.parser_bytes;
-        self.parser_bytes = next;
-        if let Err(error) = self.ensure_aggregate_work_peak(index, batch_scratch) {
-            self.parser_bytes = prior;
-            return Err(error);
-        }
-        Ok(())
+        // `raw_bytes` is an aggregate admission cap, not live memory: each
+        // touched file is read, parsed, and dropped before the next. Only this
+        // file's buffer coexists with previously retained prepared records.
+        self.ensure_work_peak(index, batch_scratch, raw_bytes)
     }
 
     fn ensure_permanent_growth(
@@ -3372,7 +3359,7 @@ impl GraphTextExactFeedBatchActualCharges {
         let next = checked_add_bytes(self.prepared_growth, growth)?;
         let prior = self.prepared_growth;
         self.prepared_growth = next;
-        if let Err(error) = self.ensure_aggregate_work_peak(index, batch_scratch) {
+        if let Err(error) = self.ensure_work_peak(index, batch_scratch, 0) {
             self.prepared_growth = prior;
             return Err(error);
         }
@@ -10935,7 +10922,7 @@ impl Graph {
             PreparedGraphTextAdmissionFinalState,
         >(usize_to_u64(batch.touched_exact_relatives.len())?)?;
         let mut raw_bytes = 0_u64;
-        let mut parser_peak = 0_u64;
+        let mut largest_present_file = 0_u64;
         let mut worst_permanent_growth = 0_u64;
         for relative in &batch.touched_exact_relatives {
             scratch = checked_add_bytes(scratch, graph_text_event_scratch_upper_bound(relative)?)?;
@@ -10947,16 +10934,11 @@ impl Graph {
                 Ok(metadata) if metadata.is_file() => {
                     present_len = Some(metadata.len());
                     raw_bytes = checked_add_bytes(raw_bytes, metadata.len())?;
+                    largest_present_file = largest_present_file.max(metadata.len());
                     if raw_bytes > MAX_GRAPH_TEXT_EXACT_FEED_BATCH_RAW_BYTES {
                         return Err(initial_shadow_limit_error(
                             "exact feed batch aggregate raw bytes",
                         ));
-                    }
-                    if self.graph_text_scope.is_eligible(relative) {
-                        parser_peak = checked_add_bytes(
-                            parser_peak,
-                            managed_page_build_metrics_upper_bound(metadata.len(), metadata.len())?,
-                        )?;
                     }
                 }
                 Ok(_) => {
@@ -10981,11 +10963,9 @@ impl Graph {
             return Err(initial_shadow_limit_error("permanent index memory"));
         }
         let live = checked_add_bytes(index.permanent_bytes, scratch)?;
-        ensure_graph_text_peak_limit(
-            live,
-            checked_add_bytes(raw_bytes, parser_peak)?,
-            index.peak_limit,
-        )?;
+        // Preparation is serial. The batch-wide raw-byte value above is an
+        // admission/work cap; only one file buffer is live at a time.
+        ensure_graph_text_peak_limit(live, largest_present_file, index.peak_limit)?;
         Ok(scratch)
     }
 
@@ -11308,22 +11288,13 @@ impl Graph {
                         format!("graph text is not UTF-8: {path}"),
                     )
                 })?;
-                if let Some(charges) = actual_charges.as_deref_mut() {
-                    charges.reserve_parser(
-                        index,
-                        event_scratch,
-                        managed_page_build_upper_bound(content)?,
-                    )?;
+                let permit = graph_text_parse_budget_permit(self, &path, content)?;
+                let (semantic, format, node_count) =
+                    self.decode_present_graph_text_with_node_count(&path, &bytes, permit)?;
+                if node_count > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
+                    return Err(initial_shadow_limit_error("parser node count"));
                 }
-                let parser_live = checked_add_bytes(live_bytes, usize_to_u64(bytes.capacity())?)?;
-                let permit = graph_text_parse_budget_permit(
-                    self,
-                    &path,
-                    content,
-                    parser_live,
-                    index.peak_limit,
-                )?;
-                self.decode_present_graph_text(&path, &bytes, permit)?
+                (semantic, format)
             } else {
                 (
                     self.managed_entry_for_managed_path(&path)
@@ -28780,14 +28751,13 @@ fn build_graph_text_admission_index(
                     format!("graph text is not UTF-8: {}", entry.path),
                 )
             })?;
-            let permit = graph_text_parse_budget_permit(
-                graph,
-                &entry.path,
-                content,
-                checked_add_bytes(combined_capture_bytes, permanent_bytes)?,
-                limits.peak_build_bytes,
-            )?;
-            graph.decode_present_graph_text(&entry.path, bytes, permit)?
+            let permit = graph_text_parse_budget_permit(graph, &entry.path, content)?;
+            let (semantic, format, node_count) =
+                graph.decode_present_graph_text_with_node_count(&entry.path, bytes, permit)?;
+            if node_count > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
+                return Err(initial_shadow_limit_error("parser node count"));
+            }
+            (semantic, format)
         } else {
             (
                 cached_semantics
@@ -29119,44 +29089,18 @@ fn graph_text_file_record_worst_case_upper_bound(
     )
 }
 
-fn graph_text_present_parse_peak_upper_bound(
-    graph: &Graph,
-    path: &ManagedPath,
-    content: &str,
-    semantic_budget: GraphTextSemanticNameBudget,
-) -> io::Result<u64> {
-    let path_len = usize_to_u64(path.as_str().len())?;
-    let mut bytes = managed_page_build_upper_bound(content)?;
-    bytes = checked_add_bytes(
-        bytes,
-        graph_text_file_record_worst_case_upper_bound(
-            graph,
-            path_len,
-            semantic_budget.semantic_name_bytes,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        owned_string_len_upper_bound(semantic_budget.title_format.input_bytes)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        owned_string_len_upper_bound(semantic_budget.title_format.rendered_bytes)?,
-    )?;
-    checked_add_bytes(bytes, 1024)
-}
-
 fn graph_text_parse_budget_permit(
     graph: &Graph,
     path: &ManagedPath,
     content: &str,
-    live_bytes: u64,
-    peak_limit: u64,
 ) -> io::Result<GraphTextParseBudgetPermit> {
     let semantic_budget = graph_text_observed_semantic_name_upper_bound(graph, path, content)?;
-    let parse_peak =
-        graph_text_present_parse_peak_upper_bound(graph, path, content, semantic_budget)?;
-    ensure_graph_text_peak_limit(live_bytes, parse_peak, peak_limit)?;
+    // Parser work is one-file-at-a-time and its tree is dropped before the next
+    // file. Source-derived `bytes == nodes in every allocation class` estimates
+    // used to count parser, DTO, projection, and index representations as if all
+    // were retained together. That rejected ordinary large pages (#311). The
+    // real envelope is the 64 MiB exact-feed/source cap plus the post-parse
+    // 1,000,000-node cap; only the semantic record below survives this call.
     Ok(GraphTextParseBudgetPermit {
         semantic_name_bytes: semantic_budget.semantic_name_bytes,
         semantic_name_allocation_bytes: owned_string_len_upper_bound(
@@ -42529,7 +42473,7 @@ mod tests {
 
         let bytes = b"title:: 26-07-2026\n\n- parser-owned title\n";
         let content = std::str::from_utf8(bytes).unwrap();
-        let permit = graph_text_parse_budget_permit(&graph, &path, content, 0, u64::MAX).unwrap();
+        let permit = graph_text_parse_budget_permit(&graph, &path, content).unwrap();
         let (present, format) = graph
             .decode_present_graph_text(&path, bytes, permit)
             .unwrap();
@@ -43964,19 +43908,10 @@ mod tests {
         let permit = graph.admit_retained_managed_text_writer().unwrap();
         let capture = collect_initial_shadow_managed_inventory(&graph, &permit, true).unwrap();
         let permanent = graph_text_initial_permanent_upper_bound(&graph, &capture, true).unwrap();
-        let path = ManagedPath::parse("Page.md").unwrap();
-        let semantic_budget =
-            graph_text_observed_semantic_name_upper_bound(&graph, &path, &parser_content).unwrap();
-        let parse_peak = graph_text_present_parse_peak_upper_bound(
-            &graph,
-            &path,
-            &parser_content,
-            semantic_budget,
-        )
-        .unwrap();
+        let obsolete_parse_peak = managed_page_build_upper_bound(&parser_content).unwrap();
         let parser_limit = checked_add_bytes(
             checked_add_bytes(capture.peak_build_charge, permanent).unwrap(),
-            parse_peak - 1,
+            obsolete_parse_peak - 1,
         )
         .unwrap();
         reset_graph_text_admission_test_counters();
@@ -43985,9 +43920,9 @@ mod tests {
                 peak_build_bytes: parser_limit,
                 ..INITIAL_SHADOW_LIMITS
             })
-            .is_err());
+            .is_ok());
         let counters = graph_text_admission_test_counters();
-        assert_eq!(counters.parser_invocations, 0);
+        assert_eq!(counters.parser_invocations, 1);
         assert!(counters.index_map_insertions > 0);
 
         let event_root = scratch("admission-exact-large-title-bound");
@@ -45183,8 +45118,8 @@ mod tests {
             .is_err());
         assert_eq!(
             graph_text_admission_test_counters().parser_invocations,
-            0,
-            "post-preflight parser growth must fail before parser allocation"
+            1,
+            "fixed source/node parser caps admit the parse; the real retained-growth limit still fails closed"
         );
         assert_poisoned_with(&parser, "peak build memory");
 
