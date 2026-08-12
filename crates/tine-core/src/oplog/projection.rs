@@ -453,6 +453,14 @@ impl PreparedEditorProjection {
         &self.rendered.target
     }
 
+    /// Borrow the editor-requested semantic post-page while draft proves that
+    /// the authored transaction produced exactly this state.  This remains a
+    /// candidate: the hot engine must compare the complete semantic delta and
+    /// prospective frontier before it may avoid rematerializing the CRDT page.
+    pub(crate) const fn requested_page_candidate(&self) -> &MaterializedPage {
+        &self.requested_page
+    }
+
     pub(crate) fn accepted_target(&self) -> &[u8] {
         &self
             .before_candidate

@@ -217,6 +217,10 @@ pub(crate) struct LocalMutationDetailTimings {
     pub(crate) before_projection_affine_fallbacks: usize,
     pub(crate) before_projection_affine_snapshot_blocks: usize,
     pub(crate) post_projection_pages: usize,
+    pub(crate) post_projection_affine_attempts: usize,
+    pub(crate) post_projection_affine_reuses: usize,
+    pub(crate) post_projection_affine_fallbacks: usize,
+    pub(crate) post_projection_affine_candidate_blocks: usize,
     pub(crate) projection_requirements: usize,
     pub(crate) draft_calls: usize,
     pub(crate) finalize_captured_inputs: usize,
@@ -269,6 +273,10 @@ thread_local! {
             before_projection_affine_fallbacks: 0,
             before_projection_affine_snapshot_blocks: 0,
             post_projection_pages: 0,
+            post_projection_affine_attempts: 0,
+            post_projection_affine_reuses: 0,
+            post_projection_affine_fallbacks: 0,
+            post_projection_affine_candidate_blocks: 0,
             projection_requirements: 0,
             draft_calls: 0,
             finalize_captured_inputs: 0,
@@ -16440,13 +16448,59 @@ impl ShardedHotEngine {
             });
             #[cfg(test)]
             let post_projection_started = Instant::now();
-            let after = self.prospective_projection_page(
-                page_id,
-                author.batch_id,
-                &parts.prospective_documents,
-                &parts.semantic_effect,
-                before.as_ref(),
-            )?;
+            let affine_after = if origin == BatchOrigin::LocalMutation {
+                prepared_editor_projection.as_ref().map(|prepared| {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.post_projection_affine_attempts =
+                            detail.post_projection_affine_attempts.saturating_add(1);
+                    });
+                    self.prospective_projection_page_from_editor_candidate(
+                        page_id,
+                        author.batch_id,
+                        &parts.prospective_documents,
+                        &parts.semantic_effect,
+                        before.as_ref(),
+                        prepared.requested_page_candidate(),
+                    )
+                })
+            } else {
+                None
+            };
+            let after = match affine_after.transpose()? {
+                Some(Some(after)) => {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.post_projection_affine_reuses =
+                            detail.post_projection_affine_reuses.saturating_add(1);
+                        detail.post_projection_affine_candidate_blocks = detail
+                            .post_projection_affine_candidate_blocks
+                            .saturating_add(after.page.blocks.len());
+                    });
+                    Some(after)
+                }
+                Some(None) => {
+                    #[cfg(test)]
+                    note_local_mutation_detail(|detail| {
+                        detail.post_projection_affine_fallbacks =
+                            detail.post_projection_affine_fallbacks.saturating_add(1);
+                    });
+                    self.prospective_projection_page(
+                        page_id,
+                        author.batch_id,
+                        &parts.prospective_documents,
+                        &parts.semantic_effect,
+                        before.as_ref(),
+                    )?
+                }
+                None => self.prospective_projection_page(
+                    page_id,
+                    author.batch_id,
+                    &parts.prospective_documents,
+                    &parts.semantic_effect,
+                    before.as_ref(),
+                )?,
+            };
             let post_frontier = match &after {
                 Some(after) => after.frontier.clone(),
                 None => self.prospective_absent_frontier(
@@ -18771,6 +18825,133 @@ impl ShardedHotEngine {
         } else {
             self.current_hot_document_dependencies(document_id, document)
         }
+    }
+
+    /// Admit the editor's already-built post-page only when the authored
+    /// transaction proves a pure, claim-free content transition to exactly
+    /// that page.  The candidate supplies no authority: page identity and
+    /// structure come from the authenticated pre-state, changed contents come
+    /// from `SemanticEffect`, and the post frontier is derived from the
+    /// prospective CRDT document.  Any richer transition uses the complete
+    /// materializer below.
+    fn prospective_projection_page_from_editor_candidate(
+        &self,
+        page_id: PageId,
+        batch_id: BatchId,
+        prospective: &BTreeMap<DocumentId, LoroDoc>,
+        effect: &SemanticEffect,
+        prior: Option<&ProjectionPageState>,
+        candidate: &MaterializedPage,
+    ) -> Result<Option<ProjectionPageState>, EngineError> {
+        let Some(prior) = prior else {
+            return Ok(None);
+        };
+        if candidate.page_id != page_id
+            || candidate.page_id != prior.page.page_id
+            || candidate.home_document_id != prior.page.home_document_id
+            || candidate.name != prior.page.name
+            || candidate.path != prior.page.path
+            || candidate.kind != prior.page.kind
+            || candidate.preamble != prior.page.preamble
+            || !candidate.path.as_str().ends_with(".md")
+            || candidate.blocks.len() != prior.page.blocks.len()
+            || effect.blocks().is_empty()
+            || !effect.pages().is_empty()
+            || !effect.page_preambles().is_empty()
+            || !effect.memberships().is_empty()
+            || !prior.claim_evidence.is_empty()
+            || !page_logseq_references(
+                &candidate.path,
+                candidate.preamble.as_deref(),
+                &candidate.blocks,
+            )
+            .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let deltas = effect
+            .blocks()
+            .iter()
+            .map(|delta| (delta.block_id, delta))
+            .collect::<BTreeMap<_, _>>();
+        if deltas.len() != effect.blocks().len() {
+            return Ok(None);
+        }
+        let mut changed = 0_usize;
+        for (before, after) in prior.page.blocks.iter().zip(&candidate.blocks) {
+            if before.block_id != after.block_id
+                || before.home_document_id != candidate.home_document_id
+                || after.home_document_id != candidate.home_document_id
+                || before.parent != after.parent
+                || before.order != after.order
+                || before.logseq_uuid != after.logseq_uuid
+                || before.logseq_identity_origin != after.logseq_identity_origin
+                || before.logseq_uuid.is_some()
+                || before.logseq_identity_origin.is_some()
+            {
+                return Ok(None);
+            }
+            let delta = deltas.get(&before.block_id);
+            if before.content == after.content {
+                if delta.is_some() {
+                    return Ok(None);
+                }
+                continue;
+            }
+            let Some(delta) = delta else {
+                return Ok(None);
+            };
+            let (Some(delta_before), Some(delta_after)) = (&delta.before, &delta.after) else {
+                return Ok(None);
+            };
+            if delta.home_document_id != candidate.home_document_id
+                || delta_before.block_id != before.block_id
+                || delta_before.home_document_id != before.home_document_id
+                || delta_before.owner != BlockOwner::Page(page_id)
+                || delta_before.logseq_uuid != before.logseq_uuid
+                || delta_before.logseq_identity_origin != before.logseq_identity_origin
+                || delta_before.content != before.content
+                || delta_after.block_id != after.block_id
+                || delta_after.home_document_id != after.home_document_id
+                || delta_after.owner != BlockOwner::Page(page_id)
+                || delta_after.logseq_uuid != after.logseq_uuid
+                || delta_after.logseq_identity_origin != after.logseq_identity_origin
+                || delta_after.content != after.content
+            {
+                return Ok(None);
+            }
+            changed = changed.saturating_add(1);
+        }
+        if changed != deltas.len()
+            || !affine_before_projection_frontier_documents_are_exact(
+                &prior.frontier,
+                candidate.home_document_id,
+                self.catalog_document_id,
+            )
+        {
+            return Ok(None);
+        }
+
+        let home = self.prospective_document_ref(candidate.home_document_id, prospective)?;
+        let home_dependencies = self.prospective_document_dependencies(
+            candidate.home_document_id,
+            home.document(),
+            batch_id,
+            prospective,
+        )?;
+        let catalog_dependencies = prior
+            .frontier
+            .documents()
+            .iter()
+            .find(|dependencies| dependencies.document_id() == self.catalog_document_id)
+            .cloned()
+            .ok_or(EngineError::MissingDocument(self.catalog_document_id))?;
+        Ok(Some(ProjectionPageState {
+            page: candidate.clone(),
+            frontier: FrontierV2::new(vec![home_dependencies, catalog_dependencies])?,
+            claim_evidence: Vec::new(),
+        }))
     }
 
     fn prospective_projection_page(

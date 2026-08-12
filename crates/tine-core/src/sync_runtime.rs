@@ -30815,6 +30815,13 @@ mod tests {
         assert_eq!(before_detail.before_projection_affine_attempts, 1);
         assert_eq!(before_detail.before_projection_affine_reuses, 0);
         assert_eq!(before_detail.before_projection_affine_fallbacks, 1);
+        assert_eq!(before_detail.post_projection_affine_attempts, 1);
+        assert_eq!(before_detail.post_projection_affine_reuses, 1);
+        assert_eq!(before_detail.post_projection_affine_fallbacks, 0);
+        assert_eq!(
+            before_detail.post_projection_affine_candidate_blocks,
+            MAX_SYNC_EDITOR_BLOCKS
+        );
 
         let (saved, saved_revision) = match saved {
             SyncApplicationPageSaveOutcome::Saved { page, revision, .. } => (page, revision),
@@ -30854,6 +30861,13 @@ mod tests {
         assert_eq!(
             before_detail.before_projection_affine_snapshot_blocks, MAX_SYNC_EDITOR_BLOCKS,
             "the affine proof must compare every pre-page block exactly once"
+        );
+        assert_eq!(before_detail.post_projection_affine_attempts, 1);
+        assert_eq!(before_detail.post_projection_affine_reuses, 1);
+        assert_eq!(before_detail.post_projection_affine_fallbacks, 0);
+        assert_eq!(
+            before_detail.post_projection_affine_candidate_blocks, MAX_SYNC_EDITOR_BLOCKS,
+            "the post-state proof must compare the editor candidate exactly once"
         );
         let counters = instrumentation.prepared_editor_projection;
         assert_eq!(counters.created, 1);
@@ -47755,6 +47769,10 @@ mod tests {
         assert_eq!(detail.before_projection_affine_attempts, 1);
         assert_eq!(detail.before_projection_affine_reuses, 1);
         assert_eq!(detail.before_projection_affine_fallbacks, 0);
+        assert_eq!(detail.post_projection_affine_attempts, 1);
+        assert_eq!(detail.post_projection_affine_reuses, 1);
+        assert_eq!(detail.post_projection_affine_fallbacks, 0);
+        assert_eq!(detail.post_projection_affine_candidate_blocks, page_blocks);
         assert_eq!(prepared.capture_sealed_pending_local_predecessor_success, 1);
         assert_eq!(prepared.finalizer_sealed_pending_local_predecessor_use, 1);
         assert_eq!(prepared.finalizer_predecessor_replay_render, 0);
@@ -47861,6 +47879,10 @@ mod tests {
             count_summary!(constructed_object_bytes),
             count_summary!(captured_documents),
             count_summary!(before_projection_pages),
+            count_summary!(post_projection_affine_attempts),
+            count_summary!(post_projection_affine_reuses),
+            count_summary!(post_projection_affine_fallbacks),
+            count_summary!(post_projection_affine_candidate_blocks),
             count_summary!(post_projection_pages),
             count_summary!(projection_requirements),
             count_summary!(draft_calls),
