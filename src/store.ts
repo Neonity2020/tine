@@ -3766,20 +3766,34 @@ function liveDocReferences(id: string): boolean {
   return Object.values(doc.byId).some((node) => reference.test(node.raw));
 }
 
-interface ClipboardPasteAuthority {
+/** What a bulk insertion route decided against, so a continuation resuming after
+ * an await can prove it is still talking about the same block, the same page
+ * instance, the same graph AND the same storage route.
+ *
+ * The storage route is part of it because a route is selected synchronously and
+ * acted on later: a drop or paste that chose Direct Files can still be reading
+ * a file while the user finishes turning managed storage on, and would then
+ * insert without the admission the managed route requires (GH #325). Graph
+ * activation flips this authority inside its own transitioning window, so
+ * `graphTransitioning` alone stops only continuations that resume DURING the
+ * switch, not the ones that resume just after it. */
+export interface BulkRouteFence {
   epoch: number;
   root: string;
   targetId: string;
   targetNode: Node;
   targetPage: string;
   targetGeneration: number;
+  routeAuthority: string | null;
+  routeBindingGeneration: number | null;
 }
 
-function captureClipboardPasteAuthority(targetId: string): ClipboardPasteAuthority | null {
+export function captureBulkRouteFence(targetId: string): BulkRouteFence | null {
   const target = doc.byId[targetId];
   if (!target || graphTransitioning()) return null;
   const targetGeneration = pageInstanceGeneration(target.page);
   if (targetGeneration === null) return null;
+  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
   return {
     epoch: graphEpoch(),
     root: graphMeta()?.root ?? "",
@@ -3787,18 +3801,23 @@ function captureClipboardPasteAuthority(targetId: string): ClipboardPasteAuthori
     targetNode: unwrap(target),
     targetPage: target.page,
     targetGeneration,
+    routeAuthority: route?.authority ?? null,
+    routeBindingGeneration: route?.binding_generation ?? null,
   };
 }
 
-function clipboardPasteAuthorityCurrent(authority: ClipboardPasteAuthority): boolean {
-  const target = doc.byId[authority.targetId];
+export function bulkRouteFenceCurrent(fence: BulkRouteFence): boolean {
+  const target = doc.byId[fence.targetId];
+  const route = managedStorageRuntime.snapshot().applicationPageAdmission;
   return !graphTransitioning()
-    && graphEpoch() === authority.epoch
-    && (graphMeta()?.root ?? "") === authority.root
+    && graphEpoch() === fence.epoch
+    && (graphMeta()?.root ?? "") === fence.root
     && !!target
-    && unwrap(target) === authority.targetNode
-    && target.page === authority.targetPage
-    && pageInstanceGeneration(authority.targetPage) === authority.targetGeneration;
+    && unwrap(target) === fence.targetNode
+    && target.page === fence.targetPage
+    && pageInstanceGeneration(fence.targetPage) === fence.targetGeneration
+    && (route?.authority ?? null) === fence.routeAuthority
+    && (route?.binding_generation ?? null) === fence.routeBindingGeneration;
 }
 
 function clipboardTargetReusesEmptyHost(target: Node, targetFormat: Format): boolean {
@@ -3882,7 +3901,7 @@ export function pasteClipboardPayload(
   targetId: string,
   slot: ClipboardPayloadSlot,
 ): Promise<string | null> {
-  const authority = captureClipboardPasteAuthority(targetId);
+  const authority = captureBulkRouteFence(targetId);
   if (!authority) return Promise.resolve(null);
 
   // Plan as if the host will NOT be reused. Whether an empty host is replaced is
@@ -3930,7 +3949,7 @@ export function pasteClipboardPayload(
         recordClipboardPhaseForTest("source-retirement");
       }
       preserveIds = await flushCutSourcePages(grant!.sourcePages);
-      if (preserveIds && !clipboardPasteAuthorityCurrent(authority)) return null;
+      if (preserveIds && !bulkRouteFenceCurrent(authority)) return null;
     }
     if (preserveIds) {
       try {
@@ -3947,7 +3966,7 @@ export function pasteClipboardPayload(
 
     // Final JS-single-thread section: every authority and retirement check is
     // synchronous and insertion follows immediately with no await boundary.
-    if (!clipboardPasteAuthorityCurrent(authority)) return null;
+    if (!bulkRouteFenceCurrent(authority)) return null;
     if (preserveIds) {
       if (import.meta.env.MODE === "test") {
         recordClipboardWorkForTest("final_identity_guard_phases");

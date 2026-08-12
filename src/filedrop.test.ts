@@ -137,6 +137,33 @@ describe("managed file-drop admission", () => {
     expect(pageByName("Drop")!.roots).toHaveLength(3);
   });
 
+  it("refuses a Direct drop that resumes after the graph became managed", async () => {
+    loadSingle({
+      name: "Drop",
+      kind: "page",
+      title: "Drop",
+      pre_block: null,
+      blocks: [{ id: TARGET, raw: "target", collapsed: false, children: [] }],
+    });
+    managedStorageRuntime.bind(1, { binding_generation: 1, authority: "direct" });
+    // The user finishes enabling managed storage while the dropped file is still
+    // being read. The Direct continuation must not resume past that (GH #325).
+    vi.spyOn(backend(), "readTextFile").mockImplementation(async () => {
+      managedWritable();
+      return "one\ntwo";
+    });
+    const importAsset = vi.spyOn(backend(), "importAsset");
+
+    await insertDroppedFiles(TARGET, ["/tmp/small.csv", "/tmp/image.png"]);
+
+    expect(importAsset).not.toHaveBeenCalled();
+    expect(pageByName("Drop")!.roots).toEqual([TARGET]);
+    expect(doc.byId[TARGET].raw).toBe("target");
+    expect(toasts().map(({ message }) => message)).toEqual([
+      "Couldn't insert the dropped files: this graph changed while they were being read.",
+    ]);
+  });
+
   it("admits a small mixed drop after managed planning", async () => {
     loadSingle({
       name: "Drop",

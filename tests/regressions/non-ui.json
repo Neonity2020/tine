@@ -3757,6 +3757,31 @@
         "failBefore": "proven"
       },
       "notes": "The point of admitting a bulk insertion in the frontend is to refuse it BEFORE the page is mutated, so the model must never admit something validate_editor_save_request will reject. It did, two ways. It compared only the INSERTED raw text against the advertised limit, ignoring the page the request also carries, so a small insertion into a nearly full page was admitted and then unsaveable. And it compared with strict greater-than, so an insertion of exactly the advertised byte count was admitted even though the native charge additionally includes the page name/id, the base revision, the preamble and every block's key and parent key, and is therefore necessarily over. The check now sums a bounded census of the existing page (content plus block and parent key bytes, deliberately omitting the page-level terms so the estimate stays a lower bound rather than a guess) with the inserted text, and refuses at the boundary. Fail-before proven by restoring the old comparison: both refusals became admissions."
+    },
+    {
+      "id": "REG-BULK-ROUTE-FENCE-ACROSS-AWAIT-325",
+      "title": "A bulk insertion that selected a storage route synchronously cannot resume onto a different one after its I/O",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [
+          325
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "frontend-store",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "src/filedrop.test.ts",
+          "src/clipboard.paste.test.ts"
+        ],
+        "scenario": "managed.bulk-route-fence-across-await",
+        "failBefore": "proven"
+      },
+      "notes": "A file drop reads the storage route once, synchronously, then does its I/O. On the Direct branch that I/O could still be running when the user finished enabling managed storage, and the continuation then inserted an unbounded outline through insertOutlineAfter with no admission at all -- exactly the mutate-first failure the admission work exists to prevent. Graph activation flips this authority inside its own graphTransitioning window, so the existing transitioning check only stopped continuations resuming DURING the switch, not the far more likely ones resuming just after it (a native confirm dialog sits inside that window). The route is now part of the shared continuation fence used by both the drop and the clipboard paste: authority and binding generation are captured with the graph epoch, root, target node, page and page-instance generation, and re-proved before any mutation. The Direct drop also stops reading further files the moment the fence breaks, which additionally removes a TypeError path when the target block was deleted mid-drop. Fail-before proven by removing the fence: the drop imported the asset and inserted."
     }
   ]
 }
