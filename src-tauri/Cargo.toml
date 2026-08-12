@@ -69,6 +69,16 @@ clipboard-rs = { version = "0.3.5", default-features = false }
 # In-app self-update (Win/Linux; macOS stays manual — unsigned). The updater
 # verifies each artifact against `plugins.updater.pubkey` (minisign); process lets
 # the frontend relaunch after `downloadAndInstall()`. See docs/adr + release.yml.
+
+# Windows uses Schannel through native-tls. The default rustls transport does not
+# inherit every Windows network/certificate policy and failed before fetching
+# latest.json on a reporter's otherwise-online Windows 11 system (GH #241).
+[target.'cfg(target_os = "windows")'.dependencies]
+tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
+
+# Keep the established rustls transport on Linux/macOS, where it is proven in
+# shipped packages. Mobile does not compile or expose the updater.
+[target.'cfg(all(not(target_os = "android"), not(target_os = "ios"), not(target_os = "windows")))'.dependencies]
 tauri-plugin-updater = "2"
 
 # Linux/WebKitGTK only: enable the webview's native spell checker (enchant +

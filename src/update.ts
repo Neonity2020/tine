@@ -97,6 +97,20 @@ async function applyUpdateOrOpen(): Promise<void> {
   }
 }
 
+function offerUpdate(version: string, current: string): void {
+  pushToast(
+    `Tine ${version} is available — you're on ${current}.`,
+    "info",
+    {
+      sticky: true,
+      action: {
+        label: "Install update",
+        run: () => void applyUpdateOrOpen(),
+      },
+    },
+  );
+}
+
 /** Check GitHub for a newer published release; toast if there is one. Resolves
  *  silently (never throws) in every failure case. */
 export async function checkForUpdate(): Promise<void> {
@@ -116,17 +130,7 @@ export async function checkForUpdate(): Promise<void> {
     const latest = typeof tag === "string" ? parseVer(tag) : null;
     if (!latest || !isNewer(latest, cur)) return;
 
-    pushToast(
-      `Tine ${latest.join(".")} is available — you're on ${cur.join(".")}.`,
-      "info",
-      {
-        sticky: true,
-        action: {
-          label: "Download",
-          run: () => void applyUpdateOrOpen(),
-        },
-      }
-    );
+    offerUpdate(latest.join("."), cur.join("."));
   } catch {
     // offline / rate-limited / network blocked — never bother the user.
   }
@@ -139,8 +143,8 @@ export type UpdateStatus =
 
 /** The About tab's explicit "Check for updates" button. Unlike `checkForUpdate`
  *  (silent on the common no-update path), this reports every outcome so the
- *  button can show feedback. If a newer release exists, kicks off the same
- *  download-or-open flow as the startup toast. Never throws. */
+ *  button can show feedback. Checking never installs by itself: an available
+ *  release gets an explicit Install update action in a sticky toast. */
 export async function checkForUpdateNow(): Promise<UpdateStatus> {
   if ((await updateMode()) === "unavailable") return { kind: "unavailable" };
   try {
@@ -157,8 +161,10 @@ export async function checkForUpdateNow(): Promise<UpdateStatus> {
     if (!latest) return { kind: "unavailable" };
 
     if (isNewer(latest, cur)) {
-      void applyUpdateOrOpen();
-      return { kind: "available", version: latest.join("."), current: cur.join(".") };
+      const version = latest.join(".");
+      const current = cur.join(".");
+      offerUpdate(version, current);
+      return { kind: "available", version, current };
     }
     return { kind: "current", version: cur.join(".") };
   } catch {

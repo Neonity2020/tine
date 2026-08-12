@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
 
 type Platform = "desktop" | "android" | "ios";
 
@@ -104,7 +105,7 @@ describe("update checks", () => {
       "info",
       expect.objectContaining({
         sticky: true,
-        action: expect.objectContaining({ label: "Download" }),
+        action: expect.objectContaining({ label: "Install update" }),
       })
     );
   });
@@ -116,16 +117,34 @@ describe("update checks", () => {
     await expect(update.checkForUpdateNow()).resolves.toEqual({ kind: "current", version: "0.5.3" });
   });
 
-  it("surfaces a self-update failure instead of failing silently (GH #241)", async () => {
+  it("checks without installing, then surfaces an explicit install failure (GH #241)", async () => {
     mockLatest("v0.6.0");
     const consoleErr = vi.spyOn(console, "error").mockImplementation(() => {});
-    const { update, pushToastMock, openExternalMock } = await loadUpdate({
+    const { update, pushToastMock, openExternalMock, updaterCheckMock } = await loadUpdate({
       platform: "desktop",
       version: "0.5.3",
       updaterReject: new Error("minisign signature verification failed"),
     });
 
-    await update.checkForUpdateNow();
+    await expect(update.checkForUpdateNow()).resolves.toEqual({
+      kind: "available",
+      version: "0.6.0",
+      current: "0.5.3",
+    });
+    expect(updaterCheckMock).not.toHaveBeenCalled();
+    const toastCalls = pushToastMock.mock.calls as unknown as Array<[
+      string,
+      string,
+      { sticky?: boolean; action?: { label: string; run: () => void } }?,
+    ]>;
+    const availableToast = toastCalls.find(([message]) =>
+      typeof message === "string" && message.includes("0.6.0 is available")
+    );
+    expect(availableToast?.[2]).toMatchObject({
+      sticky: true,
+      action: { label: "Install update" },
+    });
+    availableToast?.[2]?.action?.run();
     await new Promise((r) => setTimeout(r, 10)); // let the detached applyUpdateOrOpen settle
 
     expect(consoleErr).toHaveBeenCalledWith("[update] self-update failed:", expect.any(Error));
@@ -145,5 +164,11 @@ describe("update checks", () => {
 
     expect(platformKindMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("builds the Windows updater on the OS-native TLS transport (GH #241)", () => {
+    const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+    expect(cargo).toMatch(/cfg\(target_os = "windows"\)[\s\S]*?tauri-plugin-updater\s*=\s*\{[^}]*default-features\s*=\s*false[^}]*"native-tls"/);
+    expect(cargo).toMatch(/not\(target_os = "windows"\)[\s\S]*?tauri-plugin-updater\s*=\s*"2"/);
   });
 });

@@ -6243,7 +6243,7 @@
     },
     {
       "id": "UI-UPDATER-FAILURE-SURFACE-241",
-      "title": "A failed desktop self-update logs the real error and tells the user while still opening the releases page as the safe fallback",
+      "title": "Windows update checks use the native network trust path and require a separate install confirmation",
       "family": "updater",
       "sources": {
         "issues": [
@@ -6264,7 +6264,7 @@
         "scenario": null,
         "failBefore": "proven"
       },
-      "notes": "GH #241. The catch around check()/downloadAndInstall()/relaunch() swallowed every error and silently opened the releases page, making all updater failures (notably on Windows) indistinguishable from the manual path. It now logs '[update] self-update failed: <err>' to the console (captured in the debug log) and shows an error toast. The underlying Windows update failure itself is NOT diagnosed: manifest entries exist, so reproduce on a Windows install and read the (now-visible) error; reporter follow-up should ask for exactly that."
+      "notes": "GH #241. The earlier catch fix exposed the reporter's concrete failure: Tauri's default rustls updater transport could not send the latest.json request on their otherwise-online Windows 11 installation, before manifest parsing, signature verification, download, or installation. Windows updater builds now use reqwest native-tls/Schannel so the request follows the OS-native certificate and network trust path; Linux/macOS retain the shipped rustls path. Cargo feature-tree evidence proves Windows selects native-tls and Linux selects rustls-tls; physical reporter confirmation remains necessary. The explicit Check for updates action no longer installs by itself: it reports availability and presents a separate sticky Install update action. Installer failures remain logged and visible, with the releases page as fallback."
     },
     {
       "id": "UI-EDITOR-MATH-BLOCK-ENTER-278",
