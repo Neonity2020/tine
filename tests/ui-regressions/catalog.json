@@ -6684,12 +6684,13 @@
       "coverage": {
         "tests": [
           "scripts/e2e-block-embed.mjs",
+          "src/components/LiveRefGroup.activation.test.tsx",
           "tests/ui-regressions/e2e-contracts.json"
         ],
         "scenario": "e2e.block-embed-semantic-content-readiness",
         "failBefore": "proven"
       },
-      "notes": "The v0.6.92 journey clicked as soon as embed macro roots existed, while cross-page descendants populated asynchronously; adding an unrelated await moved the failure between disclosure and arrow/delete. The stable release journey now requires exactly one embedded root, its content and child disclosure control, the required child identity/text, and—where deletion/navigation needs it—the child's own descendants. Only then does it exercise real disclosure, Arrow navigation, deletion and Enter persistence. No timing or presentation detail is asserted, and the previously quarantined stateful-UX contract is restored to blocking stable coverage."
+      "notes": "The v0.6.92 journey clicked as soon as embed macro roots existed, while cross-page descendants populated asynchronously; adding an unrelated await moved the failure between disclosure and arrow/delete. The semantic readiness repair then exposed a deterministic product defect: multiple visible refs/embeds to the same initially unloaded page raced activation; one loaded the exact page, while siblings treated their expected stale-install refusal as permanent failure and stayed shallow. LiveRefGroup now rechecks the exact loaded kind/path after every installation attempt, so a sibling winner hydrates all groups while a different page/path remains refused. A render regression forces two concurrent activation promises and proves both descendants render with one retained activation. The release journey waits for exactly the identities/content/disclosure controls it will operate on, asserts no timing or pixels, and is restored to stable blocking coverage."
     }
   ]
 }

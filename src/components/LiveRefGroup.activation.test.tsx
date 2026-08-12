@@ -45,6 +45,17 @@ function mount() {
   return { root, dispose };
 }
 
+function hierarchyDto(): PageDto {
+  const page = dto();
+  page.blocks = [{
+    id: "source-block",
+    raw: "source block",
+    collapsed: false,
+    children: [{ id: "source-child", raw: "source child", collapsed: false, children: [] }],
+  }];
+  return page;
+}
+
 afterEach(() => {
   resetStore();
   document.body.innerHTML = "";
@@ -106,6 +117,36 @@ describe("LiveRefGroup editor activation", () => {
     expect(pageByName("Source")?.path).toBe("pages/other/Source.md");
     expect(doc.byId[pageByName("Source")!.roots[0]]?.raw).toBe("concurrent occupant");
     expect(editorActivationFor("Source")).toBe(93);
+    dispose();
+  });
+
+  it("hydrates every sibling group when concurrent activation of their exact source has one winner", async () => {
+    const page = hierarchyDto();
+    vi.spyOn(backend(), "getPageByPath").mockResolvedValue(page);
+    const first = deferred<EditorActivationHandle>();
+    const second = deferred<EditorActivationHandle>();
+    vi.spyOn(backend(), "activateEditor")
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const retire = vi.spyOn(backend(), "retireEditorActivation").mockResolvedValue(true);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const shallow = [{ ...page.blocks[0], children: [] }];
+    const dispose = render(() => (
+      <>
+        <LiveRefGroup page={page.name} kind={page.kind} path={page.path} blocks={shallow} surface="embed" />
+        <LiveRefGroup page={page.name} kind={page.kind} path={page.path} blocks={shallow} surface="embed" />
+      </>
+    ), root);
+
+    await vi.waitFor(() => expect(backend().activateEditor).toHaveBeenCalledTimes(2));
+    first.resolve({ activation: 94, target: page.path!, prospective: false });
+    await vi.waitFor(() => expect(doc.byId["source-child"]?.raw).toBe("source child"));
+    second.resolve({ activation: 95, target: page.path!, prospective: false });
+
+    await vi.waitFor(() => expect(root.textContent?.match(/source child/g)).toHaveLength(2));
+    expect(retire).toHaveBeenCalledWith(page.path, 95);
+    expect(editorActivationFor(page.name)).toBe(94);
     dispose();
   });
 });

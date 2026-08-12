@@ -80,13 +80,18 @@ export function LiveRefGroup(props: {
       const after = pageByName(p);
       if (after) return after.kind === k && (!path || after.path === path);
       if (!dto || dto.name !== p || dto.kind !== k || (path && dto.path !== path)) return false;
-      const refusal = await ensurePageLoaded(dto, {
+      await ensurePageLoaded(dto, {
         expectedGraphBinding: binding,
         isRequestLive: () => active
           && graphEpoch() === epoch
           && (graphMeta()?.root ?? "") === root,
       });
-      if (refusal) return false;
+      // Several visible refs/embeds from the same unloaded source can race the
+      // same activation. Exactly one installer wins; the others correctly get
+      // stale-instance after their captured empty slot has been occupied. That
+      // is success for hydration when the winner installed the exact requested
+      // page, not a reason to leave those sibling groups on shallow fallbacks.
+      // A different kind/path (the actual safety conflict) still stays refused.
       const loaded = pageByName(p);
       return loaded?.kind === k && (!path || loaded.path === path);
     }

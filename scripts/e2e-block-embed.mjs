@@ -98,18 +98,18 @@ async function embedContentState(id, { childId, childText } = {}) {
 
 async function waitForEmbedContent(id, options) {
   let last;
-  await browser.waitUntil(async () => {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
     last = await embedContentState(id, options);
-    return last.roots === 1
+    if (last.roots === 1
       && Boolean(last.rootContent)
       && last.rootToggle
       && last.childFound
       && (!options.childText || last.childContent?.includes(options.childText))
-      && (!options.childMustHaveChildren || last.childToggle);
-  }, {
-    timeout: 15_000,
-    timeoutMsg: `embed ${id} did not reach semantic content readiness: ${JSON.stringify(last)}`,
-  });
+      && (!options.childMustHaveChildren || last.childToggle)) return;
+    await sleep(50);
+  }
+  throw new Error(`embed ${id} did not reach semantic content readiness: ${JSON.stringify(last)}`);
 }
 
 async function openTestPage() {
