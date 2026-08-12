@@ -2527,6 +2527,16 @@ pub enum SyncApplicationMoveSubtreesOutcome {
     },
 }
 
+/// One serialized actor observation for resolving an already-issued move
+/// episode. The outcome (including any freshly loaded committed pages) and the
+/// runtime snapshot are captured in the same actor turn, so an application
+/// bridge never has to race a later independent `status()` request.
+#[derive(Clone, Debug)]
+pub struct SyncApplicationMoveSubtreesObservation {
+    pub move_outcome: SyncApplicationMoveSubtreesOutcome,
+    pub runtime_snapshot: SyncRuntimeStatusSnapshot,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncApplicationPageConflict {
@@ -3912,6 +3922,21 @@ impl SyncRuntimeHandle {
     ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
         validate_application_move_request(&request)?;
         self.application_request(|reply| ActorRequest::MoveApplicationSubtrees { request, reply })
+    }
+
+    /// Resubmit one exact move request and observe its outcome plus runtime
+    /// status from the same actor turn. This is the only in-process recovery
+    /// primitive: the durable episode digest remains the authority for replay,
+    /// and this method does not create a second recovery engine.
+    pub fn resolve_application_move_subtrees(
+        &self,
+        request: SyncApplicationMoveSubtreesRequest,
+    ) -> Result<SyncApplicationMoveSubtreesObservation, SyncApplicationPageRequestError> {
+        validate_application_move_request(&request)?;
+        self.application_request(|reply| ActorRequest::ResolveApplicationMoveSubtrees {
+            request,
+            reply,
+        })
     }
 
     /// Perform one page-identity mutation through the same actor and semantic
@@ -7114,6 +7139,12 @@ enum ActorRequest {
             Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError>,
         >,
     },
+    ResolveApplicationMoveSubtrees {
+        request: SyncApplicationMoveSubtreesRequest,
+        reply: mpsc::Sender<
+            Result<SyncApplicationMoveSubtreesObservation, SyncApplicationPageRequestError>,
+        >,
+    },
     MutateApplicationGraph {
         request: SyncApplicationGraphMutationRequest,
         reply: mpsc::Sender<Result<SyncApplicationUnitOutcome, SyncApplicationPageRequestError>>,
@@ -7355,6 +7386,16 @@ fn run_actor_loop(
             }
             ActorRequest::MoveApplicationSubtrees { request, reply } => {
                 let result = actor.move_application_subtrees(request);
+                let _ = reply.send(result);
+                false
+            }
+            ActorRequest::ResolveApplicationMoveSubtrees { request, reply } => {
+                let result = actor
+                    .resolve_application_move_subtrees(request)
+                    .map(|move_outcome| SyncApplicationMoveSubtreesObservation {
+                        move_outcome,
+                        runtime_snapshot: actor.snapshot(),
+                    });
                 let _ = reply.send(result);
                 false
             }
@@ -14193,6 +14234,22 @@ impl RuntimeActor {
                 state: editor_deferred_from_local(outcome),
             }),
         }
+    }
+
+    fn resolve_application_move_subtrees(
+        &mut self,
+        request: SyncApplicationMoveSubtreesRequest,
+    ) -> Result<SyncApplicationMoveSubtreesOutcome, SyncApplicationPageRequestError> {
+        let mut last_deferred = None;
+        for _ in 0..MAX_EDITOR_SETTLE_TURNS {
+            match self.move_application_subtrees(request.clone())? {
+                outcome @ SyncApplicationMoveSubtreesOutcome::Deferred { .. } => {
+                    last_deferred = Some(outcome);
+                }
+                outcome => return Ok(outcome),
+            }
+        }
+        Ok(last_deferred.expect("bounded move resolution executes at least one turn"))
     }
 
     fn application_move_committed_outcome(
@@ -25654,6 +25711,130 @@ mod tests {
         assert!(matches!(
             accepted_application_move(&handle, &request),
             SyncApplicationMoveSubtreesOutcome::Committed { .. }
+        ));
+        assert_eq!(fixture.manifest_count(), manifests + 1);
+    }
+
+    #[test]
+    fn application_cross_page_move_same_actor_resolution_is_one_observation() {
+        let fixture = RuntimeHostFixture::safe("application-move-one-observation");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "One Observation");
+        let manifests = fixture.manifest_count();
+        handle
+            .install_move_episode_publication_after_write_fault()
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+
+        let observation = handle
+            .resolve_application_move_subtrees(request.clone())
+            .unwrap();
+        assert_eq!(
+            observation.runtime_snapshot.lifecycle,
+            SyncRuntimeLifecycle::Active
+        );
+        match observation.move_outcome {
+            SyncApplicationMoveSubtreesOutcome::Committed {
+                episode_id,
+                recovered: true,
+                source,
+                destination,
+                ..
+            } => {
+                assert_eq!(episode_id, request.episode_id);
+                assert!(source.page.blocks.is_empty());
+                assert_eq!(destination.page.blocks.len(), 2);
+            }
+            other => panic!("same-actor observation did not resolve commit: {other:?}"),
+        }
+        assert_eq!(fixture.manifest_count(), manifests + 1);
+    }
+
+    #[test]
+    fn application_cross_page_move_still_deferred_actor_remains_active() {
+        let fixture = RuntimeHostFixture::safe("application-move-still-deferred-active");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "Still Deferred Active");
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterStage, u8::MAX)
+            .unwrap();
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        let observation = handle.resolve_application_move_subtrees(request).unwrap();
+        assert!(matches!(
+            observation.move_outcome,
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+        assert_eq!(
+            observation.runtime_snapshot.lifecycle,
+            SyncRuntimeLifecycle::Active
+        );
+        assert_eq!(
+            handle.status().unwrap().lifecycle,
+            SyncRuntimeLifecycle::Active
+        );
+    }
+
+    #[test]
+    fn application_cross_page_move_same_actor_resolution_proves_no_commit() {
+        let fixture = RuntimeHostFixture::safe("application-move-one-observation-no-commit");
+        let handle = active_handle(SyncRuntimeHandle::open(fixture.request()));
+        drive_initial_feed(&handle);
+        let request = simple_application_move_request(&handle, "One Observation No Commit");
+        let source = load_editor_named(
+            &handle,
+            "One Observation No Commit Source",
+            SyncPageKind::Page,
+        );
+        let source_native = query_page_blocks(&handle, &source.page_id).blocks[0].clone();
+        let manifests = fixture.manifest_count();
+        handle
+            .install_repeated_operational_fault(OperationalFaultPoint::AfterStage, 2)
+            .unwrap();
+        assert!(matches!(
+            handle
+                .submit_local_mutation(
+                    OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                        block: BlockLocation {
+                            block_id: BlockId::from_uuid(
+                                Uuid::parse_str(&source_native.block_id).unwrap(),
+                            ),
+                            home_document_id: DocumentId::from_uuid(
+                                Uuid::parse_str(&source_native.home_document_id).unwrap(),
+                            ),
+                        },
+                        content: "source changed before move settlement".into(),
+                    }])
+                    .unwrap(),
+                )
+                .unwrap(),
+            SyncLocalMutationOutcome::RetryableRetainedRecovery { .. }
+        ));
+        assert!(matches!(
+            handle.move_application_subtrees(request.clone()).unwrap(),
+            SyncApplicationMoveSubtreesOutcome::Deferred { .. }
+        ));
+
+        let observation = handle
+            .resolve_application_move_subtrees(request.clone())
+            .unwrap();
+        assert_eq!(
+            observation.runtime_snapshot.lifecycle,
+            SyncRuntimeLifecycle::Active
+        );
+        assert!(matches!(
+            observation.move_outcome,
+            SyncApplicationMoveSubtreesOutcome::NoCommit {
+                ref episode_id,
+                reason: SyncApplicationMoveConflict::StaleSource,
+            } if episode_id == &request.episode_id
         ));
         assert_eq!(fixture.manifest_count(), manifests + 1);
     }
