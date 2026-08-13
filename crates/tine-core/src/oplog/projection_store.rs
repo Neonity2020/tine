@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::object_store::{
-    is_temp_name, open_dir_nofollow, publish_immutable_exact, read_optional_regular,
-    require_regular_entry, sync_dir_required, StoreError,
+    is_temp_name, open_dir_nofollow, publish_immutable_exact as publish_immutable_exact_strict,
+    read_optional_regular, require_regular_entry, sync_dir_required, StoreError,
 };
 use super::sync_layout::{
     INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
@@ -115,6 +115,88 @@ fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionSto
 
     #[cfg(not(target_os = "android"))]
     super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+}
+
+fn publish_immutable_exact(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<(), StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        return publish_android_private_immutable(dir, filename, bytes, kind);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    publish_immutable_exact_strict(dir, filename, bytes, kind)
+}
+
+/// Android's app-private filesystem is single-writer from Tine's point of
+/// view, but some devices reject the hard-link primitive used by the generic
+/// no-replace publisher. Keep the crash-safe temporary-file publication and
+/// exact collision check while using the ordinary atomic rename supported by
+/// Android app storage. A concurrent hostile namespace writer is outside the
+/// managed-storage threat model; honest concurrent Tine writers are excluded
+/// by the runtime lease before this store becomes authoritative.
+#[cfg(target_os = "android")]
+fn publish_android_private_immutable(
+    dir: &Dir,
+    filename: &str,
+    bytes: &[u8],
+    kind: &'static str,
+) -> Result<(), StoreError> {
+    let verify_existing = || -> Result<bool, StoreError> {
+        match read_optional_regular(dir, filename, bytes.len() as u64, Some(bytes.len() as u64)) {
+            Ok(Some(existing)) if existing == bytes => Ok(true),
+            Ok(Some(_)) => Err(StoreError::ImmutableCollision(kind)),
+            Ok(None) => Ok(false),
+            Err(
+                StoreError::StoredLengthMismatch { .. } | StoreError::StoredFileTooLarge { .. },
+            ) => Err(StoreError::ImmutableCollision(kind)),
+            Err(error) => Err(error),
+        }
+    };
+
+    if verify_existing()? {
+        return Ok(());
+    }
+
+    let temp_name = format!(".tmp-{}", Uuid::new_v4());
+    let mut options = CapOpenOptions::new();
+    options.write(true).create_new(true);
+    let mut temp = dir.open_with(&temp_name, &options)?;
+    let result = (|| {
+        temp.write_all(bytes)?;
+        temp.sync_all()?;
+        drop(temp);
+
+        if verify_existing()? {
+            return Ok(());
+        }
+
+        dir.rename(&temp_name, dir, filename)?;
+        crate::filesystem_durability::sync_reconstructible_directory(dir)?;
+        if !verify_existing()? {
+            return Err(StoreError::Io(io::Error::new(
+                ErrorKind::NotFound,
+                format!("Android private immutable publication lost {filename}"),
+            )));
+        }
+        Ok(())
+    })();
+    let cleanup = dir.remove_file(&temp_name);
+    if let Err(error) = result {
+        let _ = cleanup;
+        return Err(error);
+    }
+    if cleanup
+        .as_ref()
+        .is_err_and(|error| error.kind() != ErrorKind::NotFound)
+    {
+        cleanup?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -828,12 +910,21 @@ impl ProjectionReceiptStore {
         let parent = root.parent().ok_or_else(|| {
             ProjectionStoreError::UnsafeEntry("store root has no existing parent".into())
         })?;
-        let canonical_parent = std::fs::canonicalize(parent)?;
-        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
-        ensure_directory_nofollow(&parent_capability, name)?;
-        let capability = open_dir_nofollow(&parent_capability, name)?;
-        let store_id = canonical_receipt_store_id(&capability)?;
-        let namespaces = Self::initialize(&capability, store_id, workspace_id, endpoint)?;
+        let canonical_parent = std::fs::canonicalize(parent)
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("canonicalize private receipt parent"))?;
+        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("open private receipt parent"))?;
+        ensure_directory_nofollow(&parent_capability, name)
+            .map_err(|error| error.at("create private receipt root"))?;
+        let capability = open_dir_nofollow(&parent_capability, name)
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("open private receipt root"))?;
+        let store_id = canonical_receipt_store_id(&capability)
+            .map_err(|error| error.at("identify private receipt root"))?;
+        let namespaces = Self::initialize(&capability, store_id, workspace_id, endpoint)
+            .map_err(|error| error.at("initialize private receipt store"))?;
 
         Ok(Self {
             root_path: canonical_parent.join(name),
@@ -2053,7 +2144,9 @@ impl ProjectionReceiptStore {
         workspace_id: WorkspaceId,
         endpoint: Option<ProjectionEndpointBinding>,
     ) -> Result<ReceiptNamespaces, ProjectionStoreError> {
-        let existing = read_optional_regular(capability, STORE_CLAIM_FILE, 512, None)?;
+        let existing = read_optional_regular(capability, STORE_CLAIM_FILE, 512, None)
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("read private receipt store claim"))?;
         if let Some(bytes) = existing {
             let expected = validate_claim(&bytes, store_id, workspace_id, endpoint)?;
             let namespaces = open_receipt_namespaces(capability, store_id)?;
@@ -2066,7 +2159,10 @@ impl ProjectionReceiptStore {
         }
 
         let expected_init = init_claim_bytes(store_id, workspace_id, endpoint);
-        match read_optional_regular(capability, STORE_INIT_FILE, 256, None)? {
+        match read_optional_regular(capability, STORE_INIT_FILE, 256, None)
+            .map_err(ProjectionStoreError::from)
+            .map_err(|error| error.at("read private receipt initialization claim"))?
+        {
             Some(bytes) => {
                 if bytes != expected_init {
                     return Err(ProjectionStoreError::MalformedStoreClaim);
@@ -2081,7 +2177,9 @@ impl ProjectionReceiptStore {
                     STORE_INIT_FILE,
                     &expected_init,
                     "projection receipt store initialization claim",
-                )?;
+                )
+                .map_err(ProjectionStoreError::from)
+                .map_err(|error| error.at("publish private receipt initialization claim"))?;
             }
         }
 
@@ -2092,17 +2190,22 @@ impl ProjectionReceiptStore {
             ATTEMPTS_DIR,
             FORENSICS_DIR,
         ] {
-            ensure_directory_nofollow(capability, namespace)?;
+            ensure_directory_nofollow(capability, namespace).map_err(|error| {
+                error.at(format!("create private receipt namespace {namespace}"))
+            })?;
         }
         require_incomplete_store_is_empty(capability)?;
-        let namespaces = open_receipt_namespaces(capability, store_id)?;
+        let namespaces = open_receipt_namespaces(capability, store_id)
+            .map_err(|error| error.at("open private receipt namespaces"))?;
         let claim = claim_bytes(store_id, workspace_id, endpoint, &namespaces.identities());
         publish_immutable_exact(
             capability,
             STORE_CLAIM_FILE,
             &claim,
             "projection receipt store claim",
-        )?;
+        )
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| error.at("publish private receipt store claim"))?;
         Ok(namespaces)
     }
 
@@ -2864,6 +2967,10 @@ fn validate_live_intent_namespace(
 pub enum ProjectionStoreError {
     Io(std::io::Error),
     Store(Box<StoreError>),
+    Operation {
+        operation: String,
+        source: Box<ProjectionStoreError>,
+    },
     Receipt(ReceiptError),
     UnsafeEntry(String),
     UnknownStoreVersion(u32),
@@ -2916,6 +3023,7 @@ impl fmt::Display for ProjectionStoreError {
         match self {
             Self::Io(error) => error.fmt(f),
             Self::Store(error) => error.fmt(f),
+            Self::Operation { operation, source } => write!(f, "{operation}: {source}"),
             Self::Receipt(error) => error.fmt(f),
             Self::UnsafeEntry(message) => write!(f, "unsafe projection store entry: {message}"),
             Self::UnknownStoreVersion(version) => {
@@ -3016,12 +3124,22 @@ impl fmt::Display for ProjectionStoreError {
     }
 }
 
+impl ProjectionStoreError {
+    fn at(self, operation: impl Into<String>) -> Self {
+        Self::Operation {
+            operation: operation.into(),
+            source: Box::new(self),
+        }
+    }
+}
+
 impl std::error::Error for ProjectionStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             Self::Store(error) => Some(error),
             Self::Receipt(error) => Some(error),
+            Self::Operation { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
