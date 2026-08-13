@@ -50,8 +50,9 @@ use crate::model::{
     RefGroup, ReferenceBlockEvidence, ReferenceKind, ReferencedPageNames, TemplateDto,
 };
 use crate::oplog::discovery::{
-    discover_startup, AmbiguousEvidence, DiscoveryClassification, DiscoveryComponent,
-    DiscoveryRequest, LocalActiveAdvisory, NonActiveStage, StartupStorageProfile,
+    classify_enrollment_error, discover_startup, AmbiguousEvidence, DiscoveryClassification,
+    DiscoveryComponent, DiscoveryRequest, LocalActiveAdvisory, NonActiveStage,
+    StartupStorageProfile,
 };
 use crate::oplog::enrollment::{
     activate_shared_initiator, activate_shared_joiner,
@@ -59,9 +60,9 @@ use crate::oplog::enrollment::{
     compose_verified_local_retaining_validation, inspect_local_activation_reservation_at,
     inspect_shared_enrollment_descriptor, open_existing_enrollment_application_root,
     prepare_shared_enrollment, prepare_shared_join, EnrollmentApplicationRoot, EnrollmentBindingV1,
-    EnrollmentDiscoveryHandoff, LocalActivationIdentityV1, LocalActivationReservationBindingV1,
-    PreparationId, SharedEnrollmentDescriptorV1, SharedEnrollmentPhase, SharedEnrollmentRole,
-    VerifiedLocalProofSet,
+    EnrollmentDiscoveryHandoff, EnrollmentError, LocalActivationIdentityV1,
+    LocalActivationReservationBindingV1, PreparationId, SharedEnrollmentDescriptorV1,
+    SharedEnrollmentPhase, SharedEnrollmentRole, VerifiedLocalProofSet,
 };
 use crate::oplog::exact_external_feed::{
     ExactExternalFeedDrain, ExactExternalFeedObserveError, ExactExternalFeedState,
@@ -164,6 +165,7 @@ use crate::oplog::wire::{
     SHARED_PROVIDER_MANIFEST_RECOVERY_LINKS_NAMESPACE,
     SHARED_PROVIDER_PUBLICATION_INTENTS_NAMESPACE,
 };
+pub use crate::oplog::ManagedStorageRefusalScenario;
 use crate::oplog::{
     classify_managed_local_anchor, decode_managed_local_record, managed_local_v2_anchor_name,
     parse_managed_local_v2_anchor_name, BatchId, BatchOrigin, BlockId, BlockLocation,
@@ -1582,9 +1584,18 @@ pub enum SyncLocalActivationStatus {
     Blocked {
         reason_code: String,
     },
-    UnsupportedOrIncompatible(SyncRuntimeComponent),
-    CorruptOrUnreadable(SyncRuntimeComponent),
-    AmbiguousOrForeignResidue(SyncAmbiguousEvidence),
+    UnsupportedOrIncompatible {
+        component: SyncRuntimeComponent,
+        scenario: ManagedStorageRefusalScenario,
+    },
+    CorruptOrUnreadable {
+        component: SyncRuntimeComponent,
+        scenario: ManagedStorageRefusalScenario,
+    },
+    AmbiguousOrForeignResidue {
+        evidence: SyncAmbiguousEvidence,
+        scenario: ManagedStorageRefusalScenario,
+    },
 }
 
 /// Activation result, split from the retained runtime capability so callers
@@ -1633,12 +1644,63 @@ pub enum SyncRuntimeOpenStatus {
     LegacyDefault,
     Absent,
     ExistingNonActive(SyncNonActiveStage),
-    Blocked { reason_code: String },
-    UnsupportedOrIncompatible(SyncRuntimeComponent),
-    CorruptOrUnreadable(SyncRuntimeComponent),
-    AmbiguousOrForeignResidue(SyncAmbiguousEvidence),
+    Blocked {
+        reason_code: String,
+    },
+    UnsupportedOrIncompatible {
+        component: SyncRuntimeComponent,
+        scenario: ManagedStorageRefusalScenario,
+    },
+    CorruptOrUnreadable {
+        component: SyncRuntimeComponent,
+        scenario: ManagedStorageRefusalScenario,
+    },
+    AmbiguousOrForeignResidue {
+        evidence: SyncAmbiguousEvidence,
+        scenario: ManagedStorageRefusalScenario,
+    },
     Active,
-    OpenRefused { detail: String },
+    OpenRefused {
+        detail: String,
+    },
+}
+
+impl SyncRuntimeOpenStatus {
+    /// A retryable open has no scenario. A durable refusal always has one;
+    /// markers emitted by lower storage boundaries survive the actor's bounded
+    /// string transport and are recovered here rather than being discarded by
+    /// the Tauri DTO conversion.
+    pub fn durable_refusal_scenario(&self) -> Option<ManagedStorageRefusalScenario> {
+        match self {
+            Self::Blocked { reason_code } => Some(blocked_reason_scenario(reason_code)),
+            Self::UnsupportedOrIncompatible { scenario, .. }
+            | Self::CorruptOrUnreadable { scenario, .. }
+            | Self::AmbiguousOrForeignResidue { scenario, .. } => Some(*scenario),
+            Self::OpenRefused { detail } => ManagedStorageRefusalScenario::marked_in(detail),
+            Self::LegacyDefault | Self::Absent | Self::ExistingNonActive(_) | Self::Active => None,
+        }
+    }
+}
+
+impl SyncLocalActivationStatus {
+    pub fn durable_refusal_scenario(&self) -> Option<ManagedStorageRefusalScenario> {
+        match self {
+            Self::Blocked { reason_code } => Some(blocked_reason_scenario(reason_code)),
+            Self::UnsupportedOrIncompatible { scenario, .. }
+            | Self::CorruptOrUnreadable { scenario, .. }
+            | Self::AmbiguousOrForeignResidue { scenario, .. } => Some(*scenario),
+            Self::Active | Self::Retryable { .. } => None,
+        }
+    }
+}
+
+fn blocked_reason_scenario(reason_code: &str) -> ManagedStorageRefusalScenario {
+    ManagedStorageRefusalScenario::for_blocked_reason(reason_code).unwrap_or(
+        // A syntactically valid blocked code not understood by this build is
+        // retained evidence from a newer/different protocol, not permission to
+        // guess at recovery.
+        ManagedStorageRefusalScenario::ProtocolIncompatible,
+    )
 }
 
 /// Startup returns typed status separately from the optional channel handle.
@@ -3552,13 +3614,8 @@ impl SyncRuntimeHandle {
         let activation_identity = local_activation_identity(&request, graph_resource_id);
         let reservation = match inspect_local_activation_reservation_at(&request.enrollment_root) {
             Ok(reservation) => reservation,
-            Err(_) => {
-                return SyncLocalActivationResult {
-                    status: SyncLocalActivationStatus::CorruptOrUnreadable(
-                        SyncRuntimeComponent::Enrollment,
-                    ),
-                    handle: None,
-                };
+            Err(error) => {
+                return activation_enrollment_failure(SyncLocalActivationStage::Absent, error)
             }
         };
         if reservation
@@ -3592,23 +3649,28 @@ impl SyncRuntimeHandle {
             DiscoveryClassification::Blocked(advisory) => {
                 return activation_blocked(advisory.reason_code);
             }
-            DiscoveryClassification::UnsupportedOrIncompatible(component) => {
+            DiscoveryClassification::Retryable(_, detail) => {
+                return activation_retryable(SyncLocalActivationStage::Absent, detail);
+            }
+            DiscoveryClassification::UnsupportedOrIncompatible(component, scenario) => {
                 return SyncLocalActivationResult {
-                    status: SyncLocalActivationStatus::UnsupportedOrIncompatible(map_component(
-                        component,
-                    )),
+                    status: SyncLocalActivationStatus::UnsupportedOrIncompatible {
+                        component: map_component(component),
+                        scenario,
+                    },
                     handle: None,
                 };
             }
-            DiscoveryClassification::CorruptOrUnreadable(component) => {
+            DiscoveryClassification::CorruptOrUnreadable(component, scenario) => {
                 return SyncLocalActivationResult {
-                    status: SyncLocalActivationStatus::CorruptOrUnreadable(map_component(
-                        component,
-                    )),
+                    status: SyncLocalActivationStatus::CorruptOrUnreadable {
+                        component: map_component(component),
+                        scenario,
+                    },
                     handle: None,
                 };
             }
-            DiscoveryClassification::AmbiguousOrForeignResidue(evidence) => {
+            DiscoveryClassification::AmbiguousOrForeignResidue(evidence, scenario) => {
                 if evidence == AmbiguousEvidence::ArchiveResidue && reservation.is_some() {
                     // The private exact reservation predates every archive
                     // write and authenticates the sole resumable construction.
@@ -3616,9 +3678,10 @@ impl SyncRuntimeHandle {
                     // state without the explicit activation identities.
                 } else {
                     return SyncLocalActivationResult {
-                        status: SyncLocalActivationStatus::AmbiguousOrForeignResidue(
-                            map_ambiguous_evidence(evidence),
-                        ),
+                        status: SyncLocalActivationStatus::AmbiguousOrForeignResidue {
+                            evidence: map_ambiguous_evidence(evidence),
+                            scenario,
+                        },
                         handle: None,
                     };
                 }
@@ -3648,6 +3711,7 @@ impl SyncRuntimeHandle {
             DiscoveryClassification::Absent => (None, SyncLocalActivationStage::Absent),
             DiscoveryClassification::AmbiguousOrForeignResidue(
                 AmbiguousEvidence::ArchiveResidue,
+                _,
             ) if reservation.is_some() => (None, SyncLocalActivationStage::Absent),
             _ => unreachable!("activation discovery branch already returned"),
         };
@@ -5142,14 +5206,7 @@ fn activation_failure_after(
 ) -> SyncLocalActivationResult {
     let reservation = match inspect_local_activation_reservation_at(&request.enrollment_root) {
         Ok(reservation) => reservation,
-        Err(_) => {
-            return SyncLocalActivationResult {
-                status: SyncLocalActivationStatus::CorruptOrUnreadable(
-                    SyncRuntimeComponent::Enrollment,
-                ),
-                handle: None,
-            };
-        }
+        Err(error) => return activation_enrollment_failure(fallback_stage, error),
     };
     let matching_reservation = reservation.as_ref().is_some_and(|reservation| {
         reservation.identity() == &local_activation_identity(request, graph_resource_id)
@@ -5171,29 +5228,40 @@ fn activation_failure_after(
         DiscoveryClassification::ExistingLocalActive(_) => {
             activation_retryable(SyncLocalActivationStage::LocalActive, detail)
         }
-        DiscoveryClassification::UnsupportedOrIncompatible(component) => {
+        DiscoveryClassification::Retryable(_, retry_detail) => {
+            activation_retryable(fallback_stage, retry_detail)
+        }
+        DiscoveryClassification::UnsupportedOrIncompatible(component, scenario) => {
             SyncLocalActivationResult {
-                status: SyncLocalActivationStatus::UnsupportedOrIncompatible(map_component(
-                    component,
-                )),
+                status: SyncLocalActivationStatus::UnsupportedOrIncompatible {
+                    component: map_component(component),
+                    scenario,
+                },
                 handle: None,
             }
         }
-        DiscoveryClassification::CorruptOrUnreadable(component) => SyncLocalActivationResult {
-            status: SyncLocalActivationStatus::CorruptOrUnreadable(map_component(component)),
-            handle: None,
-        },
-        DiscoveryClassification::AmbiguousOrForeignResidue(AmbiguousEvidence::ArchiveResidue)
-            if matching_reservation =>
-        {
-            activation_retryable(fallback_stage, detail)
+        DiscoveryClassification::CorruptOrUnreadable(component, scenario) => {
+            SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::CorruptOrUnreadable {
+                    component: map_component(component),
+                    scenario,
+                },
+                handle: None,
+            }
         }
-        DiscoveryClassification::AmbiguousOrForeignResidue(evidence) => SyncLocalActivationResult {
-            status: SyncLocalActivationStatus::AmbiguousOrForeignResidue(map_ambiguous_evidence(
-                evidence,
-            )),
-            handle: None,
-        },
+        DiscoveryClassification::AmbiguousOrForeignResidue(
+            AmbiguousEvidence::ArchiveResidue,
+            _,
+        ) if matching_reservation => activation_retryable(fallback_stage, detail),
+        DiscoveryClassification::AmbiguousOrForeignResidue(evidence, scenario) => {
+            SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::AmbiguousOrForeignResidue {
+                    evidence: map_ambiguous_evidence(evidence),
+                    scenario,
+                },
+                handle: None,
+            }
+        }
         DiscoveryClassification::Absent | DiscoveryClassification::LegacyDefault => {
             activation_retryable(fallback_stage, detail)
         }
@@ -5210,6 +5278,51 @@ fn activation_retryable(
             detail,
         },
         handle: None,
+    }
+}
+
+fn activation_enrollment_failure(
+    durable_stage: SyncLocalActivationStage,
+    error: EnrollmentError,
+) -> SyncLocalActivationResult {
+    match classify_enrollment_error(error) {
+        DiscoveryClassification::Retryable(_, detail) => {
+            activation_retryable(durable_stage, detail)
+        }
+        DiscoveryClassification::UnsupportedOrIncompatible(component, scenario) => {
+            SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::UnsupportedOrIncompatible {
+                    component: map_component(component),
+                    scenario,
+                },
+                handle: None,
+            }
+        }
+        DiscoveryClassification::CorruptOrUnreadable(component, scenario) => {
+            SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::CorruptOrUnreadable {
+                    component: map_component(component),
+                    scenario,
+                },
+                handle: None,
+            }
+        }
+        DiscoveryClassification::AmbiguousOrForeignResidue(evidence, scenario) => {
+            SyncLocalActivationResult {
+                status: SyncLocalActivationStatus::AmbiguousOrForeignResidue {
+                    evidence: map_ambiguous_evidence(evidence),
+                    scenario,
+                },
+                handle: None,
+            }
+        }
+        DiscoveryClassification::LegacyDefault
+        | DiscoveryClassification::Absent
+        | DiscoveryClassification::ExistingLocalActive(_)
+        | DiscoveryClassification::ExistingNonActive(_)
+        | DiscoveryClassification::Blocked(_) => {
+            unreachable!("an enrollment error classifier returned a non-error state")
+        }
     }
 }
 
@@ -6349,14 +6462,26 @@ fn map_discovery(classification: DiscoveryClassification) -> SyncRuntimeOpenStat
         DiscoveryClassification::Blocked(advisory) => SyncRuntimeOpenStatus::Blocked {
             reason_code: advisory.reason_code,
         },
-        DiscoveryClassification::UnsupportedOrIncompatible(component) => {
-            SyncRuntimeOpenStatus::UnsupportedOrIncompatible(map_component(component))
+        DiscoveryClassification::Retryable(_, detail) => {
+            SyncRuntimeOpenStatus::OpenRefused { detail }
         }
-        DiscoveryClassification::CorruptOrUnreadable(component) => {
-            SyncRuntimeOpenStatus::CorruptOrUnreadable(map_component(component))
+        DiscoveryClassification::UnsupportedOrIncompatible(component, scenario) => {
+            SyncRuntimeOpenStatus::UnsupportedOrIncompatible {
+                component: map_component(component),
+                scenario,
+            }
         }
-        DiscoveryClassification::AmbiguousOrForeignResidue(evidence) => {
-            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(map_ambiguous_evidence(evidence))
+        DiscoveryClassification::CorruptOrUnreadable(component, scenario) => {
+            SyncRuntimeOpenStatus::CorruptOrUnreadable {
+                component: map_component(component),
+                scenario,
+            }
+        }
+        DiscoveryClassification::AmbiguousOrForeignResidue(evidence, scenario) => {
+            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+                evidence: map_ambiguous_evidence(evidence),
+                scenario,
+            }
         }
     }
 }
@@ -24741,6 +24866,105 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn public_durable_refusal_scenarios_exactly_match_the_storage_contract() {
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        let table_ids = contract
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("| `MS-REF-")?;
+                let suffix = rest.split('`').next()?;
+                Some(format!("MS-REF-{suffix}"))
+            })
+            .collect::<BTreeSet<_>>();
+        let runtime_ids = ManagedStorageRefusalScenario::ALL
+            .into_iter()
+            .map(|scenario| scenario.as_str().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            runtime_ids, table_ids,
+            "the public refusal vocabulary and contract table must change together"
+        );
+    }
+
+    #[test]
+    fn every_public_durable_open_and_activation_class_has_a_scenario() {
+        let open = [
+            SyncRuntimeOpenStatus::Blocked {
+                reason_code: "shared.descriptor-conflict".into(),
+            },
+            SyncRuntimeOpenStatus::UnsupportedOrIncompatible {
+                component: SyncRuntimeComponent::Enrollment,
+                scenario: ManagedStorageRefusalScenario::ProtocolIncompatible,
+            },
+            SyncRuntimeOpenStatus::CorruptOrUnreadable {
+                component: SyncRuntimeComponent::Archive,
+                scenario: ManagedStorageRefusalScenario::DiskCorrupt,
+            },
+            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+                evidence: SyncAmbiguousEvidence::ArchiveBinding,
+                scenario: ManagedStorageRefusalScenario::SyncConflict,
+            },
+            SyncRuntimeOpenStatus::OpenRefused {
+                detail: "reconciliation baseline refused (MS-REF-UNSAFE-FS-KIND)".into(),
+            },
+        ];
+        assert!(
+            open.iter()
+                .all(|status| status.durable_refusal_scenario().is_some()),
+            "every durable public open refusal must identify its scenario"
+        );
+
+        let activation = [
+            SyncLocalActivationStatus::Blocked {
+                reason_code: "explicit_identity_binding_mismatch".into(),
+            },
+            SyncLocalActivationStatus::UnsupportedOrIncompatible {
+                component: SyncRuntimeComponent::Enrollment,
+                scenario: ManagedStorageRefusalScenario::ProtocolIncompatible,
+            },
+            SyncLocalActivationStatus::CorruptOrUnreadable {
+                component: SyncRuntimeComponent::Archive,
+                scenario: ManagedStorageRefusalScenario::DiskCorrupt,
+            },
+            SyncLocalActivationStatus::AmbiguousOrForeignResidue {
+                evidence: SyncAmbiguousEvidence::EnrollmentResidue,
+                scenario: ManagedStorageRefusalScenario::CrashTruncated,
+            },
+        ];
+        assert!(
+            activation
+                .iter()
+                .all(|status| status.durable_refusal_scenario().is_some()),
+            "every durable public activation refusal must identify its scenario"
+        );
+    }
+
+    #[test]
+    fn every_blocked_reason_literal_is_in_the_refusal_contract_vocabulary() {
+        let production_sources = [
+            include_str!("oplog/enrollment.rs"),
+            include_str!("sync_runtime.rs"),
+        ];
+        let emitted = production_sources
+            .into_iter()
+            .flat_map(|source| source.split('"').skip(1).step_by(2))
+            .filter(|literal| {
+                literal.starts_with("shared.")
+                    || *literal == "explicit_identity_binding_mismatch"
+                    || *literal == "proof.failed"
+            })
+            .collect::<BTreeSet<_>>();
+        let registered = crate::oplog::BLOCKED_REASON_SCENARIOS
+            .into_iter()
+            .map(|(reason, _)| reason)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            emitted, registered,
+            "adding or removing a durable blocked reason requires an explicit scenario mapping"
+        );
+    }
+
+    #[test]
     fn application_search_lane_epoch_cancels_only_the_older_same_lane_request() {
         let lanes = Mutex::new(HashMap::new());
         let first = begin_application_search_cancellation(&lanes, "ctrl-k");
@@ -37292,7 +37516,7 @@ mod tests {
         let foreign = SyncRuntimeHandle::open(foreign);
         assert!(matches!(
             foreign.status,
-            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(_)
+            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue { .. }
         ));
         assert!(foreign.handle.is_none());
 
@@ -52333,9 +52557,10 @@ mod tests {
         let result = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
         assert_eq!(
             result.status,
-            SyncLocalActivationStatus::AmbiguousOrForeignResidue(
-                SyncAmbiguousEvidence::ArchiveResidue
-            )
+            SyncLocalActivationStatus::AmbiguousOrForeignResidue {
+                evidence: SyncAmbiguousEvidence::ArchiveResidue,
+                scenario: ManagedStorageRefusalScenario::SyncConflict,
+            }
         );
         assert!(result.handle.is_none());
         assert_eq!(

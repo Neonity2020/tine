@@ -16294,17 +16294,16 @@ mod tests {
     /// refuse. One table serves both the compatibility wrapper and the hoisted
     /// [`WorkspaceRuntimeLease`], so the two cannot drift apart.
     #[cfg(unix)]
-    const WORKSPACE_LEASE_CAPABILITY_SUBSTITUTIONS: [&str; 5] = [
+    const WORKSPACE_LEASE_CAPABILITY_SUBSTITUTIONS: [&str; 4] = [
         "lease-object-store-namespace-symlink",
         "lease-sqlite-namespace-symlink",
         "lease-workspace-symlink",
         "lease-file-symlink",
-        "lease-group-writable-namespace",
     ];
 
     #[cfg(unix)]
     fn substitute_workspace_lease_capability(case: &str, store: &Path, workspace: WorkspaceId) {
-        use std::os::unix::fs::{symlink, PermissionsExt as _};
+        use std::os::unix::fs::symlink;
 
         match case {
             "lease-object-store-namespace-symlink" => {
@@ -16351,11 +16350,6 @@ mod tests {
                 )
                 .unwrap();
             }
-            "lease-group-writable-namespace" => {
-                let namespace = store.join(OBJECT_STORE_LEASE_NAMESPACE);
-                fs::create_dir(&namespace).unwrap();
-                fs::set_permissions(&namespace, fs::Permissions::from_mode(0o770)).unwrap();
-            }
             other => panic!("unknown workspace lease capability substitution: {other}"),
         }
     }
@@ -16393,9 +16387,11 @@ mod tests {
         });
     }
 
-    /// The hoisted lease keeps the same no-follow, ownership, and mode
-    /// validators the combined applier lease had, proven against the same
-    /// substitution table rather than a restated copy of it.
+    /// The hoisted lease keeps the same no-follow and entry-kind validators the
+    /// combined applier lease had, proven against the same substitution table
+    /// rather than a restated copy of it. Unix UID/mode admission is
+    /// intentionally absent: same-account permission bits are outside the
+    /// managed-storage threat model and are not portable to Android storage.
     #[cfg(unix)]
     #[test]
     fn workspace_runtime_lease_rejects_symlinked_namespaces_workspace_and_file() {

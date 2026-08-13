@@ -23,8 +23,8 @@ use tine_core::oplog::{
     DeviceId, DocumentId, LineageDigest, ProjectionEndpointId, SessionId, WorkspaceId,
 };
 use tine_core::sync_runtime::{
-    inspect_shared_enrollment_for_cold_discovery, SyncAmbiguousEvidence,
-    SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
+    inspect_shared_enrollment_for_cold_discovery, ManagedStorageRefusalScenario,
+    SyncAmbiguousEvidence, SyncApplicationMoveSubtreesOutcome, SyncApplicationMoveSubtreesRequest,
     SyncLocalActivationIdentities, SyncLocalActivationPhase, SyncLocalActivationProgress,
     SyncLocalActivationRequest, SyncLocalActivationResult, SyncLocalActivationStage,
     SyncLocalActivationStatus, SyncNonActiveStage, SyncRuntimeComponent, SyncRuntimeHandle,
@@ -238,15 +238,18 @@ pub(crate) enum SparseV2Availability {
     },
     Blocked {
         reason_code: String,
+        scenario_id: String,
     },
     Refused {
         reason_code: String,
+        scenario_id: String,
         detail: Option<String>,
     },
 }
 
 impl SparseV2Availability {
     fn from_open(status: SyncRuntimeOpenStatus) -> Self {
+        let scenario = status.durable_refusal_scenario();
         match status {
             SyncRuntimeOpenStatus::LegacyDefault => Self::LegacyDefault,
             SyncRuntimeOpenStatus::Active => Self::Active,
@@ -258,27 +261,41 @@ impl SparseV2Availability {
                 stage: non_active_stage(stage).into(),
                 detail: "Tine-managed storage setup can be resumed.".into(),
             },
-            SyncRuntimeOpenStatus::Blocked { reason_code } => Self::Blocked { reason_code },
-            SyncRuntimeOpenStatus::UnsupportedOrIncompatible(component) => Self::Refused {
+            SyncRuntimeOpenStatus::Blocked { reason_code } => Self::Blocked {
+                reason_code,
+                scenario_id: required_scenario_id(scenario),
+            },
+            SyncRuntimeOpenStatus::UnsupportedOrIncompatible { component, .. } => Self::Refused {
                 reason_code: format!("unsupported_{}", component_name(component)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncRuntimeOpenStatus::CorruptOrUnreadable(component) => Self::Refused {
+            SyncRuntimeOpenStatus::CorruptOrUnreadable { component, .. } => Self::Refused {
                 reason_code: format!("corrupt_{}", component_name(component)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(evidence) => Self::Refused {
+            SyncRuntimeOpenStatus::AmbiguousOrForeignResidue { evidence, .. } => Self::Refused {
                 reason_code: format!("ambiguous_{}", ambiguous_name(evidence)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncRuntimeOpenStatus::OpenRefused { detail } => Self::Retryable {
-                stage: "local_active".into(),
-                detail,
+            SyncRuntimeOpenStatus::OpenRefused { detail } => match scenario {
+                Some(scenario) => Self::Refused {
+                    reason_code: "open_refused".into(),
+                    scenario_id: scenario.as_str().into(),
+                    detail: Some(detail),
+                },
+                None => Self::Retryable {
+                    stage: "local_active".into(),
+                    detail,
+                },
             },
         }
     }
 
     fn from_activation(status: SyncLocalActivationStatus) -> Self {
+        let scenario = status.durable_refusal_scenario();
         match status {
             SyncLocalActivationStatus::Active => Self::Active,
             SyncLocalActivationStatus::Retryable {
@@ -288,21 +305,38 @@ impl SparseV2Availability {
                 stage: activation_stage(durable_stage).into(),
                 detail,
             },
-            SyncLocalActivationStatus::Blocked { reason_code } => Self::Blocked { reason_code },
-            SyncLocalActivationStatus::UnsupportedOrIncompatible(component) => Self::Refused {
-                reason_code: format!("unsupported_{}", component_name(component)),
-                detail: None,
+            SyncLocalActivationStatus::Blocked { reason_code } => Self::Blocked {
+                reason_code,
+                scenario_id: required_scenario_id(scenario),
             },
-            SyncLocalActivationStatus::CorruptOrUnreadable(component) => Self::Refused {
+            SyncLocalActivationStatus::UnsupportedOrIncompatible { component, .. } => {
+                Self::Refused {
+                    reason_code: format!("unsupported_{}", component_name(component)),
+                    scenario_id: required_scenario_id(scenario),
+                    detail: None,
+                }
+            }
+            SyncLocalActivationStatus::CorruptOrUnreadable { component, .. } => Self::Refused {
                 reason_code: format!("corrupt_{}", component_name(component)),
+                scenario_id: required_scenario_id(scenario),
                 detail: None,
             },
-            SyncLocalActivationStatus::AmbiguousOrForeignResidue(evidence) => Self::Refused {
-                reason_code: format!("ambiguous_{}", ambiguous_name(evidence)),
-                detail: None,
-            },
+            SyncLocalActivationStatus::AmbiguousOrForeignResidue { evidence, .. } => {
+                Self::Refused {
+                    reason_code: format!("ambiguous_{}", ambiguous_name(evidence)),
+                    scenario_id: required_scenario_id(scenario),
+                    detail: None,
+                }
+            }
         }
     }
+}
+
+fn required_scenario_id(scenario: Option<ManagedStorageRefusalScenario>) -> String {
+    scenario
+        .expect("every durable managed-storage refusal has a contract scenario")
+        .as_str()
+        .into()
 }
 
 fn activation_stage(stage: SyncLocalActivationStage) -> &'static str {
@@ -1181,39 +1215,50 @@ fn managed_open_outcome_code(status: &SyncRuntimeOpenStatus) -> &'static str {
             "existing_verified_local"
         }
         SyncRuntimeOpenStatus::Blocked { .. } => "blocked",
-        SyncRuntimeOpenStatus::UnsupportedOrIncompatible(SyncRuntimeComponent::Enrollment) => {
-            "unsupported_enrollment"
-        }
-        SyncRuntimeOpenStatus::UnsupportedOrIncompatible(SyncRuntimeComponent::Archive) => {
-            "unsupported_archive"
-        }
-        SyncRuntimeOpenStatus::CorruptOrUnreadable(SyncRuntimeComponent::Enrollment) => {
-            "corrupt_enrollment"
-        }
-        SyncRuntimeOpenStatus::CorruptOrUnreadable(SyncRuntimeComponent::Archive) => {
-            "corrupt_archive"
-        }
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::EnrollmentResidue,
-        ) => "ambiguous_enrollment_residue",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::EnrollmentNamespace,
-        ) => "ambiguous_enrollment_namespace",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::EnrollmentGraphBinding,
-        ) => "ambiguous_enrollment_graph_binding",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(SyncAmbiguousEvidence::ArchiveResidue) => {
-            "ambiguous_archive_residue"
-        }
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::ArchiveNamespace,
-        ) => "ambiguous_archive_namespace",
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(SyncAmbiguousEvidence::ArchiveBinding) => {
-            "ambiguous_archive_binding"
-        }
-        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue(
-            SyncAmbiguousEvidence::ActiveArchiveMismatch,
-        ) => "ambiguous_active_archive_mismatch",
+        SyncRuntimeOpenStatus::UnsupportedOrIncompatible {
+            component: SyncRuntimeComponent::Enrollment,
+            ..
+        } => "unsupported_enrollment",
+        SyncRuntimeOpenStatus::UnsupportedOrIncompatible {
+            component: SyncRuntimeComponent::Archive,
+            ..
+        } => "unsupported_archive",
+        SyncRuntimeOpenStatus::CorruptOrUnreadable {
+            component: SyncRuntimeComponent::Enrollment,
+            ..
+        } => "corrupt_enrollment",
+        SyncRuntimeOpenStatus::CorruptOrUnreadable {
+            component: SyncRuntimeComponent::Archive,
+            ..
+        } => "corrupt_archive",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::EnrollmentResidue,
+            ..
+        } => "ambiguous_enrollment_residue",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::EnrollmentNamespace,
+            ..
+        } => "ambiguous_enrollment_namespace",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::EnrollmentGraphBinding,
+            ..
+        } => "ambiguous_enrollment_graph_binding",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ArchiveResidue,
+            ..
+        } => "ambiguous_archive_residue",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ArchiveNamespace,
+            ..
+        } => "ambiguous_archive_namespace",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ArchiveBinding,
+            ..
+        } => "ambiguous_archive_binding",
+        SyncRuntimeOpenStatus::AmbiguousOrForeignResidue {
+            evidence: SyncAmbiguousEvidence::ActiveArchiveMismatch,
+            ..
+        } => "ambiguous_active_archive_mismatch",
         SyncRuntimeOpenStatus::Active => "active",
         SyncRuntimeOpenStatus::OpenRefused { .. } => "open_refused",
     }
@@ -2893,6 +2938,20 @@ mod tests {
                 detail: "/private/path/injected-detail".into(),
             }),
             "open_refused"
+        );
+    }
+
+    #[test]
+    fn durable_managed_refusals_export_their_contract_scenario() {
+        let refused = SparseV2Availability::from_open(SyncRuntimeOpenStatus::CorruptOrUnreadable {
+            component: SyncRuntimeComponent::Enrollment,
+            scenario: ManagedStorageRefusalScenario::DiskCorrupt,
+        });
+        let json = serde_json::to_value(refused).unwrap();
+        assert_eq!(
+            json.get("scenario_id").and_then(serde_json::Value::as_str),
+            Some("MS-REF-DISK-CORRUPT"),
+            "a durable refusal must identify the in-scope failure it defends against"
         );
     }
 

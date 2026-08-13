@@ -61,6 +61,7 @@ pub(crate) mod reconciliation_scan;
 #[allow(dead_code)] // mixed live/runtime and test-composition surface
 pub(crate) mod reconciliation_session;
 pub mod reference_catalog;
+pub mod refusal;
 #[allow(dead_code)] // retained recovery format plus test construction surface
 pub(crate) mod resume_point;
 pub(crate) mod scratch_store;
@@ -205,6 +206,8 @@ pub use reference_catalog::{
     REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
     REFERENCE_CATALOG_ROOT_SCHEMA_VERSION, REFERENCE_CATALOG_SCHEMA_VERSION,
 };
+pub use refusal::ManagedStorageRefusalScenario;
+pub(crate) use refusal::BLOCKED_REASON_SCENARIOS;
 pub use semantic::{
     BlockDelta, BlockOwner, BlockState, CanonicalSnapshot, LogicalPageName, LogicalPageNameError,
     LogseqIdentityOrigin, MembershipClaim, MembershipDelta, PageDelta, PageNameKeyDigest,

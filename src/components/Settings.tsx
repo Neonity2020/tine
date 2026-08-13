@@ -2201,9 +2201,12 @@ function ManagedSyncPanel(props: { forceOpen: boolean }): JSX.Element {
   const failureDetail = (value: SparseV2Status): string | null => {
     if (value.state === "retryable") return safeManagedErrorDetail(value.detail);
     if (value.state === "refused") {
-      return safeManagedErrorDetail(value.detail ?? `reason code: ${value.reason_code}`);
+      const detail = safeManagedErrorDetail(value.detail ?? "managed storage refused the operation");
+      return `${detail} (${value.scenario_id}; reason code: ${value.reason_code})`;
     }
-    if (value.state === "blocked") return safeManagedErrorDetail(`reason code: ${value.reason_code}`);
+    if (value.state === "blocked") {
+      return safeManagedErrorDetail(`${value.scenario_id}; reason code: ${value.reason_code}`);
+    }
     return null;
   };
 

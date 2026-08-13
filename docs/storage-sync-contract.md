@@ -184,8 +184,10 @@ fallback.
 
 ### 3.1 Refusal scenarios
 
-Every durable refusal or fail-closed validation must cite one of these stable
-scenario IDs in source. A transient condition that is safe to retry is not a
+Every public durable refusal must carry one of these stable scenario IDs. An
+internal fail-closed validation is classified when it reaches the public
+open/activation boundary; it does not need to duplicate the identifier at
+every decoder call site. A transient condition that is safe to retry is not a
 durable refusal; a disposable cache failure must rebuild instead of appearing
 in this table.
 
@@ -199,6 +201,12 @@ in this table.
 | `MS-REF-UNSAFE-FS-KIND` | Sync delivery, filesystem damage, or an external tool replaces an expected directory/regular file with a symlink, special file, reparse point, or unexpected hard-link alias | Refuse access through the substituted entry without following it |
 | `MS-REF-MALFORMED-IMPORT` | Imported/shared Markdown, Org, descriptor, manifest, or operation bytes cannot be decoded within declared bounds | Leave source/authoritative history unchanged and report the bounded invalid component |
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported/provider input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
+| `MS-REF-PROTOCOL-INCOMPATIBLE` | An honest device or restored graph supplies a recognized managed-storage component whose schema/protocol is newer or otherwise incompatible with this build | Preserve the component unchanged, refuse interpretation, and identify the component so the user can upgrade or rebuild from Direct files |
+
+Every public durable open/activation refusal carries its scenario ID separately
+from its bounded reason/stage code. Retryable open failures do not invent a
+scenario; if a lower storage boundary detects a durable refusal it emits the
+literal table ID and the public boundary preserves it.
 
 Unix UID equality and “only the current user may write this path” are
 deliberately absent. The threat model does not defend against a malicious actor

@@ -372,6 +372,7 @@ describe("Settings storage transitions", () => {
     vi.spyOn(backend(), "sparseV2Status").mockResolvedValue({
       state: "refused",
       reason_code: "local_active",
+      scenario_id: "MS-REF-DISK-CORRUPT",
       detail: "SQLite materialization failed: immutable archive error: document scratch index failed: malformed scratch blob at /home/martin/private/.tine-sync/v2/blobs.data",
       runtime: null,
       can_activate: false,
@@ -393,6 +394,7 @@ describe("Settings storage transitions", () => {
     await tick();
 
     expect(root.textContent).toContain("document scratch index failed: malformed scratch blob");
+    expect(root.textContent).toContain("MS-REF-DISK-CORRUPT");
     expect(root.textContent).toContain("LeaseContended(\"[path]\")");
     expect(root.textContent).not.toContain("/home/martin");
     expect(root.textContent).not.toContain("C:\\Users\\Martin");
@@ -403,6 +405,7 @@ describe("Settings storage transitions", () => {
     copy.click();
     await tick();
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining("malformed scratch blob"));
+    expect(writeText).toHaveBeenCalledWith(expect.stringContaining("MS-REF-DISK-CORRUPT"));
     expect(writeText).toHaveBeenCalledWith(expect.stringContaining("Return to Direct files:"));
     const copied = writeText.mock.calls.at(-1)?.[0] ?? "";
     expect(copied).toContain("[path]");

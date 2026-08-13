@@ -13,7 +13,9 @@ use super::enrollment::{
     EnrollmentError,
 };
 use super::object_store::{inspect_existing_archive_at, ArchiveDiscoveryInspection, StoreError};
-use super::{CanonicalGraphResourceId, ContentDigest, ImportId, SessionId};
+use super::{
+    CanonicalGraphResourceId, ContentDigest, ImportId, ManagedStorageRefusalScenario, SessionId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartupStorageProfile {
@@ -35,9 +37,10 @@ pub(crate) enum DiscoveryClassification {
     ExistingLocalActive(LocalActiveAdvisory),
     ExistingNonActive(NonActiveAdvisory),
     Blocked(BlockedAdvisory),
-    UnsupportedOrIncompatible(DiscoveryComponent),
-    CorruptOrUnreadable(DiscoveryComponent),
-    AmbiguousOrForeignResidue(AmbiguousEvidence),
+    Retryable(DiscoveryComponent, String),
+    UnsupportedOrIncompatible(DiscoveryComponent, ManagedStorageRefusalScenario),
+    CorruptOrUnreadable(DiscoveryComponent, ManagedStorageRefusalScenario),
+    AmbiguousOrForeignResidue(AmbiguousEvidence, ManagedStorageRefusalScenario),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +116,7 @@ pub(crate) fn discover_startup(request: &DiscoveryRequest<'_>) -> DiscoveryClass
                     ArchiveDiscoveryInspection::Residue | ArchiveDiscoveryInspection::Present(_),
                 ) => DiscoveryClassification::AmbiguousOrForeignResidue(
                     AmbiguousEvidence::ArchiveResidue,
+                    ManagedStorageRefusalScenario::SyncConflict,
                 ),
                 Err(error) => classify_archive_error(error),
             };
@@ -120,6 +124,7 @@ pub(crate) fn discover_startup(request: &DiscoveryRequest<'_>) -> DiscoveryClass
         EnrollmentDiscoveryInspection::Residue => {
             return DiscoveryClassification::AmbiguousOrForeignResidue(
                 AmbiguousEvidence::EnrollmentResidue,
+                ManagedStorageRefusalScenario::CrashTruncated,
             );
         }
         EnrollmentDiscoveryInspection::Present(evidence) => evidence,
@@ -161,6 +166,7 @@ pub(crate) fn discover_startup(request: &DiscoveryRequest<'_>) -> DiscoveryClass
             let ArchiveDiscoveryInspection::Present(archive) = archive else {
                 return DiscoveryClassification::AmbiguousOrForeignResidue(
                     AmbiguousEvidence::ArchiveResidue,
+                    ManagedStorageRefusalScenario::CrashTruncated,
                 );
             };
             if archive.bootstrap_import_id
@@ -174,6 +180,7 @@ pub(crate) fn discover_startup(request: &DiscoveryRequest<'_>) -> DiscoveryClass
             {
                 return DiscoveryClassification::AmbiguousOrForeignResidue(
                     AmbiguousEvidence::ActiveArchiveMismatch,
+                    ManagedStorageRefusalScenario::SyncConflict,
                 );
             }
             DiscoveryClassification::ExistingLocalActive(LocalActiveAdvisory {
@@ -189,52 +196,134 @@ pub(crate) fn discover_startup(request: &DiscoveryRequest<'_>) -> DiscoveryClass
     }
 }
 
-fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClassification {
+pub(crate) fn classify_enrollment_error(error: EnrollmentError) -> DiscoveryClassification {
+    let detail = error.to_string();
     match error {
+        EnrollmentError::Io(_) | EnrollmentError::InjectedCrashCut(_) => {
+            DiscoveryClassification::Retryable(DiscoveryComponent::Enrollment, detail)
+        }
         EnrollmentError::UnsupportedAuthoritySchema(_)
+        | EnrollmentError::UnsupportedLocalActivationReservationSchema(_)
         | EnrollmentError::UnsupportedCheckpointSchema(_)
         | EnrollmentError::UnsupportedRecordSchema(_)
         | EnrollmentError::UnsupportedPacketSchema(_)
+        | EnrollmentError::UnsupportedSharedEnrollmentDescriptorSchema(_)
+        | EnrollmentError::UnsupportedJoinerWorkspaceArchiveSchema(_)
         | EnrollmentError::UnsupportedCompatibility { .. }
         | EnrollmentError::FutureUnsupportedLifecycle(_) => {
-            DiscoveryClassification::UnsupportedOrIncompatible(DiscoveryComponent::Enrollment)
+            DiscoveryClassification::UnsupportedOrIncompatible(
+                DiscoveryComponent::Enrollment,
+                ManagedStorageRefusalScenario::ProtocolIncompatible,
+            )
         }
         EnrollmentError::BindingMismatch(EnrollmentBindingField::GraphResource) => {
             DiscoveryClassification::AmbiguousOrForeignResidue(
                 AmbiguousEvidence::EnrollmentGraphBinding,
+                ManagedStorageRefusalScenario::SyncConflict,
             )
         }
-        EnrollmentError::BindingMismatch(_)
-        | EnrollmentError::UnsafeNamespace(_)
-        | EnrollmentError::UnsupportedArtifact(_)
-        | EnrollmentError::NamespaceBoundExceeded
-        | EnrollmentError::AmbiguousInitialCreation
+        EnrollmentError::UnsafeNamespace(_) => DiscoveryClassification::AmbiguousOrForeignResidue(
+            AmbiguousEvidence::EnrollmentNamespace,
+            ManagedStorageRefusalScenario::UnsafeFilesystemKind,
+        ),
+        EnrollmentError::NamespaceBoundExceeded => {
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                AmbiguousEvidence::EnrollmentNamespace,
+                ManagedStorageRefusalScenario::Bounds,
+            )
+        }
+        EnrollmentError::AmbiguousInitialCreation
         | EnrollmentError::AmbiguousRecordPublication
         | EnrollmentError::AmbiguousAuthorityProvisioning => {
             DiscoveryClassification::AmbiguousOrForeignResidue(
                 AmbiguousEvidence::EnrollmentNamespace,
+                ManagedStorageRefusalScenario::CrashTruncated,
             )
         }
-        _ => DiscoveryClassification::CorruptOrUnreadable(DiscoveryComponent::Enrollment),
+        EnrollmentError::BindingMismatch(_)
+        | EnrollmentError::UnsupportedArtifact(_)
+        | EnrollmentError::InitialPreparationMismatch
+        | EnrollmentError::LocalActivationReservationMismatch
+        | EnrollmentError::PublishedBatchMismatch
+        | EnrollmentError::SharedEnrollmentBindingMismatch
+        | EnrollmentError::SharedProjectionBaseMismatch(_)
+        | EnrollmentError::SharedEnrollmentDescriptorDigestMismatch
+        | EnrollmentError::DirtyUniqueLocalTail => {
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                AmbiguousEvidence::EnrollmentNamespace,
+                ManagedStorageRefusalScenario::SyncConflict,
+            )
+        }
+        EnrollmentError::LeaseContended(_) | EnrollmentError::StaleCompareAndSwap => {
+            DiscoveryClassification::Retryable(DiscoveryComponent::Enrollment, detail)
+        }
+        EnrollmentError::AuthorityClaimTooLarge(_)
+        | EnrollmentError::LocalActivationReservationTooLarge(_)
+        | EnrollmentError::RecordTooLarge(_)
+        | EnrollmentError::JsonDepthExceeded
+        | EnrollmentError::JsonTokenBoundExceeded
+        | EnrollmentError::InvalidPageLimit(_) => DiscoveryClassification::CorruptOrUnreadable(
+            DiscoveryComponent::Enrollment,
+            ManagedStorageRefusalScenario::Bounds,
+        ),
+        _ => DiscoveryClassification::CorruptOrUnreadable(
+            DiscoveryComponent::Enrollment,
+            ManagedStorageRefusalScenario::DiskCorrupt,
+        ),
     }
 }
 
 fn classify_archive_error(error: StoreError) -> DiscoveryClassification {
+    let detail = error.to_string();
     match error {
+        StoreError::Io(_) => {
+            DiscoveryClassification::Retryable(DiscoveryComponent::Archive, detail)
+        }
         StoreError::UpgradeRequired { .. }
         | StoreError::UnsupportedStoreVersion { .. }
         | StoreError::UnsupportedPromotedRuntimeSchema(_) => {
-            DiscoveryClassification::UnsupportedOrIncompatible(DiscoveryComponent::Archive)
+            DiscoveryClassification::UnsupportedOrIncompatible(
+                DiscoveryComponent::Archive,
+                ManagedStorageRefusalScenario::ProtocolIncompatible,
+            )
         }
         StoreError::PromotedRuntimeStateMismatch(_)
         | StoreError::WorkspaceMismatch { .. }
-        | StoreError::LineageMismatch { .. } => {
-            DiscoveryClassification::AmbiguousOrForeignResidue(AmbiguousEvidence::ArchiveBinding)
+        | StoreError::LineageMismatch { .. } => DiscoveryClassification::AmbiguousOrForeignResidue(
+            AmbiguousEvidence::ArchiveBinding,
+            ManagedStorageRefusalScenario::SyncConflict,
+        ),
+        StoreError::UnsafeEntry(_) => DiscoveryClassification::AmbiguousOrForeignResidue(
+            AmbiguousEvidence::ArchiveNamespace,
+            ManagedStorageRefusalScenario::UnsafeFilesystemKind,
+        ),
+        StoreError::MalformedPath(_) => DiscoveryClassification::AmbiguousOrForeignResidue(
+            AmbiguousEvidence::ArchiveNamespace,
+            ManagedStorageRefusalScenario::MalformedImport,
+        ),
+        StoreError::StoredFileTooLarge { .. } | StoreError::PageNamePointBatchTooLarge { .. } => {
+            DiscoveryClassification::CorruptOrUnreadable(
+                DiscoveryComponent::Archive,
+                ManagedStorageRefusalScenario::Bounds,
+            )
         }
-        StoreError::UnsafeEntry(_) | StoreError::MalformedPath(_) => {
-            DiscoveryClassification::AmbiguousOrForeignResidue(AmbiguousEvidence::ArchiveNamespace)
+        StoreError::CompetingRuntimePromotion => {
+            DiscoveryClassification::Retryable(DiscoveryComponent::Archive, detail)
         }
-        _ => DiscoveryClassification::CorruptOrUnreadable(DiscoveryComponent::Archive),
+        StoreError::ObjectCollision(_)
+        | StoreError::BatchCollision(_)
+        | StoreError::LineageClaimCollision(_)
+        | StoreError::ImmutableCollision(_)
+        | StoreError::BootstrapArtifactCollision { .. } => {
+            DiscoveryClassification::CorruptOrUnreadable(
+                DiscoveryComponent::Archive,
+                ManagedStorageRefusalScenario::SyncConflict,
+            )
+        }
+        _ => DiscoveryClassification::CorruptOrUnreadable(
+            DiscoveryComponent::Archive,
+            ManagedStorageRefusalScenario::DiskCorrupt,
+        ),
     }
 }
 
@@ -304,6 +393,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn transient_discovery_failures_stay_retryable_and_durable_shapes_are_typed() {
+        for error in [
+            EnrollmentError::Io("temporary read failure".into()),
+            EnrollmentError::LeaseContended(PathBuf::from("enrollment.lease")),
+            EnrollmentError::StaleCompareAndSwap,
+        ] {
+            assert!(matches!(
+                classify_enrollment_error(error),
+                DiscoveryClassification::Retryable(DiscoveryComponent::Enrollment, _)
+            ));
+        }
+        for error in [
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "temporary archive read failure",
+            )),
+            StoreError::CompetingRuntimePromotion,
+        ] {
+            assert!(matches!(
+                classify_archive_error(error),
+                DiscoveryClassification::Retryable(DiscoveryComponent::Archive, _)
+            ));
+        }
+
+        assert!(matches!(
+            classify_enrollment_error(
+                EnrollmentError::UnsupportedLocalActivationReservationSchema(u32::MAX)
+            ),
+            DiscoveryClassification::UnsupportedOrIncompatible(
+                DiscoveryComponent::Enrollment,
+                ManagedStorageRefusalScenario::ProtocolIncompatible,
+            )
+        ));
+        assert!(matches!(
+            classify_enrollment_error(EnrollmentError::UnsafeNamespace(
+                "reservation became a symlink".into()
+            )),
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                AmbiguousEvidence::EnrollmentNamespace,
+                ManagedStorageRefusalScenario::UnsafeFilesystemKind,
+            )
+        ));
     }
 
     fn binding_with_archive(world: &TestWorld, seed: u128) -> EnrollmentBindingV1 {
@@ -492,7 +626,10 @@ mod tests {
             discover_startup(
                 &unsupported_enrollment.request(StartupStorageProfile::ExperimentalSparse)
             ),
-            DiscoveryClassification::UnsupportedOrIncompatible(DiscoveryComponent::Enrollment)
+            DiscoveryClassification::UnsupportedOrIncompatible(
+                DiscoveryComponent::Enrollment,
+                ManagedStorageRefusalScenario::ProtocolIncompatible,
+            )
         );
 
         let unsupported_archive = TestWorld::new("unsupported-archive");
@@ -509,7 +646,10 @@ mod tests {
             discover_startup(
                 &unsupported_archive.request(StartupStorageProfile::ExperimentalSparse)
             ),
-            DiscoveryClassification::UnsupportedOrIncompatible(DiscoveryComponent::Archive)
+            DiscoveryClassification::UnsupportedOrIncompatible(
+                DiscoveryComponent::Archive,
+                ManagedStorageRefusalScenario::ProtocolIncompatible,
+            )
         );
     }
 
@@ -555,7 +695,10 @@ mod tests {
             }
             assert_eq!(
                 discover_startup(&world.request(StartupStorageProfile::ExperimentalSparse)),
-                DiscoveryClassification::CorruptOrUnreadable(DiscoveryComponent::Enrollment)
+                DiscoveryClassification::CorruptOrUnreadable(
+                    DiscoveryComponent::Enrollment,
+                    ManagedStorageRefusalScenario::DiskCorrupt,
+                )
             );
         }
     }
@@ -573,7 +716,10 @@ mod tests {
         ));
         assert_eq!(
             discover_startup(&world.request(StartupStorageProfile::ExperimentalSparse)),
-            DiscoveryClassification::CorruptOrUnreadable(DiscoveryComponent::Enrollment)
+            DiscoveryClassification::CorruptOrUnreadable(
+                DiscoveryComponent::Enrollment,
+                ManagedStorageRefusalScenario::DiskCorrupt,
+            )
         );
     }
 
@@ -592,7 +738,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             discover_startup(&world.request(StartupStorageProfile::ExperimentalSparse)),
-            DiscoveryClassification::CorruptOrUnreadable(DiscoveryComponent::Archive)
+            DiscoveryClassification::CorruptOrUnreadable(
+                DiscoveryComponent::Archive,
+                ManagedStorageRefusalScenario::DiskCorrupt,
+            )
         );
     }
 
@@ -614,7 +763,10 @@ mod tests {
         });
         assert_eq!(
             copied_result,
-            DiscoveryClassification::AmbiguousOrForeignResidue(AmbiguousEvidence::ArchiveBinding)
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                AmbiguousEvidence::ArchiveBinding,
+                ManagedStorageRefusalScenario::SyncConflict,
+            )
         );
 
         let foreign = TestWorld::new("foreign-archive");
@@ -631,7 +783,10 @@ mod tests {
         });
         assert!(matches!(
             foreign_result,
-            DiscoveryClassification::AmbiguousOrForeignResidue(AmbiguousEvidence::ArchiveBinding)
+            DiscoveryClassification::AmbiguousOrForeignResidue(
+                AmbiguousEvidence::ArchiveBinding,
+                ManagedStorageRefusalScenario::SyncConflict,
+            )
         ));
         assert_eq!(
             binding.graph_resource_id(),

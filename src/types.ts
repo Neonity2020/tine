@@ -255,8 +255,8 @@ export type SparseV2Availability =
   | { state: "joinable"; descriptor_digest: string }
   | { state: "active" }
   | { state: "retryable"; stage: "absent" | "shadow_import" | "verified_local" | "local_active"; detail: string }
-  | { state: "blocked"; reason_code: string }
-  | { state: "refused"; reason_code: string; detail: string | null };
+  | { state: "blocked"; reason_code: string; scenario_id: string }
+  | { state: "refused"; reason_code: string; scenario_id: string; detail: string | null };
 
 /** Native, binding-scoped advisory envelope for pre-mutation bulk admission.
  * The managed actor remains the final save authority. */

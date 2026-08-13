@@ -3981,6 +3981,32 @@
         "failBefore": "proven"
       },
       "notes": "The reconciliation baseline is derived scheduling state, not authority. Before this repair, any semantic validation failure returned RebuildRequired through both startup call sites and permanently refused the managed graph; the isolated pre-fix test failed at that exact cache boundary. Open now preserves only the four declared baseline files (database/WAL/SHM/journal), completes or resumes the durable evidence move, creates a fresh cache, and marks the rebuild complete only after the replacement opens. Busy/locked/I/O errors stay retryable; symlinks, reparse points and special files remain MS-REF-UNSAFE-FS-KIND refusals and are never moved or followed. Actor-level coverage proves an accepted edit remains readable, immutable archive bytes stay identical, and the graph reaches Safe shutdown after recovery."
+    },
+    {
+      "id": "REG-MANAGED-DURABLE-REFUSAL-SCENARIOS-001",
+      "title": "Every public durable managed-storage open or activation refusal preserves a documented scenario while transient I/O remains retryable",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/sync_runtime.rs::tests::public_durable_refusal_scenarios_exactly_match_the_storage_contract",
+          "crates/tine-core/src/sync_runtime.rs::tests::every_public_durable_open_and_activation_class_has_a_scenario",
+          "crates/tine-core/src/sync_runtime.rs::tests::every_blocked_reason_literal_is_in_the_refusal_contract_vocabulary",
+          "src-tauri/src/sync_runtime.rs::tests::durable_managed_refusals_export_their_contract_scenario",
+          "src/components/Settings.test.tsx"
+        ],
+        "scenario": "managed.public-durable-refusal-scenario-surface",
+        "failBefore": "proven"
+      },
+      "notes": "Before this repair, startup and activation mixed component enums, persisted reason strings and free-form details, and the frontend could not identify the in-scope threat scenario behind a refusal. Discovery also classified ordinary filesystem I/O failures as corrupt/unreadable. One typed nine-scenario vocabulary now crosses discovery, open, activation, Tauri serialization and user-visible diagnostics. Unsupported schemas, corruption, conflicts, stale generations, unsafe filesystem kinds, malformed imports and bounds map explicitly; unmarked I/O remains retryable. Exhaustive Rust matches make new public status variants fail compilation until classified, the contract-table test requires an exact scenario-row match, and a source guard requires every durable blocked reason literal to have an explicit mapping."
     }
   ]
 }
