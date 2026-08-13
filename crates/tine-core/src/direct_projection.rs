@@ -598,7 +598,10 @@ fn page_recency(root: &Path, name: &str, relative_path: &str, kind: i64) -> i64 
 mod tests {
     use super::*;
     use crate::model::Graph;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    static PROJECTION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn scratch(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("tine-direct-projection-{tag}-{}", Uuid::new_v4()))
@@ -641,6 +644,7 @@ mod tests {
 
     #[test]
     fn direct_projection_matches_parser_tasks_and_tracks_replace_delete() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("task-parity");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::create_dir_all(root.join("journals")).unwrap();
@@ -721,6 +725,7 @@ mod tests {
 
     #[test]
     fn unavailable_projection_keeps_direct_files_query_semantics() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("fallback");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/tasks.md"), "- TODO remains readable\n").unwrap();
@@ -742,6 +747,7 @@ mod tests {
 
     #[test]
     fn clean_reopen_reuses_sqlite_and_external_edit_relowers_only_one_page() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("reopen-revisions");
         std::fs::create_dir_all(root.join("pages")).unwrap();
         std::fs::write(root.join("pages/one.md"), "- TODO one\n").unwrap();
@@ -813,6 +819,7 @@ mod tests {
     #[test]
     #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
     fn real_corpus_projection_converges_and_matches_task_query() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = PathBuf::from(
             std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
                 .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
@@ -859,6 +866,7 @@ mod tests {
     #[test]
     #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
     fn real_corpus_clean_reopen_reuses_projected_pages() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = PathBuf::from(
             std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
                 .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
