@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+#[cfg(not(target_os = "android"))]
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use fs2::FileExt as _;
@@ -26,8 +27,9 @@ use uuid::Uuid;
 
 use super::object_store::{
     is_temp_name, open_dir_nofollow as open_dir_nofollow_strict,
-    publish_immutable_exact as publish_immutable_exact_strict, read_optional_regular,
-    require_regular_entry, sync_dir_required, StoreError,
+    publish_immutable_exact as publish_immutable_exact_strict,
+    read_optional_regular as read_optional_regular_strict, require_regular_entry,
+    sync_dir_required, StoreError,
 };
 use super::sync_layout::{
     INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
@@ -90,12 +92,6 @@ fn open_dir_nofollow(root: &Dir, name: &str) -> Result<Dir, StoreError> {
         {
             return Err(StoreError::UnsafeEntry(format!(
                 "private receipt directory name is not one normal component: {name}"
-            )));
-        }
-        let metadata = root.symlink_metadata(component)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(StoreError::UnsafeEntry(format!(
-                "private receipt directory is not a real directory: {name}"
             )));
         }
         let name = CString::new(name)
@@ -214,32 +210,105 @@ fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionSto
                 "private receipt directory name is not one normal component: {name}"
             )));
         }
-        match root.symlink_metadata(component) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(ProjectionStoreError::UnsafeEntry(format!(
-                    "private receipt directory is not a real no-follow directory: {name}"
-                )));
-            }
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == ErrorKind::NotFound => match root.create_dir(component) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            },
+        match root.create_dir(component) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let metadata = root.symlink_metadata(component)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ProjectionStoreError::UnsafeEntry(format!(
-                "private receipt directory is not a real no-follow directory: {name}"
-            )));
-        }
+        // Reopen and classify the actual handle. Android app-private state has
+        // one honest Tine writer, so an fstatat-style preflight adds no safety
+        // but is rejected by some physical devices even when mkdir/open work.
+        open_dir_nofollow(root, name)?;
         crate::filesystem_durability::sync_reconstructible_directory(root)?;
         return Ok(());
     }
 
     #[cfg(not(target_os = "android"))]
     super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+}
+
+fn read_optional_regular(
+    dir: &Dir,
+    path: &str,
+    limit: u64,
+    expected_length: Option<u64>,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        let component = Path::new(path);
+        if !matches!(component.components().next(), Some(Component::Normal(_)))
+            || component.components().count() != 1
+        {
+            return Err(StoreError::UnsafeEntry(format!(
+                "private receipt filename is not one normal component: {path}"
+            )));
+        }
+        let name = CString::new(path)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt filename"))?;
+        // Do not ask Android's app-private filesystem for Linux hostile-path
+        // flags or an fstatat preflight. Open the honest-local name normally,
+        // then validate the retained handle before reading any bytes.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_fd().as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        // SAFETY: openat returned one newly owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(StoreError::UnsafeEntry(format!(
+                "private receipt path is not a regular file: {path}"
+            )));
+        }
+        let length = metadata.len();
+        if let Some(expected) = expected_length {
+            if length != expected {
+                return Err(StoreError::StoredLengthMismatch {
+                    path: path.into(),
+                    expected,
+                    actual: length,
+                });
+            }
+        }
+        if length > limit {
+            return Err(StoreError::StoredFileTooLarge {
+                path: path.into(),
+                length,
+                limit,
+            });
+        }
+        let mut bytes = Vec::new();
+        file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(StoreError::StoredFileTooLarge {
+                path: path.into(),
+                length: bytes.len() as u64,
+                limit,
+            });
+        }
+        if bytes.len() as u64 != length {
+            return Err(StoreError::StoredLengthMismatch {
+                path: path.into(),
+                expected: length,
+                actual: bytes.len() as u64,
+            });
+        }
+        return Ok(Some(bytes));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    read_optional_regular_strict(dir, path, limit, expected_length)
 }
 
 fn publish_immutable_exact(

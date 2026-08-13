@@ -230,10 +230,12 @@ They do not require the hard-link-based no-replace primitive used by the generic
 publisher: some Android app filesystems deny hard links even though ordinary
 app-private create, write, sync, and rename operations are available. Receipt
 directories are likewise opened through ordinary app-private directory handles
-after checking that each named entry is a real directory, rather than through
-the Linux hostile-replacement `O_NOFOLLOW` primitive. This applies to the
-receipt root as well: Android does not have to accept creation relative to a
-Linux capability-style parent handle when its ordinary app-private file API is
+and classified from the retained handle, rather than requiring a preliminary
+`fstatat` check or the Linux hostile-replacement `O_NOFOLLOW` primitive.
+Receipt files follow the same rule: ordinary app-private open, then retained
+handle type, length, and bounded-byte validation. This applies to the receipt
+root as well: Android does not have to accept creation relative to a Linux
+capability-style parent handle when its ordinary app-private file API is
 available. Honest concurrent Tine writers remain excluded by the runtime lease;
 a hostile process inside the same application sandbox is outside this threat
 model.
