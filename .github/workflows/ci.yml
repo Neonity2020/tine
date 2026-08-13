@@ -434,7 +434,8 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: |
-            ./src-tauri/gen/android/gradlew -p src-tauri/gen/android installDebug installDebugAndroidTest
+            ./src-tauri/gen/android/gradlew -p src-tauri/gen/android \
+              :app:installDebug :app:installDebugAndroidTest
             adb shell appops set --uid page.tine.app MANAGE_EXTERNAL_STORAGE allow
             adb shell am instrument -w \
               page.tine.app.test/androidx.test.runner.AndroidJUnitRunner
