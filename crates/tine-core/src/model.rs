@@ -28014,7 +28014,7 @@ fn sync_bootstrap_source_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+fn flush_bootstrap_source_filesystem(path: &Path) -> io::Result<()> {
     use std::os::fd::{AsFd as _, AsRawFd as _};
 
     let directory = fs::File::open(path)?;
@@ -28028,8 +28028,40 @@ fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+    flush_bootstrap_source_filesystem(path)
+}
+
+#[cfg(target_os = "android")]
+fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+    match flush_bootstrap_source_filesystem(path) {
+        Ok(()) => Ok(()),
+        // Some Android kernels/ROMs permit normal app-private file I/O but
+        // reject the filesystem-wide syncfs operation. Preserve the fast path
+        // where it exists; otherwise flush only Tine's exact private capture.
+        Err(error) if bootstrap_source_filesystem_flush_may_fallback(error.kind()) => {
+            flush_bootstrap_source_prefix_exact(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(test, target_os = "android"))]
+const fn bootstrap_source_filesystem_flush_may_fallback(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+    )
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+    flush_bootstrap_source_prefix_exact(path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn flush_bootstrap_source_prefix_exact(path: &Path) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let child = entry.path();
@@ -28040,7 +28072,7 @@ fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
             ));
         }
         if metadata.is_dir() {
-            flush_bootstrap_source_prefix(&child)?;
+            flush_bootstrap_source_prefix_exact(&child)?;
         } else if metadata.is_file() {
             sync_bootstrap_source_regular_file(&child)?;
         } else {
@@ -28052,7 +28084,7 @@ fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
     sync_bootstrap_source_directory(path)
 }
 
-#[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(any(test, not(target_os = "linux")))]
 fn sync_bootstrap_source_regular_file(path: &Path) -> io::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -50440,5 +50472,26 @@ mod tests {
         assert!(!gh254_code(&error).starts_with("conflict."));
         assert!(graph.force_save_page(&page).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn android_bootstrap_syncfs_falls_back_only_for_platform_capability_errors() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::InvalidInput,
+        ] {
+            assert!(bootstrap_source_filesystem_flush_may_fallback(kind));
+        }
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!bootstrap_source_filesystem_flush_may_fallback(kind));
+        }
     }
 }
