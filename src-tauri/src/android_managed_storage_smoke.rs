@@ -73,7 +73,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         return "activation returned Active without a handle".into();
     };
     match handle.clean_shutdown() {
-        Ok(SyncShutdownOutcome::Safe) => {}
+        Ok(SyncShutdownOutcome::Safe(_)) => {}
         outcome => return format!("clean shutdown failed: {outcome:?}"),
     }
     drop(handle);
@@ -86,7 +86,7 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
         return "reopen returned Active without a handle".into();
     };
     match handle.clean_shutdown() {
-        Ok(SyncShutdownOutcome::Safe) => "ok".into(),
+        Ok(SyncShutdownOutcome::Safe(_)) => "ok".into(),
         outcome => format!("reopened clean shutdown failed: {outcome:?}"),
     }
 }
