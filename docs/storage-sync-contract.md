@@ -260,8 +260,12 @@ regular file and directory in that exact app-private tree. Other I/O failures
 still abort activation, and the graph projection remains untouched until the
 private state has been sealed.
 
-Android app-private projection receipts retain temporary-file writes, exact-byte
-collision checks, file-content synchronization, and atomic rename publication.
+Android app-private projection receipts retain create-new temporary-file
+writes, exact-byte collision checks, file-content synchronization, and atomic
+rename publication. Directory creation and immutable publication stay on
+ordinary `mkdirat`/`openat`/`renameat` primitives throughout; opening the root
+through Android's ordinary API and then re-entering cap-std preflights for its
+children would reproduce the same false permission refusal one level down.
 They do not require the hard-link-based no-replace primitive used by the generic
 publisher: some Android app filesystems deny hard links even though ordinary
 app-private create, write, sync, and rename operations are available. Receipt
@@ -275,6 +279,14 @@ capability-style parent handle when its ordinary app-private file API is
 available. Honest concurrent Tine writers remain excluded by the runtime lease;
 a hostile process inside the same application sandbox is outside this threat
 model.
+
+Before an enrollment binding exists, projection receipts are reconstructible
+bootstrap state rather than authority. If Android cannot reopen a receipt tree
+left by an interrupted or older activation, retry retains one sibling
+`receipts.pre-promotion-failed` diagnostic tree and initializes a clean receipt
+store from the unchanged Markdown/Org source. Once enrollment has promoted the
+receipt-store identity, this recovery is forbidden: normal exact identity and
+receipt recovery rules apply.
 
 The graph-local shared-provider tree is transport rather than local authority.
 Tine still creates and opens it no-follow, requires ordinary directories and
