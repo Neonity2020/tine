@@ -203,6 +203,45 @@ fn persist_binding_at(path: &Path, record: &SparseV2ActivationRecord) -> Result<
             value
         })
         .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "android")]
+    if !path.exists() {
+        use std::io::Write as _;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Tine-managed storage binding has no private parent".to_owned())?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("Couldn't create Tine-managed storage private binding directory: {error}")
+        })?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(encoded.as_bytes()).map_err(|error| {
+                    format!("Couldn't write Tine-managed storage private binding: {error}")
+                })?;
+                file.sync_all().map_err(|error| {
+                    format!("Couldn't flush Tine-managed storage private binding: {error}")
+                })?;
+                // The initial binding is small, device-local and published
+                // before any managed authority exists. Android kernels can
+                // deny renameat2(RENAME_NOREPLACE) even in app-private storage;
+                // direct create_new preserves no-clobber semantics. A crash
+                // can at worst leave a malformed private opt-in record, which
+                // is recoverable through the always-available Direct Files
+                // escape without touching the Markdown tree.
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "Couldn't create Tine-managed storage private binding: {error}"
+                ));
+            }
+        }
+    }
     tine_core::model::atomic_update(path, &BINDING_WRITE, |existing| {
         if existing.trim().is_empty() || existing.trim() == "{}" {
             return Ok(encoded.clone());

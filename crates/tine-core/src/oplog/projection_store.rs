@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::object_store::{
-    ensure_directory_nofollow, is_temp_name, open_dir_nofollow, publish_immutable_exact,
-    read_optional_regular, require_regular_entry, sync_dir_required, StoreError,
+    is_temp_name, open_dir_nofollow, publish_immutable_exact, read_optional_regular,
+    require_regular_entry, sync_dir_required, StoreError,
 };
 use super::sync_layout::{
     INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
@@ -77,6 +77,45 @@ const MAX_MUTATION_ATTEMPTS: usize = 1_000_000;
 const MAX_MUTATION_AUTHORITY_BYTES: usize = 64 * 1024 * 1024;
 
 type DirectoryIdentity = [u8; 32];
+
+fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
+    #[cfg(target_os = "android")]
+    {
+        let component = Path::new(name);
+        if !matches!(component.components().next(), Some(Component::Normal(_)))
+            || component.components().count() != 1
+        {
+            return Err(ProjectionStoreError::UnsafeEntry(format!(
+                "private receipt directory name is not one normal component: {name}"
+            )));
+        }
+        match root.symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(ProjectionStoreError::UnsafeEntry(format!(
+                    "private receipt directory is not a real no-follow directory: {name}"
+                )));
+            }
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => match root.create_dir(component) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            },
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = root.symlink_metadata(component)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ProjectionStoreError::UnsafeEntry(format!(
+                "private receipt directory is not a real no-follow directory: {name}"
+            )));
+        }
+        crate::filesystem_durability::sync_reconstructible_directory(root)?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    super::object_store::ensure_directory_nofollow(root, name).map_err(Into::into)
+}
 
 #[cfg(test)]
 thread_local! {

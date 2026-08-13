@@ -7954,6 +7954,47 @@ pub(crate) fn control_directory_identity(
 }
 
 pub(crate) fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        let component = Path::new(name);
+        if !matches!(component.components().next(), Some(Component::Normal(_)))
+            || component.components().count() != 1
+        {
+            return Err(StoreError::UnsafeEntry(format!(
+                "managed private directory name is not one normal component: {name}"
+            )));
+        }
+        match root.symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(StoreError::UnsafeEntry(format!(
+                    "managed private directory is not a real no-follow directory: {name}"
+                )));
+            }
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => match root.create_dir(component) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(StoreError::Io(error)),
+            },
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+        let metadata = root.symlink_metadata(component)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StoreError::UnsafeEntry(format!(
+                "managed private directory is not a real no-follow directory: {name}"
+            )));
+        }
+        // The object store lives in Android's app-private area. Some devices
+        // permit the create and every file fsync but reject directory fsync.
+        // Before promotion the whole tree is reconstructible from Markdown;
+        // accepting only that platform capability refusal avoids treating a
+        // missing filesystem primitive as a permission/ownership failure.
+        crate::filesystem_durability::sync_reconstructible_directory(root)
+            .map_err(StoreError::Io)?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
     tine_storage::ensure_directory_nofollow(root, name).map_err(filesystem_error_without_collision)
 }
 
