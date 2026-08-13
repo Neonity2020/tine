@@ -14,7 +14,7 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::Path;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, not(target_os = "linux")))]
 use cap_std::{ambient_authority, fs::Dir};
 
 pub(crate) fn sync_private_tree(path: &Path) -> io::Result<()> {
@@ -25,11 +25,7 @@ pub(crate) fn sync_private_tree(path: &Path) -> io::Result<()> {
 
     #[cfg(target_os = "android")]
     {
-        match sync_filesystem(path) {
-            Ok(()) => return Ok(()),
-            Err(error) if android_filesystem_sync_may_fallback(error.kind()) => {}
-            Err(error) => return Err(error),
-        }
+        return finish_android_private_tree_sync(path, sync_filesystem(path));
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -58,7 +54,18 @@ const fn android_filesystem_sync_may_fallback(kind: io::ErrorKind) -> bool {
     )
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(test, target_os = "android"))]
+fn finish_android_private_tree_sync(path: &Path, result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if android_filesystem_sync_may_fallback(error.kind()) => {
+            sync_private_tree_exact(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
 fn sync_private_tree_exact(path: &Path) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -117,5 +124,30 @@ mod tests {
         ] {
             assert!(!android_filesystem_sync_may_fallback(kind));
         }
+    }
+
+    #[test]
+    fn android_capability_refusal_flushes_the_exact_private_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-android-private-tree-sync-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/artifact"), b"durable private state").unwrap();
+
+        finish_android_private_tree_sync(
+            &root,
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated Android syncfs refusal",
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(root.join("nested/artifact")).unwrap(),
+            b"durable private state"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
