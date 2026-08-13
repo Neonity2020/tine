@@ -332,7 +332,7 @@ jobs:
 
   android-core-compile:
     name: Full CI / Android core compile
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -433,8 +433,7 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           script: |
-            cd src-tauri/gen/android
-            ./gradlew installDebug installDebugAndroidTest
+            ./src-tauri/gen/android/gradlew -p src-tauri/gen/android installDebug installDebugAndroidTest
             adb shell appops set --uid page.tine.app MANAGE_EXTERNAL_STORAGE allow
             adb shell am instrument -w \
               page.tine.app.test/androidx.test.runner.AndroidJUnitRunner
