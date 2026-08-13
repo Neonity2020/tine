@@ -391,6 +391,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          cache-on-failure: true
 
       - name: Install pinned Android build toolchain
         run: |
