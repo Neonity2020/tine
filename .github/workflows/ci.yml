@@ -415,7 +415,13 @@ jobs:
         run: |
           npx tauri android build --debug --target x86_64 --apk --ci
           cd src-tauri/gen/android
-          ./gradlew assembleDebugAndroidTest
+          # Build the app variant's test APK, not every library module's generic
+          # Debug test APK. The native library was just produced by Tauri's
+          # one-shot build server; skip Gradle's always-run Rust bridge here and
+          # package that exact x86_64 output into the instrumentation APK.
+          ./gradlew :app:assembleUniversalDebugAndroidTest \
+            -PabiList=x86_64 -ParchList=x86_64 -PtargetList=x86_64 \
+            -x :app:rustBuildUniversalDebug -x :app:rustBuildX86_64Debug
 
       - name: Enable KVM for the Android emulator
         run: |
