@@ -10,7 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
-- **Android managed-storage setup no longer requires hostile-replacement directory primitives inside Tine's private receipt store.** The app-private, single-writer tree uses ordinary verified directory handles while shared or externally writable namespaces retain strict no-follow opens. A setup failure also keeps its exact inner operation when storage rediscovery runs, so a device-specific error can no longer be replaced by a generic retry message.
+- **Android managed-storage setup no longer requires hostile-replacement directory primitives inside Tine's private receipt store.** The app-private, single-writer tree is created and opened through Android's ordinary verified file API, including its root, while shared or externally writable namespaces retain strict no-follow capability opens. A setup failure also keeps its exact inner operation when storage rediscovery runs, so a device-specific error can no longer be replaced by a generic retry message.
 
 - **Enabling experimental managed storage no longer requires an Android app to be allowed to flush the entire filesystem.** Tine keeps the fast bootstrap flush on devices that support it, but Android permission or capability refusals now fall back to flushing each exact app-private bootstrap tree. The same audit removed mandatory directory-fsync assumptions from graph-local shared-provider setup and publication while preserving file flushes, no-follow/type checks, and strict durability for private authority. Ordinary graph access was already sufficient; stronger platform-wide or shared-filesystem operations can no longer turn it into a misleading `Permission denied` setup failure.
 

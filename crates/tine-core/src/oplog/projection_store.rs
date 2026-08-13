@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
+#[cfg(target_os = "android")]
+use std::fs;
 use std::fs::File;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 #[cfg(unix)]
@@ -123,6 +125,82 @@ fn open_dir_nofollow(root: &Dir, name: &str) -> Result<Dir, StoreError> {
 
     #[cfg(not(target_os = "android"))]
     open_dir_nofollow_strict(root, name)
+}
+
+/// Open one app-private receipt directory through Android's ordinary file API.
+///
+/// `cap_std::Dir::open_ambient_dir` deliberately retains a Linux-style
+/// capability handle.  Some physical Android kernels permit ordinary access
+/// to the app's private data directory but reject operations issued relative
+/// to that handle.  The private receipt tree is single-writer Tine state, so
+/// the honest-local boundary is the real-directory check before and after the
+/// open, not the particular Linux descriptor flags used to reach it.
+#[cfg(target_os = "android")]
+fn open_android_private_directory(path: &Path) -> Result<Dir, ProjectionStoreError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| {
+            error.at(format!(
+                "inspect Android private directory {}",
+                path.display()
+            ))
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProjectionStoreError::UnsafeEntry(format!(
+            "Android private receipt path is not a real directory: {}",
+            path.display()
+        )));
+    }
+    let file = File::open(path)
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| error.at(format!("open Android private directory {}", path.display())))?;
+    if !file
+        .metadata()
+        .map_err(ProjectionStoreError::from)
+        .map_err(|error| {
+            error.at(format!(
+                "verify Android private directory {}",
+                path.display()
+            ))
+        })?
+        .is_dir()
+    {
+        return Err(ProjectionStoreError::UnsafeEntry(format!(
+            "Android private receipt handle is not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(target_os = "android")]
+fn create_android_private_directory(path: &Path) -> Result<Dir, ProjectionStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ProjectionStoreError::UnsafeEntry(format!(
+                "Android private receipt path is not a real directory: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(ProjectionStoreError::from(error).at(format!(
+                    "create Android private directory {}",
+                    path.display()
+                )));
+            }
+        },
+        Err(error) => {
+            return Err(ProjectionStoreError::from(error).at(format!(
+                "inspect Android private directory {}",
+                path.display()
+            )));
+        }
+    }
+    open_android_private_directory(path)
 }
 
 fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
@@ -912,8 +990,13 @@ impl ProjectionReceiptStore {
             ProjectionStoreError::UnsafeEntry("store root has no existing parent".into())
         })?;
         let canonical_parent = std::fs::canonicalize(parent)?;
-        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
-        let capability = open_dir_nofollow(&parent_capability, name)?;
+        #[cfg(target_os = "android")]
+        let capability = open_android_private_directory(&canonical_parent.join(name))?;
+        #[cfg(not(target_os = "android"))]
+        let capability = {
+            let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())?;
+            open_dir_nofollow(&parent_capability, name)?
+        };
         let store_id = canonical_receipt_store_id(&capability)?;
         if store_id != expected_store_id {
             return Err(ProjectionStoreError::EndpointBindingMismatch);
@@ -960,14 +1043,20 @@ impl ProjectionReceiptStore {
         let canonical_parent = std::fs::canonicalize(parent)
             .map_err(ProjectionStoreError::from)
             .map_err(|error| error.at("canonicalize private receipt parent"))?;
-        let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())
-            .map_err(ProjectionStoreError::from)
-            .map_err(|error| error.at("open private receipt parent"))?;
-        ensure_directory_nofollow(&parent_capability, name)
-            .map_err(|error| error.at("create private receipt root"))?;
-        let capability = open_dir_nofollow(&parent_capability, name)
-            .map_err(ProjectionStoreError::from)
-            .map_err(|error| error.at("open private receipt root"))?;
+        #[cfg(target_os = "android")]
+        let capability = create_android_private_directory(&canonical_parent.join(name))
+            .map_err(|error| error.at("create Android private receipt root"))?;
+        #[cfg(not(target_os = "android"))]
+        let capability = {
+            let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())
+                .map_err(ProjectionStoreError::from)
+                .map_err(|error| error.at("open private receipt parent"))?;
+            ensure_directory_nofollow(&parent_capability, name)
+                .map_err(|error| error.at("create private receipt root"))?;
+            open_dir_nofollow(&parent_capability, name)
+                .map_err(ProjectionStoreError::from)
+                .map_err(|error| error.at("open private receipt root"))?
+        };
         let store_id = canonical_receipt_store_id(&capability)
             .map_err(|error| error.at("identify private receipt root"))?;
         let namespaces = Self::initialize(&capability, store_id, workspace_id, endpoint)
