@@ -436,8 +436,7 @@ jobs:
           script: |
             ./src-tauri/gen/android/gradlew -p src-tauri/gen/android :app:installDebug :app:installDebugAndroidTest
             adb shell appops set --uid page.tine.app MANAGE_EXTERNAL_STORAGE allow
-            adb shell am instrument -w \
-              page.tine.app.test/androidx.test.runner.AndroidJUnitRunner
+            adb shell am instrument -w page.tine.app.test/androidx.test.runner.AndroidJUnitRunner
 
   # Focused, signed APK proof for the frozen sync candidate. This remains outside
   # full CI: it is manually dispatched only with scope=android and never releases.
