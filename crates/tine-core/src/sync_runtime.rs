@@ -214,8 +214,8 @@ enum ManagedLocalCompactionFaultPoint {
 }
 
 #[cfg(test)]
-static MANAGED_LOCAL_COMPACTION_FAULT: Mutex<Option<(Uuid, ManagedLocalCompactionFaultPoint)>> =
-    Mutex::new(None);
+static MANAGED_LOCAL_COMPACTION_FAULTS: Mutex<BTreeMap<Uuid, ManagedLocalCompactionFaultPoint>> =
+    Mutex::new(BTreeMap::new());
 
 #[cfg(test)]
 static MANAGED_LOCAL_DIRECTORY_ENUMERATIONS: Mutex<BTreeMap<Uuid, u64>> =
@@ -242,7 +242,10 @@ fn record_managed_local_directory_enumeration(device_id: Uuid) {
 
 #[cfg(test)]
 fn fail_managed_local_compaction_once_at(device_id: Uuid, point: ManagedLocalCompactionFaultPoint) {
-    *MANAGED_LOCAL_COMPACTION_FAULT.lock().unwrap() = Some((device_id, point));
+    MANAGED_LOCAL_COMPACTION_FAULTS
+        .lock()
+        .unwrap()
+        .insert(device_id, point);
 }
 
 #[cfg(test)]
@@ -250,9 +253,9 @@ fn managed_local_compaction_fault(
     device_id: Uuid,
     point: ManagedLocalCompactionFaultPoint,
 ) -> bool {
-    let mut fault = MANAGED_LOCAL_COMPACTION_FAULT.lock().unwrap();
-    if *fault == Some((device_id, point)) {
-        *fault = None;
+    let mut faults = MANAGED_LOCAL_COMPACTION_FAULTS.lock().unwrap();
+    if faults.get(&device_id) == Some(&point) {
+        faults.remove(&device_id);
         true
     } else {
         false
@@ -24962,6 +24965,37 @@ mod tests {
             emitted, registered,
             "adding or removing a durable blocked reason requires an explicit scenario mapping"
         );
+    }
+
+    #[test]
+    fn managed_local_compaction_faults_are_isolated_per_device() {
+        let first = Uuid::from_u128(0xf001_0001);
+        let second = Uuid::from_u128(0xf001_0002);
+        fail_managed_local_compaction_once_at(
+            first,
+            ManagedLocalCompactionFaultPoint::AfterAnchorRetirement,
+        );
+        fail_managed_local_compaction_once_at(
+            second,
+            ManagedLocalCompactionFaultPoint::AfterSegmentDeletion,
+        );
+
+        assert!(managed_local_compaction_fault(
+            first,
+            ManagedLocalCompactionFaultPoint::AfterAnchorRetirement
+        ));
+        assert!(managed_local_compaction_fault(
+            second,
+            ManagedLocalCompactionFaultPoint::AfterSegmentDeletion
+        ));
+        assert!(!managed_local_compaction_fault(
+            first,
+            ManagedLocalCompactionFaultPoint::AfterAnchorRetirement
+        ));
+        assert!(!managed_local_compaction_fault(
+            second,
+            ManagedLocalCompactionFaultPoint::AfterSegmentDeletion
+        ));
     }
 
     #[test]
