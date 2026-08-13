@@ -6,11 +6,12 @@ exclusive `Legacy(Graph)` runtime before graph open. When Direct Files is
 selected, no code below may inspect or modify `.tine-sync`, open an oplog,
 create managed scratch state, or start managed recovery.
 
-The authoritative layout names live in
-`crates/tine-core/src/oplog/sync_layout.rs`. Code must import names from that
-module rather than introducing another literal. Format/schema constants remain
-beside their codecs; scratch and SQLite format versions come from the pinned
-`tine-storage::formats` module.
+The authoritative layout names live in the pinned
+`tine_storage::formats` manifest. Core code imports them through the
+definition-free compatibility surface in
+`crates/tine-core/src/oplog/sync_layout.rs`; it must not introduce another
+literal. Format/schema constants remain beside their codecs and are likewise
+certified through `tine_storage::formats`.
 
 ## 1. On-disk layout
 
