@@ -40905,6 +40905,43 @@ mod tests {
     }
 
     #[test]
+    fn android_receipt_bootstrap_does_not_reenter_capability_preflights() {
+        let source = include_str!("oplog/projection_store.rs");
+        let directory_start = source
+            .find("fn ensure_directory_nofollow(")
+            .expect("receipt directory helper");
+        let read_start = source[directory_start..]
+            .find("fn read_optional_regular(")
+            .map(|offset| directory_start + offset)
+            .expect("receipt read helper");
+        let publication_start = source
+            .find("fn publish_android_private_immutable(")
+            .expect("Android receipt publication helper");
+        let publication_end = source[publication_start..]
+            .find("\n#[cfg(test)]\nthread_local!")
+            .map(|offset| publication_start + offset)
+            .expect("end of Android receipt publication helper");
+
+        let directory = &source[directory_start..read_start];
+        assert!(directory.contains("libc::mkdirat"));
+        assert!(!directory.contains("root.create_dir"));
+
+        let publication = &source[publication_start..publication_end];
+        for required in ["libc::openat", "libc::renameat", "libc::unlinkat"] {
+            assert!(
+                publication.contains(required),
+                "Android receipt publication must retain {required}"
+            );
+        }
+        for forbidden in ["dir.open_with", "dir.rename", "dir.remove_file"] {
+            assert!(
+                !publication.contains(forbidden),
+                "Android receipt bootstrap must not re-enter {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn cold_shared_descriptor_discovery_uses_the_canonical_supported_regular_file() {
         let fixture = ActivationFixture::nested_unicode("cold-conflict-control", 0xa185);
         let descriptor = activate_and_prepare_shared(&fixture);
