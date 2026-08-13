@@ -1,6 +1,6 @@
 use crate::date::JournalDate;
 use crate::doc::{property_key_norm, DocBlock, Document};
-use crate::model::{Format, PageEntry, PageKind};
+use crate::model::{Format, PageEntry, PageKind, ReferenceKind};
 use crate::query::{
     run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
     ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
-    PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
+    PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
     PhysicalProperty, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
@@ -21,6 +21,12 @@ use uuid::Uuid;
 
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
 type PageRevisions = Arc<HashMap<PathBuf, String>>;
+
+// This is the parser-fact extractor identity, not an on-disk schema version.
+// Bump it whenever unchanged source bytes must be lowered into new/different
+// physical facts. The source-revision delta then rebuilds each page once even
+// when tine-storage's disposable SQLite schema itself remains compatible.
+const DIRECT_PROJECTION_FACTS_VERSION: u32 = 2;
 
 #[cfg(test)]
 static PHYSICAL_PAGE_LOWERINGS: AtomicU64 = AtomicU64::new(0);
@@ -332,6 +338,263 @@ impl DirectProjection {
         current
     }
 
+    pub(crate) fn page_aliases_with_owners(
+        &self,
+        cache_generation: u64,
+    ) -> Option<Vec<(String, String, String)>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut after: Option<(String, String, [u8; 16])> = None;
+        let mut aliases = Vec::new();
+        const BATCH: usize = 1024;
+        loop {
+            let rows = read
+                .navigation_aliases_after(
+                    after
+                        .as_ref()
+                        .map(|(path, alias, id)| (path.as_str(), alias.as_str(), id)),
+                    BATCH,
+                )
+                .ok()?;
+            let count = rows.len();
+            for row in rows {
+                after = Some((
+                    row.owner_path.clone(),
+                    row.normalized_alias.clone(),
+                    row.source_page_id,
+                ));
+                aliases.push((row.normalized_alias, row.owner_name, row.owner_path));
+            }
+            if count < BATCH {
+                break;
+            }
+        }
+        self.ready_at(cache_generation).then_some(aliases)
+    }
+
+    pub(crate) fn real_page_names(
+        &self,
+        cache_generation: u64,
+    ) -> Option<crate::query::RealPageNames> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut after: Option<(String, [u8; 16])> = None;
+        let mut names = crate::query::RealPageNames::new();
+        const BATCH: usize = 1024;
+        loop {
+            let rows = read
+                .navigation_pages_after_with_header_validation(
+                    after.as_ref().map(|(path, _)| path.as_str()),
+                    after.as_ref().map(|(_, id)| id),
+                    BATCH,
+                    |_, _| Ok(()),
+                )
+                .ok()?;
+            let count = rows.len();
+            for row in rows {
+                after = Some((row.path.clone(), row.page_id));
+                let path = PathBuf::from(&row.path);
+                match names.get_mut(&row.name_key) {
+                    Some((winner_path, winner_name)) if path < *winner_path => {
+                        *winner_path = path;
+                        *winner_name = row.name;
+                    }
+                    Some(_) => {}
+                    None => {
+                        names.insert(row.name_key, (path, row.name));
+                    }
+                }
+            }
+            if count < BATCH {
+                break;
+            }
+        }
+        self.ready_at(cache_generation).then_some(names)
+    }
+
+    pub(crate) fn reference_candidate_paths(
+        &self,
+        cache_generation: u64,
+        names_norm: &[String],
+        kind: ReferenceKind,
+    ) -> Option<std::collections::BTreeSet<PathBuf>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        if kind == ReferenceKind::Plain
+            && names_norm
+                .iter()
+                .any(|name| !name.chars().any(char::is_alphanumeric))
+        {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut page_ids = std::collections::BTreeSet::new();
+        const BATCH: usize = 1024;
+        for name in names_norm {
+            match kind {
+                ReferenceKind::Explicit => {
+                    let mut after = None;
+                    loop {
+                        let rows = read
+                            .page_referrer_candidates_after(name, after, BATCH)
+                            .ok()?;
+                        let count = rows.len();
+                        for row in rows {
+                            after = Some((row.source_page_id, row.source));
+                            page_ids.insert(row.source_page_id);
+                        }
+                        if count < BATCH {
+                            break;
+                        }
+                    }
+                }
+                ReferenceKind::Plain => {
+                    let mut after = None;
+                    loop {
+                        let rows = read
+                            .plain_text_candidate_pages_after(name, after, BATCH)
+                            .ok()?;
+                        let count = rows.len();
+                        for row in rows {
+                            after = Some(row.page_id);
+                            page_ids.insert(row.page_id);
+                        }
+                        if count < BATCH {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for page_id in page_ids {
+            let page = read
+                .page_with_header_validation(page_id, |_, _| Ok(()))
+                .ok()??;
+            paths.insert(PathBuf::from(page.path));
+        }
+        self.ready_at(cache_generation).then_some(paths)
+    }
+
+    /// Outer `None` means projection unavailable/stale and requires parser
+    /// fallback. Inner `None` is an exact current-generation miss.
+    pub(crate) fn block_page_hint(
+        &self,
+        cache_generation: u64,
+        uuid: &str,
+    ) -> Option<Option<String>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let block = read
+            .block(uuid)
+            .ok()?
+            .or_else(|| read.block_by_logseq_uuid(uuid).ok().flatten());
+        let page = match block {
+            Some(block) => read
+                .page_with_header_validation(block.page_id, |_, _| Ok(()))
+                .ok()?
+                .map(|page| page.name),
+            None => None,
+        };
+        self.ready_at(cache_generation).then_some(page)
+    }
+
+    pub(crate) fn block_ref_counts(
+        &self,
+        cache_generation: u64,
+    ) -> Option<std::collections::HashMap<String, usize>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut after = None;
+        let mut counts = std::collections::HashMap::new();
+        const BATCH: usize = 1024;
+        loop {
+            let rows = read.block_reference_counts_after(after, BATCH).ok()?;
+            let count = rows.len();
+            for row in rows {
+                after = Some(row.raw_uuid_claim);
+                counts.insert(
+                    Uuid::from_bytes(row.raw_uuid_claim).to_string(),
+                    usize::try_from(row.distinct_source_blocks).ok()?,
+                );
+            }
+            if count < BATCH {
+                break;
+            }
+        }
+        self.ready_at(cache_generation).then_some(counts)
+    }
+
+    pub(crate) fn block_referrer_candidate_paths(
+        &self,
+        cache_generation: u64,
+        uuid: &str,
+    ) -> Option<std::collections::BTreeSet<PathBuf>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut after = None;
+        let mut page_ids = std::collections::BTreeSet::new();
+        const BATCH: usize = 1024;
+        loop {
+            let rows = read
+                .block_referrer_candidates_after(uuid, after, BATCH)
+                .ok()?;
+            let count = rows.len();
+            for row in rows {
+                after = Some((row.source_page_id, row.source_block_id));
+                page_ids.insert(row.source_page_id);
+            }
+            if count < BATCH {
+                break;
+            }
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for page_id in page_ids {
+            let page = read
+                .page_with_header_validation(page_id, |_, _| Ok(()))
+                .ok()??;
+            paths.insert(PathBuf::from(page.path));
+        }
+        self.ready_at(cache_generation).then_some(paths)
+    }
+
     pub(crate) fn ready_at(&self, generation: u64) -> bool {
         self.shared.ready.load(Ordering::Acquire)
             && self.shared.ready_generation.load(Ordering::Acquire) == generation
@@ -494,12 +757,14 @@ fn apply_pending(
             .map(|(entry, _)| {
                 Ok(PhysicalGraphProjectionSourceRevision {
                     page_id: page_id(&entry.rel_path),
-                    revision: revisions.get(&entry.path).cloned().ok_or_else(|| {
-                        format!(
-                            "parsed page has no exact source revision: {}",
-                            entry.rel_path
-                        )
-                    })?,
+                    revision: projection_source_revision(revisions.get(&entry.path).ok_or_else(
+                        || {
+                            format!(
+                                "parsed page has no exact source revision: {}",
+                                entry.rel_path
+                            )
+                        },
+                    )?),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -518,9 +783,11 @@ fn apply_pending(
             .collect::<Result<Vec<_>, _>>()?;
         let mut replacements = Vec::with_capacity(lowered.len());
         let mut reference_postings = Vec::new();
-        for (page, mut postings) in lowered {
+        let mut aliases = Vec::new();
+        for (page, mut postings, mut page_aliases) in lowered {
             replacements.push(page);
             reference_postings.append(&mut postings);
+            aliases.append(&mut page_aliases);
         }
         let replacement_sources = sources
             .into_iter()
@@ -532,6 +799,7 @@ fn apply_pending(
                     replacements,
                     deletions: source_delta.deletions,
                     reference_postings,
+                    aliases,
                 },
                 &replacement_sources,
             )
@@ -540,6 +808,7 @@ fn apply_pending(
     if !deltas.is_empty() {
         let mut replacements = Vec::new();
         let mut reference_postings = Vec::new();
+        let mut aliases = Vec::new();
         let mut replacement_sources = Vec::new();
         let mut deletions = Vec::new();
         for (_, (_, delta)) in deltas {
@@ -547,11 +816,12 @@ fn apply_pending(
                 PageDelta::Replace(entry, document, revision) => {
                     replacement_sources.push(PhysicalGraphProjectionSourceRevision {
                         page_id: page_id(&entry.rel_path),
-                        revision,
+                        revision: projection_source_revision(&revision),
                     });
-                    let (page, mut postings) = physical_page(&entry, &document)?;
+                    let (page, mut postings, mut page_aliases) = physical_page(&entry, &document)?;
                     replacements.push(page);
                     reference_postings.append(&mut postings);
+                    aliases.append(&mut page_aliases);
                 }
                 PageDelta::Delete(entry) => deletions.push(page_id(&entry.rel_path)),
             }
@@ -562,6 +832,7 @@ fn apply_pending(
                     replacements,
                     deletions,
                     reference_postings,
+                    aliases,
                 },
                 &replacement_sources,
             )
@@ -570,10 +841,21 @@ fn apply_pending(
     Ok(())
 }
 
+fn projection_source_revision(content_revision: &str) -> String {
+    format!("direct-facts-v{DIRECT_PROJECTION_FACTS_VERSION}:{content_revision}")
+}
+
 fn physical_page(
     entry: &PageEntry,
     document: &Document,
-) -> Result<(PhysicalPage, Vec<PhysicalReferencePosting>), String> {
+) -> Result<
+    (
+        PhysicalPage,
+        Vec<PhysicalReferencePosting>,
+        Vec<PhysicalAliasDeclaration>,
+    ),
+    String,
+> {
     #[cfg(test)]
     PHYSICAL_PAGE_LOWERINGS.fetch_add(1, Ordering::Relaxed);
     let id = page_id(&entry.rel_path);
@@ -590,6 +872,21 @@ fn physical_page(
     };
     let mut blocks = Vec::new();
     let mut reference_postings = Vec::new();
+    let aliases = crate::query::document_aliases(document)
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, alias)| {
+            Ok(PhysicalAliasDeclaration {
+                source_page_id: id,
+                source_entity: PhysicalEntityId::Page(id),
+                source_locator: b"page-alias".to_vec(),
+                ordinal: u32::try_from(ordinal)
+                    .map_err(|_| "one page exceeds u32::MAX aliases".to_string())?,
+                raw_alias: alias.clone(),
+                normalized_alias: alias,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     if let Some(preamble) = document.pre_block.as_deref() {
         append_reference_postings(
             &mut reference_postings,
@@ -625,6 +922,7 @@ fn physical_page(
             blocks,
         },
         reference_postings,
+        aliases,
     ))
 }
 
@@ -662,6 +960,23 @@ fn lower_blocks(
             projection.refs_page.iter().cloned(),
             crate::doc::property_reference_page_names(&block.raw).into_iter(),
         )?;
+        for raw_claim in &projection.block_refs {
+            let Ok(raw_claim) = Uuid::parse_str(raw_claim) else {
+                continue;
+            };
+            reference_postings.push(PhysicalReferencePosting {
+                source_page_id: page_id,
+                source_entity: PhysicalEntityId::Block(block_id),
+                source_locator: order.as_bytes().to_vec(),
+                ordinal: u32::try_from(reference_postings.len())
+                    .map_err(|_| "one page exceeds u32::MAX reference postings".to_string())?,
+                kind: 6,
+                target: PhysicalReferenceTarget::ExternalUuid {
+                    raw_claim: raw_claim.into_bytes(),
+                    resolved_block_id: None,
+                },
+            });
+        }
         let searchable_text = projection
             .visible
             .split_whitespace()
@@ -676,6 +991,10 @@ fn lower_blocks(
                 value: value.clone(),
             })
             .collect();
+        let logseq_uuid = block
+            .property("id")
+            .and_then(|value| Uuid::parse_str(value.trim()).ok())
+            .map(Uuid::into_bytes);
         out.push(PhysicalBlock {
             block_id,
             home_document_id: page_id,
@@ -686,8 +1005,8 @@ fn lower_blocks(
             searchable_text,
             heading_level: projection.heading_level,
             collapsed: block.collapsed(),
-            logseq_uuid: None,
-            logseq_identity_origin: None,
+            logseq_uuid,
+            logseq_identity_origin: logseq_uuid.map(|_| 0),
             references: Vec::new(),
             properties,
             tags: projection.tags.clone(),
@@ -1044,6 +1363,143 @@ mod tests {
     }
 
     #[test]
+    fn direct_projection_matches_parser_reference_family_and_stale_fallback() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("reference-family-parity");
+        let target_id = "11111111-2222-4333-8444-555555555555";
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/target.md"),
+            format!("alias:: Alias Target\n\n- target\n  id:: {target_id}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pages/referrer.md"),
+            format!(
+                "- [[Alias Target]] and plain Alias Target and (({target_id})) (({target_id}))\n- another (({target_id}))\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("pages/unrelated.md"), "- unrelated\n").unwrap();
+
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let parser_aliases = crate::query::page_aliases_with_owners(&graph);
+        let parser_backlinks = crate::query::backlinks(&graph, "target");
+        let parser_unlinked = crate::query::unlinked_refs(&graph, "target");
+        let parser_referrers = crate::query::block_referrers(&graph, target_id);
+        let parser_resolved = crate::query::resolve_block(&graph, target_id);
+        let parser_counts = graph.block_ref_counts().unwrap();
+
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        wait_ready(&graph);
+
+        assert_eq!(graph.page_aliases_with_owners(), parser_aliases);
+        let explicit_candidates = graph.reference_candidate_pages(
+            &[
+                crate::refs::page_key("target"),
+                crate::refs::page_key("Alias Target"),
+            ],
+            ReferenceKind::Explicit,
+        );
+        assert!(explicit_candidates.indexed);
+        assert!(explicit_candidates.pages.len() < explicit_candidates.full_page_count);
+        assert_eq!(
+            signature(&crate::query::backlinks(&graph, "target")),
+            signature(&parser_backlinks)
+        );
+        assert_eq!(
+            signature(&crate::query::unlinked_refs(&graph, "target")),
+            signature(&parser_unlinked)
+        );
+        assert_eq!(
+            signature(&crate::query::block_referrers(&graph, target_id)),
+            signature(&parser_referrers)
+        );
+        assert_eq!(
+            crate::query::resolve_block(&graph, target_id)
+                .as_ref()
+                .map(|group| signature(std::slice::from_ref(group))),
+            parser_resolved
+                .as_ref()
+                .map(|group| signature(std::slice::from_ref(group)))
+        );
+        assert_eq!(
+            graph.block_ref_counts().unwrap().as_ref(),
+            parser_counts.as_ref()
+        );
+        assert_eq!(graph.block_ref_counts().unwrap().get(target_id), Some(&2));
+
+        let custom_path = root.join("pages/custom.md");
+        std::fs::write(&custom_path, "- custom identity\n  id:: not-a-uuid\n").unwrap();
+        assert!(graph.sync_file(&custom_path).is_some());
+        wait_ready(&graph);
+        assert_eq!(
+            crate::query::resolve_block(&graph, "not-a-uuid")
+                .and_then(|group| group.blocks.into_iter().next())
+                .map(|block| block.raw),
+            Some("custom identity\nid:: not-a-uuid".to_string())
+        );
+
+        graph.direct_projection_mark_stale_test();
+        assert_eq!(graph.page_aliases_with_owners(), parser_aliases);
+        assert_eq!(
+            signature(&crate::query::backlinks(&graph, "target")),
+            signature(&parser_backlinks)
+        );
+        assert_eq!(
+            signature(&crate::query::block_referrers(&graph, target_id)),
+            signature(&parser_referrers)
+        );
+        assert_eq!(
+            graph.block_ref_counts().unwrap().as_ref(),
+            parser_counts.as_ref()
+        );
+
+        let target_path = root.join("pages/target.md");
+        std::fs::write(
+            &target_path,
+            format!("alias:: Changed Alias\n\n- target\n  id:: {target_id}\n"),
+        )
+        .unwrap();
+        assert!(graph.sync_file(&target_path).is_some());
+        wait_ready(&graph);
+        let changed_aliases = graph.page_aliases_with_owners();
+        assert!(changed_aliases
+            .iter()
+            .any(|(alias, owner, _)| alias == "changed alias" && owner == "target"));
+        assert!(!changed_aliases
+            .iter()
+            .any(|(alias, _, _)| alias == "alias target"));
+
+        graph.delete_page("target", PageKind::Page).unwrap();
+        wait_ready(&graph);
+        assert!(!graph
+            .page_aliases_with_owners()
+            .iter()
+            .any(|(alias, _, _)| alias == "changed alias"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reference_family_has_no_second_in_memory_semantic_index() {
+        let model = include_str!("model.rs");
+        for removed in [
+            "alias_cache",
+            "reference_candidate_index",
+            "block_ref_count_cache",
+            "block_index: RwLock",
+        ] {
+            assert!(
+                !model.contains(removed),
+                "Direct Files reference family reintroduced {removed} beside SQLite"
+            );
+        }
+    }
+
+    #[test]
     fn direct_projection_fuzzy_candidates_preserve_parser_corpus_semantics() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("search-corpus-parity");
@@ -1251,6 +1707,14 @@ mod tests {
     }
 
     #[test]
+    fn extractor_version_participates_in_disposable_source_revision() {
+        let source = "sha256:unchanged-source";
+        let projected = projection_source_revision(source);
+        assert_eq!(projected, "direct-facts-v2:sha256:unchanged-source");
+        assert_ne!(projected, source);
+    }
+
+    #[test]
     fn storage_contract_names_the_generation_bound_cutover() {
         let contract = include_str!("../../../docs/storage-sync-contract.md");
         assert!(contract.contains("direct-files-projections/<canonical-graph-path-digest>.sqlite"));
@@ -1259,6 +1723,7 @@ mod tests {
         assert!(contract.contains("referenced-page\ninventory"));
         assert!(contract.contains("retains no separate semantic memo"));
         assert!(contract.contains("exact current parser-cache\ngeneration"));
+        assert!(contract.contains("Direct fact-extractor version"));
         assert!(contract.contains("app-private graph-fact projection contains no managed state"));
         assert!(contract.contains("clean\nreopen lowers none"));
         assert!(
@@ -1391,6 +1856,102 @@ mod tests {
             indexed_elapsed.as_micros(),
             lowerings(),
         );
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
+    }
+
+    #[test]
+    #[ignore = "manual storage packet receipt; set TINE_DIRECT_PROJECTION_CORPUS"]
+    fn real_corpus_reference_family_matches_parser_oracle() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = PathBuf::from(
+            std::env::var("TINE_DIRECT_PROJECTION_CORPUS")
+                .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
+        );
+        let database = scratch("real-corpus-reference-family").join("projection.sqlite");
+        let oracle = Graph::open(&root);
+        oracle.warm_cache();
+        let aliases = crate::query::page_aliases_with_owners(&oracle);
+        let alias_target = aliases.first().map(|(alias, _, _)| alias.clone());
+        let oracle_backlinks = alias_target
+            .as_deref()
+            .map(|target| crate::query::backlinks(&oracle, target));
+        let oracle_unlinked = alias_target
+            .as_deref()
+            .map(|target| crate::query::unlinked_refs(&oracle, target));
+        let oracle_count_started = Instant::now();
+        let oracle_counts = oracle.block_ref_counts().unwrap();
+        let oracle_count_elapsed = oracle_count_started.elapsed();
+        let block_claim = oracle.with_pages(|pages| {
+            pages.iter().find_map(|(_, document)| {
+                let mut claim = None;
+                fn visit(blocks: &[DocBlock], claim: &mut Option<String>) {
+                    for block in blocks {
+                        if claim.is_none() {
+                            *claim = block.projection().block_refs.first().cloned();
+                        }
+                        visit(&block.children, claim);
+                    }
+                }
+                visit(&document.roots, &mut claim);
+                claim
+            })
+        });
+        let oracle_referrers = block_claim
+            .as_deref()
+            .map(|claim| crate::query::block_referrers(&oracle, claim));
+        let oracle_resolved = block_claim
+            .as_deref()
+            .and_then(|claim| crate::query::resolve_block(&oracle, claim));
+
+        let graph = Graph::open(&root);
+        graph.attach_direct_projection(database.clone()).unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert_eq!(graph.page_aliases_with_owners(), aliases);
+        let projected_count_started = Instant::now();
+        let projected_counts = graph.block_ref_counts().unwrap();
+        let projected_count_elapsed = projected_count_started.elapsed();
+        assert_eq!(projected_counts.as_ref(), oracle_counts.as_ref());
+        eprintln!(
+            "real-corpus-reference counts={} parser_count_us={} sqlite_count_us={}",
+            projected_counts.len(),
+            oracle_count_elapsed.as_micros(),
+            projected_count_elapsed.as_micros(),
+        );
+        if let Some(target) = alias_target.as_deref() {
+            assert_eq!(
+                signature(&crate::query::backlinks(&graph, target)),
+                signature(oracle_backlinks.as_deref().unwrap())
+            );
+            assert_eq!(
+                signature(&crate::query::unlinked_refs(&graph, target)),
+                signature(oracle_unlinked.as_deref().unwrap())
+            );
+            let candidates = graph.reference_candidate_pages(
+                &[crate::refs::page_key(target)],
+                ReferenceKind::Explicit,
+            );
+            assert!(candidates.indexed);
+            eprintln!(
+                "real-corpus-reference explicit_candidates={} full_pages={}",
+                candidates.pages.len(),
+                candidates.full_page_count
+            );
+        }
+        if let Some(claim) = block_claim.as_deref() {
+            assert_eq!(
+                signature(&crate::query::block_referrers(&graph, claim)),
+                signature(oracle_referrers.as_deref().unwrap())
+            );
+            assert_eq!(
+                crate::query::resolve_block(&graph, claim)
+                    .as_ref()
+                    .map(|group| signature(std::slice::from_ref(group))),
+                oracle_resolved
+                    .as_ref()
+                    .map(|group| signature(std::slice::from_ref(group)))
+            );
+        }
         let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 }

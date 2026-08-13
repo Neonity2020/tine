@@ -344,28 +344,12 @@ fn crumb_line(b: &DocBlock) -> String {
     }
 }
 
-/// Collect matching blocks across the graph, grouped by source page. Scans the
-/// graph's in-memory page cache (built once, kept in sync by edits) so no disk
-/// I/O or re-parsing happens per call.
-fn collect(
+/// Collect matching blocks from an exact candidate set, or from the complete
+/// already-parsed graph when no safe candidate set is available. The parser
+/// remains the semantic authority; this helper performs no disk I/O or parsing.
+fn collect_bounded_candidates(
     graph: &Graph,
-    keep: impl FnMut(&DocBlock) -> bool,
-    keep_page_properties: impl FnMut(&PageEntry, &str) -> Option<BlockDto>,
-    exclude: Option<&str>,
-) -> Vec<RefGroup> {
-    collect_bounded(
-        graph,
-        keep,
-        keep_page_properties,
-        exclude,
-        usize::MAX,
-        usize::MAX,
-    )
-    .groups
-}
-
-fn collect_bounded(
-    graph: &Graph,
+    candidate_pages: Option<Vec<(PageEntry, std::sync::Arc<Document>)>>,
     mut keep: impl FnMut(&DocBlock) -> bool,
     mut keep_page_properties: impl FnMut(&PageEntry, &str) -> Option<BlockDto>,
     exclude: Option<&str>,
@@ -374,7 +358,8 @@ fn collect_bounded(
 ) -> BoundedGroups {
     let ex = exclude.map(refs::normalize);
     let mut budget = ConstructionBudget::new(max_rows, max_bytes);
-    let groups = graph.with_pages(|pages| {
+    let groups = graph.with_pages(|all_pages| {
+        let pages = candidate_pages.as_deref().unwrap_or(all_pages);
         // Pair each group with the referring page's journal `date_key` so the result
         // can be ordered like OG (the page cache itself is in arbitrary read_dir order).
         let mut groups: Vec<(Option<i64>, RefGroup)> = Vec::new();
@@ -1388,12 +1373,16 @@ pub fn block_referrers(graph: &Graph, uuid: &str) -> Vec<RefGroup> {
     if u.is_empty() {
         return Vec::new();
     }
-    collect(
+    collect_bounded_candidates(
         graph,
+        graph.direct_projection_block_referrer_candidate_pages(u),
         |b| b.projection().block_refs.iter().any(|r| r == u),
         |_, _| None,
         None,
+        usize::MAX,
+        usize::MAX,
     )
+    .groups
 }
 
 pub fn block_referrers_bounded(
@@ -1410,8 +1399,9 @@ pub fn block_referrers_bounded(
             exceeded: false,
         };
     }
-    collect_bounded(
+    collect_bounded_candidates(
         graph,
+        graph.direct_projection_block_referrer_candidate_pages(u),
         |b| b.projection().block_refs.iter().any(|r| r == u),
         |_, _| None,
         None,

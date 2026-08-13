@@ -45,7 +45,6 @@ use std::sync::RwLock;
 use tine_storage::{
     ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, FilesystemError,
 };
-use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2384,29 +2383,6 @@ pub struct Graph {
     page_build_flight: std::sync::Mutex<Option<Arc<PageBuildFlight>>>,
     #[cfg(test)]
     page_build_test: PageBuildTestState,
-    /// Cached `alias:: → canonical + owning path` records, derived from the page cache. Rebuilt
-    /// lazily and dropped whenever the page cache mutates (the only time aliases
-    /// can change). Avoids re-scanning the whole graph for aliases on every page
-    /// load / backlink lookup.
-    alias_cache: RwLock<Option<Vec<(String, String, String)>>>,
-    /// `block uuid / id:: → page name` hint, derived from the page cache and keyed
-    /// by `cache_gen` so it self-invalidates on any cache mutation (same pattern as
-    /// `alias_cache`). Lets `((uuid))` ref / embed resolution jump straight to the
-    /// owning page instead of walking every block of every page. A stale hint is
-    /// harmless: resolution falls back to a full scan when the block isn't found.
-    block_index: RwLock<Option<(u64, std::collections::HashMap<String, String>)>>,
-    /// Reconstructible, generation-keyed candidate index for page references.
-    /// Explicit postings are parser-owned; the fixed-size per-page signature is
-    /// only a no-false-negative prefilter for safely tokenizable plain mentions.
-    /// Exact reference verification remains authoritative in `query`.
-    reference_candidate_index: RwLock<Option<ReferenceCandidateIndex>>,
-    /// `block uuid → # of distinct blocks that reference it` (`((uuid))`, labeled
-    /// `[..](((uuid)))`, `{{embed ((uuid))}}`), keyed by `cache_gen` so it self-
-    /// invalidates on any cache mutation (same pattern as `block_index`). Drives the
-    /// per-block reference-count badge; `Arc` so handing the whole map to the
-    /// frontend is a refcount bump, not a clone. Only referenced uuids appear, so
-    /// the map is small.
-    block_ref_count_cache: RwLock<Option<(u64, Arc<std::collections::HashMap<String, usize>>)>>,
     /// Memoized results of the pervasive whole-graph scans (run_query / backlinks /
     /// unlinked_refs), keyed by `(cache_gen, today)` so it self-invalidates on ANY
     /// cache mutation and on a date rollover (relative-date queries depend on
@@ -3470,234 +3446,6 @@ enum DirectCreationEvidence {
         identity_index: Arc<EffectiveIdentityIndex>,
         disk_revs: std::collections::HashMap<PathBuf, String>,
     },
-}
-
-const REFERENCE_SIGNATURE_WORDS: usize = 64; // 4096 bits = 512 bytes/page
-
-#[derive(Clone)]
-struct ReferenceTokenSignature([u64; REFERENCE_SIGNATURE_WORDS]);
-
-impl Default for ReferenceTokenSignature {
-    fn default() -> Self {
-        Self([0; REFERENCE_SIGNATURE_WORDS])
-    }
-}
-
-impl ReferenceTokenSignature {
-    fn token_hash(token: &[u8], seed: u64) -> usize {
-        let mut hash = seed;
-        for byte in token {
-            hash ^= u64::from(byte.to_ascii_lowercase());
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        (hash as usize) & (REFERENCE_SIGNATURE_WORDS * 64 - 1)
-    }
-
-    fn insert_token(&mut self, token: &[u8]) {
-        for seed in [0xcbf29ce484222325, 0x9e3779b97f4a7c15] {
-            let bit = Self::token_hash(token, seed);
-            self.0[bit / 64] |= 1u64 << (bit % 64);
-        }
-    }
-
-    fn insert_text(&mut self, text: &str) {
-        // Exact plain-reference matching compares Unicode-lowercased, NFC text.
-        // Fold the source the same way before extracting ASCII tokens so a
-        // character such as the Kelvin sign (`K`) cannot match page `K` exactly
-        // while being absent from this no-false-negative prefilter.
-        let folded: String = text.to_lowercase().nfc().collect();
-        let bytes = folded.as_bytes();
-        let mut start = None;
-        for (index, byte) in bytes.iter().copied().enumerate() {
-            if byte.is_ascii_alphanumeric() {
-                if start.is_none() {
-                    start = Some(index);
-                }
-            } else if let Some(begin) = start.take() {
-                self.insert_token(&bytes[begin..index]);
-            }
-        }
-        if let Some(begin) = start {
-            self.insert_token(&bytes[begin..]);
-        }
-    }
-
-    /// `None` means tokenization is not provably safe, so callers must full-scan.
-    fn may_contain_name(&self, normalized_name: &str) -> Option<bool> {
-        if !normalized_name.is_ascii() {
-            return None;
-        }
-        let tokens = normalized_name
-            .as_bytes()
-            .split(|byte| !byte.is_ascii_alphanumeric())
-            .filter(|token| !token.is_empty())
-            .collect::<Vec<_>>();
-        if tokens.is_empty() {
-            return None;
-        }
-        Some(tokens.into_iter().all(|token| {
-            [0xcbf29ce484222325, 0x9e3779b97f4a7c15]
-                .into_iter()
-                .all(|seed| {
-                    let bit = Self::token_hash(token, seed);
-                    self.0[bit / 64] & (1u64 << (bit % 64)) != 0
-                })
-        }))
-    }
-}
-
-#[derive(Clone)]
-struct ReferencePageProjection {
-    explicit: Vec<String>,
-    signature: ReferenceTokenSignature,
-    name_key: String,
-    name: String,
-}
-
-struct ReferenceCandidateIndex {
-    generation: u64,
-    complete: bool,
-    pages: std::collections::HashMap<PathBuf, ReferencePageProjection>,
-    explicit: std::collections::HashMap<String, std::collections::BTreeSet<PathBuf>>,
-    real_pages: std::collections::HashMap<String, std::collections::BTreeMap<PathBuf, String>>,
-}
-
-impl ReferenceCandidateIndex {
-    fn page_projection(entry: &PageEntry, doc: &Document) -> io::Result<ReferencePageProjection> {
-        let mut signature = ReferenceTokenSignature::default();
-        if let Some(pre) = doc.pre_block.as_deref() {
-            signature.insert_text(pre);
-        }
-        let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
-            std::array::from_fn(|_| None);
-        let mut len = usize::from(!doc.roots.is_empty());
-        if len != 0 {
-            frames[0] = Some(doc.roots.iter());
-        }
-        while len != 0 {
-            let mut frame = frames[len - 1]
-                .take()
-                .expect("active reference signature frame");
-            let Some(block) = frame.next() else {
-                len -= 1;
-                continue;
-            };
-            frames[len - 1] = Some(frame);
-            signature.insert_text(&block.raw);
-            if !block.children.is_empty() {
-                if len == MAX_MANAGED_BLOCK_DEPTH {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "cached document nesting exceeds 128 levels",
-                    ));
-                }
-                frames[len] = Some(block.children.iter());
-                len += 1;
-            }
-        }
-        Ok(ReferencePageProjection {
-            explicit: crate::query::document_explicit_reference_names(entry, doc),
-            signature,
-            name_key: crate::refs::page_key(&entry.name),
-            name: entry.name.clone(),
-        })
-    }
-
-    fn build(generation: u64, pages: &[(PageEntry, Arc<Document>)]) -> io::Result<Self> {
-        let mut index = Self {
-            generation,
-            complete: true,
-            pages: std::collections::HashMap::with_capacity(pages.len()),
-            explicit: std::collections::HashMap::new(),
-            real_pages: std::collections::HashMap::new(),
-        };
-        for (entry, doc) in pages {
-            index.insert(entry, doc)?;
-        }
-        Ok(index)
-    }
-
-    fn remove(&mut self, path: &Path) {
-        let Some(previous) = self.pages.remove(path) else {
-            return;
-        };
-        for target in previous.explicit {
-            let remove_posting = self.explicit.get_mut(&target).is_some_and(|paths| {
-                paths.remove(path);
-                paths.is_empty()
-            });
-            if remove_posting {
-                self.explicit.remove(&target);
-            }
-        }
-        let remove_name = self
-            .real_pages
-            .get_mut(&previous.name_key)
-            .is_some_and(|owners| {
-                owners.remove(path);
-                owners.is_empty()
-            });
-        if remove_name {
-            self.real_pages.remove(&previous.name_key);
-        }
-    }
-
-    fn insert(&mut self, entry: &PageEntry, doc: &Document) -> io::Result<()> {
-        // Project before mutating the existing posting lists. An over-depth
-        // replacement must leave no partially-updated index behind.
-        let projection = Self::page_projection(entry, doc)?;
-        self.remove(&entry.path);
-        for target in &projection.explicit {
-            self.explicit
-                .entry(target.clone())
-                .or_default()
-                .insert(entry.path.clone());
-        }
-        self.real_pages
-            .entry(projection.name_key.clone())
-            .or_default()
-            .insert(entry.path.clone(), projection.name.clone());
-        self.pages.insert(entry.path.clone(), projection);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn estimated_bytes(&self) -> usize {
-        let page_bytes = self
-            .pages
-            .iter()
-            .map(|(path, page)| {
-                path.as_os_str().len()
-                    + std::mem::size_of::<ReferencePageProjection>()
-                    + page.explicit.iter().map(String::len).sum::<usize>()
-                    + page.name_key.len()
-                    + page.name.len()
-            })
-            .sum::<usize>();
-        let posting_bytes = self
-            .explicit
-            .iter()
-            .map(|(target, paths)| {
-                target.len()
-                    + paths
-                        .iter()
-                        .map(|path| path.as_os_str().len())
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
-        let real_page_bytes = self
-            .real_pages
-            .iter()
-            .map(|(key, owners)| {
-                key.len()
-                    + owners
-                        .iter()
-                        .map(|(path, name)| path.as_os_str().len() + name.len())
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
-        page_bytes + posting_bytes + real_page_bytes
-    }
 }
 
 pub(crate) struct ReferenceCandidatePages {
@@ -5648,10 +5396,6 @@ impl Graph {
             page_build_flight: std::sync::Mutex::new(None),
             #[cfg(test)]
             page_build_test: PageBuildTestState::default(),
-            alias_cache: RwLock::new(None),
-            block_index: RwLock::new(None),
-            reference_candidate_index: RwLock::new(None),
-            block_ref_count_cache: RwLock::new(None),
             derived_cache: RwLock::new(None),
             advanced_cache: RwLock::new(None),
             direct_projection: std::sync::Mutex::new(None),
@@ -5816,6 +5560,114 @@ impl Graph {
             pages.push(page.clone());
         }
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
+    }
+
+    fn direct_projection_pages_for_paths(
+        &self,
+        generation: u64,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return None;
+        }
+        let cache_index = self.cache_index.read().unwrap();
+        let cache_index = cache_index.as_ref()?;
+        let mut pages = Vec::new();
+        for relative in paths {
+            let path = self.root.join(&relative);
+            let slot = cache_index.by_path.get(&path).copied()?;
+            let page = snapshot.get(slot)?;
+            if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
+                return None;
+            }
+            pages.push(page.clone());
+        }
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
+    }
+
+    fn direct_projection_page_aliases_with_owners(&self) -> Option<Vec<(String, String, String)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let aliases = projection.page_aliases_with_owners(generation)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(aliases)
+    }
+
+    fn direct_projection_real_page_names(&self) -> Option<crate::query::RealPageNames> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let mut names = projection.real_page_names(generation)?;
+        for (path, _) in names.values_mut() {
+            *path = self.root.join(&*path);
+        }
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+    }
+
+    fn direct_projection_reference_candidate_pages(
+        &self,
+        names_norm: &[String],
+        kind: ReferenceKind,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let paths = projection.reference_candidate_paths(generation, names_norm, kind)?;
+        self.direct_projection_pages_for_paths(generation, paths)
+    }
+
+    fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let hint = projection.block_page_hint(generation, uuid)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(hint)
+    }
+
+    fn direct_projection_block_ref_counts(
+        &self,
+    ) -> Option<std::collections::HashMap<String, usize>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let counts = projection.block_ref_counts(generation)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(counts)
+    }
+
+    pub(crate) fn direct_projection_block_referrer_candidate_pages(
+        &self,
+        uuid: &str,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
+        self.direct_projection_pages_for_paths(generation, paths)
     }
 
     fn direct_projection_ready(&self) -> bool {
@@ -11911,10 +11763,8 @@ impl Graph {
         let graph = Graph::open(root);
         let entries = pages.iter().map(|(entry, _)| entry.clone()).collect();
         let index = build_page_cache_index(&pages);
-        let reference_index = ReferenceCandidateIndex::build(0, &pages).ok();
         *graph.cache.write().unwrap() = Some(Arc::new(pages));
         *graph.cache_index.write().unwrap() = Some(index);
-        *graph.reference_candidate_index.write().unwrap() = reference_index;
         *graph.page_list_cache.write().unwrap() = Some((0, entries));
         graph
     }
@@ -13735,24 +13585,19 @@ impl Graph {
     }
 
     pub(crate) fn page_aliases_with_owners(&self) -> Vec<(String, String, String)> {
-        if let Some(a) = self.alias_cache.read().unwrap().as_ref() {
-            return a.clone();
+        if let Some(aliases) = self.direct_projection_page_aliases_with_owners() {
+            return aliases;
         }
-        let aliases = crate::query::page_aliases_with_owners(self);
-        *self.alias_cache.write().unwrap() = Some(aliases.clone());
-        aliases
+        crate::query::page_aliases_with_owners(self)
     }
 
-    /// The page that owns a block uuid / `id::`, via a `cache_gen`-keyed index, or
-    /// `None` if unknown. A hint only — callers must verify (the index can lag a
-    /// concurrent edit). O(graph) to (re)build once per cache change, then O(1).
+    /// The page that owns a block UUID / UUID-valued `id::`, selected from the
+    /// exact-generation disposable SQLite projection. A hint only: callers
+    /// still verify parser evidence, and unsupported/stale projection state
+    /// falls back to an exact parser scan.
     pub fn block_page_hint(&self, uuid: &str) -> Option<String> {
-        use std::sync::atomic::Ordering;
-        let gen = self.cache_gen.load(Ordering::Acquire);
-        if let Some((idx_gen, map)) = self.block_index.read().unwrap().as_ref() {
-            if *idx_gen == gen {
-                return map.get(uuid).cloned();
-            }
+        if let Some(hint) = self.direct_projection_block_page_hint(uuid) {
+            return hint;
         }
         fn walk_idx(
             blocks: &[DocBlock],
@@ -13778,9 +13623,7 @@ impl Graph {
             }
             m
         });
-        let result = map.get(uuid).cloned();
-        *self.block_index.write().unwrap() = Some((gen, map));
-        result
+        map.get(uuid).cloned()
     }
 
     /// Resolve a bounded set of physical cached pages that could contain one of
@@ -13791,121 +13634,13 @@ impl Graph {
         names_norm: &[String],
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        // Force the ordinary single-flight cache build. `install_built` publishes
-        // the matching reference index alongside the parsed snapshot.
-        self.with_pages(|_| ());
-        for _ in 0..2 {
-            let (snapshot, generation) = {
-                let guard = self.cache.read().unwrap();
-                let snapshot = guard.as_ref().map(Arc::clone).unwrap();
-                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-                (snapshot, generation)
+        if let Some(pages) = self.direct_projection_reference_candidate_pages(names_norm, kind) {
+            let full_page_count = self.with_pages(|all| all.len());
+            return ReferenceCandidatePages {
+                pages,
+                indexed: true,
+                full_page_count,
             };
-            let full_page_count = snapshot.len();
-            let selected_paths = {
-                let guard = self.reference_candidate_index.read().unwrap();
-                let Some(index) = guard.as_ref().filter(|index| {
-                    index.complete
-                        && index.generation == generation
-                        && index.pages.len() == full_page_count
-                }) else {
-                    if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                        continue;
-                    }
-                    return ReferenceCandidatePages {
-                        pages: snapshot.iter().cloned().collect(),
-                        indexed: false,
-                        full_page_count,
-                    };
-                };
-                match kind {
-                    ReferenceKind::Explicit => {
-                        let mut paths = std::collections::BTreeSet::new();
-                        for name in names_norm {
-                            if let Some(postings) = index.explicit.get(name) {
-                                paths.extend(postings.iter().cloned());
-                            }
-                        }
-                        Some(paths)
-                    }
-                    ReferenceKind::Plain => {
-                        let mut paths = std::collections::BTreeSet::new();
-                        let mut safe = true;
-                        for (path, projection) in &index.pages {
-                            let mut any_name = false;
-                            for name in names_norm {
-                                let Some(maybe) = projection.signature.may_contain_name(name)
-                                else {
-                                    safe = false;
-                                    break;
-                                };
-                                any_name |= maybe;
-                            }
-                            if !safe {
-                                break;
-                            }
-                            if any_name {
-                                paths.insert(path.clone());
-                            }
-                        }
-                        safe.then_some(paths)
-                    }
-                }
-            };
-            let Some(selected_paths) = selected_paths else {
-                if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                    continue;
-                }
-                return ReferenceCandidatePages {
-                    pages: snapshot.iter().cloned().collect(),
-                    indexed: false,
-                    full_page_count,
-                };
-            };
-            let selected = {
-                let cache_index = self.cache_index.read().unwrap();
-                let Some(cache_index) = cache_index.as_ref() else {
-                    if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                        continue;
-                    }
-                    return ReferenceCandidatePages {
-                        pages: snapshot.iter().cloned().collect(),
-                        indexed: false,
-                        full_page_count,
-                    };
-                };
-                let mut selected = Vec::with_capacity(selected_paths.len());
-                let mut coherent = true;
-                for path in selected_paths {
-                    let Some(slot) = cache_index.by_path.get(&path).copied() else {
-                        coherent = false;
-                        break;
-                    };
-                    let Some(page) = snapshot.get(slot) else {
-                        coherent = false;
-                        break;
-                    };
-                    selected.push(page.clone());
-                }
-                coherent.then_some(selected)
-            };
-            let Some(selected) = selected else {
-                if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                    continue;
-                }
-                return ReferenceCandidatePages {
-                    pages: snapshot.iter().cloned().collect(),
-                    indexed: false,
-                    full_page_count,
-                };
-            };
-            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
-                return ReferenceCandidatePages {
-                    pages: selected,
-                    indexed: true,
-                    full_page_count,
-                };
-            }
         }
         let pages = self.with_pages(|pages| pages.iter().cloned().collect::<Vec<_>>());
         ReferenceCandidatePages {
@@ -13916,117 +13651,31 @@ impl Graph {
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {
-        self.with_pages(|_| ());
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let guard = self.reference_candidate_index.read().unwrap();
-        let index = guard.as_ref()?;
-        if !index.complete || index.generation != generation {
-            return None;
-        }
-        crate::fast_commit::note_real_page_name_materialization(index.real_pages.len());
-        let names = index
-            .real_pages
-            .iter()
-            .filter_map(|(key, owners)| {
-                owners
-                    .first_key_value()
-                    .map(|(path, name)| (key.clone(), (path.clone(), name.clone())))
-            })
-            .collect();
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+        let names = self.direct_projection_real_page_names()?;
+        crate::fast_commit::note_real_page_name_materialization(names.len());
+        Some(names)
     }
 
-    /// Candidate paths for rename after validating the index covers the exact
-    /// page-list/collision snapshot rename already collected. `None` means the
-    /// caller must retain its correct whole-list scan.
-    fn reference_candidate_paths_for_entries(
-        &self,
-        names_norm: &[String],
-        entries: &[PageEntry],
-    ) -> Option<std::collections::BTreeSet<PathBuf>> {
-        self.with_pages(|_| ());
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let paths = {
-            let guard = self.reference_candidate_index.read().unwrap();
-            let index = guard.as_ref()?;
-            if !index.complete
-                || index.generation != generation
-                || index.pages.len() != entries.len()
-                || entries
-                    .iter()
-                    .any(|entry| !index.pages.contains_key(&entry.path))
-            {
-                return None;
-            }
-            let mut paths = std::collections::BTreeSet::new();
-            for name in names_norm {
-                if let Some(postings) = index.explicit.get(name) {
-                    paths.extend(postings.iter().cloned());
-                }
-            }
-            paths
-        };
-
-        // Generation/path coherence proves only that the index matches the
-        // cached snapshot. Before using it to skip physical files, also prove
-        // every listed file still has the bytes that snapshot was parsed from.
-        // This catches external edits that landed before watcher reconciliation;
-        // failures or mismatches retain the existing full-scan transaction.
-        // Clone the reconstructible revisions so disk I/O does not hold a graph
-        // lock. No document is reparsed on this validation path.
-        let disk_revs = self.disk_revs.read().unwrap().clone();
-        if disk_revs.len() != entries.len() {
-            return None;
-        }
-        for entry in entries {
-            let expected = disk_revs.get(&entry.path)?;
-            let current = fs::read_to_string(&entry.path).ok()?;
-            if content_rev(&current) != *expected {
-                return None;
-            }
-        }
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(paths)
-    }
-
-    /// `block uuid → # of distinct referrer blocks`, over the whole graph, via a
-    /// `cache_gen`-keyed index whose generation is advanced across edits that do
-    /// not change the edited page's block-reference projection. A referrer is a
+    /// `block uuid → # of distinct referrer blocks`, over the whole graph. A referrer is a
     /// block whose text references the uuid (`((uuid))`, `[..](((uuid)))`, or
     /// `{{embed ((uuid))}}`); multiple refs from one block count once (OG semantics).
-    /// O(graph) to build initially or after a reference-bearing edit, then O(1)
-    /// reuse across ordinary edits.
+    /// The exact-generation SQLite projection is the ready route; its parser
+    /// fallback is used only while that disposable projection is unavailable.
     pub fn block_ref_counts(&self) -> io::Result<Arc<std::collections::HashMap<String, usize>>> {
-        use std::sync::atomic::Ordering;
-        loop {
-            let gen = self.cache_gen.load(Ordering::Acquire);
-            if let Some((idx_gen, map)) = self.block_ref_count_cache.read().unwrap().as_ref() {
-                if *idx_gen == gen {
-                    return Ok(Arc::clone(map));
-                }
-            }
-
-            let map = self.with_pages(|pages| -> io::Result<_> {
-                let mut counts = std::collections::HashMap::new();
-                for (_entry, doc) in pages {
-                    for (id, count) in document_block_ref_counts(doc)? {
-                        let total = counts.entry(id).or_insert(0_usize);
-                        *total = total.checked_add(count).ok_or_else(allocation_overflow)?;
-                    }
-                }
-                Ok(counts)
-            })?;
-            // A save can race the scan. Never publish its old snapshot under the
-            // new generation; retry against the current cache instead.
-            if self.cache_gen.load(Ordering::Acquire) != gen {
-                continue;
-            }
-            let arc = Arc::new(map);
-            let mut cache = self.block_ref_count_cache.write().unwrap();
-            if self.cache_gen.load(Ordering::Acquire) == gen {
-                *cache = Some((gen, Arc::clone(&arc)));
-                return Ok(arc);
-            }
+        if let Some(counts) = self.direct_projection_block_ref_counts() {
+            return Ok(Arc::new(counts));
         }
+        let map = self.with_pages(|pages| -> io::Result<_> {
+            let mut counts = std::collections::HashMap::new();
+            for (_entry, doc) in pages {
+                for (id, count) in document_block_ref_counts(doc)? {
+                    let total = counts.entry(id).or_insert(0_usize);
+                    *total = total.checked_add(count).ok_or_else(allocation_overflow)?;
+                }
+            }
+            Ok(counts)
+        })?;
+        Ok(Arc::new(map))
     }
 
     /// Locate a page in the parsed-doc cache by its resolved physical path.
@@ -14364,7 +14013,6 @@ impl Graph {
             .map(|(e, d, _)| (e, Arc::new(d)))
             .collect();
         let index = build_page_cache_index(&pages);
-        let reference_index = ReferenceCandidateIndex::build(expected_generation, &pages).ok();
         let effective_index = Arc::new(build_effective_identity_index(
             expected_generation,
             &pages,
@@ -14384,7 +14032,6 @@ impl Graph {
         let pages = Arc::new(pages);
         *guard = Some(Arc::clone(&pages));
         *self.cache_index.write().unwrap() = Some(index);
-        *self.reference_candidate_index.write().unwrap() = reference_index;
         *self.disk_revs.write().unwrap() = revs.clone();
         *self.effective_identity_index.write().unwrap() = Some(effective_index);
         *self.page_index_failures.write().unwrap() = failures;
@@ -14571,19 +14218,14 @@ impl Graph {
         self.page_index_failures.write().unwrap().clear();
         *self.cache_index.write().unwrap() = None;
         *self.effective_identity_index.write().unwrap() = None;
-        *self.reference_candidate_index.write().unwrap() = None;
         self.disk_revs.write().unwrap().clear(); // under the cache lock (cache → disk_revs)
                                                  // Bump the generation AFTER discarding the cache (under the cache lock), so
                                                  // a reader that loads the new gen then reads the cache sees None (and
                                                  // rebuilds from disk) rather than the stale pre-invalidation content — same
-                                                 // gen-after-content ordering as cache_upsert. The gen-keyed block index
-                                                 // then rebuilds against fresh content too.
+                                                 // gen-after-content ordering as cache_upsert.
         self.cache_gen
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         drop(guard);
-        *self.alias_cache.write().unwrap() = None;
-        *self.block_index.write().unwrap() = None;
-        *self.block_ref_count_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
     }
 
@@ -14615,8 +14257,6 @@ impl Graph {
         // removed — invalidating on every save would make a normal edit an O(P)
         // alias rescan on the next navigation.
         let new_aliases = crate::query::document_aliases(&doc);
-        let new_block_refs = document_block_ref_counts(&doc);
-        let mut block_refs_touched = false;
         let mut alias_touched = !new_aliases.is_empty();
         let path_key = entry.path.clone();
         let doc = Arc::new(doc);
@@ -14640,11 +14280,6 @@ impl Graph {
                 Some(i) => {
                     let slot = &mut pages[i];
                     alias_touched = new_aliases != crate::query::document_aliases(&slot.1);
-                    block_refs_touched = match (document_block_ref_counts(&slot.1), &new_block_refs)
-                    {
-                        (Ok(previous), Ok(current)) => previous != *current,
-                        _ => true,
-                    };
                     previous_doc = Some(Arc::clone(&slot.1));
                     identity_changed = slot.0.kind != entry.kind
                         || !crate::refs::same_page(&slot.0.name, &entry.name)
@@ -14658,9 +14293,6 @@ impl Graph {
                 }
                 None => {
                     is_new_page = true;
-                    block_refs_touched = new_block_refs
-                        .as_ref()
-                        .map_or(true, |counts| !counts.is_empty());
                     let name_key = page_cache_key(entry.kind, &entry.name);
                     pages.push((entry, doc));
                     if let Some(index) = self.cache_index.write().unwrap().as_mut() {
@@ -14727,42 +14359,9 @@ impl Graph {
         }
         *failures_guard = resulting_failures;
         drop(failures_guard);
-        if cache_built {
-            let mut index_guard = self.reference_candidate_index.write().unwrap();
-            match (identity_changed, index_guard.as_mut()) {
-                (true, _) => {
-                    if let Some(pages) = guard.as_ref() {
-                        *index_guard = ReferenceCandidateIndex::build(newgen, pages).ok();
-                    }
-                }
-                (false, Some(index)) if index.complete && index.generation + 1 == newgen => {
-                    if index.insert(&evict_entry, &evict_doc).is_ok() {
-                        index.generation = newgen;
-                    } else {
-                        *index_guard = None;
-                    }
-                }
-                (false, _) => {
-                    if let Some(pages) = guard.as_ref() {
-                        *index_guard = ReferenceCandidateIndex::build(newgen, pages).ok();
-                    }
-                }
-            }
-        }
         drop(guard);
-        {
-            let mut counts = self.block_ref_count_cache.write().unwrap();
-            if block_refs_touched {
-                *counts = None;
-            } else if let Some((generation, _)) = counts.as_mut() {
-                *generation = newgen;
-            }
-        }
-        if alias_touched {
-            *self.alias_cache.write().unwrap() = None;
-        }
         // Same treatment for the physical page inventory, and for the same
-        // reason as `block_ref_count_cache` above. `list_pages` is keyed on raw
+        // reason as other generation-bound derived inventories. `list_pages` is keyed on raw
         // `cache_gen` equality, and its ONLY way to rebuild is to walk the graph
         // text scope, re-read every file from disk and re-parse each one.
         // Measured at ~35 µs/file, dead linear from 506 to 8,006 pages: 243 ms on
@@ -14787,8 +14386,7 @@ impl Graph {
         // unrelated page was created is stale at an older generation, and
         // stamping it as current republishes that staleness permanently —
         // `list_pages` is keyed on generation equality, so it never rebuilds and
-        // the missing page becomes unloadable. The reference-candidate index
-        // above already uses exactly this guard for exactly this reason.
+        // the missing page becomes unloadable.
         if cache_built && !identity_changed && !is_new_page && !failures_changed {
             if let Some((generation, _)) = self.page_list_cache.write().unwrap().as_mut() {
                 if *generation + 1 == newgen {
@@ -15020,8 +14618,6 @@ impl Graph {
         *self.derived_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
-        let mut alias_touched = false;
-        let mut block_refs_touched = false;
         let mut removed_entries = Vec::new();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
@@ -15036,13 +14632,7 @@ impl Graph {
             let removed_paths = pages
                 .iter()
                 .filter(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
-                .map(|(e, doc)| {
-                    alias_touched |= !crate::query::document_aliases(doc).is_empty();
-                    block_refs_touched |= document_block_ref_counts(doc)
-                        .as_ref()
-                        .map_or(true, |counts| !counts.is_empty());
-                    e.path.clone()
-                })
+                .map(|(e, _)| e.path.clone())
                 .collect::<Vec<_>>();
             pages.retain(|(e, _)| !(e.kind == kind && crate::refs::same_page(&e.name, name)));
             // Drop all exact revisions removed by this ambiguity-validated logical
@@ -15063,8 +14653,6 @@ impl Graph {
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1;
         if let Some(pages) = guard.as_ref() {
-            *self.reference_candidate_index.write().unwrap() =
-                ReferenceCandidateIndex::build(newgen, pages).ok();
             *self.effective_identity_index.write().unwrap() =
                 Some(Arc::new(build_effective_identity_index(
                     newgen,
@@ -15072,21 +14660,9 @@ impl Graph {
                     self.page_index_failures.read().unwrap().clone(),
                 )));
         } else {
-            *self.reference_candidate_index.write().unwrap() = None;
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
-        {
-            let mut counts = self.block_ref_count_cache.write().unwrap();
-            if block_refs_touched {
-                *counts = None;
-            } else if let Some((generation, _)) = counts.as_mut() {
-                *generation = newgen;
-            }
-        }
-        if alias_touched {
-            *self.alias_cache.write().unwrap() = None;
-        }
         for entry in removed_entries {
             self.direct_projection_enqueue_delete(newgen, entry);
         }
@@ -15101,15 +14677,9 @@ impl Graph {
         *self.derived_cache.write().unwrap() = None;
         *self.advanced_cache.write().unwrap() = None;
         let mut guard = self.cache.write().unwrap();
-        let mut alias_touched = false;
-        let mut block_refs_touched = false;
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
             if let Some(i) = self.cached_page_index_for_path(pages, &entry.path) {
-                alias_touched = !crate::query::document_aliases(&pages[i].1).is_empty();
-                block_refs_touched = document_block_ref_counts(&pages[i].1)
-                    .as_ref()
-                    .map_or(true, |counts| !counts.is_empty());
                 pages.remove(i);
                 // Drop the rev under the cache lock (same cache → disk_revs order
                 // as cache_upsert) so the two never diverge.
@@ -15125,8 +14695,6 @@ impl Graph {
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             + 1;
         if let Some(pages) = guard.as_ref() {
-            *self.reference_candidate_index.write().unwrap() =
-                ReferenceCandidateIndex::build(newgen, pages).ok();
             *self.effective_identity_index.write().unwrap() =
                 Some(Arc::new(build_effective_identity_index(
                     newgen,
@@ -15134,21 +14702,9 @@ impl Graph {
                     self.page_index_failures.read().unwrap().clone(),
                 )));
         } else {
-            *self.reference_candidate_index.write().unwrap() = None;
             *self.effective_identity_index.write().unwrap() = None;
         }
         drop(guard);
-        {
-            let mut counts = self.block_ref_count_cache.write().unwrap();
-            if block_refs_touched {
-                *counts = None;
-            } else if let Some((generation, _)) = counts.as_mut() {
-                *generation = newgen;
-            }
-        }
-        if alias_touched {
-            *self.alias_cache.write().unwrap() = None;
-        }
         self.direct_projection_enqueue_delete(newgen, entry.clone());
     }
 
@@ -24559,84 +24115,6 @@ fn document_source_metrics(doc: &Document) -> io::Result<(u64, u64, u64)> {
     Ok((blocks, source, largest_raw))
 }
 
-fn cache_page_derived_upper_bound(
-    entry: &PageEntry,
-    blocks: u64,
-    source: u64,
-    largest_raw: u64,
-) -> io::Result<u64> {
-    // Every explicit reference, block reference, alias, or token consumes at
-    // least one source byte. `units` therefore bounds every retained row count,
-    // while `source` bounds the aggregate owned text payload for each class.
-    let units = source.max(blocks);
-    let mut bytes = checked_add_bytes(
-        conservative_hash_entry_bytes::<PathBuf, ReferencePageProjection>()?,
-        owned_path_upper_bound(&entry.path)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        usize_to_u64(std::mem::size_of::<ReferenceTokenSignature>())?,
-    )?;
-    bytes = checked_add_bytes(bytes, owned_string_upper_bound(&entry.name)?)?;
-    bytes = checked_add_bytes(bytes, owned_string_upper_bound(&entry.name)?)?;
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_vec_capacity_upper_bound::<String>(units)?,
-    )?;
-    // Projection explicit names, inverted explicit keys, block-ref keys,
-    // aliases/real-page names, and scoped invalidation maps.
-    for _class in [
-        "projection explicit names",
-        "inverted explicit keys",
-        "block-reference keys",
-        "alias names",
-        "scoped invalidation names",
-    ] {
-        bytes = checked_add_bytes(bytes, owned_string_len_upper_bound(source)?)?;
-    }
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(
-            units,
-            checked_add_bytes(
-                conservative_hash_entry_bytes::<String, std::collections::BTreeSet<PathBuf>>()?,
-                checked_add_bytes(
-                    conservative_btree_entry_bytes::<PathBuf, ()>()?,
-                    owned_path_upper_bound(&entry.path)?,
-                )?,
-            )?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_mul_bytes(units, conservative_hash_entry_bytes::<String, usize>()?)?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        conservative_hash_entry_bytes::<String, std::collections::BTreeMap<PathBuf, String>>()?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        checked_add_bytes(
-            conservative_btree_entry_bytes::<PathBuf, String>()?,
-            checked_add_bytes(
-                owned_path_upper_bound(&entry.path)?,
-                owned_string_upper_bound(&entry.name)?,
-            )?,
-        )?,
-    )?;
-    bytes = checked_add_bytes(
-        bytes,
-        managed_block_walk_stack_upper_bound::<Option<std::slice::Iter<'_, DocBlock>>>()?,
-    )?;
-    // Unicode lowercase/NFC folding owns at most three UTF-8 bytes per source
-    // byte for the currently processed block; it is scratch, not per-row state.
-    checked_add_bytes(
-        bytes,
-        owned_string_len_upper_bound(checked_mul_bytes(largest_raw, 3)?)?,
-    )
-}
-
 fn usize_to_u64(value: usize) -> io::Result<u64> {
     u64::try_from(value).map_err(|_| allocation_overflow())
 }
@@ -33725,276 +33203,6 @@ mod tests {
         paths
     }
 
-    fn assert_reference_candidates_equal_full_scan(
-        graph: &Graph,
-        target: &str,
-        names: &[String],
-        kind: ReferenceKind,
-    ) {
-        let aliases = graph.page_aliases();
-        let real_pages = crate::query::real_page_names(graph);
-        let exact_paths = |pages: &[(PageEntry, Arc<Document>)]| {
-            let mut paths = pages
-                .iter()
-                .filter(|(entry, doc)| match kind {
-                    ReferenceKind::Explicit => crate::query::page_affects_backlinks(
-                        &real_pages,
-                        &aliases,
-                        target,
-                        entry,
-                        doc,
-                    ),
-                    ReferenceKind::Plain => crate::query::page_affects_unlinked(
-                        &real_pages,
-                        &aliases,
-                        target,
-                        entry,
-                        doc,
-                    ),
-                })
-                .map(|(entry, _)| entry.rel_path.clone())
-                .collect::<Vec<_>>();
-            paths.sort();
-            paths
-        };
-        let full = graph.with_pages(exact_paths);
-        let candidates = graph.reference_candidate_pages(names, kind);
-        assert_eq!(exact_paths(&candidates.pages), full);
-    }
-
-    fn assert_indexed_reference_results_equal_full_scan(graph: &Graph, target: &str) {
-        {
-            let mut guard = graph.reference_candidate_index.write().unwrap();
-            let index = guard.as_mut().unwrap();
-            index.complete = true;
-            index.generation = graph.cache_generation();
-        }
-        let indexed_backlinks = crate::query::backlinks(graph, target);
-        let indexed_unlinked = crate::query::unlinked_refs(graph, target);
-        graph
-            .reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = false;
-        let full_backlinks = crate::query::backlinks(graph, target);
-        let full_unlinked = crate::query::unlinked_refs(graph, target);
-        assert_eq!(
-            serde_json::to_value(indexed_backlinks).unwrap(),
-            serde_json::to_value(full_backlinks).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(indexed_unlinked).unwrap(),
-            serde_json::to_value(full_unlinked).unwrap()
-        );
-        graph
-            .reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = true;
-    }
-
-    #[test]
-    fn reference_candidate_index_tracks_every_cache_seam_and_falls_back_safely() {
-        let dir = scratch("reference-candidate-index");
-        fs::write(
-            dir.join("pages/Target.md"),
-            "alias:: Alias\n\n- target body\n",
-        )
-        .unwrap();
-        let source_path = dir.join("pages/Source.md");
-        fs::write(&source_path, "- [[Alias]] and plain Target\n").unwrap();
-        fs::write(dir.join("pages/Irrelevant.md"), "- unrelated\n").unwrap();
-        let g = Graph::open(&dir);
-        g.warm_cache();
-
-        let names = vec![
-            crate::refs::page_key("Target"),
-            crate::refs::page_key("Alias"),
-        ];
-        let explicit = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(explicit.indexed);
-        assert!(candidate_paths(&explicit).contains(&"pages/Source.md".to_string()));
-        assert!(explicit.pages.len() < explicit.full_page_count);
-        let plain = g.reference_candidate_pages(&names, ReferenceKind::Plain);
-        assert!(plain.indexed);
-        assert!(candidate_paths(&plain).contains(&"pages/Source.md".to_string()));
-        let unicode_fallback =
-            g.reference_candidate_pages(&[crate::refs::page_key("Café")], ReferenceKind::Plain);
-        assert!(!unicode_fallback.indexed);
-        assert_eq!(
-            unicode_fallback.pages.len(),
-            unicode_fallback.full_page_count
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // Normal save/cache-upsert removes both projections without rebuilding
-        // the graph cache.
-        let mut source = g.load_named("Source", PageKind::Page).unwrap().unwrap();
-        source.blocks[0].raw = "nothing here".into();
-        g.save_page(&source, source.rev.as_deref()).unwrap();
-        assert!(
-            !candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Explicit))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert!(
-            !candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Plain))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // Watcher-equivalent physical replace is an upsert at the same seam.
-        fs::write(&source_path, "- [[Target]] plus Target\n").unwrap();
-        assert!(g.sync_file(&source_path).is_some());
-        assert!(
-            candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Explicit))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        g.delete_page("Source", PageKind::Page).unwrap();
-        let after_delete = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(after_delete.indexed);
-        assert!(!candidate_paths(&after_delete).contains(&"pages/Source.md".to_string()));
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // A broad invalidation reconstructs from the new physical page set.
-        fs::write(&source_path, "- [[Alias]] and Target again\n").unwrap();
-        g.invalidate_cache();
-        g.warm_cache();
-        assert!(
-            candidate_paths(&g.reference_candidate_pages(&names, ReferenceKind::Explicit))
-                .contains(&"pages/Source.md".to_string())
-        );
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        assert!(g
-            .create_markdown_page_if_absent("Created", "- [[Target]] and Target\n")
-            .unwrap());
-        let after_create = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(after_create.indexed);
-        assert!(candidate_paths(&after_create).contains(&"pages/Created.md".to_string()));
-        assert_indexed_reference_results_equal_full_scan(&g, "Target");
-
-        // Deliberate incompleteness can never narrow the authority set.
-        g.reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = false;
-        let fallback = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(!fallback.indexed);
-        assert_eq!(fallback.pages.len(), fallback.full_page_count);
-        assert_eq!(fallback.full_page_count, 4);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Explicit);
-        assert_reference_candidates_equal_full_scan(&g, "Target", &names, ReferenceKind::Plain);
-
-        let current_generation = g.cache_generation();
-        {
-            let mut guard = g.reference_candidate_index.write().unwrap();
-            let index = guard.as_mut().unwrap();
-            index.complete = true;
-            index.generation = current_generation.saturating_sub(1);
-        }
-        let stale_fallback = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        assert!(!stale_fallback.indexed);
-        assert_eq!(stale_fallback.pages.len(), stale_fallback.full_page_count);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn plain_reference_signature_folds_unicode_before_ascii_tokenizing() {
-        let dir = scratch("reference-candidate-unicode-fold");
-        fs::write(dir.join("pages/K.md"), "- target body\n").unwrap();
-        fs::write(dir.join("pages/Source.md"), "- plain K mention\n").unwrap();
-        fs::write(dir.join("pages/Irrelevant.md"), "- unrelated\n").unwrap();
-        let g = Graph::open(&dir);
-        g.warm_cache();
-
-        let names = vec![crate::refs::page_key("K")];
-        let candidates = g.reference_candidate_pages(&names, ReferenceKind::Plain);
-        assert!(candidates.indexed);
-        assert!(candidate_paths(&candidates).contains(&"pages/Source.md".to_string()));
-        assert!(candidates.pages.len() < candidates.full_page_count);
-        assert_reference_candidates_equal_full_scan(&g, "K", &names, ReferenceKind::Plain);
-        assert_indexed_reference_results_equal_full_scan(&g, "K");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    #[ignore = "10k synthetic performance receipt"]
-    fn reference_candidate_index_10k_receipt() {
-        let dir = scratch("reference-candidate-10k");
-        for index in 0..10_000 {
-            let body = if index % 1_000 == 0 {
-                format!("- [[Needle]] explicit Needle {index}\n")
-            } else if index % 500 == 0 {
-                format!("- plain Needle {index}\n")
-            } else {
-                format!("- ordinary synthetic page {index}\n")
-            };
-            fs::write(dir.join("pages").join(format!("Page {index:05}.md")), body).unwrap();
-        }
-        let g = Graph::open(&dir);
-        let started = std::time::Instant::now();
-        g.with_pages(|_| ());
-        let build_ms = started.elapsed().as_millis();
-        let names = vec![crate::refs::page_key("Needle")];
-        let explicit = g.reference_candidate_pages(&names, ReferenceKind::Explicit);
-        let plain = g.reference_candidate_pages(&names, ReferenceKind::Plain);
-        let estimated_bytes = g
-            .reference_candidate_index
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .estimated_bytes();
-        let indexed_backlinks = crate::query::backlinks(&g, "Needle");
-        let indexed_unlinked = crate::query::unlinked_refs(&g, "Needle");
-        g.reference_candidate_index
-            .write()
-            .unwrap()
-            .as_mut()
-            .unwrap()
-            .complete = false;
-        let full_backlinks = crate::query::backlinks(&g, "Needle");
-        let full_unlinked = crate::query::unlinked_refs(&g, "Needle");
-        assert!(explicit.indexed && plain.indexed);
-        assert_eq!(explicit.pages.len(), 10);
-        assert!(plain.pages.len() >= 20);
-        assert_eq!(
-            serde_json::to_value(&indexed_backlinks).unwrap(),
-            serde_json::to_value(&full_backlinks).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&indexed_unlinked).unwrap(),
-            serde_json::to_value(&full_unlinked).unwrap()
-        );
-        eprintln!(
-            "reference-index-10k build_ms={build_ms} estimated_bytes={estimated_bytes} explicit_candidates={} plain_candidates={} full_pages={} linked_exact_equal=true unlinked_exact_equal=true",
-            explicit.pages.len(),
-            plain.pages.len(),
-            explicit.full_page_count,
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn search_cache_isolates_one_page_projection_panic() {
         let dir = scratch("search-page-panic-isolation");
@@ -34890,95 +34098,6 @@ mod tests {
     }
 
     #[test]
-    fn warm_cache_primes_alias_and_block_ref_count_caches() {
-        let dir = scratch("warm-derived");
-        fs::write(
-            dir.join("pages").join("Target.md"),
-            "alias:: Alias One\n\n- target\n  id:: aaaaaaaa-0000-0000-0000-000000000001\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("pages").join("Refs.md"),
-            "- see ((aaaaaaaa-0000-0000-0000-000000000001))\n",
-        )
-        .unwrap();
-
-        let g = Graph::open(&dir);
-        assert!(
-            g.alias_cache.read().unwrap().is_none(),
-            "alias cache starts cold"
-        );
-        assert!(
-            g.block_ref_count_cache.read().unwrap().is_none(),
-            "block-ref count cache starts cold"
-        );
-
-        g.warm_cache();
-
-        let aliases = g.alias_cache.read().unwrap().as_ref().cloned().unwrap();
-        assert!(
-            aliases
-                .iter()
-                .any(|(alias, canon, _)| alias == "alias one" && canon == "Target"),
-            "alias cache warmed: {aliases:?}"
-        );
-        let gen = g.cache_generation();
-        let counts = g.block_ref_count_cache.read().unwrap();
-        let (count_gen, count_map) = counts.as_ref().expect("block-ref count cache warmed");
-        assert_eq!(
-            *count_gen, gen,
-            "count cache is keyed to the current cache generation"
-        );
-        assert_eq!(
-            count_map
-                .get("aaaaaaaa-0000-0000-0000-000000000001")
-                .copied(),
-            Some(1)
-        );
-
-        let first = g.block_ref_counts().unwrap();
-        let second = g.block_ref_counts().unwrap();
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "re-entering block_ref_counts should reuse the warmed Arc"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn non_reference_edit_reuses_block_ref_count_index() {
-        let dir = scratch("block-ref-count-scoped");
-        fs::write(
-            dir.join("pages").join("Target.md"),
-            "- target\n  id:: aaaaaaaa-0000-0000-0000-000000000001\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("pages").join("Refs.md"),
-            "- see ((aaaaaaaa-0000-0000-0000-000000000001))\n",
-        )
-        .unwrap();
-
-        let g = Graph::open(&dir);
-        g.warm_cache();
-        let before = g.block_ref_counts().unwrap();
-        let mut target = g.load_named("Target", PageKind::Page).unwrap().unwrap();
-        target.blocks[0].raw = "target edited without changing references".into();
-        g.save_page(&target, target.rev.as_deref()).unwrap();
-        let after = g.block_ref_counts().unwrap();
-
-        assert!(
-            Arc::ptr_eq(&before, &after),
-            "a non-reference edit must retain the already-built whole-graph count map"
-        );
-        assert_eq!(
-            after.get("aaaaaaaa-0000-0000-0000-000000000001").copied(),
-            Some(1)
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn migrate_recovers_title_named_org_journals() {
         // Regression: changing :journal/page-title-format while a stale in-memory
         // format was still active saved new journals under their title
@@ -35359,36 +34478,6 @@ mod tests {
         let other = fs::read_to_string(dir.join("pages").join("Other.md")).unwrap();
         assert!(other.contains("[[Beta]]"), "ref rewritten to [[Beta]]");
         assert!(!other.contains("[[Alpha]]"), "no stale [[Alpha]] left");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rename_falls_back_when_a_non_candidate_changed_on_disk() {
-        let dir = scratch("rename-stale-non-candidate");
-        fs::write(dir.join("pages/Old.md"), "- old body\n").unwrap();
-        let referrer = dir.join("pages/Referrer.md");
-        fs::write(&referrer, "- unrelated\n").unwrap();
-        let g = Graph::open(&dir);
-        g.warm_cache();
-
-        let entries = g.list_pages();
-        let names = vec![crate::refs::page_key("Old")];
-        let initial_candidates = g
-            .reference_candidate_paths_for_entries(&names, &entries)
-            .expect("warm coherent index should narrow");
-        assert!(!initial_candidates.contains(&referrer));
-
-        fs::write(&referrer, "- newly landed [[Old]] reference\n").unwrap();
-        assert!(
-            g.reference_candidate_paths_for_entries(&names, &entries)
-                .is_none(),
-            "disk-ahead-of-cache content must force the full rename scan"
-        );
-
-        g.rename_page("Old", "New").unwrap();
-        let rewritten = fs::read_to_string(&referrer).unwrap();
-        assert!(rewritten.contains("[[New]]"));
-        assert!(!rewritten.contains("[[Old]]"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -36315,7 +35404,6 @@ mod tests {
                 assert_eq!(outcome, PageCacheInstallOutcome::GenerationDrift);
                 assert!(graph.cache.read().unwrap().is_none());
                 assert!(graph.cache_index.read().unwrap().is_none());
-                assert!(graph.reference_candidate_index.read().unwrap().is_none());
                 assert!(graph.disk_revs.read().unwrap().is_empty());
                 assert!(graph.effective_identity_index.read().unwrap().is_none());
             } else {
@@ -48038,33 +47126,20 @@ mod tests {
                 (target_entry.clone(), Arc::new(target_doc.clone())),
             ],
         );
-        assert!(
-            accepted_snapshot
-                .reference_candidate_index
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|index| index.complete),
-            "depth-128 reference index must be complete",
-        );
         let target_names = vec![crate::refs::page_key("Deep target")];
         let accepted_candidates =
             accepted_snapshot.reference_candidate_pages(&target_names, ReferenceKind::Explicit);
-        assert!(accepted_candidates.indexed);
+        assert!(!accepted_candidates.indexed);
         assert_eq!(
             candidate_paths(&accepted_candidates),
-            vec!["pages/Source.md".to_owned()],
+            vec![
+                "pages/Deep target.md".to_owned(),
+                "pages/Source.md".to_owned(),
+            ],
+            "without an attached current SQLite projection, exact parser fallback must retain the complete snapshot",
         );
         let accepted_counts = accepted_snapshot.block_ref_counts().unwrap();
         assert_eq!(accepted_counts.get(TARGET_ID).copied(), Some(1));
-        assert!(
-            accepted_snapshot
-                .block_ref_count_cache
-                .read()
-                .unwrap()
-                .is_some(),
-            "complete depth-128 counts should be memoized",
-        );
 
         let accepted_graph = Graph::open(&dir);
         *accepted_graph.cache.write().unwrap() =
@@ -48097,14 +47172,6 @@ mod tests {
                 (target_entry, Arc::new(target_doc)),
             ],
         );
-        assert!(
-            rejected_snapshot
-                .reference_candidate_index
-                .read()
-                .unwrap()
-                .is_none(),
-            "an over-depth build must not publish a partial candidate index",
-        );
         for _ in 0..2 {
             let candidates =
                 rejected_snapshot.reference_candidate_pages(&target_names, ReferenceKind::Explicit);
@@ -48114,26 +47181,9 @@ mod tests {
                 candidate_paths(&candidates).contains(&"pages/Source.md".to_owned()),
                 "the deepest possible referrer must remain in the fallback set",
             );
-            assert!(
-                rejected_snapshot
-                    .reference_candidate_index
-                    .read()
-                    .unwrap()
-                    .is_none(),
-                "fallback must not memoize a partial candidate index",
-            );
-
             assert_eq!(
                 rejected_snapshot.block_ref_counts().unwrap_err().kind(),
                 io::ErrorKind::InvalidData,
-            );
-            assert!(
-                rejected_snapshot
-                    .block_ref_count_cache
-                    .read()
-                    .unwrap()
-                    .is_none(),
-                "over-depth counting must not memoize partial counts",
             );
         }
 

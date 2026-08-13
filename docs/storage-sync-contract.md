@@ -101,7 +101,9 @@ stamp. Markdown/Org remains the sole Direct Files authority.
 
 The existing parsed `PageEntry + Arc<Document>` cache feeds one background
 SQLite owner. The database retains each page's exact caller-owned content
-revision as disposable adapter metadata. A full warm-cache installation
+revision together with the Direct fact-extractor version as disposable adapter
+metadata. Bumping that extractor version forces one background re-lowering when
+unchanged source bytes acquire new physical facts. A full warm-cache installation
 compares those revisions and lowers only changed or missing pages; a clean
 reopen lowers none. One-page cache upserts and deletes enqueue coalesced page
 deltas. The editor, watcher, and save paths never wait for SQL. Indexed reads
@@ -119,20 +121,25 @@ The switched read families are the conservative task-query subset already
 accepted by `sparse_task_query_eligibility` (task markers plus priority,
 scheduled/deadline and presentation directives), literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
-inventory used by autocomplete and navigation. Once current, these families
+inventory used by autocomplete and navigation. They also include page aliases
+and real-page ownership, explicit backlink and safely tokenizable unlinked-
+reference candidate selection, persisted/runtime block-identity lookup,
+block-referrer candidates, and distinct-referrer counts. Once current, these families
 enumerate SQLite task candidates and re-evaluate every returned raw block
 through the existing parser query evaluator, or obtain a generation-bound
 candidate/name set before applying the existing parser-owned matching and
 presentation semantics. They no longer use manual whole-graph candidate scans
-or a second in-memory referenced-name semantic cache as their ordinary route.
+or second in-memory alias, reference-candidate, block-identity, referenced-name,
+or block-ref-count semantic caches as their ordinary route.
 The bounded generation-keyed
 memo of already-shaped frontend result DTOs remains Tine-native: SQLite cannot
 own parser AST semantics or presentation reuse, and dropping that memo would
 turn reactive re-renders into repeated SQL plus parser evaluation. If SQLite is
 unavailable, the same parser evaluator remains the correctness fallback; it is
 not a second candidate index. Referenced-name fallback walks only the already-
-parsed page cache and deliberately retains no separate semantic memo. All other
-query, reference, navigation, and search families retain their existing
+parsed page cache and deliberately retains no separate semantic memo. Non-UUID
+`id::` values and names that cannot be safely narrowed by SQLite tokenization
+also use that parser fallback. All other query, navigation, and search families retain their existing
 implementation until an equivalent generation-bound differential packet
 replaces and deletes each old route.
 

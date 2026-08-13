@@ -767,7 +767,7 @@ fn page_icons_answer_from_cached_pages_with_page_key_lookup() {
 }
 
 #[test]
-fn resolve_blocks_uses_indexed_hinted_page_lookup() {
+fn resolve_blocks_uses_hinted_page_lookup_without_per_hint_linear_scans() {
     let src = include_str!("../src/query.rs");
     assert!(
         !src.contains("pages.iter().find(|(e, _)| &e.name == page)"),
@@ -789,7 +789,7 @@ fn run_advanced_query_uses_generation_keyed_memo_cache() {
 }
 
 #[test]
-fn resolve_block_index_refreshes_after_cache_change() {
+fn resolve_block_refreshes_after_cache_change() {
     let root = mk("blockidx");
     std::fs::write(
         root.join("pages").join("A.md"),
@@ -798,7 +798,7 @@ fn resolve_block_index_refreshes_after_cache_change() {
     .unwrap();
     let g = Graph::open(&root);
     g.warm_cache();
-    // First resolve builds the gen-keyed uuid index.
+    // Prime resolution against the first exact cache generation.
     assert_eq!(g.resolve_block("aaaa-1111").unwrap().page, "A");
 
     // A new page appears on disk; invalidate the cache as the watcher would.
@@ -808,8 +808,8 @@ fn resolve_block_index_refreshes_after_cache_change() {
     )
     .unwrap();
     g.invalidate_cache();
-    // The index must rebuild against the fresh cache — not serve a stale "not
-    // found" for the new block, nor lose the old one.
+    // Resolution must use the fresh cache — not serve a stale "not found" for
+    // the new block, nor lose the old one.
     assert_eq!(g.resolve_block("bbbb-2222").unwrap().page, "B");
     assert_eq!(g.resolve_block("aaaa-1111").unwrap().page, "A");
     let _ = std::fs::remove_dir_all(&root);

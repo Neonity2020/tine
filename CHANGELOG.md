@@ -14,6 +14,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 - **Block search, the `((` picker, and referenced-page autocomplete now share the same disposable SQLite fact layer in Direct Files and managed storage.** SQLite supplies only generation-coherent candidates and original-case reference spellings; Tine's existing parser still owns exact fuzzy matching, ordering, property-reference rules, and presentation. The ordinary ready path no longer scans every parsed block or maintains a second referenced-name semantic cache. Missing, stale, leased, or incompatible SQLite state still falls back to the already-parsed graph without blocking open, edit, save, or external-file observation.
 
+- **Aliases, backlinks, unlinked references, and block-reference lookup/counting now use that same disposable SQLite projection in Direct Files.** SQLite narrows only an exact current cache generation and Tine still verifies every semantic result with the parser; unsafe tokenless names and non-UUID `id::` values use the parser fallback. The former in-memory alias, reference-candidate, block-identity, and block-reference-count indices and their foreground maintenance have been removed rather than retained beside SQLite.
+
 ### Fixed
 
 - Android managed-storage activation now uses the ordinary app-private
