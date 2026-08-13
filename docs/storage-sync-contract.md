@@ -240,6 +240,14 @@ available. Honest concurrent Tine writers remain excluded by the runtime lease;
 a hostile process inside the same application sandbox is outside this threat
 model.
 
+Before an enrollment binding exists, projection receipts are reconstructible
+bootstrap state rather than authority. If Android cannot reopen a receipt tree
+left by an interrupted or older activation, retry retains one sibling
+`receipts.pre-promotion-failed` diagnostic tree and initializes a clean receipt
+store from the unchanged Markdown/Org source. Once enrollment has promoted the
+receipt-store identity, this recovery is forbidden: normal exact identity and
+receipt recovery rules apply.
+
 The graph-local shared-provider tree is transport rather than local authority.
 Tine still creates and opens it no-follow, requires ordinary directories and
 regular files, flushes published file contents, and validates bounded bytes and

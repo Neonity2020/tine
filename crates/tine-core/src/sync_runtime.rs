@@ -4875,12 +4875,7 @@ fn activate_non_active_local(
             binding.receipt_store_id(),
         )
         .map_err(|error| format!("open existing private projection receipts: {error}"))?,
-        None => ProjectionReceiptStore::open_for_endpoint(
-            &request.receipt_root,
-            request.identities.workspace_id,
-            endpoint,
-        )
-        .map_err(|error| format!("create private projection receipts: {error}"))?,
+        None => open_reconstructible_activation_receipts(&request, endpoint)?,
     };
 
     // Capture precedes every graph-local sparse archive write. The capture is
@@ -5137,6 +5132,88 @@ fn activate_non_active_local(
         session_id: request.identities.session_id,
         promotion_session_id,
         promoted_state_digest,
+    })
+}
+
+fn open_reconstructible_activation_receipts(
+    request: &SyncLocalActivationRequest,
+    endpoint: ProjectionEndpointBinding,
+) -> Result<ProjectionReceiptStore, String> {
+    let first = ProjectionReceiptStore::open_for_endpoint(
+        &request.receipt_root,
+        request.identities.workspace_id,
+        endpoint,
+    );
+    match first {
+        Ok(receipts) => Ok(receipts),
+        Err(first_error) => {
+            #[cfg(target_os = "android")]
+            {
+                // No enrollment binding exists yet, so Markdown/Org is still
+                // the sole authority and this receipt tree cannot contain a
+                // promoted mutation. Older Android candidates may have left a
+                // partially initialized tree whose directory handles or modes
+                // the current app UID cannot reuse. Preserve one diagnostic
+                // copy, then prove that ordinary creation can start cleanly.
+                archive_pre_promotion_receipts(&request.receipt_root).map_err(|error| {
+                    format!(
+                        "create private projection receipts: {first_error}; archive reconstructible pre-promotion receipt state: {error}"
+                    )
+                })?;
+                return ProjectionReceiptStore::open_for_endpoint(
+                    &request.receipt_root,
+                    request.identities.workspace_id,
+                    endpoint,
+                )
+                .map_err(|retry_error| {
+                    format!(
+                        "create private projection receipts: {first_error}; clean Android receipt rebuild also failed: {retry_error}"
+                    )
+                });
+            }
+
+            #[cfg(not(target_os = "android"))]
+            Err(format!("create private projection receipts: {first_error}"))
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "android"))]
+fn archive_pre_promotion_receipts(receipt_root: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(receipt_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!("inspect {}: {error}", receipt_root.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{} is not a real private directory",
+            receipt_root.display()
+        ));
+    }
+    let name = receipt_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "private receipt root has no UTF-8 filename".to_owned())?;
+    let archived = receipt_root.with_file_name(format!("{name}.pre-promotion-failed"));
+    match fs::remove_dir_all(&archived) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "remove prior diagnostic {}: {error}",
+                archived.display()
+            ));
+        }
+    }
+    fs::rename(receipt_root, &archived).map_err(|error| {
+        format!(
+            "move {} to {}: {error}",
+            receipt_root.display(),
+            archived.display()
+        )
     })
 }
 
@@ -24889,6 +24966,34 @@ mod tests {
             detail,
             "initialize private receipt store: open namespace: permission denied; storage rediscovery: activation can be resumed"
         );
+    }
+
+    #[test]
+    fn pre_promotion_receipt_retry_preserves_one_diagnostic_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-pre-promotion-receipts-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let receipts = root.join("receipts");
+        fs::create_dir_all(&receipts).unwrap();
+        fs::write(receipts.join("interrupted.tmp"), b"partial receipt bytes").unwrap();
+
+        archive_pre_promotion_receipts(&receipts).unwrap();
+
+        assert!(!receipts.exists());
+        assert_eq!(
+            fs::read(root.join("receipts.pre-promotion-failed/interrupted.tmp")).unwrap(),
+            b"partial receipt bytes"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_contract_limits_receipt_rebuild_to_pre_enrollment_android_state() {
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("Before an enrollment binding exists"));
+        assert!(contract.contains("receipts.pre-promotion-failed"));
+        assert!(contract.contains("Once enrollment has promoted"));
     }
 
     #[test]
