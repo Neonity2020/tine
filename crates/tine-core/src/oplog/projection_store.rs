@@ -210,10 +210,20 @@ fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionSto
                 "private receipt directory name is not one normal component: {name}"
             )));
         }
-        match root.create_dir(component) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+        let component = CString::new(name).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "invalid private receipt directory")
+        })?;
+        // Keep this on the same ordinary Android syscall boundary as the
+        // directory open below. cap-std's create_dir adds Linux capability
+        // preflights which some physical app-private filesystems reject even
+        // though mkdirat/openat themselves are permitted.
+        let created =
+            unsafe { libc::mkdirat(root.as_fd().as_raw_fd(), component.as_ptr(), libc::S_IRWXU) };
+        if created < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != ErrorKind::AlreadyExists {
+                return Err(error.into());
+            }
         }
         // Reopen and classify the actual handle. Android app-private state has
         // one honest Tine writer, so an fstatat-style preflight adds no safety
@@ -357,9 +367,27 @@ fn publish_android_private_immutable(
     }
 
     let temp_name = format!(".tmp-{}", Uuid::new_v4());
-    let mut options = CapOpenOptions::new();
-    options.write(true).create_new(true);
-    let mut temp = dir.open_with(&temp_name, &options)?;
+    let temp_name_c = CString::new(temp_name.as_str())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt temp filename"))?;
+    let filename_c = CString::new(filename)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt filename"))?;
+    // As for receipt directories, use the ordinary Android primitive without
+    // the hostile-namespace flags added by the generic capability publisher.
+    // The retained file is still create-new, fully synced, and verified byte
+    // for byte before this pre-promotion store is accepted.
+    let temp_fd = unsafe {
+        libc::openat(
+            dir.as_fd().as_raw_fd(),
+            temp_name_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            libc::S_IRUSR | libc::S_IWUSR,
+        )
+    };
+    if temp_fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: openat returned one newly owned descriptor.
+    let mut temp = unsafe { File::from_raw_fd(temp_fd) };
     let result = (|| {
         temp.write_all(bytes)?;
         temp.sync_all()?;
@@ -369,7 +397,17 @@ fn publish_android_private_immutable(
             return Ok(());
         }
 
-        dir.rename(&temp_name, dir, filename)?;
+        let renamed = unsafe {
+            libc::renameat(
+                dir.as_fd().as_raw_fd(),
+                temp_name_c.as_ptr(),
+                dir.as_fd().as_raw_fd(),
+                filename_c.as_ptr(),
+            )
+        };
+        if renamed < 0 {
+            return Err(StoreError::Io(io::Error::last_os_error()));
+        }
         crate::filesystem_durability::sync_reconstructible_directory(dir)?;
         if !verify_existing()? {
             return Err(StoreError::Io(io::Error::new(
@@ -379,7 +417,11 @@ fn publish_android_private_immutable(
         }
         Ok(())
     })();
-    let cleanup = dir.remove_file(&temp_name);
+    let cleanup = match unsafe { libc::unlinkat(dir.as_fd().as_raw_fd(), temp_name_c.as_ptr(), 0) }
+    {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    };
     if let Err(error) = result {
         let _ = cleanup;
         return Err(error);
