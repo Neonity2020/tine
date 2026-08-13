@@ -47919,12 +47919,29 @@ mod tests {
             latency_us.sort_unstable();
             let percentile = |percent: usize| latency_us[(latency_us.len() - 1) * percent / 100];
             let mean_us = latency_us.iter().copied().sum::<u64>() / latency_us.len() as u64;
+            let p95_us = percentile(95);
+            let max_us = latency_us[latency_us.len() - 1];
             eprintln!(
                 "managed_sync_latency corpus={label} edits={EDITS} min_us={} p50_us={} p95_us={} max_us={} mean_us={mean_us}",
                 latency_us[0],
                 percentile(50),
-                percentile(95),
-                latency_us[latency_us.len() - 1],
+                p95_us,
+                max_us,
+            );
+            // This excludes a sync provider's own network/scan delay: it gates
+            // Tine's author publication, exact provider transfer, peer
+            // admission, SQLite projection, and query visibility. The first
+            // real-corpus receipt measured 539.600/588.501 ms p95 and
+            // 549.098/612.280 ms max. Keep bounded margin for host variance,
+            // but do not let Tine consume seconds before the provider has even
+            // entered the picture.
+            assert!(
+                p95_us < 750_000,
+                "managed device-to-device application latency exceeded 750 ms p95 for {label}: p95_us={p95_us}"
+            );
+            assert!(
+                max_us < 1_000_000,
+                "managed device-to-device application latency exceeded one second for {label}: max_us={max_us}"
             );
             assert!(matches!(
                 author_handle.clean_shutdown(),
@@ -49634,6 +49651,20 @@ mod tests {
             turns,
             startup_ms(reconciliation),
             startup_ms(shutdown_elapsed),
+        );
+        let reconciliation_ceiling = Duration::from_millis(
+            (total_pages as u64)
+                .div_ceil(1_000)
+                .saturating_mul(300)
+                .max(500),
+        );
+        assert!(
+            reconciliation < reconciliation_ceiling,
+            "settled broad reconciliation exceeded its linear ceiling at {total_pages} pages: elapsed={reconciliation:?}, ceiling={reconciliation_ceiling:?}"
+        );
+        assert!(
+            shutdown_elapsed < Duration::from_millis(300),
+            "safe shutdown exceeded 300 ms after settled reconciliation at {total_pages} pages: {shutdown_elapsed:?}"
         );
     }
 

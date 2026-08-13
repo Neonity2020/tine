@@ -340,12 +340,15 @@ async function steadyKeystrokes(browser, target) {
     editor.focus();
     editor.setSelectionRange(editor.value.length, editor.value.length);
     const inputHandlerMs = [];
+    const scheduleLagMs = [];
     let due = performance.now() + periodMs;
     for (let index = 0; index < pulses; index += 1) {
-      const wait = Math.max(0, due - performance.now());
+      const scheduled = due;
+      const wait = Math.max(0, scheduled - performance.now());
       if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
       due += periodMs;
       const started = performance.now();
+      scheduleLagMs.push(Math.max(0, started - scheduled));
       if (kind === "insert") {
         editor.value += "1";
         editor.setSelectionRange(editor.value.length, editor.value.length);
@@ -362,7 +365,7 @@ async function steadyKeystrokes(browser, target) {
       inputHandlerMs.push(performance.now() - started);
     }
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    return { original, final: editor.value, inputHandlerMs };
+    return { original, final: editor.value, inputHandlerMs, scheduleLagMs };
   }, operation, PULSES, PERIOD_MS);
   const inserted = await pulse("insert");
   if (inserted.final !== `${inserted.original}${"1".repeat(PULSES)}`) throw new Error("steady keystroke insert did not update the editor");
@@ -370,7 +373,10 @@ async function steadyKeystrokes(browser, target) {
   if (deleted.final !== inserted.original) throw new Error("steady keystroke delete did not restore the editor");
   await (await browser.$("h1.page-title")).click();
   await waitFor(() => fs.readFileSync(target).equals(before), "exact edited-page bytes after keystroke restore");
-  return Math.max(0.001, p95([...inserted.inputHandlerMs, ...deleted.inputHandlerMs]));
+  return {
+    inputHandlerP95Ms: Math.max(0.001, p95([...inserted.inputHandlerMs, ...deleted.inputHandlerMs])),
+    scheduleLagP95Ms: Math.max(0.001, p95([...inserted.scheduleLagMs, ...deleted.scheduleLagMs])),
+  };
 }
 
 async function exactTextButton(browser, text) {
@@ -433,11 +439,12 @@ async function measureMode(mode, session, target, marker) {
   await openTarget(session.browser);
   const saveMs = await saveEditedPage(session.browser, target, marker);
   await sleep(750); // the same quiet interval precedes each steady-state input phase
-  const keystrokeP95Ms = await steadyKeystrokes(session.browser, target);
+  const keystrokes = await steadyKeystrokes(session.browser, target);
   return {
     coldOpenMs: Math.max(0.001, session.coldOpenMs),
     saveMs: Math.max(0.001, saveMs),
-    keystrokeP95Ms,
+    keystrokeP95Ms: keystrokes.inputHandlerP95Ms,
+    keystrokeScheduleLagP95Ms: keystrokes.scheduleLagP95Ms,
     marker,
   };
 }
@@ -457,7 +464,7 @@ const { graph, target, fileCount } = seedGraph(root);
 for (const directory of ["data", "config", "cache"]) fs.mkdirSync(path.join(xdg, directory), { recursive: true });
 fs.mkdirSync(runDir, { recursive: true });
 const receipt = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   kind: "storage-mode-run",
   testedCommit: gitRevision(),
   app: APP,
@@ -469,11 +476,13 @@ const receipt = {
     ? {
         name: "real-corpus storage-mode fixture",
         source: SEED_GRAPH,
+        fileCount,
         graph: `${fileCount} text files copied from ${path.basename(SEED_GRAPH)}; ${BLOCKS}-block edited page added`,
         target: `pages/${TARGET_PAGE}.md`,
       }
     : {
         name: "synthetic storage-mode fixture",
+        fileCount,
         graph: `${PAGES} Markdown pages; ${BLOCKS}-block edited page (${fileCount} text files)`,
         target: `pages/${TARGET_PAGE}.md`,
       },

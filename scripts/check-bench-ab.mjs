@@ -13,10 +13,10 @@ function optionalArg(name) {
 
 const policy = JSON.parse(readFileSync(arg("--policy"), "utf8"));
 
-// Storage mode is an informational, paired axis. It intentionally has no
-// regression threshold until Martin has reviewed real measurements. Reusing
-// this checker keeps its table and receipt shape beside the release A/B gate
-// without allowing an unreviewed number to fail or pass a release.
+// Storage mode is a paired Direct-vs-managed release axis. Its budgets are
+// tripwires around measured current behavior, not declarations that the
+// managed tax is desirable. A breach is a regression to diagnose; budgets may
+// only tighten after a faster receipt, never advance automatically.
 const storageModePath = optionalArg("--storage-mode");
 if (storageModePath) {
   const report = JSON.parse(readFileSync(storageModePath, "utf8"));
@@ -25,8 +25,18 @@ if (storageModePath) {
   if (!storage || !Array.isArray(storage.modes) || !storage.operations) {
     failures.push("policy does not define the storage-mode report contract");
   }
-  if (report.schemaVersion !== 1 || report.kind !== "storage-mode") {
-    failures.push("expected a schema-1 storage-mode measurement");
+  if (report.schemaVersion !== 2 || report.kind !== "storage-mode") {
+    failures.push("expected a schema-2 storage-mode measurement");
+  }
+  if (!report.manifest?.fixture?.name || !report.manifest?.fixture?.graph) {
+    failures.push("storage-mode report is missing exact fixture provenance");
+  }
+  const minTextFiles = storage?.requiredFixture?.minTextFiles;
+  const fixtureFiles = report.manifest?.fixture?.fileCount;
+  if (!Number.isInteger(minTextFiles) || minTextFiles <= 0) {
+    failures.push("policy does not define a positive storage-mode real-corpus file floor");
+  } else if (!Number.isInteger(fixtureFiles) || fixtureFiles < minTextFiles) {
+    failures.push(`storage-mode fixture has ${fixtureFiles ?? "unknown"} text files; policy requires at least ${minTextFiles}`);
   }
   if (!Array.isArray(report.rounds) || report.rounds.length < policy.reliability?.rounds) {
     failures.push(`storage-mode report has fewer than ${policy.reliability?.rounds ?? "the required"} rounds`);
@@ -51,13 +61,38 @@ if (storageModePath) {
       `${`${delta.toFixed(1)}%`.padStart(13)}  ${`${directSpread.toFixed(1)}%`.padStart(13)}  ` +
       `${`${managedSpread.toFixed(1)}%`.padStart(14)}`,
     );
+    const budget = storage.operations[name];
+    if (!Number.isFinite(budget.managedMaxMs) || budget.managedMaxMs <= 0) {
+      failures.push(`${name}: policy is missing a positive managedMaxMs`);
+    } else if (managedValue > budget.managedMaxMs) {
+      failures.push(`${name}: managed ${managedValue.toFixed(1)} ms exceeds ${budget.managedMaxMs} ms`);
+    }
+    if (budget.managedMaxDeltaPct !== undefined) {
+      if (!Number.isFinite(budget.managedMaxDeltaPct) || budget.managedMaxDeltaPct < 0) {
+        failures.push(`${name}: policy has an invalid managedMaxDeltaPct`);
+      } else if (delta > budget.managedMaxDeltaPct) {
+        failures.push(`${name}: managed delta ${delta.toFixed(1)}% exceeds ${budget.managedMaxDeltaPct}%`);
+      }
+    }
+    if (budget.maxRoundSpreadPct !== undefined) {
+      if (!Number.isFinite(budget.maxRoundSpreadPct) || budget.maxRoundSpreadPct < 0) {
+        failures.push(`${name}: policy has an invalid maxRoundSpreadPct`);
+      } else {
+        if (directSpread > budget.maxRoundSpreadPct) {
+          failures.push(`${name}: Direct round spread ${directSpread.toFixed(1)}% exceeds ${budget.maxRoundSpreadPct}%`);
+        }
+        if (managedSpread > budget.maxRoundSpreadPct) {
+          failures.push(`${name}: managed round spread ${managedSpread.toFixed(1)}% exceeds ${budget.maxRoundSpreadPct}%`);
+        }
+      }
+    }
   }
   if (failures.length) {
     console.error("\nStorage-mode report is incomplete:");
     for (const failure of failures) console.error(`- ${failure}`);
     process.exit(1);
   }
-  console.log("Storage-mode comparison reported (informational; no pass/fail performance budget).");
+  console.log("Storage-mode Direct-vs-managed budgets passed.");
   process.exit(0);
 }
 

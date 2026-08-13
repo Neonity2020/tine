@@ -22,6 +22,23 @@ for (const [name, budget] of Object.entries(policy.metrics ?? {})) {
     problems.push(`${name} is missing a positive maxRoundSpreadPct reliability budget`);
   }
 }
+if (!Number.isInteger(policy.storageMode?.requiredFixture?.minTextFiles)
+    || policy.storageMode.requiredFixture.minTextFiles < 1_000) {
+  problems.push("storageMode must require a real-scale fixture of at least 1,000 text files");
+}
+for (const [name, budget] of Object.entries(policy.storageMode?.operations ?? {})) {
+  if (!Number.isFinite(budget.managedMaxMs) || budget.managedMaxMs <= 0) {
+    problems.push(`storageMode.${name} is missing a positive managedMaxMs`);
+  }
+  if (budget.managedMaxDeltaPct !== undefined
+      && (!Number.isFinite(budget.managedMaxDeltaPct) || budget.managedMaxDeltaPct < 0)) {
+    problems.push(`storageMode.${name} has an invalid managedMaxDeltaPct`);
+  }
+  if (budget.maxRoundSpreadPct !== undefined
+      && (!Number.isFinite(budget.maxRoundSpreadPct) || budget.maxRoundSpreadPct <= 0)) {
+    problems.push(`storageMode.${name} has an invalid maxRoundSpreadPct`);
+  }
+}
 
 function argument(name) {
   const index = process.argv.indexOf(name);

@@ -79,6 +79,11 @@ if (process.argv.includes("--storage-mode")) {
     orderLog.push(order);
   }
 
+  const fixtures = roundRecords.flatMap(({ runs }) => runs.map((run) => run.fixture));
+  const fixtureFingerprints = new Set(fixtures.map((fixture) => JSON.stringify(fixture)));
+  if (fixtures.some((fixture) => !fixture) || fixtureFingerprints.size !== 1) {
+    throw new Error("storage-mode runs did not use one exact fixture contract");
+  }
   const operationNames = Object.keys(storage.operations);
   const modes = {};
   for (const mode of storage.modes) {
@@ -101,7 +106,7 @@ if (process.argv.includes("--storage-mode")) {
   }
 
   const aggregate = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "storage-mode",
     app,
     modes,
@@ -110,7 +115,7 @@ if (process.argv.includes("--storage-mode")) {
       rounds,
       runsPerRound,
       modeOrder: orderLog,
-      graph: "synthetic storage-mode fixture (120 Markdown pages, 80-block edited page)",
+      fixture: fixtures[0],
       pairing: "each run uses one graph and one XDG profile for both modes",
     },
   };

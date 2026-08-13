@@ -14,19 +14,34 @@
     "maxCalibrationSpreadPct": 25
   },
   "storageMode": {
+    "requiredFixture": {
+      "minTextFiles": 1000,
+      "purpose": "A small synthetic graph materially understated managed cold-open overhead; the release gate uses a copied real-scale corpus."
+    },
     "modes": [
       "direct",
       "managed"
     ],
     "operations": {
       "coldOpenMs": {
-        "label": "cold open"
+        "label": "cold open",
+        "managedMaxMs": 3000,
+        "managedMaxDeltaPct": 400,
+        "maxRoundSpreadPct": 30
       },
       "saveMs": {
-        "label": "edited-page save"
+        "label": "edited-page save",
+        "managedMaxMs": 900,
+        "managedMaxDeltaPct": 50,
+        "maxRoundSpreadPct": 25
       },
       "keystrokeP95Ms": {
-        "label": "steady keystroke p95"
+        "label": "steady keystroke p95",
+        "managedMaxMs": 5
+      },
+      "keystrokeScheduleLagP95Ms": {
+        "label": "keystroke scheduling-lag p95",
+        "managedMaxMs": 5
       }
     }
   },

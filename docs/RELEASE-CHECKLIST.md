@@ -43,7 +43,30 @@ may tag, publish, comment, and close issues.
    not permission to weaken the budget. Also run `npm run bench:startup` against
    the immutable v0.4.7 native binary, retain its timing JSON and early-frame
    sequence, and inspect those frames for new blank, intermediate, or corrupt
-   paints before shipping.
+   paints before shipping. While Tine-managed storage is present, also run the
+   exact candidate against a copied real-scale graph (at least 1,000 text
+   files), not merely the small synthetic fixture:
+
+   ```bash
+   TINE_STORAGE_MODE_SEED_GRAPH=/path/to/real-scale-anonymized-graph \
+     xvfb-run -a dbus-run-session -- npm run bench:storage-mode -- \
+       --app /path/to/exact-candidate/tine \
+       --output-dir test-results/storage-mode
+   npm run check:bench:storage-mode -- \
+     --storage-mode test-results/storage-mode/storage-mode.json
+   npm run bench:managed-native -- \
+     --real-graph /path/to/real-scale-anonymized-graph \
+     --secondary-graph /path/to/second-representative-graph \
+     --output-dir test-results/managed-storage-perf
+   ```
+
+   These are release-only gates, not between-release tax. They cover paired
+   Direct/managed cold open, edit-to-durable-file, input-handler and scheduling
+   latency; aged crash reopen and forced SQLite rebuild; real-graph reads;
+   ordinary and maximum 511-block saves; Tine's two-device application latency;
+   broad reconciliation and safe shutdown. A changed source commit invalidates
+   both receipts. Keep the `<50 ms` managed 511-block save p95 and `<10 s`
+   recurring rebuild ceilings; do not weaken either to ship.
 9. Push the frozen exact candidate, manually dispatch `ci.yml` with
    `scope=full`, and require all nine full jobs to succeed on that SHA,
    including the Linux nextest inventory contract and all four hash shards plus
