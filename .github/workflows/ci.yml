@@ -27,6 +27,7 @@ on:
           - full
           - windows
           - android
+          - android-runtime
           - performance
       windows_test_name:
         description: Full Rust harness name for one exact Windows tine-core test (windows scope only)
@@ -331,7 +332,7 @@ jobs:
 
   android-core-compile:
     name: Full CI / Android core compile
-    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android')
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'full' || inputs.scope == 'android' || inputs.scope == 'android-runtime')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -368,7 +369,7 @@ jobs:
   # reliability are characterized; dispatch scope=android to exercise it.
   android-managed-storage-runtime:
     name: Android runtime / managed activation, shutdown, and reopen
-    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'android'
+    if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'android' || inputs.scope == 'android-runtime')
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
