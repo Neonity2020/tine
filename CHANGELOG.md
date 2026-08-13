@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Fixed
+
+- **A corrupt experimental managed-storage reconciliation cache no longer makes the graph permanently unopenable.** Tine preserves the exact disposable SQLite baseline files as diagnostics, rebuilds a fresh baseline, resumes safely if either the preservation or replacement was interrupted by a crash, and leaves authoritative oplog history and graph bytes unchanged. Unsupported filesystem entries are still refused without following them.
+
 ## [0.6.94] - 2026-08-12
 
 ### Changed

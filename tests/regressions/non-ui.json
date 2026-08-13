@@ -3956,6 +3956,31 @@
         "failBefore": "proven"
       },
       "notes": "The managed move path is one exact, bounded transaction across the source and destination pages. Same-actor resolution first settles the request from the current live editor state; once an episode is durably published, cold recovery resumes that exact episode rather than authoring a replacement. Fault-cut tests cover immediate loss, exact-once completion, external conflict transfer, identity preservation, and bounded work."
+    },
+    {
+      "id": "REG-MANAGED-RECONCILIATION-BASELINE-RECOVERY-001",
+      "title": "A corrupt disposable reconciliation baseline is preserved and rebuilt instead of refusing an authoritative managed graph",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/reconciliation_baseline.rs::tests::open_or_rebuild_preserves_corrupt_disposable_baseline_once",
+          "crates/tine-core/src/oplog/reconciliation_baseline.rs::tests::open_or_rebuild_resumes_an_interrupted_forensic_move",
+          "crates/tine-core/src/oplog/reconciliation_baseline.rs::tests::open_or_rebuild_recovers_if_the_replacement_was_interrupted",
+          "crates/tine-core/src/sync_runtime.rs::tests::managed_safe_reopen_rebuilds_a_corrupt_reconciliation_baseline"
+        ],
+        "scenario": "managed.reconciliation-baseline-open-recovery",
+        "failBefore": "proven"
+      },
+      "notes": "The reconciliation baseline is derived scheduling state, not authority. Before this repair, any semantic validation failure returned RebuildRequired through both startup call sites and permanently refused the managed graph; the isolated pre-fix test failed at that exact cache boundary. Open now preserves only the four declared baseline files (database/WAL/SHM/journal), completes or resumes the durable evidence move, creates a fresh cache, and marks the rebuild complete only after the replacement opens. Busy/locked/I/O errors stay retryable; symlinks, reparse points and special files remain MS-REF-UNSAFE-FS-KIND refusals and are never moved or followed. Actor-level coverage proves an accepted edit remains readable, immutable archive bytes stay identical, and the graph reaches Safe shutdown after recovery."
     }
   ]
 }

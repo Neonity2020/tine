@@ -88,6 +88,10 @@ pub const RECONCILIATION_DIR: &str = "reconciliation";
 pub const RECONCILIATION_DATABASE_FILE: &str = "scan.sqlite";
 pub const RECONCILIATION_DATABASE_SIDECARS: &[&str] =
     &["scan.sqlite-wal", "scan.sqlite-shm", "scan.sqlite-journal"];
+pub const RECONCILIATION_FORENSIC_PREFIX: &str = "scan.sqlite.forensic-";
+pub const RECONCILIATION_FORENSIC_FILES: &[&str] = &["database", "wal", "shm", "journal"];
+pub const RECONCILIATION_FORENSIC_EVIDENCE_COMPLETE: &str = "EVIDENCE_COMPLETE";
+pub const RECONCILIATION_FORENSIC_REBUILD_COMPLETE: &str = "REBUILD_COMPLETE";
 pub const SQLITE_RUNTIME_DIR: &str = ".tine-runtime";
 pub const SQLITE_WORKSPACES_DIR: &str = "sqlite-workspaces";
 pub const SQLITE_APPLIER_LOCK_FILE: &str = "sqlite-applier.lock";

@@ -12,6 +12,10 @@ use super::sync_layout::{
     RECONCILIATION_DATABASE_FILE as DATABASE_FILE,
     RECONCILIATION_DATABASE_SIDECARS as DATABASE_SIDECAR_FILES,
     RECONCILIATION_DIR as RECONCILIATION_DIRECTORY,
+    RECONCILIATION_FORENSIC_EVIDENCE_COMPLETE as BASELINE_FORENSIC_EVIDENCE_COMPLETE,
+    RECONCILIATION_FORENSIC_FILES as BASELINE_FORENSIC_FILES,
+    RECONCILIATION_FORENSIC_PREFIX as BASELINE_FORENSIC_PREFIX,
+    RECONCILIATION_FORENSIC_REBUILD_COMPLETE as BASELINE_FORENSIC_REBUILD_COMPLETE,
 };
 use super::{
     object_store::{ensure_directory_nofollow, open_dir_nofollow, sync_dir_required},
@@ -31,9 +35,11 @@ use rusqlite::{
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::io::ErrorKind;
+use std::fs;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 pub(crate) const RECONCILIATION_BASELINE_SCHEMA_VERSION: u32 = 3;
 pub(crate) const RECONCILIATION_BASELINE_APPLICATION_ID: u32 = 0x5449_4e42;
@@ -261,14 +267,11 @@ impl ReconciliationBaselineBinding {
 pub(crate) enum ReconciliationBaselineError {
     Missing,
     BaselineUnavailable { detail: String },
+    UnsafeFilesystem { detail: String },
     RebuildRequired { path: PathBuf, detail: String },
 }
 
 impl ReconciliationBaselineError {
-    pub(crate) const fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing)
-    }
-
     pub(crate) const fn requires_rebuild(&self) -> bool {
         matches!(self, Self::RebuildRequired { .. })
     }
@@ -281,6 +284,10 @@ impl fmt::Display for ReconciliationBaselineError {
             Self::BaselineUnavailable { detail } => {
                 write!(formatter, "reconciliation baseline unavailable: {detail}")
             }
+            Self::UnsafeFilesystem { detail } => write!(
+                formatter,
+                "reconciliation baseline refused (MS-REF-UNSAFE-FS-KIND): {detail}"
+            ),
             Self::RebuildRequired { path, detail } => write!(
                 formatter,
                 "reconciliation baseline {} requires an explicit rebuild: {detail}",
@@ -732,6 +739,51 @@ impl ReconciliationBaseline {
             binding,
             trusted_data_version,
         })
+    }
+
+    /// Open the disposable baseline, preserving and recreating it exactly once
+    /// when validation says its derived bytes require a rebuild.
+    ///
+    /// Busy/locked/I/O failures remain retryable and unsupported filesystem
+    /// kinds remain refused. Only `RebuildRequired` and absence reach the
+    /// recreation path. Interrupted forensic moves are resumed before the
+    /// replacement is opened, so a crash cannot turn a cache repair into a
+    /// permanently occupied namespace.
+    pub(crate) fn open_or_rebuild(
+        trusted_runtime_root: &TrustedPrivateApplicationRuntimeRoot,
+        binding: ReconciliationBaselineBinding,
+    ) -> Result<Self, ReconciliationBaselineError> {
+        let (_, path) = prepare_database_parent(trusted_runtime_root, &binding, true)?;
+        let mut pending = resume_baseline_forensics(&path)?;
+        if !pending.is_empty() {
+            let opened = match Self::open_existing(trusted_runtime_root, binding.clone()) {
+                Ok(baseline) => baseline,
+                Err(ReconciliationBaselineError::Missing) => {
+                    Self::create_fresh(trusted_runtime_root, binding.clone())?
+                }
+                Err(ReconciliationBaselineError::RebuildRequired { .. }) => {
+                    pending.extend(preserve_baseline_forensics(&path)?);
+                    Self::create_fresh(trusted_runtime_root, binding.clone())?
+                }
+                Err(error) => return Err(error),
+            };
+            mark_baseline_rebuild_complete(&pending)?;
+            return Ok(opened);
+        }
+
+        match Self::open_existing(trusted_runtime_root, binding.clone()) {
+            Ok(baseline) => Ok(baseline),
+            Err(ReconciliationBaselineError::Missing) => {
+                Self::create_fresh(trusted_runtime_root, binding)
+            }
+            Err(ReconciliationBaselineError::RebuildRequired { .. }) => {
+                let pending = preserve_baseline_forensics(&path)?;
+                let rebuilt = Self::create_fresh(trusted_runtime_root, binding)?;
+                mark_baseline_rebuild_complete(&pending)?;
+                Ok(rebuilt)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -3289,9 +3341,12 @@ fn require_namespace_entry_absent(
 
 fn require_existing_regular(parent: &Dir, path: &Path) -> Result<(), ReconciliationBaselineError> {
     match parent.symlink_metadata(DATABASE_FILE) {
-        Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => Err(
-            rebuild(path, "baseline path is not a regular no-follow file"),
-        ),
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
+            Err(unsafe_filesystem(format!(
+                "{} is not a regular no-follow file",
+                path.display()
+            )))
+        }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => {
             Err(ReconciliationBaselineError::Missing)
@@ -3309,10 +3364,10 @@ fn require_safe_sqlite_sidecars(
     for sidecar in DATABASE_SIDECAR_FILES {
         match parent.symlink_metadata(sidecar) {
             Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
-                return Err(rebuild(
-                    path,
-                    format!("baseline SQLite sidecar {sidecar} has an unsupported file type"),
-                ));
+                return Err(unsafe_filesystem(format!(
+                    "baseline SQLite sidecar {} has an unsupported file type",
+                    path.with_file_name(sidecar).display()
+                )));
             }
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -3623,6 +3678,12 @@ fn unavailable(detail: impl Into<String>) -> ReconciliationBaselineError {
     }
 }
 
+fn unsafe_filesystem(detail: impl Into<String>) -> ReconciliationBaselineError {
+    ReconciliationBaselineError::UnsafeFilesystem {
+        detail: detail.into(),
+    }
+}
+
 fn rebuild(path: &Path, detail: impl Into<String>) -> ReconciliationBaselineError {
     ReconciliationBaselineError::RebuildRequired {
         path: path.to_path_buf(),
@@ -3652,11 +3713,191 @@ fn classify_sql_error(
     }
 }
 
+fn preserve_baseline_forensics(path: &Path) -> Result<Vec<PathBuf>, ReconciliationBaselineError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| unsafe_filesystem("baseline database path has no parent"))?;
+    let directory = parent.join(format!(
+        "{BASELINE_FORENSIC_PREFIX}{}",
+        Uuid::new_v4().simple()
+    ));
+    fs::create_dir(&directory).map_err(|error| {
+        unavailable(format!(
+            "cannot create baseline forensic directory: {error}"
+        ))
+    })?;
+    sync_baseline_directory(parent)?;
+    move_baseline_forensic_files(path, &directory, false)?;
+    write_baseline_marker(&directory, BASELINE_FORENSIC_EVIDENCE_COMPLETE)?;
+    Ok(vec![directory])
+}
+
+fn resume_baseline_forensics(path: &Path) -> Result<Vec<PathBuf>, ReconciliationBaselineError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| unsafe_filesystem("baseline database path has no parent"))?;
+    let mut pending = Vec::new();
+    let entries = fs::read_dir(parent)
+        .map_err(|error| unavailable(format!("cannot inspect baseline forensic state: {error}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            unavailable(format!("cannot inspect baseline forensic entry: {error}"))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(BASELINE_FORENSIC_PREFIX) {
+            continue;
+        }
+        let directory = entry.path();
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            unavailable(format!("cannot inspect baseline forensic path: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(unsafe_filesystem(format!(
+                "baseline forensic path {} is not a real directory",
+                directory.display()
+            )));
+        }
+        if baseline_marker_exists(&directory, BASELINE_FORENSIC_REBUILD_COMPLETE)? {
+            continue;
+        }
+        let evidence_complete =
+            baseline_marker_exists(&directory, BASELINE_FORENSIC_EVIDENCE_COMPLETE)?;
+        move_baseline_forensic_files(path, &directory, evidence_complete)?;
+        if !evidence_complete {
+            write_baseline_marker(&directory, BASELINE_FORENSIC_EVIDENCE_COMPLETE)?;
+        }
+        pending.push(directory);
+    }
+    Ok(pending)
+}
+
+fn baseline_forensic_paths(path: &Path, directory: &Path) -> [(PathBuf, PathBuf); 4] {
+    let parent = path
+        .parent()
+        .expect("a prepared baseline database always has a parent");
+    [
+        (
+            path.to_path_buf(),
+            directory.join(BASELINE_FORENSIC_FILES[0]),
+        ),
+        (
+            parent.join(DATABASE_SIDECAR_FILES[0]),
+            directory.join(BASELINE_FORENSIC_FILES[1]),
+        ),
+        (
+            parent.join(DATABASE_SIDECAR_FILES[1]),
+            directory.join(BASELINE_FORENSIC_FILES[2]),
+        ),
+        (
+            parent.join(DATABASE_SIDECAR_FILES[2]),
+            directory.join(BASELINE_FORENSIC_FILES[3]),
+        ),
+    ]
+}
+
+fn move_baseline_forensic_files(
+    path: &Path,
+    directory: &Path,
+    evidence_complete: bool,
+) -> Result<(), ReconciliationBaselineError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| unsafe_filesystem("baseline database path has no parent"))?;
+    for (source, preserved) in baseline_forensic_paths(path, directory) {
+        let source_exists = baseline_regular_file_exists(&source, "baseline SQLite file")?;
+        let preserved_exists =
+            baseline_regular_file_exists(&preserved, "preserved baseline evidence")?;
+        if !evidence_complete && source_exists && preserved_exists {
+            return Err(unsafe_filesystem(format!(
+                "baseline forensic recovery found both {} and {}",
+                source.display(),
+                preserved.display()
+            )));
+        }
+        if !evidence_complete && source_exists {
+            fs::rename(&source, &preserved).map_err(|error| {
+                unavailable(format!(
+                    "cannot preserve baseline SQLite file {}: {error}",
+                    source.display()
+                ))
+            })?;
+            sync_baseline_directory(directory)?;
+            sync_baseline_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn baseline_regular_file_exists(
+    path: &Path,
+    role: &str,
+) -> Result<bool, ReconciliationBaselineError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(unsafe_filesystem(format!(
+                "{role} {} is not a regular no-follow file",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(unavailable(format!(
+            "cannot inspect {role} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn baseline_marker_exists(
+    directory: &Path,
+    name: &str,
+) -> Result<bool, ReconciliationBaselineError> {
+    baseline_regular_file_exists(&directory.join(name), "baseline forensic marker")
+}
+
+fn mark_baseline_rebuild_complete(
+    directories: &[PathBuf],
+) -> Result<(), ReconciliationBaselineError> {
+    for directory in directories {
+        write_baseline_marker(directory, BASELINE_FORENSIC_REBUILD_COMPLETE)?;
+    }
+    Ok(())
+}
+
+fn write_baseline_marker(directory: &Path, name: &str) -> Result<(), ReconciliationBaselineError> {
+    let path = directory.join(name);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    match options.open(&path) {
+        Ok(mut file) => {
+            writeln!(file, "pid={}", std::process::id())
+                .map_err(|error| unavailable(format!("cannot write baseline marker: {error}")))?;
+            file.sync_all()
+                .map_err(|error| unavailable(format!("cannot sync baseline marker: {error}")))?;
+            sync_baseline_directory(directory)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(unavailable(format!(
+            "cannot create baseline marker {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn sync_baseline_directory(path: &Path) -> Result<(), ReconciliationBaselineError> {
+    let directory = Dir::open_ambient_dir(path, ambient_authority())
+        .map_err(|error| unavailable(format!("cannot retain baseline directory: {error}")))?;
+    sync_dir_required(&directory)
+        .map_err(|error| unavailable(format!("cannot sync baseline directory: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph_text_scope::GraphTextScope;
-    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -4000,6 +4241,146 @@ mod tests {
                 "{corruption} database was not preserved"
             );
         }
+    }
+
+    #[test]
+    fn open_or_rebuild_preserves_corrupt_disposable_baseline_once() {
+        let (directory, binding, mut baseline) = open_fresh("recover-corrupt");
+        clean_epoch(
+            &mut baseline,
+            &binding,
+            1,
+            &[present("nested/page.md", b"bytes")],
+        );
+        let database_path = baseline.path().to_path_buf();
+        drop(baseline);
+        let unrelated_auth = database_path.with_file_name("scan.sqlite-auth");
+        fs::write(&unrelated_auth, b"not owned by the reconciliation baseline").unwrap();
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute("UPDATE binding SET endpoint = zeroblob(16)", [])
+            .unwrap();
+        drop(connection);
+
+        let runtime = trusted_runtime(directory.path());
+        let rebuilt = ReconciliationBaseline::open_or_rebuild(&runtime, binding.clone())
+            .expect("a corrupt derived baseline must be preserved and rebuilt");
+        assert_eq!(rebuilt.binding(), &binding);
+        drop(rebuilt);
+
+        let prefix = BASELINE_FORENSIC_PREFIX;
+        let forensic = fs::read_dir(database_path.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            forensic.len(),
+            1,
+            "one invalid cache produces one evidence set"
+        );
+        let forensic = forensic[0].path();
+        assert!(forensic.join("database").is_file());
+        assert!(forensic.join(BASELINE_FORENSIC_EVIDENCE_COMPLETE).is_file());
+        assert!(forensic.join(BASELINE_FORENSIC_REBUILD_COMPLETE).is_file());
+        assert_eq!(
+            fs::read(&unrelated_auth).unwrap(),
+            b"not owned by the reconciliation baseline",
+            "recovery may move only the four files declared by the baseline contract"
+        );
+
+        let reopened = ReconciliationBaseline::open_or_rebuild(&runtime, binding)
+            .expect("the rebuilt baseline must open without another rebuild");
+        drop(reopened);
+        let forensic_count = fs::read_dir(database_path.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .count();
+        assert_eq!(forensic_count, 1, "a successful rebuild must not oscillate");
+    }
+
+    #[test]
+    fn storage_contract_tracks_reconciliation_baseline_recovery_layout() {
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        for required in [
+            DATABASE_FILE,
+            DATABASE_SIDECAR_FILES[0],
+            DATABASE_SIDECAR_FILES[1],
+            DATABASE_SIDECAR_FILES[2],
+            BASELINE_FORENSIC_PREFIX,
+            BASELINE_FORENSIC_FILES[0],
+            BASELINE_FORENSIC_FILES[1],
+            BASELINE_FORENSIC_FILES[2],
+            BASELINE_FORENSIC_FILES[3],
+            BASELINE_FORENSIC_EVIDENCE_COMPLETE,
+            BASELINE_FORENSIC_REBUILD_COMPLETE,
+        ] {
+            assert!(
+                contract.contains(required),
+                "storage contract is missing reconciliation layout name {required}"
+            );
+        }
+        assert!(contract.contains(&format!(
+            "SQLite baseline v{RECONCILIATION_BASELINE_SCHEMA_VERSION}"
+        )));
+        assert!(contract.contains("exactly one bounded rebuild"));
+    }
+
+    #[test]
+    fn open_or_rebuild_resumes_an_interrupted_forensic_move() {
+        let (directory, binding, mut baseline) = open_fresh("recover-interrupted-move");
+        clean_epoch(
+            &mut baseline,
+            &binding,
+            1,
+            &[present("nested/page.md", b"bytes")],
+        );
+        let database_path = baseline.path().to_path_buf();
+        drop(baseline);
+
+        let forensic = database_path
+            .parent()
+            .unwrap()
+            .join(format!("{BASELINE_FORENSIC_PREFIX}interrupted"));
+        fs::create_dir(&forensic).unwrap();
+        fs::rename(&database_path, forensic.join("database")).unwrap();
+
+        let runtime = trusted_runtime(directory.path());
+        let rebuilt = ReconciliationBaseline::open_or_rebuild(&runtime, binding.clone())
+            .expect("an interrupted evidence move must resume and rebuild the cache");
+        assert_eq!(rebuilt.binding(), &binding);
+        drop(rebuilt);
+        assert!(forensic.join("database").is_file());
+        assert!(forensic.join(BASELINE_FORENSIC_EVIDENCE_COMPLETE).is_file());
+        assert!(forensic.join(BASELINE_FORENSIC_REBUILD_COMPLETE).is_file());
+        assert!(database_path.is_file());
+    }
+
+    #[test]
+    fn open_or_rebuild_recovers_if_the_replacement_was_interrupted() {
+        let (directory, binding, baseline) = open_fresh("recover-interrupted-replacement");
+        let database_path = baseline.path().to_path_buf();
+        drop(baseline);
+
+        let forensic = database_path
+            .parent()
+            .unwrap()
+            .join(format!("{BASELINE_FORENSIC_PREFIX}interrupted-replacement"));
+        fs::create_dir(&forensic).unwrap();
+        fs::rename(&database_path, forensic.join("database")).unwrap();
+        write_baseline_marker(&forensic, BASELINE_FORENSIC_EVIDENCE_COMPLETE).unwrap();
+        fs::write(&database_path, b"partial replacement").unwrap();
+
+        let runtime = trusted_runtime(directory.path());
+        let rebuilt = ReconciliationBaseline::open_or_rebuild(&runtime, binding.clone())
+            .expect("a corrupt replacement must be preserved and replaced again");
+        assert_eq!(rebuilt.binding(), &binding);
+        drop(rebuilt);
+        assert!(forensic.join(BASELINE_FORENSIC_REBUILD_COMPLETE).is_file());
+        let reopened = ReconciliationBaseline::open_or_rebuild(&runtime, binding)
+            .expect("the second replacement must be stable");
+        drop(reopened);
     }
 
     #[test]

@@ -74,6 +74,7 @@ from the immutable archive.
 | `archive/projection-work-index-v1/{projection-work.claim,projection-work.head,*.prepared,*.work-node,*.work-root}` | projector | projection drain/recovery | work-index v11 | derived, reconstructable |
 | `archive/engine-history/resume-points/*.resume-point` | clean/unsafe handoff | promoted-runtime recovery | resume point v2 | bounded retained recovery hints |
 | `reconciliation/{scan.sqlite,scan.sqlite-wal,scan.sqlite-shm,scan.sqlite-journal}` | reconciliation | reconciliation scheduler | SQLite baseline v3 | disposable |
+| `reconciliation/<workspace>/<endpoint>/scan.sqlite.forensic-<uuid>/{database,wal,shm,journal,EVIDENCE_COMPLETE,REBUILD_COMPLETE}` | reconciliation recovery | cache-corruption diagnostics and crash-resumable rebuild | exact former baseline file set plus completion markers | diagnostic; never authority; created only when the disposable baseline fails semantic validation |
 | `.tine-runtime/sqlite-workspaces/sqlite-applier.lock` | SQLite applier | SQLite applier | empty OS-lock file | disposable process coordination |
 | `projection/materialization.sqlite{,-wal,-shm}` | SQLite applier | managed queries/navigation | `tine-storage` SQLite schema 15 | disposable; mismatch causes one rebuild |
 | runtime scratch (`tine-storage::formats::SCRATCH_DIR` and its marker/lease/pages/blobs) | hot engine/import | hot engine/rebuild | scratch schema 13, page schema 1 | disposable; one run only |

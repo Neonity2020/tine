@@ -5283,13 +5283,7 @@ fn open_reconciliation_baseline_with_runtime(
         graph.graph_text_scope_binding().map_err(display)?,
     )
     .map_err(display)?;
-    match ReconciliationBaseline::open_existing(&trusted, baseline_binding.clone()) {
-        Ok(baseline) => Ok(baseline),
-        Err(error) if error.is_missing() => {
-            ReconciliationBaseline::create_fresh(&trusted, baseline_binding).map_err(display)
-        }
-        Err(error) => return Err(display(error)),
-    }
+    ReconciliationBaseline::open_or_rebuild(&trusted, baseline_binding).map_err(display)
 }
 
 struct ApplicationBlockRef<'a> {
@@ -10536,7 +10530,7 @@ impl RuntimeActor {
         let actor_baseline_binding = phase_started.elapsed();
         #[cfg(test)]
         let phase_started = Instant::now();
-        let baseline = ReconciliationBaseline::open_existing(&trusted_runtime, baseline_binding)
+        let baseline = ReconciliationBaseline::open_or_rebuild(&trusted_runtime, baseline_binding)
             .map_err(display)?;
         #[cfg(test)]
         let actor_baseline_open = phase_started.elapsed();
@@ -49690,6 +49684,88 @@ mod tests {
             },
             "rebuilt-preserving-evidence",
         );
+    }
+
+    #[test]
+    fn managed_safe_reopen_rebuilds_a_corrupt_reconciliation_baseline() {
+        let fixture = ActivationFixture::nested_unicode(
+            "managed-safe-reopen-corrupt-reconciliation-baseline",
+            0xa0ec,
+        );
+        let activated = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(activated.status, SyncLocalActivationStatus::Active);
+        let handle = activated.handle.expect("synthetic graph activates");
+        drive_initial_feed(&handle);
+
+        let (page, revision) = load_application_exact(&handle, "Root.md");
+        let _ = save_application_block_text(
+            &handle,
+            page,
+            revision,
+            "accepted before baseline corruption",
+        );
+        drain_managed_local(&handle);
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+        drop(handle);
+
+        let baseline_path = fixture
+            .request
+            .application_runtime_root
+            .join(crate::oplog::sync_layout::RECONCILIATION_DIR)
+            .join(fixture.request.identities.workspace_id.to_string())
+            .join(fixture.request.identities.endpoint_id.to_string())
+            .join(crate::oplog::sync_layout::RECONCILIATION_DATABASE_FILE);
+        assert!(baseline_path.is_file());
+        let connection = rusqlite::Connection::open(&baseline_path).unwrap();
+        connection
+            .execute("UPDATE binding SET endpoint = zeroblob(16)", [])
+            .unwrap();
+        drop(connection);
+        let archive_before = immutable_archive_bytes(&fixture.request.archive_root);
+
+        let reopened = SyncRuntimeHandle::open(reopen_request(&fixture.request));
+        assert_eq!(
+            reopened.status,
+            SyncRuntimeOpenStatus::Active,
+            "corruption of a disposable reconciliation baseline must not refuse the graph"
+        );
+        let handle = reopened
+            .handle
+            .expect("the recovered graph retains a handle");
+        let (page, _) = load_application_exact(&handle, "Root.md");
+        assert!(
+            page.blocks
+                .iter()
+                .any(|block| block.raw.contains("accepted before baseline corruption")),
+            "baseline recovery lost an accepted edit"
+        );
+        assert_eq!(
+            immutable_archive_bytes(&fixture.request.archive_root),
+            archive_before,
+            "rebuilding a disposable baseline may not rewrite authoritative history"
+        );
+        assert!(matches!(
+            handle.clean_shutdown().unwrap(),
+            SyncShutdownOutcome::Safe(_)
+        ));
+
+        let forensic_prefix = crate::oplog::sync_layout::RECONCILIATION_FORENSIC_PREFIX;
+        let forensic = fs::read_dir(baseline_path.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(forensic_prefix)
+            })
+            .expect("corrupt baseline evidence is preserved")
+            .path();
+        assert!(forensic.join("EVIDENCE_COMPLETE").is_file());
+        assert!(forensic.join("REBUILD_COMPLETE").is_file());
     }
 
     /// A retained run is a reconstructible accelerator, not authority.  This
