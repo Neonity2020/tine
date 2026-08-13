@@ -1419,6 +1419,7 @@ pub fn inspect_shared_enrollment_for_cold_discovery(
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncLocalActivationPhase {
+    PrivateSetup,
     SourceCapture,
     BootstrapImportPreparation,
     ImmutablePublicationInstall,
@@ -1558,6 +1559,7 @@ impl From<BootstrapPreparationProgress> for SyncLocalActivationProgress {
 impl SyncLocalActivationPhase {
     pub const fn diagnostic_name(self) -> &'static str {
         match self {
+            Self::PrivateSetup => "private activation setup",
             Self::SourceCapture => "source capture",
             Self::BootstrapImportPreparation => "bootstrap import preparation",
             Self::ImmutablePublicationInstall => "immutable publication/install",
@@ -4848,19 +4850,23 @@ fn activate_non_active_local(
     existing_binding: Option<EnrollmentBindingV1>,
     progress: &mut dyn FnMut(SyncLocalActivationProgress),
 ) -> Result<SameProcessActivationHandoff, String> {
-    prepare_activation_private_paths(&request)?;
+    progress(SyncLocalActivationProgress::Phase {
+        phase: SyncLocalActivationPhase::PrivateSetup,
+    });
+    prepare_activation_private_paths(&request)
+        .map_err(|error| format!("prepare private activation paths: {error}"))?;
     let enrollment = EnrollmentApplicationRoot::open_explicit_private(&request.enrollment_root)
-        .map_err(display)?;
+        .map_err(|error| format!("open private enrollment state: {error}"))?;
     let application_runtime_root =
         ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-            .map_err(display)?;
+            .map_err(|error| format!("open private application runtime: {error}"))?;
 
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
         request.identities.endpoint_id,
         request.identities.device_id,
     )
-    .map_err(display)?;
+    .map_err(|error| format!("identify graph projection endpoint: {error}"))?;
     let receipts = match existing_binding.as_ref() {
         Some(binding) => ProjectionReceiptStore::open_existing_for_endpoint(
             &request.receipt_root,
@@ -4868,13 +4874,13 @@ fn activate_non_active_local(
             endpoint,
             binding.receipt_store_id(),
         )
-        .map_err(display)?,
+        .map_err(|error| format!("open existing private projection receipts: {error}"))?,
         None => ProjectionReceiptStore::open_for_endpoint(
             &request.receipt_root,
             request.identities.workspace_id,
             endpoint,
         )
-        .map_err(display)?,
+        .map_err(|error| format!("create private projection receipts: {error}"))?,
     };
 
     // Capture precedes every graph-local sparse archive write. The capture is
@@ -47510,6 +47516,7 @@ mod tests {
         assert_eq!(activated.status, SyncLocalActivationStatus::Active);
         assert_eq!(user_graph_bytes(&fixture.graph_root), before);
         let expected = [
+            SyncLocalActivationPhase::PrivateSetup,
             SyncLocalActivationPhase::SourceCapture,
             SyncLocalActivationPhase::BootstrapImportPreparation,
             SyncLocalActivationPhase::ImmutablePublicationInstall,
@@ -47593,6 +47600,7 @@ mod tests {
         assert_eq!(
             phases,
             vec![
+                SyncLocalActivationPhase::PrivateSetup,
                 SyncLocalActivationPhase::SourceCapture,
                 SyncLocalActivationPhase::BootstrapImportPreparation,
                 SyncLocalActivationPhase::ImmutablePublicationInstall,
@@ -47667,8 +47675,8 @@ mod tests {
         assert_eq!(large_receipt.source_files, small_receipt.source_files + 4);
         assert!(large_receipt.source_bytes > small_receipt.source_bytes);
         assert!(large_receipt.blocks > small_receipt.blocks);
-        assert_eq!(small_receipt.phase_ms.len(), 8);
-        assert_eq!(large_receipt.phase_ms.len(), 8);
+        assert_eq!(small_receipt.phase_ms.len(), 9);
+        assert_eq!(large_receipt.phase_ms.len(), 9);
         for receipt in [&small_receipt, &large_receipt] {
             assert_eq!(
                 receipt.full_digest_scans,
@@ -52490,7 +52498,7 @@ mod tests {
         assert_eq!(user_graph_bytes(&fixture.graph_root), before);
         assert!(interrupted_phases
             .first()
-            .is_none_or(|phase| *phase == SyncLocalActivationPhase::SourceCapture));
+            .is_none_or(|phase| *phase == SyncLocalActivationPhase::PrivateSetup));
 
         let mut resumed_phases = Vec::new();
         let resumed = SyncRuntimeHandle::activate_or_resume_local_with_progress(

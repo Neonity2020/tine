@@ -28014,7 +28014,7 @@ fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
 
 fn sync_bootstrap_source_directory(path: &Path) -> io::Result<()> {
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
-    sync_projection_directory_required(&directory)
+    crate::filesystem_durability::sync_reconstructible_directory(&directory)
 }
 
 #[cfg(test)]

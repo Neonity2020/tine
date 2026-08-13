@@ -4007,6 +4007,30 @@
         "failBefore": "proven"
       },
       "notes": "Before this repair, startup and activation mixed component enums, persisted reason strings and free-form details, and the frontend could not identify the in-scope threat scenario behind a refusal. Discovery also classified ordinary filesystem I/O failures as corrupt/unreadable. One typed nine-scenario vocabulary now crosses discovery, open, activation, Tauri serialization and user-visible diagnostics. Unsupported schemas, corruption, conflicts, stale generations, unsafe filesystem kinds, malformed imports and bounds map explicitly; unmarked I/O remains retryable. Exhaustive Rust matches make new public status variants fail compilation until classified, the contract-table test requires an exact scenario-row match, and a source guard requires every durable blocked reason literal to have an explicit mapping."
+    },
+    {
+      "id": "REG-MANAGED-ANDROID-ACTIVATION-DURABILITY-001",
+      "title": "Android managed activation falls back from unavailable filesystem-wide and directory durability without accepting real I/O errors",
+      "family": "managed-storage-data-safety",
+      "sources": {
+        "issues": [],
+        "commits": []
+      },
+      "platforms": [
+        "android"
+      ],
+      "layer": "native-storage",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/filesystem_durability.rs::tests::android_reconstructible_directory_accepts_only_capability_refusals",
+          "src-tauri/src/sync_runtime.rs::tests::retryable_activation_keeps_the_last_exact_progress_in_its_public_detail",
+          ".github/workflows/ci.yml::android-managed-storage-runtime"
+        ],
+        "scenario": "managed.android-activation-durability-capability-fallback",
+        "failBefore": "field-reproduced"
+      },
+      "notes": "A physical Android device returned Permission denied (os error 13) while enabling managed storage even though Direct Files worked and a real app-UID emulator journey passed. The first compatibility packet replaced three Tine-core syncfs calls but missed the separately versioned tine-storage immutable-publication batch; its only completion barrier was another syncfs. The exact-tree fallback also ended each reconstructible directory with a strict directory fsync that could reproduce the same capability error. tine-storage v0.3.1 retains and synchronizes every exact batch file before accepting only Android permission/unsupported/invalid-operation results for directory durability; ordinary file and I/O failures remain fatal. Tine applies the same narrow policy only to pre-promotion source-capture, preparation, backup, enrollment-namespace and disposable SQLite-lease directories reconstructible from unchanged Markdown. It keeps post-promotion authority, atomic no-clobber publication, no-follow/type validation and locks strict. Activation now reports private setup before enrollment/runtime/receipts and attaches the last exact phase to Retryable details, so any remaining device-specific refusal is actionable rather than a bare OS error."
     }
   ]
 }

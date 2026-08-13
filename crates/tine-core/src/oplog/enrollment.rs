@@ -59,9 +59,7 @@ use super::legacy_enrollment_verifier::{
 use super::migration_backup::{
     verify_migration_source_backup, MigrationBackupError, MigrationBackupRoot, VerifiedSourceBackup,
 };
-use super::object_store::{
-    ensure_directory_nofollow, open_dir_nofollow, publish_immutable_exact, sync_dir_required,
-};
+use super::object_store::{open_dir_nofollow, publish_immutable_exact, sync_dir_required};
 use super::shadow_projection::{
     verify_inactive_bootstrap_shadow_projection, ShadowProjectionError, VerifiedShadowProjection,
 };
@@ -6704,7 +6702,12 @@ fn open_component(parent: &Dir, name: &str, create: bool) -> Result<Option<Dir>,
         Ok(_) => created = false,
         Err(error) if error.kind() == ErrorKind::NotFound && !create => return Ok(None),
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            ensure_directory_nofollow(parent, name)
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(EnrollmentError::UnsafeNamespace(error.to_string())),
+            }
+            crate::filesystem_durability::sync_reconstructible_directory(parent)
                 .map_err(|error| EnrollmentError::UnsafeNamespace(error.to_string()))?;
             created = true;
         }
@@ -6712,7 +6715,7 @@ fn open_component(parent: &Dir, name: &str, create: bool) -> Result<Option<Dir>,
     }
     let directory = open_dir_nofollow(parent, name)
         .map_err(|error| EnrollmentError::UnsafeNamespace(error.to_string()))?;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     if created {
         let descriptor = directory.try_clone()?.into_std_file();
         // SAFETY: this changes the exact retained directory descriptor.
@@ -6720,6 +6723,8 @@ fn open_component(parent: &Dir, name: &str, create: bool) -> Result<Option<Dir>,
             return Err(std::io::Error::last_os_error().into());
         }
     }
+    #[cfg(target_os = "android")]
+    let _ = created;
     validate_private_directory(&directory, name)?;
     Ok(Some(directory))
 }

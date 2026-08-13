@@ -3794,7 +3794,7 @@ fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
 
 fn sync_bootstrap_preparation_directory(path: &Path) -> io::Result<()> {
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
-    tine_storage::sync_dir_required(&directory)
+    crate::filesystem_durability::sync_reconstructible_directory(&directory)
 }
 
 #[cfg(test)]

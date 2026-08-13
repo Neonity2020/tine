@@ -7491,7 +7491,7 @@ fn open_or_create_lease_directory(
             "{description} is not a no-follow directory: {error}"
         ))
     })?;
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     if created {
         // SAFETY: `directory` is the retained descriptor returned by the
         // no-follow open above; `fchmod` changes that exact opened directory.
@@ -7501,7 +7501,7 @@ fn open_or_create_lease_directory(
     }
     validate_owned_lease_directory(&directory, description)?;
     if created {
-        super::object_store::sync_dir_required(parent)
+        crate::filesystem_durability::sync_reconstructible_directory(parent)
             .map_err(|error| ProjectionError::Io(error.to_string()))?;
     }
     Ok(directory)

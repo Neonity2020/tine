@@ -1326,6 +1326,18 @@ struct SparseV2ActivationProgressEvent {
     progress: SyncLocalActivationProgress,
 }
 
+fn attach_latest_progress_to_activation_result(
+    binding: &mut SparseV2Binding,
+    progress: &str,
+) -> Option<String> {
+    let SparseV2Availability::Retryable { detail, .. } = &mut binding.availability else {
+        return None;
+    };
+    let contextual = format!("Tine-managed storage setup failed during {progress}: {detail}");
+    *detail = contextual.clone();
+    Some(contextual)
+}
+
 fn activate_record_with_diagnostics(
     facade: &SyncRuntimeFacade,
     app: &tauri::AppHandle,
@@ -1355,15 +1367,28 @@ fn activate_record_with_diagnostics(
         ));
     });
     drop(heartbeat);
-    result.map_err(|error| {
-        let progress = latest_activation_progress_name(&latest_progress);
-        let detail = format!("Tine-managed storage setup failed during {progress}: {error}");
-        crate::debug::diag(format!(
-            "sparse-v2 activation failed after {} ms: {detail}",
-            started.elapsed().as_millis()
-        ));
-        detail
-    })
+    let progress = latest_activation_progress_name(&latest_progress);
+    match result {
+        Ok(mut binding) => {
+            if let Some(detail) =
+                attach_latest_progress_to_activation_result(&mut binding, &progress)
+            {
+                crate::debug::diag(format!(
+                    "sparse-v2 activation failed after {} ms: {detail}",
+                    started.elapsed().as_millis()
+                ));
+            }
+            Ok(binding)
+        }
+        Err(error) => {
+            let detail = format!("Tine-managed storage setup failed during {progress}: {error}");
+            crate::debug::diag(format!(
+                "sparse-v2 activation failed after {} ms: {detail}",
+                started.elapsed().as_millis()
+            ));
+            Err(detail)
+        }
+    }
 }
 
 pub(crate) fn active_handle(
@@ -2998,6 +3023,44 @@ mod tests {
         );
         assert_eq!(serialized["progress"]["completed"], 2);
         assert_eq!(serialized["progress"]["total"], 5);
+    }
+
+    #[test]
+    fn retryable_activation_keeps_the_last_exact_progress_in_its_public_detail() {
+        let mut binding = SparseV2Binding {
+            availability: SparseV2Availability::Retryable {
+                stage: "shadow_import".into(),
+                detail: "Permission denied (os error 13)".into(),
+            },
+            handle: None,
+        };
+        assert_eq!(
+            attach_latest_progress_to_activation_result(
+                &mut binding,
+                "bootstrap preparation: sealing",
+            )
+            .as_deref(),
+            Some(
+                "Tine-managed storage setup failed during bootstrap preparation: sealing: Permission denied (os error 13)"
+            )
+        );
+        assert_eq!(
+            binding.availability,
+            SparseV2Availability::Retryable {
+                stage: "shadow_import".into(),
+                detail: "Tine-managed storage setup failed during bootstrap preparation: sealing: Permission denied (os error 13)".into(),
+            }
+        );
+
+        let mut active = SparseV2Binding {
+            availability: SparseV2Availability::Active,
+            handle: None,
+        };
+        assert_eq!(
+            attach_latest_progress_to_activation_result(&mut active, "source capture"),
+            None
+        );
+        assert_eq!(active.availability, SparseV2Availability::Active);
     }
 
     #[test]

@@ -15,7 +15,8 @@ use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::Path;
 
 #[cfg(any(test, not(target_os = "linux")))]
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 
 pub(crate) fn sync_private_tree(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
@@ -89,7 +90,38 @@ fn sync_private_tree_exact(path: &Path) -> io::Result<()> {
         }
     }
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
-    tine_storage::sync_dir_required(&directory)
+    sync_reconstructible_directory(&directory)
+}
+
+/// Synchronize a directory belonging to a pre-promotion, reconstructible
+/// managed-storage tree. Android app sandboxes and vendor filesystems can deny
+/// directory fsync even after permitting every exact file sync. That platform
+/// limitation must not block activation; ordinary I/O errors remain fatal.
+pub(crate) fn sync_reconstructible_directory(directory: &Dir) -> io::Result<()> {
+    finish_android_reconstructible_directory_sync(tine_storage::sync_dir_required(directory))
+}
+
+#[cfg(target_os = "android")]
+fn finish_android_reconstructible_directory_sync(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if android_filesystem_sync_may_fallback(error.kind()) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn finish_android_reconstructible_directory_sync(result: io::Result<()>) -> io::Result<()> {
+    result
+}
+
+#[cfg(test)]
+fn simulate_android_reconstructible_directory_sync(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if android_filesystem_sync_may_fallback(error.kind()) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(any(test, not(target_os = "linux")))]
@@ -149,5 +181,23 @@ mod tests {
             b"durable private state"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn android_reconstructible_directory_accepts_only_capability_refusals() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::InvalidInput,
+        ] {
+            simulate_android_reconstructible_directory_sync(Err(io::Error::new(kind, "denied")))
+                .unwrap();
+        }
+        let error = simulate_android_reconstructible_directory_sync(Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "real I/O failure",
+        )))
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WriteZero);
     }
 }

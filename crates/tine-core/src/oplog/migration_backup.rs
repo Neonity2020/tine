@@ -24,7 +24,7 @@ use super::import::{
     InactiveBootstrapVerifiedPublication,
 };
 use super::object_store::{
-    control_directory_identity, open_dir_nofollow, open_file_nofollow, sync_dir_required,
+    control_directory_identity, open_dir_nofollow, open_file_nofollow,
     BootstrapAggregateHistoryBindingV1,
 };
 use super::sync_layout::{
@@ -2677,7 +2677,7 @@ fn sync_file_and_parent(path: &Path) -> Result<(), MigrationBackupError> {
 
 fn sync_directory(path: &Path) -> Result<(), MigrationBackupError> {
     let directory = open_directory_nofollow_ambient(path)?;
-    sync_dir_required(&directory)
+    crate::filesystem_durability::sync_reconstructible_directory(&directory)
         .map_err(|error| MigrationBackupError::Io(io::Error::other(error.to_string())))
 }
 
