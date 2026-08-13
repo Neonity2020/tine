@@ -1355,7 +1355,15 @@ fn activate_record_with_diagnostics(
         ));
     });
     drop(heartbeat);
-    result
+    result.map_err(|error| {
+        let progress = latest_activation_progress_name(&latest_progress);
+        let detail = format!("Tine-managed storage setup failed during {progress}: {error}");
+        crate::debug::diag(format!(
+            "sparse-v2 activation failed after {} ms: {detail}",
+            started.elapsed().as_millis()
+        ));
+        detail
+    })
 }
 
 pub(crate) fn active_handle(

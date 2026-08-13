@@ -25740,22 +25740,21 @@ const BOOTSTRAP_SOURCE_MAX_SORT_RUNS: u64 = 4096;
 const BOOTSTRAP_SOURCE_MERGE_INPUTS: usize = 32;
 const BOOTSTRAP_SOURCE_CURSOR_BUFFER_BYTES: usize = 64 * 1024;
 
-#[cfg(test)]
 thread_local! {
     static BOOTSTRAP_SOURCE_IO_STAGE: std::cell::Cell<&'static str> =
         const { std::cell::Cell::new("bootstrap source capture not started") };
 }
 
-#[cfg(test)]
 fn note_bootstrap_source_io_stage(stage: &'static str) {
     BOOTSTRAP_SOURCE_IO_STAGE.with(|current| current.set(stage));
 }
 
-#[cfg(not(test))]
-fn note_bootstrap_source_io_stage(_stage: &'static str) {}
-
 #[cfg(test)]
 pub(crate) fn bootstrap_source_io_stage_for_test() -> &'static str {
+    BOOTSTRAP_SOURCE_IO_STAGE.with(std::cell::Cell::get)
+}
+
+fn bootstrap_source_io_stage() -> &'static str {
     BOOTSTRAP_SOURCE_IO_STAGE.with(std::cell::Cell::get)
 }
 
@@ -26283,6 +26282,22 @@ fn require_current_bootstrap_source_binding(
 }
 
 fn capture_inactive_bootstrap_sources(
+    graph: &Graph,
+    scratch: &Path,
+) -> io::Result<BootstrapSourceCapture> {
+    note_bootstrap_source_io_stage("prepare bootstrap source capture");
+    capture_inactive_bootstrap_sources_inner(graph, scratch).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "bootstrap source capture failed during `{}`: {error}",
+                bootstrap_source_io_stage()
+            ),
+        )
+    })
+}
+
+fn capture_inactive_bootstrap_sources_inner(
     graph: &Graph,
     scratch: &Path,
 ) -> io::Result<BootstrapSourceCapture> {
