@@ -5,6 +5,7 @@ use crate::query::{
     run_parser_sparse_task_query_bounded, sparse_task_query_eligibility,
     ApplicationSparseQueryPage, BoundedGroups, ParserSparseQueryCandidate,
 };
+use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -276,6 +277,25 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
         eprintln!("[tine] Direct Files SQLite projection disabled: create directory: {error}");
         return;
     }
+    let lease_path = shared.path.with_extension("sqlite.writer.lock");
+    let lease = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lease_path)
+        .and_then(|file| {
+            file.try_lock_exclusive()?;
+            Ok(file)
+        }) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!(
+                "[tine] Direct Files SQLite projection unavailable; another graph instance owns it or its lease cannot be opened: {error}"
+            );
+            return;
+        }
+    };
     let mut database = match open_projection_database(&shared.path) {
         Ok(database) => database,
         Err(error) => {
@@ -283,6 +303,10 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             return;
         }
     };
+    // The lock file is app-private disposable state. Retain its exclusive lock
+    // for the complete writer lifetime so another Graph instance cannot replace
+    // this database's facts behind a locally-ready generation watermark.
+    let _lease = lease;
     let mut requires_full_rebuild = false;
     loop {
         let (full, deltas, latest_generation) = {
@@ -743,6 +767,44 @@ mod tests {
         assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
         assert_eq!(graph.direct_projection_indexed_reads_test(), 0);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_graph_instance_cannot_replace_ready_projection_facts() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("single-writer");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(root.join("pages/tasks.md"), "- TODO one\n").unwrap();
+        let database = scratch("single-writer-db").join("projection.sqlite");
+
+        let owner = Graph::open(&root);
+        owner.attach_direct_projection(database.clone()).unwrap();
+        owner.warm_cache();
+        wait_ready(&owner);
+
+        let fallback = Graph::open(&root);
+        fallback.attach_direct_projection(database.clone()).unwrap();
+        fallback.warm_cache();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !fallback.direct_projection_ready_test(),
+            "a second graph instance must not publish into the first instance's ready database"
+        );
+        let oracle = crate::query::run_query_bounded(&fallback, "(task TODO)", 100, 1_000_000);
+        let actual = fallback.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert_eq!(signature(&actual.groups), signature(&oracle.groups));
+        assert_eq!(fallback.direct_projection_indexed_reads_test(), 0);
+
+        let owner_oracle = crate::query::run_query_bounded(&owner, "(task TODO)", 100, 1_000_000);
+        let owner_actual = owner.run_query_bounded("(task TODO)", 100, 1_000_000);
+        assert_eq!(
+            signature(&owner_actual.groups),
+            signature(&owner_oracle.groups)
+        );
+        assert!(owner.direct_projection_indexed_reads_test() > 0);
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(database.parent().unwrap());
     }
 
     #[test]

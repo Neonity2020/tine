@@ -106,7 +106,12 @@ compares those revisions and lowers only changed or missing pages; a clean
 reopen lowers none. One-page cache upserts and deletes enqueue coalesced page
 deltas. The editor, watcher, and save paths never wait for SQL. Indexed reads
 are admitted only when the worker has published the exact current parser-cache
-generation. A missing, stale, corrupt, incompatible, or unwritable database
+generation. One app-private sidecar lease permits only one graph instance to
+publish into a projection database at a time; a concurrent window or process
+that cannot acquire it stays on the parser evaluator. This prevents an older
+instance from replacing facts behind another instance's locally-ready
+generation watermark. A missing, stale, corrupt, incompatible, leased, or
+unwritable database
 therefore uses the established parser evaluator and cannot block graph open,
 save, or external file observation.
 
