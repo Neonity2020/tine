@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+### Changed
+
+- **Direct Files task queries now use the same disposable SQLite fact layer as managed storage without making SQLite part of saving.** The already-parsed page cache feeds one background, coalescing worker; clean reopens reuse unchanged page facts, and task candidates are admitted only at the exact current cache generation before Tine's existing query parser evaluates them. Missing, stale, corrupt, incompatible, or unwritable SQLite state falls back to the established Direct Files evaluator. The switched task family no longer uses its old whole-graph candidate scan as the ordinary route, while retaining the bounded final-result memo that keeps reactive re-renders cheap.
+
 ### Fixed
 
 - **Android managed-storage setup no longer requires hostile-replacement directory primitives inside Tine's private receipt store.** The app-private, single-writer tree is created and opened through Android's ordinary verified file API, including its root, while shared or externally writable namespaces retain strict no-follow capability opens. A setup failure also keeps its exact inner operation when storage rediscovery runs, so a device-specific error can no longer be replaced by a generic retry message.

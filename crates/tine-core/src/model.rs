@@ -2416,6 +2416,10 @@ pub struct Graph {
     /// Memoized advanced-query results. Kept separate from `derived_cache` because
     /// advanced queries return clause metadata as well as groups.
     advanced_cache: RwLock<Option<AdvancedCache>>,
+    /// Disposable SQLite facts for Direct Files. Markdown/Org and the parsed
+    /// page cache remain authoritative; indexed reads are admitted only when
+    /// this worker has published the exact current `cache_gen`.
+    direct_projection: std::sync::Mutex<Option<Arc<crate::direct_projection::DirectProjection>>>,
     /// Memoized `list_pages()` (the journals//pages/ directory scan), keyed by
     /// cache_gen — which bumps on every page create/delete/rename (Tine or watcher)
     /// — so quick-switch / [[ ]] autocomplete don't re-read both dirs on every
@@ -5660,6 +5664,7 @@ impl Graph {
             block_ref_count_cache: RwLock::new(None),
             derived_cache: RwLock::new(None),
             advanced_cache: RwLock::new(None),
+            direct_projection: std::sync::Mutex::new(None),
             page_list_cache: RwLock::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -5673,6 +5678,140 @@ impl Graph {
             handoff_instance_token: Arc::new(HandoffGraphInstanceToken),
             search_lanes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Attach Direct Files' app-private disposable SQLite projection.
+    ///
+    /// This never reads or writes graph files. If the parsed cache is already
+    /// warm, its exact snapshot is queued; otherwise `install_built` supplies it
+    /// when the ordinary background warm completes.
+    pub fn attach_direct_projection(&self, path: PathBuf) -> io::Result<()> {
+        if self.derived_read_only {
+            return Ok(());
+        }
+        let projection = Arc::new(crate::direct_projection::DirectProjection::start(path)?);
+        let mut slot = self.direct_projection.lock().unwrap();
+        if slot.is_some() {
+            return Ok(());
+        }
+        *slot = Some(Arc::clone(&projection));
+        let cache = self.cache.read().unwrap();
+        if let Some(snapshot) = cache.as_ref().map(Arc::clone) {
+            let revisions = Arc::new(self.disk_revs.read().unwrap().clone());
+            projection.enqueue_full(
+                self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                snapshot,
+                revisions,
+            );
+        }
+        Ok(())
+    }
+
+    fn direct_projection_enqueue_full(
+        &self,
+        generation: u64,
+        pages: Arc<Vec<(PageEntry, Arc<Document>)>>,
+        revisions: Arc<std::collections::HashMap<PathBuf, String>>,
+    ) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.enqueue_full(generation, pages, revisions);
+        }
+    }
+
+    fn direct_projection_enqueue_replace(
+        &self,
+        generation: u64,
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+    ) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.enqueue_replace(generation, entry, document, revision);
+        }
+    }
+
+    fn direct_projection_enqueue_delete(&self, generation: u64, entry: PageEntry) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.enqueue_delete(generation, entry);
+        }
+    }
+
+    fn direct_projection_mark_stale(&self) {
+        if let Some(projection) = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+        {
+            projection.mark_stale();
+        }
+    }
+
+    fn direct_projection_sparse_task_query(
+        &self,
+        query_src: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Option<crate::query::BoundedGroups> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let pages = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        let result = projection.sparse_task_query(
+            &self.root, generation, &pages, query_src, max_rows, max_bytes,
+        )?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
+    }
+
+    fn direct_projection_ready(&self) -> bool {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|projection| projection.ready_at(generation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_ready_test(&self) -> bool {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|projection| projection.ready_at(generation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_indexed_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.indexed_reads())
     }
 
     /// Stable identity of the exact no-follow directory capability retained at
@@ -14218,10 +14357,11 @@ impl Graph {
         if guard.is_some() {
             return PageCacheInstallOutcome::AlreadyAvailable;
         }
-        *guard = Some(Arc::new(pages));
+        let pages = Arc::new(pages);
+        *guard = Some(Arc::clone(&pages));
         *self.cache_index.write().unwrap() = Some(index);
         *self.reference_candidate_index.write().unwrap() = reference_index;
-        *self.disk_revs.write().unwrap() = revs;
+        *self.disk_revs.write().unwrap() = revs.clone();
         *self.effective_identity_index.write().unwrap() = Some(effective_index);
         *self.page_index_failures.write().unwrap() = failures;
         *self.page_list_cache.write().unwrap() = Some((expected_generation, page_list));
@@ -14230,6 +14370,7 @@ impl Graph {
             .installs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(guard);
+        self.direct_projection_enqueue_full(expected_generation, pages, Arc::new(revs));
         PageCacheInstallOutcome::Installed
     }
 
@@ -14400,6 +14541,7 @@ impl Graph {
     }
 
     fn invalidate_cache_after_tine_mutation(&self) {
+        self.direct_projection_mark_stale();
         let mut guard = self.cache.write().unwrap();
         *guard = None;
         self.page_index_failures.write().unwrap().clear();
@@ -14458,6 +14600,7 @@ impl Graph {
         // (the original is moved into the cache slot; this clone is a refcount bump).
         let evict_doc = Arc::clone(&doc);
         let evict_entry = entry.clone();
+        let projection_revision = disk_rev.clone();
         let mut previous_doc: Option<Arc<Document>> = None;
         let mut is_new_page = false;
         let mut identity_changed = false;
@@ -14643,6 +14786,16 @@ impl Graph {
             newgen,
             scoped,
         );
+        if cache_built {
+            self.direct_projection_enqueue_replace(
+                newgen,
+                evict_entry,
+                evict_doc,
+                projection_revision,
+            );
+        } else {
+            self.direct_projection_mark_stale();
+        }
     }
 
     /// See `cache_upsert`. When `scoped`, evict only derived entries the edited
@@ -14845,8 +14998,17 @@ impl Graph {
         let mut guard = self.cache.write().unwrap();
         let mut alias_touched = false;
         let mut block_refs_touched = false;
+        let mut removed_entries = Vec::new();
         if let Some(pages) = guard.as_mut() {
             let pages = Arc::make_mut(pages);
+            removed_entries.extend(
+                pages
+                    .iter()
+                    .filter(|(entry, _)| {
+                        entry.kind == kind && crate::refs::same_page(&entry.name, name)
+                    })
+                    .map(|(entry, _)| entry.clone()),
+            );
             let removed_paths = pages
                 .iter()
                 .filter(|(e, _)| e.kind == kind && crate::refs::same_page(&e.name, name))
@@ -14900,6 +15062,9 @@ impl Graph {
         }
         if alias_touched {
             *self.alias_cache.write().unwrap() = None;
+        }
+        for entry in removed_entries {
+            self.direct_projection_enqueue_delete(newgen, entry);
         }
     }
 
@@ -14960,6 +15125,7 @@ impl Graph {
         if alias_touched {
             *self.alias_cache.write().unwrap() = None;
         }
+        self.direct_projection_enqueue_delete(newgen, entry.clone());
     }
 
     /// Memoize a derived whole-graph scan result, keyed by `(cache_gen, today)` +
@@ -15228,6 +15394,17 @@ impl Graph {
         {
             return Arc::new(Vec::new());
         }
+        if crate::query::sparse_task_query_eligibility(query_src).is_some()
+            && self.direct_projection_ready()
+        {
+            return self.derived_memo(format!("sq\0{query_src}"), || {
+                self.direct_projection_sparse_task_query(query_src, usize::MAX, usize::MAX)
+                    .map_or_else(
+                        || crate::query::run_query(self, query_src),
+                        |result| result.groups,
+                    )
+            });
+        }
         self.derived_memo(format!("q\0{query_src}"), || {
             crate::query::run_query(self, query_src)
         })
@@ -15247,6 +15424,19 @@ impl Graph {
                 total: 0,
                 exceeded: false,
             };
+        }
+        if crate::query::sparse_task_query_eligibility(query_src).is_some()
+            && self.direct_projection_ready()
+        {
+            return self.derived_memo_bounded(
+                format!("SQ\0{max_rows}\0{max_bytes}\0{query_src}"),
+                || {
+                    self.direct_projection_sparse_task_query(query_src, max_rows, max_bytes)
+                        .unwrap_or_else(|| {
+                            crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
+                        })
+                },
+            );
         }
         self.derived_memo_bounded(format!("Q\0{max_rows}\0{max_bytes}\0{query_src}"), || {
             crate::query::run_query_bounded(self, query_src, max_rows, max_bytes)
