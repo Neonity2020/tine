@@ -228,9 +228,12 @@ Android app-private projection receipts retain temporary-file writes, exact-byte
 collision checks, file-content synchronization, and atomic rename publication.
 They do not require the hard-link-based no-replace primitive used by the generic
 publisher: some Android app filesystems deny hard links even though ordinary
-app-private create, write, sync, and rename operations are available. Honest
-concurrent Tine writers remain excluded by the runtime lease; a hostile process
-inside the same application sandbox is outside this threat model.
+app-private create, write, sync, and rename operations are available. Receipt
+directories are likewise opened through ordinary app-private directory handles
+after checking that each named entry is a real directory, rather than through
+the Linux hostile-replacement `O_NOFOLLOW` primitive. Honest concurrent Tine
+writers remain excluded by the runtime lease; a hostile process inside the same
+application sandbox is outside this threat model.
 
 The graph-local shared-provider tree is transport rather than local authority.
 Tine still creates and opens it no-follow, requires ordinary directories and

@@ -5237,9 +5237,10 @@ fn activation_failure_after(
         DiscoveryClassification::ExistingLocalActive(_) => {
             activation_retryable(SyncLocalActivationStage::LocalActive, detail)
         }
-        DiscoveryClassification::Retryable(_, retry_detail) => {
-            activation_retryable(fallback_stage, retry_detail)
-        }
+        DiscoveryClassification::Retryable(_, retry_detail) => activation_retryable(
+            fallback_stage,
+            retain_activation_failure_detail(detail, retry_detail),
+        ),
         DiscoveryClassification::UnsupportedOrIncompatible(component, scenario) => {
             SyncLocalActivationResult {
                 status: SyncLocalActivationStatus::UnsupportedOrIncompatible {
@@ -5275,6 +5276,10 @@ fn activation_failure_after(
             activation_retryable(fallback_stage, detail)
         }
     }
+}
+
+fn retain_activation_failure_detail(detail: String, retry_detail: String) -> String {
+    format!("{detail}; storage rediscovery: {retry_detail}")
 }
 
 fn activation_retryable(
@@ -24873,6 +24878,18 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use uuid::Uuid;
+
+    #[test]
+    fn activation_rediscovery_does_not_erase_the_physical_failure() {
+        let detail = retain_activation_failure_detail(
+            "initialize private receipt store: open namespace: permission denied".into(),
+            "activation can be resumed".into(),
+        );
+        assert_eq!(
+            detail,
+            "initialize private receipt store: open namespace: permission denied; storage rediscovery: activation can be resumed"
+        );
+    }
 
     #[test]
     fn public_durable_refusal_scenarios_exactly_match_the_storage_contract() {

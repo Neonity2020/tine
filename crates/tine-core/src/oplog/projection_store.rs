@@ -23,8 +23,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::object_store::{
-    is_temp_name, open_dir_nofollow, publish_immutable_exact as publish_immutable_exact_strict,
-    read_optional_regular, require_regular_entry, sync_dir_required, StoreError,
+    is_temp_name, open_dir_nofollow as open_dir_nofollow_strict,
+    publish_immutable_exact as publish_immutable_exact_strict, read_optional_regular,
+    require_regular_entry, sync_dir_required, StoreError,
 };
 use super::sync_layout::{
     INTENT_NAMESPACE_AUTHORITY_SUFFIX, INTENT_NAMESPACE_RESERVATION_SUFFIX,
@@ -77,6 +78,52 @@ const MAX_MUTATION_ATTEMPTS: usize = 1_000_000;
 const MAX_MUTATION_AUTHORITY_BYTES: usize = 64 * 1024 * 1024;
 
 type DirectoryIdentity = [u8; 32];
+
+fn open_dir_nofollow(root: &Dir, name: &str) -> Result<Dir, StoreError> {
+    #[cfg(target_os = "android")]
+    {
+        let component = Path::new(name);
+        if !matches!(component.components().next(), Some(Component::Normal(_)))
+            || component.components().count() != 1
+        {
+            return Err(StoreError::UnsafeEntry(format!(
+                "private receipt directory name is not one normal component: {name}"
+            )));
+        }
+        let metadata = root.symlink_metadata(component)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StoreError::UnsafeEntry(format!(
+                "private receipt directory is not a real directory: {name}"
+            )));
+        }
+        let name = CString::new(name)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid receipt directory"))?;
+        // Android app-private receipt state has one honest Tine writer. Avoid
+        // the Linux hostile-replacement flag that physical Android storage may
+        // reject; the final handle is still checked to be a directory.
+        let fd = unsafe {
+            libc::openat(
+                root.as_fd().as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+            )
+        };
+        if fd < 0 {
+            return Err(StoreError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: openat returned one newly owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata()?.is_dir() {
+            return Err(StoreError::UnsafeEntry(
+                "private receipt handle is not a directory".into(),
+            ));
+        }
+        return Ok(Dir::from_std_file(file));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    open_dir_nofollow_strict(root, name)
+}
 
 fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), ProjectionStoreError> {
     #[cfg(target_os = "android")]
