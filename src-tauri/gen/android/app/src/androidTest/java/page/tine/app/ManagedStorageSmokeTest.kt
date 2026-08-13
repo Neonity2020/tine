@@ -17,7 +17,7 @@ object ManagedStorageSmoke {
 @RunWith(AndroidJUnit4::class)
 class ManagedStorageSmokeTest {
   @Test
-  fun activationCleanShutdownAndReopenWorkAsTheAppUidOnSharedStorage() {
+  fun activationShareSetupCleanShutdownAndReopenWorkAsTheAppUidOnSharedStorage() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val nonce = UUID.randomUUID().toString()
     val graphRoot = File(

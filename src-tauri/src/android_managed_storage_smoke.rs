@@ -72,6 +72,9 @@ fn run(graph_root: PathBuf, private_root: PathBuf) -> String {
     let Some(handle) = activation.handle else {
         return "activation returned Active without a handle".into();
     };
+    if let Err(error) = handle.prepare_shared() {
+        return format!("prepare shared failed: {error}");
+    }
     match handle.clean_shutdown() {
         Ok(SyncShutdownOutcome::Safe(_)) => {}
         outcome => return format!("clean shutdown failed: {outcome:?}"),

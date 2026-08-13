@@ -368,7 +368,7 @@ jobs:
   # It deliberately remains outside full release CI until its runtime and
   # reliability are characterized; dispatch scope=android to exercise it.
   android-managed-storage-runtime:
-    name: Android runtime / managed activation, shutdown, and reopen
+    name: Android runtime / managed activation, share setup, shutdown, and reopen
     if: github.event_name == 'workflow_dispatch' && (inputs.scope == 'android' || inputs.scope == 'android-runtime')
     runs-on: ubuntu-22.04
     steps:
