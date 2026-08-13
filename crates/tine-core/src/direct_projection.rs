@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
-    PhysicalBlock, PhysicalGraphProjectionChange, PhysicalGraphProjectionDatabase,
-    PhysicalGraphProjectionSourceRevision, PhysicalPage, PhysicalProperty, PhysicalTask,
+    PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
+    PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
+    PhysicalProperty, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -47,6 +48,10 @@ struct ProjectionShared {
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
     #[cfg(test)]
     indexed_reads: AtomicU64,
+    #[cfg(test)]
+    referenced_name_reads: AtomicU64,
+    #[cfg(test)]
+    fuzzy_candidate_reads: AtomicU64,
 }
 
 /// Direct Files' disposable parser-fact projection.
@@ -70,6 +75,10 @@ impl DirectProjection {
             reader: Mutex::new(None),
             #[cfg(test)]
             indexed_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            referenced_name_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            fuzzy_candidate_reads: AtomicU64::new(0),
         });
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -235,6 +244,94 @@ impl DirectProjection {
         current
     }
 
+    pub(crate) fn referenced_page_names(&self, cache_generation: u64) -> Option<Vec<String>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut after: Option<(String, String, String, [u8; 16])> = None;
+        let mut names = std::collections::HashMap::<String, String>::new();
+        const BATCH: usize = 1024;
+        loop {
+            let rows = read
+                .navigation_reference_names_after(
+                    after.as_ref().map(|(path, raw, normalized, id)| {
+                        (path.as_str(), raw.as_str(), normalized.as_str(), id)
+                    }),
+                    BATCH,
+                )
+                .ok()?;
+            let count = rows.len();
+            for row in rows {
+                after = Some((
+                    row.owner_path,
+                    row.raw_name.clone(),
+                    row.normalized_name,
+                    row.source_page_id,
+                ));
+                names
+                    .entry(crate::refs::page_key(&row.raw_name))
+                    .or_insert(row.raw_name);
+            }
+            if count < BATCH {
+                break;
+            }
+        }
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut names = names.into_values().collect::<Vec<_>>();
+        names.sort_by_key(|name| crate::refs::page_key(name));
+        #[cfg(test)]
+        self.shared
+            .referenced_name_reads
+            .fetch_add(1, Ordering::Relaxed);
+        Some(names)
+    }
+
+    pub(crate) fn fuzzy_candidate_paths(
+        &self,
+        cache_generation: u64,
+        normalized_needle: &str,
+    ) -> Option<std::collections::HashSet<String>> {
+        if !self.ready_at(cache_generation) {
+            return None;
+        }
+        let mut reader = self.shared.reader.lock().unwrap();
+        if reader.is_none() {
+            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
+        }
+        let read = reader.as_ref()?.read();
+        let mut after = None;
+        let mut paths = std::collections::HashSet::new();
+        const BATCH: usize = 1024;
+        loop {
+            let rows = read
+                .fuzzy_subsequence_candidate_pages_after(normalized_needle, after, BATCH)
+                .ok()?;
+            let count = rows.len();
+            for row in rows {
+                after = Some(row.page_id);
+                paths.insert(row.path);
+            }
+            if count < BATCH {
+                break;
+            }
+        }
+        let current = self.ready_at(cache_generation).then_some(paths);
+        #[cfg(test)]
+        if current.is_some() {
+            self.shared
+                .fuzzy_candidate_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        current
+    }
+
     pub(crate) fn ready_at(&self, generation: u64) -> bool {
         self.shared.ready.load(Ordering::Acquire)
             && self.shared.ready_generation.load(Ordering::Acquire) == generation
@@ -243,6 +340,16 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn indexed_reads(&self) -> u64 {
         self.shared.indexed_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn referenced_name_reads(&self) -> u64 {
+        self.shared.referenced_name_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fuzzy_candidate_reads(&self) -> u64 {
+        self.shared.fuzzy_candidate_reads.load(Ordering::Relaxed)
     }
 }
 
@@ -404,11 +511,17 @@ fn apply_pending(
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
-        let replacements = pages
+        let lowered = pages
             .iter()
             .filter(|(entry, _)| replacements_needed.contains(&page_id(&entry.rel_path)))
             .map(|(entry, document)| physical_page(entry, document))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut replacements = Vec::with_capacity(lowered.len());
+        let mut reference_postings = Vec::new();
+        for (page, mut postings) in lowered {
+            replacements.push(page);
+            reference_postings.append(&mut postings);
+        }
         let replacement_sources = sources
             .into_iter()
             .filter(|source| replacements_needed.contains(&source.page_id))
@@ -418,6 +531,7 @@ fn apply_pending(
                 &PhysicalGraphProjectionChange {
                     replacements,
                     deletions: source_delta.deletions,
+                    reference_postings,
                 },
                 &replacement_sources,
             )
@@ -425,6 +539,7 @@ fn apply_pending(
     }
     if !deltas.is_empty() {
         let mut replacements = Vec::new();
+        let mut reference_postings = Vec::new();
         let mut replacement_sources = Vec::new();
         let mut deletions = Vec::new();
         for (_, (_, delta)) in deltas {
@@ -434,7 +549,9 @@ fn apply_pending(
                         page_id: page_id(&entry.rel_path),
                         revision,
                     });
-                    replacements.push(physical_page(&entry, &document)?);
+                    let (page, mut postings) = physical_page(&entry, &document)?;
+                    replacements.push(page);
+                    reference_postings.append(&mut postings);
                 }
                 PageDelta::Delete(entry) => deletions.push(page_id(&entry.rel_path)),
             }
@@ -444,6 +561,7 @@ fn apply_pending(
                 &PhysicalGraphProjectionChange {
                     replacements,
                     deletions,
+                    reference_postings,
                 },
                 &replacement_sources,
             )
@@ -452,7 +570,10 @@ fn apply_pending(
     Ok(())
 }
 
-fn physical_page(entry: &PageEntry, document: &Document) -> Result<PhysicalPage, String> {
+fn physical_page(
+    entry: &PageEntry,
+    document: &Document,
+) -> Result<(PhysicalPage, Vec<PhysicalReferencePosting>), String> {
     #[cfg(test)]
     PHYSICAL_PAGE_LOWERINGS.fetch_add(1, Ordering::Relaxed);
     let id = page_id(&entry.rel_path);
@@ -468,22 +589,43 @@ fn physical_page(entry: &PageEntry, document: &Document) -> Result<PhysicalPage,
         format!("{} {preamble_search}", entry.name)
     };
     let mut blocks = Vec::new();
-    lower_blocks(&document.roots, id, None, &mut Vec::new(), &mut blocks)?;
-    Ok(PhysicalPage {
-        page_id: id,
-        home_document_id: id,
-        name: entry.name.clone(),
-        name_key: crate::refs::page_key(&entry.name),
-        path: entry.rel_path.clone(),
-        text_kind: page_kind_to_sql(entry.kind),
-        preamble: document.pre_block.clone(),
-        normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
-        searchable_text,
-        references: Vec::new(),
-        properties,
-        tags,
-        blocks,
-    })
+    let mut reference_postings = Vec::new();
+    if let Some(preamble) = document.pre_block.as_deref() {
+        append_reference_postings(
+            &mut reference_postings,
+            id,
+            PhysicalEntityId::Page(id),
+            b"preamble",
+            std::iter::empty(),
+            crate::doc::property_reference_page_names(preamble).into_iter(),
+        )?;
+    }
+    lower_blocks(
+        &document.roots,
+        id,
+        None,
+        &mut Vec::new(),
+        &mut blocks,
+        &mut reference_postings,
+    )?;
+    Ok((
+        PhysicalPage {
+            page_id: id,
+            home_document_id: id,
+            name: entry.name.clone(),
+            name_key: crate::refs::page_key(&entry.name),
+            path: entry.rel_path.clone(),
+            text_kind: page_kind_to_sql(entry.kind),
+            preamble: document.pre_block.clone(),
+            normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
+            searchable_text,
+            references: Vec::new(),
+            properties,
+            tags,
+            blocks,
+        },
+        reference_postings,
+    ))
 }
 
 fn lower_blocks(
@@ -492,6 +634,7 @@ fn lower_blocks(
     parent: Option<[u8; 16]>,
     structural_path: &mut Vec<u32>,
     out: &mut Vec<PhysicalBlock>,
+    reference_postings: &mut Vec<PhysicalReferencePosting>,
 ) -> Result<(), String> {
     for (position, block) in source.iter().enumerate() {
         let position = u32::try_from(position)
@@ -506,6 +649,19 @@ fn lower_blocks(
             })?
             .into_bytes();
         let projection = block.projection();
+        let order = structural_path
+            .iter()
+            .map(|part| format!("{part:08x}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        append_reference_postings(
+            reference_postings,
+            page_id,
+            PhysicalEntityId::Block(block_id),
+            order.as_bytes(),
+            projection.refs_page.iter().cloned(),
+            crate::doc::property_reference_page_names(&block.raw).into_iter(),
+        )?;
         let searchable_text = projection
             .visible
             .split_whitespace()
@@ -524,11 +680,7 @@ fn lower_blocks(
             block_id,
             home_document_id: page_id,
             parent,
-            order: structural_path
-                .iter()
-                .map(|part| format!("{part:08x}"))
-                .collect::<Vec<_>>()
-                .join("/"),
+            order,
             content: block.raw.clone(),
             normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
             searchable_text,
@@ -552,8 +704,43 @@ fn lower_blocks(
             Some(block_id),
             structural_path,
             out,
+            reference_postings,
         )?;
         structural_path.pop();
+    }
+    Ok(())
+}
+
+fn append_reference_postings(
+    out: &mut Vec<PhysicalReferencePosting>,
+    page_id: [u8; 16],
+    source: PhysicalEntityId,
+    source_locator: &[u8],
+    inline_names: impl IntoIterator<Item = String>,
+    property_names: impl IntoIterator<Item = String>,
+) -> Result<(), String> {
+    let mut ordinal = 0_u32;
+    for (kind, names) in [
+        (0_i64, inline_names.into_iter().collect::<Vec<_>>()),
+        (3_i64, property_names.into_iter().collect::<Vec<_>>()),
+    ] {
+        for raw_name in names {
+            out.push(PhysicalReferencePosting {
+                source_page_id: page_id,
+                source_entity: source,
+                source_locator: source_locator.to_vec(),
+                ordinal,
+                kind,
+                target: PhysicalReferenceTarget::PageName {
+                    normalized_name: crate::refs::page_key(&raw_name),
+                    raw_name,
+                    resolved_page_id: None,
+                },
+            });
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| "one reference source exceeds u32::MAX postings".to_string())?;
+        }
     }
     Ok(())
 }
@@ -579,7 +766,7 @@ fn facets(raw: &str, is_org: bool) -> (String, Vec<PhysicalProperty>, Vec<String
     (searchable, properties, block.projection().tags.clone())
 }
 
-fn page_id(relative_path: &str) -> [u8; 16] {
+pub(crate) fn page_id(relative_path: &str) -> [u8; 16] {
     let mut digest = Sha256::new();
     digest.update(b"tine-direct-page-v1\0");
     digest.update(relative_path.as_bytes());
@@ -748,11 +935,197 @@ mod tests {
     }
 
     #[test]
+    fn direct_projection_matches_fuzzy_search_and_virtual_reference_names() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("search-reference-parity");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/one.md"),
+            "tags:: Page Tag, [[Property Page]]\nalias:: Alias Page\nquoted:: untouched\n\n- Characteristically useful [[Inline Page]]\n  aliases:: #Block Alias\n- c% literal\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("pages/two.md"), "- unrelated content\n").unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let oracle = crate::query::search(&graph, "cly", 20);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        wait_ready(&graph);
+
+        let candidate_pages = graph
+            .direct_projection_fuzzy_candidate_pages("cly")
+            .unwrap();
+        assert_eq!(candidate_pages.len(), 1);
+        assert_eq!(candidate_pages[0].0.rel_path, "pages/one.md");
+        assert_eq!(signature(&graph.search("cly", 20)), signature(&oracle));
+        assert!(graph.direct_projection_fuzzy_candidate_reads_test() > 0);
+        let names = graph
+            .referenced_page_names()
+            .into_iter()
+            .map(|name| crate::refs::page_key(&name))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            [
+                "page tag",
+                "property page",
+                "alias page",
+                "inline page",
+                "block",
+                "block alias",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+        assert!(graph.direct_projection_referenced_name_reads_test() > 0);
+
+        let fuzzy_reads = graph.direct_projection_fuzzy_candidate_reads_test();
+        let name_reads = graph.direct_projection_referenced_name_reads_test();
+        graph.direct_projection_mark_stale_test();
+        assert_eq!(signature(&graph.search("cly", 20)), signature(&oracle));
+        assert_eq!(
+            graph
+                .referenced_page_names()
+                .into_iter()
+                .map(|name| crate::refs::page_key(&name))
+                .collect::<std::collections::BTreeSet<_>>(),
+            names
+        );
+        assert_eq!(
+            graph.direct_projection_fuzzy_candidate_reads_test(),
+            fuzzy_reads,
+            "a stale generation must use the parser fallback"
+        );
+        assert_eq!(
+            graph.direct_projection_referenced_name_reads_test(),
+            name_reads,
+            "a stale generation must not read reference names from SQLite"
+        );
+
+        let entry = graph
+            .list_pages()
+            .into_iter()
+            .find(|entry| entry.name == "one")
+            .unwrap();
+        let mut page = graph.load_page(&entry).unwrap();
+        let baseline = page.rev.clone();
+        page.blocks[0].raw = "Nothing matching [[Replacement Page]]".into();
+        graph.save_page(&page, baseline.as_deref()).unwrap();
+        wait_ready(&graph);
+        assert!(graph.search("cly", 20).is_empty());
+        let names = graph
+            .referenced_page_names()
+            .into_iter()
+            .map(|name| crate::refs::page_key(&name))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("replacement page"));
+        assert!(!names.contains("inline page"));
+
+        std::fs::write(
+            root.join("pages/one.md"),
+            "tags:: External Tag\n\n- Externally changed fuzzy [[External Page]]\n",
+        )
+        .unwrap();
+        graph.sync_file_checked(&root.join("pages/one.md")).unwrap();
+        wait_ready(&graph);
+        assert!(!graph.search("ecf", 20).is_empty());
+        let names = graph
+            .referenced_page_names()
+            .into_iter()
+            .map(|name| crate::refs::page_key(&name))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("external tag"));
+        assert!(names.contains("external page"));
+        assert!(!names.contains("replacement page"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_projection_fuzzy_candidates_preserve_parser_corpus_semantics() {
+        let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
+        let root = scratch("search-corpus-parity");
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        std::fs::write(
+            root.join("pages/search.md"),
+            "- Characteristically useful\n  - descendant Needle\n- Café and cafe\u{301}\n- 100% under_score back\\slash\n- MixedCASE\n- x a y b z\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("pages/other.md"),
+            "- Another characteristically useful result\n",
+        )
+        .unwrap();
+        let cases = [
+            ("", 20),
+            ("   ", 20),
+            ("cly", 20),
+            ("needle", 20),
+            ("CAFÉ", 20),
+            ("cafe\u{301}", 20),
+            ("%", 20),
+            ("_", 20),
+            ("\\", 20),
+            ("mixedcase", 20),
+            ("xyz", 20),
+            ("cly", 1),
+        ];
+        let oracle_graph = Graph::open(&root);
+        oracle_graph.warm_cache();
+        let oracle = cases
+            .iter()
+            .map(|(query, limit)| signature(&crate::query::search(&oracle_graph, query, *limit)))
+            .collect::<Vec<_>>();
+        let graph = Graph::open(&root);
+        graph
+            .attach_direct_projection(root.join("private/projection.sqlite"))
+            .unwrap();
+        assert!(
+            graph.warm_cache_cancellable(|| false),
+            "corpus cache failed to warm: {:?}",
+            graph.page_index_failures()
+        );
+        wait_ready(&graph);
+        for ((query, limit), expected) in cases.into_iter().zip(oracle) {
+            assert_eq!(
+                signature(&graph.search(query, limit)),
+                expected,
+                "{query:?}"
+            );
+        }
+        let cancellation_checks = std::cell::Cell::new(0);
+        assert!(crate::query::search_cancellable(&graph, "cly", 20, || {
+            cancellation_checks.set(cancellation_checks.get() + 1);
+            cancellation_checks.get() > 1
+        })
+        .is_empty());
+
+        graph.rename_page("search", "renamed search").unwrap();
+        graph.warm_cache();
+        wait_ready(&graph);
+        assert_eq!(
+            signature(&graph.search("needle", 20)),
+            signature(&crate::query::search(&graph, "needle", 20))
+        );
+        graph.delete_page("renamed search", PageKind::Page).unwrap();
+        wait_ready(&graph);
+        assert!(graph.search("needle", 20).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn unavailable_projection_keeps_direct_files_query_semantics() {
         let _serial = PROJECTION_TEST_LOCK.lock().unwrap();
         let root = scratch("fallback");
         std::fs::create_dir_all(root.join("pages")).unwrap();
-        std::fs::write(root.join("pages/tasks.md"), "- TODO remains readable\n").unwrap();
+        std::fs::write(
+            root.join("pages/tasks.md"),
+            "- TODO Characteristically readable [[Inline Only]]\n  alias:: #Alias Only\n",
+        )
+        .unwrap();
         let blocked_parent = root.join("not-a-directory");
         std::fs::write(&blocked_parent, b"ordinary file").unwrap();
 
@@ -766,6 +1139,19 @@ mod tests {
         let fallback = graph.run_query_bounded("(task TODO)", 100, 1_000_000);
         assert_eq!(signature(&fallback.groups), signature(&oracle.groups));
         assert_eq!(graph.direct_projection_indexed_reads_test(), 0);
+        assert_eq!(
+            signature(&graph.search("cly", 20)),
+            signature(&crate::query::search(&graph, "cly", 20))
+        );
+        let names = graph
+            .referenced_page_names()
+            .into_iter()
+            .map(|name| crate::refs::page_key(&name))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("inline only"));
+        assert!(names.contains("alias only"));
+        assert_eq!(graph.direct_projection_fuzzy_candidate_reads_test(), 0);
+        assert_eq!(graph.direct_projection_referenced_name_reads_test(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -869,6 +1255,9 @@ mod tests {
         let contract = include_str!("../../../docs/storage-sync-contract.md");
         assert!(contract.contains("direct-files-projections/<canonical-graph-path-digest>.sqlite"));
         assert!(contract.contains("sparse_task_query_eligibility"));
+        assert!(contract.contains("literal fuzzy-search candidate"));
+        assert!(contract.contains("referenced-page\ninventory"));
+        assert!(contract.contains("retains no separate semantic memo"));
         assert!(contract.contains("exact current parser-cache\ngeneration"));
         assert!(contract.contains("app-private graph-fact projection contains no managed state"));
         assert!(contract.contains("clean\nreopen lowers none"));
@@ -887,6 +1276,8 @@ mod tests {
                 .expect("TINE_DIRECT_PROJECTION_CORPUS is required"),
         );
         let database = scratch("real-corpus").join("projection.sqlite");
+        let oracle_graph = Graph::open(&root);
+        oracle_graph.warm_cache();
         let graph = Graph::open(&root);
         graph.attach_direct_projection(database.clone()).unwrap();
         let started = Instant::now();
@@ -895,7 +1286,8 @@ mod tests {
         wait_ready(&graph);
         let converged = started.elapsed();
         let oracle_started = Instant::now();
-        let oracle = crate::query::run_query_bounded(&graph, "(task TODO)", 20_000, 32 << 20);
+        let oracle =
+            crate::query::run_query_bounded(&oracle_graph, "(task TODO)", 20_000, 32 << 20);
         let oracle_elapsed = oracle_started.elapsed();
         let query_started = Instant::now();
         let indexed = graph.run_query_bounded("(task TODO)", 20_000, 32 << 20);
@@ -907,6 +1299,37 @@ mod tests {
         let memo_elapsed = memo_started.elapsed();
         assert_eq!(signature(&repeated.groups), signature(&oracle.groups));
         assert_eq!(graph.direct_projection_indexed_reads_test(), indexed_reads);
+        let mut fuzzy_indexed = Duration::ZERO;
+        let mut fuzzy_oracle = Duration::ZERO;
+        for value in ["a", "todo", "http", "2026", "%", "_", "é"] {
+            let indexed_started = Instant::now();
+            let indexed_search = graph.search(value, 5_000);
+            fuzzy_indexed += indexed_started.elapsed();
+            let oracle_started = Instant::now();
+            let oracle_search = crate::query::search(&oracle_graph, value, 5_000);
+            fuzzy_oracle += oracle_started.elapsed();
+            assert_eq!(
+                signature(&indexed_search),
+                signature(&oracle_search),
+                "real-corpus fuzzy search diverged for a bounded probe"
+            );
+        }
+        eprintln!(
+            "direct projection fuzzy receipt: indexed_total_ms={} oracle_total_ms={}",
+            fuzzy_indexed.as_millis(),
+            fuzzy_oracle.as_millis(),
+        );
+        let normalize_names = |mut names: Vec<String>| {
+            names.sort_by_key(|name| crate::refs::page_key(name));
+            names
+        };
+        assert_eq!(
+            normalize_names(graph.referenced_page_names()),
+            normalize_names(oracle_graph.referenced_page_names()),
+            "real-corpus referenced-page inventory diverged"
+        );
+        assert!(graph.direct_projection_fuzzy_candidate_reads_test() > 0);
+        assert!(graph.direct_projection_referenced_name_reads_test() > 0);
         let task_candidates = PhysicalGraphProjectionDatabase::open_read_only(&database)
             .unwrap()
             .read()

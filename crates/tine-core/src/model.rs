@@ -2464,16 +2464,6 @@ pub struct Graph {
     /// snapshot and DTO round-trip, and a copy would then claim an identity it
     /// does not have (see the frontend's `clonePages`/history snapshots).
     editor_activations: std::sync::Mutex<EditorActivationState>,
-    /// All page names referenced anywhere — `[[link]]`/`#tag`/`#[[..]]` plus
-    /// `tags::`/`alias::` property values — in their as-written display case,
-    /// keyed by `cache_gen`. Like OG, a page that is only referenced (never given
-    /// its own file) still "exists" — this lets quick-switch / `[[ ]]`/`#`
-    /// autocomplete surface such a page instead of offering a misleading
-    /// "Create …". Built from the page cache, and only when it's already warm
-    /// (never force-built on a keystroke); empty until then.
-    /// `(cache_gen, names, digest)` — the digest lets a caller holding the same
-    /// set skip transporting it (see `referenced_page_names_versioned`).
-    referenced_names_cache: RwLock<Option<(u64, Vec<String>, u64)>>,
     /// Per-resolved-path write locks. The same page file has TWO in-process
     /// writers — the editor (`save_page`/`write_page`) and the PDF highlight path
     /// (`write_highlights`, for an `hls__` page) — and a rename rewrites many
@@ -5672,7 +5662,6 @@ impl Graph {
             loaded_file_identities: RwLock::new(std::collections::HashMap::new()),
             conflict_authority: std::sync::Mutex::new(ConflictAuthorityState::default()),
             editor_activations: std::sync::Mutex::new(EditorActivationState::default()),
-            referenced_names_cache: RwLock::new(None),
             page_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
             managed_write_binding,
             handoff_instance_token: Arc::new(HandoffGraphInstanceToken),
@@ -5786,6 +5775,49 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(result)
     }
 
+    fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let names = projection.referenced_page_names(generation)?;
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+    }
+
+    pub(crate) fn direct_projection_fuzzy_candidate_pages(
+        &self,
+        normalized_needle: &str,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let projection = self
+            .direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)?;
+        let paths = projection.fuzzy_candidate_paths(generation, normalized_needle)?;
+        let snapshot = self.cache.read().unwrap().as_ref().map(Arc::clone)?;
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return None;
+        }
+        let cache_index = self.cache_index.read().unwrap();
+        let cache_index = cache_index.as_ref()?;
+        let mut pages = Vec::with_capacity(paths.len());
+        for relative in paths {
+            let path = self.root.join(&relative);
+            let slot = cache_index.by_path.get(&path).copied()?;
+            let page = snapshot.get(slot)?;
+            if page.0.path != path || page.0.rel_path != relative {
+                return None;
+            }
+            pages.push(page.clone());
+        }
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
+    }
+
     fn direct_projection_ready(&self) -> bool {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         self.direct_projection
@@ -5806,12 +5838,35 @@ impl Graph {
     }
 
     #[cfg(test)]
+    pub(crate) fn direct_projection_mark_stale_test(&self) {
+        self.direct_projection_mark_stale();
+    }
+
+    #[cfg(test)]
     pub(crate) fn direct_projection_indexed_reads_test(&self) -> u64 {
         self.direct_projection
             .lock()
             .unwrap()
             .as_ref()
             .map_or(0, |projection| projection.indexed_reads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_referenced_name_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.referenced_name_reads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_projection_fuzzy_candidate_reads_test(&self) -> u64 {
+        self.direct_projection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |projection| projection.fuzzy_candidate_reads())
     }
 
     /// Stable identity of the exact no-follow directory capability retained at
@@ -12448,9 +12503,10 @@ impl Graph {
     /// that "exist" by reference even without a file of their own (OG semantics),
     /// so autocomplete/quick-switch can offer them instead of "Create …".
     ///
-    /// Computed from the whole-graph cache and memoized by `cache_gen`. If the
-    /// cache isn't warm yet it returns empty and memoizes nothing — we never force
-    /// a full-graph parse from here (this runs on autocomplete keystrokes).
+    /// Read from the disposable SQLite fact projection at the exact current
+    /// cache generation. If that projection is unavailable or stale, the
+    /// already-parsed whole-graph cache is the correctness fallback; this never
+    /// forces a full-graph parse (it runs on autocomplete keystrokes).
     pub fn referenced_page_names(&self) -> Vec<String> {
         self.referenced_page_names_versioned(None)
             .names
@@ -12473,61 +12529,31 @@ impl Graph {
     /// changes. It carries the count as well, so adding a name that collides with
     /// a removed one still shows up unless the count also matches.
     pub fn referenced_page_names_versioned(&self, known: Option<u64>) -> ReferencedPageNames {
-        let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        if let Some((g, names, digest)) = self.referenced_names_cache.read().unwrap().as_ref() {
-            if *g == gen {
-                return ReferencedPageNames::answer(*digest, names, known);
-            }
+        if let Some(names) = self.direct_projection_referenced_page_names() {
+            let digest = referenced_names_digest(&names);
+            return ReferencedPageNames::answer(digest, &names, known);
         }
-        let names = self.rebuild_referenced_page_names(gen);
+        let names = self.rebuild_referenced_page_names();
         let digest = referenced_names_digest(&names);
         ReferencedPageNames::answer(digest, &names, known)
     }
 
-    fn rebuild_referenced_page_names(&self, gen: u64) -> Vec<String> {
+    fn rebuild_referenced_page_names(&self) -> Vec<String> {
         let guard = self.cache.read().unwrap();
         let Some(pages) = guard.as_ref() else {
-            return Vec::new(); // cache not warm — don't force a parse, don't memoize
+            return Vec::new(); // cache not warm — don't force a parse
         };
         fn add(seen: &mut std::collections::HashMap<String, String>, name: String) {
             if !name.is_empty() {
                 seen.entry(crate::refs::page_key(&name)).or_insert(name);
             }
         }
-        // `tags::` / `alias::` property values are page references in OG too —
-        // comma-separated, written bare or as `[[..]]`/`#..` — so a page named
-        // only in a `tags::`/`alias::` list still "exists". Strip any wrapping
-        // down to the page name. (Line-based, like DocBlock::property.)
-        fn add_property_refs(seen: &mut std::collections::HashMap<String, String>, text: &str) {
-            for line in text.lines() {
-                let Some((k, v)) = crate::doc::parse_property_line(line) else {
-                    continue;
-                };
-                if !(k.eq_ignore_ascii_case("tags")
-                    || k.eq_ignore_ascii_case("alias")
-                    || k.eq_ignore_ascii_case("aliases"))
-                {
-                    continue;
-                }
-                let quoted = v.trim();
-                if quoted.len() >= 2 && quoted.starts_with('"') && quoted.ends_with('"') {
-                    continue;
-                }
-                for val in v.split([',', '，']) {
-                    let t = val.trim();
-                    let t = t.strip_prefix('#').unwrap_or(t).trim();
-                    let t = t
-                        .strip_prefix("[[")
-                        .and_then(|x| x.strip_suffix("]]"))
-                        .unwrap_or(t);
-                    add(seen, t.trim().to_string());
-                }
-            }
-        }
         let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for (_, doc) in pages.iter() {
             if let Some(pre) = &doc.pre_block {
-                add_property_refs(&mut seen, pre); // page-level tags::/alias::
+                for name in crate::doc::property_reference_page_names(pre) {
+                    add(&mut seen, name);
+                }
             }
             let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_MANAGED_BLOCK_DEPTH] =
                 std::array::from_fn(|_| None);
@@ -12550,12 +12576,14 @@ impl Graph {
                 for name in &block.projection().refs_page {
                     add(&mut seen, name.clone());
                 }
-                add_property_refs(&mut seen, &block.raw);
+                for name in crate::doc::property_reference_page_names(&block.raw) {
+                    add(&mut seen, name);
+                }
                 if !block.children.is_empty() {
                     if len == MAX_MANAGED_BLOCK_DEPTH {
                         // Cache documents normally pass the checked parser/admission
                         // boundary. Contain any forged or stale over-depth value:
-                        // publish neither a partial result nor a memoized generation.
+                        // publish no partial result.
                         return Vec::new();
                     }
                     frames[len] = Some(block.children.iter());
@@ -12563,11 +12591,7 @@ impl Graph {
                 }
             }
         }
-        drop(guard);
-        let names: Vec<String> = seen.into_values().collect();
-        let digest = referenced_names_digest(&names);
-        *self.referenced_names_cache.write().unwrap() = Some((gen, names.clone(), digest));
-        names
+        seen.into_values().collect()
     }
 
     /// Journals sorted newest-first.
@@ -48116,14 +48140,6 @@ mod tests {
         let rejected_graph = Graph::open(&dir);
         *rejected_graph.cache.write().unwrap() = Some(Arc::new(vec![(entry, Arc::new(rejected))]));
         assert!(rejected_graph.referenced_page_names().is_empty());
-        assert!(
-            rejected_graph
-                .referenced_names_cache
-                .read()
-                .unwrap()
-                .is_none(),
-            "over-depth traversal must not memoize a partial cache result",
-        );
 
         let accepted_markdown =
             markdown_page_dto("Depth 128", "Depth 128", &nested_markdown(128)).unwrap();

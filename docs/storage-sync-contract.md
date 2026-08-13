@@ -76,7 +76,7 @@ from the immutable archive.
 | `reconciliation/{scan.sqlite,scan.sqlite-wal,scan.sqlite-shm,scan.sqlite-journal}` | reconciliation | reconciliation scheduler | SQLite baseline v3 | disposable |
 | `reconciliation/<workspace>/<endpoint>/scan.sqlite.forensic-<uuid>/{database,wal,shm,journal,EVIDENCE_COMPLETE,REBUILD_COMPLETE}` | reconciliation recovery | cache-corruption diagnostics and crash-resumable rebuild | exact former baseline file set plus completion markers | diagnostic; never authority; created only when the disposable baseline fails semantic validation |
 | `.tine-runtime/sqlite-workspaces/sqlite-applier.lock` | SQLite applier | SQLite applier | empty OS-lock file | disposable process coordination |
-| `projection/materialization.sqlite{,-wal,-shm}` | SQLite applier | managed queries/navigation | `tine-storage` SQLite schema 15 | disposable; mismatch causes one rebuild |
+| `projection/materialization.sqlite{,-wal,-shm}` | SQLite applier | managed queries/navigation | `tine-storage` SQLite schema 16 | disposable; mismatch causes one rebuild |
 | runtime scratch (`tine-storage::formats::SCRATCH_DIR` and its marker/lease/pages/blobs) | hot engine/import | hot engine/rebuild | scratch schema 13, page schema 1 | disposable; one run only |
 | `managed-local-journal-v1/` | actor fast durability lane | drain/recovery | journal frames/segments | durable until incorporated into oplog, then reclaimable |
 | `local-authorship-v1/` | actor publication | provider repair/recovery | receipt v1 | retained until corresponding publication is proven |
@@ -115,19 +115,26 @@ unwritable database
 therefore uses the established parser evaluator and cannot block graph open,
 save, or external file observation.
 
-The first switched read family is the conservative task-query subset already
+The switched read families are the conservative task-query subset already
 accepted by `sparse_task_query_eligibility` (task markers plus priority,
-scheduled/deadline and presentation directives). Once current, that family
-enumerates SQLite task candidates and re-evaluates every returned raw block
-through the existing parser query evaluator; it no longer uses the manual
-whole-graph candidate scan as its ordinary route. The bounded generation-keyed
+scheduled/deadline and presentation directives), literal fuzzy-search candidate
+selection (including the `((` picker), and the original-case referenced-page
+inventory used by autocomplete and navigation. Once current, these families
+enumerate SQLite task candidates and re-evaluate every returned raw block
+through the existing parser query evaluator, or obtain a generation-bound
+candidate/name set before applying the existing parser-owned matching and
+presentation semantics. They no longer use manual whole-graph candidate scans
+or a second in-memory referenced-name semantic cache as their ordinary route.
+The bounded generation-keyed
 memo of already-shaped frontend result DTOs remains Tine-native: SQLite cannot
 own parser AST semantics or presentation reuse, and dropping that memo would
 turn reactive re-renders into repeated SQL plus parser evaluation. If SQLite is
 unavailable, the same parser evaluator remains the correctness fallback; it is
-not a second candidate index. All other query, reference, navigation, and search
-families retain their existing implementation until an equivalent
-generation-bound differential packet replaces and deletes each old route.
+not a second candidate index. Referenced-name fallback walks only the already-
+parsed page cache and deliberately retains no separate semantic memo. All other
+query, reference, navigation, and search families retain their existing
+implementation until an equivalent generation-bound differential packet
+replaces and deletes each old route.
 
 ## 2. Enrollment and synchronization state machine
 
