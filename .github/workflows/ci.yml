@@ -404,6 +404,12 @@ jobs:
 
       - run: npm ci
 
+      # The generated Android project retains the stable production package;
+      # desktop builds use the mixed-case reverse-DNS identifier.
+      - name: Pin Android identifier to page.tine.app
+        run: |
+          node -e "const f='./src-tauri/tauri.conf.json',c=require(f);c.identifier='page.tine.app';require('fs').writeFileSync(f,JSON.stringify(c,null,2)+'\n');"
+
       - name: Build debug x86_64 app and instrumentation APKs
         run: |
           npx tauri android build --debug --target x86_64 --apk --ci
