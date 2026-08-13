@@ -1155,9 +1155,13 @@ fn claimless_nonempty_and_prior_version_receipt_roots_fail_without_mutation() {
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
+    let claimless_error = ProjectionReceiptStore::open(claimless.path(), workspace(1))
+        .expect_err("claimless nonempty receipt root must be rejected");
     assert!(matches!(
-        ProjectionReceiptStore::open(claimless.path(), workspace(1)),
-        Err(ProjectionStoreError::ClaimlessNonemptyStore)
+        claimless_error,
+        ProjectionStoreError::Operation { operation, source }
+            if operation == "initialize private receipt store"
+                && matches!(*source, ProjectionStoreError::ClaimlessNonemptyStore)
     ));
     let after = fs::read_dir(claimless.path())
         .unwrap()
@@ -1174,10 +1178,15 @@ fn claimless_nonempty_and_prior_version_receipt_roots_fail_without_mutation() {
     fs::write(prior.path().join("projection-receipts.claim"), &claim).unwrap();
     assert!(matches!(
         ProjectionReceiptStore::open(prior.path(), workspace(1)),
-        Err(ProjectionStoreError::UpgradeRequired {
-            found: 4,
-            current: 5
-        })
+        Err(ProjectionStoreError::Operation { operation, source })
+            if operation == "initialize private receipt store"
+                && matches!(
+                    *source,
+                    ProjectionStoreError::UpgradeRequired {
+                        found: 4,
+                        current: 5
+                    }
+                )
     ));
     assert_eq!(
         fs::read(prior.path().join("projection-receipts.claim")).unwrap(),
