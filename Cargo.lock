@@ -5599,6 +5599,7 @@ dependencies = [
  "ed25519-dalek",
  "gdkwayland-sys",
  "gtk",
+ "jni 0.21.1",
  "libc",
  "notify",
  "same-file",

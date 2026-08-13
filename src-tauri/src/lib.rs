@@ -3,6 +3,8 @@
 //! spellcheck WebKit integration; platform OS bridges; commands thin IPC.
 
 mod android_folder_picker;
+#[cfg(all(target_os = "android", debug_assertions))]
+mod android_managed_storage_smoke;
 mod android_media;
 mod android_safe_back;
 mod android_system_bars;
