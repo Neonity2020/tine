@@ -1143,7 +1143,9 @@ fn corrupt_missing_noncanonical_and_unknown_evidence_fail_closed() {
     fs::write(claim_dir.path().join("projection-receipts.claim"), claim).unwrap();
     assert!(matches!(
         ProjectionReceiptStore::open(claim_dir.path(), workspace(1)),
-        Err(ProjectionStoreError::UnknownStoreVersion(99))
+        Err(ProjectionStoreError::Operation { operation, source })
+            if operation == "initialize private receipt store"
+                && matches!(*source, ProjectionStoreError::UnknownStoreVersion(99))
     ));
 }
 
@@ -1224,7 +1226,9 @@ fn receipt_resource_identity_survives_move_and_rejects_a_simultaneous_copy() {
     copy_directory_tree(&moved, &copied);
     assert!(matches!(
         ProjectionReceiptStore::open(&copied, workspace(1)),
-        Err(ProjectionStoreError::EndpointBindingMismatch)
+        Err(ProjectionStoreError::Operation { operation, source })
+            if operation == "initialize private receipt store"
+                && matches!(*source, ProjectionStoreError::EndpointBindingMismatch)
     ));
 }
 
