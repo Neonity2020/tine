@@ -14,7 +14,7 @@ use tauri::{Emitter, Manager, State};
 use tine_core::model::{Graph, GraphMeta};
 use tine_core::sync_runtime::{
     inspect_shared_enrollment_for_cold_discovery, inspect_shared_provider_cold_prefix,
-    SyncSharedProviderColdPrefix,
+    ManagedStorageRefusalScenario, SyncSharedProviderColdPrefix,
 };
 
 /// Reset the warm flag for a new graph load and return the new warm generation
@@ -278,7 +278,7 @@ enum ColdSparseArchive {
     Absent,
     Joinable,
     Partial,
-    Refused,
+    Refused(ManagedStorageRefusalScenario),
 }
 
 fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
@@ -294,9 +294,10 @@ fn refuse_unclaimed_sparse_archive(root: &Path) -> Result<(), String> {
                 // incomplete arrival, not proof of hostile graph state.
                 .or(Ok(false))
         }
-        SyncSharedProviderColdPrefix::Refused => {
-            Err("shared provider namespace is ambiguous or unsafe".into())
-        }
+        SyncSharedProviderColdPrefix::Refused => Err(format!(
+            "shared provider namespace has an unsafe filesystem kind [scenario_id={}]",
+            ManagedStorageRefusalScenario::UnsafeFilesystemKind
+        )),
     })
 }
 
@@ -304,7 +305,6 @@ fn refuse_unclaimed_sparse_archive_with(
     root: &Path,
     inspect_shared: impl FnOnce(&Path) -> Result<bool, String>,
 ) -> Result<(), String> {
-    const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
     match inspect_unclaimed_sparse_archive(root, inspect_shared)? {
         ColdSparseArchive::Absent | ColdSparseArchive::Joinable => Ok(()),
         ColdSparseArchive::Partial => {
@@ -313,7 +313,9 @@ fn refuse_unclaimed_sparse_archive_with(
             );
             Err(PARTIAL_PROVIDER_REFUSAL.into())
         }
-        ColdSparseArchive::Refused => Err(REFUSAL.into()),
+        ColdSparseArchive::Refused(scenario) => Err(format!(
+            "Tine-managed storage data has an unsafe filesystem kind, so this graph could not be opened safely. [scenario_id={scenario}]"
+        )),
     }
 }
 
@@ -334,7 +336,9 @@ fn inspect_unclaimed_sparse_archive(
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Ok(ColdSparseArchive::Refused);
+        return Ok(ColdSparseArchive::Refused(
+            ManagedStorageRefusalScenario::UnsafeFilesystemKind,
+        ));
     }
     let shared = archive.join("shared");
     let shared_metadata = match std::fs::symlink_metadata(&shared) {
@@ -349,7 +353,9 @@ fn inspect_unclaimed_sparse_archive(
         }
     };
     if shared_metadata.file_type().is_symlink() || !shared_metadata.is_dir() {
-        return Ok(ColdSparseArchive::Refused);
+        return Ok(ColdSparseArchive::Refused(
+            ManagedStorageRefusalScenario::UnsafeFilesystemKind,
+        ));
     }
     // The canonical shared directory is the only path that carries discovery
     // authority.  Temporary or future sibling entries under v2 are inert.
@@ -905,6 +911,17 @@ mod tests {
         dir
     }
 
+    fn assert_unsafe_provider_refusal(error: &str) {
+        assert!(
+            error.contains("unsafe filesystem kind"),
+            "the refusal must name the user-actionable class: {error}"
+        );
+        assert!(
+            error.contains(ManagedStorageRefusalScenario::UnsafeFilesystemKind.as_str()),
+            "the refusal must preserve its stable scenario ID: {error}"
+        );
+    }
+
     fn tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         fn collect(root: &Path, relative: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
             for entry in std::fs::read_dir(root.join(relative)).unwrap() {
@@ -1148,15 +1165,12 @@ mod tests {
 
     #[test]
     fn cold_provider_unsafe_canonical_kinds_refuse_but_unrelated_entries_retry() {
-        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
-
         let non_directory = scratch("cold-provider-outbox-file");
         let shared = non_directory.join(".tine-sync/v2/shared");
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::write(shared.join("outbox"), b"not a directory").unwrap();
-        assert_eq!(
-            refuse_unclaimed_sparse_archive(&non_directory).unwrap_err(),
-            REFUSAL
+        assert_unsafe_provider_refusal(
+            &refuse_unclaimed_sparse_archive(&non_directory).unwrap_err(),
         );
         let _ = std::fs::remove_dir_all(non_directory);
 
@@ -1178,9 +1192,8 @@ mod tests {
             let target = symlinked.join("provider-outbox-target");
             std::fs::create_dir_all(&target).unwrap();
             symlink(&target, shared.join("outbox")).unwrap();
-            assert_eq!(
-                refuse_unclaimed_sparse_archive(&symlinked).unwrap_err(),
-                REFUSAL
+            assert_unsafe_provider_refusal(
+                &refuse_unclaimed_sparse_archive(&symlinked).unwrap_err(),
             );
             let _ = std::fs::remove_dir_all(symlinked);
         }
@@ -1188,7 +1201,6 @@ mod tests {
 
     #[test]
     fn cold_shared_discovery_uses_the_real_v2_shared_namespace() {
-        const REFUSAL: &str = "Tine-managed storage data exists without its required local recovery information, so this graph could not be opened safely.";
         let dir = scratch("cold-shared-layout");
         let v2 = dir.join(".tine-sync/v2");
         let shared = v2.join("shared");
@@ -1229,9 +1241,8 @@ mod tests {
             let target = dir.join("provider-target");
             std::fs::create_dir_all(&target).unwrap();
             symlink(&target, &shared).unwrap();
-            assert_eq!(
-                refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
-                REFUSAL
+            assert_unsafe_provider_refusal(
+                &refuse_unclaimed_sparse_archive_with(&dir, |_| Ok(true)).unwrap_err(),
             );
         }
         let _ = std::fs::remove_dir_all(dir);
