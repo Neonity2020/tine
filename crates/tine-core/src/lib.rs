@@ -7,6 +7,7 @@ pub mod date;
 pub mod doc;
 pub mod edn;
 pub mod fast_commit;
+mod filesystem_durability;
 
 pub mod graph_text_scope;
 pub mod html_sanitize;

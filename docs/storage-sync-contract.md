@@ -216,12 +216,20 @@ groups. Capability-relative no-follow access, exact file identity, link count,
 OS locks, digests, generations, and decoders carry the in-scope invariants.
 
 Android bootstrap durability likewise does not require the application sandbox
-to authorize a filesystem-wide `syncfs` operation. Tine uses that operation as
-an optimization where the device permits it; a permission, unsupported, or
-invalid-operation response falls back to synchronizing every regular file and
-directory in the exact app-private capture tree. Other I/O failures still abort
-activation, and the graph projection remains untouched until the private
-capture has been sealed.
+to authorize a filesystem-wide `syncfs` operation. Source capture, prepared
+bootstrap state, and migration-backup proof share one policy: Tine uses
+`syncfs` as an optimization where the device permits it; a permission,
+unsupported, or invalid-operation response falls back to synchronizing every
+regular file and directory in that exact app-private tree. Other I/O failures
+still abort activation, and the graph projection remains untouched until the
+private state has been sealed.
+
+The graph-local shared-provider tree is transport rather than local authority.
+Tine still creates and opens it no-follow, requires ordinary directories and
+regular files, flushes published file contents, and validates bounded bytes and
+digests. On Android, inability to fsync a shared-storage directory is treated
+as a platform durability limit rather than a durable refusal. App-private
+enrollment, archive, journal, and SQLite directory barriers remain required.
 
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
 15. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,

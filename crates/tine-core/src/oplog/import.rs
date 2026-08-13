@@ -7,8 +7,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
@@ -3790,58 +3788,18 @@ fn inactive_bootstrap_preparation_before_seal_hook() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
-    let directory = File::open(path)?;
-    // SAFETY: the opened directory descriptor names the filesystem containing
-    // the complete authenticated preparation prefix.
-    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn flush_bootstrap_preparation_tree(path: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata.file_type().is_symlink() {
-            return Err(invalid_bootstrap_data(
-                "bootstrap preparation tree contains a symlink",
-            ));
-        }
-        if metadata.is_dir() {
-            flush_bootstrap_preparation_tree(&child)?;
-        } else if metadata.is_file() {
-            sync_bootstrap_preparation_regular_file(&child)?;
-        } else {
-            return Err(invalid_bootstrap_data(
-                "bootstrap preparation tree contains a non-file entry",
-            ));
-        }
-    }
-    sync_bootstrap_preparation_directory(path)
-}
-
-#[cfg(any(test, not(any(target_os = "linux", target_os = "android"))))]
-fn sync_bootstrap_preparation_regular_file(path: &Path) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    // `sync_all` maps to `FlushFileBuffers` on Windows. That API requires a
-    // write-capable handle; a `File::open` read handle fails with
-    // `ERROR_ACCESS_DENIED` even when the artifact itself is writable.
-    #[cfg(windows)]
-    options.write(true);
-    options.open(path)?.sync_all()
+    crate::filesystem_durability::sync_private_tree(path)
 }
 
 fn sync_bootstrap_preparation_directory(path: &Path) -> io::Result<()> {
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
     tine_storage::sync_dir_required(&directory)
+}
+
+#[cfg(test)]
+fn sync_bootstrap_preparation_regular_file(path: &Path) -> io::Result<()> {
+    crate::filesystem_durability::sync_regular_file(path)
 }
 
 fn copy_bootstrap_tree_exact(

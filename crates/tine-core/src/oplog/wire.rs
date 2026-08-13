@@ -1942,10 +1942,10 @@ impl ProviderRuntime {
             fs::canonicalize(parent).map_err(|error| ScenarioError::Io(error.to_string()))?;
         let parent_capability = Dir::open_ambient_dir(&canonical_parent, ambient_authority())
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        ensure_provider_directory(&parent_capability, name)?;
+        ensure_shared_provider_directory(&parent_capability, name)?;
         let provider = open_provider_directory(&parent_capability, name)?;
         for tree in ["inbox", "outbox"] {
-            ensure_provider_directory(&provider, tree)?;
+            ensure_shared_provider_directory(&provider, tree)?;
             let tree = open_provider_directory(&provider, tree)?;
             for namespace in [
                 PROVIDER_OBJECTS_NAMESPACE,
@@ -1959,7 +1959,7 @@ impl ProviderRuntime {
                 PROVIDER_REMOVED_NAMESPACE,
                 PROVIDER_RENAME_EVIDENCE_NAMESPACE,
             ] {
-                ensure_provider_directory(&tree, namespace)?;
+                ensure_shared_provider_directory(&tree, namespace)?;
                 let _ = open_provider_directory(&tree, namespace)?;
             }
         }
@@ -2007,7 +2007,7 @@ impl ProviderRuntime {
                 return Ok((parent, component.into()));
             }
             if create {
-                ensure_provider_directory(&parent, component)?;
+                ensure_shared_provider_directory(&parent, component)?;
             }
             parent = open_provider_directory(&parent, component)?;
         }
@@ -2224,7 +2224,7 @@ impl ProviderRuntime {
                 &expected,
                 &record,
             )?;
-            sync_provider_publication_directories(&destination_dir, Some(&temporary_dir))?;
+            sync_shared_provider_publication_directories(&destination_dir, Some(&temporary_dir))?;
             record.phase = ProviderJournalPhase::Published;
             journal.store(gate, &record)?;
             provider_journal_after_phase_hook(ProviderJournalPhase::Published)?;
@@ -3031,7 +3031,7 @@ impl SharedProviderTransport {
                         location.path.clone(),
                     ));
                 }
-                sync_provider_publication_directories(&destination_dir, None)?;
+                sync_shared_provider_publication_directories(&destination_dir, None)?;
                 let current = open_provider_regular_optional(
                     &destination_dir,
                     &destination_name,
@@ -8283,7 +8283,7 @@ fn run_provider_rename(
             &expected,
             to_path,
         )?;
-        sync_provider_publication_directories(&to_dir, Some(&temporary_dir))?;
+        sync_shared_provider_publication_directories(&to_dir, Some(&temporary_dir))?;
         record.phase = ProviderJournalPhase::Published;
         journal.store(&gate, &record)?;
         provider_journal_after_phase_hook(ProviderJournalPhase::Published)?;
@@ -8687,7 +8687,7 @@ fn quarantine_provider_name(
     }
     provider_rename_named_noreplace(source_dir, source_name, removed, &diagnostic_name)
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-    sync_provider_publication_directories(removed, Some(source_dir))
+    sync_shared_provider_publication_directories(removed, Some(source_dir))
 }
 
 fn provider_quarantine_diagnostic_name(prefix: &str, source_name: &str, bytes: &[u8]) -> String {
@@ -8791,7 +8791,7 @@ fn reconcile_provider_retirement(
                 provider_retirement_after_validation_hook();
                 provider_rename_handle_noreplace(&source.file, removed, diagnostic_name)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                sync_provider_publication_directories(removed, Some(source_dir))?;
+                sync_shared_provider_publication_directories(removed, Some(source_dir))?;
             }
             (None, Some(retired))
                 if provider_file_matches_identity(&retired.file, identity)?
@@ -8852,7 +8852,7 @@ fn reconcile_provider_retirement(
                     &placeholder,
                 )?));
                 journal.store(gate, record)?;
-                sync_provider_directory(removed)?;
+                sync_shared_provider_directory(removed)?;
                 provider_journal_boundary_hook(
                     ProviderJournalBoundary::RetirementPlaceholderDurable,
                 )?;
@@ -8889,7 +8889,7 @@ fn reconcile_provider_retirement(
                 provider_retirement_after_validation_hook();
                 provider_exchange_names(source_dir, source_name, removed, diagnostic_name)
                     .map_err(|error| ScenarioError::Io(error.to_string()))?;
-                sync_provider_publication_directories(removed, Some(source_dir))?;
+                sync_shared_provider_publication_directories(removed, Some(source_dir))?;
                 provider_journal_boundary_hook(ProviderJournalBoundary::RetirementExchangeDurable)?;
                 source = open_provider_regular_optional(
                     source_dir,
@@ -8919,14 +8919,14 @@ fn reconcile_provider_retirement(
                 || u64::try_from(exchanged_retired.bytes.len()).ok() != Some(record.source_len)
             {
                 let _ = provider_exchange_names(source_dir, source_name, removed, diagnostic_name);
-                let _ = sync_provider_publication_directories(removed, Some(source_dir));
+                let _ = sync_shared_provider_publication_directories(removed, Some(source_dir));
                 return Err(ScenarioError::UnsafeProviderEntry(source_path.into()));
             }
 
             provider_retirement_before_private_move_hook();
             provider_rename_named_noreplace(source_dir, source_name, evidence, &evidence_name)
                 .map_err(|error| ScenarioError::Io(error.to_string()))?;
-            sync_provider_publication_directories(evidence, Some(source_dir))?;
+            sync_shared_provider_publication_directories(evidence, Some(source_dir))?;
             provider_journal_boundary_hook(
                 ProviderJournalBoundary::RetirementPlaceholderQuarantined,
             )?;
@@ -9062,7 +9062,7 @@ fn reconcile_private_retirement_evidence(
     evidence
         .remove_file(evidence_name)
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-    sync_provider_directory(evidence)?;
+    sync_shared_provider_directory(evidence)?;
     provider_journal_boundary_hook(ProviderJournalBoundary::RetirementPlaceholderPrivateDeleted)
 }
 
@@ -9076,7 +9076,7 @@ fn preserve_retirement_race(
     let race_name = provider_quarantine_diagnostic_name("retirement-race", source_name, bytes);
     provider_rename_named_noreplace(source_dir, source_name, evidence, &race_name)
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-    sync_provider_publication_directories(evidence, Some(source_dir))
+    sync_shared_provider_publication_directories(evidence, Some(source_dir))
 }
 
 fn valid_relative_path(path: &str) -> bool {
@@ -9180,6 +9180,33 @@ fn provider_tree_name(tree: ProviderTree) -> &'static str {
 fn ensure_provider_directory(parent: &Dir, name: &str) -> Result<(), ScenarioError> {
     ensure_directory_nofollow(parent, name)
         .map_err(|error| ScenarioError::UnsafeProviderEntry(format!("{name}: {error}")))
+}
+
+/// Create one directory in the graph-local shared provider namespace.
+///
+/// The entry-kind/no-follow checks remain mandatory. Android shared-storage
+/// filesystems may, however, permit the create while denying directory fsync;
+/// provider bytes remain recoverable/retryable and are not local authority, so
+/// inability to issue that stronger barrier must not refuse ordinary sync.
+fn ensure_shared_provider_directory(parent: &Dir, name: &str) -> Result<(), ScenarioError> {
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ScenarioError::UnsafeProviderEntry(format!(
+                "{name}: expected a real no-follow directory"
+            )));
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ScenarioError::UnsafeProviderEntry(format!(
+                "{name}: {error}"
+            )));
+        }
+    }
+    parent
+        .create_dir(name)
+        .map_err(|error| ScenarioError::UnsafeProviderEntry(format!("{name}: {error}")))?;
+    sync_shared_provider_directory(parent)
 }
 
 fn open_provider_directory(parent: &Dir, name: &str) -> Result<Dir, ScenarioError> {
@@ -10153,7 +10180,7 @@ fn cleanup_journal_staging(
         removed
             .remove_file(&diagnostic_name)
             .map_err(|error| ScenarioError::Io(error.to_string()))?;
-        sync_provider_directory(&removed)?;
+        sync_shared_provider_directory(&removed)?;
     }
     Ok(())
 }
@@ -10213,7 +10240,7 @@ fn quarantine_unowned_staging(
     }
     provider_rename_named_noreplace(staging, staging_name, &removed, &diagnostic_name)
         .map_err(|error| ScenarioError::Io(error.to_string()))?;
-    sync_provider_publication_directories(&removed, Some(staging))
+    sync_shared_provider_publication_directories(&removed, Some(staging))
 }
 
 /// Publish anonymous staging from its handle, or consume the exact named
@@ -10276,9 +10303,9 @@ fn publish_provider_file_noreplace(
                 destination_path,
                 expected,
             )?;
-            sync_provider_publication_directories(destination_dir, Some(source_directory))?;
+            sync_shared_provider_publication_directories(destination_dir, Some(source_directory))?;
         } else {
-            sync_provider_publication_directories(destination_dir, None)?;
+            sync_shared_provider_publication_directories(destination_dir, None)?;
         }
         return Ok(());
     }
@@ -10308,7 +10335,7 @@ fn publish_provider_file_noreplace(
     {
         return Err(ScenarioError::UnsafeProviderEntry(destination_path.into()));
     }
-    sync_provider_publication_directories(destination_dir, source_directory)?;
+    sync_shared_provider_publication_directories(destination_dir, source_directory)?;
     Ok(())
 }
 
@@ -10454,6 +10481,27 @@ fn sync_provider_directory(directory: &Dir) -> Result<(), ScenarioError> {
     sync_dir_required(directory).map_err(|error| ScenarioError::Io(error.to_string()))
 }
 
+fn sync_shared_provider_directory(directory: &Dir) -> Result<(), ScenarioError> {
+    match sync_dir_required(directory) {
+        Ok(()) => Ok(()),
+        #[cfg(target_os = "android")]
+        Err(super::object_store::StoreError::Io(error))
+            if shared_provider_directory_sync_may_be_unavailable(error.kind()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(ScenarioError::Io(error.to_string())),
+    }
+}
+
+#[cfg(any(test, target_os = "android"))]
+const fn shared_provider_directory_sync_may_be_unavailable(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::PermissionDenied | ErrorKind::Unsupported | ErrorKind::InvalidInput
+    )
+}
+
 #[cfg(unix)]
 fn provider_lock_file_exclusive_nonblocking(file: &fs::File) -> std::io::Result<bool> {
     // SAFETY: flock only observes the retained authority-key descriptor.
@@ -10544,6 +10592,23 @@ fn sync_provider_publication_directories(
     );
     if let Some(source_directory) = source_directory {
         sync_provider_directory(source_directory)?;
+        provider_publication_durability_hook(
+            ProviderPublicationDurabilityStep::SourceDirectorySynced,
+        );
+    }
+    Ok(())
+}
+
+fn sync_shared_provider_publication_directories(
+    destination_directory: &Dir,
+    source_directory: Option<&Dir>,
+) -> Result<(), ScenarioError> {
+    sync_shared_provider_directory(destination_directory)?;
+    provider_publication_durability_hook(
+        ProviderPublicationDurabilityStep::DestinationDirectorySynced,
+    );
+    if let Some(source_directory) = source_directory {
+        sync_shared_provider_directory(source_directory)?;
         provider_publication_durability_hook(
             ProviderPublicationDurabilityStep::SourceDirectorySynced,
         );
@@ -11347,6 +11412,26 @@ mod tests {
         BatchCausalDot, BatchOrigin, CausalPeerId, ContentDigest, FrontierV2, ObjectKind,
         OperationObject, SemanticEffectDigest,
     };
+
+    #[test]
+    fn android_shared_provider_tolerates_only_missing_directory_sync_capability() {
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Unsupported,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(shared_provider_directory_sync_may_be_unavailable(kind));
+        }
+        for kind in [
+            ErrorKind::NotFound,
+            ErrorKind::Interrupted,
+            ErrorKind::InvalidData,
+            ErrorKind::WriteZero,
+            ErrorKind::Other,
+        ] {
+            assert!(!shared_provider_directory_sync_may_be_unavailable(kind));
+        }
+    }
 
     fn fixture_manifest(origin: BatchOrigin, batch_id: BatchId) -> OperationBatch {
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x5eed));

@@ -10,7 +10,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Fixed
 
-- **Enabling experimental managed storage no longer requires an Android app to be allowed to flush the entire filesystem.** Tine keeps the fast bootstrap flush on devices that support it, but Android permission or capability refusals now fall back to flushing only Tine's exact app-private capture tree. Ordinary graph access was already sufficient; a stronger platform-wide operation can no longer turn it into a misleading `Permission denied` setup failure.
+- **Enabling experimental managed storage no longer requires an Android app to be allowed to flush the entire filesystem.** Tine keeps the fast bootstrap flush on devices that support it, but Android permission or capability refusals now fall back to flushing each exact app-private bootstrap tree. The same audit removed mandatory directory-fsync assumptions from graph-local shared-provider setup and publication while preserving file flushes, no-follow/type checks, and strict durability for private authority. Ordinary graph access was already sufficient; stronger platform-wide or shared-filesystem operations can no longer turn it into a misleading `Permission denied` setup failure.
 
 - **Experimental managed-storage startup failures now say what safety condition actually stopped the open.** Durable refusals carry a stable contract scenario separately from their bounded reason/stage code all the way through the native API and Settings diagnostics; temporary I/O failures remain retryable instead of being mislabeled as corrupt data. The source guard requires every public refusal class and every durable blocked reason to stay mapped to the documented vocabulary.
 

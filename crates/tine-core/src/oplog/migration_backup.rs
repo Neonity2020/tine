@@ -7,8 +7,6 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::{AsFd as _, AsRawFd as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 #[cfg(windows)]
@@ -2684,21 +2682,8 @@ fn sync_directory(path: &Path) -> Result<(), MigrationBackupError> {
 }
 
 fn sync_tree(path: &Path, summary: SourceSummary) -> Result<(), MigrationBackupError> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let _ = traverse_tree_bounded(path, summary, false)?;
-        let directory = open_directory_nofollow_ambient(path)?;
-        // SAFETY: the retained no-follow directory owns a live descriptor for
-        // the filesystem containing every bounded payload entry just walked.
-        let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        let _ = traverse_tree_bounded(path, summary, true)?;
-    }
+    let _ = traverse_tree_bounded(path, summary, false)?;
+    crate::filesystem_durability::sync_private_tree(path)?;
     Ok(())
 }
 

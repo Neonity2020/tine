@@ -28008,93 +28008,18 @@ fn encode_bootstrap_source_manifest(capture: &BootstrapSourceCapture) -> io::Res
     Ok(frame.finish())
 }
 
+fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
+    crate::filesystem_durability::sync_private_tree(path)
+}
+
 fn sync_bootstrap_source_directory(path: &Path) -> io::Result<()> {
     let directory = Dir::open_ambient_dir(path, ambient_authority())?;
     sync_projection_directory_required(&directory)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn flush_bootstrap_source_filesystem(path: &Path) -> io::Result<()> {
-    use std::os::fd::{AsFd as _, AsRawFd as _};
-
-    let directory = fs::File::open(path)?;
-    // SAFETY: the opened directory descriptor names the filesystem holding
-    // every authenticated spool, chunk, and directory in the capture prefix.
-    let result = unsafe { libc::syncfs(directory.as_fd().as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
-    flush_bootstrap_source_filesystem(path)
-}
-
-#[cfg(target_os = "android")]
-fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
-    match flush_bootstrap_source_filesystem(path) {
-        Ok(()) => Ok(()),
-        // Some Android kernels/ROMs permit normal app-private file I/O but
-        // reject the filesystem-wide syncfs operation. Preserve the fast path
-        // where it exists; otherwise flush only Tine's exact private capture.
-        Err(error) if bootstrap_source_filesystem_flush_may_fallback(error.kind()) => {
-            flush_bootstrap_source_prefix_exact(path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(any(test, target_os = "android"))]
-const fn bootstrap_source_filesystem_flush_may_fallback(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
-    )
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn flush_bootstrap_source_prefix(path: &Path) -> io::Result<()> {
-    flush_bootstrap_source_prefix_exact(path)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn flush_bootstrap_source_prefix_exact(path: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        let metadata = fs::symlink_metadata(&child)?;
-        if metadata.file_type().is_symlink() {
-            return Err(bootstrap_source_capture_error(
-                "source capture prefix contains a symlink",
-            ));
-        }
-        if metadata.is_dir() {
-            flush_bootstrap_source_prefix_exact(&child)?;
-        } else if metadata.is_file() {
-            sync_bootstrap_source_regular_file(&child)?;
-        } else {
-            return Err(bootstrap_source_capture_error(
-                "source capture prefix contains a non-file entry",
-            ));
-        }
-    }
-    sync_bootstrap_source_directory(path)
-}
-
-#[cfg(any(test, not(target_os = "linux")))]
+#[cfg(test)]
 fn sync_bootstrap_source_regular_file(path: &Path) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    // Rust's Windows `File::sync_all` calls `FlushFileBuffers`, which requires
-    // a handle with write access. `File::open` supplies only `GENERIC_READ` and
-    // therefore reports `ERROR_ACCESS_DENIED` even for our writable capture
-    // artifacts. Keep the narrower read-only handle on other platforms.
-    #[cfg(windows)]
-    options.write(true);
-    options.open(path)?.sync_all()
+    crate::filesystem_durability::sync_regular_file(path)
 }
 
 fn verify_bootstrap_source_capture(
@@ -50472,26 +50397,5 @@ mod tests {
         assert!(!gh254_code(&error).starts_with("conflict."));
         assert!(graph.force_save_page(&page).is_err());
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn android_bootstrap_syncfs_falls_back_only_for_platform_capability_errors() {
-        for kind in [
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::Unsupported,
-            io::ErrorKind::InvalidInput,
-        ] {
-            assert!(bootstrap_source_filesystem_flush_may_fallback(kind));
-        }
-        for kind in [
-            io::ErrorKind::NotFound,
-            io::ErrorKind::AlreadyExists,
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::InvalidData,
-            io::ErrorKind::WriteZero,
-            io::ErrorKind::Other,
-        ] {
-            assert!(!bootstrap_source_filesystem_flush_may_fallback(kind));
-        }
     }
 }
