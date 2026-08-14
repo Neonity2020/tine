@@ -11677,6 +11677,29 @@ mod tests {
             .unwrap();
         let create_event =
             apply_and_assert_identity_shadow(&mut database, &mut engine, &store, &create);
+        let read = database.materialized_read().unwrap();
+        let name_record = read
+            .causal_page_name_identity_record(
+                crate::oplog::LogicalPageName::parse("Identity Alpha")
+                    .unwrap()
+                    .key_digest(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            name_record.occupied().unwrap().acquisition().batch_id(),
+            Some(create_event.batch_id())
+        );
+        let path = ManagedPath::parse("pages/identity-alpha.md").unwrap();
+        let path_record = read
+            .causal_portable_path_identity_record(path.portable_key().digest())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            path_record.occupied().unwrap().acquisition().batch_id(),
+            Some(create_event.batch_id())
+        );
+        drop(read);
         assert_eq!(
             database
                 .materialized_read()

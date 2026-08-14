@@ -1931,6 +1931,20 @@ impl<'a> SqliteMaterializedRead<'a> {
             .transpose()
     }
 
+    pub(crate) fn causal_page_name_identity_record(
+        &self,
+        key: super::PageNameKeyDigest,
+    ) -> Result<Option<super::sqlite_identity::PageNameIdentityRecordV1>, MaterializationError>
+    {
+        let digest = ContentDigest::from_bytes(*key.as_bytes());
+        self.page_name_identity_record(digest)?
+            .map(|row| {
+                super::sqlite_identity::PageNameIdentityRecordV1::decode(key, &row.record)
+                    .map_err(MaterializationError::Corrupt)
+            })
+            .transpose()
+    }
+
     pub fn portable_path_identity_record(
         &self,
         key_digest: ContentDigest,
@@ -1938,6 +1952,20 @@ impl<'a> SqliteMaterializedRead<'a> {
         self.inner
             .portable_path_identity_record(key_digest)?
             .map(identity_record_row_from_storage)
+            .transpose()
+    }
+
+    pub(crate) fn causal_portable_path_identity_record(
+        &self,
+        key: super::PortablePathKeyDigest,
+    ) -> Result<Option<super::sqlite_identity::PortablePathIdentityRecordV1>, MaterializationError>
+    {
+        let digest = ContentDigest::from_bytes(*key.as_bytes());
+        self.portable_path_identity_record(digest)?
+            .map(|row| {
+                super::sqlite_identity::PortablePathIdentityRecordV1::decode(key, &row.record)
+                    .map_err(MaterializationError::Corrupt)
+            })
             .transpose()
     }
 
@@ -3104,6 +3132,85 @@ mod tests {
             tags: Vec::new(),
             blocks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn terminal_lowering_seeds_true_baseline_identity_records() {
+        let page_id = page_id(311_000);
+        let block_id = block_id(311_001);
+        let home_document_id = document_id(311_002);
+        let logseq_uuid = LogseqUuid::from_uuid(Uuid::from_u128(311_003));
+        let mut page = page_input(page_id, "baseline identity".into());
+        page.name = "Baseline Identity".into();
+        page.name_key = crate::refs::page_key(&page.name);
+        page.path = ManagedPath::parse("pages/baseline-identity.md").unwrap();
+        page.home_document_id = home_document_id;
+        page.blocks.push(MaterializedBlockInput {
+            block_id,
+            home_document_id,
+            parent: None,
+            order: "a".into(),
+            content: "baseline block".into(),
+            searchable_text: "baseline block".into(),
+            heading_level: None,
+            collapsed: false,
+            logseq_uuid: Some(logseq_uuid),
+            logseq_identity_origin: Some(LogseqIdentityOrigin::ExternalImported),
+            references: Vec::new(),
+            properties: Vec::new(),
+            tags: Vec::new(),
+            task: None,
+        });
+
+        let physical = lower_terminal_chunk(TerminalMaterializationChunk {
+            pages: vec![page.clone()],
+            postings: Vec::new(),
+            aliases: Vec::new(),
+        })
+        .unwrap();
+
+        let name_key = LogicalPageName::parse(&page.name).unwrap().key_digest();
+        let name_record = crate::oplog::sqlite_identity::PageNameIdentityRecordV1::decode(
+            name_key,
+            &physical.page_name_identity_records[0].record,
+        )
+        .unwrap();
+        let name_occupied = name_record.occupied().unwrap();
+        assert_eq!(name_occupied.page_id(), page_id);
+        assert_eq!(
+            name_occupied.acquisition(),
+            crate::oplog::sqlite_identity::IdentityOriginV1::Baseline
+        );
+        assert_eq!(
+            name_occupied.exact_state(),
+            crate::oplog::sqlite_identity::IdentityOriginV1::Baseline
+        );
+
+        let path_key = page.path.portable_key().digest();
+        let path_record = crate::oplog::sqlite_identity::PortablePathIdentityRecordV1::decode(
+            path_key,
+            &physical.portable_path_identity_records[0].record,
+        )
+        .unwrap();
+        let path_occupied = path_record.occupied().unwrap();
+        assert_eq!(path_occupied.page_id(), page_id);
+        assert_eq!(
+            path_occupied.acquisition(),
+            crate::oplog::sqlite_identity::IdentityOriginV1::Baseline
+        );
+
+        assert_eq!(physical.block_home_claims.len(), 1);
+        assert!(physical.block_home_claims[0].batch_id.is_none());
+        assert!(physical.block_home_claims[0].causal_peer_id.is_none());
+        assert!(physical.block_home_claims[0].causal_counter.is_none());
+        assert_eq!(physical.logseq_uuid_introductions.len(), 1);
+        assert!(physical.logseq_uuid_introductions[0].batch_id.is_none());
+        assert!(physical.logseq_uuid_introductions[0]
+            .causal_peer_id
+            .is_none());
+        assert!(physical.logseq_uuid_introductions[0]
+            .causal_counter
+            .is_none());
     }
 
     fn semantic_effect_for_replacements(pages: &[MaterializedPageInput]) -> Vec<u8> {
