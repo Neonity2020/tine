@@ -3437,105 +3437,6 @@ fn the_bootstrap_ancestry_proof_is_bounded_by_the_changed_radix_paths() {
 
 /// The construction regression for the promoted reference catalog.
 ///
-/// A non-empty inactive bootstrap binds a `reference_catalog_root` into every
-/// accepted cold record. That root has exactly one construction — the target
-/// archive's durable content-addressed Patricia store — so every bound root must be
-/// fully openable from a *fresh* archive open that holds no process-local
-/// engine, candidate, or in-memory catalog, both while the bootstrap is still
-/// inactive and after the runtime is promoted and its history has advanced.
-///
-/// Fail-before: authoring the bootstrap against the run-local ephemeral catalog
-/// backend produced flat in-memory digests instead of Patricia roots, so this
-/// validation failed with a missing authenticated node and promotion could
-/// never open a non-empty bootstrap.
-#[test]
-fn a_non_empty_bootstrap_catalog_root_opens_from_a_fresh_archive_before_and_after_promotion() {
-    // A genuinely multipart bootstrap, so more than one accepted cold record
-    // binds a catalog root, over content that produces real reference sources.
-    let mut multipart = String::from("title:: Catalog root\n\n");
-    for ordinal in 0..4096 {
-        // Deliberately syntax-free: the operation count alone forces a second
-        // part, while reference evidence stays on the two pages below so the
-        // catalog walk here is not an accidental 4096-target benchmark.
-        multipart.push_str(&format!("- operation {ordinal:04}\n"));
-    }
-    force_next_bootstrap_part_operation_limit(4_096);
-    let mut fixture = Fixture::new(
-        "promote-catalog-root",
-        None,
-        vec![
-            ("pages/multipart.md".into(), multipart.into_bytes()),
-            (
-                "pages/référence.md".into(),
-                "- see [[Catalog root]] and #tag\r\n".as_bytes().to_vec(),
-            ),
-        ],
-    );
-    let root = fixture.enrollment_root("promote-catalog-root");
-    let paths = PromotedPaths::new(&fixture, "catalog-root");
-    assert!(
-        fixture.verified.part_count() >= 2,
-        "the fixture must bind more than one cold record: {}",
-        fixture.verified.part_count()
-    );
-
-    // Every root bound by an accepted cold record, validated completely against
-    // a freshly opened durable catalog.
-    fn assert_every_bound_catalog_root_opens(fixture: &Fixture, label: &str) {
-        let catalog = fixture.archive().open_reference_catalog().unwrap();
-        let materials = fixture.prepared.engine_materials();
-        assert_eq!(materials.len(), fixture.verified.part_count() as usize);
-        let mut covered = 0;
-        for material in materials {
-            let bound = material.reference_catalog_root();
-            catalog
-                .validate_catalog_root(bound)
-                .unwrap_or_else(|error| {
-                    panic!("{label}: a bound bootstrap catalog root is not durable: {error}")
-                });
-            covered = covered.max(bound.source_count());
-        }
-        assert!(
-            covered > 0,
-            "{label}: the bootstrap covers reference sources"
-        );
-    }
-
-    // Before promotion: the inactive bootstrap's own bound roots.
-    assert_every_bound_catalog_root_opens(&fixture, "inactive bootstrap");
-
-    let session = SessionId::new();
-    let (mut authority, mut runtime) = promote(&mut fixture, &root, session, &paths);
-
-    // After promotion, and after the history advances past the bootstrap.
-    for seed in [0xA100_u128, 0xA200] {
-        append_local_batch(&fixture, &mut authority, &mut runtime, seed);
-    }
-    assert!(
-        runtime
-            .engine()
-            .durable_history_authority()
-            .unwrap()
-            .generation
-            > u64::from(fixture.verified.part_count())
-    );
-    let advanced = runtime.engine().reference_catalog_root().unwrap().clone();
-    drop(runtime);
-    drop(authority);
-
-    assert_every_bound_catalog_root_opens(&fixture, "promoted and advanced");
-    // The live advanced catalog root is durable too, from a fresh archive open.
-    fixture
-        .archive()
-        .open_reference_catalog()
-        .unwrap()
-        .validate_catalog_root(&advanced)
-        .expect("the advanced promoted catalog root opens from a fresh archive");
-    fixture.assert_graph_unchanged();
-}
-
-/// The promoted runtime token, its sealed promotion, and its mutation window
-/// are opaque: no clone, no serde, and no way to reconstruct one from bytes.
 #[test]
 fn promoted_runtime_values_cannot_be_cloned_serialized_or_deserialized() {
     assert!(!Probe::<PromotedLocalRuntime>::CLONEABLE);
@@ -7467,14 +7368,13 @@ fn packed_patricia_maintenance_is_post_commit_complete_and_best_effort() {
                         ContentPatriciaIndexKind::LogseqUuidClaims,
                         ContentPatriciaIndexKind::PortablePaths,
                         ContentPatriciaIndexKind::PageNames,
-                        ContentPatriciaIndexKind::ReferenceCatalog,
                     ]
                 );
                 assert_eq!(
                     packed.indexes[0].outcome,
                     PackedPatriciaMaintenanceOutcome::Busy
                 );
-                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 4);
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 3);
 
                 fail_next_patricia_reclamation_for_test(
                     PatriciaReclamationFailureForTest::MalformedAuthority,
@@ -7493,7 +7393,7 @@ fn packed_patricia_maintenance_is_post_commit_complete_and_best_effort() {
                     packed.indexes[0].outcome,
                     PackedPatriciaMaintenanceOutcome::Unavailable(_)
                 ));
-                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 8);
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 6);
             },
         );
         fixture.assert_graph_unchanged();
@@ -7541,7 +7441,7 @@ fn packed_patricia_maintenance_requires_a_successful_durable_replacement() {
                         ..
                     }
                 ));
-                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 4);
+                assert_eq!(runtime.engine().packed_patricia_reclamation_attempts(), 3);
             },
         );
         fixture.assert_graph_unchanged();

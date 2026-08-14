@@ -10029,10 +10029,19 @@ mod tests {
             Err(ProjectionError::Materialization(message))
                 if message.contains("no authenticated exact page-name owner")
         ));
-        let source_posting = engine
-            .reference_source_posting(source_ids.page)
-            .unwrap()
-            .unwrap();
+        let source_materialization = rich_materialization(
+            &source_event,
+            source_ids,
+            source_path,
+            ManagedTextKind::Page,
+            "Source",
+            &source_content,
+        );
+        let source_posting = parser_derived_reference_source_posting(
+            engine.reference_catalog_policy().unwrap(),
+            &source_materialization.replacements()[0],
+        )
+        .unwrap();
         for fact in source_posting.facts() {
             if let ReferenceFactV1::PageName(fact) = fact {
                 let parser_owned_span =

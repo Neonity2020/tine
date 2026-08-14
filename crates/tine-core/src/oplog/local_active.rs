@@ -5593,13 +5593,11 @@ fn mint_promoted_runtime<W: PromotedWorkspaceAuthority>(
             "recovered accepted frontier is behind the bootstrap anchor",
         ));
     }
-    // The projection-work index and reference/catalog authority must both be
-    // live before the SQLite projection is opened at the current frontier.
+    // Projection work must be live before the disposable SQLite projection is
+    // opened at the current frontier. Reference facts are derived into SQLite
+    // from parser-owned page state; there is no second catalog authority.
     try_release!(engine
         .projection_work_index()
-        .map_err(RuntimePromotionError::Engine));
-    try_release!(engine
-        .reference_catalog_root()
         .map_err(RuntimePromotionError::Engine));
 
     let claim = ProjectionClaim::current(state.workspace_id, state.lineage_digest);

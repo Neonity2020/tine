@@ -390,10 +390,9 @@ pub(crate) struct InactiveBootstrapPreparedPublication {
     commit: BootstrapAggregateCommitV1,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    /// The archive whose durable authenticated reference catalog this
-    /// preparation's accepted roots were built in. Installation must target
-    /// exactly that archive.
-    reference_catalog_archive_identity: ControlDirectoryIdentity,
+    /// The archive whose durable identity indexes this preparation's accepted
+    /// roots were built in. Installation must target exactly that archive.
+    bootstrap_index_archive_identity: ControlDirectoryIdentity,
     candidate: Rc<DetachedBootstrapCandidate>,
     engine_materials: Vec<DetachedBootstrapAcceptedEngineMaterial>,
     terminal_construction: Option<TerminalBootstrapConstructionMaterial>,
@@ -1402,20 +1401,18 @@ fn validate_inactive_bootstrap_preparation(
         || prepared.candidate.part_count() != aggregate.parts().len() as u32
         || prepared.candidate.last_part() != aggregate.final_frontier().last_part()
         || prepared.engine_materials.len() != aggregate.parts().len()
-        || prepared.candidate.index_archive_identity()
-            != prepared.reference_catalog_archive_identity
+        || prepared.candidate.index_archive_identity() != prepared.bootstrap_index_archive_identity
     {
         return Err(invalid_bootstrap_orchestration(
             "workspace, graph, capture, candidate, or aggregate identity mismatch",
         ));
     }
-    // Every accepted cold record about to be installed binds a reference
-    // catalog root that was built in one exact archive's durable authenticated
-    // store. Installing that history into any other archive would bind a root
-    // that archive cannot open.
-    if store.canonical_archive_identity()? != prepared.reference_catalog_archive_identity {
+    // Every accepted cold record about to be installed binds identity roots
+    // built in one exact archive's authenticated stores. Installing that
+    // history into another archive would bind roots it cannot open.
+    if store.canonical_archive_identity()? != prepared.bootstrap_index_archive_identity {
         return Err(invalid_bootstrap_orchestration(
-            "bootstrap preparation was authored against a different archive's reference catalog",
+            "bootstrap preparation was authored against another archive's identity indexes",
         ));
     }
 
@@ -1430,8 +1427,6 @@ fn validate_inactive_bootstrap_preparation(
             ));
         }
     }
-    let reference_catalog = store.open_reference_catalog()?;
-
     for (ordinal, (descriptor, material)) in aggregate
         .parts()
         .iter()
@@ -1461,18 +1456,6 @@ fn validate_inactive_bootstrap_preparation(
                 "prepared part, manifest, descriptor, or engine material mismatch",
             ));
         }
-        // This exact record is about to be installed as durable history that
-        // names `reference_catalog_root`. Authoring built that root in this
-        // archive's durable catalog; prove the archive holds it before any
-        // history record can name it.
-        reference_catalog
-            .require_catalog_root_nodes(material.reference_catalog_root())
-            .map_err(|error| {
-                invalid_bootstrap_orchestration(format!(
-                    "archive is missing the durable reference catalog this bootstrap part binds: \
-                     {error}"
-                ))
-            })?;
         spans.validate_part(descriptor.evidence())?;
         let span_bytes = spans.encode()?;
         let payload_descriptors = manifest
@@ -1817,7 +1800,7 @@ pub(crate) fn retain_inactive_bootstrap_accepted_authority(
     let archive_identity = store.canonical_archive_identity()?;
     if store.workspace_id() != verified.workspace_id
         || archive_identity != verified.archive_identity
-        || prepared.reference_catalog_archive_identity != archive_identity
+        || prepared.bootstrap_index_archive_identity != archive_identity
         || prepared.candidate.index_archive_identity() != archive_identity
     {
         return Err(invalid_bootstrap_orchestration(
@@ -3991,7 +3974,7 @@ fn author_bootstrap_parts(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog: &BootstrapAuthoringCapability,
+    bootstrap_indexes: &BootstrapAuthoringCapability,
     import_id: ImportId,
     operation_spool: &BootstrapOperationSpool,
     part_count: u32,
@@ -4009,7 +3992,7 @@ fn author_bootstrap_parts(
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
-        reference_catalog,
+        bootstrap_indexes,
     )?;
     let author_device_id = DeviceId::for_external_import_author(workspace_id);
     let author_session_id = SessionId::for_external_import_author(workspace_id, import_id);
@@ -4392,12 +4375,10 @@ fn write_prepared_bootstrap_part(
 /// outside the graph. Only the final `sealed.commit` file marks a reusable
 /// preparation; all UUID-named work directories are non-authoritative residue.
 ///
-/// `reference_catalog` must be the durable capability of the exact archive this
-/// preparation will be installed into. Authoring binds a `reference_catalog_root`
-/// into every accepted cold record; building it anywhere else would produce a
-/// root the installed archive could never open. The preparation retains that
-/// archive's control-directory identity so installation cannot later be pointed
-/// at a different archive.
+/// `bootstrap_indexes` must be the durable capability of the exact archive this
+/// preparation will be installed into. The preparation retains that archive's
+/// control-directory identity so installation cannot later be pointed at a
+/// different archive.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_inactive_bootstrap_import(
     graph: &Graph,
@@ -4406,7 +4387,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog: &BootstrapAuthoringCapability,
+    bootstrap_indexes: &BootstrapAuthoringCapability,
     scratch: &Path,
 ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
     prepare_inactive_bootstrap_import_with_progress(
@@ -4416,7 +4397,7 @@ pub(crate) fn prepare_inactive_bootstrap_import(
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
-        reference_catalog,
+        bootstrap_indexes,
         scratch,
         |_| {},
     )
@@ -4430,13 +4411,13 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
     reference_catalog_policy: ReferenceCatalogPolicyV1,
-    reference_catalog: &BootstrapAuthoringCapability,
+    bootstrap_indexes: &BootstrapAuthoringCapability,
     scratch: &Path,
     mut progress: impl FnMut(BootstrapPreparationProgress),
 ) -> Result<InactiveBootstrapPreparedPublication, BootstrapStreamingImportError> {
-    if reference_catalog.workspace_id() != workspace_id {
+    if bootstrap_indexes.workspace_id() != workspace_id {
         return Err(invalid_bootstrap_orchestration(
-            "bootstrap reference-catalog capability belongs to another workspace",
+            "bootstrap index capability belongs to another workspace",
         ));
     }
     prepare_bootstrap_scratch(graph, scratch)?;
@@ -4518,7 +4499,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         lineage_digest,
         catalog_document_id,
         reference_catalog_policy,
-        reference_catalog,
+        bootstrap_indexes,
         source.import_id,
         &mut operations,
         part_count,
@@ -4623,7 +4604,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         BootstrapPreparationSummary::from(&instrumentation),
     ));
 
-    if authored.candidate.index_archive_identity() != reference_catalog.archive_identity() {
+    if authored.candidate.index_archive_identity() != bootstrap_indexes.archive_identity() {
         return Err(invalid_bootstrap_orchestration(
             "detached candidate durability proof belongs to another archive",
         ));
@@ -4636,7 +4617,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         commit,
         catalog_document_id,
         reference_catalog_policy: retained_reference_catalog_policy,
-        reference_catalog_archive_identity: reference_catalog.archive_identity(),
+        bootstrap_index_archive_identity: bootstrap_indexes.archive_identity(),
         candidate: Rc::from(authored.candidate),
         engine_materials: authored.engine_materials,
         terminal_construction,
@@ -11929,11 +11910,11 @@ mod tests {
         );
     }
 
-    /// The durable reference-catalog capability of one target archive.
+    /// The durable identity-index capability of one target archive.
     ///
     /// A bootstrap preparation is authored for exactly one archive: its
-    /// accepted cold records bind catalog roots that live in that archive's
-    /// content-addressed Patricia store, so installing it elsewhere fails closed.
+    /// accepted cold records bind roots in that archive's content-addressed
+    /// identity stores, so installing it elsewhere fails closed.
     fn target_catalog(archive: &Path, workspace: WorkspaceId) -> BootstrapAuthoringCapability {
         ObjectStore::open(archive, workspace)
             .unwrap()
@@ -11971,16 +11952,10 @@ mod tests {
             "the old activation path must still expose its simulated operation expansion"
         );
 
-        let work = prepared.candidate().bootstrap_catalog_work_stats();
-        assert_eq!(work.reference_catalog_prepared_sources, 2);
-        assert!(
-            work.reference_catalog_persistent_node_writes > 0,
-            "the old activation path must still expose reference Patricia publication"
-        );
-
         let source = include_str!("import.rs");
         assert!(source.contains("fn spool_bootstrap_operations("));
         assert!(source.contains("fn author_bootstrap_parts("));
+        assert!(!include_str!("reference_catalog.rs").contains("ReferenceCatalogStateV2"));
         let sqlite_source = include_str!("sqlite.rs");
         assert!(sqlite_source.contains("self.materialized_row_digest_for_harness()?"));
     }
@@ -12279,26 +12254,9 @@ mod tests {
                 <= u64::from(MAX_OPERATIONS_PER_BOOTSTRAP_PART)
         );
 
-        let work = prepared.candidate().bootstrap_catalog_work_stats();
+        let work = prepared.candidate().bootstrap_index_work_stats();
         assert_eq!(work.full_catalog_author_clones, 0);
         assert_eq!(work.reference_fallback_document_reconstructions, 0);
-        assert!(
-            work.reference_catalog_peak_resident_bytes
-                <= super::super::content_patricia::MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
-            "private Patricia construction exceeded its fixed resident budget: {work:?}"
-        );
-        assert_eq!(
-            work.reference_catalog_prepared_validations,
-            prepared.aggregate().parts().len(),
-            "each accepted part must consume one exact prepared-candidate proof"
-        );
-        assert_eq!(
-            work.reference_catalog_full_delta_validations, 0,
-            "private same-call construction must not replay prepared catalog deltas"
-        );
-        assert_eq!(work.reference_catalog_prepared_sources, PAGE_COUNT);
-        assert_eq!(work.reference_catalog_fact_updates, PAGE_COUNT);
-        assert_eq!(work.reference_catalog_persistent_node_reads, 0);
         assert_eq!(
             work.authenticated_page_identity_lookups, 0,
             "page-capsule authoring must use its prospective catalog rather than reopen page identity per page"
@@ -12377,10 +12335,10 @@ mod tests {
 
         let sparse_stats = sparse.candidate().detached_publication_stats().unwrap();
         let dense_stats = dense.candidate().detached_publication_stats().unwrap();
-        assert!(sparse_stats.immutable_publications > 0);
+        assert!(sparse_stats.packed_immutable_publications > 0);
         assert!(
-            dense_stats.immutable_publications > sparse_stats.immutable_publications,
-            "reference/UUID density should increase immutable object work: sparse={sparse_stats:?} dense={dense_stats:?}"
+            dense_stats.packed_immutable_publications > sparse_stats.packed_immutable_publications,
+            "UUID density should increase retained identity-index object work: sparse={sparse_stats:?} dense={dense_stats:?}"
         );
         assert_eq!(sparse_stats.successful_batch_completions, 1);
         assert_eq!(dense_stats.successful_batch_completions, 1);
@@ -12437,17 +12395,6 @@ mod tests {
                 super::super::hot_engine::LogseqUuidResolution::Unique(claim)
                     if claim.page_id == page_id && claim.block_id == page.blocks[0].block_id
             ));
-            let posting = dense
-                .candidate()
-                .accepted_engine()
-                .reference_posting_for_test(page_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(posting.facts().len(), 1);
-            assert!(matches!(
-                &posting.facts()[0],
-                super::super::reference_catalog::ReferenceFactV1::PageName(_)
-            ));
         }
     }
 
@@ -12480,12 +12427,8 @@ mod tests {
 
         let retried = prepare_streaming_bootstrap_attempt(&root, "retry", workspace).unwrap();
         let stats = retried.candidate().detached_publication_stats().unwrap();
-        assert!(stats.immutable_publications > 0);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        assert!(
-            stats.verified_existing_publications > clean_stats.verified_existing_publications,
-            "retry did not add byte-verification work for abandoned exact objects: clean={clean_stats:?} retry={stats:?}"
-        );
+        assert_eq!(stats.packed_immutable_publications, 0);
+        assert!(clean_stats.packed_immutable_publications > 0);
         assert_eq!(stats.successful_batch_completions, 1);
         assert_eq!(
             retried.candidate().index_archive_identity(),
@@ -12525,7 +12468,7 @@ mod tests {
         assert_eq!(publication.successful_batch_completions, 1);
         assert_eq!(publication.packed_capacity_fallbacks, 0);
         assert!(publication.packed_immutable_publications > 0);
-        assert_eq!(count_packed_patricia_heads(&root.path().join("archive")), 4);
+        assert_eq!(count_packed_patricia_heads(&root.path().join("archive")), 3);
     }
 
     #[test]
@@ -16376,12 +16319,7 @@ mod tests {
             (
                 "insert extra materialization batch row",
                 "INSERT INTO materialization_batches
-                 SELECT 1000, randomblob(16), input_digest, event_binding_digest,
-                        prior_frontier_root_digest, post_frontier_root_digest,
-                        prior_catalog_root, prior_catalog_root_digest,
-                        post_catalog_root, post_catalog_root_digest,
-                        catalog_change, catalog_change_digest,
-                        canonical_input_digest
+                 SELECT 1000, randomblob(16), input_digest
                  FROM materialization_batches WHERE acceptance_sequence = 1",
             ),
         ];

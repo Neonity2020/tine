@@ -60,7 +60,6 @@ use super::sync_layout::{
     ENGINE_HISTORY_ROOTS_DIR, ENGINE_HISTORY_ROOT_SUFFIX, ENGINE_HISTORY_TRANSITION_LOCK_FILE,
     LINEAGE_CLAIM_FILE, LOGSEQ_CLAIM_INDEX_DIR, PAGE_NAME_OWNERSHIP_INDEX_DIR,
     PORTABLE_PATH_INDEX_DIR, PROJECTION_WORK_DIR, PROMOTED_RUNTIME_STATE_FILE,
-    REFERENCE_CATALOG_DIR,
 };
 use super::watcher_queue::WatcherQuiescedProof;
 use super::{
@@ -1589,7 +1588,7 @@ pub(crate) struct DetachedBootstrapPublicationSession {
 /// authored by one detached session is beneath its archive durability barrier.
 pub(crate) struct CompletedDetachedBootstrapPublication {
     physical: tine_storage::CompletedExactImmutablePublicationBatch,
-    packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 4]>,
+    packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 3]>,
     workspace_id: WorkspaceId,
     archive_identity: ControlDirectoryIdentity,
 }
@@ -1616,7 +1615,7 @@ impl CompletedDetachedBootstrapPublication {
     #[cfg(test)]
     pub(crate) fn packed_construction_stats(
         &self,
-    ) -> Option<[tine_storage::PatriciaIndexConstructionStats; 4]> {
+    ) -> Option<[tine_storage::PatriciaIndexConstructionStats; 3]> {
         self.packed_constructions.as_ref().map(|constructions| {
             constructions
                 .each_ref()
@@ -1650,7 +1649,7 @@ impl DetachedBootstrapPublicationSession {
 
     pub(crate) fn finish(
         self,
-        packed_constructions: [super::content_patricia::CompletedPatriciaConstruction; 4],
+        packed_constructions: [super::content_patricia::CompletedPatriciaConstruction; 3],
     ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
         self.finish_inner(Some(packed_constructions))
     }
@@ -1664,7 +1663,7 @@ impl DetachedBootstrapPublicationSession {
 
     fn finish_inner(
         self,
-        packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 4]>,
+        packed_constructions: Option<[super::content_patricia::CompletedPatriciaConstruction; 3]>,
     ) -> Result<CompletedDetachedBootstrapPublication, StoreError> {
         let mut state = self.publisher.shared.state.lock().map_err(|_| {
             StoreError::Bootstrap(
@@ -1754,9 +1753,9 @@ impl LoadedBootstrapPartV1 {
 /// The durable authenticated index capabilities of one exact archive, for
 /// detached bootstrap authoring and replay.
 ///
-/// Every accepted bootstrap cold record binds four authenticated roots — the
-/// portable-path root, the page-name ownership root, the external UUID-claim
-/// root, and the reference-catalog root. Each has exactly one construction:
+/// Every accepted bootstrap cold record binds three authenticated roots — the
+/// portable-path root, the page-name ownership root, and the external UUID-claim
+/// root. Each has exactly one construction:
 /// the archive's durable content-addressed Patricia stores. A detached session that
 /// used the run-local ephemeral backends instead would bind roots the promoted
 /// runtime's durable stores can never open, so authoring takes this capability
@@ -1771,25 +1770,18 @@ pub(crate) struct BootstrapAuthoringCapability {
     workspace_id: WorkspaceId,
     archive_identity: ControlDirectoryIdentity,
     archive: Arc<Dir>,
-    reference_catalog: Arc<super::reference_catalog::ReferenceCatalogStore>,
     portable_path_index: Arc<super::portable_path_index::PortablePathIndexStore>,
     logseq_claim_index: Arc<super::uuid_claim_index::LogseqClaimIndexStore>,
     page_name_index: Arc<super::page_name_index::PageNameOwnershipStore>,
 }
 
 pub(crate) struct DetachedBootstrapAuthoringIndexes {
-    reference_catalog: Arc<super::reference_catalog::ReferenceCatalogStore>,
     portable_path_index: Arc<super::portable_path_index::PortablePathIndexStore>,
     logseq_claim_index: Arc<super::uuid_claim_index::LogseqClaimIndexStore>,
     page_name_index: Arc<super::page_name_index::PageNameOwnershipStore>,
-    construction_resident_budget_bytes: usize,
 }
 
 impl DetachedBootstrapAuthoringIndexes {
-    pub(crate) fn reference_catalog(&self) -> Arc<super::reference_catalog::ReferenceCatalogStore> {
-        Arc::clone(&self.reference_catalog)
-    }
-
     pub(crate) fn portable_path_index(
         &self,
     ) -> Arc<super::portable_path_index::PortablePathIndexStore> {
@@ -1802,10 +1794,6 @@ impl DetachedBootstrapAuthoringIndexes {
 
     pub(crate) fn page_name_index(&self) -> Arc<super::page_name_index::PageNameOwnershipStore> {
         Arc::clone(&self.page_name_index)
-    }
-
-    pub(crate) const fn construction_resident_budget_bytes(&self) -> usize {
-        self.construction_resident_budget_bytes
     }
 }
 
@@ -1911,10 +1899,6 @@ impl BootstrapAuthoringCapability {
         self.archive_identity
     }
 
-    pub(crate) fn reference_catalog(&self) -> Arc<super::reference_catalog::ReferenceCatalogStore> {
-        Arc::clone(&self.reference_catalog)
-    }
-
     pub(crate) fn portable_path_index(
         &self,
     ) -> Arc<super::portable_path_index::PortablePathIndexStore> {
@@ -1948,10 +1932,6 @@ impl BootstrapAuthoringCapability {
             detached_bootstrap_construction_resident_budget_bytes();
         let indexes =
             DetachedBootstrapAuthoringIndexes {
-                reference_catalog: Arc::new(
-                    self.reference_catalog
-                        .for_detached_bootstrap(publisher.clone())?,
-                ),
                 portable_path_index: Arc::new(self.portable_path_index.for_detached_bootstrap(
                     publisher.clone(),
                     construction_resident_budget_bytes,
@@ -1967,7 +1947,6 @@ impl BootstrapAuthoringCapability {
                     self.page_name_index
                         .for_detached_bootstrap(publisher, construction_resident_budget_bytes)?,
                 ),
-                construction_resident_budget_bytes,
             };
         Ok((publication, indexes))
     }
@@ -3326,26 +3305,12 @@ impl ObjectStore {
         super::page_name_index::PageNameOwnershipStore::open(index)
     }
 
-    pub(crate) fn open_reference_catalog(
-        &self,
-    ) -> Result<super::reference_catalog::ReferenceCatalogStore, StoreError> {
-        ensure_directory_nofollow(&self.capability, REFERENCE_CATALOG_DIR)?;
-        let catalog = open_dir_nofollow(&self.capability, REFERENCE_CATALOG_DIR)?;
-        for name in ["nodes", "postings"] {
-            ensure_directory_nofollow(&catalog, name)?;
-        }
-        Ok(super::reference_catalog::ReferenceCatalogStore::new(
-            open_dir_nofollow(&catalog, "nodes")?,
-            open_dir_nofollow(&catalog, "postings")?,
-        ))
-    }
-
     /// Mint the durable authenticated index capability detached bootstrap
     /// authoring and replay build their bound roots against.
     ///
     /// The bootstrap is authored detached from every runtime authority, but its
     /// accepted cold records bind this archive's authenticated portable-path,
-    /// page-name, external UUID-claim, and reference-catalog roots. Handing
+    /// page-name, and external UUID-claim roots. Handing
     /// authoring an explicit capability over *this* archive is what makes the
     /// promoted runtime later able to open the very roots its own bootstrap
     /// history names.
@@ -3356,7 +3321,6 @@ impl ObjectStore {
             workspace_id: self.workspace_id,
             archive_identity: self.canonical_archive_identity()?,
             archive: Arc::new(self.capability.try_clone()?),
-            reference_catalog: Arc::new(self.open_reference_catalog()?),
             portable_path_index: Arc::new(self.open_portable_path_index()?),
             logseq_claim_index: Arc::new(self.open_logseq_claim_index()?),
             page_name_index: Arc::new(self.open_page_name_ownership_index()?),
