@@ -3041,6 +3041,32 @@
       "notes": "The reporter's trace identified the content-specific blocker after source capture: one parseable Markdown file changed block structure under parse/reserialize, and managed import rejected the entire graph even though its error already described the file as byte-preserved and read-only. Tine already admitted the equivalent Org state. Managed import and inactive bootstrap now admit either format as an exact source, while the shared exact-page DTO parser independently recomputes structural editability and marks non-roundtripping Markdown or Org read-only. Existing application/save gates consume that format-neutral flag, so these bytes can be shown but never rewritten. Tests preserve the exact source through both import paths and prove the DTO read-only bit. The UI diagnostic sanitizer now redacts graph-relative source paths while retaining the actual causal reason instead of replacing the whole message with a generic unsafe-detail fallback. The hosted Windows large-graph scenario remains useful platform coverage, but the reporter's demonstrated content cause is now covered deterministically."
     },
     {
+      "id": "REG-MANAGED-ACTIVATION-LATENCY-292",
+      "title": "Managed activation avoids graph-sized intermediate operation I/O and stays within the representative Linux and Windows latency gates",
+      "family": "managed-storage-activation",
+      "sources": {
+        "issues": [
+          292
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "windows",
+        "linux",
+        "android"
+      ],
+      "layer": "core-native",
+      "status": "fixing",
+      "coverage": {
+        "tests": [
+          "crates/tine-core/src/oplog/import.rs::in_memory_and_spilled_bootstrap_builders_publish_identical_canonical_state",
+          "crates/tine-core/src/sync_runtime.rs::activation_scaled_manual_phase_receipt",
+          "scripts/e2e-windows-managed-storage.mjs"
+        ]
+      },
+      "notes": "The reporter-scale hosted Windows baseline reached 427 seconds: 314 seconds in bootstrap preparation, including 302 seconds of detached authoring, before the intentionally non-roundtripping page produced its expected semantic refusal. The equivalent 13k-page Linux baseline was about 91 seconds. The approved redesign first reduced successful activation to one live capture plus one final live proof; this packet makes semantic lowering size-adaptive so ordinary graphs retain canonical encoded operations under a measured 128 MiB budget and never write or reread the operation spool, while oversized graphs retain the deterministic bounded spill route. Forced-route differential coverage requires byte-identical aggregate and commit output. Status remains fixing until the 13k Linux gate and same hosted Windows receipt are measured on the exact candidate, followed by the remaining terminal-materialization redesign."
+    },
+    {
       "id": "REG-MANAGED-LARGE-PAGE-ADMISSION-311",
       "title": "A 20,000-block managed page is admitted without a false memory terminal or thousands of tiny resumptions",
       "family": "managed-storage-external-import",

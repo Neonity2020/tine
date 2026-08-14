@@ -182,6 +182,15 @@ from that observation instead of completing under stale authority.
    The new sealed capture and the live graph are not moved. Archive detachment
    happens first and enrollment last, so an interrupted reset retains the old
    reservation and repeats safely. Active/shared enrollment is never retired.
+   Bootstrap semantic lowering is size-adaptive. Canonical encoded operations
+   remain in memory through partitioning and detached authoring while their
+   measured retained bytes stay at or below 128 MiB; this ordinary route writes
+   no operation spool and performs no operation external-merge sort. Crossing
+   that byte budget deterministically spills the same canonical records into
+   the bounded external-sort path. Both routes must produce byte-identical
+   aggregate and commit records. The process-only terminal SQLite optimization
+   retains only authenticated accepted events after authoring, never a second
+   operation-spool artifact.
 3. **VerifiedLocal** — bootstrap, backup, shadow projection, and SQLite proof
    agree. Authority is still inactive.
 4. **LocalActive** — promotion publishes the accepted runtime state; the actor

@@ -468,6 +468,8 @@ export interface SparseV2BootstrapPreparationSummary {
   operations: number;
   parts: number;
   prepared_bytes: number;
+  operation_builder_retained_bytes: number;
+  operation_builder_spilled: boolean;
   source_protocol_micros: number;
   operation_spool_micros: number;
   partition_micros: number;

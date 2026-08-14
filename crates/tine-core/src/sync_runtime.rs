@@ -1448,6 +1448,8 @@ pub struct SyncBootstrapPreparationSummary {
     pub operations: u64,
     pub parts: u32,
     pub prepared_bytes: u64,
+    pub operation_builder_retained_bytes: u64,
+    pub operation_builder_spilled: bool,
     pub source_protocol_micros: u64,
     pub operation_spool_micros: u64,
     pub partition_micros: u64,
@@ -1481,7 +1483,7 @@ impl SyncLocalActivationProgress {
                 "bootstrap preparation: {}",
                 match subphase {
                     SyncBootstrapPreparationSubphase::SourceProtocol => "source protocol",
-                    SyncBootstrapPreparationSubphase::OperationSpool => "operation spool",
+                    SyncBootstrapPreparationSubphase::OperationSpool => "semantic lowering",
                     SyncBootstrapPreparationSubphase::Partition => "partition",
                     SyncBootstrapPreparationSubphase::DetachedAuthoring => "detached authoring",
                     SyncBootstrapPreparationSubphase::Sealing => "sealing",
@@ -1491,13 +1493,15 @@ impl SyncLocalActivationProgress {
                 format!("bootstrap preparation: detached authoring {completed}/{total} parts")
             }
             Self::BootstrapPreparationSummary { summary } => format!(
-                "bootstrap preparation complete: source_files={}, source_bytes={}, parser_nodes={}, operations={}, parts={}, prepared_bytes={}, durations_us=source_protocol:{},operation_spool:{},partition:{},detached_authoring:{},sealing:{}",
+                "bootstrap preparation complete: source_files={}, source_bytes={}, parser_nodes={}, operations={}, parts={}, prepared_bytes={}, operation_builder_retained_bytes={}, operation_builder_spilled={}, durations_us=source_protocol:{},semantic_lowering:{},partition:{},detached_authoring:{},sealing:{}",
                 summary.source_files,
                 summary.source_bytes,
                 summary.parser_nodes,
                 summary.operations,
                 summary.parts,
                 summary.prepared_bytes,
+                summary.operation_builder_retained_bytes,
+                summary.operation_builder_spilled,
                 summary.source_protocol_micros,
                 summary.operation_spool_micros,
                 summary.partition_micros,
@@ -1529,6 +1533,8 @@ impl From<BootstrapPreparationSummary> for SyncBootstrapPreparationSummary {
             operations: summary.operations,
             parts: summary.parts,
             prepared_bytes: summary.prepared_bytes,
+            operation_builder_retained_bytes: summary.operation_builder_retained_bytes,
+            operation_builder_spilled: summary.operation_builder_spilled,
             source_protocol_micros: summary.source_protocol_micros,
             operation_spool_micros: summary.operation_spool_micros,
             partition_micros: summary.partition_micros,
@@ -47922,6 +47928,8 @@ mod tests {
         assert!(summary.parser_nodes > 0);
         assert!(summary.operations > 0);
         assert!(summary.prepared_bytes > 0);
+        assert!(summary.operation_builder_retained_bytes > 0);
+        assert!(!summary.operation_builder_spilled);
         drop(activated.handle);
     }
 
@@ -47968,6 +47976,17 @@ mod tests {
             assert_eq!(
                 receipt.construction.preparation.external_sort_runs, 0,
                 "ordinary activation must remain on the in-memory sort path"
+            );
+            assert!(
+                !receipt.construction.preparation.operation_builder_spilled,
+                "ordinary activation must not write and reread an operation spool"
+            );
+            assert!(
+                receipt
+                    .construction
+                    .preparation
+                    .operation_builder_retained_bytes
+                    <= crate::oplog::import::BOOTSTRAP_OPERATION_MEMORY_BYTES as u64
             );
             assert!(receipt.construction.preparation.max_part_documents <= 65);
             assert!(

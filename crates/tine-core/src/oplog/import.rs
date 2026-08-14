@@ -76,6 +76,8 @@ thread_local! {
             const { std::cell::Cell::new(None) };
     static NEXT_BOOTSTRAP_PART_OPERATION_LIMIT:
         std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static NEXT_BOOTSTRAP_OPERATION_MEMORY_LIMIT:
+        std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_SEAL:
         std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
             const { std::cell::RefCell::new(None) };
@@ -87,11 +89,24 @@ thread_local! {
 /// Force the operations-per-part limit of exactly the next bootstrap
 /// preparation, so a small deterministic fixture can be genuinely multipart.
 ///
-/// It changes only how the operation spool is partitioned; every part is
+/// It changes only how the operation sequence is partitioned; every part is
 /// authored, published, installed, and replayed through the ordinary path.
 #[cfg(test)]
 pub(crate) fn force_next_bootstrap_part_operation_limit(operations: u32) {
     NEXT_BOOTSTRAP_PART_OPERATION_LIMIT.with(|limit| limit.set(Some(operations)));
+}
+
+#[cfg(test)]
+fn force_next_bootstrap_operation_memory_limit(bytes: usize) {
+    NEXT_BOOTSTRAP_OPERATION_MEMORY_LIMIT.with(|limit| limit.set(Some(bytes)));
+}
+
+fn bootstrap_operation_memory_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = NEXT_BOOTSTRAP_OPERATION_MEMORY_LIMIT.with(|limit| limit.take()) {
+        return limit;
+    }
+    BOOTSTRAP_OPERATION_MEMORY_BYTES
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +161,12 @@ pub const MAX_IMPORT_STRUCTURAL_KEY_WORK: usize = 64_000_000;
 /// file corpus peaks below 3 MiB per sorter; 32 MiB leaves ample headroom while
 /// keeping simultaneous sorters bounded on mobile-class processes.
 const BOOTSTRAP_STREAM_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+/// Canonical encoded operations below this bound stay in memory through
+/// partitioning and detached authoring. Larger imports fall back to the exact
+/// external-sort/spool path. The bound is on retained encoded bytes rather
+/// than page count because block content, identities, and paths dominate the
+/// actual footprint.
+pub(crate) const BOOTSTRAP_OPERATION_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const BOOTSTRAP_STREAM_SORT_FAN_IN: usize = 4;
 const BOOTSTRAP_STREAM_MAX_SORT_RUNS: usize = 4096;
 const BOOTSTRAP_STREAM_FRAME_BYTES: usize = 64 * 1024 * 1024 + 1024 * 1024;
@@ -188,6 +209,8 @@ pub(crate) struct BootstrapStreamingImportInstrumentation {
     pub(crate) max_part_manifest_bytes: u64,
     pub(crate) max_part_payload_descriptors: u64,
     pub(crate) operation_spool_bytes: u64,
+    pub(crate) operation_builder_retained_bytes: u64,
+    pub(crate) operation_builder_spilled: bool,
     pub(crate) prepared_bytes: u64,
     pub(crate) external_sort_runs: u64,
     pub(crate) capture_passes: u64,
@@ -220,6 +243,8 @@ pub(crate) struct BootstrapPreparationSummary {
     pub(crate) operations: u64,
     pub(crate) parts: u32,
     pub(crate) prepared_bytes: u64,
+    pub(crate) operation_builder_retained_bytes: u64,
+    pub(crate) operation_builder_spilled: bool,
     pub(crate) source_protocol_micros: u64,
     pub(crate) operation_spool_micros: u64,
     pub(crate) partition_micros: u64,
@@ -236,6 +261,8 @@ impl From<&BootstrapStreamingImportInstrumentation> for BootstrapPreparationSumm
             operations: instrumentation.operations,
             parts: instrumentation.parts,
             prepared_bytes: instrumentation.prepared_bytes,
+            operation_builder_retained_bytes: instrumentation.operation_builder_retained_bytes,
+            operation_builder_spilled: instrumentation.operation_builder_spilled,
             source_protocol_micros: instrumentation.source_protocol_micros,
             operation_spool_micros: instrumentation.operation_spool_micros,
             partition_micros: instrumentation.partition_micros,
@@ -770,12 +797,9 @@ impl InactiveBootstrapAcceptedAuthority {
 /// just authored, instead of reloading and replaying every physical bootstrap
 /// part.
 ///
-/// It retains only values this preparation already produced: the existing
-/// operation spool file and the already-typed accepted event of each authored
-/// part. It is deliberately neither `Clone` nor serializable, is never sealed,
-/// fsynced, or named by any durable artifact, and removes its relocated spool
-/// on drop. Crash residue is ordinary incomplete-preparation garbage that a new
-/// process ignores.
+/// It retains only the already-typed accepted event of each authored part. It
+/// is deliberately neither `Clone` nor serializable and is never sealed,
+/// fsynced, or named by any durable artifact.
 ///
 /// It is an optimization capability, never an authority: every consumer must
 /// independently bind it to the retained candidate, aggregate, durable history
@@ -785,7 +809,6 @@ pub(crate) struct TerminalBootstrapConstructionMaterial {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     import_id: ImportId,
-    operations: PathBuf,
     operation_count: u64,
     declaration_count: u64,
     accepted_events: Vec<AcceptedBatchEvent>,
@@ -815,25 +838,6 @@ impl TerminalBootstrapConstructionMaterial {
 
     pub(crate) const fn declaration_count(&self) -> u64 {
         self.declaration_count
-    }
-
-    /// Reopen the retained operation spool. Chunk 2's manifest-intent sink is
-    /// this handle's other consumer; chunk 1 only proves the spool survived the
-    /// working-directory removal so the capability stays one artifact.
-    pub(crate) fn open_operations(
-        &self,
-    ) -> Result<BootstrapOperationSpoolReader, BootstrapStreamingImportError> {
-        Ok(BootstrapOperationSpoolReader::open(&self.operations)?)
-    }
-
-    pub(crate) fn operations_path(&self) -> &Path {
-        &self.operations
-    }
-}
-
-impl Drop for TerminalBootstrapConstructionMaterial {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.operations);
     }
 }
 
@@ -2495,10 +2499,258 @@ impl BootstrapOperationRecord {
     }
 }
 
+enum BootstrapOperationStorage {
+    Memory(Vec<SortRecord>),
+    File(PathBuf),
+}
+
 struct BootstrapOperationSpool {
-    path: PathBuf,
+    storage: BootstrapOperationStorage,
     operation_count: u64,
     declaration_count: u64,
+}
+
+enum BootstrapOperationCollectionMode {
+    Memory {
+        content: Vec<SortRecord>,
+        identities: Vec<SortRecord>,
+        retained_bytes: usize,
+    },
+    Streaming {
+        content: ExternalSort,
+        identities: ExternalSort,
+    },
+    Transitioning,
+}
+
+struct BootstrapOperationCollector {
+    working: PathBuf,
+    memory_limit: usize,
+    peak_retained_bytes: usize,
+    mode: BootstrapOperationCollectionMode,
+}
+
+#[derive(Clone, Copy)]
+enum BootstrapOperationCollectionTarget {
+    Content,
+    Identity,
+}
+
+impl BootstrapOperationCollector {
+    fn new(working: &Path) -> Self {
+        Self {
+            working: working.to_path_buf(),
+            memory_limit: bootstrap_operation_memory_limit(),
+            peak_retained_bytes: 0,
+            mode: BootstrapOperationCollectionMode::Memory {
+                content: Vec::new(),
+                identities: Vec::new(),
+                retained_bytes: 0,
+            },
+        }
+    }
+
+    fn push_content(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        self.push(BootstrapOperationCollectionTarget::Content, key, value)
+    }
+
+    fn push_identity(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        self.push(BootstrapOperationCollectionTarget::Identity, key, value)
+    }
+
+    fn push(
+        &mut self,
+        target: BootstrapOperationCollectionTarget,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        let record_bytes = key
+            .len()
+            .checked_add(value.len())
+            .and_then(|bytes| bytes.checked_add(8))
+            .ok_or_else(|| {
+                BootstrapStreamingImportError::InvalidOperation(
+                    "in-memory bootstrap operation length overflow".into(),
+                )
+            })?;
+        let must_spill = matches!(
+            &self.mode,
+            BootstrapOperationCollectionMode::Memory { retained_bytes, .. }
+                if retained_bytes.saturating_add(record_bytes) > self.memory_limit
+        );
+        if must_spill {
+            self.spill_to_streaming()?;
+        }
+        match &mut self.mode {
+            BootstrapOperationCollectionMode::Memory {
+                content,
+                identities,
+                retained_bytes,
+            } => {
+                *retained_bytes = retained_bytes.saturating_add(record_bytes);
+                self.peak_retained_bytes = self.peak_retained_bytes.max(*retained_bytes);
+                let records = match target {
+                    BootstrapOperationCollectionTarget::Content => content,
+                    BootstrapOperationCollectionTarget::Identity => identities,
+                };
+                records.push(SortRecord { key, value });
+                Ok(())
+            }
+            BootstrapOperationCollectionMode::Streaming {
+                content,
+                identities,
+            } => match target {
+                BootstrapOperationCollectionTarget::Content => content.push(key, value),
+                BootstrapOperationCollectionTarget::Identity => identities.push(key, value),
+            },
+            BootstrapOperationCollectionMode::Transitioning => unreachable!(),
+        }
+    }
+
+    fn spill_to_streaming(&mut self) -> Result<(), BootstrapStreamingImportError> {
+        let previous = std::mem::replace(
+            &mut self.mode,
+            BootstrapOperationCollectionMode::Transitioning,
+        );
+        let BootstrapOperationCollectionMode::Memory {
+            content,
+            identities,
+            retained_bytes,
+        } = previous
+        else {
+            self.mode = previous;
+            return Ok(());
+        };
+        self.peak_retained_bytes = self.peak_retained_bytes.max(retained_bytes);
+        let mut content_sort = ExternalSort::new(&self.working, "phase-content")?;
+        let mut identity_sort = ExternalSort::new(&self.working, "identity-candidates")?;
+        for record in content {
+            content_sort.push(record.key, record.value)?;
+        }
+        for record in identities {
+            identity_sort.push(record.key, record.value)?;
+        }
+        self.mode = BootstrapOperationCollectionMode::Streaming {
+            content: content_sort,
+            identities: identity_sort,
+        };
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        instrumentation: &mut BootstrapStreamingImportInstrumentation,
+    ) -> Result<(BootstrapOperationStorage, u64), BootstrapStreamingImportError> {
+        instrumentation.operation_builder_retained_bytes = instrumentation
+            .operation_builder_retained_bytes
+            .max(self.peak_retained_bytes as u64);
+        match self.mode {
+            BootstrapOperationCollectionMode::Memory {
+                mut content,
+                mut identities,
+                retained_bytes,
+            } => {
+                instrumentation.operation_builder_retained_bytes = instrumentation
+                    .operation_builder_retained_bytes
+                    .max(retained_bytes as u64);
+                content.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                identities.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                let mut identity_count = 0_u64;
+                let mut start = 0;
+                while start < identities.len() {
+                    let mut end = start + 1;
+                    while end < identities.len() && identities[end].key == identities[start].key {
+                        end += 1;
+                    }
+                    if end == start + 1 {
+                        let unique = &identities[start];
+                        let (key, value) = decode_identity_candidate(&unique.value)?;
+                        content.push(SortRecord { key, value });
+                        identity_count = identity_count.saturating_add(1);
+                    }
+                    start = end;
+                }
+                content.sort_unstable_by(|left, right| {
+                    (&left.key, &left.value).cmp(&(&right.key, &right.value))
+                });
+                Ok((BootstrapOperationStorage::Memory(content), identity_count))
+            }
+            BootstrapOperationCollectionMode::Streaming {
+                content,
+                identities,
+            } => {
+                instrumentation.operation_builder_spilled = true;
+                let content_path = self.working.join("phase-content.sorted");
+                let capsule_path = self.working.join("phase-capsule.sorted");
+                let identity_candidates_path = self.working.join("identity-candidates.sorted");
+                let identity_path = self.working.join("phase-identity.sorted");
+                for (sort, destination) in [
+                    (content, &content_path),
+                    (identities, &identity_candidates_path),
+                ] {
+                    let receipt = sort.finish(destination)?;
+                    record_sort_receipt(instrumentation, receipt);
+                }
+                let identity_count = collapse_unique_identity_candidates(
+                    &identity_candidates_path,
+                    &identity_path,
+                    &self.working,
+                    instrumentation,
+                )?;
+                merge_sort_runs(
+                    &[content_path.clone(), identity_path.clone()],
+                    &capsule_path,
+                )?;
+                let operation_path = self.working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
+                let mut output = BufWriter::new(create_new_file(&operation_path)?);
+                let mut input = File::open(&capsule_path)?;
+                io::copy(&mut input, &mut output)?;
+                output.flush()?;
+                instrumentation.operation_spool_bytes = instrumentation
+                    .operation_spool_bytes
+                    .saturating_add(operation_path.metadata()?.len());
+                Ok((
+                    BootstrapOperationStorage::File(operation_path),
+                    identity_count,
+                ))
+            }
+            BootstrapOperationCollectionMode::Transitioning => unreachable!(),
+        }
+    }
+}
+
+fn decode_identity_candidate(
+    value: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), BootstrapStreamingImportError> {
+    if value.len() < 4 {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "truncated identity candidate".into(),
+        ));
+    }
+    let key_length = u32::from_be_bytes(value[..4].try_into().unwrap()) as usize;
+    let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "identity capsule key length overflow".into(),
+        )
+    })?;
+    if key_end > value.len() {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "truncated identity capsule key".into(),
+        ));
+    }
+    Ok((value[4..key_end].to_vec(), value[key_end..].to_vec()))
 }
 
 fn page_capsule_sort_key(path: &ManagedPath, sequence: u64) -> Vec<u8> {
@@ -2517,12 +2769,7 @@ fn spool_bootstrap_operations(
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
     let authoritative_paths = bootstrap_authoritative_source_paths(capture)?;
-    let content_path = working.join("phase-content.sorted");
-    let capsule_path = working.join("phase-capsule.sorted");
-    let identity_candidates_path = working.join("identity-candidates.sorted");
-    let identity_path = working.join("phase-identity.sorted");
-    let mut content_sort = ExternalSort::new(working, "phase-content")?;
-    let mut identity_candidates = ExternalSort::new(working, "identity-candidates")?;
+    let mut collector = BootstrapOperationCollector::new(working);
     let mut source_reader = BootstrapSourceReader::new(capture)?;
     let mut entries = capture.entries_cursor()?;
     let mut operation_count = 0_u64;
@@ -2585,7 +2832,7 @@ fn spool_bootstrap_operations(
             source_leaf,
             full_span,
         )?;
-        content_sort.push(
+        collector.push_content(
             page_capsule_sort_key(entry.path(), 0),
             page_operation.encode()?,
         )?;
@@ -2611,7 +2858,7 @@ fn spool_bootstrap_operations(
                 source_leaf,
                 full_span,
             )?;
-            content_sort.push(page_capsule_sort_key(entry.path(), 1), preamble.encode()?)?;
+            collector.push_content(page_capsule_sort_key(entry.path(), 1), preamble.encode()?)?;
             operation_count = checked_bootstrap_operation_count(operation_count)?;
         }
         let mut node_ids = Vec::with_capacity(tree.nodes.len());
@@ -2645,7 +2892,7 @@ fn spool_bootstrap_operations(
                 span,
             )?;
             let block_sequence = 2_u64.saturating_add((index as u64).saturating_mul(2));
-            content_sort.push(
+            collector.push_content(
                 page_capsule_sort_key(entry.path(), block_sequence),
                 operation.encode()?,
             )?;
@@ -2674,7 +2921,7 @@ fn spool_bootstrap_operations(
                     value.extend_from_slice(&key_length.to_be_bytes());
                     value.extend_from_slice(&content_key);
                     value.extend_from_slice(&identity.encode()?);
-                    identity_candidates.push(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
+                    collector.push_identity(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
                 }
             }
         }
@@ -2682,39 +2929,14 @@ fn spool_bootstrap_operations(
     }
     source_reader.finish()?;
 
-    for (sort, destination) in [
-        (content_sort, &content_path),
-        (identity_candidates, &identity_candidates_path),
-    ] {
-        let receipt = sort.finish(destination)?;
-        record_sort_receipt(instrumentation, receipt);
-    }
-    let identity_count = collapse_unique_identity_candidates(
-        &identity_candidates_path,
-        &identity_path,
-        working,
-        instrumentation,
-    )?;
+    let (storage, identity_count) = collector.finish(instrumentation)?;
     operation_count = operation_count.checked_add(identity_count).ok_or_else(|| {
         BootstrapStreamingImportError::InvalidOperation("bootstrap operation count overflow".into())
     })?;
     require_bootstrap_operation_limit(operation_count)?;
-    merge_sort_runs(
-        &[content_path.clone(), identity_path.clone()],
-        &capsule_path,
-    )?;
-
-    let operation_path = working.join(BOOTSTRAP_STREAM_OPERATION_SPOOL);
-    let mut output = BufWriter::new(create_new_file(&operation_path)?);
-    let mut input = File::open(&capsule_path)?;
-    io::copy(&mut input, &mut output)?;
-    output.flush()?;
     instrumentation.operations = operation_count;
-    instrumentation.operation_spool_bytes = instrumentation
-        .operation_spool_bytes
-        .saturating_add(operation_path.metadata()?.len());
     Ok(BootstrapOperationSpool {
-        path: operation_path,
+        storage,
         operation_count,
         declaration_count,
     })
@@ -2739,27 +2961,8 @@ fn collapse_unique_identity_candidates(
             Some(_) => {
                 if !duplicate {
                     let unique = pending.take().expect("pending identity exists");
-                    if unique.value.len() < 4 {
-                        return Err(BootstrapStreamingImportError::InvalidOperation(
-                            "truncated identity candidate".into(),
-                        ));
-                    }
-                    let key_length =
-                        u32::from_be_bytes(unique.value[..4].try_into().unwrap()) as usize;
-                    let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
-                        BootstrapStreamingImportError::InvalidOperation(
-                            "identity capsule key length overflow".into(),
-                        )
-                    })?;
-                    if key_end > unique.value.len() {
-                        return Err(BootstrapStreamingImportError::InvalidOperation(
-                            "truncated identity capsule key".into(),
-                        ));
-                    }
-                    output_sort.push(
-                        unique.value[4..key_end].to_vec(),
-                        unique.value[key_end..].to_vec(),
-                    )?;
+                    let (key, value) = decode_identity_candidate(&unique.value)?;
+                    output_sort.push(key, value)?;
                     count = count.saturating_add(1);
                 }
                 pending = Some(record);
@@ -2770,26 +2973,8 @@ fn collapse_unique_identity_candidates(
     }
     if let Some(unique) = pending {
         if !duplicate {
-            if unique.value.len() < 4 {
-                return Err(BootstrapStreamingImportError::InvalidOperation(
-                    "truncated identity candidate".into(),
-                ));
-            }
-            let key_length = u32::from_be_bytes(unique.value[..4].try_into().unwrap()) as usize;
-            let key_end = 4_usize.checked_add(key_length).ok_or_else(|| {
-                BootstrapStreamingImportError::InvalidOperation(
-                    "identity capsule key length overflow".into(),
-                )
-            })?;
-            if key_end > unique.value.len() {
-                return Err(BootstrapStreamingImportError::InvalidOperation(
-                    "truncated identity capsule key".into(),
-                ));
-            }
-            output_sort.push(
-                unique.value[4..key_end].to_vec(),
-                unique.value[key_end..].to_vec(),
-            )?;
+            let (key, value) = decode_identity_candidate(&unique.value)?;
+            output_sort.push(key, value)?;
             count = count.saturating_add(1);
         }
     }
@@ -2819,22 +3004,30 @@ fn require_bootstrap_operation_limit(count: u64) -> Result<(), BootstrapStreamin
     }
 }
 
-pub(crate) struct BootstrapOperationSpoolReader {
-    records: SortRecordReader,
+enum BootstrapOperationSpoolReader<'a> {
+    Memory(std::slice::Iter<'a, SortRecord>),
+    File(SortRecordReader),
 }
 
-impl BootstrapOperationSpoolReader {
-    fn open(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            records: SortRecordReader::open(path)?,
-        })
+impl<'a> BootstrapOperationSpoolReader<'a> {
+    fn open(operations: &'a BootstrapOperationSpool) -> io::Result<Self> {
+        match &operations.storage {
+            BootstrapOperationStorage::Memory(records) => Ok(Self::Memory(records.iter())),
+            BootstrapOperationStorage::File(path) => Ok(Self::File(SortRecordReader::open(path)?)),
+        }
     }
 
     fn next(&mut self) -> Result<Option<BootstrapOperationRecord>, BootstrapStreamingImportError> {
-        self.records
-            .next()?
-            .map(|record| BootstrapOperationRecord::decode(&record.value))
-            .transpose()
+        let value = match self {
+            Self::Memory(records) => records.next().map(|record| record.value.as_slice()),
+            Self::File(records) => {
+                return records
+                    .next()?
+                    .map(|record| BootstrapOperationRecord::decode(&record.value))
+                    .transpose();
+            }
+        };
+        value.map(BootstrapOperationRecord::decode).transpose()
     }
 }
 
@@ -2865,7 +3058,7 @@ fn partition_bootstrap_operation_spool(
         split_continuation: bool,
     }
 
-    let mut reader = BootstrapOperationSpoolReader::open(&operations.path)?;
+    let mut reader = BootstrapOperationSpoolReader::open(operations)?;
     let mut units = Vec::new();
     let mut observed_operations = 0_u64;
     let mut current: Option<Unit> = None;
@@ -3093,7 +3286,7 @@ fn author_bootstrap_parts(
         &working.join(BOOTSTRAP_STREAM_BOUNDARY_SPOOL),
         std::mem::size_of::<u32>(),
     )?;
-    let mut operations = BootstrapOperationSpoolReader::open(&operation_spool.path)?;
+    let mut operations = BootstrapOperationSpoolReader::open(operation_spool)?;
     let mut predecessor = None;
     let mut archive_frontier = ArchiveLocalFrontierBindingV1::initial(import_id, profile_digest);
     let mut descriptors = Vec::with_capacity(part_count as usize);
@@ -3543,7 +3736,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     #[cfg(test)]
     if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
         eprintln!(
-            "bootstrap operation spool: {} ms",
+            "bootstrap semantic lowering: {} ms",
             instrumentation.operation_spool_micros / 1_000
         );
     }
@@ -3659,15 +3852,10 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
             instrumentation.preparation_sealing_micros / 1_000
         );
     }
-    // Move the existing operation spool out of the working directory before it
-    // is removed, under a fresh random name in the same preparation prefix. The
-    // relocation is a rename of a file this preparation already wrote; it is
-    // never fsynced or sealed, and the handle removes it on drop.
     let terminal_construction = retain_terminal_construction_material(
         workspace_id,
         lineage_digest,
         source.import_id,
-        &root,
         &operations,
         authored.accepted_events,
     );
@@ -3712,26 +3900,21 @@ fn inactive_bootstrap_preparation_before_detached_authoring_hook() -> io::Result
     Ok(())
 }
 
-/// Retain the process-only terminal construction capability, or `None` if the
-/// spool could not be relocated. `None` is not a failure: it only means this
-/// activation takes the existing archive replay path.
+/// Retain the process-only terminal construction capability. Detached
+/// authoring has already produced the authenticated accepted events consumed
+/// by SQLite; the operation sequence itself is no longer needed after that
+/// pass and must not be persisted merely to keep this optimization alive.
 fn retain_terminal_construction_material(
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     import_id: ImportId,
-    root: &Path,
     operations: &BootstrapOperationSpool,
     accepted_events: Vec<AcceptedBatchEvent>,
 ) -> Option<TerminalBootstrapConstructionMaterial> {
-    let retained = root.join(format!(".terminal-{}", Uuid::new_v4().simple()));
-    if fs::rename(&operations.path, &retained).is_err() {
-        return None;
-    }
     Some(TerminalBootstrapConstructionMaterial {
         workspace_id,
         lineage_digest,
         import_id,
-        operations: retained,
         operation_count: operations.operation_count,
         declaration_count: operations.declaration_count,
         accepted_events,
@@ -10710,7 +10893,7 @@ mod tests {
         drop(output);
 
         let spool = BootstrapOperationSpool {
-            path: operation_path,
+            storage: BootstrapOperationStorage::File(operation_path),
             operation_count,
             declaration_count: pages as u64,
         };
@@ -10723,7 +10906,7 @@ mod tests {
             std::mem::size_of::<u32>(),
         )
         .unwrap();
-        let mut operations = BootstrapOperationSpoolReader::open(&spool.path).unwrap();
+        let mut operations = BootstrapOperationSpoolReader::open(&spool).unwrap();
         let mut page_part_touches = 0_usize;
         while let Some(boundary) = boundaries.next().unwrap() {
             let count = u32::from_be_bytes(boundary.try_into().unwrap());
@@ -11530,7 +11713,7 @@ mod tests {
         writer.flush().unwrap();
         writer.get_ref().sync_all().unwrap();
         BootstrapOperationSpool {
-            path,
+            storage: BootstrapOperationStorage::File(path),
             operation_count,
             declaration_count: 0,
         }
@@ -11562,7 +11745,7 @@ mod tests {
         writer.flush().unwrap();
         writer.get_ref().sync_all().unwrap();
         BootstrapOperationSpool {
-            path,
+            storage: BootstrapOperationStorage::File(path),
             operation_count: page_count,
             declaration_count: 0,
         }
@@ -11603,7 +11786,7 @@ mod tests {
         writer.flush().unwrap();
         writer.get_ref().sync_all().unwrap();
         BootstrapOperationSpool {
-            path,
+            storage: BootstrapOperationStorage::File(path),
             operation_count: declaration_count,
             declaration_count,
         }
@@ -11656,7 +11839,7 @@ mod tests {
                 std::mem::size_of::<u32>(),
             )
             .unwrap();
-            let mut operations = BootstrapOperationSpoolReader::open(&spool.path).unwrap();
+            let mut operations = BootstrapOperationSpoolReader::open(&spool).unwrap();
             let mut observed_boundaries = Vec::new();
             let mut observed_pages = Vec::new();
             while let Some(boundary) = boundaries.next().unwrap() {
@@ -11733,7 +11916,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_streaming_bootstrap_capture_c_mutation_leaves_no_seal() {
+    fn inactive_streaming_bootstrap_live_mutation_prepares_only_from_sealed_capture() {
         let root = TestRoot::new("streaming-capture-c-mutation");
         let graph_root = root.path().join("graph");
         fs::write(graph_root.join("pages/mutable.md"), "- before").unwrap();
@@ -11747,7 +11930,7 @@ mod tests {
             .unwrap();
         fs::write(graph_root.join("pages/mutable.md"), "- after").unwrap();
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5b01));
-        assert!(prepare_inactive_bootstrap_import(
+        let prepared = prepare_inactive_bootstrap_import(
             &graph,
             capture,
             workspace,
@@ -11757,16 +11940,15 @@ mod tests {
             &target_catalog(&root.path().join("archive"), workspace),
             &preparation_scratch,
         )
-        .is_err());
-        let publication_root = preparation_scratch.join(BOOTSTRAP_STREAM_DIRECTORY);
+        .unwrap();
         assert!(
-            !publication_root.exists()
-                || fs::read_dir(publication_root).unwrap().all(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".building-"))
+            prepared
+                .source_capture()
+                .verify_before_inactive_bootstrap_authoring(&graph)
+                .is_err(),
+            "the final live-source proof must reject bytes changed after capture"
         );
+        assert_eq!(prepared.instrumentation().capture_passes, 1);
     }
 
     #[test]
@@ -12113,7 +12295,7 @@ mod tests {
             &target_catalog(&root.path().join("archive"), workspace),
             ImportId::from_digest([0x63; 32]),
             &BootstrapOperationSpool {
-                path: operation_path,
+                storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: 4,
                 declaration_count: 0,
             },
@@ -12184,7 +12366,7 @@ mod tests {
             &target_catalog(&root.path().join("archive"), workspace),
             ImportId::from_digest([0x6f; 32]),
             &BootstrapOperationSpool {
-                path: operation_path,
+                storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
                 declaration_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
             },
@@ -12302,7 +12484,7 @@ mod tests {
             partition_instrumentation.max_part_documents
                 <= u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART)
         );
-        let mut streaming_reader = BootstrapOperationSpoolReader::open(&streaming.path).unwrap();
+        let mut streaming_reader = BootstrapOperationSpoolReader::open(&streaming).unwrap();
         let mut streaming_operations = Vec::new();
         while let Some(operation) = streaming_reader.next().unwrap() {
             streaming_operations.push(operation.operation);
@@ -12421,6 +12603,80 @@ mod tests {
                 .path()
                 .as_str(),
             "Root.md"
+        );
+    }
+
+    #[test]
+    fn in_memory_and_spilled_bootstrap_builders_publish_identical_canonical_state() {
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains(&format!(
+            "at or below {} MiB",
+            BOOTSTRAP_OPERATION_MEMORY_BYTES / (1024 * 1024)
+        )));
+        let root = TestRoot::new("bootstrap-memory-spill-differential");
+        let graph_root = root.path().join("graph");
+        fs::create_dir_all(graph_root.join("pages")).unwrap();
+        let unique = Uuid::from_u128(0x5e80_0001);
+        let duplicate = Uuid::from_u128(0x5e80_0002);
+        fs::write(
+            graph_root.join("pages/alpha.md"),
+            format!(
+                "title:: Alpha\n\n- parent\n  id:: {unique}\n  - child\n- duplicate one\n  id:: {duplicate}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            graph_root.join("pages/beta.md"),
+            format!("- duplicate two\n  id:: {duplicate}\n- plain\n"),
+        )
+        .unwrap();
+        let graph = Graph::open(&graph_root);
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5e80_1000));
+        let lineage = LineageDigest::of(b"bootstrap-memory-spill-differential");
+        let catalog_document_id = DocumentId::from_uuid(Uuid::from_u128(0x5e80_2000));
+
+        let prepare = |label: &str, memory_limit: usize| {
+            let capture_scratch = root.path().join(format!("capture-{label}"));
+            let preparation_scratch = root.path().join(format!("preparation-{label}"));
+            fs::create_dir(&capture_scratch).unwrap();
+            fs::create_dir(&preparation_scratch).unwrap();
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            force_next_bootstrap_operation_memory_limit(memory_limit);
+            prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                lineage,
+                catalog_document_id,
+                ReferenceCatalogPolicyV1::default(),
+                &target_catalog(&root.path().join(format!("archive-{label}")), workspace),
+                &preparation_scratch,
+            )
+            .unwrap()
+        };
+
+        let memory = prepare("memory", usize::MAX);
+        let spilled = prepare("spilled", 0);
+        assert!(!memory.instrumentation().operation_builder_spilled);
+        assert!(spilled.instrumentation().operation_builder_spilled);
+        assert!(memory.instrumentation().operation_builder_retained_bytes > 0);
+        assert_eq!(
+            memory.aggregate_bytes().unwrap(),
+            spilled.aggregate_bytes().unwrap()
+        );
+        assert_eq!(
+            memory.commit().encode().unwrap(),
+            spilled.commit().encode().unwrap()
+        );
+        assert_eq!(
+            memory.instrumentation().operations,
+            spilled.instrumentation().operations
+        );
+        assert_eq!(
+            memory.instrumentation().parts,
+            spilled.instrumentation().parts
         );
     }
 
