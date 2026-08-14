@@ -13,6 +13,13 @@ definition-free compatibility surface in
 literal. Format/schema constants remain beside their codecs and are likewise
 certified through `tine_storage::formats`.
 
+[ADR 0054](adr/0054-lazy-genesis-managed-activation.md) is the accepted next
+activation format. Until its production-switch gates pass, the layout and
+lifecycle below describe the current multipart-bootstrap runtime; acceptance
+of the ADR alone does not make partially implemented genesis artifacts
+authoritative. The exact removal/replacement ledger is
+[managed-activation-authority-census.md](managed-activation-authority-census.md).
+
 ## 1. On-disk layout
 
 ### 1.1 Shared graph-local provider

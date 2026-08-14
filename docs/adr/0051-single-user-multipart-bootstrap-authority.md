@@ -1,7 +1,6 @@
 # 0051. Single-user multipart bootstrap authority is one commit-last V1 publication
 
-- **Status:** Accepted — inactive format contract; it neither enables activation nor
-  proves the implementation complete
+- **Status:** Superseded by [0054](0054-lazy-genesis-managed-activation.md)
 - **Date:** 2026-07-26
 - **Amends:** the bootstrap boundary in [ADR 0049](0049-oplog-first-sparse-storage.md)
 

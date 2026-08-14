@@ -11167,6 +11167,50 @@ mod tests {
         prepare_streaming_bootstrap_with_config(label, None, files)
     }
 
+    /// Fail-before receipt for ADR 0054.
+    ///
+    /// This test deliberately names the three graph-sized mechanisms the new
+    /// activation format must remove.  It is not an assertion that the old
+    /// design is desirable: each assertion must flip to zero/absence when the
+    /// corresponding genesis consumer becomes authoritative, so a partial
+    /// cutover cannot quietly keep replay or reference Patricia construction.
+    #[test]
+    fn lazy_genesis_redesign_records_current_structural_debt() {
+        let (_root, prepared, _) = prepare_streaming_bootstrap(
+            "lazy-genesis-fail-before",
+            &[
+                ("pages/alpha.md", "- alpha [[Beta]]\n"),
+                ("pages/beta.md", "- beta\n"),
+            ],
+        );
+
+        assert_eq!(prepared.instrumentation().page_capsules, 2);
+        assert!(
+            prepared.instrumentation().operations > 2,
+            "the old activation path must still expose its simulated operation expansion"
+        );
+
+        let work = prepared.candidate().bootstrap_catalog_work_stats();
+        assert_eq!(work.reference_catalog_prepared_sources, 2);
+        assert!(
+            work.reference_catalog_persistent_node_writes > 0,
+            "the old activation path must still expose reference Patricia publication"
+        );
+
+        let frontier = prepared
+            .candidate()
+            .accepted_engine()
+            .accepted_frontier_root()
+            .unwrap();
+        assert_eq!(frontier.reference_catalog_root().source_count(), 2);
+
+        let source = include_str!("import.rs");
+        assert!(source.contains("fn spool_bootstrap_operations("));
+        assert!(source.contains("fn author_bootstrap_parts("));
+        let sqlite_source = include_str!("sqlite.rs");
+        assert!(sqlite_source.contains("self.materialized_row_digest_for_harness()?"));
+    }
+
     fn bootstrap_preparation_scratch(root: &TestRoot, label: &str) -> (PathBuf, PathBuf) {
         let nonce = Uuid::new_v4();
         let capture_scratch = root.path().join(format!("capture-{label}-{nonce}"));
