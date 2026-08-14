@@ -3831,6 +3831,53 @@ pub(crate) struct CleanActivationCandidates {
     accepted_frontier: AcceptedFrontierRoot,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CleanActivationInstrumentation {
+    pub(crate) source_files: u64,
+    pub(crate) source_bytes: u64,
+    pub(crate) parser_nodes: u64,
+    pub(crate) activation_record_bytes: u64,
+    pub(crate) activation_records_spilled: bool,
+    pub(crate) identity_scan_micros: u64,
+    pub(crate) activation_record_micros: u64,
+    pub(crate) candidate_fanout_micros: u64,
+}
+
+/// Move-only clean activation preparation. It retains the exact initial source
+/// capture beside both unpublished products so the final source comparison
+/// cannot accidentally verify a different activation episode.
+pub(crate) struct CleanActivationPreparation {
+    capture: BootstrapSourceCapture,
+    candidates: CleanActivationCandidates,
+    instrumentation: CleanActivationInstrumentation,
+}
+
+impl CleanActivationPreparation {
+    pub(crate) const fn capture(&self) -> &BootstrapSourceCapture {
+        &self.capture
+    }
+
+    pub(crate) const fn candidates(&self) -> &CleanActivationCandidates {
+        &self.candidates
+    }
+
+    pub(crate) const fn instrumentation(&self) -> &CleanActivationInstrumentation {
+        &self.instrumentation
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        BootstrapSourceCapture,
+        LazyGenesisCandidate,
+        super::sqlite::CleanGenesisSqliteCandidate,
+        AcceptedFrontierRoot,
+    ) {
+        let (baseline, sqlite, accepted_frontier) = self.candidates.into_parts();
+        (self.capture, baseline, sqlite, accepted_frontier)
+    }
+}
+
 impl CleanActivationCandidates {
     pub(crate) const fn baseline(&self) -> &LazyGenesisCandidate {
         &self.baseline
@@ -3912,6 +3959,124 @@ fn build_clean_activation_candidates(
         baseline,
         sqlite,
         accepted_frontier,
+    })
+}
+
+fn derive_clean_activation_import_id(
+    capture: &BootstrapSourceCapture,
+    workspace_id: WorkspaceId,
+) -> Result<ImportId, BootstrapStreamingImportError> {
+    let source_count = usize::try_from(capture.source_file_count()).map_err(|_| {
+        BootstrapStreamingImportError::ResourceLimit {
+            resource: "source files",
+            observed: capture.source_file_count(),
+            limit: u64::from(super::bootstrap_import::MAX_SOURCE_INVENTORY_LEAVES),
+        }
+    })?;
+    if source_count > super::bootstrap_import::MAX_SOURCE_INVENTORY_LEAVES as usize {
+        return Err(BootstrapStreamingImportError::ResourceLimit {
+            resource: "source files",
+            observed: capture.source_file_count(),
+            limit: u64::from(super::bootstrap_import::MAX_SOURCE_INVENTORY_LEAVES),
+        });
+    }
+    let mut derivation =
+        ImportIdDerivation::new(workspace_id, 0, source_count, DIFF_SCHEMA_VERSION)
+            .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    derivation
+        .begin_inventory()
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    let mut entries = capture.entries_cursor()?;
+    let mut observed = 0_usize;
+    while let Some(entry) = entries.next()? {
+        observed = observed.checked_add(1).ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidSource("source count overflow".into())
+        })?;
+        derivation
+            .push_inventory(&ImportInventoryEntry::with_kind(
+                entry.kind(),
+                entry.path().clone(),
+                ImportInventoryState::Present(entry.description()),
+            ))
+            .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    }
+    if observed != source_count {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "sealed source entry count differs from its capture".into(),
+        ));
+    }
+    derivation
+        .finish()
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))
+}
+
+/// Prepare the new operation-free activation episode. Source metadata is
+/// scanned once to derive stable imported identities, each source page is then
+/// parsed exactly once into a terminal activation record, and that record is
+/// fanned out to the baseline pack and SQLite in one pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_clean_activation(
+    graph: &Graph,
+    capture: BootstrapSourceCapture,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    catalog_document_id: DocumentId,
+    scratch_parent: &Path,
+    database_path: &Path,
+    policy: &ReferenceCatalogPolicyV1,
+) -> Result<CleanActivationPreparation, BootstrapStreamingImportError> {
+    fs::create_dir_all(scratch_parent)?;
+    let canonical_scratch = fs::canonicalize(scratch_parent)?;
+    let canonical_graph = fs::canonicalize(&graph.root)?;
+    if canonical_scratch == canonical_graph || canonical_scratch.starts_with(&canonical_graph) {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation scratch must be outside the graph".into(),
+        ));
+    }
+    let working = canonical_scratch.join(format!("clean-activation-{}", Uuid::new_v4().simple()));
+    create_private_directory(&working)?;
+    let mut legacy_instrumentation = BootstrapStreamingImportInstrumentation::default();
+    record_capture_instrumentation(&mut legacy_instrumentation, capture.instrumentation());
+
+    let started = Instant::now();
+    let import_id = derive_clean_activation_import_id(&capture, workspace_id)?;
+    let identity_scan_micros = elapsed_micros(started);
+
+    let started = Instant::now();
+    let pages = capture_activation_page_records(
+        &capture,
+        import_id,
+        workspace_id,
+        &mut legacy_instrumentation,
+    )?;
+    let activation_record_micros = elapsed_micros(started);
+
+    let started = Instant::now();
+    let candidates = build_clean_activation_candidates(
+        &pages,
+        workspace_id,
+        lineage_digest,
+        catalog_document_id,
+        capture.capture_identity()?,
+        &working,
+        database_path,
+        policy,
+    )?;
+    let candidate_fanout_micros = elapsed_micros(started);
+    let instrumentation = CleanActivationInstrumentation {
+        source_files: capture.source_file_count(),
+        source_bytes: legacy_instrumentation.source_bytes_read,
+        parser_nodes: legacy_instrumentation.parser_nodes,
+        activation_record_bytes: pages.encoded_bytes() as u64,
+        activation_records_spilled: pages.spilled(),
+        identity_scan_micros,
+        activation_record_micros,
+        candidate_fanout_micros,
+    };
+    Ok(CleanActivationPreparation {
+        capture,
+        candidates,
+        instrumentation,
     })
 }
 
@@ -12400,6 +12565,53 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(legacy.database.applied_batch_count().unwrap() > 0);
+    }
+
+    #[test]
+    fn clean_activation_prepares_both_candidates_and_final_scan_without_operations() {
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-activation-entry",
+            &[
+                ("pages/alpha.md", "- alpha [[Beta]]\n"),
+                ("pages/beta.md", "- beta\n"),
+            ],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let scratch = root.path().join("clean-preparation");
+        let database = root.path().join("clean-projection.sqlite");
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            &scratch,
+            &database,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+
+        assert_eq!(preparation.instrumentation().source_files, 2);
+        assert_eq!(preparation.candidates().baseline().page_count(), 2);
+        assert_eq!(
+            preparation
+                .candidates()
+                .accepted_frontier()
+                .acceptance_sequence(),
+            0
+        );
+        let final_scan = preparation
+            .capture()
+            .verify_before_inactive_bootstrap_authoring(&graph)
+            .unwrap();
+        assert_eq!(final_scan.parser_calls, 0);
+        let (_, baseline, sqlite, root) = preparation.into_parts();
+        assert_eq!(
+            crate::oplog::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline).unwrap(),
+            root
+        );
+        let physical = sqlite.publish().unwrap();
+        assert!(physical.load_all_batches().unwrap().is_empty());
     }
 
     #[test]
