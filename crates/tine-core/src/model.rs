@@ -25414,7 +25414,7 @@ fn reconciliation_scan_unsafe_error(detail: impl Into<String>) -> io::Error {
 // in the graph and not in the object store.  A spool is evidence for a later
 // author; it has no history/publication authority by itself.
 
-pub(crate) const BOOTSTRAP_SOURCE_CAPTURE_SCHEMA: u32 = 1;
+pub(crate) const BOOTSTRAP_SOURCE_CAPTURE_SCHEMA: u32 = 2;
 pub(crate) const BOOTSTRAP_SOURCE_CHUNK_BYTES: usize = 1024 * 1024;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -25426,6 +25426,7 @@ pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORIES: u64 = 1_000_000;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH: usize = 256;
 pub(crate) const BOOTSTRAP_SOURCE_MAX_PATH_BYTES: usize = 4096;
 const BOOTSTRAP_SOURCE_MAX_AGGREGATE_PATH_BYTES: u64 = 512 * 1024 * 1024;
+const BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY: &str = "activation-pages";
 // Ordinary graphs sort each source spool in memory. Large captures retain the
 // external merge path once a single spool exceeds this measured threshold.
 const BOOTSTRAP_SOURCE_SORT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
@@ -25461,6 +25462,7 @@ pub(crate) struct BootstrapSourceCaptureInstrumentation {
     pub(crate) sort_runs: u64,
     pub(crate) peak_owned_buffer_bytes: u64,
     pub(crate) peak_owned_rows: u64,
+    pub(crate) parser_calls: u64,
 }
 
 /// A sealed, private source capture.  It is intentionally crate-private until
@@ -25514,7 +25516,8 @@ impl BootstrapSourceCapture {
 
     /// Final hash-only proof before promotion. It rereads every source through
     /// a fresh retained graph capability and compares the complete canonical
-    /// inventory, entry, and chunk spools to the sealed initial capture.
+    /// inventory and chunk spools to the sealed initial capture. Parser-owned
+    /// entry records are intentionally initial-capture-only.
     pub(crate) fn verify_before_inactive_bootstrap_authoring(
         &self,
         graph: &Graph,
@@ -25544,6 +25547,16 @@ impl BootstrapSourceCapture {
             .join(hex_digest(chunk.description.sha256()));
         BootstrapSourceChunkReader::open(path, chunk.description)
     }
+
+    pub(crate) fn read_activation_page(&self, entry: &BootstrapSourceEntry) -> io::Result<Vec<u8>> {
+        let description = entry.activation_page_description();
+        let path = self
+            .sealed_directory
+            .join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY)
+            .join(hex_digest(description.sha256()));
+        verify_capture_file(&path, description)?;
+        fs::read(path)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25555,6 +25568,7 @@ pub(crate) struct BootstrapSourceEntry {
     file_resource: ContentDigest,
     link_count: u64,
     chunk_count: u32,
+    activation_page: BlobDescription,
 }
 
 impl BootstrapSourceEntry {
@@ -25586,6 +25600,10 @@ impl BootstrapSourceEntry {
 
     pub(crate) fn chunk_count(&self) -> u32 {
         self.chunk_count
+    }
+
+    pub(crate) fn activation_page_description(&self) -> BlobDescription {
+        self.activation_page
     }
 }
 
@@ -26012,6 +26030,8 @@ fn capture_inactive_bootstrap_sources_inner(
     fs::create_dir(&working)?;
     note_bootstrap_source_io_stage("create bootstrap source chunk directory");
     fs::create_dir(working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY))?;
+    note_bootstrap_source_io_stage("create bootstrap activation-page directory");
+    fs::create_dir(working.join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY))?;
 
     note_bootstrap_source_io_stage("collect bootstrap source capture");
     let captured = collect_bootstrap_source_pass(graph, &working, "capture-a", &binding, true)?;
@@ -26151,6 +26171,7 @@ fn collect_bootstrap_source_pass(
         &mut writers,
         &mut state,
         &working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY),
+        &working.join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY),
         seal_chunks,
     )?;
     note_bootstrap_source_io_stage("sync bootstrap source raw spool writers");
@@ -26181,7 +26202,7 @@ fn collect_bootstrap_source_pass(
     note_bootstrap_source_io_stage("validate bootstrap source sorted entries");
     validate_bootstrap_source_sorted_entries(
         &paths.sorted(BootstrapSourceSpoolKind::Entries),
-        state.source_files,
+        if seal_chunks { state.source_files } else { 0 },
     )?;
     note_bootstrap_source_io_stage("validate bootstrap source sorted chunks");
     validate_bootstrap_source_sorted_chunks(
@@ -26206,6 +26227,7 @@ fn walk_bootstrap_source_directory(
     writers: &mut BootstrapSourcePassWriters,
     state: &mut BootstrapSourceWalkState,
     chunks_directory: &Path,
+    activation_pages_directory: &Path,
     seal_chunks: bool,
 ) -> io::Result<()> {
     note_bootstrap_source_io_stage("open bootstrap source directory cursor");
@@ -26366,7 +26388,7 @@ fn walk_bootstrap_source_directory(
         if is_source {
             let path = source_path.expect("source path was just checked");
             note_bootstrap_source_io_stage("capture bootstrap source file");
-            let (logical_name, kind, description, chunk_count) = capture_bootstrap_source_file(
+            let captured = capture_bootstrap_source_file(
                 graph,
                 file,
                 &path,
@@ -26375,6 +26397,7 @@ fn walk_bootstrap_source_directory(
                 writers,
                 state,
                 chunks_directory,
+                activation_pages_directory,
                 seal_chunks,
             )?;
             write_bootstrap_source_inventory_file(
@@ -26382,28 +26405,31 @@ fn walk_bootstrap_source_directory(
                 &child_relative,
                 resource,
                 link_count,
-                Some((kind, description)),
+                Some(captured.description),
                 &mut state.instrumentation,
             )?;
-            write_bootstrap_source_entry(
-                &mut writers.entries,
-                &BootstrapSourceEntry {
-                    path: path.clone(),
-                    kind,
-                    logical_name,
-                    description,
-                    file_resource: resource,
-                    link_count,
-                    chunk_count,
-                },
-                &mut state.instrumentation,
-            )?;
-            write_bootstrap_source_portable(
-                &mut writers.portable,
-                &path.portable_key(),
-                path.as_str(),
-                &mut state.instrumentation,
-            )?;
+            if let Some(semantic) = captured.semantic {
+                write_bootstrap_source_entry(
+                    &mut writers.entries,
+                    &BootstrapSourceEntry {
+                        path: path.clone(),
+                        kind: semantic.kind,
+                        logical_name: semantic.logical_name,
+                        description: captured.description,
+                        file_resource: resource,
+                        link_count,
+                        chunk_count: captured.chunk_count,
+                        activation_page: semantic.activation_page,
+                    },
+                    &mut state.instrumentation,
+                )?;
+                write_bootstrap_source_portable(
+                    &mut writers.portable,
+                    &path.portable_key(),
+                    path.as_str(),
+                    &mut state.instrumentation,
+                )?;
+            }
         } else {
             write_bootstrap_source_inventory_file(
                 &mut writers.inventory,
@@ -26418,6 +26444,18 @@ fn walk_bootstrap_source_directory(
     Ok(())
 }
 
+struct CapturedBootstrapSourceSemantic {
+    logical_name: String,
+    kind: ManagedTextKind,
+    activation_page: BlobDescription,
+}
+
+struct CapturedBootstrapSourceFile {
+    description: BlobDescription,
+    chunk_count: u32,
+    semantic: Option<CapturedBootstrapSourceSemantic>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capture_bootstrap_source_file(
     graph: &Graph,
@@ -26428,8 +26466,9 @@ fn capture_bootstrap_source_file(
     writers: &mut BootstrapSourcePassWriters,
     state: &mut BootstrapSourceWalkState,
     chunks_directory: &Path,
+    activation_pages_directory: &Path,
     seal_chunks: bool,
-) -> io::Result<(String, ManagedTextKind, BlobDescription, u32)> {
+) -> io::Result<CapturedBootstrapSourceFile> {
     let advertised_len = file.metadata()?.len();
     if advertised_len > BOOTSTRAP_SOURCE_MAX_FILE_BYTES {
         return Err(bootstrap_source_capture_error(format!(
@@ -26504,31 +26543,68 @@ fn capture_bootstrap_source_file(
             "source file changed while captured: {path}"
         )));
     }
-    let content = std::str::from_utf8(&bytes).map_err(|_| {
-        bootstrap_source_capture_error(format!("source graph text is not UTF-8: {path}"))
-    })?;
     let live_bytes = actual_len
         .checked_add(BOOTSTRAP_SOURCE_CHUNK_BYTES as u64)
         .ok_or_else(|| bootstrap_source_capture_error("source working-byte counter overflow"))?;
-    let permit = bootstrap_source_parse_budget_permit(graph, path, content)?;
-    let (semantic, _, node_count) =
-        graph.decode_present_graph_text_with_node_count(path, &bytes, permit)?;
-    if node_count > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
-        return Err(bootstrap_source_capture_error(format!(
-            "source parser-node cap exceeded: {path}"
-        )));
-    }
-    state.instrumentation.peak_owned_rows = state.instrumentation.peak_owned_rows.max(node_count);
-    let kind = match semantic.kind {
-        PageKind::Page => ManagedTextKind::Page,
-        PageKind::Journal => ManagedTextKind::Journal,
+    let semantic = if seal_chunks {
+        let content = std::str::from_utf8(&bytes).map_err(|_| {
+            bootstrap_source_capture_error(format!("source graph text is not UTF-8: {path}"))
+        })?;
+        // Retain the same conservative parse budget at the source boundary,
+        // but hand the actual parser tree to activation instead of dropping it
+        // and parsing the sealed bytes again.
+        let permit = bootstrap_source_parse_budget_permit(graph, path, content)?;
+        let record = crate::oplog::import::capture_activation_page_record(graph, path, &bytes)?;
+        state.instrumentation.parser_calls = state
+            .instrumentation
+            .parser_calls
+            .checked_add(1)
+            .ok_or_else(|| bootstrap_source_capture_error("source parser-call overflow"))?;
+        if record.node_count() as u64 > BOOTSTRAP_SOURCE_MAX_PARSER_NODES {
+            return Err(bootstrap_source_capture_error(format!(
+                "source parser-node cap exceeded: {path}"
+            )));
+        }
+        state.instrumentation.peak_owned_rows = state
+            .instrumentation
+            .peak_owned_rows
+            .max(record.node_count() as u64);
+        let logical_name = record.logical_name().to_owned();
+        let logical_name_allocation = checked_add_bytes(
+            usize_to_u64(std::mem::size_of::<String>())?,
+            usize_to_u64(logical_name.capacity())?,
+        )?;
+        if usize_to_u64(logical_name.len())? > permit.semantic_name_bytes
+            || logical_name_allocation > permit.semantic_name_allocation_bytes
+        {
+            return Err(bootstrap_source_capture_error(
+                "rendered semantic title exceeds source capture budget",
+            ));
+        }
+        validate_bootstrap_source_logical_name(&logical_name)?;
+        let activation_page =
+            seal_bootstrap_activation_page(activation_pages_directory, record.encoded())?;
+        Some(CapturedBootstrapSourceSemantic {
+            logical_name,
+            kind: record.kind(),
+            activation_page,
+        })
+    } else {
+        // The final concurrency proof compares the exact path inventory and
+        // byte/chunk descriptions. The initial capture already established
+        // parser admissibility under the same bound configuration, so parsing
+        // here would prove nothing additional.
+        None
     };
-    let logical_name = semantic.name;
-    validate_bootstrap_source_logical_name(&logical_name)?;
-    let logical_name_allocation =
-        owned_string_len_upper_bound(u64::try_from(logical_name.capacity()).map_err(|_| {
-            bootstrap_source_capture_error("logical source name allocation overflow")
-        })?)?;
+    let logical_name_allocation = semantic
+        .as_ref()
+        .map(|semantic| {
+            owned_string_len_upper_bound(u64::try_from(semantic.logical_name.capacity()).map_err(
+                |_| bootstrap_source_capture_error("logical source name allocation overflow"),
+            )?)
+        })
+        .transpose()?
+        .unwrap_or(0);
     state.source_files += 1;
     state.total_source_bytes = next_total;
     state.instrumentation.files += 1;
@@ -26554,12 +26630,28 @@ fn capture_bootstrap_source_file(
                     bootstrap_source_capture_error("source working-byte counter overflow")
                 })?,
         );
-    Ok((
-        logical_name,
-        kind,
-        BlobDescription::from_parts(hasher.finalize().into(), actual_len),
+    Ok(CapturedBootstrapSourceFile {
+        description: BlobDescription::from_parts(hasher.finalize().into(), actual_len),
         chunk_count,
-    ))
+        semantic,
+    })
+}
+
+fn seal_bootstrap_activation_page(directory: &Path, bytes: &[u8]) -> io::Result<BlobDescription> {
+    let description = BlobDescription::of(bytes);
+    let destination = directory.join(hex_digest(description.sha256()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(mut file) => file.write_all(bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_capture_file(&destination, description)?;
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(description)
 }
 
 fn bootstrap_source_parse_budget_permit(
@@ -26618,7 +26710,7 @@ fn write_bootstrap_source_inventory_file(
     path: &str,
     resource: ContentDigest,
     link_count: u64,
-    source: Option<(ManagedTextKind, BlobDescription)>,
+    source: Option<BlobDescription>,
     instrumentation: &mut BootstrapSourceCaptureInstrumentation,
 ) -> io::Result<()> {
     let mut frame = BootstrapSourceEncoder::new(2);
@@ -26627,8 +26719,11 @@ fn write_bootstrap_source_inventory_file(
     frame.u64(link_count);
     match source {
         None => frame.u8(0),
-        Some((kind, description)) => {
-            frame.u8(managed_text_kind_tag(kind));
+        Some(description) => {
+            // Inventory is the exact-byte concurrency proof. Parser-derived
+            // kind belongs only to the initial activation-page record, so a
+            // final proof can reproduce this row without parsing.
+            frame.u8(1);
             frame.description(description);
         }
     }
@@ -26649,6 +26744,7 @@ fn write_bootstrap_source_entry(
     frame.digest(entry.file_resource);
     frame.u64(entry.link_count);
     frame.u32(entry.chunk_count);
+    frame.description(entry.activation_page);
     write_bootstrap_source_frame_accounted(file, frame.finish(), instrumentation)
 }
 
@@ -26875,6 +26971,7 @@ fn decode_bootstrap_source_entry(frame: &[u8]) -> io::Result<BootstrapSourceEntr
     let file_resource = decoder.digest()?;
     let link_count = decoder.u64()?;
     let chunk_count = decoder.u32()?;
+    let activation_page = decoder.description()?;
     decoder.finish()?;
     if link_count != 1 {
         return Err(bootstrap_source_capture_error(
@@ -26889,6 +26986,7 @@ fn decode_bootstrap_source_entry(frame: &[u8]) -> io::Result<BootstrapSourceEntr
         file_resource,
         link_count,
         chunk_count,
+        activation_page,
     })
 }
 
@@ -27223,7 +27321,7 @@ fn bootstrap_source_inventory_key(frame: &[u8]) -> io::Result<(&str, u8)> {
             }
             match decoder.u8()? {
                 0 => {}
-                1 | 2 => {
+                1 => {
                     let _ = decoder.description()?;
                 }
                 _ => {
@@ -27251,6 +27349,7 @@ fn bootstrap_source_entry_key(frame: &[u8]) -> io::Result<&str> {
     let _ = decoder.digest()?;
     let _ = decoder.u64()?;
     let _ = decoder.u32()?;
+    let _ = decoder.description()?;
     decoder.finish()?;
     Ok(path)
 }
@@ -27549,6 +27648,18 @@ fn validate_bootstrap_source_chunk_files(directory: &Path, chunks: &Path) -> io:
     Ok(())
 }
 
+fn validate_bootstrap_activation_page_files(directory: &Path, entries: &Path) -> io::Result<()> {
+    let mut cursor = BootstrapSourceEntryCursor::open(entries.to_path_buf())?;
+    while let Some(entry) = cursor.next()? {
+        let description = entry.activation_page_description();
+        verify_capture_file(
+            &directory.join(hex_digest(description.sha256())),
+            description,
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_sealed_bootstrap_source_capture(capture: &BootstrapSourceCapture) -> io::Result<()> {
     let manifest = encode_bootstrap_source_manifest(capture)?;
     if fs::read(capture.sealed_directory.join(BOOTSTRAP_SOURCE_MANIFEST))? != manifest {
@@ -27585,6 +27696,12 @@ fn validate_sealed_bootstrap_source_capture(capture: &BootstrapSourceCapture) ->
             .sealed_directory
             .join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY),
         &capture.sealed_directory.join(BOOTSTRAP_SOURCE_CHUNKS),
+    )?;
+    validate_bootstrap_activation_page_files(
+        &capture
+            .sealed_directory
+            .join(BOOTSTRAP_SOURCE_ACTIVATION_PAGES_DIRECTORY),
+        &capture.sealed_directory.join(BOOTSTRAP_SOURCE_ENTRIES),
     )
 }
 
@@ -27672,7 +27789,6 @@ fn verify_bootstrap_source_capture(
             BootstrapSourceSpoolKind::Inventory,
             BOOTSTRAP_SOURCE_INVENTORY,
         ),
-        (BootstrapSourceSpoolKind::Entries, BOOTSTRAP_SOURCE_ENTRIES),
         (BootstrapSourceSpoolKind::Chunks, BOOTSTRAP_SOURCE_CHUNKS),
     ] {
         if !bootstrap_source_files_equal(
@@ -48172,9 +48288,11 @@ mod tests {
                 ),
             ]
         );
-        capture
+        assert_eq!(capture.instrumentation().parser_calls, 5);
+        let final_proof = capture
             .verify_before_inactive_bootstrap_authoring(&graph)
             .unwrap();
+        assert_eq!(final_proof.parser_calls, 0);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&capture_scratch);
     }
@@ -48467,6 +48585,7 @@ mod tests {
                     file_resource: ContentDigest::from_bytes([1; 32]),
                     link_count: 1,
                     chunk_count: 0,
+                    activation_page: BlobDescription::from_parts([2; 32], 0),
                 },
                 &mut instrumentation,
             )

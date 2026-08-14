@@ -3305,12 +3305,6 @@ fn spool_bootstrap_operations(
         if !authoritative_paths.contains(entry.path()) {
             continue;
         }
-        let text = std::str::from_utf8(&bytes).map_err(|_| {
-            BootstrapStreamingImportError::InvalidSource(format!(
-                "captured source {} is not UTF-8",
-                entry.path()
-            ))
-        })?;
         let logical_name = LogicalPageName::parse(entry.logical_name().to_owned())
             .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
         let leaf = SourceLeafV1::new(
@@ -3329,14 +3323,9 @@ fn spool_bootstrap_operations(
             .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
 
         let mut parser_instrumentation = ImportInstrumentation::default();
-        let mut tree = parse_nodes(entry.path(), bytes.as_slice(), &mut parser_instrumentation)
-            .map_err(|block| {
-                BootstrapStreamingImportError::InvalidSource(format!(
-                    "{}: {}",
-                    entry.path(),
-                    block.detail
-                ))
-            })?;
+        let captured_page = capture.read_activation_page(&entry)?;
+        let mut tree =
+            decode_captured_activation_page_record(entry.path(), captured_page.as_slice())?;
         if tree.nodes.len() as u32 > MAX_PARSED_NODES_PER_SOURCE_FILE {
             return Err(BootstrapStreamingImportError::ResourceLimit {
                 resource: "parser nodes per source file",
@@ -3435,7 +3424,6 @@ fn spool_bootstrap_operations(
             &mut declaration_count,
         )?;
         activation_pages.push(record)?;
-        let _ = text;
     }
     source_reader.finish()?;
 
@@ -8099,6 +8087,8 @@ fn match_pages(
     Ok(matches)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParsedNode {
     parent: Option<usize>,
     sibling_position: u32,
@@ -8110,7 +8100,8 @@ struct ParsedNode {
     projection_facets: ParsedBlockProjectionFacets,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParsedBlockProjectionFacets {
     searchable_text: String,
     heading_level: Option<u8>,
@@ -8120,6 +8111,8 @@ struct ParsedBlockProjectionFacets {
     task: Option<super::MaterializedTask>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParsedTree {
     path: ManagedPath,
     preamble: Option<String>,
@@ -8132,6 +8125,115 @@ struct ParsedExternalTree {
     explicit_title: Option<String>,
     filename_fallback: PageEntry,
     effective: PageEntry,
+}
+
+const CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION: u32 = 1;
+const MAX_CAPTURED_ACTIVATION_PAGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Parser-owned, process-local handoff from the exact source capture to the
+/// activation constructor. This is deliberately not the durable genesis
+/// capsule codec: it may change with the parser and disappears with an
+/// uncommitted activation episode.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapturedActivationPageV1 {
+    schema_version: u32,
+    tree: ParsedTree,
+}
+
+pub(crate) struct CapturedActivationPageRecord {
+    encoded: Vec<u8>,
+    logical_name: String,
+    kind: ManagedTextKind,
+    node_count: usize,
+}
+
+impl CapturedActivationPageRecord {
+    pub(crate) fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    pub(crate) fn logical_name(&self) -> &str {
+        &self.logical_name
+    }
+
+    pub(crate) fn kind(&self) -> ManagedTextKind {
+        self.kind
+    }
+
+    pub(crate) fn node_count(&self) -> usize {
+        self.node_count
+    }
+}
+
+pub(crate) fn capture_activation_page_record(
+    graph: &Graph,
+    path: &ManagedPath,
+    bytes: &[u8],
+) -> io::Result<CapturedActivationPageRecord> {
+    let mut instrumentation = ImportInstrumentation::default();
+    let parsed =
+        parse_external_nodes(graph, path, bytes, &mut instrumentation).map_err(|block| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {}", path, block.detail),
+            )
+        })?;
+    let logical_name = parsed.effective.name.clone();
+    let kind = match parsed.effective.kind {
+        PageKind::Page => ManagedTextKind::Page,
+        PageKind::Journal => ManagedTextKind::Journal,
+    };
+    let node_count = parsed.tree.nodes.len();
+    let record = CapturedActivationPageV1 {
+        schema_version: CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION,
+        tree: parsed.tree,
+    };
+    let encoded = postcard::to_allocvec(&record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if encoded.len() > MAX_CAPTURED_ACTIVATION_PAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "captured activation page exceeds its fixed record cap",
+        ));
+    }
+    Ok(CapturedActivationPageRecord {
+        encoded,
+        logical_name,
+        kind,
+        node_count,
+    })
+}
+
+fn decode_captured_activation_page_record(
+    expected_path: &ManagedPath,
+    bytes: &[u8],
+) -> Result<ParsedTree, BootstrapStreamingImportError> {
+    if bytes.len() > MAX_CAPTURED_ACTIVATION_PAGE_BYTES {
+        return Err(BootstrapStreamingImportError::ResourceLimit {
+            resource: "captured activation page bytes",
+            observed: bytes.len() as u64,
+            limit: MAX_CAPTURED_ACTIVATION_PAGE_BYTES as u64,
+        });
+    }
+    let record: CapturedActivationPageV1 = postcard::from_bytes(bytes)
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    if record.schema_version != CAPTURED_ACTIVATION_PAGE_SCHEMA_VERSION
+        || &record.tree.path != expected_path
+    {
+        return Err(BootstrapStreamingImportError::InvalidSource(format!(
+            "captured activation page does not bind {}",
+            expected_path
+        )));
+    }
+    if record.tree.nodes.len() as u32 > MAX_PARSED_NODES_PER_SOURCE_FILE {
+        return Err(BootstrapStreamingImportError::ResourceLimit {
+            resource: "parser nodes per source file",
+            observed: record.tree.nodes.len() as u64,
+            limit: u64::from(MAX_PARSED_NODES_PER_SOURCE_FILE),
+        });
+    }
+    Ok(record.tree)
 }
 
 impl std::ops::Deref for ParsedExternalTree {
