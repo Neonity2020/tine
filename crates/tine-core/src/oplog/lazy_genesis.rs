@@ -20,6 +20,10 @@ use super::{
 };
 
 const LAZY_GENESIS_SCHEMA_VERSION: u32 = 1;
+const LAZY_GENESIS_COMMIT_SCHEMA_VERSION: u32 = 1;
+const LAZY_GENESIS_MANIFEST_FILE: &str = "manifest.postcard";
+const LAZY_GENESIS_COMMIT_FILE: &str = "commit.postcard";
+const MAX_LAZY_GENESIS_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
 const LAZY_GENESIS_SEGMENT_TARGET_BYTES: usize = 32 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CAPSULE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES: usize = 512 * 1024 * 1024;
@@ -172,6 +176,48 @@ struct LazyGenesisManifestV1 {
     block_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LazyGenesisCommitV1 {
+    schema_version: u32,
+    workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
+    source_capture: BlobDescription,
+    manifest: BlobDescription,
+    root: ContentDigest,
+}
+
+impl LazyGenesisCommitV1 {
+    pub(crate) const fn root(self) -> ContentDigest {
+        self.root
+    }
+
+    fn for_manifest(manifest: &LazyGenesisManifestV1, bytes: &[u8]) -> Self {
+        Self {
+            schema_version: LAZY_GENESIS_COMMIT_SCHEMA_VERSION,
+            workspace_id: manifest.workspace_id,
+            lineage_digest: manifest.lineage_digest,
+            source_capture: manifest.source_capture,
+            manifest: BlobDescription::of(bytes),
+            root: lazy_genesis_manifest_root(bytes),
+        }
+    }
+
+    fn encode(self) -> io::Result<Vec<u8>> {
+        postcard::to_allocvec(&self).map_err(|error| invalid(error.to_string()))
+    }
+
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let commit: Self =
+            postcard::from_bytes(bytes).map_err(|error| invalid(error.to_string()))?;
+        if commit.schema_version != LAZY_GENESIS_COMMIT_SCHEMA_VERSION || commit.encode()? != bytes
+        {
+            return Err(invalid("lazy genesis commit is malformed or non-canonical"));
+        }
+        Ok(commit)
+    }
+}
+
 pub(crate) struct LazyGenesisPackBuilder {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
@@ -192,9 +238,9 @@ impl LazyGenesisPackBuilder {
         workspace_id: WorkspaceId,
         lineage_digest: LineageDigest,
         source_capture: BlobDescription,
+        scratch_parent: &Path,
     ) -> io::Result<Self> {
-        let scratch =
-            std::env::temp_dir().join(format!("tine-lazy-genesis-{}", Uuid::new_v4().simple()));
+        let scratch = scratch_parent.join(format!("tine-lazy-genesis-{}", Uuid::new_v4().simple()));
         fs::create_dir(&scratch)?;
         Ok(Self {
             workspace_id,
@@ -318,16 +364,7 @@ impl LazyGenesisPackBuilder {
         validate_manifest(&manifest)?;
         let manifest_bytes =
             postcard::to_allocvec(&manifest).map_err(|error| invalid(error.to_string()))?;
-        let root = ContentDigest::from_bytes(
-            Sha256::digest(
-                [
-                    b"tine/lazy-genesis/root/v1\0".as_slice(),
-                    manifest_bytes.as_slice(),
-                ]
-                .concat(),
-            )
-            .into(),
-        );
+        let root = lazy_genesis_manifest_root(&manifest_bytes);
         let index = manifest
             .pages
             .iter()
@@ -341,6 +378,7 @@ impl LazyGenesisPackBuilder {
             manifest_bytes,
             root,
             index,
+            cleanup_on_drop: true,
         })
     }
 }
@@ -359,6 +397,7 @@ pub(crate) struct LazyGenesisCandidate {
     manifest_bytes: Vec<u8>,
     root: ContentDigest,
     index: BTreeMap<PageId, usize>,
+    cleanup_on_drop: bool,
 }
 
 impl LazyGenesisCandidate {
@@ -434,11 +473,99 @@ impl LazyGenesisCandidate {
         }
         Ok(bytes)
     }
+
+    pub(crate) fn stage_into(
+        mut self,
+        destination: &Path,
+    ) -> io::Result<(Self, LazyGenesisCommitV1)> {
+        if destination.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "lazy genesis destination already exists",
+            ));
+        }
+        if self.manifest_bytes.len() > MAX_LAZY_GENESIS_MANIFEST_BYTES {
+            return Err(invalid("lazy genesis manifest exceeds its fixed cap"));
+        }
+        let commit = LazyGenesisCommitV1::for_manifest(&self.manifest, &self.manifest_bytes);
+        if commit.root() != self.root {
+            return Err(invalid(
+                "lazy genesis candidate root changed before staging",
+            ));
+        }
+        write_new(
+            &self.scratch.join(LAZY_GENESIS_MANIFEST_FILE),
+            &self.manifest_bytes,
+        )?;
+        write_new(
+            &self.scratch.join(LAZY_GENESIS_COMMIT_FILE),
+            &commit.encode()?,
+        )?;
+        fs::rename(&self.scratch, destination)?;
+        self.scratch = destination.to_path_buf();
+        Ok((self, commit))
+    }
+
+    pub(crate) fn relocate_after_parent_move(mut self, destination: &Path) -> io::Result<Self> {
+        if self.scratch.exists() || !destination.is_dir() {
+            return Err(invalid(
+                "lazy genesis same-process relocation does not match the sealed parent move",
+            ));
+        }
+        self.scratch = destination.to_path_buf();
+        self.cleanup_on_drop = false;
+        Ok(self)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_sealed(directory: &Path, expected: LazyGenesisCommitV1) -> io::Result<Self> {
+        let manifest_bytes = read_bounded(
+            &directory.join(LAZY_GENESIS_MANIFEST_FILE),
+            MAX_LAZY_GENESIS_MANIFEST_BYTES,
+        )?;
+        let commit_bytes = read_bounded(&directory.join(LAZY_GENESIS_COMMIT_FILE), 1024)?;
+        let commit = LazyGenesisCommitV1::decode(&commit_bytes)?;
+        if commit != expected
+            || commit.manifest != BlobDescription::of(&manifest_bytes)
+            || commit.root != lazy_genesis_manifest_root(&manifest_bytes)
+        {
+            return Err(invalid(
+                "lazy genesis sealed commit does not bind its manifest",
+            ));
+        }
+        let manifest: LazyGenesisManifestV1 =
+            postcard::from_bytes(&manifest_bytes).map_err(|error| invalid(error.to_string()))?;
+        validate_manifest(&manifest)?;
+        if manifest.workspace_id != commit.workspace_id
+            || manifest.lineage_digest != commit.lineage_digest
+            || manifest.source_capture != commit.source_capture
+        {
+            return Err(invalid(
+                "lazy genesis commit and manifest identity disagree",
+            ));
+        }
+        let index = manifest
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| (page.page_id, index))
+            .collect();
+        Ok(Self {
+            scratch: directory.to_path_buf(),
+            manifest,
+            manifest_bytes,
+            root: commit.root,
+            index,
+            cleanup_on_drop: false,
+        })
+    }
 }
 
 impl Drop for LazyGenesisCandidate {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.scratch);
+        if self.cleanup_on_drop {
+            let _ = fs::remove_dir_all(&self.scratch);
+        }
     }
 }
 
@@ -474,6 +601,31 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
 
 fn segment_path(root: &Path, index: usize) -> PathBuf {
     root.join(format!("segment-{index:08}.pack"))
+}
+
+fn lazy_genesis_manifest_root(bytes: &[u8]) -> ContentDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"tine/lazy-genesis/root/v1\0");
+    hasher.update(bytes);
+    ContentDigest::from_bytes(hasher.finalize().into())
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+fn read_bounded(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > cap as u64 {
+        return Err(invalid(
+            "lazy genesis sealed file is not a bounded regular file",
+        ));
+    }
+    fs::read(path)
 }
 
 fn describe_file(path: &Path) -> io::Result<BlobDescription> {
@@ -523,7 +675,9 @@ mod tests {
         let lineage = LineageDigest::of(b"lazy-genesis-test");
         let source = BlobDescription::of(b"capture");
         let build = || {
-            let mut builder = LazyGenesisPackBuilder::new(workspace, lineage, source).unwrap();
+            let mut builder =
+                LazyGenesisPackBuilder::new(workspace, lineage, source, &std::env::temp_dir())
+                    .unwrap();
             let pages = vec![page(1, "pages/a.md", 2), page(2, "pages/b.org", 1)];
             for page in pages {
                 builder.push(page).unwrap();
@@ -548,17 +702,69 @@ mod tests {
     fn lazy_genesis_rejects_cross_page_parent_and_duplicate_identity() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
         let lineage = LineageDigest::of(b"lazy-genesis-test");
-        let mut builder =
-            LazyGenesisPackBuilder::new(workspace, lineage, BlobDescription::of(b"capture"))
-                .unwrap();
+        let mut builder = LazyGenesisPackBuilder::new(
+            workspace,
+            lineage,
+            BlobDescription::of(b"capture"),
+            &std::env::temp_dir(),
+        )
+        .unwrap();
         let mut invalid_page = page(1, "pages/a.md", 1);
         invalid_page.blocks[0].parent = Some(BlockId::from_uuid(Uuid::from_u128(999)));
         assert!(builder.push(invalid_page).is_err());
 
-        let mut builder =
-            LazyGenesisPackBuilder::new(workspace, lineage, BlobDescription::of(b"capture"))
-                .unwrap();
+        let mut builder = LazyGenesisPackBuilder::new(
+            workspace,
+            lineage,
+            BlobDescription::of(b"capture"),
+            &std::env::temp_dir(),
+        )
+        .unwrap();
         builder.push(page(2, "pages/b.md", 0)).unwrap();
         assert!(builder.push(page(1, "pages/a.md", 0)).is_err());
+    }
+
+    #[test]
+    fn lazy_genesis_seal_reopens_and_detects_payload_corruption() {
+        let parent = std::env::temp_dir().join(format!(
+            "tine-lazy-genesis-seal-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let moved_parent = parent.with_extension("sealed");
+        fs::create_dir(&parent).unwrap();
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+        let lineage = LineageDigest::of(b"lazy-genesis-seal-test");
+        let mut builder = LazyGenesisPackBuilder::new(
+            workspace,
+            lineage,
+            BlobDescription::of(b"capture"),
+            &parent,
+        )
+        .unwrap();
+        builder.push(page(1, "pages/a.md", 1)).unwrap();
+        let candidate = builder.finish(vec![0x43, 0x41, 0x54]).unwrap();
+        let (candidate, commit) = candidate.stage_into(&parent.join("genesis")).unwrap();
+        fs::rename(&parent, &moved_parent).unwrap();
+        let candidate = candidate
+            .relocate_after_parent_move(&moved_parent.join("genesis"))
+            .unwrap();
+        assert_eq!(candidate.root(), commit.root());
+        drop(candidate);
+
+        let reopened =
+            LazyGenesisCandidate::open_sealed(&moved_parent.join("genesis"), commit).unwrap();
+        assert_eq!(reopened.page_count(), 1);
+        let segment = segment_path(&moved_parent.join("genesis"), 0);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(segment)
+            .unwrap()
+            .write_all(b"corrupt")
+            .unwrap();
+        assert!(reopened
+            .page(PageId::from_uuid(Uuid::from_u128(1)))
+            .is_err());
+        drop(reopened);
+        fs::remove_dir_all(moved_parent).unwrap();
     }
 }

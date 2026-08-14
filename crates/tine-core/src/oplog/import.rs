@@ -43,7 +43,8 @@ use super::hot_engine::{
 };
 use super::identity::BootstrapPartId;
 use super::lazy_genesis::{
-    LazyGenesisBlockInput, LazyGenesisCandidate, LazyGenesisPackBuilder, LazyGenesisPageInput,
+    LazyGenesisBlockInput, LazyGenesisCandidate, LazyGenesisCommitV1, LazyGenesisPackBuilder,
+    LazyGenesisPageInput,
 };
 use super::object_store::{
     BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
@@ -190,6 +191,7 @@ pub(crate) const BOOTSTRAP_OPERATION_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const BOOTSTRAP_STREAM_SORT_FAN_IN: usize = 4;
 const BOOTSTRAP_STREAM_MAX_SORT_RUNS: usize = 4096;
 const BOOTSTRAP_STREAM_FRAME_BYTES: usize = 64 * 1024 * 1024 + 1024 * 1024;
+const BOOTSTRAP_STREAM_LAZY_GENESIS: &str = "lazy-genesis";
 use super::sync_layout::{
     BOOTSTRAP_STREAM_AGGREGATE_FILE as BOOTSTRAP_STREAM_AGGREGATE,
     BOOTSTRAP_STREAM_BLOB_PAGES_DIR as BOOTSTRAP_STREAM_BLOB_PAGES,
@@ -395,6 +397,7 @@ pub(crate) struct InactiveBootstrapPreparedPublication {
     candidate: Rc<DetachedBootstrapCandidate>,
     engine_materials: Vec<DetachedBootstrapAcceptedEngineMaterial>,
     terminal_construction: Option<TerminalBootstrapConstructionMaterial>,
+    lazy_genesis_commit: LazyGenesisCommitV1,
     instrumentation: BootstrapStreamingImportInstrumentation,
 }
 
@@ -431,6 +434,10 @@ impl InactiveBootstrapPreparedPublication {
 
     pub(crate) const fn source_capture(&self) -> &BootstrapSourceCapture {
         &self.source_capture
+    }
+
+    pub(crate) const fn lazy_genesis_commit(&self) -> LazyGenesisCommitV1 {
+        self.lazy_genesis_commit
     }
 
     pub(crate) fn aggregate_bytes(&self) -> Result<Vec<u8>, BootstrapStreamingImportError> {
@@ -3600,8 +3607,12 @@ fn spool_bootstrap_operations(
     instrumentation.operations = operation_count;
     let activation_pages = activation_pages.finish()?;
     let mut accepted_identities = AcceptedIdentityCursor::open(&accepted_identity_storage)?;
-    let mut lazy_genesis =
-        LazyGenesisPackBuilder::new(workspace_id, lineage_digest, capture.capture_identity()?)?;
+    let mut lazy_genesis = LazyGenesisPackBuilder::new(
+        workspace_id,
+        lineage_digest,
+        capture.capture_identity()?,
+        working,
+    )?;
     let mut lazy_checkpoints = LazyGenesisCheckpointBuilder::new(catalog_document_id)?;
     for page_id in activation_pages.path_order() {
         let record = activation_pages.page(*page_id)?.ok_or_else(|| {
@@ -4553,6 +4564,13 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         &aggregate_bytes,
     )?;
     write_exact_new(&artifacts.join(BOOTSTRAP_STREAM_COMMIT), &commit_bytes)?;
+    let lazy_genesis = operations.lazy_genesis.take().ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "bootstrap preparation lost its lazy genesis candidate".into(),
+        )
+    })?;
+    let staged_lazy_path = artifacts.join(BOOTSTRAP_STREAM_LAZY_GENESIS);
+    let (staged_lazy_genesis, lazy_genesis_commit) = lazy_genesis.stage_into(&staged_lazy_path)?;
 
     progress(BootstrapPreparationProgress::Subphase(
         BootstrapPreparationSubphase::Sealing,
@@ -4573,6 +4591,14 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     )?;
     let decoded_commit = BootstrapAggregateCommitV1::decode(&sealed_commit)?;
     decoded_commit.validate_aggregate(&aggregate)?;
+    let sealed_lazy_path = sealed_directory.join(BOOTSTRAP_STREAM_LAZY_GENESIS);
+    let sealed_lazy_genesis = if staged_lazy_path.exists() {
+        drop(staged_lazy_genesis);
+        LazyGenesisCandidate::open_sealed(&sealed_lazy_path, lazy_genesis_commit)?
+    } else {
+        staged_lazy_genesis.relocate_after_parent_move(&sealed_lazy_path)?
+    };
+    operations.lazy_genesis = Some(sealed_lazy_genesis);
     instrumentation.preparation_sealing_micros = elapsed_micros(phase_started);
     #[cfg(test)]
     if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
@@ -4610,6 +4636,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         candidate: Rc::from(authored.candidate),
         engine_materials: authored.engine_materials,
         terminal_construction,
+        lazy_genesis_commit,
         instrumentation,
     })
 }
