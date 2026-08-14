@@ -1882,28 +1882,32 @@ fn verify_sqlite_identity_transition_against_legacy(
     })
 }
 
-/// Fresh local publication carries the exact transition prepared against
-/// SQLite frontier F. Recompute it after acceptance only as a differential
-/// proof, then make the prepared rows -- not Patricia's rows -- the production
-/// input for the F -> F+1 SQLite transaction. Provider/recovery events retain
-/// the temporary oracle path until their own pre-acceptance hook is wired.
-fn install_prepared_identity_transition(
+/// Make clean SQLite-owned identity rows -- never Patricia's rows -- the
+/// production input for the F -> F+1 transaction. Fresh local publication
+/// additionally carries the exact transition prepared at F; the post-accept
+/// recomputation must equal it. Provider/recovery events are deterministically
+/// recomputed here until their own pre-acceptance hook is wired. Patricia is
+/// consulted only by the differential verifier immediately before this call.
+fn install_clean_identity_transition(
     event: &AcceptedBatchEvent,
     change: super::MaterializationChange,
     recomputed: PreparedSqliteIdentityTransition,
 ) -> Result<super::MaterializationChange, ProjectionError> {
-    let Some(prepared) = event.prepared_identity_transition() else {
-        return Ok(change);
+    let selected = if let Some(prepared) = event.prepared_identity_transition() {
+        if prepared != &recomputed {
+            return Err(ProjectionError::Materialization(
+                "prepared SQLite identity transition changed between preflight and acceptance"
+                    .into(),
+            ));
+        }
+        prepared
+    } else {
+        &recomputed
     };
-    if prepared != &recomputed {
-        return Err(ProjectionError::Materialization(
-            "prepared SQLite identity transition changed between preflight and acceptance".into(),
-        ));
-    }
     change
         .with_identity_projection_records(
-            prepared.page_names.clone(),
-            prepared.portable_paths.clone(),
+            selected.page_names.clone(),
+            selected.portable_paths.clone(),
         )
         .map_err(Into::into)
 }
@@ -4643,7 +4647,7 @@ impl SqliteFrontier {
         )?;
         drop(prior);
         let materialization =
-            install_prepared_identity_transition(event, materialization, recomputed)?;
+            install_clean_identity_transition(event, materialization, recomputed)?;
         let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
             event,
             ApplyFault::None,
@@ -4679,7 +4683,7 @@ impl SqliteFrontier {
         )?;
         drop(prior);
         let materialization =
-            install_prepared_identity_transition(event, materialization, recomputed)?;
+            install_clean_identity_transition(event, materialization, recomputed)?;
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
     }
 
