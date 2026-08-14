@@ -10283,6 +10283,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::oplog::sqlite::{LeasedWorkspaceProjection, WorkspaceRuntimeLease};
     use crate::oplog::{
         execute_manifested_projection_work, write_projection_exact, ApplicationRuntimeRoot,
         AuthorBatch, BatchDisposition, BatchId, BlockLocation, CrdtPeerId, DeviceId, DocumentId,
@@ -12945,7 +12946,49 @@ mod tests {
             0,
             "cold open must not hydrate every page checkpoint"
         );
-        drop(reopened);
+        let (mut clean_engine, clean_projection, _) = reopened.into_parts();
+        let operation_archive_path = clean_archive.join("operations");
+        clean_engine
+            .attach_clean_archive_store(
+                ObjectStore::open(&operation_archive_path, workspace).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !clean_engine.has_native_semantic_index_stores_for_test(),
+            "clean runtime must not open native semantic Patricia stores"
+        );
+        let runtime_store = ObjectStore::open(&operation_archive_path, workspace).unwrap();
+        let lease = WorkspaceRuntimeLease::acquire(&runtime_store, workspace).unwrap();
+        let mut leased_projection = LeasedWorkspaceProjection::adopt_clean_genesis(
+            lease,
+            &database,
+            ProjectionClaim::current(
+                workspace,
+                LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+            ),
+            &root,
+            &runtime_store,
+            &clean_engine,
+            clean_projection,
+        )
+        .map_err(|(_, error)| error)
+        .unwrap();
+        assert_eq!(
+            leased_projection.database().frontier_root().unwrap(),
+            root,
+            "lease-bound clean projection must retain the exact baseline frontier"
+        );
+        let (database_handle, lease_identity) = leased_projection.database_and_lease_identity();
+        lease_identity.revalidate().unwrap();
+        assert_eq!(
+            database_handle
+                .materialized_read()
+                .unwrap()
+                .acceptance_sequence(),
+            0
+        );
+        drop(leased_projection);
+        drop(clean_engine);
         fs::write(&database, b"corrupt disposable SQLite").unwrap();
         let rebuilt = open_clean_activation(
             &clean_enrollment,

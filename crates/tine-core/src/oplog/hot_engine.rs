@@ -8093,6 +8093,64 @@ impl ShardedHotEngine {
         )
     }
 
+    /// Construct the archive-backed engine used by the clean-baseline runtime.
+    ///
+    /// Unlike the legacy constructor, this does not open or create the native
+    /// block, external-UUID, path, or page-name semantic indexes.  Those facts
+    /// are owned by the disposable SQLite projection.  The archive remains the
+    /// durable home for ordinary post-baseline operations and scratch remains
+    /// available for bounded document materialization.
+    pub(crate) fn with_clean_archive_store(
+        store: ObjectStore,
+        lineage_digest: LineageDigest,
+        catalog_document_id: DocumentId,
+    ) -> Result<Self, EngineError> {
+        let workspace_id = store.workspace_id();
+        let mut engine = Self::new(workspace_id, lineage_digest, catalog_document_id);
+        engine.attach_clean_archive_store(store)?;
+        Ok(engine)
+    }
+
+    /// Attach durable operation storage to an already-open clean baseline
+    /// without changing its run-local engine identity.
+    ///
+    /// Keeping the identity is load-bearing: the SQLite genesis candidate was
+    /// constructed for this exact accepted frontier and is bound to this exact
+    /// engine when it is adopted under the workspace lease.
+    pub(crate) fn attach_clean_archive_store(
+        &mut self,
+        store: ObjectStore,
+    ) -> Result<(), EngineError> {
+        if store.workspace_id() != self.workspace_id
+            || self.archive_store.is_some()
+            || self.scratch.is_some()
+            || self.has_native_semantic_index_stores()
+        {
+            return Err(EngineError::Archive(
+                "clean operation archive can only attach once to a matching index-free engine"
+                    .into(),
+            ));
+        }
+        let scratch = store
+            .start_clean_engine_scratch()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        self.scratch = Some(scratch);
+        self.archive_store = Some(Arc::new(store));
+        Ok(())
+    }
+
+    fn has_native_semantic_index_stores(&self) -> bool {
+        self.block_claim_index.is_some()
+            || self.logseq_claim_index.is_some()
+            || self.portable_path_index.is_some()
+            || self.page_name_index.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_native_semantic_index_stores_for_test(&self) -> bool {
+        self.has_native_semantic_index_stores()
+    }
+
     /// The one construction that installs this engine's run-local scratch.
     ///
     /// A fresh open mints a disposable run. Retained and already-created

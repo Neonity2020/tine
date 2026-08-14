@@ -3175,6 +3175,22 @@ impl ObjectStore {
         ))
     }
 
+    /// Start only the disposable document scratch used by the clean managed
+    /// runtime.
+    ///
+    /// The legacy runtime couples this scratch directory to a native block
+    /// claim index.  Clean activation deliberately does not: current-state
+    /// block ownership belongs to the frontier-stamped SQLite projection, and
+    /// constructing the scratch must not create a second semantic index merely
+    /// because the document engine needs spill space.
+    pub(crate) fn start_clean_engine_scratch(
+        &self,
+    ) -> Result<Arc<super::scratch_store::ScratchStore>, StoreError> {
+        super::scratch_store::ScratchStore::open(&self.capability, self.workspace_id)
+            .map(Arc::new)
+            .map_err(|error| StoreError::Scratch(error.to_string()))
+    }
+
     fn engine_claim_index(
         &self,
         scratch: Arc<super::scratch_store::ScratchStore>,

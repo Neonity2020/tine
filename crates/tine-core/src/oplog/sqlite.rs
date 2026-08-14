@@ -3705,6 +3705,81 @@ fn fail_during_apply_for_harness() -> Result<(), ProjectionError> {
 }
 
 impl SqliteFrontier {
+    /// Adopt the already-published clean-genesis projection under the one
+    /// archive-rooted workspace lease that will own the managed runtime.
+    ///
+    /// The activation builder intentionally creates SQLite before authority is
+    /// switched, when it is still a disposable candidate and no runtime lease
+    /// is justified.  Once the marker exists, this boundary closes that
+    /// candidate handle, takes the database-adjacent lock through the supplied
+    /// affine lease slot, reopens and revalidates the exact published file, and
+    /// binds it to the clean engine's run-local authority.  No legacy bootstrap
+    /// history, promotion record, or semantic index participates.
+    pub(crate) fn adopt_clean_genesis_with_applier_slot<'lease>(
+        path: &Path,
+        claim: ProjectionClaim,
+        expected_root: &AcceptedFrontierRoot,
+        store: &ObjectStore,
+        engine: &ShardedHotEngine,
+        candidate: CleanGenesisPhysicalProjection,
+        slot: SqliteApplierSlot<'lease>,
+    ) -> Result<LeasedOpenProjection<'lease>, ProjectionError> {
+        if claim != ProjectionClaim::current(engine.workspace_id(), engine.lineage_digest())
+            || store.workspace_id() != engine.workspace_id()
+            || expected_root
+                != &engine
+                    .accepted_frontier_root()
+                    .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+            || expected_root.acceptance_sequence() != 0
+            || expected_root.genesis().is_none()
+        {
+            return Err(ProjectionError::AuthorityMismatch);
+        }
+        let candidate_root = read_frontier_root(&candidate)?;
+        if &candidate_root != expected_root {
+            return Err(ProjectionError::FrontierRegression);
+        }
+        // The candidate was opened before runtime authority existed.  It must
+        // not overlap the database lock acquired below.
+        drop(candidate);
+
+        let locks = ApplierAuthorization::Slot(&slot).acquire(store, path, claim.workspace_id)?;
+        validate_sidecar_shape(path)?;
+        let checkpointed = authenticate_projection_checkpoint(path, claim)?;
+        let physical = PhysicalSqliteDatabase::open_writable(path)?;
+        physical.validate_schema_and_claim(lower_physical_claim(claim))?;
+        let stored = read_frontier_root(&physical)?;
+        let expected_digest = canonical_frontier_root_digest(expected_root)?;
+        if stored != *expected_root
+            || checkpointed != expected_digest
+            || physical.read_frontier()?.applied_batch_count != 0
+            || !physical.load_all_batches()?.is_empty()
+            || physical
+                .materialized_read(0, expected_digest)?
+                .acceptance_sequence()
+                != 0
+        {
+            return Err(ProjectionError::FrontierRegression);
+        }
+        Ok(LeasedOpenProjection::bind(
+            OpenProjection {
+                database: Self {
+                    path: path.to_path_buf(),
+                    claim,
+                    physical,
+                    runtime_authority: engine.runtime_authority().clone(),
+                    required_frontier_root: expected_root.clone(),
+                    required_frontier_digest: expected_digest,
+                    checkpoint_each_apply: true,
+                    _lease: locks,
+                },
+                recovery: ProjectionRecovery::OpenedExisting,
+                rebuild: RebuildInstrumentation::default(),
+            },
+            slot,
+        ))
+    }
+
     /// Authenticate the accepted semantic suffix after a promoted bootstrap
     /// and retain only its affected page IDs. The bootstrap state digest is
     /// the trusted induction anchor; every later SQLite row must be canonical,
@@ -7855,6 +7930,32 @@ mod applier_lease {
     }
 
     impl LeasedWorkspaceProjection {
+        /// Adopt a published clean-genesis SQLite candidate as the writable
+        /// projection of `engine`, retaining `lease` for the resulting runtime.
+        pub(crate) fn adopt_clean_genesis(
+            lease: WorkspaceRuntimeLease,
+            path: &Path,
+            claim: ProjectionClaim,
+            expected_root: &AcceptedFrontierRoot,
+            store: &ObjectStore,
+            engine: &ShardedHotEngine,
+            candidate: CleanGenesisPhysicalProjection,
+        ) -> Result<Self, (WorkspaceRuntimeLease, ProjectionError)> {
+            Self::open_under(lease, |slot| {
+                let opened = SqliteFrontier::adopt_clean_genesis_with_applier_slot(
+                    path,
+                    claim,
+                    expected_root,
+                    store,
+                    engine,
+                    candidate,
+                    slot,
+                )?;
+                Ok((opened, ()))
+            })
+            .map(|(projection, ())| projection)
+        }
+
         /// Open one database under `lease`'s single applier slot and retain both.
         ///
         /// `open` receives the slot and must consume it into the
