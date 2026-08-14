@@ -32277,6 +32277,7 @@ mod validation_tests {
     use crate::oplog::external_import::{
         ExternalImportObservationEntry, ExternalImportObservationState,
     };
+    use crate::oplog::lazy_genesis::LazyGenesisBlockInput;
     use crate::oplog::projection_work_index::ProjectionExpectedPathReadBudget;
     use crate::oplog::reconciliation_scan::{
         scan_graph_text, AuthenticatedExpectedPath, AuthenticatedExpectedPathSource,
@@ -44398,6 +44399,104 @@ mod validation_tests {
             drop(writer);
             crate::test_support::remove_dir_all(root);
         }
+    }
+
+    /// Isolates the cost which decides whether the new baseline should retain
+    /// directly constructed CRDT checkpoints or add an implicit-genesis causal
+    /// representation. This is intentionally not part of the ordinary suite.
+    ///
+    /// Run with:
+    /// `cargo test --release -p tine-core lazy_genesis_direct_checkpoint_cost_receipt -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual lazy-genesis checkpoint construction receipt"]
+    fn lazy_genesis_direct_checkpoint_cost_receipt() {
+        let pages = std::env::var("TINE_LAZY_GENESIS_PAGES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(13_000);
+        let blocks_per_page = std::env::var("TINE_LAZY_GENESIS_BLOCKS_PER_PAGE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(10);
+        let catalog = DocumentId::from_uuid(Uuid::from_u128(0x7500));
+        let mut builder = LazyGenesisCheckpointBuilder::new(catalog).unwrap();
+        let started = std::time::Instant::now();
+        let mut checkpoint_bytes = 0_u64;
+        for page_ordinal in 0..pages {
+            let home = DocumentId::from_uuid(Uuid::from_u128(
+                0x7600_u128.saturating_add(page_ordinal as u128),
+            ));
+            let page_id = PageId::from_uuid(Uuid::from_u128(
+                0x1_0000_0000_u128.saturating_add(page_ordinal as u128),
+            ));
+            let path = format!("pages/receipt-{page_ordinal:08}.md");
+            let page = LazyGenesisPageInput {
+                source_leaf: *ContentDigest::of(path.as_bytes()).as_bytes(),
+                exact_source_bytes: (blocks_per_page as u64).saturating_mul(96),
+                page_id,
+                home_document_id: home,
+                name: format!("Receipt {page_ordinal:08}"),
+                path: ManagedPath::parse(path).unwrap(),
+                kind: ManagedTextKind::Page,
+                preamble: None,
+                blocks: (0..blocks_per_page)
+                    .map(|block_ordinal| LazyGenesisBlockInput {
+                        block_id: BlockId::from_uuid(Uuid::from_u128(
+                            0x2_0000_0000_u128
+                                .saturating_add((page_ordinal * blocks_per_page) as u128)
+                                .saturating_add(block_ordinal as u128),
+                        )),
+                        home_document_id: home,
+                        parent: None,
+                        order: format!("{block_ordinal:08}"),
+                        content: format!(
+                            "receipt page {page_ordinal:08} block {block_ordinal:04} with representative content"
+                        ),
+                        external_uuid_claims: Vec::new(),
+                    })
+                    .collect(),
+                document_checkpoint: Vec::new(),
+                document_dependencies: None,
+            };
+            let (checkpoint, _) = builder.push_page(&page, &BTreeMap::new()).unwrap();
+            checkpoint_bytes = checkpoint_bytes.saturating_add(checkpoint.len() as u64);
+        }
+        let page_elapsed = started.elapsed();
+        let (catalog_checkpoint, _) = builder.finish().unwrap();
+        let total_elapsed = started.elapsed();
+        eprintln!(
+            "lazy_genesis_checkpoint_receipt pages={pages} blocks={} page_ms={} total_ms={} page_checkpoint_bytes={checkpoint_bytes} catalog_checkpoint_bytes={}",
+            pages.saturating_mul(blocks_per_page),
+            page_elapsed.as_millis(),
+            total_elapsed.as_millis(),
+            catalog_checkpoint.len(),
+        );
+    }
+
+    #[test]
+    fn lazy_genesis_checkpoint_builder_is_terminal_state_not_import_history() {
+        let source = include_str!("hot_engine.rs");
+        let builder = source
+            .split_once("impl LazyGenesisCheckpointBuilder")
+            .and_then(|(_, tail)| tail.split_once("fn verify_lazy_genesis_page_checkpoint"))
+            .map(|(body, _)| body)
+            .expect("lazy-genesis checkpoint builder must remain identifiable");
+        for forbidden in [
+            "SemanticOperation",
+            "OperationTransaction",
+            "prepare_bootstrap_transaction",
+            "AcceptedBatchEvidence",
+            "ProjectionReceipt",
+        ] {
+            assert!(
+                !builder.contains(forbidden),
+                "lazy-genesis checkpoint construction reintroduced {forbidden}"
+            );
+        }
+        let contract = include_str!("../../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("deterministic CRDT checkpoint constructed\ndirectly"));
+        assert!(contract.contains("authors no `SemanticOperation`"));
+        assert!(contract.contains("remain unopened in the lazy pack"));
     }
 
     /// The exact 25-batch / 400-page / 100-block shape of the release 1M-block

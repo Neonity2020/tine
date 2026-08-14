@@ -257,6 +257,15 @@ projection and can be rebuilt without changing the marker or semantic truth.
 The marker is published only after the baseline is durable and one final
 byte/inventory comparison under the watcher fence matches the sealed source.
 
+Each page capsule carries one deterministic CRDT checkpoint constructed
+directly from its terminal page state, plus its compact causal dependencies.
+The single catalog checkpoint is constructed by the same direct terminal-state
+builder. These checkpoints are baseline semantic/causal state, not fabricated
+interactive history: their construction authors no `SemanticOperation`, batch,
+ordinary mutation receipt, partition, or detached bootstrap part. Untouched
+page checkpoints remain unopened in the lazy pack until a page read or first
+ordinary operation needs one.
+
 The corresponding crash states are exhaustive:
 
 | Durable state at restart | Authority | Required behavior |
