@@ -42,6 +42,9 @@ use super::hot_engine::{
     ProjectionStorageBinding, MAX_TRANSACTION_OPERATIONS,
 };
 use super::identity::BootstrapPartId;
+use super::lazy_genesis::{
+    LazyGenesisBlockInput, LazyGenesisCandidate, LazyGenesisPackBuilder, LazyGenesisPageInput,
+};
 use super::object_store::{
     BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
     BootstrapPublicationInspectionV1, ControlDirectoryIdentity, DurablyStagedBootstrapPrefix,
@@ -1226,6 +1229,7 @@ pub(crate) struct TerminalBootstrapConstructionMaterial {
     declaration_count: u64,
     accepted_events: Vec<AcceptedBatchEvent>,
     activation_pages: Option<ActivationPageRecordStore>,
+    lazy_genesis: Option<LazyGenesisCandidate>,
 }
 
 #[allow(dead_code)]
@@ -1265,6 +1269,22 @@ impl TerminalBootstrapConstructionMaterial {
             .transpose()?
             .flatten()
             .map(|record| record.page))
+    }
+
+    pub(crate) fn lazy_genesis_page_count(&self) -> Option<usize> {
+        self.lazy_genesis
+            .as_ref()
+            .map(LazyGenesisCandidate::page_count)
+    }
+
+    pub(crate) fn lazy_genesis_block_count(&self) -> Option<u64> {
+        self.lazy_genesis
+            .as_ref()
+            .map(LazyGenesisCandidate::block_count)
+    }
+
+    pub(crate) fn lazy_genesis_root(&self) -> Option<ContentDigest> {
+        self.lazy_genesis.as_ref().map(LazyGenesisCandidate::root)
     }
 }
 
@@ -2936,6 +2956,7 @@ struct BootstrapOperationSpool {
     operation_count: u64,
     declaration_count: u64,
     activation_pages: Option<ActivationPageRecordStore>,
+    lazy_genesis: Option<LazyGenesisCandidate>,
 }
 
 enum BootstrapOperationCollectionMode {
@@ -3289,6 +3310,7 @@ fn spool_bootstrap_operations(
     capture: &BootstrapSourceCapture,
     import_id: ImportId,
     workspace_id: WorkspaceId,
+    lineage_digest: LineageDigest,
     working: &Path,
     instrumentation: &mut BootstrapStreamingImportInstrumentation,
 ) -> Result<BootstrapOperationSpool, BootstrapStreamingImportError> {
@@ -3299,6 +3321,8 @@ fn spool_bootstrap_operations(
     let mut operation_count = 0_u64;
     let mut declaration_count = 0_u64;
     let mut activation_pages = ActivationPageRecordBuilder::new();
+    let mut lazy_genesis =
+        LazyGenesisPackBuilder::new(workspace_id, lineage_digest, capture.capture_identity()?)?;
 
     while let Some(entry) = entries.next()? {
         let bytes = source_reader.read_entry(&entry, instrumentation)?;
@@ -3423,6 +3447,7 @@ fn spool_bootstrap_operations(
             &mut operation_count,
             &mut declaration_count,
         )?;
+        lazy_genesis.push(lazy_genesis_page_input(&record))?;
         activation_pages.push(record)?;
     }
     source_reader.finish()?;
@@ -3434,6 +3459,7 @@ fn spool_bootstrap_operations(
     require_bootstrap_operation_limit(operation_count)?;
     instrumentation.operations = operation_count;
     let activation_pages = activation_pages.finish()?;
+    let lazy_genesis = lazy_genesis.finish()?;
     instrumentation.terminal_projection_hint_pages = activation_pages.page_count() as u64;
     instrumentation.terminal_projection_hint_bytes = activation_pages.encoded_bytes() as u64;
     instrumentation.terminal_projection_hint_spilled = activation_pages.spilled();
@@ -3442,7 +3468,48 @@ fn spool_bootstrap_operations(
         operation_count,
         declaration_count,
         activation_pages: Some(activation_pages),
+        lazy_genesis: Some(lazy_genesis),
     })
+}
+
+fn lazy_genesis_page_input(record: &ActivationPageRecordV1) -> LazyGenesisPageInput {
+    let blocks = record
+        .page
+        .blocks
+        .iter()
+        .zip(&record.block_sources)
+        .map(|(block, source)| {
+            let external_uuid_claims = if source.raw_ids.len() == 1 {
+                LogseqUuid::parse(source.raw_ids[0].trim())
+                    .ok()
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            LazyGenesisBlockInput {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+                parent: block.parent,
+                order: block.order.clone(),
+                content: block.content.clone(),
+                external_uuid_claims,
+            }
+        })
+        .collect();
+    LazyGenesisPageInput {
+        source_leaf: record.source_leaf,
+        exact_source_bytes: record
+            .full_span
+            .map_or(0, |span| span.end().saturating_sub(span.start())),
+        page_id: record.page.page_id,
+        home_document_id: record.page.home_document_id,
+        name: record.page.name.clone(),
+        path: record.page.path.clone(),
+        kind: record.page.kind,
+        preamble: record.page.preamble.clone(),
+        blocks,
+    }
 }
 
 fn collapse_unique_identity_candidates(
@@ -4232,6 +4299,7 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         &capture,
         source.import_id,
         workspace_id,
+        lineage_digest,
         &working,
         &mut instrumentation,
     )?;
@@ -4422,6 +4490,7 @@ fn retain_terminal_construction_material(
         declaration_count: operations.declaration_count,
         accepted_events,
         activation_pages: operations.activation_pages.take(),
+        lazy_genesis: operations.lazy_genesis.take(),
     })
 }
 
@@ -11537,6 +11606,7 @@ mod tests {
             operation_count,
             declaration_count: pages as u64,
             activation_pages: None,
+            lazy_genesis: None,
         };
         force_next_bootstrap_part_operation_limit(128);
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
@@ -12494,6 +12564,7 @@ mod tests {
             operation_count,
             declaration_count: 0,
             activation_pages: None,
+            lazy_genesis: None,
         }
     }
 
@@ -12527,6 +12598,7 @@ mod tests {
             operation_count: page_count,
             declaration_count: 0,
             activation_pages: None,
+            lazy_genesis: None,
         }
     }
 
@@ -12569,6 +12641,7 @@ mod tests {
             operation_count: declaration_count,
             declaration_count,
             activation_pages: None,
+            lazy_genesis: None,
         }
     }
 
@@ -13079,6 +13152,7 @@ mod tests {
                 operation_count: 4,
                 declaration_count: 0,
                 activation_pages: None,
+                lazy_genesis: None,
             },
             2,
             &working,
@@ -13151,6 +13225,7 @@ mod tests {
                 operation_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
                 declaration_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
                 activation_pages: None,
+                lazy_genesis: None,
             },
             1,
             &working,
@@ -13234,10 +13309,43 @@ mod tests {
             &capture,
             source.import_id,
             workspace,
+            LineageDigest::of(b"canonical-activation-stream-test"),
             &working,
             &mut source_instrumentation,
         )
         .unwrap();
+        let lazy_genesis = streaming
+            .lazy_genesis
+            .as_ref()
+            .expect("shadow lazy-genesis candidate");
+        assert_eq!(
+            lazy_genesis.page_count(),
+            usize::try_from(capture.source_file_count()).unwrap()
+        );
+        let root_path = ManagedPath::parse("Root.md").unwrap();
+        let root_page_id = source
+            .import_id
+            .unmatched_page_id(&ImportLocator::page(root_path));
+        let lazy_root = lazy_genesis.page(root_page_id).unwrap().unwrap();
+        let parsed_root = streaming
+            .activation_pages
+            .as_ref()
+            .unwrap()
+            .page(root_page_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lazy_root.page_id, parsed_root.page.page_id);
+        assert_eq!(lazy_root.name, parsed_root.page.name);
+        assert_eq!(lazy_root.preamble, parsed_root.page.preamble);
+        assert_eq!(lazy_root.blocks.len(), parsed_root.page.blocks.len());
+        assert!(lazy_root
+            .blocks
+            .iter()
+            .zip(&parsed_root.page.blocks)
+            .all(|(lazy, parsed)| lazy.block_id == parsed.block_id
+                && lazy.parent == parsed.parent
+                && lazy.order == parsed.order
+                && lazy.content == parsed.content));
         let mut partition_instrumentation = BootstrapStreamingImportInstrumentation::default();
         assert_eq!(
             partition_bootstrap_operation_spool(

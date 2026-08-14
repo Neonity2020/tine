@@ -31,6 +31,7 @@ pub mod hot_engine;
 mod hot_engine_integration_tests;
 pub mod identity;
 pub mod import;
+pub(crate) mod lazy_genesis;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
 pub(crate) mod local_active;
 #[allow(dead_code)] // mixed live/runtime and recovery/test surface
