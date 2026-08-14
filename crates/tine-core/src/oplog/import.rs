@@ -43,8 +43,8 @@ use super::hot_engine::{
 };
 use super::identity::BootstrapPartId;
 use super::lazy_genesis::{
-    LazyGenesisBlockInput, LazyGenesisCandidate, LazyGenesisCommitV1, LazyGenesisPackBuilder,
-    LazyGenesisPageInput,
+    publish_activation_marker, LazyGenesisActivationMarkerV1, LazyGenesisBlockInput,
+    LazyGenesisCandidate, LazyGenesisCommitV1, LazyGenesisPackBuilder, LazyGenesisPageInput,
 };
 use super::object_store::{
     BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
@@ -4077,6 +4077,104 @@ pub(crate) fn prepare_clean_activation(
         capture,
         candidates,
         instrumentation,
+    })
+}
+
+/// Same-process ownership of a clean activation after the marker has made the
+/// baseline authoritative. No fallible work occurs between marker publication
+/// and construction of this receipt.
+pub(crate) struct CommittedCleanActivation {
+    baseline: LazyGenesisCandidate,
+    projection: super::sqlite::CleanGenesisPhysicalProjection,
+    accepted_frontier: AcceptedFrontierRoot,
+    marker: LazyGenesisActivationMarkerV1,
+    final_scan: BootstrapSourceCaptureInstrumentation,
+}
+
+impl CommittedCleanActivation {
+    pub(crate) const fn baseline(&self) -> &LazyGenesisCandidate {
+        &self.baseline
+    }
+
+    pub(crate) const fn accepted_frontier(&self) -> &AcceptedFrontierRoot {
+        &self.accepted_frontier
+    }
+
+    pub(crate) const fn marker(&self) -> LazyGenesisActivationMarkerV1 {
+        self.marker
+    }
+
+    pub(crate) const fn final_scan(&self) -> &BootstrapSourceCaptureInstrumentation {
+        &self.final_scan
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LazyGenesisCandidate,
+        super::sqlite::CleanGenesisPhysicalProjection,
+        AcceptedFrontierRoot,
+        LazyGenesisActivationMarkerV1,
+    ) {
+        (
+            self.baseline,
+            self.projection,
+            self.accepted_frontier,
+            self.marker,
+        )
+    }
+}
+
+/// Publish both completed candidates, compare the live source bytes one final
+/// time without parsing, and write the authority marker last. A failure before
+/// the marker removes the disposable baseline and SQLite file set.
+pub(crate) fn commit_clean_activation(
+    graph: &Graph,
+    preparation: CleanActivationPreparation,
+    baseline_destination: &Path,
+    enrollment_root: &Path,
+) -> Result<CommittedCleanActivation, BootstrapStreamingImportError> {
+    let (capture, baseline, sqlite, accepted_frontier) = preparation.into_parts();
+    let database_path = sqlite.target_path().to_path_buf();
+    let (baseline, _) = baseline.publish_durable(baseline_destination)?;
+    let projection = sqlite.publish()?;
+
+    let watcher_fence = graph.cache_generation();
+    let final_scan = match capture.verify_before_inactive_bootstrap_authoring(graph) {
+        Ok(scan) if graph.cache_generation() == watcher_fence => scan,
+        Ok(_) => {
+            drop(projection);
+            super::sqlite::remove_disposable_projection(&database_path)?;
+            return Err(BootstrapStreamingImportError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "graph watcher generation changed during the final activation comparison",
+            )));
+        }
+        Err(error) => {
+            drop(projection);
+            super::sqlite::remove_disposable_projection(&database_path)?;
+            return Err(error.into());
+        }
+    };
+    let marker = LazyGenesisActivationMarkerV1::new(
+        baseline.workspace_id(),
+        baseline.lineage_digest(),
+        baseline.root(),
+        baseline.source_capture(),
+        super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?,
+        watcher_fence,
+    )?;
+    if let Err(error) = publish_activation_marker(enrollment_root, marker) {
+        drop(projection);
+        super::sqlite::remove_disposable_projection(&database_path)?;
+        return Err(error.into());
+    }
+    Ok(CommittedCleanActivation {
+        baseline: baseline.retain_as_authoritative(),
+        projection,
+        accepted_frontier,
+        marker,
+        final_scan,
     })
 }
 
@@ -12605,13 +12703,73 @@ mod tests {
             .verify_before_inactive_bootstrap_authoring(&graph)
             .unwrap();
         assert_eq!(final_scan.parser_calls, 0);
-        let (_, baseline, sqlite, root) = preparation.into_parts();
+        let clean_archive = root.path().join("clean-archive");
+        let clean_enrollment = root.path().join("clean-enrollment");
+        fs::create_dir(&clean_archive).unwrap();
+        let committed = commit_clean_activation(
+            &graph,
+            preparation,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &clean_enrollment,
+        )
+        .unwrap();
+        assert_eq!(committed.final_scan().parser_calls, 0);
+        assert_eq!(
+            crate::oplog::lazy_genesis::read_activation_marker(&clean_enrollment).unwrap(),
+            Some(committed.marker())
+        );
+        let (baseline, physical, root, marker) = committed.into_parts();
         assert_eq!(
             crate::oplog::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline).unwrap(),
             root
         );
-        let physical = sqlite.publish().unwrap();
+        assert_eq!(baseline.root(), marker.baseline_root());
         assert!(physical.load_all_batches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clean_activation_source_drift_keeps_direct_files_authoritative() {
+        let (root, old_oracle, workspace) = prepare_streaming_bootstrap(
+            "clean-activation-source-drift",
+            &[("pages/alpha.md", "- alpha\n")],
+        );
+        let graph = Graph::open(&root.path().join("graph"));
+        let database = root.path().join("clean-projection.sqlite");
+        let preparation = prepare_clean_activation(
+            &graph,
+            old_oracle.source_capture().clone(),
+            workspace,
+            LineageDigest::of(b"inactive-streaming-bootstrap-test"),
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            &root.path().join("clean-preparation"),
+            &database,
+            &ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap();
+        let clean_archive = root.path().join("clean-archive");
+        let clean_enrollment = root.path().join("clean-enrollment");
+        fs::create_dir(&clean_archive).unwrap();
+        fs::write(
+            root.path().join("graph/pages/alpha.md"),
+            "- changed after capture\n",
+        )
+        .unwrap();
+
+        assert!(commit_clean_activation(
+            &graph,
+            preparation,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &clean_enrollment,
+        )
+        .is_err());
+        assert!(!clean_archive
+            .join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY)
+            .exists());
+        assert_eq!(
+            crate::oplog::lazy_genesis::read_activation_marker(&clean_enrollment).unwrap(),
+            None
+        );
+        assert!(!tine_storage::sqlite::SqliteFileSet::new(&database).any_exists());
     }
 
     #[test]

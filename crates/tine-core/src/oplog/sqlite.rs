@@ -62,6 +62,8 @@ use uuid::Uuid;
 use super::hot_engine::{
     AcceptedFrontierRoot, EngineAuthority, EngineError, RetainedScratchResumeFailure,
 };
+
+pub(crate) type CleanGenesisPhysicalProjection = PhysicalSqliteDatabase;
 #[cfg(test)]
 use super::import::ActivationPageRecordStore;
 use super::import::{
@@ -2115,6 +2117,10 @@ impl Drop for CleanGenesisProjectionBuilder {
 }
 
 impl CleanGenesisSqliteCandidate {
+    pub(crate) fn target_path(&self) -> &Path {
+        &self.target
+    }
+
     pub(crate) fn publish(mut self) -> Result<PhysicalSqliteDatabase, ProjectionError> {
         let files = self
             .files
@@ -2129,6 +2135,10 @@ impl CleanGenesisSqliteCandidate {
         write_projection_checkpoint(&self.target, self.claim, &stored)?;
         Ok(physical)
     }
+}
+
+pub(crate) fn remove_disposable_projection(path: &Path) -> Result<(), ProjectionError> {
+    SqliteFileSet::new(path).remove().map_err(Into::into)
 }
 
 impl Drop for CleanGenesisSqliteCandidate {
@@ -6713,7 +6723,7 @@ fn canonical_frontier_root_bytes(root: &AcceptedFrontierRoot) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-fn canonical_frontier_root_digest(
+pub(crate) fn canonical_frontier_root_digest(
     root: &AcceptedFrontierRoot,
 ) -> Result<ContentDigest, ProjectionError> {
     canonical_frontier_root_bytes(root).map(|bytes| ContentDigest::of(&bytes))
