@@ -1846,8 +1846,21 @@ fn detached_bootstrap_available_memory_bytes() -> Option<u64> {
         return [host, cgroup_v2, cgroup_v1].into_iter().flatten().min();
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(target_os = "windows"))]
     {
         None
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: `status` is initialized with the exact ABI size required by
+        // GlobalMemoryStatusEx and remains exclusively borrowed for the call.
+        (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status.ullAvailPhys)
     }
 }
 

@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ### Changed
 
+- **Experimental managed-storage activation no longer explodes a dense reference catalog into hundreds of thousands of tiny immutable files.** `tine-storage` 0.6.2 constructs oversized Patricia ranges in bounded canonical chunks and admits the representative 130,000-block catalog in seven packs with no capacity fallback. Tine also sizes that bounded construction from real available memory on Windows. On the 13,000-page release fixture this cuts activation from 86.1 s to 67.5 s and makes SQLite, rather than immutable-catalog fallback, the clear remaining bottleneck.
+
 - **Experimental managed-storage activation now lowers each terminal page once for both SQLite and its exact-byte shadow proof.** SQLite consumes bounded terminal-page chunks while an activation-only sink derives compact, unpublished shadow evidence from the same parser-owned pages; only after SQLite has completed is that evidence bound into the atomic shadow proof. Cold recovery retains the independent builder, and differential plus crash-cut tests require both routes to publish identical durable bytes.
 
 - **Experimental managed-storage activation no longer writes and rereads a graph-sized operation spool for ordinary graphs.** Canonical semantic operations stay in a measured, byte-bounded memory builder through partitioning and detached authoring; oversized imports retain the exact spill path, and both routes are differentially required to publish the same aggregate and commit. SQLite's uninterrupted-build shortcut now retains only the authenticated accepted events it actually consumes.
