@@ -4224,6 +4224,19 @@ pub(crate) fn open_clean_activation(
             "clean activation marker names a different catalog document".into(),
         ));
     }
+    let projection = match super::sqlite::open_clean_genesis_projection(
+        database_path,
+        super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
+        &super::hot_engine::accepted_frontier_root_for_lazy_genesis(&baseline)?,
+    ) {
+        Ok(projection) => projection,
+        Err(_) => rebuild_clean_genesis_projection(
+            database_path,
+            super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
+            &baseline,
+            policy.clone(),
+        )?,
+    };
     let mut engine = ShardedHotEngine::new(
         marker.workspace_id(),
         marker.lineage_digest(),
@@ -4239,16 +4252,124 @@ pub(crate) fn open_clean_activation(
             "clean activation marker accepted frontier differs from its baseline".into(),
         ));
     }
-    let projection = super::sqlite::open_clean_genesis_projection(
-        database_path,
-        super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
-        &accepted_frontier,
-    )?;
     Ok(Some(OpenedCleanActivation {
         engine,
         projection,
         marker,
     }))
+}
+
+fn materialize_lazy_genesis_page(
+    page: LazyGenesisPageInput,
+) -> Result<super::MaterializedPageInput, BootstrapStreamingImportError> {
+    let mut parser_instrumentation = ImportInstrumentation::default();
+    let mut tree = parse_nodes(
+        &page.path,
+        &page.exact_source_bytes,
+        &mut parser_instrumentation,
+    )
+    .map_err(|block| {
+        BootstrapStreamingImportError::InvalidSource(format!("{}: {}", page.path, block.detail))
+    })?;
+    if tree.nodes.len() != page.blocks.len() || tree.preamble != page.preamble {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "lazy genesis source bytes differ from their semantic capsule".into(),
+        ));
+    }
+    let mut blocks = Vec::with_capacity(page.blocks.len());
+    for index in 0..tree.nodes.len() {
+        let stored = &page.blocks[index];
+        let expected_parent = tree.nodes[index]
+            .parent
+            .map(|parent| page.blocks[parent].block_id);
+        let expected_order = imported_order(tree.nodes[index].sibling_position);
+        if stored.home_document_id != page.home_document_id
+            || stored.parent != expected_parent
+            || stored.order != expected_order
+            || stored.content != tree.nodes[index].raw
+        {
+            return Err(BootstrapStreamingImportError::InvalidSource(
+                "lazy genesis block identity differs from its exact source bytes".into(),
+            ));
+        }
+        let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
+        let logseq_uuid = if stored.external_uuid_claims.len() == 1 {
+            Some(stored.external_uuid_claims[0])
+        } else {
+            None
+        };
+        blocks.push(super::MaterializedBlockInput {
+            block_id: stored.block_id,
+            home_document_id: stored.home_document_id,
+            parent: stored.parent,
+            order: stored.order.clone(),
+            content: stored.content.clone(),
+            searchable_text: facets.searchable_text,
+            heading_level: facets.heading_level,
+            collapsed: facets.collapsed,
+            logseq_uuid,
+            logseq_identity_origin: logseq_uuid
+                .map(|_| super::LogseqIdentityOrigin::ExternalImported),
+            references: Vec::new(),
+            properties: facets.properties,
+            tags: facets.tags,
+            task: facets.task,
+        });
+    }
+    let is_org = super::reference_catalog::reference_source_is_org(&page.path);
+    let (preamble_search, _, _, properties, tags, _) = page
+        .preamble
+        .as_deref()
+        .map(|preamble| super::sqlite::document_facets(preamble, is_org))
+        .unwrap_or_default();
+    let logical_name = LogicalPageName::parse(page.name.clone())
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    let mut searchable = page.name.clone();
+    if !preamble_search.is_empty() {
+        searchable.push(' ');
+        searchable.push_str(&preamble_search);
+    }
+    Ok(super::MaterializedPageInput {
+        page_id: page.page_id,
+        home_document_id: page.home_document_id,
+        name: page.name,
+        name_key: logical_name.canonical_key(),
+        path: page.path,
+        kind: page.kind,
+        preamble: page.preamble,
+        searchable_text: searchable,
+        references: Vec::new(),
+        properties,
+        tags,
+        blocks,
+    })
+}
+
+fn rebuild_clean_genesis_projection(
+    database_path: &Path,
+    claim: super::ProjectionClaim,
+    baseline: &LazyGenesisCandidate,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<super::sqlite::CleanGenesisPhysicalProjection, BootstrapStreamingImportError> {
+    super::sqlite::remove_disposable_projection(database_path)?;
+    let accepted_frontier = super::hot_engine::accepted_frontier_root_for_lazy_genesis(baseline)?;
+    let mut builder = super::sqlite::CleanGenesisProjectionBuilder::new(
+        database_path,
+        claim,
+        baseline.page_count(),
+    )?;
+    for page_id in baseline.page_ids() {
+        let page = baseline.page(page_id)?.ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidSource(
+                "lazy genesis manifest page disappeared during SQLite rebuild".into(),
+            )
+        })?;
+        builder.push_page(materialize_lazy_genesis_page(page)?, &policy)?;
+    }
+    builder
+        .finish(&accepted_frontier)?
+        .publish()
+        .map_err(Into::into)
 }
 
 fn collapse_unique_identity_candidates(
@@ -12798,6 +12919,7 @@ mod tests {
         );
         assert_eq!(baseline.root(), marker.baseline_root());
         assert!(physical.load_all_batches().unwrap().is_empty());
+        let original_projection_rows = physical.materialized_row_digests_by_table().unwrap();
         drop(physical);
         drop(baseline);
 
@@ -12822,6 +12944,33 @@ mod tests {
                 .lazy_genesis_resident_page_documents_for_test(),
             0,
             "cold open must not hydrate every page checkpoint"
+        );
+        drop(reopened);
+        fs::write(&database, b"corrupt disposable SQLite").unwrap();
+        let rebuilt = open_clean_activation(
+            &clean_enrollment,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &database,
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap()
+        .expect("corrupt SQLite rebuilds from the baseline");
+        assert_eq!(rebuilt.marker(), marker);
+        assert_eq!(rebuilt.engine().accepted_frontier_root().unwrap(), root);
+        assert_eq!(
+            rebuilt
+                .engine()
+                .lazy_genesis_resident_page_documents_for_test(),
+            0
+        );
+        let (_, rebuilt_projection, _) = rebuilt.into_parts();
+        assert_eq!(
+            rebuilt_projection
+                .materialized_row_digests_by_table()
+                .unwrap(),
+            original_projection_rows,
+            "SQLite rebuilt from exact baseline bytes must reproduce every physical row family"
         );
     }
 
