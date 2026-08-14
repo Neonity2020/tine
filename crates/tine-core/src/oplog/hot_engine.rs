@@ -13009,7 +13009,7 @@ impl ShardedHotEngine {
     /// Materialize the already-authenticated causal clock used by ordinary
     /// operation admission. SQLite identity preflight consumes this instead
     /// of retaining a second identity-specific ancestry structure.
-    pub(crate) fn accepted_batch_causal_containment(
+    pub(crate) fn batch_causal_containment(
         &self,
         batch_id: BatchId,
         causal_dot: BatchCausalDot,

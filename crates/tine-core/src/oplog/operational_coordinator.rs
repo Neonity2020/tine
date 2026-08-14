@@ -593,6 +593,7 @@ struct PublishedContinuationCore {
     manifest_digest: ContentDigest,
     retained_bytes: usize,
     reservation: Option<TailReservation>,
+    identity: Option<super::sqlite::PreparedSqliteIdentityTransition>,
     provider_ingress: bool,
     failure: OperationalCoordinatorError,
 }
@@ -765,6 +766,18 @@ impl PublishedContinuationCore {
         for event in events {
             budget.consume(1, OperationalPhase::TailAdmission)?;
             if event.batch_id() == self.batch_id {
+                let event =
+                    match self.identity.clone() {
+                        Some(identity) => event
+                            .with_prepared_identity_transition(identity)
+                            .map_err(|error| {
+                                OperationalCoordinatorError::new(
+                                    OperationalPhase::TailAdmission,
+                                    error.to_string(),
+                                )
+                            })?,
+                        None => event,
+                    };
                 if event.retained_bytes() != self.retained_bytes {
                     return Err(OperationalCoordinatorError::retained_block(
                         OperationalPhase::TailAdmission,
@@ -781,8 +794,18 @@ impl PublishedContinuationCore {
                             )
                         })?;
                     self.reservation = None;
+                    self.identity = None;
                     continue;
                 }
+                tail.try_enqueue(database, engine, &event)
+                    .map_err(|error| {
+                        OperationalCoordinatorError::new(
+                            OperationalPhase::TailAdmission,
+                            error.to_string(),
+                        )
+                    })?;
+                self.identity = None;
+                continue;
             }
             tail.try_enqueue(database, engine, &event)
                 .map_err(|error| {
@@ -796,6 +819,13 @@ impl PublishedContinuationCore {
             return Err(OperationalCoordinatorError::retained_block(
                 OperationalPhase::TailAdmission,
                 "published reservation survived tail admission of the published event",
+                RetainedBlockReason::PublishedAuthentication,
+            ));
+        }
+        if !self.provider_ingress && self.identity.is_some() {
+            return Err(OperationalCoordinatorError::retained_block(
+                OperationalPhase::TailAdmission,
+                "published local SQLite identity preflight survived accepted tail admission",
                 RetainedBlockReason::PublishedAuthentication,
             ));
         }
@@ -1108,6 +1138,7 @@ fn construct_archive_continuation(
         manifest_digest,
         retained_bytes,
         reservation: None,
+        identity: None,
         provider_ingress: true,
         failure: OperationalCoordinatorError::new(
             OperationalPhase::ArchiveStage,
@@ -1817,6 +1848,11 @@ impl OperationalCoordinator {
             ));
         }
         fault(OperationalFaultPoint::AfterFinalize)?;
+        let identity = database
+            .preflight_prepared_identity_transition(engine, &prepared)
+            .map_err(|error| {
+                OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
+            })?;
         let origin = BatchOrigin::ExternalReconciliation { import_id };
         match publish_and_drain(
             admission,
@@ -1831,6 +1867,7 @@ impl OperationalCoordinator {
             prepared,
             author.batch_id,
             origin,
+            identity,
         )? {
             PublishedPipelineState::Complete(batch_id) => Ok(
                 OperationalCoordinatorState::Complete(OperationalCompletion {
@@ -1864,7 +1901,7 @@ impl OperationalCoordinator {
         }
         #[cfg(test)]
         let parts_started = Instant::now();
-        let (admission, engine, _database, _tail, bootstrap) =
+        let (admission, engine, database, _tail, bootstrap) =
             session.parts_with_bootstrap().map_err(|refusal| {
                 OperationalCoordinatorError::revoked(OperationalPhase::Bindings, refusal)
             })?;
@@ -1872,7 +1909,7 @@ impl OperationalCoordinator {
         note_trusted_local_preparation_stage(|timings| {
             timings.session_parts = parts_started.elapsed();
         });
-        prepare_local_inner(
+        let prepared = prepare_local_inner(
             &admission,
             graph,
             receipts,
@@ -1882,7 +1919,14 @@ impl OperationalCoordinator {
             LocalPreparationBinding::TrustedLocal,
             transaction,
             prepared_editor_projection,
-        )
+        )?;
+        match prepared {
+            PreparedLocalMutationState::Prepared(mut prepared) => {
+                prepared.preflight_identity(database, engine)?;
+                Ok(PreparedLocalMutationState::Prepared(prepared))
+            }
+            reconciliation => Ok(reconciliation),
+        }
     }
 
     /// Execute one already-translated semantic local mutation under the
@@ -1940,7 +1984,7 @@ impl OperationalCoordinator {
                 );
             }
         };
-        let prepared = match prepare_local_inner(
+        let mut prepared = match prepare_local_inner(
             &admission,
             graph,
             receipts,
@@ -1961,6 +2005,9 @@ impl OperationalCoordinator {
             }
             Err(error) => return LocalMutationCoordinatorState::blocked(error),
         };
+        if let Err(error) = prepared.preflight_identity(database, engine) {
+            return LocalMutationCoordinatorState::blocked(error);
+        }
         let manifest_bytes = match prepared.prepared.manifest().encode() {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -2088,6 +2135,7 @@ pub(crate) struct PreparedLocalMutation {
     guard: HandoffSafeGuard,
     prepared: PreparedBatch,
     batch_id: BatchId,
+    identity: Option<super::sqlite::PreparedSqliteIdentityTransition>,
 }
 
 impl PreparedLocalMutation {
@@ -2099,6 +2147,27 @@ impl PreparedLocalMutation {
         &self.prepared
     }
 
+    fn preflight_identity(
+        &mut self,
+        database: &SqliteFrontier,
+        engine: &ShardedHotEngine,
+    ) -> Result<(), OperationalCoordinatorError> {
+        if self.identity.is_some() {
+            return Err(OperationalCoordinatorError::new(
+                OperationalPhase::Finalize,
+                "prepared local mutation was identity-preflighted twice",
+            ));
+        }
+        self.identity = Some(
+            database
+                .preflight_prepared_identity_transition(engine, &self.prepared)
+                .map_err(|error| {
+                    OperationalCoordinatorError::new(OperationalPhase::Finalize, error.to_string())
+                })?,
+        );
+        Ok(())
+    }
+
     pub(super) fn into_trusted_batch(self) -> PreparedBatch {
         let Self {
             endpoint: _,
@@ -2106,6 +2175,7 @@ impl PreparedLocalMutation {
             guard,
             prepared,
             batch_id: _,
+            identity: _,
         } = self;
         drop(guard);
         prepared
@@ -2267,6 +2337,7 @@ fn prepare_local_inner(
             guard,
             prepared,
             batch_id,
+            identity: None,
         },
     ))
 }
@@ -2283,7 +2354,7 @@ fn execute_local_inner(
     source: LocalDraftSource,
     transaction: &OperationTransaction,
 ) -> Result<LocalMutationCoordinatorState, OperationalCoordinatorError> {
-    let prepared = match prepare_local_inner(
+    let mut prepared = match prepare_local_inner(
         admission,
         graph,
         receipts,
@@ -2301,6 +2372,7 @@ fn execute_local_inner(
             ));
         }
     };
+    prepared.preflight_identity(database, engine)?;
     publish_prepared_local(admission, graph, receipts, engine, database, tail, prepared)
 }
 
@@ -2320,8 +2392,10 @@ fn publish_prepared_local(
         guard,
         prepared,
         batch_id,
+        identity,
     } = prepared;
     let archive = archive.expect("slow local preparation retains its verified archive");
+    let identity = identity.expect("slow local publication requires SQLite identity preflight");
 
     match publish_and_drain(
         admission,
@@ -2336,6 +2410,7 @@ fn publish_prepared_local(
         prepared,
         batch_id,
         BatchOrigin::LocalMutation,
+        identity,
     )? {
         PublishedPipelineState::Complete(batch_id) => Ok(LocalMutationCoordinatorState::Active(
             LocalMutationCompletion { batch_id },
@@ -2370,6 +2445,7 @@ fn publish_and_drain(
     prepared: PreparedBatch,
     batch_id: BatchId,
     origin: BatchOrigin,
+    identity: super::sqlite::PreparedSqliteIdentityTransition,
 ) -> Result<PublishedPipelineState, OperationalCoordinatorError> {
     if prepared.manifest().batch_id() != batch_id || prepared.manifest().origin() != origin {
         return Err(OperationalCoordinatorError::new(
@@ -2453,6 +2529,7 @@ fn publish_and_drain(
                 manifest_digest,
                 retained_bytes,
                 reservation: Some(reservation),
+                identity: Some(identity),
                 provider_ingress: false,
                 failure: OperationalCoordinatorError::new(
                     OperationalPhase::Publication,
@@ -2471,6 +2548,7 @@ fn publish_and_drain(
         manifest_digest,
         retained_bytes,
         reservation: Some(reservation),
+        identity: Some(identity),
         provider_ingress: false,
         failure: boundary.clone().err().unwrap_or_else(|| {
             OperationalCoordinatorError::new(
