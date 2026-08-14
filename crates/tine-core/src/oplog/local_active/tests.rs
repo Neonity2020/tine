@@ -10277,6 +10277,14 @@ mod terminal_construction {
                     "diary/nested/02-08-2026.org".into(),
                     b"* journal entry [[Spoke]]\n".to_vec(),
                 ),
+                // A skipped Org heading level is readable but intentionally
+                // not editable. Activation must preserve its accepted parser
+                // semantics and exact bytes without requiring a serializer
+                // round trip.
+                (
+                    "notes/ReadOnly.org".into(),
+                    b"* parent\n*** skipped level [[Hub]]\n".to_vec(),
+                ),
             ],
         );
         assert!(fixture.verified.part_count() > 0);

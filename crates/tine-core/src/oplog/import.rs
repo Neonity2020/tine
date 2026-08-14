@@ -11790,6 +11790,39 @@ mod tests {
         assert!(!spill_path.exists());
     }
 
+    #[test]
+    #[ignore = "explicit 20k-block managed-activation spill acceptance gate"]
+    fn activation_page_record_stream_accepts_one_20k_block_page_when_spilled() {
+        let mut source = String::with_capacity(1_000_000);
+        for ordinal in 0..20_000 {
+            source.push_str(&format!(
+                "- TODO [#A] block {ordinal:05} [[Target]] #bulk\n"
+            ));
+        }
+        force_next_activation_page_record_memory_limit(0);
+        let (_root, prepared, _) = prepare_streaming_bootstrap(
+            "activation-pages-20k-spill",
+            &[("pages/fat.md", source.as_str())],
+        );
+        assert!(prepared.instrumentation().terminal_projection_hint_spilled);
+        assert_eq!(prepared.instrumentation().terminal_projection_hint_pages, 1);
+        assert_eq!(prepared.instrumentation().parser_nodes, 20_000);
+        let store = prepared
+            .terminal_construction
+            .as_ref()
+            .and_then(|material| material.activation_pages.as_ref())
+            .expect("20k activation page record store");
+        let page_id = match store {
+            ActivationPageRecordStore::Memory { .. } => panic!("forced 20k spill stayed in memory"),
+            ActivationPageRecordStore::Spilled(records) => {
+                *records.index.keys().next().expect("one spilled page")
+            }
+        };
+        let record = store.page(page_id).unwrap().expect("spilled 20k page");
+        assert_eq!(record.page.blocks.len(), 20_000);
+        assert_eq!(record.block_sources.len(), 20_000);
+    }
+
     fn bootstrap_preparation_scratch(root: &TestRoot, label: &str) -> (PathBuf, PathBuf) {
         let nonce = Uuid::new_v4();
         let capture_scratch = root.path().join(format!("capture-{label}-{nonce}"));
