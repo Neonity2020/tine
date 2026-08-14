@@ -11,6 +11,22 @@ on:
         description: Optional single Windows scenario, or all, for focused debugging
         required: false
         default: ""
+      managed_page_count:
+        description: Note-page count for the focused Windows managed-storage receipt
+        required: false
+        default: "13000"
+      managed_blocks_per_page:
+        description: Blocks per ordinary page for the focused Windows managed-storage receipt
+        required: false
+        default: "10"
+      managed_total_file_count:
+        description: Total graph files including ignored assets for the focused Windows managed-storage receipt
+        required: false
+        default: "25890"
+      managed_asset_logical_bytes:
+        description: Logical bytes in the compact sparse asset for the focused Windows managed-storage receipt
+        required: false
+        default: "25200000000"
 
 permissions:
   contents: read
@@ -72,7 +88,7 @@ jobs:
     name: Windows x64 ${{ matrix.scenario }} real-app smoke
     if: ${{ inputs.linux_scenario == '' }}
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -103,6 +119,10 @@ jobs:
       - name: Run Windows WebView2 smoke
         env:
           TINE_APP: ${{ github.workspace }}\target\release\tine.exe
+          E2E_MANAGED_PAGE_COUNT: ${{ inputs.managed_page_count }}
+          E2E_MANAGED_BLOCKS_PER_PAGE: ${{ inputs.managed_blocks_per_page }}
+          E2E_MANAGED_TOTAL_FILE_COUNT: ${{ inputs.managed_total_file_count }}
+          E2E_MANAGED_ASSET_LOGICAL_BYTES: ${{ inputs.managed_asset_logical_bytes }}
         run: npm run e2e:windows:smoke -- --scenario=${{ matrix.scenario }}
       - name: Upload Windows E2E evidence
         if: always()

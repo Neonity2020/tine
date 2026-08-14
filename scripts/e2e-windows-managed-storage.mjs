@@ -26,7 +26,19 @@ const TD = process.env.TAURI_DRIVER || "tauri-driver";
 const DRIVER_PORT = Number(process.env.E2E_DRIVER_PORT || 4444);
 const NATIVE_PORT = Number(process.env.E2E_NATIVE_PORT || 4445);
 const PAGE_COUNT = Number(process.env.E2E_MANAGED_PAGE_COUNT || 13_000);
-if (!Number.isSafeInteger(PAGE_COUNT) || PAGE_COUNT < 2) throw new Error(`invalid E2E_MANAGED_PAGE_COUNT ${PAGE_COUNT}`);
+const BLOCKS_PER_PAGE = Number(process.env.E2E_MANAGED_BLOCKS_PER_PAGE || 10);
+const TOTAL_FILE_COUNT = Number(process.env.E2E_MANAGED_TOTAL_FILE_COUNT || 25_890);
+const ASSET_LOGICAL_BYTES = Number(process.env.E2E_MANAGED_ASSET_LOGICAL_BYTES || 25_200_000_000);
+const ACTIVATION_TIMEOUT_MS = Number(process.env.E2E_MANAGED_ACTIVATION_TIMEOUT_MS || 30 * 60_000);
+for (const [name, value, minimum] of [
+  ["E2E_MANAGED_PAGE_COUNT", PAGE_COUNT, 2],
+  ["E2E_MANAGED_BLOCKS_PER_PAGE", BLOCKS_PER_PAGE, 1],
+  ["E2E_MANAGED_TOTAL_FILE_COUNT", TOTAL_FILE_COUNT, PAGE_COUNT + 3],
+  ["E2E_MANAGED_ASSET_LOGICAL_BYTES", ASSET_LOGICAL_BYTES, 0],
+  ["E2E_MANAGED_ACTIVATION_TIMEOUT_MS", ACTIVATION_TIMEOUT_MS, 60_000],
+]) {
+  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`invalid ${name} ${value}`);
+}
 
 const root = path.join(os.tmpdir(), `tine-windows-managed-${process.pid}`);
 const graph = path.join(root, "graph-研究");
@@ -46,13 +58,54 @@ for (const dir of ["pages", "pages/研究", "journals", "logseq", "assets/层级
 fs.mkdirSync(artifacts, { recursive: true });
 fs.writeFileSync(path.join(graph, "logseq", "config.edn"), '{:preferred-format "Markdown"}\n');
 fs.writeFileSync(path.join(graph, "journals", `${journalStem}.md`), `- ${journalMarker}\n`);
-fs.writeFileSync(nestedFile, `- ${nestedMarker}\n`);
-fs.writeFileSync(path.join(graph, "assets", "层级", "二", "fixture.txt"), "nested asset\n");
+const pageBody = (label) => Array.from(
+  { length: BLOCKS_PER_PAGE },
+  (_, block) => `- ${label} block ${block + 1} references [[${nestedTitle}]] and #[[windows-managed]]`,
+).join("\n") + "\n";
+fs.writeFileSync(nestedFile, pageBody(nestedMarker));
 for (let index = 1; index < PAGE_COUNT; index += 1) {
   const bucket = path.join(graph, "pages", `bucket-${String(index % 37).padStart(2, "0")}`);
   fs.mkdirSync(bucket, { recursive: true });
   const stem = `Windows Managed ${String(index).padStart(5, "0")}`;
-  fs.writeFileSync(path.join(bucket, `${stem}.md`), `- fixture block ${index}\n`);
+  const body = index === 1
+    // Parseable Markdown whose source spans deliberately do not structurally
+    // round-trip. Managed activation must retain the exact bytes read-only,
+    // not reject the entire reporter-shaped graph (#292).
+    ? "- root\r  ```\r  - fake\r  ```"
+    : pageBody(`fixture page ${index}`);
+  fs.writeFileSync(path.join(bucket, `${stem}.md`), body);
+}
+
+// Match the reporter's two independent filesystem axes without transferring
+// or allocating a 24.7 GiB Actions artifact: many ignored files exercise the
+// graph walk, while one sparse file carries the large logical-byte shape.
+const sparseAsset = path.join(graph, "assets", "reporter-shape-sparse.bin");
+fs.closeSync(fs.openSync(sparseAsset, "w"));
+const markedSparse = spawnSync("fsutil.exe", ["sparse", "setflag", sparseAsset], { encoding: "utf8" });
+if (markedSparse.status !== 0) {
+  throw new Error(`could not mark reporter-shape asset sparse: ${String(markedSparse.stderr || markedSparse.stdout).trim()}`);
+}
+const sparseHandle = fs.openSync(sparseAsset, "r+");
+try {
+  fs.ftruncateSync(sparseHandle, ASSET_LOGICAL_BYTES);
+} finally {
+  fs.closeSync(sparseHandle);
+}
+const sparseRange = spawnSync(
+  "fsutil.exe",
+  ["sparse", "setrange", sparseAsset, "0", String(ASSET_LOGICAL_BYTES)],
+  { encoding: "utf8" },
+);
+if (sparseRange.status !== 0) {
+  throw new Error(`could not retain compact reporter-shape asset: ${String(sparseRange.stderr || sparseRange.stdout).trim()}`);
+}
+const sourceFileCount = PAGE_COUNT + 1; // pages plus today's journal
+const fixedNonSourceFiles = 2; // config.edn plus the sparse asset
+const fillerAssetCount = TOTAL_FILE_COUNT - sourceFileCount - fixedNonSourceFiles;
+for (let index = 0; index < fillerAssetCount; index += 1) {
+  const bucket = path.join(graph, "assets", `asset-bucket-${String(index % 281).padStart(3, "0")}`);
+  fs.mkdirSync(bucket, { recursive: true });
+  fs.writeFileSync(path.join(bucket, `asset-${String(index).padStart(5, "0")}.bin`), "fixture\n");
 }
 
 function sourceSnapshot() {
@@ -70,6 +123,46 @@ function sourceSnapshot() {
   };
   visit(graph);
   return snapshot;
+}
+
+function graphInventory() {
+  const metrics = {
+    totalFiles: 0,
+    totalLogicalBytes: 0,
+    sourceFiles: 0,
+    sourceBytes: 0,
+    blocks: 0,
+    ignoredFiles: 0,
+    ignoredLogicalBytes: 0,
+  };
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(absolute);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const stat = fs.statSync(absolute);
+      metrics.totalFiles += 1;
+      metrics.totalLogicalBytes += stat.size;
+      if (/\.(md|org)$/i.test(entry.name)) {
+        const source = fs.readFileSync(absolute);
+        metrics.sourceFiles += 1;
+        metrics.sourceBytes += source.length;
+        metrics.blocks += source
+          .toString("utf8")
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("- ") || /^\*+ /.test(line))
+          .length;
+      } else {
+        metrics.ignoredFiles += 1;
+        metrics.ignoredLogicalBytes += stat.size;
+      }
+    }
+  };
+  visit(graph);
+  return metrics;
 }
 
 function assertSameSource(before, label) {
@@ -158,7 +251,7 @@ async function closeSettings() {
 }
 
 async function waitForActivation() {
-  const deadline = Date.now() + 12 * 60_000;
+  const deadline = Date.now() + ACTIVATION_TIMEOUT_MS;
   let last = "";
   while (Date.now() < deadline) {
     last = await bodyText();
@@ -197,6 +290,16 @@ async function openPage(title) {
 }
 
 const before = sourceSnapshot();
+const inventory = graphInventory();
+if (inventory.totalFiles !== TOTAL_FILE_COUNT) {
+  throw new Error(`fixture file-count mismatch: expected ${TOTAL_FILE_COUNT}, got ${inventory.totalFiles}`);
+}
+if (inventory.sourceFiles !== PAGE_COUNT + 1) {
+  throw new Error(`fixture source-count mismatch: expected ${PAGE_COUNT + 1}, got ${inventory.sourceFiles}`);
+}
+if (inventory.blocks < PAGE_COUNT * BLOCKS_PER_PAGE - BLOCKS_PER_PAGE) {
+  throw new Error(`fixture block-count mismatch: expected reporter scale, got ${inventory.blocks}`);
+}
 const env = {
   ...process.env,
   TINE_GRAPH: graph,
@@ -221,8 +324,9 @@ const receipt = {
   schemaVersion: 1,
   scenario: "windows-managed-storage",
   pageCount: PAGE_COUNT,
-  sourceFiles: before.size,
-  graphPathKinds: ["nested", "unicode", "markdown", "asset"],
+  blocksPerPage: BLOCKS_PER_PAGE,
+  graph: inventory,
+  graphPathKinds: ["nested", "unicode", "markdown", "parseable-non-roundtripping-markdown", "many-assets", "sparse-large-asset"],
   milestones: {},
 };
 try {
@@ -257,12 +361,35 @@ try {
   await closeSettings();
   await openPage(nestedTitle);
   receipt.milestones.directFilesRestored = true;
+  if (fs.existsSync(debugLog)) {
+    receipt.activationTrace = fs.readFileSync(debugLog, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.includes("sparse-v2 activation"))
+      .map((line) => line.replaceAll(graph, "<GRAPH>"))
+      .slice(-250);
+  }
   receipt.result = "pass";
   fs.writeFileSync(path.join(artifacts, "windows-managed-storage-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
   console.log(`PASS: Windows managed storage activation and Direct Files return: ${JSON.stringify(receipt)}`);
 } catch (error) {
   try { await browser?.saveScreenshot(path.join(artifacts, "failure.png")); } catch {}
-  const failure = { ...receipt, result: "fail", error: String(error).split("\n").slice(0, 8).join(" | ") };
+  let lastBody = "";
+  try { lastBody = (await bodyText()).slice(-4_000); } catch {}
+  let activationTrace = [];
+  try {
+    activationTrace = fs.readFileSync(debugLog, "utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.includes("sparse-v2 activation"))
+      .map((line) => line.replaceAll(graph, "<GRAPH>"))
+      .slice(-250);
+  } catch {}
+  const failure = {
+    ...receipt,
+    result: "fail",
+    error: String(error).split("\n").slice(0, 8).join(" | "),
+    lastBody,
+    activationTrace,
+  };
   fs.writeFileSync(path.join(artifacts, "failure-capsule.json"), `${JSON.stringify(failure, null, 2)}\n`);
   throw error;
 } finally {

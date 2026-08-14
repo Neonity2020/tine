@@ -17,7 +17,13 @@ const app = path.resolve(process.env.TINE_APP || path.join(root, process.platfor
 const artifactRoot = path.resolve(process.env.E2E_ARTIFACT_DIR || path.join(root, "test-results/e2e", suiteName));
 const longFocusedWindows = suiteName === "windows-smoke"
   && ["windows-managed-storage", "windows-direct-large-open"].includes(only);
-const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (longFocusedWindows ? 15 * 60_000 : 180_000));
+const timeoutMs = Number(process.env.E2E_SCENARIO_TIMEOUT_MS || (
+  only === "windows-managed-storage"
+    ? 35 * 60_000
+    : longFocusedWindows
+      ? 15 * 60_000
+      : 180_000
+));
 const suiteStartedAt = new Date().toISOString();
 function gitOutput(args) {
   const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
