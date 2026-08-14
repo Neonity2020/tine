@@ -1270,6 +1270,7 @@ pub(crate) mod tests {
                 &bootstrap_runtime,
                 &accepted,
                 None,
+                None,
             )
             .unwrap();
             let archive_resource = accepted

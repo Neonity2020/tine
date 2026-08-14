@@ -44,7 +44,10 @@ use super::projection::{
 };
 #[cfg(test)]
 use super::sqlite::OpenProjection;
-use super::sqlite::VerifiedBootstrapSqliteProjection;
+use super::sqlite::{
+    ProjectionError as SqliteProjectionError, TerminalProjectionChunkSink,
+    VerifiedBootstrapSqliteProjection,
+};
 use super::sync_layout::{
     COMMIT_MARKER_FILE, COMMIT_MARKER_STAGE_FILE, MANIFEST_FILE, PROOF_FILE, PROOF_STAGE_FILE,
     SHADOW_ROOT_DIR as SHADOW_ROOT_DIRECTORY,
@@ -60,11 +63,11 @@ use super::{
 };
 use crate::model::{
     move_file_noreplace, BootstrapSourceCapture, BootstrapSourceChunkCursor, BootstrapSourceEntry,
-    Graph, BOOTSTRAP_SOURCE_CAPTURE_SCHEMA, BOOTSTRAP_SOURCE_CHUNK_BYTES,
-    BOOTSTRAP_SOURCE_MAX_DIRECTORIES, BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH,
-    BOOTSTRAP_SOURCE_MAX_FILES, BOOTSTRAP_SOURCE_MAX_FILE_BYTES,
-    BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES, BOOTSTRAP_SOURCE_MAX_PATH_BYTES,
-    BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
+    BootstrapSourceEntryCursor, Graph, BOOTSTRAP_SOURCE_CAPTURE_SCHEMA,
+    BOOTSTRAP_SOURCE_CHUNK_BYTES, BOOTSTRAP_SOURCE_MAX_DIRECTORIES,
+    BOOTSTRAP_SOURCE_MAX_DIRECTORY_DEPTH, BOOTSTRAP_SOURCE_MAX_FILES,
+    BOOTSTRAP_SOURCE_MAX_FILE_BYTES, BOOTSTRAP_SOURCE_MAX_LOGICAL_NAME_BYTES,
+    BOOTSTRAP_SOURCE_MAX_PATH_BYTES, BOOTSTRAP_SOURCE_MAX_TOTAL_BYTES,
 };
 
 const SHADOW_PROJECTION_SCHEMA_VERSION: u32 = 2;
@@ -428,6 +431,9 @@ pub(crate) struct ShadowProjectionInstrumentation {
     pub(crate) peak_owned_source_bytes: u64,
     pub(crate) peak_owned_catalog_rows: u64,
     pub(crate) tree_entries_visited: u64,
+    /// Same-process activations whose manifest evidence consumed the exact
+    /// bounded terminal page stream already materialized for SQLite.
+    pub(crate) adjacent_terminal_streams: u64,
 }
 
 /// Constant-size durable binding for the immutable shadow publication retained
@@ -1555,7 +1561,7 @@ fn read_capability_file(
     Ok(bytes)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceSummary {
     file_count: u64,
     chunk_count: u64,
@@ -1574,6 +1580,221 @@ struct StagedInventoryProof {
     digest: ContentDigest,
     file_count: u64,
     total_bytes: u64,
+}
+
+/// Compact, process-local evidence produced from the exact terminal pages
+/// already materialized for SQLite.  It contains only canonical shadow
+/// manifest-entry bytes and their running proof, never retained page state.
+pub(crate) struct AdjacentTerminalShadowEvidence {
+    binding: CurrentPathCatalogBinding,
+    summary: SourceSummary,
+    manifest_entries: Vec<u8>,
+    staged: StagedInventoryProof,
+    instrumentation: ShadowProjectionInstrumentation,
+}
+
+pub(crate) struct AdjacentTerminalShadowConstruction {
+    capture: BootstrapSourceCapture,
+    authoritative_paths: HashSet<ManagedPath>,
+    binding: CurrentPathCatalogBinding,
+    summary: SourceSummary,
+    entries: BootstrapSourceEntryCursor,
+    chunks: BootstrapSourceChunkCursor,
+    manifest_entries: Vec<u8>,
+    inventory: Sha256,
+    file_count: u64,
+    total_bytes: u64,
+    instrumentation: ShadowProjectionInstrumentation,
+}
+
+impl AdjacentTerminalShadowConstruction {
+    pub(crate) fn new(
+        prepared: &InactiveBootstrapPreparedPublication,
+        authority: &InactiveBootstrapAcceptedAuthority,
+    ) -> Result<Self, ShadowProjectionError> {
+        let capture = prepared.source_capture().clone();
+        let authoritative_paths = bootstrap_authoritative_source_paths(&capture).map_err(|_| {
+            ShadowProjectionError::CorruptOrConflicting(
+                "source collision-authority selection is invalid",
+            )
+        })?;
+        let summary = summarize_source(&capture, &authoritative_paths)?;
+        let binding = authority
+            .accepted_engine()
+            .current_path_catalog_binding()
+            .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?;
+        if binding.catalog_rows() != authoritative_paths.len() as u64 {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "terminal catalog and authoritative source path counts differ",
+            ));
+        }
+        let mut construction = Self {
+            entries: capture.entries_cursor()?,
+            chunks: capture.chunks_cursor()?,
+            capture,
+            authoritative_paths,
+            binding,
+            summary,
+            manifest_entries: Vec::new(),
+            inventory: Sha256::new(),
+            file_count: 0,
+            total_bytes: 0,
+            instrumentation: ShadowProjectionInstrumentation::default(),
+        };
+        construction.reset_state()?;
+        Ok(construction)
+    }
+
+    fn reset_state(&mut self) -> Result<(), ShadowProjectionError> {
+        self.entries = self.capture.entries_cursor()?;
+        self.chunks = self.capture.chunks_cursor()?;
+        self.manifest_entries.clear();
+        self.inventory = Sha256::new();
+        self.inventory
+            .update(b"tine/inactive-shadow-projection-inventory/v1\0");
+        self.file_count = 0;
+        self.total_bytes = 0;
+        self.instrumentation = ShadowProjectionInstrumentation {
+            catalog_rows: self.binding.catalog_rows(),
+            source_files: self.summary.file_count,
+            source_chunks: self.summary.chunk_count,
+            peak_owned_catalog_rows: self.summary.file_count.min(CATALOG_PAGE_ROWS as u64),
+            ..ShadowProjectionInstrumentation::default()
+        };
+        Ok(())
+    }
+
+    fn next_authoritative_source(
+        &mut self,
+    ) -> Result<Option<(BootstrapSourceEntry, Vec<u8>)>, ShadowProjectionError> {
+        while let Some(entry) = self.entries.next()? {
+            let source = read_source_file(
+                &self.capture,
+                &entry,
+                &mut self.chunks,
+                &mut self.instrumentation,
+            )?;
+            if self.authoritative_paths.contains(entry.path()) {
+                return Ok(Some((entry, source)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        authority: &InactiveBootstrapAcceptedAuthority,
+    ) -> Result<AdjacentTerminalShadowEvidence, ShadowProjectionError> {
+        if self.next_authoritative_source()?.is_some()
+            || self.chunks.next()?.is_some()
+            || self.file_count != self.binding.catalog_rows()
+            || authority
+                .accepted_engine()
+                .current_path_catalog_binding()
+                .map_err(|error| ShadowProjectionError::Projection(error.to_string()))?
+                != self.binding
+        {
+            return Err(ShadowProjectionError::BindingMismatch(
+                "adjacent terminal shadow stream did not cover the exact catalog",
+            ));
+        }
+        self.instrumentation.adjacent_terminal_streams = 1;
+        Ok(AdjacentTerminalShadowEvidence {
+            binding: self.binding,
+            summary: self.summary,
+            manifest_entries: self.manifest_entries,
+            staged: StagedInventoryProof {
+                digest: ContentDigest::from_bytes(self.inventory.finalize().into()),
+                file_count: self.file_count,
+                total_bytes: self.total_bytes,
+            },
+            instrumentation: self.instrumentation,
+        })
+    }
+}
+
+impl TerminalProjectionChunkSink for AdjacentTerminalShadowConstruction {
+    fn reset(&mut self) -> Result<(), SqliteProjectionError> {
+        self.reset_state()
+            .map_err(|error| SqliteProjectionError::Materialization(error.to_string()))
+    }
+
+    fn accept_chunk(
+        &mut self,
+        rows: &[CurrentPathCatalogRow],
+        pages: &[ProjectionPageState],
+    ) -> Result<(), SqliteProjectionError> {
+        let mut accept = || -> Result<(), ShadowProjectionError> {
+            if rows.len() != pages.len() {
+                return Err(ShadowProjectionError::BindingMismatch(
+                    "terminal page chunk differs from its catalog rows",
+                ));
+            }
+            self.instrumentation.bulk_materialization_chunks = checked_add(
+                self.instrumentation.bulk_materialization_chunks,
+                1,
+                "adjacent shadow bulk chunks",
+            )?;
+            self.instrumentation.bulk_pages_materialized = checked_add(
+                self.instrumentation.bulk_pages_materialized,
+                pages.len() as u64,
+                "adjacent shadow materialized pages",
+            )?;
+            self.instrumentation.peak_bulk_pages =
+                self.instrumentation.peak_bulk_pages.max(pages.len() as u64);
+            for (row, state) in rows.iter().zip(pages) {
+                let (entry, source) = self.next_authoritative_source()?.ok_or(
+                    ShadowProjectionError::BindingMismatch(
+                        "terminal catalog outlived the sealed source capture",
+                    ),
+                )?;
+                if entry.path() != row.path() {
+                    return Err(ShadowProjectionError::BindingMismatch(
+                        "terminal catalog order differs from sealed source order",
+                    ));
+                }
+                let intent = plan_exact_source_row(
+                    self.binding,
+                    row,
+                    &entry,
+                    &source,
+                    state,
+                    &mut self.instrumentation,
+                )?;
+                emit_manifest_entry(&mut self.manifest_entries, &entry, row.page_id(), &intent)?;
+                self.instrumentation.manifest_entries = checked_add(
+                    self.instrumentation.manifest_entries,
+                    1,
+                    "adjacent shadow manifest entries",
+                )?;
+                enforce_limit(
+                    "adjacent shadow manifest bytes",
+                    self.manifest_entries.len() as u64,
+                    MAX_MANIFEST_BYTES,
+                )?;
+                let evidence = ShadowProjectionFileEvidence {
+                    path: entry.path().clone(),
+                    kind: entry.kind(),
+                    logical_name: entry.logical_name().to_owned(),
+                    page_id: row.page_id(),
+                    source: entry.description(),
+                    source_file_resource: entry.file_resource(),
+                    source_link_count: entry.link_count(),
+                    source_chunk_count: entry.chunk_count(),
+                    intent,
+                };
+                hash_file_evidence(&mut self.inventory, &evidence)?;
+                self.file_count = checked_add(self.file_count, 1, "adjacent shadow files")?;
+                self.total_bytes = checked_add(
+                    self.total_bytes,
+                    source.len() as u64,
+                    "adjacent shadow bytes",
+                )?;
+            }
+            Ok(())
+        };
+        accept().map_err(|error| SqliteProjectionError::Materialization(error.to_string()))
+    }
 }
 
 struct PublicationPaths {
@@ -1596,6 +1817,29 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
     authority: &InactiveBootstrapAcceptedAuthority,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
+    verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence(
+        graph,
+        roots,
+        prepared,
+        verified_publication,
+        source_backup,
+        authority,
+        sqlite_projection,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence(
+    graph: &Graph,
+    roots: &MigrationBackupRoot,
+    prepared: &InactiveBootstrapPreparedPublication,
+    verified_publication: &InactiveBootstrapVerifiedPublication,
+    source_backup: &VerifiedSourceBackup,
+    authority: &InactiveBootstrapAcceptedAuthority,
+    sqlite_projection: &VerifiedBootstrapSqliteProjection,
+    adjacent: Option<AdjacentTerminalShadowEvidence>,
+) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
     verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
         graph,
         roots,
@@ -1605,6 +1849,7 @@ pub(crate) fn verify_inactive_bootstrap_shadow_projection(
         authority,
         sqlite_projection,
         super::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT,
+        adjacent,
     )
 }
 
@@ -1618,6 +1863,7 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
     authority: &InactiveBootstrapAcceptedAuthority,
     sqlite_projection: &VerifiedBootstrapSqliteProjection,
     session_budget_bytes_per_root: usize,
+    mut adjacent: Option<AdjacentTerminalShadowEvidence>,
 ) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
     let shadow_started = Instant::now();
     let mut shadow_lap = shadow_started;
@@ -1704,15 +1950,31 @@ fn verify_inactive_bootstrap_shadow_projection_with_lookup_budget(
     let mut adjacent_construction = None;
     if !final_exists {
         ensure_real_directory_created(&paths.stage)?;
-        let constructed = publish_manifest_from_source(
-            &paths.stage.join(MANIFEST_FILE),
-            &header,
-            prepared,
-            authority,
-            &catalog,
-            &mut instrumentation,
-            session_budget_bytes_per_root,
-        )?;
+        let constructed = match adjacent.take() {
+            Some(evidence) => {
+                if evidence.binding != catalog.binding || evidence.summary != summary {
+                    return Err(ShadowProjectionError::BindingMismatch(
+                        "adjacent terminal shadow evidence differs from final bindings",
+                    ));
+                }
+                instrumentation = evidence.instrumentation;
+                publish_manifest_from_adjacent_evidence(
+                    &paths.stage.join(MANIFEST_FILE),
+                    &header,
+                    evidence.manifest_entries,
+                    evidence.staged,
+                )?
+            }
+            None => publish_manifest_from_source(
+                &paths.stage.join(MANIFEST_FILE),
+                &header,
+                prepared,
+                authority,
+                &catalog,
+                &mut instrumentation,
+                session_budget_bytes_per_root,
+            )?,
+        };
         trace_lap("semantic manifest construction", &mut shadow_lap);
         inject_crash_cut(ShadowProjectionCrashCut::AfterManifestFileSync)?;
         // A retained stage came from an interrupted earlier process and must
@@ -2127,14 +2389,32 @@ fn plan_exact_source(
         // The complete catalog traversal proves no skipped path has authority.
         return Ok(None);
     };
+    let intent = plan_exact_source_row(
+        catalog.binding,
+        row,
+        entry,
+        source,
+        state.ok_or(ShadowProjectionError::BindingMismatch(
+            "authoritative source path is missing its bounded materialization",
+        ))?,
+        instrumentation,
+    )?;
+    Ok(Some((row.clone(), intent)))
+}
+
+fn plan_exact_source_row(
+    binding: CurrentPathCatalogBinding,
+    row: &CurrentPathCatalogRow,
+    entry: &BootstrapSourceEntry,
+    source: &[u8],
+    state: &ProjectionPageState,
+    instrumentation: &mut ShadowProjectionInstrumentation,
+) -> Result<ProjectionIntent, ShadowProjectionError> {
     if row.path() != entry.path() || row.kind() != entry.kind() {
         return Err(ShadowProjectionError::BindingMismatch(
             "source path kind differs from accepted catalog",
         ));
     }
-    let state = state.ok_or(ShadowProjectionError::BindingMismatch(
-        "authoritative source path is missing its bounded materialization",
-    ))?;
     if state.page.page_id != row.page_id() || state.page.path != *entry.path() {
         return Err(ShadowProjectionError::BindingMismatch(
             "materialized page identity or path differs from source and accepted catalog",
@@ -2167,19 +2447,18 @@ fn plan_exact_source(
             "materialized page logical name differs from the accepted catalog digest",
         ));
     }
-    let plan =
-        plan_projection_adopting_exact_source(binding_workspace(catalog.binding), state, source)
-            .map_err(|error| match error {
-                ExactSourceProjectionError::Projection(error) => {
-                    ShadowProjectionError::Projection(error.to_string())
+    let plan = plan_projection_adopting_exact_source(binding_workspace(binding), state, source)
+        .map_err(|error| match error {
+            ExactSourceProjectionError::Projection(error) => {
+                ShadowProjectionError::Projection(error.to_string())
+            }
+            ExactSourceProjectionError::Semantic(difference) => {
+                ShadowProjectionError::SemanticMismatch {
+                    path: entry.path().as_str().to_owned(),
+                    difference,
                 }
-                ExactSourceProjectionError::Semantic(difference) => {
-                    ShadowProjectionError::SemanticMismatch {
-                        path: entry.path().as_str().to_owned(),
-                        difference,
-                    }
-                }
-            })?;
+            }
+        })?;
     instrumentation.projection_plans =
         checked_add(instrumentation.projection_plans, 1, "projection plans")?;
     require_exact_source_baseline(
@@ -2190,7 +2469,7 @@ fn plan_exact_source(
         entry.path(),
         entry.description(),
     )?;
-    Ok(Some((row.clone(), plan.intent().clone())))
+    Ok(plan.intent().clone())
 }
 
 fn binding_workspace(binding: CurrentPathCatalogBinding) -> WorkspaceId {
@@ -2393,6 +2672,54 @@ fn publish_manifest_from_source(
             total_bytes,
         },
     ))
+}
+
+fn publish_manifest_from_adjacent_evidence(
+    manifest_path: &Path,
+    header: &[u8],
+    manifest_entries: Vec<u8>,
+    staged: StagedInventoryProof,
+) -> Result<(BlobDescription, StagedInventoryProof), ShadowProjectionError> {
+    let total = header.len().checked_add(manifest_entries.len()).ok_or(
+        ShadowProjectionError::ResourceLimit {
+            resource: "adjacent shadow manifest bytes",
+            observed: u64::MAX,
+            limit: MAX_MANIFEST_BYTES,
+        },
+    )?;
+    enforce_limit(
+        "adjacent shadow manifest bytes",
+        total as u64,
+        MAX_MANIFEST_BYTES,
+    )?;
+    let mut output = ResumableExactFile::open(
+        manifest_path,
+        "shadow manifest conflicts with adjacent terminal evidence",
+    )?;
+    if header.len() > 1 && take_crash_cut(ShadowProjectionCrashCut::PartialManifestWrite) {
+        let prefix = (header.len() / 2).clamp(1, header.len() - 1);
+        output.write_all(&header[..prefix]).map_err(|_| {
+            ShadowProjectionError::CorruptOrConflicting(
+                "shadow manifest conflicts with adjacent terminal evidence",
+            )
+        })?;
+        output.flush()?;
+        return Err(ShadowProjectionError::InjectedCrashCut(
+            ShadowProjectionCrashCut::PartialManifestWrite.label(),
+        ));
+    }
+    output.write_all(header).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting(
+            "shadow manifest conflicts with adjacent terminal evidence",
+        )
+    })?;
+    output.write_all(&manifest_entries).map_err(|_| {
+        ShadowProjectionError::CorruptOrConflicting(
+            "shadow manifest conflicts with adjacent terminal evidence",
+        )
+    })?;
+    let manifest = output.finish()?;
+    Ok((manifest, staged))
 }
 
 fn session_stat_u64(value: usize, resource: &'static str) -> Result<u64, ShadowProjectionError> {
@@ -3731,6 +4058,7 @@ fn hex(bytes: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     use uuid::Uuid;
@@ -3792,12 +4120,22 @@ mod tests {
         backup: VerifiedSourceBackup,
         sqlite: OpenProjection,
         sqlite_proof: VerifiedBootstrapSqliteProjection,
+        adjacent: RefCell<Option<AdjacentTerminalShadowEvidence>>,
         archive_resource_id: crate::oplog::CanonicalArchiveResourceId,
         original_graph: BTreeMap<String, Vec<u8>>,
     }
 
     impl Fixture {
         fn new(label: &str, config: Option<&[u8]>, files: Vec<(String, Vec<u8>)>) -> Self {
+            Self::new_with_adjacent_stream(label, config, files, false)
+        }
+
+        fn new_with_adjacent_stream(
+            label: &str,
+            config: Option<&[u8]>,
+            files: Vec<(String, Vec<u8>)>,
+            adjacent: bool,
+        ) -> Self {
             let root = TestRoot::new(label);
             let graph_root = root.path().join("graph");
             fs::create_dir(&graph_root).unwrap();
@@ -3863,12 +4201,24 @@ mod tests {
             let backup = verify_migration_source_backup(&roots, &prepared, &verified).unwrap();
             let runtime =
                 ApplicationRuntimeRoot::open_for_test(&root.path().join("runtime")).unwrap();
-            let (sqlite, sqlite_proof) = SqliteFrontier::open_or_rebuild_inactive_bootstrap(
-                &root.path().join("bootstrap.sqlite"),
-                &runtime,
-                &authority,
-            )
+            let mut adjacent_construction = adjacent
+                .then(|| AdjacentTerminalShadowConstruction::new(&prepared, &authority).unwrap());
+            let (sqlite, sqlite_proof) = match adjacent_construction.as_mut() {
+                Some(sink) => SqliteFrontier::open_or_rebuild_inactive_bootstrap_with_sink(
+                    &root.path().join("bootstrap.sqlite"),
+                    &runtime,
+                    &authority,
+                    sink,
+                ),
+                None => SqliteFrontier::open_or_rebuild_inactive_bootstrap(
+                    &root.path().join("bootstrap.sqlite"),
+                    &runtime,
+                    &authority,
+                ),
+            }
             .unwrap();
+            let adjacent =
+                adjacent_construction.map(|construction| construction.finish(&authority).unwrap());
             let archive_resource_id = authority
                 .store()
                 .provision_enrolled_archive_resource_id()
@@ -3884,13 +4234,14 @@ mod tests {
                 backup,
                 sqlite,
                 sqlite_proof,
+                adjacent: RefCell::new(adjacent),
                 archive_resource_id,
                 original_graph,
             }
         }
 
         fn verify(&self) -> Result<VerifiedShadowProjection, ShadowProjectionError> {
-            verify_inactive_bootstrap_shadow_projection(
+            verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence(
                 &self.graph,
                 &self.roots,
                 &self.prepared,
@@ -3898,6 +4249,7 @@ mod tests {
                 &self.backup,
                 &self.authority,
                 &self.sqlite_proof,
+                self.adjacent.borrow_mut().take(),
             )
         }
 
@@ -3914,6 +4266,7 @@ mod tests {
                 &self.authority,
                 &self.sqlite_proof,
                 session_budget_bytes_per_root,
+                None,
             )
         }
 
@@ -4169,6 +4522,37 @@ mod tests {
             page_ids["notes/b/same-copy.org"]
         );
         rich.assert_graph_unchanged();
+    }
+
+    #[test]
+    fn adjacent_terminal_stream_and_independent_recovery_publish_identical_shadow_bytes() {
+        let fixture = Fixture::new_with_adjacent_stream(
+            "adjacent-differential",
+            Some(b"{:preferred-format \"markdown\"}\n"),
+            vec![
+                (
+                    "pages/alpha.md".into(),
+                    b"alias:: A, First\n- parent\n  - child ((123e4567-e89b-12d3-a456-426614174000))\n"
+                        .to_vec(),
+                ),
+                (
+                    "pages/unicode.md".into(),
+                    "- De\u{301}ja\u{300}\n- [[alpha]]\n".as_bytes().to_vec(),
+                ),
+            ],
+            true,
+        );
+
+        let adjacent = fixture.verify().unwrap();
+        assert_eq!(adjacent.instrumentation().adjacent_terminal_streams, 1);
+        let adjacent_bytes = snapshot_files(adjacent.directory());
+
+        fixture.reset_shadow();
+        let independent = fixture.verify().unwrap();
+        assert_eq!(independent.instrumentation().adjacent_terminal_streams, 0);
+        assert_eq!(snapshot_files(independent.directory()), adjacent_bytes);
+        assert!(independent == adjacent);
+        fixture.assert_graph_unchanged();
     }
 
     #[test]
@@ -5525,6 +5909,38 @@ mod tests {
             assert_eq!(
                 fixture.verify().unwrap().evidence_digest(),
                 proof.evidence_digest()
+            );
+            fixture.assert_graph_unchanged();
+        }
+    }
+
+    #[test]
+    fn adjacent_terminal_shadow_crash_cuts_resume_through_independent_recovery() {
+        for cut in [
+            ShadowProjectionCrashCut::PartialManifestWrite,
+            ShadowProjectionCrashCut::AfterStagingRename,
+            ShadowProjectionCrashCut::PartialProofWrite,
+            ShadowProjectionCrashCut::PartialCommitMarkerWrite,
+        ] {
+            let fixture = Fixture::new_with_adjacent_stream(
+                cut.label(),
+                None,
+                vec![(
+                    "pages/adjacent-cuts.md".into(),
+                    b"- adjacent construction survives by cold recovery\n".to_vec(),
+                )],
+                true,
+            );
+            SHADOW_PROJECTION_CRASH_CUT.with(|pending| pending.set(Some(cut)));
+            assert!(matches!(
+                fixture.verify(),
+                Err(ShadowProjectionError::InjectedCrashCut(label)) if label == cut.label()
+            ));
+            let recovered = fixture.verify().unwrap();
+            assert_eq!(recovered.instrumentation().adjacent_terminal_streams, 0);
+            assert_eq!(
+                fs::read(backup_payload_path(&recovered, "pages/adjacent-cuts.md")).unwrap(),
+                b"- adjacent construction survives by cold recovery\n"
             );
             fixture.assert_graph_unchanged();
         }

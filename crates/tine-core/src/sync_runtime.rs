@@ -125,9 +125,12 @@ use crate::oplog::reconciliation_baseline::{
     BaselineTimestamp, ReconciliationBaseline, ReconciliationBaselineBinding,
     TrustedPrivateApplicationRuntimeRoot,
 };
-use crate::oplog::shadow_projection::verify_inactive_bootstrap_shadow_projection;
 #[cfg(test)]
 use crate::oplog::shadow_projection::ShadowProjectionInstrumentation;
+use crate::oplog::shadow_projection::{
+    verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence,
+    AdjacentTerminalShadowConstruction,
+};
 use crate::oplog::sqlite::ApplicationRuntimeRoot;
 #[cfg(test)]
 use crate::oplog::sqlite::{
@@ -5024,6 +5027,8 @@ fn activate_non_active_local(
     // construction capability here. Taking it also means a later resumed or
     // restarted activation cannot see it, so that run rebuilds from the archive.
     let terminal_construction = prepared.take_terminal_construction_material();
+    let mut adjacent_shadow =
+        AdjacentTerminalShadowConstruction::new(&prepared, &accepted_authority).map_err(display)?;
     let inactive = InactiveBootstrapRuntimeSession::open(
         &request.archive_root,
         binding.workspace_id(),
@@ -5031,12 +5036,16 @@ fn activate_non_active_local(
         &application_runtime_root,
         &accepted_authority,
         terminal_construction,
+        Some(&mut adjacent_shadow),
     )
     .map_err(display)?;
+    let adjacent_shadow = adjacent_shadow
+        .finish(&accepted_authority)
+        .map_err(display)?;
     progress(SyncLocalActivationProgress::Phase {
         phase: SyncLocalActivationPhase::ShadowReconstructionByteVerification,
     });
-    let shadow = verify_inactive_bootstrap_shadow_projection(
+    let shadow = verify_inactive_bootstrap_shadow_projection_with_adjacent_evidence(
         &graph,
         &backup_root,
         &prepared,
@@ -5044,6 +5053,7 @@ fn activate_non_active_local(
         &source_backup,
         &accepted_authority,
         inactive.sqlite_proof(),
+        Some(adjacent_shadow),
     )
     .map_err(display)?;
     #[cfg(test)]
@@ -48042,6 +48052,7 @@ mod tests {
             assert_eq!(receipt.construction.shadow.payload_bytes_written, 0);
             assert_eq!(receipt.construction.shadow.payload_bytes_read, 0);
             assert_eq!(receipt.construction.shadow.source_revalidations, 1);
+            assert_eq!(receipt.construction.shadow.adjacent_terminal_streams, 1);
             assert_eq!(
                 receipt.construction.shadow.bulk_pages_materialized,
                 receipt.source_files as u64

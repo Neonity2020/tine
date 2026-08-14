@@ -5931,6 +5931,7 @@ impl InactiveBootstrapRuntimeSession {
         application_runtime_root: &ApplicationRuntimeRoot,
         authority: &InactiveBootstrapAcceptedAuthority,
         terminal: Option<TerminalBootstrapConstructionMaterial>,
+        terminal_projection_sink: Option<&mut dyn super::sqlite::TerminalProjectionChunkSink>,
     ) -> Result<Self, ProjectionError> {
         let archive = ObjectStore::open(archive_root, workspace)?;
         let lease = WorkspaceRuntimeLease::acquire(&archive, workspace)?;
@@ -5940,6 +5941,7 @@ impl InactiveBootstrapRuntimeSession {
             application_runtime_root,
             authority,
             terminal,
+            terminal_projection_sink,
         )
         .map_err(|(_released_lease, error)| error)
     }
@@ -5962,6 +5964,7 @@ impl InactiveBootstrapRuntimeSession {
             application_runtime_root,
             authority,
             None,
+            None,
         )
     }
 
@@ -5971,7 +5974,10 @@ impl InactiveBootstrapRuntimeSession {
         application_runtime_root: &ApplicationRuntimeRoot,
         authority: &InactiveBootstrapAcceptedAuthority,
         terminal: Option<TerminalBootstrapConstructionMaterial>,
+        terminal_projection_sink: Option<&mut dyn super::sqlite::TerminalProjectionChunkSink>,
     ) -> Result<Self, (WorkspaceRuntimeLease, ProjectionError)> {
+        let terminal_projection_sink =
+            terminal_projection_sink.map(super::sqlite::TerminalProjectionChunkSinkHandle::new);
         LeasedWorkspaceProjection::open_under::<VerifiedBootstrapSqliteProjection, ProjectionError>(
             lease,
             |slot| {
@@ -5981,6 +5987,7 @@ impl InactiveBootstrapRuntimeSession {
                     authority,
                     slot,
                     terminal.as_ref(),
+                    terminal_projection_sink.as_ref(),
                 )
             },
         )
@@ -6201,6 +6208,7 @@ mod bounded_admission {
                 &root.path().join("bootstrap.sqlite"),
                 &runtime,
                 &authority,
+                None,
                 None,
             )
             .expect("inactive bootstrap runtime session");

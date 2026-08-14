@@ -335,6 +335,16 @@ digests. On Android, inability to fsync a shared-storage directory is treated
 as a platform durability limit rather than a durable refusal. App-private
 enrollment, archive, journal, and SQLite directory barriers remain required.
 
+During uninterrupted activation, SQLite's terminal builder is the single
+bounded producer of parser-owned terminal page states. An activation-only
+consumer derives exact-source shadow manifest evidence from those same chunks,
+but cannot publish it until SQLite has completed and supplied the projection
+proof that names the final shadow publication. It retains compact canonical
+manifest entries, never a second graph-sized page cache. A crash or later
+reopen discards that process-local evidence and uses the independent sealed
+source plus archive reconstruction path; differential and crash-cut tests
+require the two paths to publish identical durable shadow bytes.
+
 Current disposable schema identities are scratch 13 / scratch page 1 / SQLite
 15. Their authoritative values are `tine_storage::formats::{SCRATCH_SCHEMA_VERSION,
 SCRATCH_PAGE_SCHEMA_VERSION, SQLITE_SCHEMA_VERSION}`. Bumping one invalidates

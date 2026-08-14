@@ -3068,6 +3068,47 @@ pub(crate) enum TerminalConstructionCut {
     AfterPublicationBeforeCheckpointProof,
 }
 
+/// Activation-only consumer of the exact terminal pages already materialized
+/// for SQLite.  Implementations may retain compact derived evidence, but not a
+/// graph-sized page cache.  `reset` is called before the archive-replay
+/// fallback after a refused same-process terminal construction.
+pub(crate) trait TerminalProjectionChunkSink {
+    fn reset(&mut self) -> Result<(), ProjectionError>;
+
+    fn accept_chunk(
+        &mut self,
+        rows: &[super::hot_engine::CurrentPathCatalogRow],
+        pages: &[super::hot_engine::ProjectionPageState],
+    ) -> Result<(), ProjectionError>;
+}
+
+/// Shared-reference adapter used while SQLite owns nested candidate-build
+/// calls.  Interior mutability keeps the one sink borrow short at each bounded
+/// chunk instead of extending it across the workspace-lease closure.
+pub(crate) struct TerminalProjectionChunkSinkHandle<'a> {
+    sink: RefCell<&'a mut dyn TerminalProjectionChunkSink>,
+}
+
+impl<'a> TerminalProjectionChunkSinkHandle<'a> {
+    pub(crate) fn new(sink: &'a mut dyn TerminalProjectionChunkSink) -> Self {
+        Self {
+            sink: RefCell::new(sink),
+        }
+    }
+
+    fn reset(&self) -> Result<(), ProjectionError> {
+        self.sink.borrow_mut().reset()
+    }
+
+    fn accept_chunk(
+        &self,
+        rows: &[super::hot_engine::CurrentPathCatalogRow],
+        pages: &[super::hot_engine::ProjectionPageState],
+    ) -> Result<(), ProjectionError> {
+        self.sink.borrow_mut().accept_chunk(rows, pages)
+    }
+}
+
 thread_local! {
     // Crate-private deterministic simulator hook, in the same shape as
     // `HARNESS_FAIL_DURING_APPLY` above: it fires at a real atomic boundary so
@@ -3358,6 +3399,7 @@ impl SqliteFrontier {
             authority,
             &ApplierAuthorization::OwnWorkspaceLease,
             None,
+            None,
         )
     }
 
@@ -3377,6 +3419,28 @@ impl SqliteFrontier {
             authority,
             &ApplierAuthorization::OwnWorkspaceLease,
             Some(terminal),
+            None,
+        )
+    }
+
+    /// Test-only activation twin that exposes the bounded terminal page stream
+    /// to a second projection builder. Production reaches the same seam through
+    /// `InactiveBootstrapRuntimeSession` so its archive lease remains held.
+    #[cfg(test)]
+    pub(crate) fn open_or_rebuild_inactive_bootstrap_with_sink(
+        path: &Path,
+        application_runtime_root: &ApplicationRuntimeRoot,
+        authority: &InactiveBootstrapAcceptedAuthority,
+        sink: &mut dyn TerminalProjectionChunkSink,
+    ) -> Result<(OpenProjection, VerifiedBootstrapSqliteProjection), ProjectionError> {
+        let sink = TerminalProjectionChunkSinkHandle::new(sink);
+        Self::open_or_rebuild_inactive_bootstrap_authorized(
+            path,
+            application_runtime_root,
+            authority,
+            &ApplierAuthorization::OwnWorkspaceLease,
+            None,
+            Some(&sink),
         )
     }
 
@@ -3394,6 +3458,7 @@ impl SqliteFrontier {
         authority: &InactiveBootstrapAcceptedAuthority,
         slot: SqliteApplierSlot<'lease>,
         terminal: Option<&TerminalBootstrapConstructionMaterial>,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<
         (
             LeasedOpenProjection<'lease>,
@@ -3407,6 +3472,7 @@ impl SqliteFrontier {
             authority,
             &ApplierAuthorization::Slot(&slot),
             terminal,
+            terminal_projection_sink,
         )?;
         Ok((LeasedOpenProjection::bind(opened, slot), proof))
     }
@@ -3417,12 +3483,19 @@ impl SqliteFrontier {
         authority: &InactiveBootstrapAcceptedAuthority,
         authorization: &ApplierAuthorization<'_, '_>,
         terminal: Option<&TerminalBootstrapConstructionMaterial>,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<(OpenProjection, VerifiedBootstrapSqliteProjection), ProjectionError> {
         let binding = authority.binding();
         let claim = ProjectionClaim::current(binding.workspace_id(), binding.lineage_digest());
         let source = RebuildSource::from_inactive_bootstrap(authority)?;
-        let (mut opened, bootstrap_rebuild) =
-            Self::rebuild_fresh_inactive_bootstrap(path, claim, source, authorization, terminal)?;
+        let (mut opened, bootstrap_rebuild) = Self::rebuild_fresh_inactive_bootstrap(
+            path,
+            claim,
+            source,
+            authorization,
+            terminal,
+            terminal_projection_sink,
+        )?;
         let frontier_root = opened.database.frontier_root()?;
         let accepted_batch_count = u64::try_from(opened.database.applied_batch_count()?)
             .map_err(|_| ProjectionError::Rebuild("SQLite accepted count overflowed".into()))?;
@@ -3488,6 +3561,7 @@ impl SqliteFrontier {
         source: RebuildSource<'_>,
         authorization: &ApplierAuthorization<'_, '_>,
         terminal: Option<&TerminalBootstrapConstructionMaterial>,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<(OpenProjection, BootstrapSqliteRebuildInstrumentation), ProjectionError> {
         reset_projection_open_breakdown();
         validate_source(claim, &source)?;
@@ -3500,8 +3574,14 @@ impl SqliteFrontier {
             pending_forensics.extend(preserve_forensics(&path)?);
             maybe_abort_forensic_test("before-rebuild", 0);
         }
-        let (database, rebuild, bootstrap_rebuild) =
-            Self::build_candidate_and_publish(&path, claim, lease, &source, terminal)?;
+        let (database, rebuild, bootstrap_rebuild) = Self::build_candidate_and_publish(
+            &path,
+            claim,
+            lease,
+            &source,
+            terminal,
+            terminal_projection_sink,
+        )?;
         if !pending_forensics.directories.is_empty() {
             mark_rebuild_complete(&pending_forensics)?;
             return Ok((
@@ -3648,8 +3728,9 @@ impl SqliteFrontier {
                     });
                     maybe_abort_forensic_test("before-rebuild", 0);
                     let stage = Instant::now();
-                    let (database, rebuild, _) =
-                        Self::build_candidate_and_publish(&path, claim, lease, &source, None)?;
+                    let (database, rebuild, _) = Self::build_candidate_and_publish(
+                        &path, claim, lease, &source, None, None,
+                    )?;
                     record_projection_rebuild("rebuilt-behind", &reason, stage.elapsed(), &rebuild);
                     mark_rebuild_complete(&pending_forensics)?;
                     return Ok(OpenProjection {
@@ -3720,8 +3801,9 @@ impl SqliteFrontier {
                     });
                     maybe_abort_forensic_test("before-rebuild", 0);
                     let stage = Instant::now();
-                    let (database, rebuild, _) =
-                        Self::build_candidate_and_publish(&path, claim, lease, &source, None)?;
+                    let (database, rebuild, _) = Self::build_candidate_and_publish(
+                        &path, claim, lease, &source, None, None,
+                    )?;
                     record_projection_rebuild(
                         "rebuilt-preserving-evidence",
                         &reason,
@@ -3743,7 +3825,7 @@ impl SqliteFrontier {
         }
 
         let (database, rebuild, _) =
-            Self::build_candidate_and_publish(&path, claim, lease, &source, None)?;
+            Self::build_candidate_and_publish(&path, claim, lease, &source, None, None)?;
         if !pending_forensics.directories.is_empty() {
             mark_rebuild_complete(&pending_forensics)?;
             return Ok(OpenProjection {
@@ -3771,6 +3853,7 @@ impl SqliteFrontier {
         lease: Arc<HeldApplierLocks>,
         source: &RebuildSource<'_>,
         terminal: Option<&TerminalBootstrapConstructionMaterial>,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<
         (
             Self,
@@ -3785,7 +3868,14 @@ impl SqliteFrontier {
         // to the unchanged archive replay path over the same durable evidence.
         let mut refused = 0_usize;
         if terminal.is_some() {
-            match Self::build_candidate(path, claim, Arc::clone(&lease), source, terminal) {
+            match Self::build_candidate(
+                path,
+                claim,
+                Arc::clone(&lease),
+                source,
+                terminal,
+                terminal_projection_sink,
+            ) {
                 Ok(built) => return Self::publish_candidate(path, claim, lease, source, built),
                 Err(discarded) => {
                     if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
@@ -3793,11 +3883,21 @@ impl SqliteFrontier {
                             "sqlite terminal construction refused; replaying archive: {discarded}"
                         );
                     }
+                    if let Some(sink) = terminal_projection_sink {
+                        sink.reset()?;
+                    }
                     refused = 1;
                 }
             }
         }
-        let mut built = Self::build_candidate(path, claim, Arc::clone(&lease), source, None)?;
+        let mut built = Self::build_candidate(
+            path,
+            claim,
+            Arc::clone(&lease),
+            source,
+            None,
+            terminal_projection_sink,
+        )?;
         built.2.terminal_construction_refusals = refused;
         Self::publish_candidate(path, claim, lease, source, built)
     }
@@ -3808,6 +3908,7 @@ impl SqliteFrontier {
         lease: Arc<HeldApplierLocks>,
         source: &RebuildSource<'_>,
         terminal: Option<&TerminalBootstrapConstructionMaterial>,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<
         (
             SqliteFileSet,
@@ -3826,8 +3927,8 @@ impl SqliteFrontier {
         )?;
         candidate.require_frontier(&source.exact_frontier_root)?;
         let streamed = match terminal {
-            Some(material) => candidate.terminal_stream(source, material),
-            None => candidate.rebuild_stream(source),
+            Some(material) => candidate.terminal_stream(source, material, terminal_projection_sink),
+            None => candidate.rebuild_stream(source, terminal_projection_sink),
         };
         let (rebuild, bootstrap_rebuild) = match streamed {
             Ok(rebuild) => rebuild,
@@ -4404,6 +4505,7 @@ impl SqliteFrontier {
         &mut self,
         source: &RebuildSource<'_>,
         material: &TerminalBootstrapConstructionMaterial,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<
         (
             RebuildInstrumentation,
@@ -4493,6 +4595,7 @@ impl SqliteFrontier {
             &provenance,
             &mut instrumentation,
             &mut bootstrap,
+            terminal_projection_sink,
         )?;
         trace_terminal_phase("terminal row seed", rows_started);
         let cursor_probe = super::hot_engine::take_current_path_cursor_probe();
@@ -4569,6 +4672,7 @@ impl SqliteFrontier {
     fn terminal_archive_stream(
         &mut self,
         source: &RebuildSource<'_>,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<
         (
             RebuildInstrumentation,
@@ -4662,6 +4766,7 @@ impl SqliteFrontier {
             &provenance,
             &mut instrumentation,
             &mut bootstrap,
+            terminal_projection_sink,
         )?;
         trace_terminal_phase("archive terminal row seed", rows_started);
         let cursor_probe = super::hot_engine::take_current_path_cursor_probe();
@@ -4732,6 +4837,7 @@ impl SqliteFrontier {
         provenance: &[storage_frontier::PhysicalTerminalConstructionBatch],
         instrumentation: &mut RebuildInstrumentation,
         bootstrap: &mut BootstrapSqliteRebuildInstrumentation,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<u64, ProjectionError> {
         let binding = engine
             .current_path_catalog_binding()
@@ -4797,35 +4903,35 @@ impl SqliteFrontier {
             let (rows, next) = page.into_parts();
             cursor = next;
             pending.extend(rows);
-            while pending.len() >= super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES
-                || (cursor.is_none() && !pending.is_empty())
-            {
-                let take = pending
-                    .len()
-                    .min(super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES);
-                let chunk_rows = pending.drain(..take).collect::<Vec<_>>();
-                observed_rows = observed_rows.saturating_add(chunk_rows.len() as u64);
-                for row in &chunk_rows {
-                    if !seen_pages.insert(row.page_id()) {
-                        return Err(ProjectionError::Rebuild(
-                            "current-path catalog repeats a terminal page identity".into(),
-                        ));
-                    }
+        }
+        // The authenticated cursor is keyed by its compact index, while the
+        // sealed source stream is lexical by path.  Retain only these compact
+        // catalog rows, sort them once, and materialize bounded page chunks in
+        // source order so the adjacent shadow consumer never retains pages.
+        pending.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+        for chunk_rows in pending.chunks(super::hot_engine::BOOTSTRAP_MATERIALIZATION_CHUNK_PAGES) {
+            observed_rows = observed_rows.saturating_add(chunk_rows.len() as u64);
+            for row in chunk_rows {
+                if !seen_pages.insert(row.page_id()) {
+                    return Err(ProjectionError::Rebuild(
+                        "current-path catalog repeats a terminal page identity".into(),
+                    ));
                 }
-                self.seed_terminal_chunk(
-                    materializer.as_ref().ok_or_else(|| {
-                        ProjectionError::Rebuild(
-                            "terminal catalog rows require a bulk materializer".into(),
-                        )
-                    })?,
-                    engine,
-                    &reference_index,
-                    extractor_stamp,
-                    &chunk_rows,
-                    instrumentation,
-                    bootstrap,
-                )?;
             }
+            self.seed_terminal_chunk(
+                materializer.as_ref().ok_or_else(|| {
+                    ProjectionError::Rebuild(
+                        "terminal catalog rows require a bulk materializer".into(),
+                    )
+                })?,
+                engine,
+                &reference_index,
+                extractor_stamp,
+                chunk_rows,
+                instrumentation,
+                bootstrap,
+                terminal_projection_sink,
+            )?;
         }
         if let Some(materializer) = materializer.as_ref() {
             let (accepted_frontier, external_exact) = materializer.lookup_session_stats();
@@ -4906,11 +5012,12 @@ impl SqliteFrontier {
         rows: &[super::hot_engine::CurrentPathCatalogRow],
         instrumentation: &mut RebuildInstrumentation,
         bootstrap: &mut BootstrapSqliteRebuildInstrumentation,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<(), ProjectionError> {
         let page_ids = rows.iter().map(|row| row.page_id()).collect::<Vec<_>>();
         let materialize_started = std::time::Instant::now();
         let materialized = materializer
-            .materialize_pages(&page_ids)
+            .materialize_pages_for_projection(&page_ids)
             .map_err(ProjectionError::materialization_from_engine)?;
         bootstrap.terminal_materialization_micros = bootstrap
             .terminal_materialization_micros
@@ -4919,12 +5026,21 @@ impl SqliteFrontier {
         let mut reference_rows = ReferenceCatalogSourceRows::default();
         let lower_started = std::time::Instant::now();
         let mut reference_micros = 0_u128;
-        for (row, page) in rows.iter().zip(materialized) {
-            let page = page.ok_or_else(|| {
-                ProjectionError::Rebuild(
-                    "authenticated current-path catalog row has no terminal page".into(),
-                )
-            })?;
+        let materialized = materialized
+            .into_iter()
+            .map(|page| {
+                page.ok_or_else(|| {
+                    ProjectionError::Rebuild(
+                        "authenticated current-path catalog row has no terminal page".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(sink) = terminal_projection_sink {
+            sink.accept_chunk(rows, &materialized)?;
+        }
+        for (row, state) in rows.iter().zip(materialized) {
+            let page = state.page;
             if page.page_id != row.page_id() || page.path != *row.path() || page.kind != row.kind()
             {
                 return Err(ProjectionError::Rebuild(
@@ -5018,6 +5134,7 @@ impl SqliteFrontier {
     fn rebuild_stream(
         &mut self,
         source: &RebuildSource<'_>,
+        terminal_projection_sink: Option<&TerminalProjectionChunkSinkHandle<'_>>,
     ) -> Result<
         (
             RebuildInstrumentation,
@@ -5030,7 +5147,7 @@ impl SqliteFrontier {
             RebuildLoader::InactiveBootstrap { .. }
                 | RebuildLoader::PromotedBootstrapAnchored { .. }
         ) {
-            return self.terminal_archive_stream(source);
+            return self.terminal_archive_stream(source, terminal_projection_sink);
         }
         let mut instrumentation = RebuildInstrumentation::default();
         let mut intermediate_page_materializations = 0_usize;

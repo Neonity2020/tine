@@ -255,6 +255,7 @@ impl Fixture {
             &runtime,
             &authority,
             None,
+            None,
         )
         .expect("inactive bootstrap runtime session");
         let archive_resource_id = authority
