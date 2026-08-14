@@ -2141,6 +2141,42 @@ pub(crate) fn remove_disposable_projection(path: &Path) -> Result<(), Projection
     SqliteFileSet::new(path).remove().map_err(Into::into)
 }
 
+/// Open the sequence-zero projection named by a clean activation marker.
+/// This is a cold-open validation boundary only: it vends no mutation lease.
+/// Missing or divergent SQLite is recoverable by rebuilding from the baseline.
+pub(crate) fn open_clean_genesis_projection(
+    path: &Path,
+    claim: ProjectionClaim,
+    expected_root: &AcceptedFrontierRoot,
+) -> Result<CleanGenesisPhysicalProjection, ProjectionError> {
+    super::hot_engine::validate_accepted_frontier_root(expected_root)
+        .map_err(|error| ProjectionError::InvalidFrontier(error.to_string()))?;
+    if expected_root.acceptance_sequence() != 0 || expected_root.genesis().is_none() {
+        return Err(ProjectionError::InvalidFrontier(
+            "clean activation marker does not name a sequence-zero baseline".into(),
+        ));
+    }
+    validate_sidecar_shape(path)?;
+    let checkpointed = authenticate_projection_checkpoint(path, claim)?;
+    let physical = PhysicalSqliteDatabase::open_read_only(path)?;
+    physical.validate_schema_and_claim(lower_physical_claim(claim))?;
+    let stored = read_frontier_root(&physical)?;
+    let expected_digest = canonical_frontier_root_digest(expected_root)?;
+    if stored != *expected_root
+        || checkpointed != expected_digest
+        || physical.read_frontier()?.applied_batch_count != 0
+        || !physical.load_all_batches()?.is_empty()
+    {
+        return Err(ProjectionError::FrontierRegression);
+    }
+    let materialized = physical.materialized_read(0, expected_digest)?;
+    if materialized.acceptance_sequence() != 0 {
+        return Err(ProjectionError::FrontierRegression);
+    }
+    drop(physical);
+    PhysicalSqliteDatabase::open_writable(path).map_err(Into::into)
+}
+
 impl Drop for CleanGenesisSqliteCandidate {
     fn drop(&mut self) {
         if let Some(files) = self.files.take() {

@@ -43,8 +43,9 @@ use super::hot_engine::{
 };
 use super::identity::BootstrapPartId;
 use super::lazy_genesis::{
-    publish_activation_marker, LazyGenesisActivationMarkerV1, LazyGenesisBlockInput,
-    LazyGenesisCandidate, LazyGenesisCommitV1, LazyGenesisPackBuilder, LazyGenesisPageInput,
+    publish_activation_marker, read_activation_marker, LazyGenesisActivationMarkerV1,
+    LazyGenesisBlockInput, LazyGenesisCandidate, LazyGenesisCommitV1, LazyGenesisPackBuilder,
+    LazyGenesisPageInput,
 };
 use super::object_store::{
     BootstrapAggregateHistoryBindingV1, BootstrapAuthoringCapability,
@@ -4176,6 +4177,78 @@ pub(crate) fn commit_clean_activation(
         marker,
         final_scan,
     })
+}
+
+/// Cold-opened clean baseline and its matching disposable projection. This
+/// proof deliberately stops before mutation authority; the runtime cutover
+/// separately binds the workspace writer lease and ordinary operation tail.
+pub(crate) struct OpenedCleanActivation {
+    engine: ShardedHotEngine,
+    projection: super::sqlite::CleanGenesisPhysicalProjection,
+    marker: LazyGenesisActivationMarkerV1,
+}
+
+impl OpenedCleanActivation {
+    pub(crate) const fn engine(&self) -> &ShardedHotEngine {
+        &self.engine
+    }
+
+    pub(crate) const fn marker(&self) -> LazyGenesisActivationMarkerV1 {
+        self.marker
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ShardedHotEngine,
+        super::sqlite::CleanGenesisPhysicalProjection,
+        LazyGenesisActivationMarkerV1,
+    ) {
+        (self.engine, self.projection, self.marker)
+    }
+}
+
+pub(crate) fn open_clean_activation(
+    enrollment_root: &Path,
+    baseline_directory: &Path,
+    database_path: &Path,
+    catalog_document_id: DocumentId,
+    policy: ReferenceCatalogPolicyV1,
+) -> Result<Option<OpenedCleanActivation>, BootstrapStreamingImportError> {
+    let Some(marker) = read_activation_marker(enrollment_root)? else {
+        return Ok(None);
+    };
+    let baseline = LazyGenesisCandidate::open_sealed_for_marker(baseline_directory, marker)?;
+    if baseline.catalog_document_id() != catalog_document_id {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation marker names a different catalog document".into(),
+        ));
+    }
+    let mut engine = ShardedHotEngine::new(
+        marker.workspace_id(),
+        marker.lineage_digest(),
+        catalog_document_id,
+    );
+    engine.configure_reference_catalog_policy(policy)?;
+    engine.install_lazy_genesis_baseline(std::sync::Arc::new(baseline))?;
+    let accepted_frontier = engine.accepted_frontier_root()?;
+    if super::sqlite::canonical_frontier_root_digest(&accepted_frontier)?
+        != marker.accepted_frontier_digest()
+    {
+        return Err(BootstrapStreamingImportError::InvalidSource(
+            "clean activation marker accepted frontier differs from its baseline".into(),
+        ));
+    }
+    let projection = super::sqlite::open_clean_genesis_projection(
+        database_path,
+        super::ProjectionClaim::current(marker.workspace_id(), marker.lineage_digest()),
+        &accepted_frontier,
+    )?;
+    Ok(Some(OpenedCleanActivation {
+        engine,
+        projection,
+        marker,
+    }))
 }
 
 fn collapse_unique_identity_candidates(
@@ -12725,6 +12798,31 @@ mod tests {
         );
         assert_eq!(baseline.root(), marker.baseline_root());
         assert!(physical.load_all_batches().unwrap().is_empty());
+        drop(physical);
+        drop(baseline);
+
+        let reopened = open_clean_activation(
+            &clean_enrollment,
+            &clean_archive.join(crate::oplog::lazy_genesis::LAZY_GENESIS_BASELINE_DIRECTORY),
+            &database,
+            DocumentId::from_uuid(Uuid::from_u128(0x5a02)),
+            ReferenceCatalogPolicyV1::default(),
+        )
+        .unwrap()
+        .expect("published marker opens clean activation");
+        assert_eq!(reopened.marker(), marker);
+        assert_eq!(
+            reopened.engine().accepted_frontier_root().unwrap(),
+            root,
+            "cold open derives the exact sequence-zero frontier from the baseline"
+        );
+        assert_eq!(
+            reopened
+                .engine()
+                .lazy_genesis_resident_page_documents_for_test(),
+            0,
+            "cold open must not hydrate every page checkpoint"
+        );
     }
 
     #[test]
