@@ -21,8 +21,7 @@ use uuid::Uuid;
 use super::{
     AcceptedBatchEvent, BatchId, BlockId, BlockOwner, ContentDigest, DocumentId,
     LogseqIdentityOrigin, LogseqUuid, ManagedPath, ManagedTextKind, PageId, PageState,
-    PolicyGeneratedAnchorReason, ReferenceCatalogRootV2, ReferenceSourceLocatorV1, SemanticEffect,
-    REFERENCE_CATALOG_EXTRACTOR_VERSION, REFERENCE_CATALOG_POLICY_VERSION,
+    PolicyGeneratedAnchorReason, ReferenceSourceLocatorV1, SemanticEffect,
 };
 
 pub const MAX_MATERIALIZATION_QUERY_ROWS: usize = storage::MAX_MATERIALIZATION_QUERY_ROWS;
@@ -49,16 +48,9 @@ const MATERIALIZATION_TAG_OVERHEAD_BYTES: usize = 16;
 const MATERIALIZATION_STRING_OVERHEAD_BYTES: usize = 16;
 const REFERENCE_CATALOG_POSTING_OVERHEAD_BYTES: usize = 96;
 const REFERENCE_CATALOG_ALIAS_OVERHEAD_BYTES: usize = 80;
-const REFERENCE_CATALOG_BINDING_OVERHEAD_BYTES: usize = 64;
-const REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES: usize = 80;
-// Packet 3 attaches the already-authenticated reference-catalog transition to
-// the same SQL transaction as the ordinary page materialization. The
-// authenticated reverse-candidate contract is persisted as SQLite schema v10;
-// schema v11 adds page-led cleanup and authoritative FTS ownership.
-const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 4;
-pub(crate) const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION: u32 = 2;
-const REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN: &[u8] =
-    b"tine/sqlite-reference-extractor-dependency-stamp/v2";
+// Parser-derived query facts are disposable rows bound only by the accepted
+// frontier stamp. They are never a second authenticated authority.
+const MATERIALIZATION_INPUT_SCHEMA_VERSION: u32 = 5;
 
 pub(crate) type ApplyChangeInstrumentation = storage::ApplyChangeInstrumentation;
 
@@ -213,58 +205,6 @@ impl MaterializedReferenceTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReferenceExtractorDependencyStamp {
-    schema_version: u32,
-    extractor_version: u32,
-    extractor_digest: ContentDigest,
-    policy_version: u32,
-    policy_digest: ContentDigest,
-}
-
-impl ReferenceExtractorDependencyStamp {
-    pub(crate) fn new(
-        extractor_digest: ContentDigest,
-        policy_digest: ContentDigest,
-    ) -> Result<Self, MaterializationError> {
-        let stamp = Self {
-            schema_version: REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION,
-            extractor_version: REFERENCE_CATALOG_EXTRACTOR_VERSION,
-            extractor_digest,
-            policy_version: REFERENCE_CATALOG_POLICY_VERSION,
-            policy_digest,
-        };
-        stamp.validate()?;
-        Ok(stamp)
-    }
-
-    fn validate(&self) -> Result<(), MaterializationError> {
-        if self.schema_version != REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_SCHEMA_VERSION
-            || self.extractor_version != REFERENCE_CATALOG_EXTRACTOR_VERSION
-            || self.policy_version != REFERENCE_CATALOG_POLICY_VERSION
-        {
-            return Err(MaterializationError::InvalidInput(
-                "unknown reference extractor dependency stamp version".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn digest(&self) -> Result<ContentDigest, MaterializationError> {
-        self.validate()?;
-        let encoded = postcard::to_allocvec(self)
-            .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        let mut preimage = Vec::with_capacity(
-            REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN.len() + 1 + encoded.len(),
-        );
-        preimage.extend_from_slice(REFERENCE_EXTRACTOR_DEPENDENCY_STAMP_DOMAIN);
-        preimage.push(0);
-        preimage.extend_from_slice(&encoded);
-        Ok(ContentDigest::of(&preimage))
-    }
-}
-
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MaterializedReferencePosting {
@@ -289,289 +229,9 @@ pub(crate) struct MaterializedAliasDeclaration {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SourceCoverageFacet {
-    pub(crate) source_page_id: PageId,
-    pub(crate) source_digest: ContentDigest,
-    pub(crate) extractor_dependency_stamp: ReferenceExtractorDependencyStamp,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct MaterializedReferenceNameBinding {
-    pub(crate) raw_name: String,
-    pub(crate) normalized_name: String,
-    pub(crate) candidate_ordinal: u32,
-    pub(crate) resolved_page_id: Option<PageId>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct MaterializedReferenceUuidBinding {
-    pub(crate) raw_uuid_claim: LogseqUuid,
-    pub(crate) candidate_ordinal: u32,
-    pub(crate) resolved_block_id: Option<BlockId>,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct MaterializedReferenceAliasBinding {
-    pub(crate) normalized_alias: String,
-    pub(crate) candidate_ordinal: u32,
-    pub(crate) resolved_page_id: Option<PageId>,
-    pub(crate) catalog_root_digest: ContentDigest,
-}
-
-/// The accepted evidence which binds a catalog transition to a particular
-/// frontier step.  It is deliberately separate from SQLite-shaped input: a
-/// rebuilt projection must recover this only from authenticated history.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuthenticatedReferenceMaterialization {
-    pub(crate) event_binding_digest: ContentDigest,
-    pub(crate) prior_frontier_root_digest: ContentDigest,
-    pub(crate) post_frontier_root_digest: ContentDigest,
-    pub(crate) prior_catalog_root: ReferenceCatalogRootV2,
-    pub(crate) post_catalog_root: ReferenceCatalogRootV2,
-}
-
-/// Fully validated catalog rows that may be projected only with matching
-/// accepted frontier evidence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReferenceCatalogMaterializationInput {
-    prior_catalog_root: ReferenceCatalogRootV2,
-    post_catalog_root: ReferenceCatalogRootV2,
-    postings: Vec<MaterializedReferencePosting>,
-    aliases: Vec<MaterializedAliasDeclaration>,
-    name_bindings: Vec<MaterializedReferenceNameBinding>,
-    uuid_bindings: Vec<MaterializedReferenceUuidBinding>,
-    alias_bindings: Vec<MaterializedReferenceAliasBinding>,
-    coverage: Vec<SourceCoverageFacet>,
-    removed_sources: Vec<PageId>,
-}
-
-impl ReferenceCatalogMaterializationInput {
-    pub(crate) fn new(
-        prior_catalog_root: ReferenceCatalogRootV2,
-        post_catalog_root: ReferenceCatalogRootV2,
-        mut postings: Vec<MaterializedReferencePosting>,
-        mut aliases: Vec<MaterializedAliasDeclaration>,
-        mut name_bindings: Vec<MaterializedReferenceNameBinding>,
-        mut uuid_bindings: Vec<MaterializedReferenceUuidBinding>,
-        mut alias_bindings: Vec<MaterializedReferenceAliasBinding>,
-        mut coverage: Vec<SourceCoverageFacet>,
-        mut removed_sources: Vec<PageId>,
-    ) -> Result<Self, MaterializationError> {
-        postings.sort_unstable();
-        aliases.sort_unstable();
-        name_bindings.sort_unstable();
-        uuid_bindings.sort_unstable();
-        alias_bindings.sort_unstable();
-        coverage.sort_unstable();
-        removed_sources.sort_unstable();
-        let input = Self {
-            prior_catalog_root,
-            post_catalog_root,
-            postings,
-            aliases,
-            name_bindings,
-            uuid_bindings,
-            alias_bindings,
-            coverage,
-            removed_sources,
-        };
-        input.validate()?;
-        Ok(input)
-    }
-
-    fn validate(&self) -> Result<(), MaterializationError> {
-        self.prior_catalog_root
-            .encode()
-            .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        self.post_catalog_root
-            .encode()
-            .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-        if !strictly_sorted_unique_by(&self.postings, |posting| {
-            (
-                posting.source_page_id,
-                posting.source_entity.clone(),
-                posting.source_locator,
-                posting.ordinal,
-            )
-        }) {
-            return Err(MaterializationError::InvalidInput(
-                "reference postings are not canonical".into(),
-            ));
-        }
-        if !strictly_sorted_unique_by(&self.aliases, |alias| {
-            (
-                alias.source_page_id,
-                alias.source_entity.clone(),
-                alias.source_locator,
-                alias.ordinal,
-            )
-        }) {
-            return Err(MaterializationError::InvalidInput(
-                "reference alias declarations are not canonical".into(),
-            ));
-        }
-        if !strictly_sorted_unique_by(&self.name_bindings, |binding| {
-            (binding.raw_name.clone(), binding.candidate_ordinal)
-        }) {
-            return Err(MaterializationError::InvalidInput(
-                "reference name bindings are not canonical".into(),
-            ));
-        }
-        if !strictly_sorted_unique_by(&self.uuid_bindings, |binding| {
-            (binding.raw_uuid_claim, binding.candidate_ordinal)
-        }) {
-            return Err(MaterializationError::InvalidInput(
-                "reference UUID bindings are not canonical".into(),
-            ));
-        }
-        if !strictly_sorted_unique_by(&self.alias_bindings, |binding| {
-            (
-                binding.normalized_alias.clone(),
-                binding.candidate_ordinal,
-                binding.catalog_root_digest,
-            )
-        }) {
-            return Err(MaterializationError::InvalidInput(
-                "reference alias bindings are not canonical".into(),
-            ));
-        }
-        if !strictly_sorted_unique_by(&self.coverage, |facet| facet.source_page_id) {
-            return Err(MaterializationError::InvalidInput(
-                "reference source coverage is not canonical".into(),
-            ));
-        }
-        if !strictly_sorted_unique_by(&self.removed_sources, |page_id| *page_id) {
-            return Err(MaterializationError::InvalidInput(
-                "removed reference sources are not canonical".into(),
-            ));
-        }
-
-        let covered = self
-            .coverage
-            .iter()
-            .map(|facet| facet.source_page_id)
-            .collect::<BTreeSet<_>>();
-        if self
-            .removed_sources
-            .iter()
-            .any(|page_id| covered.contains(page_id))
-        {
-            return Err(MaterializationError::InvalidInput(
-                "one reference source is both covered and removed".into(),
-            ));
-        }
-
-        let mut input_budget = MaterializationInputBudget::default();
-        for posting in &self.postings {
-            if !covered.contains(&posting.source_page_id) {
-                return Err(MaterializationError::InvalidInput(
-                    "reference posting has no source coverage".into(),
-                ));
-            }
-            validate_reference_posting(posting, &mut input_budget)?;
-        }
-        for alias in &self.aliases {
-            if !covered.contains(&alias.source_page_id) {
-                return Err(MaterializationError::InvalidInput(
-                    "reference alias has no source coverage".into(),
-                ));
-            }
-            validate_alias_declaration(alias, &mut input_budget)?;
-        }
-        for binding in &self.name_bindings {
-            validate_page_name_pair(
-                "reference name binding",
-                &binding.raw_name,
-                &binding.normalized_name,
-            )?;
-            input_budget.add_facet_values(1)?;
-            input_budget.add_bytes(REFERENCE_CATALOG_BINDING_OVERHEAD_BYTES)?;
-            input_budget.add_field(
-                "reference name binding raw bytes",
-                &binding.raw_name,
-                MAX_MATERIALIZATION_FIELD_BYTES,
-            )?;
-            input_budget.add_field(
-                "reference name binding normalized bytes",
-                &binding.normalized_name,
-                MAX_MATERIALIZATION_FIELD_BYTES,
-            )?;
-        }
-        for _binding in &self.uuid_bindings {
-            input_budget.add_facet_values(1)?;
-            input_budget.add_bytes(REFERENCE_CATALOG_BINDING_OVERHEAD_BYTES + 16)?;
-        }
-        for binding in &self.alias_bindings {
-            validate_normalized_page_name("reference alias binding", &binding.normalized_alias)?;
-            input_budget.add_facet_values(1)?;
-            input_budget.add_bytes(REFERENCE_CATALOG_BINDING_OVERHEAD_BYTES)?;
-            input_budget.add_field(
-                "reference alias binding normalized bytes",
-                &binding.normalized_alias,
-                MAX_MATERIALIZATION_FIELD_BYTES,
-            )?;
-        }
-        for facet in &self.coverage {
-            facet.extractor_dependency_stamp.validate()?;
-            let _ = facet.extractor_dependency_stamp.digest()?;
-            input_budget.add_facet_values(1)?;
-            input_budget.add_bytes(REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES)?;
-        }
-        Ok(())
-    }
-
-    fn validate_for_authenticated_transition(
-        &self,
-        authenticated: &AuthenticatedReferenceMaterialization,
-        effect: &SemanticEffect,
-    ) -> Result<(), MaterializationError> {
-        self.validate()?;
-        if self.prior_catalog_root != authenticated.prior_catalog_root
-            || self.post_catalog_root != authenticated.post_catalog_root
-        {
-            return Err(MaterializationError::Contradiction(
-                "reference catalog input is not bound to the accepted frontier transition".into(),
-            ));
-        }
-        let expected = super::reference_catalog::affected_reference_sources(effect);
-        let supplied = self
-            .coverage
-            .iter()
-            .map(|facet| facet.source_page_id)
-            .chain(self.removed_sources.iter().copied())
-            .collect::<BTreeSet<_>>();
-        if supplied != expected {
-            return Err(MaterializationError::Incomplete(
-                "reference catalog input does not cover the accepted affected sources".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_for_event(
-        &self,
-        event: &AcceptedBatchEvent,
-        effect: &SemanticEffect,
-    ) -> Result<(), MaterializationError> {
-        let authenticated = AuthenticatedReferenceMaterialization {
-            event_binding_digest: event.event_binding_digest(),
-            prior_frontier_root_digest: ContentDigest::of(
-                &postcard::to_allocvec(event.prior_frontier_root())
-                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?,
-            ),
-            post_frontier_root_digest: ContentDigest::of(
-                &postcard::to_allocvec(event.post_frontier_root())
-                    .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?,
-            ),
-            prior_catalog_root: event.prior_frontier_root().reference_catalog_root().clone(),
-            post_catalog_root: event.post_frontier_root().reference_catalog_root().clone(),
-        };
-        self.validate_for_authenticated_transition(&authenticated, effect)
-    }
+pub(crate) struct MaterializedPortablePathClaim {
+    pub(crate) page_id: PageId,
+    pub(crate) portable_path_key: ContentDigest,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -640,7 +300,9 @@ pub struct MaterializationChange {
     batch_id: BatchId,
     replacements: Vec<MaterializedPageInput>,
     deletions: Vec<PageId>,
-    reference_catalog: Option<ReferenceCatalogMaterializationInput>,
+    derived_reference_postings: Vec<MaterializedReferencePosting>,
+    derived_aliases: Vec<MaterializedAliasDeclaration>,
+    portable_path_claims: Vec<MaterializedPortablePathClaim>,
 }
 
 impl MaterializationChange {
@@ -659,7 +321,9 @@ impl MaterializationChange {
             batch_id,
             replacements,
             deletions,
-            reference_catalog: None,
+            derived_reference_postings: Vec::new(),
+            derived_aliases: Vec::new(),
+            portable_path_claims: Vec::new(),
         };
         change.validate_shape()?;
         Ok(change)
@@ -677,30 +341,18 @@ impl MaterializationChange {
         &self.deletions
     }
 
-    /// Attach the catalog transition that was independently authenticated by
-    /// an accepted batch.  This is crate-private so callers cannot make a
-    /// SQLite row claim a catalog root without the engine/store adapter.
-    pub(crate) fn with_authenticated_reference_catalog(
+    pub(crate) fn with_derived_graph_facts(
         mut self,
-        reference_catalog: ReferenceCatalogMaterializationInput,
+        mut reference_postings: Vec<MaterializedReferencePosting>,
+        mut aliases: Vec<MaterializedAliasDeclaration>,
+        mut portable_path_claims: Vec<MaterializedPortablePathClaim>,
     ) -> Result<Self, MaterializationError> {
-        if self.reference_catalog.is_some() {
-            return Err(MaterializationError::InvalidInput(
-                "materialization change already has a reference catalog transition".into(),
-            ));
-        }
-        self.reference_catalog = Some(reference_catalog);
-        self.validate_shape()?;
-        Ok(self)
-    }
-
-    pub(crate) fn reference_catalog(&self) -> Option<&ReferenceCatalogMaterializationInput> {
-        self.reference_catalog.as_ref()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn without_reference_catalog(mut self) -> Result<Self, MaterializationError> {
-        self.reference_catalog = None;
+        reference_postings.sort_unstable();
+        aliases.sort_unstable();
+        portable_path_claims.sort_unstable();
+        self.derived_reference_postings = reference_postings;
+        self.derived_aliases = aliases;
+        self.portable_path_claims = portable_path_claims;
         self.validate_shape()?;
         Ok(self)
     }
@@ -732,9 +384,6 @@ impl MaterializationChange {
         let effect = SemanticEffect::decode(event.semantic_effect())
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
         self.validate_against_effect(&effect)?;
-        if let Some(reference_catalog) = &self.reference_catalog {
-            reference_catalog.validate_for_event(event, &effect)?;
-        }
         self.digest()
     }
 
@@ -753,9 +402,6 @@ impl MaterializationChange {
         let effect = SemanticEffect::decode(semantic_effect)
             .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
         self.validate_against_effect(&effect)?;
-        if let Some(reference_catalog) = &self.reference_catalog {
-            reference_catalog.validate()?;
-        }
         self.digest()
     }
 
@@ -809,9 +455,67 @@ impl MaterializationChange {
                 }
             }
         }
-        if let Some(reference_catalog) = &self.reference_catalog {
-            reference_catalog.validate()?;
+        if !strictly_sorted_unique_by(&self.derived_reference_postings, |posting| {
+            (
+                posting.source_page_id,
+                posting.source_entity.clone(),
+                posting.source_locator,
+                posting.ordinal,
+            )
+        }) || !strictly_sorted_unique_by(&self.derived_aliases, |alias| {
+            (
+                alias.source_page_id,
+                alias.source_entity.clone(),
+                alias.source_locator,
+                alias.ordinal,
+            )
+        }) || !strictly_sorted_unique_by(&self.portable_path_claims, |claim| claim.page_id)
+        {
+            return Err(MaterializationError::InvalidInput(
+                "derived graph facts are not canonical".into(),
+            ));
         }
+        let replacement_ids = self
+            .replacements
+            .iter()
+            .map(|page| page.page_id)
+            .collect::<BTreeSet<_>>();
+        if self
+            .derived_reference_postings
+            .iter()
+            .any(|posting| !replacement_ids.contains(&posting.source_page_id))
+            || self
+                .derived_aliases
+                .iter()
+                .any(|alias| !replacement_ids.contains(&alias.source_page_id))
+            || (!self.portable_path_claims.is_empty()
+                && self
+                    .portable_path_claims
+                    .iter()
+                    .map(|claim| claim.page_id)
+                    .collect::<BTreeSet<_>>()
+                    != replacement_ids)
+        {
+            return Err(MaterializationError::InvalidInput(
+                "derived graph facts do not exactly belong to replacement pages".into(),
+            ));
+        }
+        for posting in &self.derived_reference_postings {
+            validate_reference_posting(posting, &mut input_budget)?;
+        }
+        for alias in &self.derived_aliases {
+            validate_alias_declaration(alias, &mut input_budget)?;
+        }
+        input_budget.add_facet_values(self.portable_path_claims.len())?;
+        input_budget.add_bytes(self.portable_path_claims.len().checked_mul(48).ok_or_else(
+            || {
+                resource_limit(
+                    "materialization change bytes",
+                    usize::MAX,
+                    MAX_MATERIALIZATION_CHANGE_BYTES,
+                )
+            },
+        )?)?;
         Ok(())
     }
 
@@ -1489,17 +1193,15 @@ pub(crate) fn apply_change(
     sequence: u64,
     input_digest: ContentDigest,
     post_frontier_digest: ContentDigest,
-    authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-    let (physical, authenticated) =
-        lower_validated_change(change, semantic_effect, authenticated_reference)?;
+    let physical = lower_validated_change(change, semantic_effect)?;
     storage::apply_materialization_change_for_test(
         transaction,
         &physical,
         sequence,
         input_digest,
         post_frontier_digest,
-        authenticated.as_ref(),
+        None,
     )
     .map_err(Into::into)
 }
@@ -1507,26 +1209,11 @@ pub(crate) fn apply_change(
 pub(crate) fn lower_validated_change(
     change: &MaterializationChange,
     semantic_effect: &[u8],
-    authenticated_reference: Option<&AuthenticatedReferenceMaterialization>,
-) -> Result<
-    (
-        storage::PhysicalMaterializationChange,
-        Option<storage::PhysicalAuthenticatedReference>,
-    ),
-    MaterializationError,
-> {
+) -> Result<storage::PhysicalMaterializationChange, MaterializationError> {
     change.validate_shape()?;
     let effect = SemanticEffect::decode(semantic_effect)
         .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
     change.validate_against_effect(&effect)?;
-    if let Some(reference_catalog) = change.reference_catalog() {
-        let authenticated = authenticated_reference.ok_or_else(|| {
-            MaterializationError::Incomplete(
-                "authenticated reference materialization requires accepted event evidence".into(),
-            )
-        })?;
-        reference_catalog.validate_for_authenticated_transition(authenticated, &effect)?;
-    }
 
     let pages_with_live_metadata_delta = effect
         .pages()
@@ -1539,31 +1226,27 @@ pub(crate) fn lower_validated_change(
         .iter()
         .map(lower_page)
         .collect::<Result<Vec<_>, _>>()?;
-    let reference_catalog = change
-        .reference_catalog
-        .as_ref()
-        .map(lower_reference_catalog)
-        .transpose()?;
-    let authenticated =
-        authenticated_reference.map(|value| storage::PhysicalAuthenticatedReference {
-            event_binding_digest: value.event_binding_digest,
-            prior_frontier_root_digest: value.prior_frontier_root_digest,
-            post_frontier_root_digest: value.post_frontier_root_digest,
-        });
-    Ok((
-        storage::PhysicalMaterializationChange {
-            batch_id: change.batch_id.as_uuid().into_bytes(),
-            replacements,
-            deletions: change
-                .deletions
-                .iter()
-                .map(|page_id| page_id.as_uuid().into_bytes())
-                .collect(),
-            pages_with_live_metadata_delta,
-            reference_catalog,
-        },
-        authenticated,
-    ))
+    Ok(storage::PhysicalMaterializationChange {
+        batch_id: change.batch_id.as_uuid().into_bytes(),
+        replacements,
+        deletions: change
+            .deletions
+            .iter()
+            .map(|page_id| page_id.as_uuid().into_bytes())
+            .collect(),
+        pages_with_live_metadata_delta,
+        derived_reference_postings: lower_reference_postings(&change.derived_reference_postings)?,
+        derived_aliases: lower_alias_declarations(&change.derived_aliases)?,
+        portable_path_claims: change
+            .portable_path_claims
+            .iter()
+            .map(|claim| storage::PhysicalPagePortablePathClaim {
+                page_id: claim.page_id.as_uuid().into_bytes(),
+                portable_path_key: claim.portable_path_key,
+            })
+            .collect(),
+        reference_catalog: None,
+    })
 }
 
 fn lower_page(page: &MaterializedPageInput) -> Result<storage::PhysicalPage, MaterializationError> {
@@ -1655,53 +1338,6 @@ fn lower_entity(entity: MaterializedEntityId) -> storage::PhysicalEntityId {
     }
 }
 
-fn lower_reference_catalog(
-    input: &ReferenceCatalogMaterializationInput,
-) -> Result<storage::PhysicalReferenceCatalogChange, MaterializationError> {
-    let prior_catalog_root = input
-        .prior_catalog_root
-        .encode()
-        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    let prior_catalog_root_digest = input
-        .prior_catalog_root
-        .external_digest()
-        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    let post_catalog_root = input
-        .post_catalog_root
-        .encode()
-        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    let post_catalog_root_digest = input
-        .post_catalog_root
-        .external_digest()
-        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    let extractor_dependency_stamp_digest = ReferenceExtractorDependencyStamp::new(
-        input.post_catalog_root.extractor_digest(),
-        input.post_catalog_root.policy_digest(),
-    )?
-    .digest()?;
-    let canonical_bytes = postcard::to_allocvec(input)
-        .map_err(|error| MaterializationError::InvalidInput(error.to_string()))?;
-    Ok(storage::PhysicalReferenceCatalogChange {
-        prior_catalog_root,
-        prior_catalog_root_digest,
-        prior_source_count: input.prior_catalog_root.source_count(),
-        post_catalog_root,
-        post_catalog_root_digest,
-        post_source_count: input.post_catalog_root.source_count(),
-        coverage_digest: input.post_catalog_root.source_coverage_root(),
-        extractor_dependency_stamp_digest,
-        postings: lower_reference_postings(&input.postings)?,
-        aliases: lower_alias_declarations(&input.aliases)?,
-        coverage: lower_source_coverage(&input.coverage)?,
-        removed_sources: input
-            .removed_sources
-            .iter()
-            .map(|id| id.as_uuid().into_bytes())
-            .collect(),
-        canonical_bytes,
-    })
-}
-
 fn lower_reference_postings(
     postings: &[MaterializedReferencePosting],
 ) -> Result<Vec<storage::PhysicalReferencePosting>, MaterializationError> {
@@ -1755,31 +1391,14 @@ fn lower_alias_declarations(
         .collect()
 }
 
-fn lower_source_coverage(
-    coverage: &[SourceCoverageFacet],
-) -> Result<Vec<storage::PhysicalSourceCoverage>, MaterializationError> {
-    coverage
-        .iter()
-        .map(|facet| {
-            Ok(storage::PhysicalSourceCoverage {
-                source_page_id: facet.source_page_id.as_uuid().into_bytes(),
-                source_digest: facet.source_digest,
-                extractor_dependency_stamp_digest: facet.extractor_dependency_stamp.digest()?,
-            })
-        })
-        .collect()
-}
-
 /// One bounded chunk of terminal bootstrap rows, before lowering.
 ///
 /// Terminal construction never replays an intermediate page or reference
-/// replacement, so a chunk has no deletions, no removed sources, and no prior
-/// catalog transition: the accepted terminal catalog root authenticates every
-/// row in it.
+/// replacement. Parser-derived reference rows are disposable projection facts
+/// covered by the final accepted-frontier stamp, not catalog coverage rows.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TerminalMaterializationChunk {
     pub(crate) pages: Vec<MaterializedPageInput>,
-    pub(crate) coverage: Vec<SourceCoverageFacet>,
     pub(crate) postings: Vec<MaterializedReferencePosting>,
     pub(crate) aliases: Vec<MaterializedAliasDeclaration>,
 }
@@ -1792,7 +1411,6 @@ pub(crate) fn lower_terminal_chunk(
     mut chunk: TerminalMaterializationChunk,
 ) -> Result<storage::PhysicalTerminalMaterializationChunk, MaterializationError> {
     chunk.pages.sort_unstable_by_key(|page| page.page_id);
-    chunk.coverage.sort_unstable();
     chunk.postings.sort_unstable();
     chunk.aliases.sort_unstable();
     let mut input_budget = MaterializationInputBudget::default();
@@ -1813,11 +1431,6 @@ pub(crate) fn lower_terminal_chunk(
                 )));
             }
         }
-    }
-    if !strictly_sorted_unique_by(&chunk.coverage, |facet| facet.source_page_id) {
-        return Err(MaterializationError::InvalidInput(
-            "terminal reference source coverage is not canonical".into(),
-        ));
     }
     if !strictly_sorted_unique_by(&chunk.postings, |posting| {
         (
@@ -1843,32 +1456,26 @@ pub(crate) fn lower_terminal_chunk(
             "terminal reference alias declarations are not canonical".into(),
         ));
     }
-    let covered = chunk
-        .coverage
+    let page_ids = chunk
+        .pages
         .iter()
-        .map(|facet| facet.source_page_id)
+        .map(|page| page.page_id)
         .collect::<BTreeSet<_>>();
     for posting in &chunk.postings {
-        if !covered.contains(&posting.source_page_id) {
+        if !page_ids.contains(&posting.source_page_id) {
             return Err(MaterializationError::InvalidInput(
-                "terminal reference posting has no source coverage".into(),
+                "terminal reference posting has no source page".into(),
             ));
         }
         validate_reference_posting(posting, &mut input_budget)?;
     }
     for alias in &chunk.aliases {
-        if !covered.contains(&alias.source_page_id) {
+        if !page_ids.contains(&alias.source_page_id) {
             return Err(MaterializationError::InvalidInput(
-                "terminal reference alias has no source coverage".into(),
+                "terminal reference alias has no source page".into(),
             ));
         }
         validate_alias_declaration(alias, &mut input_budget)?;
-    }
-    for facet in &chunk.coverage {
-        facet.extractor_dependency_stamp.validate()?;
-        let _ = facet.extractor_dependency_stamp.digest()?;
-        input_budget.add_facet_values(1)?;
-        input_budget.add_bytes(REFERENCE_CATALOG_COVERAGE_OVERHEAD_BYTES)?;
     }
     Ok(storage::PhysicalTerminalMaterializationChunk {
         pages: chunk
@@ -1876,7 +1483,7 @@ pub(crate) fn lower_terminal_chunk(
             .iter()
             .map(lower_page)
             .collect::<Result<Vec<_>, _>>()?,
-        coverage: lower_source_coverage(&chunk.coverage)?,
+        coverage: Vec::new(),
         postings: lower_reference_postings(&chunk.postings)?,
         aliases: lower_alias_declarations(&chunk.aliases)?,
     })
@@ -2955,24 +2562,6 @@ mod tests {
         BatchId::from_uuid(Uuid::from_u128(value))
     }
 
-    fn extractor_stamp() -> ReferenceExtractorDependencyStamp {
-        ReferenceExtractorDependencyStamp::new(
-            ContentDigest::of(b"test extractor"),
-            ContentDigest::of(b"test policy"),
-        )
-        .unwrap()
-    }
-
-    fn empty_reference_catalog_root() -> ReferenceCatalogRootV2 {
-        let page_names = super::super::PageNameOwnershipRootV1::empty();
-        ReferenceCatalogRootV2::empty(
-            &super::super::ReferenceCatalogPolicyV1::default(),
-            &page_names,
-            ContentDigest::of(b"external UUID authority"),
-        )
-        .unwrap()
-    }
-
     #[test]
     fn task_candidate_and_structure_rows_keep_typed_authority_boundaries() {
         let page = page_id(1);
@@ -3035,7 +2624,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_catalog_input_preserves_raw_spellings_uuid_claims_and_structural_locators() {
+    fn derived_reference_input_preserves_raw_spellings_and_structural_locators() {
         let source_page = page_id(1);
         let source_block = block_id(2);
         let locator = ReferenceSourceLocatorV1::Block {
@@ -3052,16 +2641,17 @@ mod tests {
         let normalized_name = crate::refs::page_key(&raw_name);
         let raw_alias = " /Alias/ ".to_owned();
         let normalized_alias = crate::refs::page_key(&raw_alias);
-        let uuid_claim = LogseqUuid::from_uuid(Uuid::from_u128(4));
-        let catalog_root = ContentDigest::of(b"catalog root");
-        let root = empty_reference_catalog_root();
-        let input = ReferenceCatalogMaterializationInput::new(
-            root.clone(),
-            root,
+        let input = MaterializationChange::new(
+            batch_id(4),
+            vec![page_input(source_page, "source".into())],
+            Vec::new(),
+        )
+        .unwrap()
+        .with_derived_graph_facts(
             vec![MaterializedReferencePosting {
                 source_page_id: source_page,
-                source_entity: MaterializedEntityId::Block(source_block),
-                source_locator: locator,
+                source_entity: MaterializedEntityId::Page(source_page),
+                source_locator: ReferenceSourceLocatorV1::Preamble,
                 ordinal: 0,
                 kind: ReferenceCatalogReferenceKind::PropertyKeyPseudoPage,
                 target: MaterializedReferenceTarget::PageName {
@@ -3072,51 +2662,28 @@ mod tests {
             }],
             vec![MaterializedAliasDeclaration {
                 source_page_id: source_page,
-                source_entity: MaterializedEntityId::Block(source_block),
-                source_locator: locator,
+                source_entity: MaterializedEntityId::Page(source_page),
+                source_locator: ReferenceSourceLocatorV1::Preamble,
                 ordinal: 1,
                 raw_alias: raw_alias.clone(),
                 normalized_alias: normalized_alias.clone(),
-            }],
-            vec![MaterializedReferenceNameBinding {
-                raw_name: raw_name.clone(),
-                normalized_name,
-                candidate_ordinal: 0,
-                resolved_page_id: None,
-            }],
-            vec![MaterializedReferenceUuidBinding {
-                raw_uuid_claim: uuid_claim,
-                candidate_ordinal: 0,
-                resolved_block_id: None,
-            }],
-            vec![MaterializedReferenceAliasBinding {
-                normalized_alias,
-                candidate_ordinal: 0,
-                resolved_page_id: None,
-                catalog_root_digest: catalog_root,
-            }],
-            vec![SourceCoverageFacet {
-                source_page_id: source_page,
-                source_digest: ContentDigest::of(b"source"),
-                extractor_dependency_stamp: extractor_stamp(),
             }],
             Vec::new(),
         )
         .unwrap();
         assert_eq!(
-            input.postings[0].target,
+            input.derived_reference_postings[0].target,
             MaterializedReferenceTarget::PageName {
                 raw_name,
                 normalized_name: crate::refs::page_key(" /Über/ "),
                 resolved_page_id: None,
             }
         );
-        assert_eq!(input.aliases[0].raw_alias, raw_alias);
-        assert_eq!(input.uuid_bindings[0].raw_uuid_claim, uuid_claim);
+        assert_eq!(input.derived_aliases[0].raw_alias, raw_alias);
     }
 
     #[test]
-    fn reference_catalog_input_rejects_malformed_names_locators_and_aggregate_limits() {
+    fn derived_reference_input_rejects_malformed_names_locators_and_aggregate_limits() {
         assert!(matches!(
             validate_reference_source_locator_bytes(b"not-a-postcard-locator"),
             Err(MaterializationError::InvalidInput(_))
@@ -3134,17 +2701,13 @@ mod tests {
             },
         };
         assert!(matches!(
-            ReferenceCatalogMaterializationInput::new(
-                empty_reference_catalog_root(),
-                empty_reference_catalog_root(),
-                vec![malformed],
+            MaterializationChange::new(
+                batch_id(2),
+                vec![page_input(page_id(1), "source".into())],
                 Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
+            )
+            .unwrap()
+            .with_derived_graph_facts(vec![malformed], Vec::new(), Vec::new(),),
             Err(MaterializationError::InvalidInput(_))
         ));
 
@@ -3167,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_catalog_input_rejects_cross_kind_target_pairs() {
+    fn derived_reference_input_rejects_cross_kind_target_pairs() {
         for posting in [
             MaterializedReferencePosting {
                 source_page_id: page_id(1),
@@ -3194,17 +2757,13 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                ReferenceCatalogMaterializationInput::new(
-                    empty_reference_catalog_root(),
-                    empty_reference_catalog_root(),
-                    vec![posting],
+                MaterializationChange::new(
+                    batch_id(2),
+                    vec![page_input(page_id(1), "source".into())],
                     Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
+                )
+                .unwrap()
+                .with_derived_graph_facts(vec![posting], Vec::new(), Vec::new(),),
                 Err(MaterializationError::InvalidInput(_))
             ));
         }
@@ -3402,7 +2961,7 @@ mod tests {
 
     #[test]
     fn materialization_input_schema_refuses_prior_and_future_before_sqlite_write() {
-        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 4);
+        assert_eq!(MATERIALIZATION_INPUT_SCHEMA_VERSION, 5);
         let current = MaterializationChange::new(
             batch_id(500_000),
             vec![page_input(page_id(500_001), "current".into())],
@@ -3437,7 +2996,6 @@ mod tests {
                     1,
                     ContentDigest::of(b"input"),
                     ContentDigest::of(b"next"),
-                    None,
                 ),
                 Err(MaterializationError::InvalidInput(message))
                     if message == format!("unknown materialization input schema {schema_version}")
@@ -3501,7 +3059,6 @@ mod tests {
                 1,
                 change.digest().unwrap(),
                 ContentDigest::of(b"next"),
-                None,
             ),
             Err(MaterializationError::Incomplete(message))
                 if message.contains("lacks prior validated metadata")
@@ -3553,7 +3110,6 @@ mod tests {
                 group as u64 + 1,
                 digest,
                 final_frontier,
-                None,
             )
             .unwrap();
             transaction.commit().unwrap();
@@ -3609,7 +3165,6 @@ mod tests {
                 group as u64 + 1,
                 digest,
                 final_frontier,
-                None,
             )
             .unwrap();
             transaction.commit().unwrap();

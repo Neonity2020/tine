@@ -5575,13 +5575,6 @@ fn verified_local_proof_binding_digest(
     hasher.update(frontier.retained_bytes_total().to_be_bytes());
     hasher.update(frontier.document_map_root_digest().as_bytes());
     hasher.update(frontier.batch_map_root_digest().as_bytes());
-    hasher.update(
-        frontier
-            .reference_catalog_root()
-            .external_digest()
-            .map_err(|error| VerifiedLocalCompositionError::ProofBinding(error.to_string()))?
-            .as_bytes(),
-    );
     hasher.update(reference_policy_digest.as_bytes());
 
     let sqlite = proofs.sqlite_projection;

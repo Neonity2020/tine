@@ -11978,13 +11978,6 @@ mod tests {
             "the old activation path must still expose reference Patricia publication"
         );
 
-        let frontier = prepared
-            .candidate()
-            .accepted_engine()
-            .accepted_frontier_root()
-            .unwrap();
-        assert_eq!(frontier.reference_catalog_root().source_count(), 2);
-
         let source = include_str!("import.rs");
         assert!(source.contains("fn spool_bootstrap_operations("));
         assert!(source.contains("fn author_bootstrap_parts("));
@@ -14408,18 +14401,6 @@ mod tests {
                 u64::from(descriptor.acceptance_sequence())
             );
         }
-        let terminal = prepared.engine_materials.last().unwrap();
-        let terminal_frontier = prepared.candidate().accepted_frontier_root().unwrap();
-        assert_eq!(
-            terminal.reference_catalog_root(),
-            terminal_frontier.reference_catalog_root(),
-            "the terminal accepted record must bind the complete catalog"
-        );
-        assert_eq!(
-            terminal.reference_catalog_root().source_count(),
-            page_transitions.len() as u64,
-            "the terminal catalog must contain both reference-bearing sources"
-        );
         (root, prepared, workspace)
     }
 
@@ -15893,23 +15874,25 @@ mod tests {
         assert_eq!(multi_opened.rebuild.accepted_events_applied, parts);
         assert_eq!(multi_opened.rebuild.max_live_events, 1);
         assert_eq!(multi_opened.rebuild.max_live_evidence_records, 1);
-        // One, not one per part, for both of these, and that is the point: the
-        // accepted root is authenticated once per rebuild and the exact catalog
-        // is loaded once, however many parts the publication has. Pinning the
-        // literals keeps it that way — a `<= parts` bound would pass while
-        // quietly letting a large graph's rebuild scale with its part count
-        // again. The two counters above stay per-part, because validating and
-        // applying each accepted event is exactly what a part costs.
+        // The accepted root and the still-transitional history catalog are each
+        // loaded once per rebuild, however many parts the publication has.
+        // Pinning these literals keeps that boundedness explicit: a `<= parts`
+        // bound would pass while quietly letting a large graph's rebuild scale
+        // with its part count again. The two counters above stay per-part,
+        // because validating and applying each accepted event is exactly what
+        // a part costs. The catalog load disappears with the subsequent
+        // history-authority deletion packet; it is no longer consulted by the
+        // parser-derived SQLite projection in this packet.
         assert_eq!(multi_opened.rebuild.accepted_root_authentications, 1);
         assert_eq!(multi_opened.rebuild.exact_catalog_loads, 1);
         // Terminal bootstrap construction intentionally does not replay each
         // part's reference delta. It authenticates and applies every accepted
-        // event above, seeds the final rows once, then proves reference
-        // coverage once over that terminal materialization. Per-part
-        // inductive checks would describe the incremental replay path, not
-        // this bounded terminal path (GH #314).
+        // event above, then seeds parser-derived reference rows as disposable
+        // state.
+        // There is no longer a reference-coverage proof or scan in the SQLite
+        // path (GH #314).
         assert_eq!(multi_opened.rebuild.reference_coverage_inductive_checks, 0);
-        assert_eq!(multi_opened.rebuild.reference_coverage_full_scans, 1);
+        assert_eq!(multi_opened.rebuild.reference_coverage_full_scans, 0);
         assert_eq!(multi_opened.rebuild.final_semantic_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.final_row_digest_equivalence_proofs, 1);
         assert_eq!(multi_opened.rebuild.physical_candidate_transactions, 1);

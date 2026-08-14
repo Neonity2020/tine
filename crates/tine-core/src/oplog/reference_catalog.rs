@@ -2557,7 +2557,7 @@ pub(crate) fn reference_source_is_org(path: &ManagedPath) -> bool {
     path.as_str().ends_with(".org")
 }
 
-fn extract_source_posting(
+pub(crate) fn extract_source_posting(
     policy: &ReferenceCatalogPolicyV1,
     source: ReferenceSourcePageV1,
 ) -> Result<ReferenceSourcePostingV2, ReferenceCatalogError> {
@@ -2780,7 +2780,7 @@ fn empty_map_digest() -> ContentDigest {
     PatriciaIndexRoot::empty().digest()
 }
 
-fn extractor_digest() -> ContentDigest {
+pub(crate) fn extractor_digest() -> ContentDigest {
     let mut bytes = b"tine/reference-catalog/extractor/v2\0".to_vec();
     bytes.extend_from_slice(&REFERENCE_CATALOG_EXTRACTOR_VERSION.to_be_bytes());
     bytes.extend_from_slice(crate::reference_evidence::ENGINE_VERSION.as_bytes());

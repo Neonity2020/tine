@@ -1535,62 +1535,55 @@ fn effective_transition_index(
     transitions
 }
 
-fn attach_authenticated_reference_catalog(
+fn attach_parser_derived_graph_facts(
     engine: &ShardedHotEngine,
-    event: &AcceptedBatchEvent,
     change: super::MaterializationChange,
 ) -> Result<super::MaterializationChange, ProjectionError> {
-    attach_authenticated_reference_catalog_at(
-        engine,
-        event.semantic_effect(),
-        event.prior_frontier_root(),
-        event.post_frontier_root(),
-        change,
-    )
+    let policy = engine
+        .reference_catalog_policy()
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+    let mut rows = ReferenceCatalogSourceRows::default();
+    for page in change.replacements() {
+        let posting = parser_derived_reference_source_posting(policy, page)?;
+        append_reference_fact_rows(posting.facts(), page.page_id, &mut rows)?;
+    }
+    let portable_path_claims = change
+        .replacements()
+        .iter()
+        .map(
+            |page| super::sqlite_materialization::MaterializedPortablePathClaim {
+                page_id: page.page_id,
+                portable_path_key: ContentDigest::from_bytes(
+                    *page.path.portable_key().digest().as_bytes(),
+                ),
+            },
+        )
+        .collect();
+    change
+        .with_derived_graph_facts(rows.postings, rows.aliases, portable_path_claims)
+        .map_err(Into::into)
 }
 
-fn attach_authenticated_reference_catalog_at(
-    engine: &ShardedHotEngine,
-    semantic_effect: &[u8],
-    prior_frontier_root: &AcceptedFrontierRoot,
-    post_frontier_root: &AcceptedFrontierRoot,
-    change: super::MaterializationChange,
-) -> Result<super::MaterializationChange, ProjectionError> {
-    let effect = SemanticEffect::decode(semantic_effect)
-        .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-    let post_root = post_frontier_root.reference_catalog_root().clone();
-    let prior_root = prior_frontier_root.reference_catalog_root().clone();
-    let stamp = super::sqlite_materialization::ReferenceExtractorDependencyStamp::new(
-        post_root.extractor_digest(),
-        post_root.policy_digest(),
-    )?;
-    let mut rows = ReferenceCatalogSourceRows::default();
-    let mut removed_sources = Vec::new();
-    for page_id in super::reference_catalog::affected_reference_sources(&effect) {
-        if !collect_reference_source_rows(engine, &post_root, stamp, page_id, &mut rows)? {
-            removed_sources.push(page_id);
-        }
-    }
-    let ReferenceCatalogSourceRows {
-        coverage,
-        postings,
-        aliases,
-    } = rows;
-    let reference_catalog =
-        super::sqlite_materialization::ReferenceCatalogMaterializationInput::new(
-            prior_root,
-            post_root,
-            postings,
-            aliases,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            coverage,
-            removed_sources,
-        )?;
-    change
-        .with_authenticated_reference_catalog(reference_catalog)
-        .map_err(Into::into)
+fn parser_derived_reference_source_posting(
+    policy: &super::ReferenceCatalogPolicyV1,
+    page: &super::MaterializedPageInput,
+) -> Result<super::ReferenceSourcePostingV2, ProjectionError> {
+    let source = super::reference_catalog::ReferenceSourcePageV1 {
+        page_id: page.page_id,
+        is_org: super::reference_catalog::reference_source_is_org(&page.path),
+        preamble: page.preamble.clone(),
+        blocks: page
+            .blocks
+            .iter()
+            .map(|block| super::reference_catalog::ReferenceSourceBlockV1 {
+                block_id: block.block_id,
+                home_document_id: block.home_document_id,
+                content: block.content.clone(),
+            })
+            .collect(),
+    };
+    super::reference_catalog::extract_source_posting(policy, source)
+        .map_err(|error| ProjectionError::Materialization(error.to_string()))
 }
 
 /// Opt-in construction phase trace, matching the activation trace the bootstrap
@@ -1697,68 +1690,19 @@ fn validate_terminal_construction_material(
     Ok(())
 }
 
-/// The authenticated catalog rows one reference source contributes at one
-/// catalog root. Per-event lowering and terminal construction share this exact
-/// derivation so a replayed database and a terminal one cannot disagree.
+/// Parser-derived reference rows for one or more replacement pages.
 #[derive(Debug, Default)]
 struct ReferenceCatalogSourceRows {
-    coverage: Vec<super::sqlite_materialization::SourceCoverageFacet>,
     postings: Vec<super::sqlite_materialization::MaterializedReferencePosting>,
     aliases: Vec<super::sqlite_materialization::MaterializedAliasDeclaration>,
 }
 
-/// Append one source's authenticated rows. Returns `false` when the catalog has
-/// no posting for that page at this root, which the per-event caller records as
-/// a removed source.
-fn collect_reference_source_rows(
-    engine: &ShardedHotEngine,
-    post_root: &super::ReferenceCatalogRootV2,
-    stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
-    page_id: PageId,
-    rows: &mut ReferenceCatalogSourceRows,
-) -> Result<bool, ProjectionError> {
-    let Some(posting) = engine
-        .reference_source_posting_at(post_root, page_id)
-        .map_err(|error| ProjectionError::Materialization(error.to_string()))?
-    else {
-        return Ok(false);
-    };
-    append_reference_source_rows(posting, stamp, page_id, rows)?;
-    Ok(true)
-}
-
-fn collect_indexed_reference_source_rows(
-    engine: &ShardedHotEngine,
-    index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
-    stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
-    page_id: PageId,
-    rows: &mut ReferenceCatalogSourceRows,
-) -> Result<bool, ProjectionError> {
-    let Some(posting) = engine
-        .reference_source_posting_from_index(index, page_id)
-        .map_err(|error| ProjectionError::Materialization(error.to_string()))?
-    else {
-        return Ok(false);
-    };
-    append_reference_source_rows(posting, stamp, page_id, rows)?;
-    Ok(true)
-}
-
-fn append_reference_source_rows(
-    posting: super::ReferenceSourcePostingV2,
-    stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
+fn append_reference_fact_rows(
+    facts: &[ReferenceFactV1],
     page_id: PageId,
     rows: &mut ReferenceCatalogSourceRows,
 ) -> Result<(), ProjectionError> {
-    rows.coverage
-        .push(super::sqlite_materialization::SourceCoverageFacet {
-            source_page_id: page_id,
-            source_digest: posting
-                .digest()
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
-            extractor_dependency_stamp: stamp,
-        });
-    for (ordinal, fact) in posting.facts().iter().enumerate() {
+    for (ordinal, fact) in facts.iter().enumerate() {
         let ordinal = u32::try_from(ordinal).map_err(|_| {
             ProjectionError::Materialization(
                 "reference posting ordinal exceeds the SQLite adapter bound".into(),
@@ -1821,24 +1765,6 @@ fn append_reference_source_rows(
         }
     }
     Ok(())
-}
-
-fn authenticated_reference_materialization(
-    event: &AcceptedBatchEvent,
-) -> Result<super::sqlite_materialization::AuthenticatedReferenceMaterialization, ProjectionError> {
-    Ok(
-        super::sqlite_materialization::AuthenticatedReferenceMaterialization {
-            event_binding_digest: event.event_binding_digest(),
-            prior_frontier_root_digest: ContentDigest::of(&canonical_frontier_root_bytes(
-                event.prior_frontier_root(),
-            )?),
-            post_frontier_root_digest: ContentDigest::of(&canonical_frontier_root_bytes(
-                event.post_frontier_root(),
-            )?),
-            prior_catalog_root: event.prior_frontier_root().reference_catalog_root().clone(),
-            post_catalog_root: event.post_frontier_root().reference_catalog_root().clone(),
-        },
-    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2189,11 +2115,8 @@ impl BootstrapSqliteRebuildInstrumentation {
                 self.terminal_catalog_document_validations, 0,
                 "a nonempty terminal catalog must be authenticated"
             );
-            assert_eq!(self.terminal_reference_index_traversals, 1);
-            assert_eq!(
-                self.terminal_reference_index_entries, self.terminal_catalog_rows_authenticated,
-                "the one reference-catalog traversal must cover every terminal page"
-            );
+            assert_eq!(self.terminal_reference_index_traversals, 0);
+            assert_eq!(self.terminal_reference_index_entries, 0);
         }
         // The one graph-lifetime decoded-segment session is measured, not
         // assumed: it must not thrash while it covers the whole terminal root.
@@ -2457,14 +2380,14 @@ impl FrontierRenamePlan {
     }
 }
 
-/// Read-only reference view at the engine's current authenticated frontier.
-/// SQLite contributes only reverse-index candidates from its stamped prefix;
-/// every returned candidate is checked against the catalog's current exact
-/// posting, and the bounded tail is read from that same catalog.
+/// Read-only reference view at the engine's current accepted frontier.
+/// SQLite contributes only reverse-index candidates from its frontier-stamped
+/// prefix. Every returned candidate is checked against current parser-owned
+/// page state, while the bounded tail is derived from the exact accepted page
+/// materialization. No derived reference catalog participates in authority.
 pub struct FrontierReferenceQuery<'a> {
     database: &'a SqliteFrontier,
     engine: &'a ShardedHotEngine,
-    base_catalog_root: super::ReferenceCatalogRootV2,
     tail_sources: BTreeMap<PageId, Option<super::ReferenceSourcePostingV2>>,
     instrumentation: ReferenceQueryInstrumentation,
 }
@@ -3374,9 +3297,6 @@ impl SqliteFrontier {
             || accepted_batch_count != proof.accepted_batch_count()
             || self.required_frontier_root != frontier
             || materialized.acceptance_sequence() != accepted_batch_count
-            || (accepted_batch_count != 0
-                && self.authenticated_reference_catalog_root()?
-                    != *frontier.reference_catalog_root())
         {
             return Err(ProjectionError::Rebuild(
                 "promoted SQLite reopen differs from retained bootstrap proof".into(),
@@ -3414,14 +3334,6 @@ impl SqliteFrontier {
         {
             return Err(ProjectionError::Rebuild(
                 "fresh SQLite evidence differs from inactive bootstrap proof".into(),
-            ));
-        }
-        if accepted_batch_count != 0
-            && self.authenticated_reference_catalog_root()?
-                != *frontier_root.reference_catalog_root()
-        {
-            return Err(ProjectionError::Rebuild(
-                "fresh SQLite reference catalog differs from bootstrap authority".into(),
             ));
         }
         Ok(())
@@ -3572,21 +3484,12 @@ impl SqliteFrontier {
                 "SQLite materialization does not agree with inactive bootstrap authority".into(),
             ));
         }
-        if accepted_batch_count != 0
-            && opened.database.authenticated_reference_catalog_root()?
-                != *frontier_root.reference_catalog_root()
-        {
-            return Err(ProjectionError::Rebuild(
-                "SQLite reference catalog does not agree with inactive bootstrap authority".into(),
-            ));
-        }
-        // E site: candidate publication, reopen, frontier/stamp/reference
-        // checks, and these two complete scans together establish the one
+        // E site: candidate publication, reopen, frontier/stamp checks, and
+        // these two complete scans together establish the one
         // process-bound proof consumed by uninterrupted promotion. Keep this
         // after publication: proving the unpublished candidate as well would
         // duplicate graph-wide work without strengthening any in-scope crash,
         // corruption, or concurrency boundary.
-        opened.rebuild.reference_coverage_full_scans += 1;
         let semantic_projection_digest = opened.database.semantic_projection_digest()?;
         opened.rebuild.final_semantic_equivalence_proofs += 1;
         #[cfg(test)]
@@ -4272,8 +4175,7 @@ impl SqliteFrontier {
         }
         let (materialization, materialization_stats) =
             materialize_accepted_event_with_stats(engine, event)?;
-        let materialization =
-            attach_authenticated_reference_catalog(engine, event, materialization)?;
+        let materialization = attach_parser_derived_graph_facts(engine, materialization)?;
         let (disposition, apply_stats) = self.apply_internal_with_materialization_and_stats(
             event,
             ApplyFault::None,
@@ -4283,7 +4185,7 @@ impl SqliteFrontier {
     }
 
     #[cfg(test)]
-    fn apply_authenticated_reference_catalog_materialized_accepted(
+    fn apply_parser_derived_materialized_accepted(
         &mut self,
         event: &AcceptedBatchEvent,
         materialization: super::MaterializationChange,
@@ -4293,8 +4195,7 @@ impl SqliteFrontier {
             return Err(ProjectionError::AuthorityMismatch);
         }
         authenticate_event_for_engine(engine, event)?;
-        let materialization =
-            attach_authenticated_reference_catalog(engine, event, materialization)?;
+        let materialization = attach_parser_derived_graph_facts(engine, materialization)?;
         self.apply_internal_with_materialization(event, ApplyFault::None, Some(&materialization))
     }
 
@@ -4306,61 +4207,6 @@ impl SqliteFrontier {
             )
             .map(super::SqliteMaterializedRead::from_storage)
             .map_err(Into::into)
-    }
-
-    pub(crate) fn authenticated_reference_catalog_root(
-        &self,
-    ) -> Result<super::ReferenceCatalogRootV2, ProjectionError> {
-        let frontier = read_frontier_root(&self.physical)?;
-        let frontier_bytes = canonical_frontier_root_bytes(&frontier)?;
-        let stamp = self.physical.reference_catalog_stamp()?;
-        if u64::try_from(stamp.acceptance_sequence).ok() != Some(frontier.acceptance_sequence())
-            || stamp.frontier_root_digest.as_slice()
-                != ContentDigest::of(&frontier_bytes).as_bytes()
-        {
-            return Err(ProjectionError::Materialization(
-                "reference materialization stamp is stale against SQLite frontier".into(),
-            ));
-        }
-        let (Some(root_bytes), Some(root_digest), Some(coverage_digest), Some(stamp_digest)) = (
-            stamp.catalog_root,
-            stamp.catalog_root_digest,
-            stamp.coverage_digest,
-            stamp.extractor_dependency_stamp_digest,
-        ) else {
-            return Err(ProjectionError::Materialization(
-                "SQLite frontier has no authenticated reference catalog materialization".into(),
-            ));
-        };
-        let root = super::ReferenceCatalogRootV2::decode(&root_bytes)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-        let expected = frontier.reference_catalog_root();
-        if &root != expected
-            || root_digest.as_slice()
-                != root
-                    .external_digest()
-                    .map_err(|error| ProjectionError::Materialization(error.to_string()))?
-                    .as_bytes()
-            || coverage_digest.as_slice() != root.source_coverage_root().as_bytes()
-            || stamp_digest.as_slice()
-                != super::sqlite_materialization::ReferenceExtractorDependencyStamp::new(
-                    root.extractor_digest(),
-                    root.policy_digest(),
-                )?
-                .digest()?
-                .as_bytes()
-        {
-            return Err(ProjectionError::Materialization(
-                "SQLite reference catalog stamp is not bound to its authenticated frontier".into(),
-            ));
-        }
-        let coverage_count = self.physical.reference_source_coverage_count()?;
-        if u64::try_from(coverage_count).ok() != Some(root.source_count()) {
-            return Err(ProjectionError::Materialization(
-                "SQLite reference source coverage is incomplete for its catalog root".into(),
-            ));
-        }
-        Ok(root)
     }
 
     /// Rebuild only the disposable graph-wide rows from a streaming sequence
@@ -4378,12 +4224,10 @@ impl SqliteFrontier {
         self.rebuild_materialization_inner(changes, None)
     }
 
-    /// Rebuild a disposable materialization while deriving every reference
-    /// row afresh from the catalog roots bound to accepted history.  Generic
-    /// page/search facets still come from the supplied projection inputs;
-    /// reference facts never do.
+    /// Rebuild a disposable materialization while deriving every reference,
+    /// alias, and portable-path row afresh from parser-owned page snapshots.
     #[cfg(test)]
-    fn rebuild_authenticated_reference_catalog_materialization<I>(
+    fn rebuild_parser_derived_graph_materialization<I>(
         &mut self,
         changes: I,
         engine: &ShardedHotEngine,
@@ -4428,44 +4272,24 @@ impl SqliteFrontier {
                     ))
                 })?;
             if let Some(engine) = reference_engine {
-                let prior = decode_frontier_root(&stored.prior_frontier_root)?;
-                let post = decode_frontier_root(&stored.post_frontier_root)?;
-                change = attach_authenticated_reference_catalog_at(
-                    engine,
-                    &stored.semantic_effect,
-                    &prior,
-                    &post,
-                    change.without_reference_catalog()?,
-                )?;
-            } else if change.reference_catalog().is_some() {
-                return Err(ProjectionError::Materialization(
-                    "reference catalog rebuild input requires authenticated engine authority"
-                        .into(),
-                ));
+                change = attach_parser_derived_graph_facts(engine, change)?;
             }
             let input_digest =
                 change.validate_against_stored(stored.batch_id, &stored.semantic_effect)?;
             let prior_digest = decode_content_digest(&stored.prior_frontier_root_digest)?;
             let post_digest = decode_content_digest(&stored.post_frontier_root_digest)?;
-            let authenticated_reference = change
-                .reference_catalog()
-                .is_some()
-                .then(|| stored.authenticated_reference_materialization())
-                .transpose()?;
             self.physical
                 .ensure_materialization_stamp(sequence - 1, prior_digest)?;
-            let (physical, authenticated_reference) =
-                super::sqlite_materialization::lower_validated_change(
-                    &change,
-                    &stored.semantic_effect,
-                    authenticated_reference.as_ref(),
-                )?;
+            let physical = super::sqlite_materialization::lower_validated_change(
+                &change,
+                &stored.semantic_effect,
+            )?;
             self.physical.apply_materialization_for_test(
                 &physical,
                 sequence,
                 input_digest,
                 post_digest,
-                authenticated_reference.as_ref(),
+                None,
             )?;
             applied = sequence;
         }
@@ -4659,10 +4483,7 @@ impl SqliteFrontier {
         if std::env::var_os("TINE_ACTIVATION_TRACE").is_some() {
             eprintln!("sqlite terminal current-path cursor probe: {cursor_probe:?}");
         }
-        self.reference_coverage = Some(InductiveReferenceCoverage {
-            applied_through: source.accepted_batch_count,
-            rows: coverage_count,
-        });
+        self.reference_coverage = None;
         if instrumentation.cleanup_page_attempts != 0
             || instrumentation.cleanup_owned_rows != 0
             || instrumentation.cleanup_fts_rowids != 0
@@ -4678,8 +4499,8 @@ impl SqliteFrontier {
                 })?
             || bootstrap.bootstrap_part_reads != 0
             || bootstrap.terminal_materializations != 1
-            || bootstrap.terminal_reference_index_traversals != 1
-            || bootstrap.terminal_reference_index_entries != bootstrap.terminal_pages_materialized
+            || bootstrap.terminal_reference_index_traversals != 0
+            || bootstrap.terminal_reference_index_entries != 0
         {
             return Err(ProjectionError::Rebuild(
                 "terminal candidate structural accounting invariant failed".into(),
@@ -4830,10 +4651,7 @@ impl SqliteFrontier {
         bootstrap.terminal_catalog_rows_authenticated = cursor_probe.rows;
         bootstrap.terminal_catalog_document_validations = cursor_probe.catalog_document_validations;
 
-        self.reference_coverage = Some(InductiveReferenceCoverage {
-            applied_through: source.accepted_batch_count,
-            rows: coverage_count,
-        });
+        self.reference_coverage = None;
         if instrumentation.cleanup_page_attempts != 0
             || instrumentation.cleanup_owned_rows != 0
             || instrumentation.cleanup_fts_rowids != 0
@@ -4848,8 +4666,8 @@ impl SqliteFrontier {
                     )
                 })?
             || bootstrap.terminal_materializations != 1
-            || bootstrap.terminal_reference_index_traversals != 1
-            || bootstrap.terminal_reference_index_entries != bootstrap.terminal_pages_materialized
+            || bootstrap.terminal_reference_index_traversals != 0
+            || bootstrap.terminal_reference_index_entries != 0
         {
             return Err(ProjectionError::Rebuild(
                 "terminal archive structural accounting invariant failed".into(),
@@ -4882,12 +4700,10 @@ impl SqliteFrontier {
         Ok((instrumentation, bootstrap))
     }
 
-    /// Stream the complete terminal page and reference rows in bounded chunks.
-    ///
-    /// The page set is the engine's authenticated current-path catalog at the
-    /// exact terminal accepted frontier, and every row is materialized once at
-    /// that same root. The final coverage count is separately proved against
-    /// `AcceptedFrontierRoot::reference_catalog_root`.
+    /// Stream the complete terminal page and parser-derived projection rows in
+    /// bounded chunks. The accepted frontier authenticates page state; SQLite
+    /// reference/search/query rows are disposable facts derived from those
+    /// exact pages, not a second catalog authority.
     fn seed_terminal_rows(
         &mut self,
         engine: &ShardedHotEngine,
@@ -4907,23 +4723,6 @@ impl SqliteFrontier {
         {
             return Err(ProjectionError::Rebuild(
                 "current-path catalog is not bound to the terminal accepted frontier".into(),
-            ));
-        }
-        let catalog_root = terminal_root.reference_catalog_root().clone();
-        let extractor_stamp =
-            super::sqlite_materialization::ReferenceExtractorDependencyStamp::new(
-                catalog_root.extractor_digest(),
-                catalog_root.policy_digest(),
-            )?;
-        let reference_index = engine
-            .reference_source_posting_index_at(&catalog_root)
-            .map_err(ProjectionError::materialization_from_engine)?;
-        bootstrap.terminal_reference_index_traversals = 1;
-        bootstrap.terminal_reference_index_entries = reference_index.len();
-        if reference_index.len() as u64 != binding.catalog_rows() {
-            return Err(ProjectionError::Rebuild(
-                "terminal reference catalog does not cover the complete current-path catalog"
-                    .into(),
             ));
         }
         let materializer = (binding.catalog_rows() != 0)
@@ -4984,8 +4783,6 @@ impl SqliteFrontier {
                     )
                 })?,
                 engine,
-                &reference_index,
-                extractor_stamp,
                 chunk_rows,
                 instrumentation,
                 bootstrap,
@@ -5030,36 +4827,17 @@ impl SqliteFrontier {
                 "terminal current-path catalog changed or is incompletely covered".into(),
             ));
         }
-        if provenance.is_empty() {
-            if binding.catalog_rows() != 0 || catalog_root.source_count() != 0 {
-                return Err(ProjectionError::Rebuild(
-                    "an empty accepted prefix cannot carry terminal catalog rows".into(),
-                ));
-            }
-            return Ok(0);
-        }
-        let stamp = storage_frontier::PhysicalTerminalCatalogStamp {
+        let stamp = storage_frontier::PhysicalTerminalProjectionStamp {
             acceptance_sequence: terminal_root.acceptance_sequence(),
             frontier_root_digest: ContentDigest::of(&canonical_frontier_root_bytes(terminal_root)?),
-            catalog_root: catalog_root
-                .encode()
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
-            catalog_root_digest: catalog_root
-                .external_digest()
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
-            coverage_digest: catalog_root.source_coverage_root(),
-            extractor_dependency_stamp_digest: extractor_stamp.digest()?,
-            source_count: catalog_root.source_count(),
         };
         let finish_started = std::time::Instant::now();
-        let finished = self
-            .physical
-            .finish_terminal_bootstrap_construction(provenance, &stamp)
-            .map_err(Into::into);
+        self.physical
+            .finish_terminal_graph_projection_construction(provenance, stamp)?;
         bootstrap.terminal_finish_micros = bootstrap
             .terminal_finish_micros
             .saturating_add(finish_started.elapsed().as_micros());
-        finished
+        Ok(0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5067,8 +4845,6 @@ impl SqliteFrontier {
         &mut self,
         materializer: &super::hot_engine::BootstrapBulkMaterializer<'_>,
         engine: &ShardedHotEngine,
-        reference_index: &super::reference_catalog::ReferenceCatalogPostingDigestIndex,
-        extractor_stamp: super::sqlite_materialization::ReferenceExtractorDependencyStamp,
         rows: &[super::hot_engine::CurrentPathCatalogRow],
         instrumentation: &mut RebuildInstrumentation,
         bootstrap: &mut BootstrapSqliteRebuildInstrumentation,
@@ -5123,26 +4899,19 @@ impl SqliteFrontier {
                 bootstrap.terminal_projection_hint_misses =
                     bootstrap.terminal_projection_hint_misses.saturating_add(1);
             }
-            chunk
-                .pages
-                .push(hinted.unwrap_or_else(|| materialized_page_input(page)));
+            let page = hinted.unwrap_or_else(|| materialized_page_input(page));
             let reference_started = std::time::Instant::now();
-            let posted = collect_indexed_reference_source_rows(
-                engine,
-                reference_index,
-                extractor_stamp,
-                row.page_id(),
-                &mut reference_rows,
+            let posting = parser_derived_reference_source_posting(
+                engine
+                    .reference_catalog_policy()
+                    .map_err(ProjectionError::materialization_from_engine)?,
+                &page,
             )?;
+            append_reference_fact_rows(posting.facts(), row.page_id(), &mut reference_rows)?;
             reference_micros =
                 reference_micros.saturating_add(reference_started.elapsed().as_micros());
-            if !posted {
-                return Err(ProjectionError::Rebuild(
-                    "terminal catalog page has no authenticated reference posting".into(),
-                ));
-            }
+            chunk.pages.push(page);
         }
-        chunk.coverage = reference_rows.coverage;
         chunk.postings = reference_rows.postings;
         chunk.aliases = reference_rows.aliases;
         bootstrap.terminal_materialization_chunks += 1;
@@ -5182,18 +4951,14 @@ impl SqliteFrontier {
     fn finish_fresh_candidate(
         &mut self,
         source: &RebuildSource<'_>,
-        inductive_coverage_count: u64,
+        _inductive_coverage_count: u64,
         instrumentation: &mut RebuildInstrumentation,
     ) -> Result<(), ProjectionError> {
-        self.physical.finalize_fresh_bootstrap(
-            source
-                .exact_frontier_root
-                .reference_catalog_root()
-                .source_count(),
-            inductive_coverage_count,
-        )?;
+        // Reference rows are disposable parser-derived projection state. The
+        // legacy coverage table remains empty during this transition and is no
+        // longer compared with an accepted-frontier catalog root.
+        self.physical.finalize_fresh_bootstrap(0, 0)?;
         if !matches!(&source.loader, RebuildLoader::InactiveBootstrap { .. }) {
-            instrumentation.reference_coverage_full_scans += 1;
             let _semantic_digest = self.semantic_projection_digest()?;
             instrumentation.final_semantic_equivalence_proofs += 1;
             #[cfg(test)]
@@ -5244,7 +5009,7 @@ impl SqliteFrontier {
                 let (materialization, materialization_stats) =
                     materialize_inactive_bootstrap_event_bulk(source.engine, &event)?;
                 let materialization =
-                    attach_authenticated_reference_catalog(source.engine, &event, materialization)?;
+                    attach_parser_derived_graph_facts(source.engine, materialization)?;
                 instrumentation.record_materialization(materialization_stats);
                 intermediate_page_materializations += 1;
                 self.apply_candidate_with_materialization_and_stats(
@@ -5290,29 +5055,19 @@ impl SqliteFrontier {
             || instrumentation.accepted_root_authentications
                 > instrumentation.accepted_events_applied
             || instrumentation.cleanup_fts_rowids > instrumentation.cleanup_owned_rows
-            || instrumentation.reference_coverage_inductive_checks
-                != instrumentation.accepted_events_applied
+            || instrumentation.reference_coverage_inductive_checks != 0
             || instrumentation.reference_coverage_full_scans != 0
         {
             return Err(ProjectionError::Rebuild(
                 "fresh candidate structural accounting invariant failed".into(),
             ));
         }
-        let inductive_coverage_count = self
-            .reference_coverage
-            .filter(|coverage| coverage.applied_through == source.accepted_batch_count)
-            .map(|coverage| coverage.rows)
-            .ok_or_else(|| {
-                ProjectionError::Rebuild(
-                    "fresh candidate lost its inductive reference coverage state".into(),
-                )
-            })?;
         // Every preceding row transition was committed atomically with one
         // authenticated archive event, and the exact terminal frontier above
         // equals the source authority. The two complete scans below close that
         // inductive semantic/materialized-row proof while the file is still an
         // unpublished candidate; publication happens only after this returns.
-        self.finish_fresh_candidate(source, inductive_coverage_count, &mut instrumentation)?;
+        self.finish_fresh_candidate(source, 0, &mut instrumentation)?;
         if inactive_bulk {
             self.physical.finish_candidate_build()?;
         }
@@ -5430,28 +5185,18 @@ impl SqliteFrontier {
         let current_root = read_frontier_root(&self.physical)?;
         let current_physical = lower_physical_frontier_root(&current_root)?;
         let batch = lower_physical_accepted_batch(event)?;
-        let (physical_materialization, authenticated_reference) = match materialization {
-            Some(change) => {
-                let authenticated = change
-                    .reference_catalog()
-                    .is_some()
-                    .then(|| authenticated_reference_materialization(event))
-                    .transpose()?;
-                let (physical, authenticated) =
-                    super::sqlite_materialization::lower_validated_change(
-                        change,
-                        event.semantic_effect(),
-                        authenticated.as_ref(),
-                    )?;
-                (Some(physical), authenticated)
-            }
-            None => (None, None),
+        let physical_materialization = match materialization {
+            Some(change) => Some(super::sqlite_materialization::lower_validated_change(
+                change,
+                event.semantic_effect(),
+            )?),
+            None => None,
         };
         let mut request = storage_frontier::PhysicalApplyRequest {
             batch,
             materialization: physical_materialization,
             materialization_input_digest: materialization_digest,
-            authenticated_reference,
+            authenticated_reference: None,
             prior_reference_coverage_count: self
                 .reference_coverage
                 .and_then(|coverage| coverage.prior_rows_for(event.acceptance_sequence)),
@@ -6188,38 +5933,6 @@ impl StoredBatch {
             Some(decode_uuid(&self.causal_clock_root_key)?.into_bytes()),
             decode_content_digest(&self.causal_clock_root_digest)?,
         ))
-    }
-
-    #[cfg(test)]
-    fn authenticated_reference_materialization(
-        &self,
-    ) -> Result<super::sqlite_materialization::AuthenticatedReferenceMaterialization, ProjectionError>
-    {
-        let manifest_digest = decode_content_digest(&self.manifest_digest)?;
-        let semantic_effect_digest = decode_semantic_effect_digest(&self.semantic_effect_digest)?;
-        let dependency_frontier = decode_frontier(&self.dependency_frontier)?;
-        let causal_dependency_heads = decode_batch_ids(&self.causal_dependency_heads)?;
-        let event_binding_digest = super::AcceptedBatchEvidence::binding_digest_for(
-            self.batch_id,
-            manifest_digest,
-            semantic_effect_digest,
-            &dependency_frontier,
-            &causal_dependency_heads,
-        )
-        .map_err(|error| ProjectionError::Corrupt(error.to_string()))?;
-        let prior = decode_frontier_root(&self.prior_frontier_root)?;
-        let post = decode_frontier_root(&self.post_frontier_root)?;
-        Ok(
-            super::sqlite_materialization::AuthenticatedReferenceMaterialization {
-                event_binding_digest,
-                prior_frontier_root_digest: decode_content_digest(
-                    &self.prior_frontier_root_digest,
-                )?,
-                post_frontier_root_digest: decode_content_digest(&self.post_frontier_root_digest)?,
-                prior_catalog_root: prior.reference_catalog_root().clone(),
-                post_catalog_root: post.reference_catalog_root().clone(),
-            },
-        )
     }
 }
 
@@ -8436,9 +8149,9 @@ impl From<storage_frontier::FrontierError> for ProjectionError {
 
 impl SqliteFrontier {
     /// Open a read-only reference view at `engine`'s exact accepted frontier.
-    /// A SQLite prefix is usable only when its catalog stamp matches its
-    /// authenticated frontier; any newer portion is bounded by the existing
-    /// tail limits and read from immutable catalog postings.
+    /// A SQLite prefix is usable only when its ordinary materialization stamp
+    /// matches that frontier. Any newer portion is bounded by the existing tail
+    /// limits and derived from parser-owned accepted page state.
     pub fn frontier_reference_query<'a>(
         &'a self,
         engine: &'a ShardedHotEngine,
@@ -8450,7 +8163,7 @@ impl SqliteFrontier {
         let source = RebuildSource::new(engine, store)?;
         source.authenticate_exact_frontier()?;
         let mut expected = self.frontier_root()?;
-        let base_catalog_root = self.authenticated_reference_catalog_root()?;
+        self.materialized_read()?;
         let accepted = engine
             .accepted_frontier_root()
             .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
@@ -8479,14 +8192,18 @@ impl SqliteFrontier {
                     "SQLite reference query requires an over-limit authenticated tail".into(),
                 ));
             }
-            let effect = SemanticEffect::decode(event.semantic_effect())
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-            let catalog_root = event.post_frontier_root().reference_catalog_root();
-            for source_page_id in super::reference_catalog::affected_reference_sources(&effect) {
-                let posting = engine
-                    .reference_source_posting_at(catalog_root, source_page_id)
-                    .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-                tail_sources.insert(source_page_id, posting);
+            let materialization = materialize_accepted_event(engine, &event)?;
+            for page in materialization.replacements() {
+                let posting = parser_derived_reference_source_posting(
+                    engine
+                        .reference_catalog_policy()
+                        .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
+                    page,
+                )?;
+                tail_sources.insert(page.page_id, Some(posting));
+            }
+            for page_id in materialization.deletions() {
+                tail_sources.insert(*page_id, None);
             }
             expected = event.post_frontier_root().clone();
         }
@@ -8499,7 +8216,6 @@ impl SqliteFrontier {
         Ok(FrontierReferenceQuery {
             database: self,
             engine,
-            base_catalog_root,
             instrumentation: ReferenceQueryInstrumentation {
                 tail_source_postings: tail_sources.len(),
                 ..ReferenceQueryInstrumentation::default()
@@ -8544,25 +8260,7 @@ impl FrontierReferenceQuery<'_> {
                     "reference query candidate source limit exceeded".into(),
                 ));
             }
-            let logical = super::LogicalPageName::parse(name.clone())
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-            let authenticated = self
-                .engine
-                .reference_candidates_at(
-                    &self.base_catalog_root,
-                    super::reference_catalog::ReferenceCandidateTargetV2::PageName(
-                        logical.key_digest(),
-                    ),
-                    hard_limit,
-                )
-                .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-            if sqlite_for_name != authenticated {
-                return Err(ProjectionError::Materialization(
-                    "SQLite page-reference candidates differ from the authenticated reverse catalog"
-                        .into(),
-                ));
-            }
-            candidates.extend(authenticated);
+            candidates.extend(sqlite_for_name);
             if candidates.len() > hard_limit {
                 return Err(ProjectionError::Materialization(
                     "reference query candidate source limit exceeded".into(),
@@ -8597,21 +8295,7 @@ impl FrontierReferenceQuery<'_> {
                 "reference query candidate source limit exceeded".into(),
             ));
         }
-        let authenticated = self
-            .engine
-            .reference_candidates_at(
-                &self.base_catalog_root,
-                super::reference_catalog::ReferenceCandidateTargetV2::BlockUuid(logseq_uuid),
-                hard_limit,
-            )
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-        if candidates != authenticated {
-            return Err(ProjectionError::Materialization(
-                "SQLite block-reference candidates differ from the authenticated reverse catalog"
-                    .into(),
-            ));
-        }
-        Ok(authenticated)
+        Ok(candidates)
     }
 
     fn sqlite_alias_candidates(
@@ -8638,39 +8322,24 @@ impl FrontierReferenceQuery<'_> {
                 "reference alias candidate source limit exceeded".into(),
             ));
         }
-        let logical = super::LogicalPageName::parse(normalized_alias.to_owned())
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-        let authenticated = self
-            .engine
-            .reference_candidates_at(
-                &self.base_catalog_root,
-                super::reference_catalog::ReferenceCandidateTargetV2::PageAlias(
-                    logical.key_digest(),
-                ),
-                super::MAX_MATERIALIZATION_QUERY_ROWS,
-            )
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
-        if candidates != authenticated {
-            return Err(ProjectionError::Materialization(
-                "SQLite alias bindings differ from the authenticated reverse catalog".into(),
-            ));
-        }
-        Ok(authenticated)
+        Ok(candidates)
     }
 
     fn current_posting(
         &mut self,
         source_page_id: PageId,
     ) -> Result<super::ReferenceSourcePostingV2, ProjectionError> {
-        let posting = self
+        let page = self
             .engine
-            .reference_source_posting(source_page_id)
-            .map_err(|error| ProjectionError::Materialization(error.to_string()))?
-            .ok_or_else(|| {
-                ProjectionError::Materialization(
-                    "reference candidate has no current authenticated source posting".into(),
-                )
-            })?;
+            .materialize_page(source_page_id)
+            .map_err(|error| ProjectionError::Materialization(error.to_string()))?;
+        let page = materialized_page_input(page);
+        let posting = parser_derived_reference_source_posting(
+            self.engine
+                .reference_catalog_policy()
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?,
+            &page,
+        )?;
         self.instrumentation.revalidated_sources =
             self.instrumentation.revalidated_sources.saturating_add(1);
         Ok(posting)
@@ -10361,7 +10030,7 @@ mod tests {
             AcceptedBatchEvent::from_accepted(&engine, &store, target.manifest().batch_id())
                 .unwrap();
         database
-            .apply_authenticated_reference_catalog_materialized_accepted(
+            .apply_parser_derived_materialized_accepted(
                 &target_event,
                 rich_materialization(
                     &target_event,
@@ -10389,7 +10058,7 @@ mod tests {
             AcceptedBatchEvent::from_accepted(&engine, &store, source.manifest().batch_id())
                 .unwrap();
         database
-            .apply_authenticated_reference_catalog_materialized_accepted(
+            .apply_parser_derived_materialized_accepted(
                 &source_event,
                 rich_materialization(
                     &source_event,
@@ -10501,7 +10170,7 @@ mod tests {
             AcceptedBatchEvent::from_accepted(&engine, &store, delete.manifest().batch_id())
                 .unwrap();
         database
-            .apply_authenticated_reference_catalog_materialized_accepted(
+            .apply_parser_derived_materialized_accepted(
                 &delete_event,
                 MaterializationChange::new(delete_event.batch_id(), Vec::new(), vec![ids.page])
                     .unwrap(),
@@ -10534,7 +10203,7 @@ mod tests {
             AcceptedBatchEvent::from_accepted(&engine, &store, recreate.manifest().batch_id())
                 .unwrap();
         database
-            .apply_authenticated_reference_catalog_materialized_accepted(
+            .apply_parser_derived_materialized_accepted(
                 &recreate_event,
                 rich_materialization(
                     &recreate_event,
@@ -10557,7 +10226,7 @@ mod tests {
     }
 
     #[test]
-    fn frontier_reference_query_rejects_stale_sqlite_catalog_stamp() {
+    fn frontier_reference_query_rejects_a_corrupt_frontier_stamp() {
         let ids = TestIds::new(1_770);
         let dir = TestDir::new("frontier-reference-stale-stamp");
         let (mut database, mut engine, store) = open_empty(&dir, ids);
@@ -10572,7 +10241,7 @@ mod tests {
             AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
                 .unwrap();
         database
-            .apply_authenticated_reference_catalog_materialized_accepted(
+            .apply_parser_derived_materialized_accepted(
                 &event,
                 rich_materialization(
                     &event,
@@ -10602,19 +10271,15 @@ mod tests {
         database
             .physical
             .execute_corrupting_statement_for_test(
-                "UPDATE materialization_stamp SET catalog_root_digest = zeroblob(32) WHERE singleton = 1",
+                "UPDATE materialization_stamp SET frontier_root_digest = zeroblob(32) WHERE singleton = 1",
                 [],
             )
             .unwrap();
-        assert!(matches!(
-            database.frontier_reference_query(&engine, &store),
-            Err(ProjectionError::Materialization(message))
-                if message.contains("not bound to its authenticated frontier")
-        ));
+        assert!(database.frontier_reference_query(&engine, &store).is_err());
     }
 
     #[test]
-    fn frontier_reference_query_detects_posting_and_alias_binding_tamper_and_reads_tail() {
+    fn frontier_reference_query_is_bounded_and_reads_the_unapplied_tail() {
         let ids = TestIds::new(1_775);
         let dir = TestDir::new("frontier-reference-row-tamper");
         let engine_store = ObjectStore::open(&dir.path().join("objects"), ids.workspace).unwrap();
@@ -10648,16 +10313,9 @@ mod tests {
             content,
         );
         database
-            .apply_authenticated_reference_catalog_materialized_accepted(
-                &event,
-                base.clone(),
-                &engine,
-            )
+            .apply_parser_derived_materialized_accepted(&event, base.clone(), &engine)
             .unwrap();
         let target = crate::oplog::LogicalPageName::parse("Target").unwrap();
-        let old_owner = crate::oplog::LogicalPageName::parse("Old Owner").unwrap();
-        let target_key = crate::refs::page_key("Target");
-        let old_owner_key = crate::refs::page_key("Old Owner");
 
         assert_eq!(
             database
@@ -10676,128 +10334,6 @@ mod tests {
                 .references_to_page_name(&target, invalid_limit)
                 .is_err());
         }
-
-        database
-            .physical
-            .execute_corrupting_statement_for_test(
-                "DELETE FROM reference_postings WHERE normalized_name = ?1",
-                params![target_key],
-            )
-            .unwrap();
-        assert!(matches!(
-            database
-                .frontier_reference_query(&engine, &store)
-                .unwrap()
-                .references_to_page_name(&target, 16),
-            Err(ProjectionError::Materialization(message))
-                if message.contains("authenticated reverse catalog")
-        ));
-        database
-            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
-            .unwrap();
-
-        database
-            .physical
-            .execute_corrupting_statement_for_test(
-                "UPDATE reference_postings
-                 SET normalized_name = 'tampered'
-                 WHERE normalized_name = ?1",
-                params![target_key],
-            )
-            .unwrap();
-        assert!(database
-            .frontier_reference_query(&engine, &store)
-            .unwrap()
-            .references_to_page_name(&target, 16)
-            .is_err());
-        database
-            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
-            .unwrap();
-
-        let inserted_source = PageId::from_uuid(uuid(1_799));
-        database
-            .physical
-            .execute_corrupting_statement_for_test(
-                "INSERT INTO reference_postings (
-                     source_page_id, source_entity_type, source_entity_id, source_locator,
-                     ordinal, reference_kind, target_type, raw_name, normalized_name,
-                     raw_uuid_claim, resolved_page_id, resolved_block_id
-                 )
-                 SELECT ?1, source_entity_type, source_entity_id, source_locator,
-                        ordinal, reference_kind, target_type, raw_name, normalized_name,
-                        raw_uuid_claim, resolved_page_id, resolved_block_id
-                 FROM reference_postings WHERE normalized_name = ?2 LIMIT 1",
-                params![inserted_source.as_uuid().as_bytes().as_slice(), target_key],
-            )
-            .unwrap();
-        assert!(database
-            .frontier_reference_query(&engine, &store)
-            .unwrap()
-            .references_to_page_name(&target, 16)
-            .is_err());
-        database
-            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
-            .unwrap();
-
-        database
-            .physical
-            .execute_corrupting_statement_for_test(
-                "DELETE FROM reference_alias_bindings WHERE normalized_alias = ?1",
-                params![old_owner_key],
-            )
-            .unwrap();
-        assert!(matches!(
-            database
-                .frontier_reference_query(&engine, &store)
-                .unwrap()
-                .references_to_page_name(&old_owner, 16),
-            Err(ProjectionError::Materialization(message))
-                if message.contains("alias bindings")
-        ));
-        database
-            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
-            .unwrap();
-
-        database
-            .physical
-            .execute_corrupting_statement_for_test(
-                "UPDATE reference_alias_bindings
-                 SET normalized_alias = 'tampered'
-                 WHERE normalized_alias = ?1",
-                params![old_owner_key],
-            )
-            .unwrap();
-        assert!(database
-            .frontier_reference_query(&engine, &store)
-            .unwrap()
-            .references_to_page_name(&old_owner, 16)
-            .is_err());
-        database
-            .rebuild_authenticated_reference_catalog_materialization(vec![base.clone()], &engine)
-            .unwrap();
-
-        database
-            .physical
-            .execute_corrupting_statement_for_test(
-                "INSERT INTO reference_alias_bindings (
-                     normalized_alias, candidate_ordinal, resolved_page_id
-                 )
-                 SELECT normalized_alias, candidate_ordinal + 1000000, ?1
-                 FROM reference_alias_bindings WHERE normalized_alias = ?2 LIMIT 1",
-                params![
-                    inserted_source.as_uuid().as_bytes().as_slice(),
-                    old_owner_key
-                ],
-            )
-            .unwrap();
-        assert!(database
-            .frontier_reference_query(&engine, &store)
-            .unwrap()
-            .references_to_page_name(&old_owner, 16)
-            .is_err());
-        database
-            .rebuild_authenticated_reference_catalog_materialization(vec![base], &engine)
-            .unwrap();
 
         let tail_content = "aliases:: Old Owner\n[[Target]] and [[Tail Target]]";
         let tail = engine
@@ -10823,91 +10359,6 @@ mod tests {
         assert_eq!(results.hits.len(), 1);
         assert_eq!(results.hits[0].source_page_id, ids.page);
         assert_eq!(results.instrumentation.tail_source_postings, 1);
-    }
-
-    #[test]
-    fn rebuild_materialization_rebinds_authenticated_reference_transition() {
-        let ids = TestIds::new(1_780);
-        let dir = TestDir::new("rebuild-authenticated-reference-catalog");
-        let (mut database, mut engine, store) = open_empty(&dir, ids);
-        let prepared = engine
-            .prepare_bootstrap_transaction(
-                author(1_781),
-                &root_transaction(ids, "nested/rebuild/source.md", "[[Target]]"),
-            )
-            .unwrap();
-        publish_and_stage(&mut engine, &store, &prepared);
-        let event =
-            AcceptedBatchEvent::from_accepted(&engine, &store, prepared.manifest().batch_id())
-                .unwrap();
-        let change = attach_authenticated_reference_catalog(
-            &engine,
-            &event,
-            rich_materialization(
-                &event,
-                ids,
-                "nested/rebuild/source.md",
-                ManagedTextKind::Page,
-                "Root Fixture Page",
-                "[[Target]]",
-            ),
-        )
-        .unwrap();
-        database
-            .apply_materialized_accepted(&event, &change)
-            .unwrap();
-        let post_root = event.post_frontier_root().reference_catalog_root().clone();
-        let forged_reference =
-            super::super::sqlite_materialization::ReferenceCatalogMaterializationInput::new(
-                event.prior_frontier_root()
-                    .reference_catalog_root()
-                    .clone(),
-                post_root.clone(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![
-                    super::super::sqlite_materialization::SourceCoverageFacet {
-                        source_page_id: ids.page,
-                        source_digest: ContentDigest::of(b"caller-forged-source"),
-                        extractor_dependency_stamp:
-                            super::super::sqlite_materialization::ReferenceExtractorDependencyStamp::new(
-                                post_root.extractor_digest(),
-                                post_root.policy_digest(),
-                            )
-                            .unwrap(),
-                    },
-                ],
-                Vec::new(),
-            )
-            .unwrap();
-        let forged = MaterializationChange::new(
-            event.batch_id(),
-            change.replacements().to_vec(),
-            change.deletions().to_vec(),
-        )
-        .unwrap()
-        .with_authenticated_reference_catalog(forged_reference)
-        .unwrap();
-        assert!(matches!(
-            database.rebuild_materialization(vec![forged.clone()]),
-            Err(ProjectionError::Materialization(message))
-                if message.contains("requires authenticated engine authority")
-        ));
-        assert_eq!(
-            database
-                .rebuild_authenticated_reference_catalog_materialization(vec![forged], &engine)
-                .unwrap(),
-            1
-        );
-        let mut query = database.frontier_reference_query(&engine, &store).unwrap();
-        let hits = query
-            .references_to_page_name(&crate::oplog::LogicalPageName::parse("Target").unwrap(), 16)
-            .unwrap();
-        assert_eq!(hits.hits.len(), 1);
-        assert_eq!(hits.hits[0].source_page_id, ids.page);
     }
 
     #[test]
@@ -11054,11 +10505,7 @@ mod tests {
                 "initial",
             );
             database
-                .apply_authenticated_reference_catalog_materialized_accepted(
-                    &root_event,
-                    root_change,
-                    &engine,
-                )
+                .apply_parser_derived_materialized_accepted(&root_event, root_change, &engine)
                 .unwrap();
             let prior_page = database
                 .materialized_read()
@@ -12045,11 +11492,7 @@ mod tests {
                 <= crate::oplog::hot_engine::BOOTSTRAP_LOOKUP_SESSION_BYTES_PER_ROOT
         );
         zero_budget_database
-            .apply_authenticated_reference_catalog_materialized_accepted(
-                &create_event,
-                zero_budget_create,
-                &engine,
-            )
+            .apply_parser_derived_materialized_accepted(&create_event, zero_budget_create, &engine)
             .unwrap();
         let zero_budget_frontier = zero_budget_database.frontier_root().unwrap();
         let zero_budget_row_digest = zero_budget_database
@@ -12096,9 +11539,8 @@ mod tests {
         assert_eq!(create_stats.accepted_root_authentications, 1);
         assert_eq!(create_stats.exact_catalog_loads, 1);
         assert_eq!(
-            attach_authenticated_reference_catalog(&engine, &create_event, scoped_create.clone(),)
-                .unwrap(),
-            attach_authenticated_reference_catalog(&engine, &create_event, point_create).unwrap(),
+            attach_parser_derived_graph_facts(&engine, scoped_create.clone()).unwrap(),
+            attach_parser_derived_graph_facts(&engine, point_create).unwrap(),
             "aliases and raw reference evidence must be identical"
         );
 
@@ -12467,11 +11909,7 @@ mod tests {
             )
             .unwrap();
             database
-                .apply_authenticated_reference_catalog_materialized_accepted(
-                    &root_event,
-                    root_change,
-                    &engine,
-                )
+                .apply_parser_derived_materialized_accepted(&root_event, root_change, &engine)
                 .unwrap();
 
             let move_prepared = engine
@@ -12516,14 +11954,8 @@ mod tests {
                 "a cross-page move must preserve the block's immutable home"
             );
             database
-                .apply_authenticated_reference_catalog_materialized_accepted(
-                    &move_event,
-                    move_change,
-                    &engine,
-                )
+                .apply_parser_derived_materialized_accepted(&move_event, move_change, &engine)
                 .unwrap();
-
-            assert!(database.authenticated_reference_catalog_root().is_ok());
 
             let read = database.materialized_read().unwrap();
             assert_eq!(
@@ -13166,7 +12598,6 @@ mod tests {
     type RichDrainObservation = (
         AcceptedFrontierRoot,
         ContentDigest,
-        crate::oplog::ReferenceCatalogRootV2,
         Vec<(&'static str, ContentDigest)>,
         Vec<String>,
     );
@@ -13447,14 +12878,9 @@ mod tests {
                         .unwrap()
                 ));
             }
-            observation.push(format!(
-                "{:?}",
-                database.physical.reference_source_coverage_count().unwrap()
-            ));
             (
                 database.frontier_root().unwrap(),
                 database.semantic_projection_digest().unwrap(),
-                database.authenticated_reference_catalog_root().unwrap(),
                 database
                     .materialized_row_digests_by_table_for_test()
                     .unwrap(),
@@ -13490,8 +12916,8 @@ mod tests {
             assert!(!read.properties_named("owner", None, 64).unwrap().is_empty());
             assert!(!read.search("\"Drain Renamed\"", 64).unwrap().is_empty());
             drop(read);
-            // Reference rows for an oplog-derived materialization live in the
-            // authenticated reference catalog, not in `refs`.
+            // Parser-derived reference rows are disposable projection facts,
+            // independent of the legacy target-ID `refs` table.
             assert_eq!(
                 database
                     .physical
@@ -13507,7 +12933,7 @@ mod tests {
                 .is_empty());
             assert_eq!(
                 database.physical.reference_source_coverage_count().unwrap(),
-                2
+                0
             );
         }
 
@@ -13537,7 +12963,6 @@ mod tests {
         assert_eq!(drained_observation.1, replayed_observation.1);
         assert_eq!(drained_observation.2, replayed_observation.2);
         assert_eq!(drained_observation.3, replayed_observation.3);
-        assert_eq!(drained_observation.4, replayed_observation.4);
         assert_eq!(drained_row_digest, replayed_row_digest);
 
         let reopened = open_test_projection(
@@ -13597,22 +13022,19 @@ mod tests {
         after_refusal
     }
 
-    /// Counting `reference_source_coverage` is the only whole-table read an
-    /// otherwise point-sized ordinary apply performs. One open pays it once;
-    /// every later apply on that handle inducts from the count it already
-    /// proved against the authenticated catalog's source counts. The accounting
-    /// is asserted identical at two graph sizes, which is the property that
-    /// makes a one-page save proportional to its own delta.
+    /// Parser-derived references have no authenticated coverage table. Ordinary
+    /// applies therefore perform neither its old whole-table count nor its
+    /// inductive follow-up, independent of total graph size.
     #[test]
-    fn ordinary_applies_count_the_reference_coverage_table_once_per_open() {
+    fn parser_derived_applies_never_scan_the_legacy_reference_coverage_table() {
         let small = coverage_accounting_for_graph(2_400, 0);
         let large = coverage_accounting_for_graph(2_600, 40);
         assert_eq!(
             small.0, large.0,
             "coverage accounting per ordinary save must not depend on total graph sources"
         );
-        assert_eq!(small.1, 1, "the small graph holds one reference source");
-        assert_eq!(large.1, 41, "the large graph holds forty more sources");
+        assert_eq!(small.1, 0, "the legacy coverage table stays empty");
+        assert_eq!(large.1, 0, "graph size cannot repopulate legacy coverage");
     }
 
     /// Returns the per-apply `(full_scans, inductive_checks)` sequence and the
@@ -13676,10 +13098,10 @@ mod tests {
         publish_and_stage_archive(&mut engine, &store, &prepared);
 
         let mut coverage_accounting = Vec::new();
-        let mut apply_next = |database: &mut SqliteFrontier,
-                              engine: &ShardedHotEngine,
-                              store: &ObjectStore,
-                              sequence: u64| {
+        let apply_next = |database: &mut SqliteFrontier,
+                          engine: &ShardedHotEngine,
+                          store: &ObjectStore,
+                          sequence: u64| {
             let source = RebuildSource::new(engine, store).unwrap();
             let event = source.accepted_event_at(sequence).unwrap();
             let (disposition, _, stats) = database
@@ -13711,18 +13133,11 @@ mod tests {
             sequence += 1;
             coverage_accounting.push(apply_next(&mut database, &engine, &store, sequence));
         }
-        assert_eq!(
-            coverage_accounting[0],
-            (
-                usize::from(extra_sources == 0),
-                usize::from(extra_sources > 0)
-            ),
-            "the first apply of an open is the only one that may count the table"
-        );
+        assert_eq!(coverage_accounting[0], (0, 0));
         assert_eq!(
             &coverage_accounting[1..],
-            &[(0, 1), (0, 1), (0, 1)],
-            "an ordinary apply must not count the coverage table"
+            &[(0, 0), (0, 0), (0, 0)],
+            "parser-derived applies must not touch authenticated coverage bookkeeping"
         );
 
         // A reopened database never inherits the count, so it re-proves it.
@@ -13745,7 +13160,7 @@ mod tests {
             publish_and_stage_archive,
         );
         sequence += 1;
-        assert_eq!(apply_next(&mut database, &engine, &store, sequence), (1, 0));
+        assert_eq!(apply_next(&mut database, &engine, &store, sequence), (0, 0));
         edit_block_content(
             &mut engine,
             &store,
@@ -13755,7 +13170,7 @@ mod tests {
             publish_and_stage_archive,
         );
         sequence += 1;
-        assert_eq!(apply_next(&mut database, &engine, &store, sequence), (0, 1));
+        assert_eq!(apply_next(&mut database, &engine, &store, sequence), (0, 0));
         let coverage_rows = database.physical.reference_source_coverage_count().unwrap();
         (coverage_accounting[1..].to_vec(), coverage_rows)
     }
@@ -15159,15 +14574,7 @@ mod tests {
         for unavailable in [
             concat!("pub fn apply_", "accepted("),
             concat!("pub fn apply_", "materialized_accepted("),
-            concat!(
-                "pub fn apply_authenticated_reference_catalog_",
-                "materialized_accepted("
-            ),
             concat!("pub fn rebuild_", "materialization"),
-            concat!(
-                "pub fn rebuild_authenticated_reference_catalog_",
-                "materialization"
-            ),
             concat!("pub fn apply_internal_", "with_materialization("),
         ] {
             assert!(
@@ -15178,9 +14585,9 @@ mod tests {
         for test_only in [
             "#[cfg(test)]\n    fn apply_accepted(",
             "#[cfg(test)]\n    fn apply_materialized_accepted(",
-            "#[cfg(test)]\n    fn apply_authenticated_reference_catalog_materialized_accepted(",
+            "#[cfg(test)]\n    fn apply_parser_derived_materialized_accepted(",
             "#[cfg(test)]\n    fn rebuild_materialization",
-            "#[cfg(test)]\n    fn rebuild_authenticated_reference_catalog_materialization",
+            "#[cfg(test)]\n    fn rebuild_parser_derived_graph_materialization",
             "#[cfg(test)]\n    fn rebuild_materialization_inner",
             "#[cfg(test)]\n    fn apply_internal(",
         ] {
@@ -17144,11 +16551,8 @@ mod tests {
             reopened.database.frontier().unwrap(),
             accepted_engine.exact_frontier().unwrap()
         );
-        assert_eq!(reopened.rebuild.reference_coverage_full_scans, 1);
-        assert_eq!(
-            reopened.rebuild.reference_coverage_inductive_checks,
-            reopened.rebuild.accepted_events_applied
-        );
+        assert_eq!(reopened.rebuild.reference_coverage_full_scans, 0);
+        assert_eq!(reopened.rebuild.reference_coverage_inductive_checks, 0);
         let retry_semantic_digest = reopened.database.semantic_projection_digest().unwrap();
         let retry_row_digest = reopened
             .database

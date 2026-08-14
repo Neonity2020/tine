@@ -49,7 +49,7 @@ impl LazyGenesisFrontierBindingV1 {
         let document_count = candidate
             .manifest
             .page_count
-            .checked_add(1)
+            .checked_add(u64::from(candidate.manifest.catalog_dependencies.is_some()))
             .ok_or_else(|| invalid("lazy genesis document count overflowed"))?;
         let binding = Self {
             schema_version: LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION,
@@ -63,9 +63,7 @@ impl LazyGenesisFrontierBindingV1 {
     }
 
     pub(crate) fn validate(self) -> io::Result<()> {
-        if self.schema_version != LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION
-            || self.document_count == 0
-        {
+        if self.schema_version != LAZY_GENESIS_FRONTIER_BINDING_SCHEMA_VERSION {
             return Err(invalid("lazy genesis frontier binding is malformed"));
         }
         Ok(())
@@ -222,7 +220,7 @@ struct LazyGenesisManifestV1 {
     lineage_digest: LineageDigest,
     source_capture: BlobDescription,
     catalog_checkpoint: BlobDescription,
-    catalog_dependencies: DocumentDependencies,
+    catalog_dependencies: Option<DocumentDependencies>,
     pages: Vec<LazyGenesisPageDescriptorV1>,
     segments: Vec<BlobDescription>,
     page_count: u64,
@@ -399,7 +397,7 @@ impl LazyGenesisPackBuilder {
     pub(crate) fn finish(
         mut self,
         catalog_checkpoint: Vec<u8>,
-        catalog_dependencies: DocumentDependencies,
+        catalog_dependencies: Option<DocumentDependencies>,
     ) -> io::Result<LazyGenesisCandidate> {
         if catalog_checkpoint.is_empty()
             || catalog_checkpoint.len() > MAX_LAZY_GENESIS_CATALOG_CHECKPOINT_BYTES
@@ -408,12 +406,13 @@ impl LazyGenesisPackBuilder {
                 "lazy genesis catalog checkpoint is empty or exceeds its fixed cap",
             ));
         }
-        if !catalog_dependencies.direct_dependency_heads().is_empty()
-            || self
-                .descriptors
-                .iter()
-                .any(|page| page.home_document_id == catalog_dependencies.document_id())
-        {
+        if catalog_dependencies.as_ref().is_some_and(|dependencies| {
+            !dependencies.direct_dependency_heads().is_empty()
+                || self
+                    .descriptors
+                    .iter()
+                    .any(|page| page.home_document_id == dependencies.document_id())
+        }) {
             return Err(invalid(
                 "lazy genesis catalog dependencies are headed or alias a page home",
             ));
@@ -518,7 +517,7 @@ impl LazyGenesisCandidate {
     /// are small dependency records, not eagerly opened CRDT documents.
     pub(crate) fn frontier_documents(&self) -> Vec<DocumentDependencies> {
         let mut documents = Vec::with_capacity(self.manifest.pages.len() + 1);
-        documents.push(self.manifest.catalog_dependencies.clone());
+        documents.extend(self.manifest.catalog_dependencies.iter().cloned());
         documents.extend(
             self.manifest
                 .pages
@@ -536,8 +535,10 @@ impl LazyGenesisCandidate {
         &self,
         document_id: DocumentId,
     ) -> Option<DocumentDependencies> {
-        if self.manifest.catalog_dependencies.document_id() == document_id {
-            return Some(self.manifest.catalog_dependencies.clone());
+        if let Some(dependencies) = &self.manifest.catalog_dependencies {
+            if dependencies.document_id() == document_id {
+                return Some(dependencies.clone());
+            }
         }
         self.home_index
             .get(&document_id)
@@ -742,11 +743,14 @@ fn validate_manifest(manifest: &LazyGenesisManifestV1) -> io::Result<()> {
     }
     let mut pages = BTreeSet::new();
     let mut homes = BTreeSet::new();
-    let mut dependency_documents = BTreeSet::from([manifest.catalog_dependencies.document_id()]);
-    if !manifest
+    let mut dependency_documents = BTreeSet::new();
+    if manifest
         .catalog_dependencies
-        .direct_dependency_heads()
-        .is_empty()
+        .as_ref()
+        .is_some_and(|dependencies| {
+            !dependencies.direct_dependency_heads().is_empty()
+                || !dependency_documents.insert(dependencies.document_id())
+        })
     {
         return Err(invalid("lazy genesis catalog dependencies are headed"));
     }
@@ -875,7 +879,7 @@ mod tests {
                 builder.push(page).unwrap();
             }
             builder
-                .finish(vec![0x43, 0x41, 0x54], catalog_dependencies())
+                .finish(vec![0x43, 0x41, 0x54], Some(catalog_dependencies()))
                 .unwrap()
         };
         let first = build();
@@ -937,7 +941,7 @@ mod tests {
         .unwrap();
         builder.push(page(1, "pages/a.md", 1)).unwrap();
         let candidate = builder
-            .finish(vec![0x43, 0x41, 0x54], catalog_dependencies())
+            .finish(vec![0x43, 0x41, 0x54], Some(catalog_dependencies()))
             .unwrap();
         let (candidate, commit) = candidate.stage_into(&parent.join("genesis")).unwrap();
         fs::rename(&parent, &moved_parent).unwrap();

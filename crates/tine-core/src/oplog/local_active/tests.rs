@@ -2994,15 +2994,6 @@ fn inactive_bootstrap_promotes_to_a_writable_runtime_and_resumes_exactly() {
             .same_accepted_authority(&bootstrap_frontier),
         "promotion must reproduce the exact accepted bootstrap frontier"
     );
-    assert_eq!(
-        runtime
-            .engine()
-            .accepted_frontier_root()
-            .unwrap()
-            .reference_catalog_root(),
-        bootstrap_frontier.reference_catalog_root(),
-        "the promoted catalog root is the exact bootstrap catalog root"
-    );
     assert!(runtime
         .database()
         .frontier_root()
@@ -9160,16 +9151,6 @@ fn an_ephemeral_bootstrap_predecessor_refusal_falls_back_without_retained_mutati
                     }),
                     "the fallback must install the terminal reference-source view: {reference_names:?}"
                 );
-                let sqlite_reference_root = runtime
-                    .database()
-                    .authenticated_reference_catalog_root()
-                    .unwrap();
-                assert_eq!(sqlite_reference_root.source_count(), pages.len() as u64);
-                assert_eq!(
-                    &sqlite_reference_root,
-                    runtime.engine().reference_catalog_root().unwrap(),
-                    "SQLite and the fallback engine must expose one terminal reference authority"
-                );
                 assert_eq!(
                     runtime.publish_quiescent_resume_point(authority, &fixture.graph),
                     ResumePublicationStatus::NotPublished(
@@ -9885,7 +9866,6 @@ mod terminal_construction {
         pub(super) accepted_batch_count: usize,
         semantic_projection_digest: ContentDigest,
         semantic_effects: Vec<Vec<u8>>,
-        reference_catalog_root: Option<crate::oplog::ReferenceCatalogRootV2>,
         table_rows: Vec<(&'static str, ContentDigest)>,
         pages: Vec<MaterializedPageRow>,
         page_kind_pages: Vec<MaterializedPageRow>,
@@ -9952,8 +9932,6 @@ mod terminal_construction {
             });
         }
         ProjectionObservation {
-            reference_catalog_root: (accepted_batch_count != 0)
-                .then(|| database.authenticated_reference_catalog_root().unwrap()),
             frontier_root,
             accepted_batch_count,
             semantic_projection_digest: database.semantic_projection_digest().unwrap(),

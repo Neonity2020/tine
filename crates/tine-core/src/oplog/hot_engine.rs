@@ -112,8 +112,8 @@ const MANAGED_LOCAL_RECORD_SCHEMA_VERSION: u32 = 1;
 const ENGINE_HISTORY_SCHEMA_VERSION: u32 = 13;
 const BLOCK_CLAIM_RECORD_SCHEMA_VERSION: u32 = 2;
 const LOGSEQ_CLAIM_RECORD_SCHEMA_VERSION: u32 = 1;
-const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 7;
-const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 6;
+const ACCEPTED_EVIDENCE_SCHEMA_VERSION: u32 = 8;
+const ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION: u32 = 7;
 pub(crate) const MAX_EPHEMERAL_BLOCK_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_LOGSEQ_CLAIMS: usize = 4_096;
 const MAX_EPHEMERAL_PORTABLE_PATHS: usize = 4_096;
@@ -2016,11 +2016,6 @@ impl DetachedBootstrapAcceptedEngineMaterial {
     ) -> Result<Vec<u8>, EngineError> {
         if self.accepted_evidence.batch_id != part.batch_id()
             || self.accepted_evidence.acceptance_sequence != u64::from(part.acceptance_sequence())
-            || self
-                .accepted_evidence
-                .post_frontier_root
-                .reference_catalog_root
-                != self.reference_catalog_root
         {
             return Err(EngineError::Archive(
                 "detached bootstrap material does not match its aggregate part".into(),
@@ -4155,7 +4150,6 @@ pub struct AcceptedBatchEvidence {
     prior_frontier_root: AcceptedFrontierRoot,
     post_frontier_root: AcceptedFrontierRoot,
     affected_documents: Vec<DocumentDependencies>,
-    reference_catalog_delta: ReferenceCatalogDeltaV2,
 }
 
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
@@ -4181,7 +4175,6 @@ pub struct AcceptedFrontierRoot {
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
     genesis: Option<LazyGenesisFrontierBindingV1>,
-    reference_catalog_root: ReferenceCatalogRootV2,
     state_digest: ContentDigest,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
 }
@@ -4207,7 +4200,6 @@ pub(crate) struct AcceptedFrontierIdentity<'a> {
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: &'a ContentDigest,
     genesis: &'a Option<LazyGenesisFrontierBindingV1>,
-    reference_catalog_root: &'a ReferenceCatalogRootV2,
     state_digest: &'a ContentDigest,
 }
 
@@ -4232,7 +4224,6 @@ impl AcceptedFrontierRoot {
             batch_map_root_key: self.batch_map_root_key,
             batch_map_root_digest: &self.batch_map_root_digest,
             genesis: &self.genesis,
-            reference_catalog_root: &self.reference_catalog_root,
             state_digest: &self.state_digest,
         }
     }
@@ -4267,7 +4258,6 @@ impl AcceptedBatchEvidence {
         let (batch_map_root_key, batch_map_root_digest) =
             authenticated_map_root(&accepted_batch_entries)
                 .expect("canonical test authenticated batch map");
-        let reference_catalog_root = prior_frontier_root.reference_catalog_root.clone();
         let post_frontier_root = next_accepted_frontier_root(
             &prior_frontier_root,
             event_binding_digest,
@@ -4279,7 +4269,6 @@ impl AcceptedBatchEvidence {
             document_map_root_digest,
             batch_map_root_key,
             batch_map_root_digest,
-            reference_catalog_root.clone(),
             None,
         )
         .expect("canonical test accepted-frontier transition");
@@ -4292,9 +4281,6 @@ impl AcceptedBatchEvidence {
             prior_frontier_root,
             post_frontier_root,
             affected_documents,
-            reference_catalog_delta: ReferenceCatalogDeltaV2::empty_transition(
-                reference_catalog_root,
-            ),
         }
     }
 
@@ -4345,10 +4331,6 @@ impl AcceptedBatchEvidence {
         &self.affected_documents
     }
 
-    pub const fn reference_catalog_delta(&self) -> &ReferenceCatalogDeltaV2 {
-        &self.reference_catalog_delta
-    }
-
     pub(crate) fn validate(&self) -> Result<(), EngineError> {
         validate_accepted_evidence(self)
     }
@@ -4376,7 +4358,6 @@ impl AcceptedFrontierRoot {
             batch_map_root_key: Some([0xff; 16]),
             batch_map_root_digest: ContentDigest::of(b"saturated batch map"),
             genesis: None,
-            reference_catalog_root: empty_accepted_frontier_root().reference_catalog_root,
             state_digest: ContentDigest::of(b"saturated frontier state"),
             scratch_root: Some(super::scratch_store::ScratchLsmRoot::saturated_for_test(
                 key_bytes,
@@ -4434,10 +4415,6 @@ impl AcceptedFrontierRoot {
         normalized
     }
 
-    pub const fn reference_catalog_root(&self) -> &ReferenceCatalogRootV2 {
-        &self.reference_catalog_root
-    }
-
     pub(crate) const fn has_persistent_point_index(&self) -> bool {
         self.scratch_root.is_some()
     }
@@ -4449,7 +4426,7 @@ impl AcceptedFrontierRoot {
     /// offset legitimately differs between two runs over the identical accepted
     /// history — exactly as durable history-record validation already treats
     /// accepted evidence and the catalog checkpoint. Every authenticated field,
-    /// including `state_digest` and the reference-catalog root, is compared.
+    /// including `state_digest`, is compared.
     pub(crate) fn same_accepted_authority(&self, other: &Self) -> bool {
         let Self {
             schema_version,
@@ -4461,7 +4438,6 @@ impl AcceptedFrontierRoot {
             batch_map_root_key,
             batch_map_root_digest,
             genesis,
-            reference_catalog_root,
             state_digest,
             scratch_root: _,
         } = self;
@@ -4474,7 +4450,6 @@ impl AcceptedFrontierRoot {
             && *batch_map_root_key == other.batch_map_root_key
             && *batch_map_root_digest == other.batch_map_root_digest
             && *genesis == other.genesis
-            && *reference_catalog_root == other.reference_catalog_root
             && *state_digest == other.state_digest
     }
 
@@ -4498,7 +4473,6 @@ impl AcceptedFrontierRoot {
             post.document_map_root_digest,
             post.batch_map_root_key,
             post.batch_map_root_digest,
-            post.reference_catalog_root.clone(),
             post.scratch_root.clone(),
         )? == *post)
     }
@@ -4680,8 +4654,7 @@ impl StatusHistorySource {
                             page_names: super::object_store::PageNameDurableBinding::empty(),
                             logseq_claim_root: LogseqClaimIndexRoot::empty(),
                             reference_catalog_policy: ReferenceCatalogPolicyV1::default(),
-                            reference_catalog_root: empty_accepted_frontier_root()
-                                .reference_catalog_root,
+                            reference_catalog_root: empty_reference_catalog_root(),
                             status,
                         })
                     })
@@ -4728,8 +4701,7 @@ impl StatusHistorySource {
                         page_names: super::object_store::PageNameDurableBinding::empty(),
                         logseq_claim_root: LogseqClaimIndexRoot::empty(),
                         reference_catalog_policy: ReferenceCatalogPolicyV1::default(),
-                        reference_catalog_root: empty_accepted_frontier_root()
-                            .reference_catalog_root,
+                        reference_catalog_root: empty_reference_catalog_root(),
                         status,
                     })
                 })
@@ -6598,7 +6570,6 @@ fn accepted_frontier_cross_run_facts(
     ContentDigest,
     Option<[u8; 16]>,
     ContentDigest,
-    &ReferenceCatalogRootV2,
 ) {
     (
         root.acceptance_sequence,
@@ -6607,7 +6578,6 @@ fn accepted_frontier_cross_run_facts(
         root.document_map_root_digest,
         root.batch_map_root_key,
         root.batch_map_root_digest,
-        &root.reference_catalog_root,
     )
 }
 
@@ -7721,18 +7691,30 @@ impl LazyGenesisCheckpointBuilder {
             canonical_peer_counters(&document.oplog_vv())?,
             Vec::new(),
         )
-        .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
+        .map_err(|error| {
+            EngineError::InvalidTransaction(format!(
+                "lazy genesis page {} dependencies are invalid: {error}",
+                page.page_id
+            ))
+        })?;
         Ok((snapshot, dependencies))
     }
 
-    pub(crate) fn finish(self) -> Result<(Vec<u8>, DocumentDependencies), EngineError> {
+    pub(crate) fn finish(self) -> Result<(Vec<u8>, Option<DocumentDependencies>), EngineError> {
         self.catalog.commit();
-        let dependencies = DocumentDependencies::new(
-            self.catalog_document_id,
-            canonical_peer_counters(&self.catalog.oplog_vv())?,
-            Vec::new(),
-        )
-        .map_err(|error| EngineError::InvalidTransaction(error.to_string()))?;
+        let peer_counters = canonical_peer_counters(&self.catalog.oplog_vv())?;
+        let dependencies = if peer_counters.is_empty() {
+            None
+        } else {
+            Some(
+                DocumentDependencies::new(self.catalog_document_id, peer_counters, Vec::new())
+                    .map_err(|error| {
+                        EngineError::InvalidTransaction(format!(
+                            "lazy genesis catalog dependencies are invalid: {error}"
+                        ))
+                    })?,
+            )
+        };
         let checkpoint = self
             .catalog
             .export(ExportMode::all_updates())
@@ -8205,20 +8187,11 @@ impl ShardedHotEngine {
         catalog.set_peer_id(1).map_err(loro_error)?;
         validate_catalog(self.catalog_document_id, &catalog)?;
         let documents = candidate.frontier_documents();
-        if documents
-            .binary_search_by_key(&self.catalog_document_id, DocumentDependencies::document_id)
-            .is_err()
-        {
-            return Err(EngineError::InvalidTransaction(
-                "lazy genesis causal baseline omits the catalog document".into(),
-            ));
-        }
         let accepted_frontier_root = lazy_genesis_accepted_frontier_root(
             candidate
                 .frontier_binding()
                 .map_err(|error| EngineError::Archive(error.to_string()))?,
             &documents,
-            self.reference_catalog.root().clone(),
         )?;
         if self.scratch.is_none() {
             self.accepted_frontier = documents
@@ -10296,15 +10269,6 @@ impl ShardedHotEngine {
         let scratch = self.scratch.as_ref().ok_or_else(|| {
             EngineError::Archive("runtime resume restore requires a run-local scratch".into())
         })?;
-        // The reference catalog root the predecessor record commits must be the
-        // one the accepted frontier carries. Cheap, and it is the link between
-        // the durable authority and the run-local frontier.
-        if record.reference_catalog_root != snapshot.accepted_frontier_root.reference_catalog_root {
-            return Err(EngineError::Archive(
-                "adopted accepted frontier does not carry the predecessor reference catalog root"
-                    .into(),
-            ));
-        }
         // The accepted batch map commits one entry per accepted batch, so its
         // cardinality is the acceptance sequence. A frontier claiming more
         // accepted work than the adopted run holds stops here.
@@ -11253,8 +11217,7 @@ impl ShardedHotEngine {
                 .attach_store(store)
                 .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         }
-        self.accepted_frontier_root =
-            empty_accepted_frontier_root_with_catalog(self.reference_catalog.root().clone());
+        self.accepted_frontier_root = empty_accepted_frontier_root();
         self.current_path_catalog.accepted_frontier_root = self.accepted_frontier_root.clone();
         self.current_path_cursor_book.borrow_mut().active.clear();
         Ok(())
@@ -12705,7 +12668,7 @@ impl ShardedHotEngine {
         replacements: &BTreeMap<DocumentId, EngineDocument>,
         replacement_heads: &BTreeMap<DocumentId, BTreeSet<BatchId>>,
         candidate_roots: &ScratchRoots,
-        reference_catalog_delta: &ReferenceCatalogDeltaV2,
+        _reference_catalog_delta: &ReferenceCatalogDeltaV2,
     ) -> Result<
         (
             Option<BTreeMap<DocumentId, DocumentDependencies>>,
@@ -12915,7 +12878,6 @@ impl ShardedHotEngine {
             document_map_root_digest,
             batch_map_root_key,
             batch_map_root_digest,
-            reference_catalog_delta.post_root().clone(),
             scratch_root,
         )?;
         let evidence = AcceptedBatchEvidence {
@@ -12927,7 +12889,6 @@ impl ShardedHotEngine {
             prior_frontier_root,
             post_frontier_root,
             affected_documents,
-            reference_catalog_delta: reference_catalog_delta.clone(),
         };
         if let Some(store) = &self.scratch {
             roots.accepted_sequence_root = store
@@ -13372,6 +13333,17 @@ impl ShardedHotEngine {
     pub fn reference_catalog_root(&self) -> Result<&ReferenceCatalogRootV2, EngineError> {
         self.ensure_not_blocked()?;
         Ok(self.reference_catalog.root())
+    }
+
+    /// The parser-owned reference policy used by both accepted-history
+    /// extraction and the disposable SQLite projection.  Exposing the policy,
+    /// rather than catalog rows, lets derived projections reproduce semantic
+    /// facts without making the catalog part of accepted authority.
+    pub(crate) fn reference_catalog_policy(
+        &self,
+    ) -> Result<&ReferenceCatalogPolicyV1, EngineError> {
+        self.ensure_not_blocked()?;
+        Ok(self.reference_catalog.policy())
     }
 
     pub fn reference_source_posting(
@@ -15709,6 +15681,7 @@ impl ShardedHotEngine {
             binding,
             logseq_claim_candidate.0,
             reference_catalog.root().clone(),
+            Some(reference_catalog.delta()),
             reference_catalog.prepared_candidate(),
         )?;
         self.record_replay_timing_elapsed(durable_history_started, |timing, elapsed| {
@@ -20983,8 +20956,6 @@ impl ShardedHotEngine {
             || durable_evidence.event_binding_digest() != accepted_evidence.event_binding_digest()
             || durable_evidence.acceptance_sequence() != acceptance_sequence
             || durable_evidence.affected_documents() != accepted_evidence.affected_documents()
-            || durable_evidence.reference_catalog_delta()
-                != accepted_evidence.reference_catalog_delta()
             || accepted_frontier_cross_run_facts(durable_evidence.prior_frontier_root())
                 != accepted_frontier_cross_run_facts(accepted_evidence.prior_frontier_root())
             || accepted_frontier_cross_run_facts(durable_evidence.post_frontier_root())
@@ -22731,6 +22702,7 @@ impl ShardedHotEngine {
             self.logseq_claim_root,
             self.reference_catalog.root().clone(),
             None,
+            None,
         )
     }
 
@@ -22742,6 +22714,7 @@ impl ShardedHotEngine {
         binding: super::object_store::EngineHistoryBinding,
         logseq_claim_root: LogseqClaimIndexRoot,
         reference_catalog_root: ReferenceCatalogRootV2,
+        reference_catalog_delta: Option<&ReferenceCatalogDeltaV2>,
         prepared_reference_catalog: Option<ReferenceCatalogPreparedCandidateV2<'_>>,
     ) -> Result<(), EngineError> {
         if matches!(status, ArchiveStatus::Staged) {
@@ -22764,21 +22737,22 @@ impl ShardedHotEngine {
             validate_accepted_evidence(evidence)?;
             if evidence.batch_id != batch_id
                 || evidence.manifest_fingerprint != manifest_fingerprint
-                || evidence.post_frontier_root.reference_catalog_root != reference_catalog_root
             {
                 return Err(EngineError::Archive(
                     "accepted evidence is not cross-bound to durable history authority".into(),
                 ));
             }
-            match prepared_reference_catalog {
-                Some(prepared) => self.reference_catalog.validate_prepared_candidate(
-                    prepared,
-                    &evidence.reference_catalog_delta,
-                    &reference_catalog_root,
-                ),
-                None => self
-                    .reference_catalog
-                    .validate_delta(&evidence.reference_catalog_delta),
+            match reference_catalog_delta {
+                Some(delta) => match prepared_reference_catalog {
+                    Some(prepared) => self.reference_catalog.validate_prepared_candidate(
+                        prepared,
+                        delta,
+                        &reference_catalog_root,
+                    ),
+                    None => self.reference_catalog.validate_delta(delta),
+                },
+                None if self.reference_catalog.root() == &reference_catalog_root => Ok(()),
+                None => Err(super::reference_catalog::ReferenceCatalogError::AuthorityMismatch),
             }
             .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
         }
@@ -23162,13 +23136,8 @@ impl ShardedHotEngine {
 
     fn validate_record_catalog_transition(
         &self,
-        record: &ColdHistoryRecord,
+        _record: &ColdHistoryRecord,
     ) -> Result<(), EngineError> {
-        if let ArchiveStatus::Accepted { evidence, .. } = &record.status {
-            self.reference_catalog
-                .validate_delta(&evidence.reference_catalog_delta)
-                .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-        }
         Ok(())
     }
 
@@ -24768,6 +24737,7 @@ impl ShardedHotEngine {
                 self.logseq_claim_root,
                 self.reference_catalog.root().clone(),
                 None,
+                None,
             ) {
                 self.precommit_history_publication_failure = Some(error.clone());
                 return Err(error);
@@ -24835,6 +24805,10 @@ impl ShardedHotEngine {
         let prepared_reference_catalog = reference_catalog
             .as_ref()
             .and_then(ReferenceCatalogCandidateV2::prepared_candidate);
+        let reference_catalog_delta = reference_catalog
+            .as_ref()
+            .expect("visible batch prepared reference catalog")
+            .delta();
         let durable_history_started = self.replay_timing_started();
         if let Err(error) = self.persist_durable_final_status_with_binding(
             batch_id,
@@ -24849,6 +24823,7 @@ impl ShardedHotEngine {
                 .expect("visible batch prepared UUID claims")
                 .0,
             reference_root,
+            Some(reference_catalog_delta),
             prepared_reference_catalog,
         ) {
             self.precommit_history_publication_failure = Some(error.clone());
@@ -26773,6 +26748,7 @@ impl ShardedHotEngine {
                 self.logseq_claim_root,
                 self.reference_catalog.root().clone(),
                 None,
+                None,
             ) {
                 self.precommit_history_publication_failure = Some(error.clone());
                 return Err(error);
@@ -26871,6 +26847,7 @@ impl ShardedHotEngine {
             binding,
             logseq_claim_candidate.0,
             reference_catalog.root().clone(),
+            Some(reference_catalog.delta()),
             prepared_reference_catalog,
         ) {
             self.precommit_history_publication_failure = Some(error.clone());
@@ -30010,25 +29987,6 @@ fn decode_accepted_evidence(bytes: &[u8]) -> Result<AcceptedBatchEvidence, Engin
 }
 
 fn empty_accepted_frontier_root() -> AcceptedFrontierRoot {
-    let reference_catalog_root = ReferenceCatalogRootV2::empty(
-        &ReferenceCatalogPolicyV1::default(),
-        &PageNameOwnershipRootV1::empty(),
-        LogseqClaimIndexRoot::empty().digest(),
-    )
-    .expect("empty accepted frontier has a fixed reference catalog root");
-    empty_accepted_frontier_root_with_catalog(reference_catalog_root)
-}
-
-fn empty_accepted_frontier_root_with_catalog(
-    reference_catalog_root: ReferenceCatalogRootV2,
-) -> AcceptedFrontierRoot {
-    let mut state_bytes = b"tine/oplog/accepted-frontier/v5/empty\0".to_vec();
-    state_bytes.extend_from_slice(
-        reference_catalog_root
-            .external_digest()
-            .expect("validated empty reference root has a canonical digest")
-            .as_bytes(),
-    );
     AcceptedFrontierRoot {
         schema_version: ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION,
         acceptance_sequence: 0,
@@ -30039,16 +29997,26 @@ fn empty_accepted_frontier_root_with_catalog(
         batch_map_root_key: None,
         batch_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
         genesis: None,
-        reference_catalog_root,
-        state_digest: ContentDigest::of(&state_bytes),
+        state_digest: ContentDigest::of(b"tine/oplog/accepted-frontier/v7/empty\0"),
         scratch_root: None,
     }
+}
+
+/// Transitional empty derived-reference state. The accepted frontier no longer
+/// contains this root; remaining runtime/history users are removed by the
+/// derived-projection cutover that follows.
+fn empty_reference_catalog_root() -> ReferenceCatalogRootV2 {
+    ReferenceCatalogRootV2::empty(
+        &ReferenceCatalogPolicyV1::default(),
+        &PageNameOwnershipRootV1::empty(),
+        LogseqClaimIndexRoot::empty().digest(),
+    )
+    .expect("empty reference catalog has fixed authority inputs")
 }
 
 fn lazy_genesis_accepted_frontier_root(
     binding: LazyGenesisFrontierBindingV1,
     documents: &[DocumentDependencies],
-    reference_catalog_root: ReferenceCatalogRootV2,
 ) -> Result<AcceptedFrontierRoot, EngineError> {
     binding
         .validate()
@@ -30069,7 +30037,6 @@ fn lazy_genesis_accepted_frontier_root(
         documents.len() as u64,
         document_map_root_key,
         document_map_root_digest,
-        &reference_catalog_root,
     )?;
     let root = AcceptedFrontierRoot {
         schema_version: ACCEPTED_FRONTIER_ROOT_SCHEMA_VERSION,
@@ -30081,7 +30048,6 @@ fn lazy_genesis_accepted_frontier_root(
         batch_map_root_key: None,
         batch_map_root_digest: super::scratch_store::authenticated_map_empty_digest(),
         genesis: Some(binding),
-        reference_catalog_root,
         state_digest,
         scratch_root: None,
     };
@@ -30094,9 +30060,8 @@ fn lazy_genesis_frontier_state_digest(
     document_count: u64,
     document_map_root_key: Option<[u8; 16]>,
     document_map_root_digest: ContentDigest,
-    reference_catalog_root: &ReferenceCatalogRootV2,
 ) -> Result<ContentDigest, EngineError> {
-    let mut bytes = b"tine/oplog/accepted-frontier/v5/genesis\0".to_vec();
+    let mut bytes = b"tine/oplog/accepted-frontier/v7/genesis\0".to_vec();
     let binding =
         postcard::to_allocvec(&binding).map_err(|error| EngineError::Archive(error.to_string()))?;
     bytes.extend_from_slice(&(binding.len() as u64).to_be_bytes());
@@ -30110,12 +30075,6 @@ fn lazy_genesis_frontier_state_digest(
         None => bytes.push(0),
     }
     bytes.extend_from_slice(document_map_root_digest.as_bytes());
-    bytes.extend_from_slice(
-        reference_catalog_root
-            .external_digest()
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .as_bytes(),
-    );
     Ok(ContentDigest::of(&bytes))
 }
 
@@ -30131,7 +30090,6 @@ fn next_accepted_frontier_root(
     document_map_root_digest: ContentDigest,
     batch_map_root_key: Option<[u8; 16]>,
     batch_map_root_digest: ContentDigest,
-    reference_catalog_root: ReferenceCatalogRootV2,
     scratch_root: Option<super::scratch_store::ScratchLsmRoot>,
 ) -> Result<AcceptedFrontierRoot, EngineError> {
     validate_accepted_frontier_root(prior)?;
@@ -30140,11 +30098,7 @@ fn next_accepted_frontier_root(
             "accepted frontier sequence is not contiguous".into(),
         ));
     }
-    reference_catalog_root
-        .encode()
-        .map(|_| ())
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
-    let mut bytes = b"tine/oplog/accepted-frontier/v5\0".to_vec();
+    let mut bytes = b"tine/oplog/accepted-frontier/v7\0".to_vec();
     bytes.extend_from_slice(prior.state_digest.as_bytes());
     bytes.extend_from_slice(event_binding_digest.as_bytes());
     bytes.extend_from_slice(&acceptance_sequence.to_be_bytes());
@@ -30175,12 +30129,6 @@ fn next_accepted_frontier_root(
             .validate()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
     }
-    bytes.extend_from_slice(
-        reference_catalog_root
-            .external_digest()
-            .map_err(|error| EngineError::Archive(error.to_string()))?
-            .as_bytes(),
-    );
     bytes.extend_from_slice(&(affected_documents.len() as u64).to_be_bytes());
     for document in affected_documents {
         let encoded = encode_accepted_document(document)?;
@@ -30197,7 +30145,6 @@ fn next_accepted_frontier_root(
         batch_map_root_key,
         batch_map_root_digest,
         genesis: prior.genesis,
-        reference_catalog_root,
         state_digest: ContentDigest::of(&bytes),
         scratch_root,
     })
@@ -30211,20 +30158,9 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
         )));
     }
     if root.acceptance_sequence == 0 {
-        let empty_page_name_authority_root = PageNameOwnershipRootV1::empty()
-            .external_digest()
-            .map_err(|error| EngineError::Archive(error.to_string()))?;
-        let empty_uuid_claim_authority_root = LogseqClaimIndexRoot::empty().digest();
         if root.retained_bytes_total != 0
             || root.batch_map_root_key.is_some()
             || root.batch_map_root_digest != super::scratch_store::authenticated_map_empty_digest()
-            || root.reference_catalog_root.source_count() != 0
-            || root.reference_catalog_root.page_name_authority_root()
-                != empty_page_name_authority_root
-            || root
-                .reference_catalog_root
-                .external_uuid_claim_authority_root()
-                != empty_uuid_claim_authority_root
             || root.scratch_root.is_some()
         {
             return Err(EngineError::Archive(
@@ -30237,11 +30173,7 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
                     || root.document_map_root_key.is_some()
                     || root.document_map_root_digest
                         != super::scratch_store::authenticated_map_empty_digest()
-                    || root.state_digest
-                        != empty_accepted_frontier_root_with_catalog(
-                            root.reference_catalog_root.clone(),
-                        )
-                        .state_digest
+                    || root.state_digest != empty_accepted_frontier_root().state_digest
                 {
                     return Err(EngineError::Archive(
                         "malformed empty accepted-frontier root".into(),
@@ -30262,7 +30194,6 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
                             root.document_count,
                             root.document_map_root_key,
                             root.document_map_root_digest,
-                            &root.reference_catalog_root,
                         )?
                 {
                     return Err(EngineError::Archive(
@@ -30277,7 +30208,8 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
             && (root.document_map_root_key.is_some()
                 || root.document_map_root_digest
                     != super::scratch_store::authenticated_map_empty_digest()))
-        || (root.document_count > 0
+        || (root.genesis.is_none()
+            && root.document_count > 0
             && (root.document_map_root_key.is_none()
                 || root.document_map_root_digest
                     == super::scratch_store::authenticated_map_empty_digest()))
@@ -30291,9 +30223,6 @@ fn validate_accepted_frontier_root(root: &AcceptedFrontierRoot) -> Result<(), En
             .validate()
             .map_err(|error| EngineError::Archive(error.to_string()))?;
     }
-    root.reference_catalog_root
-        .encode()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
     Ok(())
 }
 
@@ -30555,19 +30484,6 @@ fn validate_accepted_evidence(evidence: &AcceptedBatchEvidence) -> Result<(), En
             "accepted frontier affected documents are not canonical".into(),
         ));
     }
-    if evidence.reference_catalog_delta.prior_root()
-        != &evidence.prior_frontier_root.reference_catalog_root
-        || evidence.reference_catalog_delta.post_root()
-            != &evidence.post_frontier_root.reference_catalog_root
-    {
-        return Err(EngineError::Archive(
-            "accepted reference-catalog delta is misbound".into(),
-        ));
-    }
-    evidence
-        .reference_catalog_delta
-        .encode()
-        .map_err(|error| EngineError::Archive(error.to_string()))?;
     let expected = next_accepted_frontier_root(
         &evidence.prior_frontier_root,
         evidence.event_binding_digest,
@@ -30583,7 +30499,6 @@ fn validate_accepted_evidence(evidence: &AcceptedBatchEvidence) -> Result<(), En
         evidence.post_frontier_root.document_map_root_digest,
         evidence.post_frontier_root.batch_map_root_key,
         evidence.post_frontier_root.batch_map_root_digest,
-        evidence.post_frontier_root.reference_catalog_root.clone(),
         evidence.post_frontier_root.scratch_root.clone(),
     )?;
     if expected != evidence.post_frontier_root {
@@ -30803,8 +30718,6 @@ fn decode_history_record(
             validate_accepted_evidence(evidence).is_ok()
                 && evidence.batch_id == record.batch_id
                 && evidence.manifest_fingerprint == record.manifest_fingerprint
-                && evidence.post_frontier_root.reference_catalog_root
-                    == record.reference_catalog_root
         }
         _ => true,
     };
@@ -30837,12 +30750,6 @@ fn decode_authenticated_current_history_leaf(
                 && evidence.batch_id == record.batch_id
                 && evidence.manifest_fingerprint == record.manifest_fingerprint
                 && evidence.acceptance_sequence == evidence.post_frontier_root.acceptance_sequence
-                && evidence.reference_catalog_delta.prior_root()
-                    == &evidence.prior_frontier_root.reference_catalog_root
-                && evidence.reference_catalog_delta.post_root()
-                    == &evidence.post_frontier_root.reference_catalog_root
-                && evidence.post_frontier_root.reference_catalog_root
-                    == record.reference_catalog_root
                 && validate_accepted_frontier_root(&evidence.post_frontier_root).is_ok()
         }
         _ => true,
@@ -30986,7 +30893,6 @@ fn cold_history_record_difference(
                 prior_frontier_root,
                 post_frontier_root,
                 affected_documents,
-                reference_catalog_delta,
             );
         }
         _ if actual.status != expected.status => return "status",
@@ -30999,10 +30905,8 @@ fn validate_history_catalog(
     records: &[ColdHistoryRecord],
     through_generation: u64,
 ) -> Result<(), EngineError> {
-    let mut prior_reference_root = None;
     let mut policy = None;
     let mut bootstrap = None;
-    let mut accepted_transition_seen = false;
     for (index, record) in records.iter().enumerate() {
         if record.generation != index as u64 + 1 {
             return Err(EngineError::Archive(
@@ -31025,55 +30929,6 @@ fn validate_history_catalog(
             ));
         }
         policy.get_or_insert_with(|| record.reference_catalog_policy.clone());
-        match &record.status {
-            ArchiveStatus::Accepted { evidence, .. } => {
-                let initial_root = (!accepted_transition_seen)
-                    .then(|| {
-                        ReferenceCatalogRootV2::empty_for_authority_digests(
-                            &record.reference_catalog_policy,
-                            PageNameOwnershipRootV1::empty()
-                                .external_digest()
-                                .map_err(|error| EngineError::Archive(error.to_string()))?,
-                            LogseqClaimIndexRoot::empty().digest(),
-                        )
-                        .map_err(|error| EngineError::Archive(error.to_string()))
-                    })
-                    .transpose()?;
-                if initial_root
-                    .as_ref()
-                    .is_some_and(|initial| evidence.reference_catalog_delta.prior_root() != initial)
-                {
-                    return Err(EngineError::Archive(
-                        "initial engine history reference-catalog root is not canonical empty"
-                            .into(),
-                    ));
-                }
-                let expected_prior = prior_reference_root
-                    .as_ref()
-                    .or(initial_root.as_ref())
-                    .expect("the first accepted transition has a canonical initial root");
-                if evidence.reference_catalog_delta.prior_root() != expected_prior
-                    || evidence.reference_catalog_delta.post_root()
-                        != &record.reference_catalog_root
-                {
-                    return Err(EngineError::Archive(
-                        "engine history reference-catalog transition chain is broken".into(),
-                    ));
-                }
-                accepted_transition_seen = true;
-            }
-            _ => {
-                if prior_reference_root
-                    .as_ref()
-                    .is_some_and(|prior| prior != &record.reference_catalog_root)
-                {
-                    return Err(EngineError::Archive(
-                        "non-accepted engine history record changed reference authority".into(),
-                    ));
-                }
-            }
-        }
-        prior_reference_root = Some(record.reference_catalog_root.clone());
     }
     if records.len() as u64 != through_generation {
         return Err(EngineError::Archive(
@@ -31085,7 +30940,7 @@ fn validate_history_catalog(
 
 fn validated_history_records(
     store: &super::object_store::DurableEngineHistoryStore,
-    catalog_store: Option<&ReferenceCatalogStore>,
+    _catalog_store: Option<&ReferenceCatalogStore>,
     through_generation: u64,
     history_root: ContentDigest,
 ) -> Result<Vec<ColdHistoryRecord>, EngineError> {
@@ -31096,13 +30951,6 @@ fn validated_history_records(
         .map(|(batch_id, bytes)| {
             store.note_history_decode();
             let record = decode_history_record(batch_id, &bytes)?;
-            if let (Some(catalog_store), ArchiveStatus::Accepted { evidence, .. }) =
-                (catalog_store, &record.status)
-            {
-                catalog_store
-                    .validate_delta(&evidence.reference_catalog_delta)
-                    .map_err(|error| EngineError::ReferenceCatalog(error.to_string()))?;
-            }
             Ok::<ColdHistoryRecord, EngineError>(record)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -35980,7 +35828,6 @@ mod validation_tests {
         ContentDigest,
         Option<[u8; 16]>,
         ContentDigest,
-        ReferenceCatalogRootV2,
     );
 
     type CrossRunEngineFacts = (
@@ -36012,15 +35859,7 @@ mod validation_tests {
             engine.portable_path_root.digest(),
             engine.logseq_claim_root.digest(),
             engine.reference_catalog.root().clone(),
-            (
-                frontier.0,
-                frontier.1,
-                frontier.2,
-                frontier.3,
-                frontier.4,
-                frontier.5,
-                frontier.6.clone(),
-            ),
+            frontier,
         )
     }
 
@@ -46478,7 +46317,7 @@ mod replay_benchmark {
     }
 
     #[test]
-    fn history_rejects_first_reference_delta_with_post_authority_as_prior_root() {
+    fn history_rejects_first_accepted_record_with_nonempty_prior_frontier() {
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(969_000));
         let catalog = DocumentId::from_uuid(Uuid::from_u128(969_001));
         let page = PageId::from_uuid(Uuid::from_u128(969_002));
@@ -46491,7 +46330,7 @@ mod replay_benchmark {
         let writer = ObjectStore::open(&root, workspace).unwrap();
         let mut engine = ShardedHotEngine::with_archive_store(
             ObjectStore::open(&root, workspace).unwrap(),
-            LineageDigest::of(b"reference-catalog-initial-root"),
+            LineageDigest::of(b"accepted-frontier-initial-root"),
             catalog,
         );
         let prepared = engine
@@ -46523,36 +46362,13 @@ mod replay_benchmark {
 
         let mut tampered = engine.cold_history_record(batch_id).unwrap().unwrap();
         tampered.generation = 1;
-        let arbitrary_prior = ReferenceCatalogRootV2::empty(
-            &tampered.reference_catalog_policy,
-            &tampered.page_names.ownership_root,
-            tampered.logseq_claim_root.digest(),
-        )
-        .unwrap();
         let ArchiveStatus::Accepted { evidence, .. } = &mut tampered.status else {
             panic!("first history record was accepted");
         };
-        assert_ne!(
-            evidence.reference_catalog_delta.prior_root(),
-            &arbitrary_prior,
-            "the first batch must change page-name authority for this regression"
-        );
-        evidence
-            .reference_catalog_delta
-            .replace_prior_root_for_test(arbitrary_prior.clone());
-        evidence.prior_frontier_root = empty_accepted_frontier_root_with_catalog(arbitrary_prior);
+        evidence.prior_frontier_root = evidence.post_frontier_root.clone();
         assert!(validate_accepted_evidence(evidence).is_err());
         let bytes = encode_history_record(&tampered).unwrap();
         assert!(decode_history_record(batch_id, &bytes).is_err());
-        let error = validate_history_catalog(&[tampered], 1).unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                EngineError::Archive(message)
-                    if message.contains("initial engine history reference-catalog root")
-            ),
-            "unexpected initial-root validation error: {error:?}"
-        );
         drop(engine);
         drop(writer);
         crate::test_support::remove_dir_all(root);
@@ -46846,20 +46662,6 @@ mod replay_benchmark {
             super::super::ReferenceFactV1::Block(fact)
                 if fact.raw_claim == raw_uuid
         )));
-        let evidence = engine.accepted_batch_evidence(create_id).unwrap();
-        assert_eq!(
-            evidence.reference_catalog_delta().post_root(),
-            engine.reference_catalog_root().unwrap()
-        );
-        let mut tampered_evidence = evidence.clone();
-        tampered_evidence.post_frontier_root.reference_catalog_root = tampered_evidence
-            .prior_frontier_root
-            .reference_catalog_root
-            .clone();
-        assert!(matches!(
-            tampered_evidence.validate(),
-            Err(EngineError::Archive(_))
-        ));
         let record = engine.cold_history_record(create_id).unwrap().unwrap();
         let assert_record_rejected = |label: &str, record: ColdHistoryRecord| {
             let bytes = encode_history_record(&record).unwrap();
@@ -46890,13 +46692,6 @@ mod replay_benchmark {
         };
         status_evidence.manifest_fingerprint = ContentDigest::of(b"wrong fingerprint");
         assert_record_rejected("fingerprint", tampered);
-
-        let mut tampered = record.clone();
-        tampered.reference_catalog_root = evidence
-            .prior_frontier_root()
-            .reference_catalog_root()
-            .clone();
-        assert_record_rejected("catalog root", tampered);
 
         let mut tampered = record.clone();
         let mut policy_config = crate::config::Config::default();

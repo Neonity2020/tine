@@ -1876,7 +1876,7 @@ mod tests {
         // byte-equality above. This catches a payload member that started
         // carrying path- or name-derived state, which would move the size at
         // one of the two roots and not the other.
-        assert_eq!(bytes.len(), 3_294, "the empty-rooted record's size moved");
+        assert_eq!(bytes.len(), 2_378, "the empty-rooted record's size moved");
 
         for (label, dir) in [("plain", &plain), ("nested", &nested)] {
             let set = ResumePointSet::read(dir).unwrap();
@@ -2001,7 +2001,7 @@ mod tests {
 
     /// Measured sentinel for the byte ceiling.
     ///
-    /// A record whose run-local roots are all empty already costs ~3.1 KiB,
+    /// A record whose run-local roots are all empty already costs ~2.3 KiB,
     /// because every authenticated digest is carried as a 64-character hex
     /// string and `BlockClaimIndexRoot` alone spells out 8 x 32 empty segment
     /// slots. Populated roots grow from there with **run lifetime**, not with
@@ -2016,7 +2016,7 @@ mod tests {
     fn an_empty_rooted_record_records_its_measured_headroom() {
         let length = point(1).encode().unwrap().len() as u64;
         assert!(
-            (3_000..=3_500).contains(&length),
+            (2_200..=2_600).contains(&length),
             "empty-root sealed resume point is {length} bytes"
         );
         assert!(
