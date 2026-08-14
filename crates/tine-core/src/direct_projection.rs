@@ -794,14 +794,14 @@ fn apply_pending(
             .filter(|source| replacements_needed.contains(&source.page_id))
             .collect::<Vec<_>>();
         database
-            .apply_with_source_revisions(
+            .apply_with_source_revisions_and_aliases(
                 &PhysicalGraphProjectionChange {
                     replacements,
                     deletions: source_delta.deletions,
                     reference_postings,
-                    aliases,
                 },
                 &replacement_sources,
+                &aliases,
             )
             .map_err(|error| error.to_string())?;
     }
@@ -827,14 +827,14 @@ fn apply_pending(
             }
         }
         database
-            .apply_with_source_revisions(
+            .apply_with_source_revisions_and_aliases(
                 &PhysicalGraphProjectionChange {
                     replacements,
                     deletions,
                     reference_postings,
-                    aliases,
                 },
                 &replacement_sources,
+                &aliases,
             )
             .map_err(|error| error.to_string())?;
     }
