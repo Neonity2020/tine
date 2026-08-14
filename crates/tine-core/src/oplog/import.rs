@@ -3,15 +3,17 @@
 //! This module plans reconciliation only. It does not publish semantic
 //! operations, write a graph, consult SQLite, or activate managed sync.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
 use cap_std::{ambient_authority, fs::Dir};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -78,6 +80,8 @@ thread_local! {
         std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static NEXT_BOOTSTRAP_OPERATION_MEMORY_LIMIT:
         std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static NEXT_ACTIVATION_PAGE_RECORD_MEMORY_LIMIT:
+        std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_SEAL:
         std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
             const { std::cell::RefCell::new(None) };
@@ -107,6 +111,19 @@ fn bootstrap_operation_memory_limit() -> usize {
         return limit;
     }
     BOOTSTRAP_OPERATION_MEMORY_BYTES
+}
+
+#[cfg(test)]
+fn force_next_activation_page_record_memory_limit(bytes: usize) {
+    NEXT_ACTIVATION_PAGE_RECORD_MEMORY_LIMIT.with(|limit| limit.set(Some(bytes)));
+}
+
+fn activation_page_record_memory_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = NEXT_ACTIVATION_PAGE_RECORD_MEMORY_LIMIT.with(|limit| limit.take()) {
+        return limit;
+    }
+    MAX_TERMINAL_PROJECTION_HINT_BYTES
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -796,6 +813,398 @@ impl InactiveBootstrapAcceptedAuthority {
     }
 }
 
+const ACTIVATION_PAGE_RECORD_SCHEMA_VERSION: u32 = 1;
+const MAX_ACTIVATION_PAGE_RECORD_BYTES: usize = 256 * 1024 * 1024;
+
+/// Source-only facts needed by the temporary old-operation oracle but not by
+/// SQLite. Keeping them beside the terminal page makes one parsed page record
+/// sufficient for both consumers during the genesis differential phase.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationBlockSourceV1 {
+    span: StructuralSpan,
+    raw_ids: Vec<String>,
+}
+
+/// One parser-owned page record for the activation fan-out.
+///
+/// The record is process-only in Packet 1. It is neither managed authority nor
+/// a durable format commitment; the later genesis packet will choose the
+/// durable capsule codec. Its strict schema and bounds nevertheless make the
+/// shadow differential exercise the same streaming boundary production will
+/// consume.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationPageRecordV1 {
+    schema_version: u32,
+    source_leaf: [u8; 32],
+    full_span: Option<StructuralSpan>,
+    page: super::MaterializedPageInput,
+    block_sources: Vec<ActivationBlockSourceV1>,
+}
+
+impl ActivationPageRecordV1 {
+    fn new(
+        source_leaf: SourceLeafDigestV1,
+        full_span: Option<StructuralSpan>,
+        page: super::MaterializedPageInput,
+        block_sources: Vec<ActivationBlockSourceV1>,
+    ) -> Result<Self, BootstrapStreamingImportError> {
+        let record = Self {
+            schema_version: ACTIVATION_PAGE_RECORD_SCHEMA_VERSION,
+            source_leaf: *source_leaf.as_bytes(),
+            full_span,
+            page,
+            block_sources,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), BootstrapStreamingImportError> {
+        if self.schema_version != ACTIVATION_PAGE_RECORD_SCHEMA_VERSION
+            || self.page.blocks.len() != self.block_sources.len()
+        {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "activation page record shape is malformed".into(),
+            ));
+        }
+        if let Some(full) = self.full_span {
+            for source in &self.block_sources {
+                if source.span.start() < full.start() || source.span.end() > full.end() {
+                    return Err(BootstrapStreamingImportError::InvalidOperation(
+                        "activation block span escapes its source page".into(),
+                    ));
+                }
+            }
+        } else if !self.block_sources.is_empty() {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "nonempty activation page has no exact source span".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, BootstrapStreamingImportError> {
+        self.validate()?;
+        let bytes = postcard::to_allocvec(self)
+            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
+        if bytes.len() > MAX_ACTIVATION_PAGE_RECORD_BYTES {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "activation page record bytes",
+                observed: bytes.len() as u64,
+                limit: MAX_ACTIVATION_PAGE_RECORD_BYTES as u64,
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, BootstrapStreamingImportError> {
+        if bytes.len() > MAX_ACTIVATION_PAGE_RECORD_BYTES {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "activation page record bytes",
+                observed: bytes.len() as u64,
+                limit: MAX_ACTIVATION_PAGE_RECORD_BYTES as u64,
+            });
+        }
+        let record: Self = postcard::from_bytes(bytes)
+            .map_err(|error| BootstrapStreamingImportError::InvalidOperation(error.to_string()))?;
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+enum ActivationPageRecordBuildMode {
+    Memory {
+        records: Vec<ActivationPageRecordV1>,
+        encoded_bytes: usize,
+    },
+    Spilled {
+        writer: BufWriter<File>,
+        path: PathBuf,
+        index: BTreeMap<PageId, (u64, u64)>,
+        encoded_bytes: usize,
+    },
+    Transitioning,
+}
+
+struct ActivationPageRecordBuilder {
+    memory_limit: usize,
+    mode: ActivationPageRecordBuildMode,
+}
+
+impl ActivationPageRecordBuilder {
+    fn new() -> Self {
+        Self {
+            memory_limit: activation_page_record_memory_limit(),
+            mode: ActivationPageRecordBuildMode::Memory {
+                records: Vec::new(),
+                encoded_bytes: 0,
+            },
+        }
+    }
+
+    fn push(
+        &mut self,
+        record: ActivationPageRecordV1,
+    ) -> Result<(), BootstrapStreamingImportError> {
+        let encoded = record.encode()?;
+        let transition = match &self.mode {
+            ActivationPageRecordBuildMode::Memory { encoded_bytes, .. } => encoded_bytes
+                .checked_add(encoded.len())
+                .is_none_or(|next| next > self.memory_limit),
+            _ => false,
+        };
+        if transition {
+            self.spill_memory_records()?;
+        }
+        match &mut self.mode {
+            ActivationPageRecordBuildMode::Memory {
+                records,
+                encoded_bytes,
+            } => {
+                *encoded_bytes = encoded_bytes.checked_add(encoded.len()).ok_or_else(|| {
+                    BootstrapStreamingImportError::InvalidOperation(
+                        "activation page record byte count overflow".into(),
+                    )
+                })?;
+                records.push(record);
+                Ok(())
+            }
+            ActivationPageRecordBuildMode::Spilled {
+                writer,
+                index,
+                encoded_bytes,
+                ..
+            } => {
+                write_activation_page_record_frame(writer, index, &record, &encoded)?;
+                *encoded_bytes = encoded_bytes.checked_add(encoded.len()).ok_or_else(|| {
+                    BootstrapStreamingImportError::InvalidOperation(
+                        "activation page record byte count overflow".into(),
+                    )
+                })?;
+                Ok(())
+            }
+            ActivationPageRecordBuildMode::Transitioning => unreachable!(),
+        }
+    }
+
+    fn spill_memory_records(&mut self) -> Result<(), BootstrapStreamingImportError> {
+        let ActivationPageRecordBuildMode::Memory {
+            records,
+            encoded_bytes,
+        } = std::mem::replace(&mut self.mode, ActivationPageRecordBuildMode::Transitioning)
+        else {
+            unreachable!("activation page records spill only once")
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tine-activation-page-records-{}.spool",
+            Uuid::new_v4().simple()
+        ));
+        let prepared = (|| {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            let mut writer = BufWriter::new(file);
+            let mut index = BTreeMap::new();
+            for record in records {
+                let encoded = record.encode()?;
+                write_activation_page_record_frame(&mut writer, &mut index, &record, &encoded)?;
+            }
+            Ok::<_, BootstrapStreamingImportError>((writer, index))
+        })();
+        let (writer, index) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        self.mode = ActivationPageRecordBuildMode::Spilled {
+            writer,
+            path,
+            index,
+            encoded_bytes,
+        };
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ActivationPageRecordStore, BootstrapStreamingImportError> {
+        match self.mode {
+            ActivationPageRecordBuildMode::Memory {
+                mut records,
+                encoded_bytes,
+            } => {
+                records.sort_unstable_by_key(|record| record.page.page_id);
+                if records
+                    .windows(2)
+                    .any(|pair| pair[0].page.page_id == pair[1].page.page_id)
+                {
+                    return Err(BootstrapStreamingImportError::InvalidOperation(
+                        "activation page records repeat a page identity".into(),
+                    ));
+                }
+                Ok(ActivationPageRecordStore::Memory {
+                    records,
+                    encoded_bytes,
+                })
+            }
+            ActivationPageRecordBuildMode::Spilled {
+                mut writer,
+                path,
+                index,
+                encoded_bytes,
+            } => {
+                if let Err(error) = writer.flush() {
+                    drop(writer);
+                    let _ = fs::remove_file(&path);
+                    return Err(error.into());
+                }
+                let file = match writer.into_inner() {
+                    Ok(file) => file,
+                    Err(error) => {
+                        let failure =
+                            io::Error::new(error.error().kind(), error.error().to_string());
+                        drop(error.into_inner());
+                        let _ = fs::remove_file(&path);
+                        return Err(failure.into());
+                    }
+                };
+                Ok(ActivationPageRecordStore::Spilled(
+                    SpilledActivationPageRecords {
+                        file: RefCell::new(Some(file)),
+                        path,
+                        index,
+                        encoded_bytes,
+                    },
+                ))
+            }
+            ActivationPageRecordBuildMode::Transitioning => unreachable!(),
+        }
+    }
+}
+
+fn write_activation_page_record_frame(
+    writer: &mut BufWriter<File>,
+    index: &mut BTreeMap<PageId, (u64, u64)>,
+    record: &ActivationPageRecordV1,
+    encoded: &[u8],
+) -> Result<(), BootstrapStreamingImportError> {
+    let start = writer.stream_position()?;
+    let length = u64::try_from(encoded.len()).map_err(|_| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "activation page record length cannot be represented".into(),
+        )
+    })?;
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(encoded)?;
+    let offset = start.checked_add(8).ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "activation page record offset overflow".into(),
+        )
+    })?;
+    if index
+        .insert(record.page.page_id, (offset, length))
+        .is_some()
+    {
+        return Err(BootstrapStreamingImportError::InvalidOperation(
+            "activation page records repeat a page identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+enum ActivationPageRecordStore {
+    Memory {
+        records: Vec<ActivationPageRecordV1>,
+        encoded_bytes: usize,
+    },
+    Spilled(SpilledActivationPageRecords),
+}
+
+impl ActivationPageRecordStore {
+    fn page_count(&self) -> usize {
+        match self {
+            Self::Memory { records, .. } => records.len(),
+            Self::Spilled(spilled) => spilled.index.len(),
+        }
+    }
+
+    fn encoded_bytes(&self) -> usize {
+        match self {
+            Self::Memory { encoded_bytes, .. } => *encoded_bytes,
+            Self::Spilled(spilled) => spilled.encoded_bytes,
+        }
+    }
+
+    fn spilled(&self) -> bool {
+        matches!(self, Self::Spilled(_))
+    }
+
+    fn page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<ActivationPageRecordV1>, BootstrapStreamingImportError> {
+        match self {
+            Self::Memory { records, .. } => Ok(records
+                .binary_search_by_key(&page_id, |record| record.page.page_id)
+                .ok()
+                .map(|index| records[index].clone())),
+            Self::Spilled(spilled) => spilled.page(page_id),
+        }
+    }
+}
+
+struct SpilledActivationPageRecords {
+    file: RefCell<Option<File>>,
+    path: PathBuf,
+    index: BTreeMap<PageId, (u64, u64)>,
+    encoded_bytes: usize,
+}
+
+impl SpilledActivationPageRecords {
+    fn page(
+        &self,
+        page_id: PageId,
+    ) -> Result<Option<ActivationPageRecordV1>, BootstrapStreamingImportError> {
+        let Some(&(offset, length)) = self.index.get(&page_id) else {
+            return Ok(None);
+        };
+        if length > MAX_ACTIVATION_PAGE_RECORD_BYTES as u64 {
+            return Err(BootstrapStreamingImportError::ResourceLimit {
+                resource: "activation page record bytes",
+                observed: length,
+                limit: MAX_ACTIVATION_PAGE_RECORD_BYTES as u64,
+            });
+        }
+        let mut file = self.file.borrow_mut();
+        let file = file.as_mut().ok_or_else(|| {
+            BootstrapStreamingImportError::InvalidOperation(
+                "activation page record spool is closed".into(),
+            )
+        })?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0_u8; length as usize];
+        file.read_exact(&mut bytes)?;
+        let record = ActivationPageRecordV1::decode(&bytes)?;
+        if record.page.page_id != page_id {
+            return Err(BootstrapStreamingImportError::InvalidOperation(
+                "activation page record index points to another page".into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+}
+
+impl Drop for SpilledActivationPageRecords {
+    fn drop(&mut self) {
+        self.file.get_mut().take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// One-shot, process-local capability that lets an uninterrupted fresh
 /// activation build its SQLite projection from the terminal accepted state it
 /// just authored, instead of reloading and replaying every physical bootstrap
@@ -816,7 +1225,7 @@ pub(crate) struct TerminalBootstrapConstructionMaterial {
     operation_count: u64,
     declaration_count: u64,
     accepted_events: Vec<AcceptedBatchEvent>,
-    terminal_projection_pages: Option<Vec<super::MaterializedPageInput>>,
+    activation_pages: Option<ActivationPageRecordStore>,
 }
 
 #[allow(dead_code)]
@@ -848,12 +1257,14 @@ impl TerminalBootstrapConstructionMaterial {
     pub(crate) fn terminal_projection_page(
         &self,
         page_id: PageId,
-    ) -> Option<&super::MaterializedPageInput> {
-        let pages = self.terminal_projection_pages.as_ref()?;
-        pages
-            .binary_search_by_key(&page_id, |page| page.page_id)
-            .ok()
-            .map(|index| &pages[index])
+    ) -> Result<Option<super::MaterializedPageInput>, BootstrapStreamingImportError> {
+        Ok(self
+            .activation_pages
+            .as_ref()
+            .map(|pages| pages.page(page_id))
+            .transpose()?
+            .flatten()
+            .map(|record| record.page))
     }
 }
 
@@ -2524,7 +2935,7 @@ struct BootstrapOperationSpool {
     storage: BootstrapOperationStorage,
     operation_count: u64,
     declaration_count: u64,
-    terminal_projection_pages: Option<Vec<super::MaterializedPageInput>>,
+    activation_pages: Option<ActivationPageRecordStore>,
 }
 
 enum BootstrapOperationCollectionMode {
@@ -2778,6 +3189,102 @@ fn page_capsule_sort_key(path: &ManagedPath, sequence: u64) -> Vec<u8> {
     key
 }
 
+fn emit_activation_page_operations(
+    record: &ActivationPageRecordV1,
+    collector: &mut BootstrapOperationCollector,
+    operation_count: &mut u64,
+    declaration_count: &mut u64,
+) -> Result<(), BootstrapStreamingImportError> {
+    record.validate()?;
+    let source_leaf = SourceLeafDigestV1::from_bytes(record.source_leaf);
+    let page = &record.page;
+    let logical_name = LogicalPageName::parse(page.name.clone())
+        .map_err(|error| BootstrapStreamingImportError::InvalidSource(error.to_string()))?;
+    let page_operation = BootstrapOperationRecord::new(
+        SemanticOperation::CreatePage {
+            page_id: page.page_id,
+            home_document_id: page.home_document_id,
+            name: logical_name,
+            path: page.path.clone(),
+            kind: page.kind,
+        },
+        source_leaf,
+        record.full_span,
+    )?;
+    collector.push_content(
+        page_capsule_sort_key(&page.path, 0),
+        page_operation.encode()?,
+    )?;
+    *operation_count = checked_bootstrap_operation_count(*operation_count)?;
+    *declaration_count = declaration_count.checked_add(1).ok_or_else(|| {
+        BootstrapStreamingImportError::InvalidOperation(
+            "bootstrap declaration count overflow".into(),
+        )
+    })?;
+    if page.preamble.is_some() {
+        let preamble = BootstrapOperationRecord::new(
+            SemanticOperation::SetPagePreamble {
+                page_id: page.page_id,
+                preamble: page.preamble.clone(),
+            },
+            source_leaf,
+            record.full_span,
+        )?;
+        collector.push_content(page_capsule_sort_key(&page.path, 1), preamble.encode()?)?;
+        *operation_count = checked_bootstrap_operation_count(*operation_count)?;
+    }
+    for (index, (block, source)) in page.blocks.iter().zip(&record.block_sources).enumerate() {
+        let operation = BootstrapOperationRecord::new(
+            SemanticOperation::CreateBlock {
+                block: BlockLocation {
+                    block_id: block.block_id,
+                    home_document_id: block.home_document_id,
+                },
+                page_id: page.page_id,
+                parent: block.parent,
+                order: block.order.clone(),
+                content: block.content.clone(),
+            },
+            source_leaf,
+            Some(source.span),
+        )?;
+        let block_sequence = 2_u64.saturating_add((index as u64).saturating_mul(2));
+        collector.push_content(
+            page_capsule_sort_key(&page.path, block_sequence),
+            operation.encode()?,
+        )?;
+        *operation_count = checked_bootstrap_operation_count(*operation_count)?;
+
+        if source.raw_ids.len() == 1 {
+            if let Ok(logseq_uuid) = LogseqUuid::parse(source.raw_ids[0].trim()) {
+                let identity = BootstrapOperationRecord::new(
+                    SemanticOperation::MutateBlockLogseqIdentity {
+                        block: BlockLocation {
+                            block_id: block.block_id,
+                            home_document_id: block.home_document_id,
+                        },
+                        mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
+                    },
+                    source_leaf,
+                    Some(source.span),
+                )?;
+                let content_key = page_capsule_sort_key(&page.path, block_sequence + 1);
+                let key_length = u32::try_from(content_key.len()).map_err(|_| {
+                    BootstrapStreamingImportError::InvalidOperation(
+                        "page capsule key length cannot be represented".into(),
+                    )
+                })?;
+                let mut value = Vec::with_capacity(4 + content_key.len() + 128);
+                value.extend_from_slice(&key_length.to_be_bytes());
+                value.extend_from_slice(&content_key);
+                value.extend_from_slice(&identity.encode()?);
+                collector.push_identity(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn spool_bootstrap_operations(
     capture: &BootstrapSourceCapture,
     import_id: ImportId,
@@ -2791,8 +3298,7 @@ fn spool_bootstrap_operations(
     let mut entries = capture.entries_cursor()?;
     let mut operation_count = 0_u64;
     let mut declaration_count = 0_u64;
-    let mut terminal_projection_pages = Some(Vec::new());
-    let mut terminal_projection_bytes = 0_usize;
+    let mut activation_pages = ActivationPageRecordBuilder::new();
 
     while let Some(entry) = entries.next()? {
         let bytes = source_reader.read_entry(&entry, instrumentation)?;
@@ -2842,23 +3348,6 @@ fn spool_bootstrap_operations(
         // operation for this external document is constructible.
         let page_name = logical_name.as_str().to_owned();
         let page_name_key = logical_name.canonical_key();
-        let page_operation = BootstrapOperationRecord::new(
-            SemanticOperation::CreatePage {
-                page_id,
-                home_document_id,
-                name: logical_name,
-                path: entry.path().clone(),
-                kind: entry.kind(),
-            },
-            source_leaf,
-            full_span,
-        )?;
-        collector.push_content(
-            page_capsule_sort_key(entry.path(), 0),
-            page_operation.encode()?,
-        )?;
-        operation_count = checked_bootstrap_operation_count(operation_count)?;
-        declaration_count += 1;
         instrumentation.parser_nodes = instrumentation
             .parser_nodes
             .checked_add(tree.nodes.len() as u64)
@@ -2870,22 +3359,9 @@ fn spool_bootstrap_operations(
         instrumentation.peak_owned_parser_nodes = instrumentation
             .peak_owned_parser_nodes
             .max(tree.nodes.len() as u64);
-        if tree.preamble.is_some() {
-            let preamble = BootstrapOperationRecord::new(
-                SemanticOperation::SetPagePreamble {
-                    page_id,
-                    preamble: tree.preamble.clone(),
-                },
-                source_leaf,
-                full_span,
-            )?;
-            collector.push_content(page_capsule_sort_key(entry.path(), 1), preamble.encode()?)?;
-            operation_count = checked_bootstrap_operation_count(operation_count)?;
-        }
         let mut node_ids = Vec::with_capacity(tree.nodes.len());
-        let mut terminal_blocks = terminal_projection_pages
-            .as_ref()
-            .map(|_| Vec::with_capacity(tree.nodes.len()));
+        let mut terminal_blocks = Vec::with_capacity(tree.nodes.len());
+        let mut activation_block_sources = Vec::with_capacity(tree.nodes.len());
         for index in 0..tree.nodes.len() {
             let locator = materialize_locator(&tree, index, &mut parser_instrumentation).map_err(
                 |block| {
@@ -2900,87 +3376,43 @@ fn spool_bootstrap_operations(
                 import_id.unmatched_block_id(&ImportLocator::block(entry.path().clone(), locator));
             let parent = tree.nodes[index].parent.map(|parent| node_ids[parent]);
             node_ids.push(block_id);
-            let span = Some(tree.nodes[index].span);
-            let operation = BootstrapOperationRecord::new(
-                SemanticOperation::CreateBlock {
-                    block: BlockLocation {
-                        block_id,
-                        home_document_id,
-                    },
-                    page_id,
-                    parent,
-                    order: imported_order(tree.nodes[index].sibling_position),
-                    content: tree.nodes[index].raw.clone(),
-                },
-                source_leaf,
-                span,
-            )?;
-            let block_sequence = 2_u64.saturating_add((index as u64).saturating_mul(2));
-            collector.push_content(
-                page_capsule_sort_key(entry.path(), block_sequence),
-                operation.encode()?,
-            )?;
-            operation_count = checked_bootstrap_operation_count(operation_count)?;
-
-            if tree.nodes[index].raw_ids.len() == 1 {
-                if let Ok(logseq_uuid) = LogseqUuid::parse(tree.nodes[index].raw_ids[0].trim()) {
-                    let identity = BootstrapOperationRecord::new(
-                        SemanticOperation::MutateBlockLogseqIdentity {
-                            block: BlockLocation {
-                                block_id,
-                                home_document_id,
-                            },
-                            mutation: LogseqIdentityMutation::AssignExternal { logseq_uuid },
-                        },
-                        source_leaf,
-                        span,
-                    )?;
-                    let content_key = page_capsule_sort_key(entry.path(), block_sequence + 1);
-                    let key_length = u32::try_from(content_key.len()).map_err(|_| {
-                        BootstrapStreamingImportError::InvalidOperation(
-                            "page capsule key length cannot be represented".into(),
-                        )
-                    })?;
-                    let mut value = Vec::with_capacity(4 + content_key.len() + 128);
-                    value.extend_from_slice(&key_length.to_be_bytes());
-                    value.extend_from_slice(&content_key);
-                    value.extend_from_slice(&identity.encode()?);
-                    collector.push_identity(logseq_uuid.as_uuid().as_bytes().to_vec(), value)?;
-                }
-            }
-            if let Some(blocks) = terminal_blocks.as_mut() {
-                let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
-                blocks.push(super::MaterializedBlockInput {
-                    block_id,
-                    home_document_id,
-                    parent,
-                    order: imported_order(tree.nodes[index].sibling_position),
-                    content: std::mem::take(&mut tree.nodes[index].raw),
-                    searchable_text: facets.searchable_text,
-                    heading_level: facets.heading_level,
-                    collapsed: facets.collapsed,
-                    logseq_uuid: None,
-                    logseq_identity_origin: None,
-                    references: Vec::new(),
-                    properties: facets.properties,
-                    tags: facets.tags,
-                    task: facets.task,
-                });
-            }
+            let facets = std::mem::take(&mut tree.nodes[index].projection_facets);
+            terminal_blocks.push(super::MaterializedBlockInput {
+                block_id,
+                home_document_id,
+                parent,
+                order: imported_order(tree.nodes[index].sibling_position),
+                content: std::mem::take(&mut tree.nodes[index].raw),
+                searchable_text: facets.searchable_text,
+                heading_level: facets.heading_level,
+                collapsed: facets.collapsed,
+                logseq_uuid: None,
+                logseq_identity_origin: None,
+                references: Vec::new(),
+                properties: facets.properties,
+                tags: facets.tags,
+                task: facets.task,
+            });
+            activation_block_sources.push(ActivationBlockSourceV1 {
+                span: tree.nodes[index].span,
+                raw_ids: std::mem::take(&mut tree.nodes[index].raw_ids),
+            });
         }
-        if let Some(blocks) = terminal_blocks {
-            let is_org = super::reference_catalog::reference_source_is_org(entry.path());
-            let (preamble_search, _, _, properties, tags, _) = tree
-                .preamble
-                .as_deref()
-                .map(|preamble| super::sqlite::document_facets(preamble, is_org))
-                .unwrap_or_default();
-            let mut searchable = page_name.clone();
-            if !preamble_search.is_empty() {
-                searchable.push(' ');
-                searchable.push_str(&preamble_search);
-            }
-            let page = super::MaterializedPageInput {
+        let is_org = super::reference_catalog::reference_source_is_org(entry.path());
+        let (preamble_search, _, _, properties, tags, _) = tree
+            .preamble
+            .as_deref()
+            .map(|preamble| super::sqlite::document_facets(preamble, is_org))
+            .unwrap_or_default();
+        let mut searchable = page_name.clone();
+        if !preamble_search.is_empty() {
+            searchable.push(' ');
+            searchable.push_str(&preamble_search);
+        }
+        let record = ActivationPageRecordV1::new(
+            source_leaf,
+            full_span,
+            super::MaterializedPageInput {
                 page_id,
                 home_document_id,
                 name: page_name,
@@ -2992,25 +3424,17 @@ fn spool_bootstrap_operations(
                 references: Vec::new(),
                 properties,
                 tags,
-                blocks,
-            };
-            let encoded_bytes = postcard::to_allocvec(&page)
-                .map_err(|error| {
-                    BootstrapStreamingImportError::InvalidOperation(error.to_string())
-                })?
-                .len();
-            let next = terminal_projection_bytes.saturating_add(encoded_bytes);
-            if next > MAX_TERMINAL_PROJECTION_HINT_BYTES {
-                terminal_projection_pages = None;
-                instrumentation.terminal_projection_hint_spilled = true;
-            } else {
-                terminal_projection_bytes = next;
-                terminal_projection_pages
-                    .as_mut()
-                    .expect("terminal projection pages remain enabled")
-                    .push(page);
-            }
-        }
+                blocks: terminal_blocks,
+            },
+            activation_block_sources,
+        )?;
+        emit_activation_page_operations(
+            &record,
+            &mut collector,
+            &mut operation_count,
+            &mut declaration_count,
+        )?;
+        activation_pages.push(record)?;
         let _ = text;
     }
     source_reader.finish()?;
@@ -3021,15 +3445,15 @@ fn spool_bootstrap_operations(
     })?;
     require_bootstrap_operation_limit(operation_count)?;
     instrumentation.operations = operation_count;
-    instrumentation.terminal_projection_hint_pages = terminal_projection_pages
-        .as_ref()
-        .map_or(0, |pages| pages.len() as u64);
-    instrumentation.terminal_projection_hint_bytes = terminal_projection_bytes as u64;
+    let activation_pages = activation_pages.finish()?;
+    instrumentation.terminal_projection_hint_pages = activation_pages.page_count() as u64;
+    instrumentation.terminal_projection_hint_bytes = activation_pages.encoded_bytes() as u64;
+    instrumentation.terminal_projection_hint_spilled = activation_pages.spilled();
     Ok(BootstrapOperationSpool {
         storage,
         operation_count,
         declaration_count,
-        terminal_projection_pages,
+        activation_pages: Some(activation_pages),
     })
 }
 
@@ -4002,10 +4426,6 @@ fn retain_terminal_construction_material(
     operations: &mut BootstrapOperationSpool,
     accepted_events: Vec<AcceptedBatchEvent>,
 ) -> Option<TerminalBootstrapConstructionMaterial> {
-    let mut terminal_projection_pages = operations.terminal_projection_pages.take();
-    if let Some(pages) = terminal_projection_pages.as_mut() {
-        pages.sort_unstable_by_key(|page| page.page_id);
-    }
     Some(TerminalBootstrapConstructionMaterial {
         workspace_id,
         lineage_digest,
@@ -4013,7 +4433,7 @@ fn retain_terminal_construction_material(
         operation_count: operations.operation_count,
         declaration_count: operations.declaration_count,
         accepted_events,
-        terminal_projection_pages,
+        activation_pages: operations.activation_pages.take(),
     })
 }
 
@@ -11014,7 +11434,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(operation_path),
             operation_count,
             declaration_count: pages as u64,
-            terminal_projection_pages: None,
+            activation_pages: None,
         };
         force_next_bootstrap_part_operation_limit(128);
         let mut instrumentation = BootstrapStreamingImportInstrumentation::default();
@@ -11209,6 +11629,63 @@ mod tests {
         assert!(source.contains("fn author_bootstrap_parts("));
         let sqlite_source = include_str!("sqlite.rs");
         assert!(sqlite_source.contains("self.materialized_row_digest_for_harness()?"));
+    }
+
+    #[test]
+    fn activation_page_record_stream_is_identical_in_memory_and_spilled() {
+        let files = [
+            ("pages/alpha.md", "title:: Alpha\n\n- one [[Beta]]\n"),
+            (
+                "pages/beta.md",
+                "- two\n  id:: 00000000-0000-0000-0000-000000000042\n",
+            ),
+        ];
+        force_next_activation_page_record_memory_limit(usize::MAX);
+        let (_memory_root, memory, _) =
+            prepare_streaming_bootstrap("activation-pages-memory", &files);
+        force_next_activation_page_record_memory_limit(0);
+        let (_spilled_root, spilled, _) =
+            prepare_streaming_bootstrap("activation-pages-spilled", &files);
+
+        assert!(!memory.instrumentation().terminal_projection_hint_spilled);
+        assert!(spilled.instrumentation().terminal_projection_hint_spilled);
+        assert_eq!(memory.instrumentation().terminal_projection_hint_pages, 2);
+        assert_eq!(spilled.instrumentation().terminal_projection_hint_pages, 2);
+
+        let collect = |prepared: &InactiveBootstrapPreparedPublication| {
+            let store = prepared
+                .terminal_construction
+                .as_ref()
+                .and_then(|material| material.activation_pages.as_ref())
+                .unwrap();
+            let page_ids = match store {
+                ActivationPageRecordStore::Memory { records, .. } => records
+                    .iter()
+                    .map(|record| record.page.page_id)
+                    .collect::<Vec<_>>(),
+                ActivationPageRecordStore::Spilled(records) => {
+                    records.index.keys().copied().collect::<Vec<_>>()
+                }
+            };
+            page_ids
+                .into_iter()
+                .map(|page_id| store.page(page_id).unwrap().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(collect(&memory), collect(&spilled));
+
+        let spill_path = match spilled
+            .terminal_construction
+            .as_ref()
+            .and_then(|material| material.activation_pages.as_ref())
+            .unwrap()
+        {
+            ActivationPageRecordStore::Spilled(records) => records.path.clone(),
+            ActivationPageRecordStore::Memory { .. } => panic!("forced spill stayed in memory"),
+        };
+        assert!(spill_path.exists());
+        drop(spilled);
+        assert!(!spill_path.exists());
     }
 
     fn bootstrap_preparation_scratch(root: &TestRoot, label: &str) -> (PathBuf, PathBuf) {
@@ -11881,7 +12358,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(path),
             operation_count,
             declaration_count: 0,
-            terminal_projection_pages: None,
+            activation_pages: None,
         }
     }
 
@@ -11914,7 +12391,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(path),
             operation_count: page_count,
             declaration_count: 0,
-            terminal_projection_pages: None,
+            activation_pages: None,
         }
     }
 
@@ -11956,7 +12433,7 @@ mod tests {
             storage: BootstrapOperationStorage::File(path),
             operation_count: declaration_count,
             declaration_count,
-            terminal_projection_pages: None,
+            activation_pages: None,
         }
     }
 
@@ -12466,7 +12943,7 @@ mod tests {
                 storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: 4,
                 declaration_count: 0,
-                terminal_projection_pages: None,
+                activation_pages: None,
             },
             2,
             &working,
@@ -12538,7 +13015,7 @@ mod tests {
                 storage: BootstrapOperationStorage::File(operation_path),
                 operation_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
                 declaration_count: u64::from(MAX_PAGE_DOCUMENTS_PER_BOOTSTRAP_PART),
-                terminal_projection_pages: None,
+                activation_pages: None,
             },
             1,
             &working,

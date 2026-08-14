@@ -5108,8 +5108,13 @@ impl SqliteFrontier {
                     "terminal page identity differs from its authenticated catalog row".into(),
                 ));
             }
-            let hinted = terminal_material
-                .and_then(|material| material.terminal_projection_page(page.page_id))
+            let retained_hint = terminal_material
+                .map(|material| material.terminal_projection_page(page.page_id))
+                .transpose()
+                .map_err(|error| ProjectionError::Materialization(error.to_string()))?
+                .flatten();
+            let hinted = retained_hint
+                .as_ref()
                 .and_then(|hint| materialized_page_input_from_hint(&page, hint));
             if hinted.is_some() {
                 bootstrap.terminal_projection_hint_hits =
