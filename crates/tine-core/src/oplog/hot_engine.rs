@@ -29,7 +29,7 @@ use super::content_patricia::{
 use super::external_import::{ExternalImportObservationEntry, ExternalImportObservationMaterial};
 use super::identity::BootstrapPartId;
 use super::import::ImportExecutionMaterial;
-use super::lazy_genesis::LazyGenesisPageInput;
+use super::lazy_genesis::{LazyGenesisCandidate, LazyGenesisPageInput};
 use super::object_store::{
     BlockClaimIndexRoot, BlockClaimIndexStore, BlockClaimIndexValue, BootstrapAuthoringCapability,
     CompletedDetachedBootstrapPublication, ControlDirectoryIdentity,
@@ -7701,7 +7701,7 @@ impl LazyGenesisCheckpointBuilder {
         }
         document.commit();
         let snapshot = document
-            .export(ExportMode::Snapshot)
+            .export(ExportMode::all_updates())
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))?;
         verify_lazy_genesis_page_checkpoint(page, accepted_external_uuids, &snapshot)?;
         Ok(snapshot)
@@ -7710,7 +7710,7 @@ impl LazyGenesisCheckpointBuilder {
     pub(crate) fn finish(self) -> Result<Vec<u8>, EngineError> {
         self.catalog.commit();
         self.catalog
-            .export(ExportMode::Snapshot)
+            .export(ExportMode::all_updates())
             .map_err(|error| EngineError::InvalidCrdt(error.to_string()))
     }
 }
@@ -7763,6 +7763,10 @@ pub struct ShardedHotEngine {
     workspace_id: WorkspaceId,
     lineage_digest: LineageDigest,
     catalog_document_id: DocumentId,
+    /// Immutable baseline for pages that have no ordinary accepted receipt
+    /// yet. The catalog is installed once; page documents are point-loaded
+    /// only for reads or their first mutation.
+    lazy_genesis: Option<Arc<LazyGenesisCandidate>>,
     archive: BTreeMap<BatchId, ValidatedBatch>,
     // Inactive detached bootstrap authoring retains only canonical manifests
     // after validation. Prior object envelopes live in neither this map nor
@@ -8037,6 +8041,7 @@ impl ShardedHotEngine {
             workspace_id,
             lineage_digest,
             catalog_document_id,
+            lazy_genesis: None,
             archive: BTreeMap::new(),
             detached_accepted_manifests: BTreeMap::new(),
             detached_accepted_manifest_fingerprints: BTreeMap::new(),
@@ -8145,6 +8150,159 @@ impl ShardedHotEngine {
             #[cfg(test)]
             previous_document_derivation: Cell::new(false),
         }
+    }
+
+    pub(crate) fn install_lazy_genesis_baseline(
+        &mut self,
+        candidate: Arc<LazyGenesisCandidate>,
+    ) -> Result<(), EngineError> {
+        if self.lazy_genesis.is_some()
+            || candidate.workspace_id() != self.workspace_id
+            || candidate.lineage_digest() != self.lineage_digest
+            || !self.visible_documents.is_empty()
+            || !self.visible_document_heads.is_empty()
+            || self.history_generation != 0
+        {
+            return Err(EngineError::InvalidTransaction(
+                "lazy genesis can only initialize an empty matching engine".into(),
+            ));
+        }
+        let catalog_snapshot = candidate
+            .catalog_checkpoint()
+            .map_err(|error| EngineError::Archive(error.to_string()))?;
+        let catalog = LoroDoc::new();
+        import_complete(self.catalog_document_id, &catalog, &[catalog_snapshot])?;
+        catalog.set_peer_id(1).map_err(loro_error)?;
+        validate_catalog(self.catalog_document_id, &catalog)?;
+        self.visible_documents
+            .insert(self.catalog_document_id, catalog);
+        self.lazy_genesis = Some(candidate);
+        Ok(())
+    }
+
+    fn lazy_genesis_checkpoint(
+        &self,
+        document_id: DocumentId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let Some(candidate) = &self.lazy_genesis else {
+            return Ok(None);
+        };
+        let snapshot = if document_id == self.catalog_document_id {
+            Some(
+                candidate
+                    .catalog_checkpoint()
+                    .map_err(|error| EngineError::Archive(error.to_string()))?,
+            )
+        } else {
+            candidate
+                .document_checkpoint(document_id)
+                .map_err(|error| EngineError::Archive(error.to_string()))?
+        };
+        Ok(snapshot)
+    }
+
+    fn validate_lazy_genesis_document(
+        &self,
+        document_id: DocumentId,
+        document: &LoroDoc,
+    ) -> Result<(), EngineError> {
+        if document_id == self.catalog_document_id {
+            validate_catalog(self.catalog_document_id, document)?;
+        } else {
+            validate_shard(self.catalog_document_id, document_id, document)?;
+        }
+        Ok(())
+    }
+
+    fn lazy_genesis_document(
+        &self,
+        document_id: DocumentId,
+        peer: u64,
+    ) -> Result<Option<LoroDoc>, EngineError> {
+        let Some(snapshot) = self.lazy_genesis_checkpoint(document_id)? else {
+            return Ok(None);
+        };
+        let document = LoroDoc::new();
+        import_complete(document_id, &document, &[snapshot])?;
+        document.set_peer_id(peer).map_err(loro_error)?;
+        self.validate_lazy_genesis_document(document_id, &document)?;
+        Ok(Some(document))
+    }
+
+    fn lazy_genesis_engine_document(
+        &self,
+        document_id: DocumentId,
+        peer: u64,
+    ) -> Result<Option<EngineDocument>, EngineError> {
+        let Some(snapshot) = self.lazy_genesis_checkpoint(document_id)? else {
+            return Ok(None);
+        };
+        let document = match &self.scratch {
+            Some(store) => {
+                let external = super::document_state::ExternalDocument::empty(Arc::clone(store))
+                    .map_err(|error| EngineError::Archive(error.to_string()))?;
+                import_complete(document_id, external.document(), &[snapshot])?;
+                external.document().set_peer_id(peer).map_err(loro_error)?;
+                self.validate_lazy_genesis_document(document_id, external.document())?;
+                EngineDocument::External(external)
+            }
+            None => {
+                let document = LoroDoc::new();
+                import_complete(document_id, &document, &[snapshot])?;
+                document.set_peer_id(peer).map_err(loro_error)?;
+                self.validate_lazy_genesis_document(document_id, &document)?;
+                EngineDocument::InMemory(document)
+            }
+        };
+        Ok(Some(document))
+    }
+
+    fn lazy_genesis_dependency_engine_document(
+        &self,
+        dependencies: &DocumentDependencies,
+        peer: u64,
+    ) -> Result<Option<EngineDocument>, EngineError> {
+        if !dependencies.direct_dependency_heads().is_empty() {
+            return Ok(None);
+        }
+        let Some(document) = self.lazy_genesis_engine_document(dependencies.document_id(), peer)?
+        else {
+            return Ok(None);
+        };
+        if canonical_peer_counters(&document.document().oplog_vv())? != dependencies.peer_counters()
+        {
+            return Err(EngineError::FrontierVectorMismatch(
+                dependencies.document_id(),
+            ));
+        }
+        Ok(Some(document))
+    }
+
+    fn lazy_genesis_dependency_document(
+        &self,
+        dependencies: &DocumentDependencies,
+        peer: u64,
+    ) -> Result<Option<LoroDoc>, EngineError> {
+        if !dependencies.direct_dependency_heads().is_empty() {
+            return Ok(None);
+        }
+        let Some(document) = self.lazy_genesis_document(dependencies.document_id(), peer)? else {
+            return Ok(None);
+        };
+        if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
+            return Err(EngineError::FrontierVectorMismatch(
+                dependencies.document_id(),
+            ));
+        }
+        Ok(Some(document))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lazy_genesis_resident_page_documents_for_test(&self) -> usize {
+        self.visible_documents
+            .keys()
+            .filter(|document_id| **document_id != self.catalog_document_id)
+            .count()
     }
 
     /// Construct a sparse engine that follows compact direct heads through
@@ -23519,6 +23677,12 @@ impl ShardedHotEngine {
     ) -> Result<bool, EngineError> {
         for dependencies in frontier.documents() {
             let document_id = dependencies.document_id();
+            if self
+                .lazy_genesis_dependency_document(dependencies, 1)?
+                .is_some()
+            {
+                continue;
+            }
             let current_heads = if self.is_blocked() {
                 self.terminal_document_heads
                     .get(&document_id)
@@ -23689,6 +23853,12 @@ impl ShardedHotEngine {
                 if dependencies.document_id() == self.catalog_document_id
                     && !requested_catalog_page_ids.is_empty()
                 {
+                    if let Some(document) =
+                        self.lazy_genesis_dependency_engine_document(dependencies, 1)?
+                    {
+                        documents.insert(dependencies.document_id(), document);
+                        continue;
+                    }
                     let (document, page_names) = self
                         .load_authenticated_catalog_frontier_document(
                             Some(dependencies),
@@ -23702,6 +23872,12 @@ impl ShardedHotEngine {
                     .remove(&dependencies.document_id())
                     .expect("one batched exact result per frontier document");
                 let Some((record, document, state_work)) = loaded else {
+                    if let Some(document) =
+                        self.lazy_genesis_dependency_engine_document(dependencies, 1)?
+                    {
+                        documents.insert(dependencies.document_id(), document);
+                        continue;
+                    }
                     return Err(EngineError::FrontierVectorMismatch(
                         dependencies.document_id(),
                     ));
@@ -23768,7 +23944,10 @@ impl ShardedHotEngine {
         }
         let mut documents = BTreeMap::new();
         for dependencies in frontier.documents() {
-            let document = self.clone_validation_document(dependencies.document_id(), 1)?;
+            let document = match self.lazy_genesis_dependency_document(dependencies, 1)? {
+                Some(document) => document,
+                None => self.clone_validation_document(dependencies.document_id(), 1)?,
+            };
             self.record_stage_snapshot_clone(&document);
             if canonical_peer_counters(&document.oplog_vv())? != dependencies.peer_counters() {
                 return Ok(None);
@@ -26751,7 +26930,9 @@ impl ShardedHotEngine {
                     self.validate_external_record_anchor(document_id, &record)?;
                     document.into_document()
                 }
-                None => LoroDoc::new(),
+                None => self
+                    .lazy_genesis_document(document_id, peer)?
+                    .unwrap_or_else(LoroDoc::new),
             };
             document.set_peer_id(peer).map_err(loro_error)?;
             return Ok(document);
@@ -26764,7 +26945,8 @@ impl ShardedHotEngine {
                     .get(&document_id)
                     .is_none_or(BTreeSet::is_empty)
                 {
-                    LoroDoc::new()
+                    self.lazy_genesis_document(document_id, peer)?
+                        .unwrap_or_else(LoroDoc::new)
                 } else {
                     self.reconstruct_document_from_heads(document_id, false)?
                 };
@@ -26820,9 +27002,12 @@ impl ShardedHotEngine {
                 self.record_document_state_work(*state_work);
                 self.validate_external_record_anchor(document_id, record)?;
             }
-            let document = loaded
-                .map(|(_, document, _)| document.into_document())
-                .unwrap_or_else(LoroDoc::new);
+            let document = match loaded {
+                Some((_, document, _)) => document.into_document(),
+                None => self
+                    .lazy_genesis_document(document_id, peer)?
+                    .unwrap_or_else(LoroDoc::new),
+            };
             document.set_peer_id(peer).map_err(loro_error)?;
             return Ok(document);
         }
@@ -26875,6 +27060,9 @@ impl ShardedHotEngine {
             self.validate_external_record_anchor(document_id, &record)?;
             let heads = record.exact_direct_heads().iter().copied().collect();
             return Ok((EngineDocument::External(document), heads));
+        }
+        if let Some(document) = self.lazy_genesis_engine_document(document_id, 1)? {
+            return Ok((document, BTreeSet::new()));
         }
         Ok((
             EngineDocument::External(
@@ -26944,6 +27132,8 @@ impl ShardedHotEngine {
                         document_id,
                         (EngineDocument::External(document), heads, true),
                     ))
+                } else if let Some(document) = self.lazy_genesis_engine_document(document_id, 1)? {
+                    Ok((document_id, (document, BTreeSet::new(), true)))
                 } else {
                     Ok((
                         document_id,
@@ -27719,6 +27909,12 @@ impl ShardedHotEngine {
             })?;
             let expected_home_document_id = if let Some(pages) = pages {
                 pages.get(&page_id).map(PageState::home_document_id)
+            } else if let Some(home_document_id) = self
+                .lazy_genesis
+                .as_ref()
+                .and_then(|genesis| genesis.page_home_document_id(page_id))
+            {
+                Some(home_document_id)
             } else {
                 self.authenticated_current_page_catalog_row(page_id)?
                     .map(|row| row.home_document_id)

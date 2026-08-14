@@ -9597,9 +9597,9 @@ mod tests {
         execute_manifested_projection_work, write_projection_exact, ApplicationRuntimeRoot,
         AuthorBatch, BatchDisposition, BatchId, BlockLocation, CrdtPeerId, DeviceId, DocumentId,
         LineageDigest, ManagedTextKind, ObjectStore, OperationTransaction, PortablePathIndexRoot,
-        ProjectionClaim, ProjectionEndpointBinding, ProjectionEndpointId, ProjectionRecovery,
-        RebuildSource, SemanticEffect, SemanticOperation, SessionId, SqliteFrontier,
-        MAX_MATERIALIZATION_QUERY_ROWS,
+        PreparedBatch, ProjectionClaim, ProjectionEndpointBinding, ProjectionEndpointId,
+        ProjectionRecovery, RebuildSource, SemanticEffect, SemanticOperation, SessionId,
+        SqliteFrontier, MAX_MATERIALIZATION_QUERY_ROWS,
     };
 
     struct TestRoot(PathBuf);
@@ -13490,7 +13490,7 @@ mod tests {
             &mut source_instrumentation,
         )
         .unwrap();
-        let streaming = spool_bootstrap_operations(
+        let mut streaming = spool_bootstrap_operations(
             &capture,
             source.import_id,
             workspace,
@@ -13685,6 +13685,202 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lazy_snapshot, old_snapshot);
+        let candidate = std::sync::Arc::new(streaming.lazy_genesis.take().unwrap());
+        let first_page = candidate
+            .page(candidate.page_ids().next().unwrap())
+            .unwrap()
+            .unwrap();
+        let first_block = first_page.blocks.first().unwrap();
+        let edit = |content: &str| {
+            OperationTransaction::new(vec![SemanticOperation::EditBlockContent {
+                block: BlockLocation {
+                    block_id: first_block.block_id,
+                    home_document_id: first_block.home_document_id,
+                },
+                content: content.to_owned(),
+            }])
+            .unwrap()
+        };
+        for (ordinal, content) in [(1_u128, "left first edit"), (2, "right first edit")] {
+            let mut engine = ShardedHotEngine::new(
+                workspace,
+                LineageDigest::of(b"canonical-activation-stream-test"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            );
+            engine
+                .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+                .unwrap();
+            assert_eq!(
+                engine.lazy_genesis_resident_page_documents_for_test(),
+                0,
+                "install must not eagerly open untouched page documents"
+            );
+            assert_eq!(engine.canonical_snapshot().unwrap(), old_snapshot);
+            assert_eq!(engine.lazy_genesis_resident_page_documents_for_test(), 0);
+            engine
+                .draft_author_transaction(
+                    AuthorBatch {
+                        batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e20 + ordinal)),
+                        author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e30 + ordinal)),
+                        author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e40 + ordinal)),
+                        crdt_peer_id: CrdtPeerId::from_u64(0x5e50 + ordinal as u64),
+                    },
+                    BatchOrigin::LocalMutation,
+                    &edit(content),
+                )
+                .unwrap();
+        }
+        let make_engine = || {
+            let mut engine = ShardedHotEngine::new(
+                workspace,
+                LineageDigest::of(b"canonical-activation-stream-test"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            );
+            engine
+                .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+                .unwrap();
+            engine
+        };
+        let base = make_engine();
+        let left_author = AuthorBatch {
+            batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e61)),
+            author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e62)),
+            author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e63)),
+            crdt_peer_id: CrdtPeerId::from_u64(0x5e64),
+        };
+        let right_author = AuthorBatch {
+            batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e71)),
+            author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e72)),
+            author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e73)),
+            crdt_peer_id: CrdtPeerId::from_u64(0x5e74),
+        };
+        let left = base
+            .prepare_bootstrap_transaction(left_author, &edit("left concurrent edit"))
+            .unwrap();
+        let right = base
+            .prepare_bootstrap_transaction(right_author, &edit("right concurrent edit"))
+            .unwrap();
+        let merge = |prepared: [PreparedBatch; 2]| {
+            let mut merged = make_engine();
+            for prepared in prepared {
+                let outcome = merged.stage_ready(super::super::ValidatedBatch::new(prepared));
+                assert!(
+                    matches!(
+                        outcome.disposition,
+                        super::super::BatchDisposition::Accepted { .. }
+                    ),
+                    "concurrent lazy-genesis batch refused: {:?}",
+                    outcome.disposition
+                );
+            }
+            let merged_page = merged.materialize_page(first_page.page_id).unwrap();
+            merged_page
+                .blocks
+                .iter()
+                .find(|block| block.block_id == first_block.block_id)
+                .unwrap()
+                .content
+                .clone()
+        };
+        let forward = merge([left.clone(), right.clone()]);
+        let reverse = merge([right.clone(), left.clone()]);
+        assert_eq!(forward, reverse, "concurrent first edits did not converge");
+        assert!(
+            forward != first_block.content
+                && forward != "left concurrent edit"
+                && forward != "right concurrent edit",
+            "concurrent lazy-genesis edits collapsed instead of merging: {:?}",
+            forward
+        );
+
+        let archive_path = root.path().join("lazy-genesis-scratch-archive");
+        let scratch_writer = ObjectStore::open(&archive_path, workspace).unwrap();
+        scratch_writer
+            .publish_bootstrap_prepared_for_test(&left)
+            .unwrap();
+        scratch_writer
+            .publish_bootstrap_prepared_for_test(&right)
+            .unwrap();
+        let make_scratch_engine = || {
+            let mut engine = ShardedHotEngine::with_archive_store(
+                ObjectStore::open(&archive_path, workspace).unwrap(),
+                LineageDigest::of(b"canonical-activation-stream-test"),
+                DocumentId::from_uuid(Uuid::from_u128(0x5e02)),
+            );
+            engine
+                .install_lazy_genesis_baseline(std::sync::Arc::clone(&candidate))
+                .unwrap();
+            assert_eq!(engine.lazy_genesis_resident_page_documents_for_test(), 0);
+            engine
+        };
+        let scratch_merge = |batch_ids: [BatchId; 2]| {
+            let mut merged = make_scratch_engine();
+            for batch_id in batch_ids {
+                let outcome = merged.stage_archive_batch(batch_id).unwrap();
+                assert!(
+                    matches!(
+                        outcome.disposition,
+                        super::super::BatchDisposition::Accepted { .. }
+                    ),
+                    "scratch-backed concurrent lazy-genesis batch refused: {:?}",
+                    outcome.disposition
+                );
+            }
+            let merged_page = merged.materialize_page(first_page.page_id).unwrap();
+            merged_page
+                .blocks
+                .iter()
+                .find(|block| block.block_id == first_block.block_id)
+                .unwrap()
+                .content
+                .clone()
+        };
+        assert_eq!(
+            scratch_merge([left.manifest().batch_id(), right.manifest().batch_id()]),
+            scratch_merge([right.manifest().batch_id(), left.manifest().batch_id()]),
+            "scratch-backed concurrent first edits did not converge"
+        );
+
+        let mut sequential = make_scratch_engine();
+        let first_outcome = sequential
+            .stage_archive_batch(left.manifest().batch_id())
+            .unwrap();
+        assert!(matches!(
+            first_outcome.disposition,
+            super::super::BatchDisposition::Accepted { .. }
+        ));
+        let second = sequential
+            .prepare_bootstrap_transaction(
+                AuthorBatch {
+                    batch_id: BatchId::from_uuid(Uuid::from_u128(0x5e81)),
+                    author_device_id: DeviceId::from_uuid(Uuid::from_u128(0x5e82)),
+                    author_session_id: SessionId::from_uuid(Uuid::from_u128(0x5e83)),
+                    crdt_peer_id: CrdtPeerId::from_u64(0x5e84),
+                },
+                &edit("ordinary receipt supersedes genesis"),
+            )
+            .unwrap();
+        scratch_writer
+            .publish_bootstrap_prepared_for_test(&second)
+            .unwrap();
+        let second_outcome = sequential
+            .stage_archive_batch(second.manifest().batch_id())
+            .unwrap();
+        assert!(matches!(
+            second_outcome.disposition,
+            super::super::BatchDisposition::Accepted { .. }
+        ));
+        assert_eq!(
+            sequential
+                .materialize_page(first_page.page_id)
+                .unwrap()
+                .blocks
+                .iter()
+                .find(|block| block.block_id == first_block.block_id)
+                .unwrap()
+                .content,
+            "ordinary receipt supersedes genesis"
+        );
         assert_eq!(
             capture
                 .entries_cursor()

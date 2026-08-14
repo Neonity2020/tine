@@ -371,6 +371,12 @@ impl LazyGenesisPackBuilder {
             .enumerate()
             .map(|(index, descriptor)| (descriptor.page_id, index))
             .collect();
+        let home_index = manifest
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, descriptor)| (descriptor.home_document_id, index))
+            .collect();
         let scratch = std::mem::take(&mut self.scratch);
         Ok(LazyGenesisCandidate {
             scratch,
@@ -378,6 +384,7 @@ impl LazyGenesisPackBuilder {
             manifest_bytes,
             root,
             index,
+            home_index,
             cleanup_on_drop: true,
         })
     }
@@ -397,12 +404,21 @@ pub(crate) struct LazyGenesisCandidate {
     manifest_bytes: Vec<u8>,
     root: ContentDigest,
     index: BTreeMap<PageId, usize>,
+    home_index: BTreeMap<DocumentId, usize>,
     cleanup_on_drop: bool,
 }
 
 impl LazyGenesisCandidate {
     pub(crate) const fn root(&self) -> ContentDigest {
         self.root
+    }
+
+    pub(crate) const fn workspace_id(&self) -> WorkspaceId {
+        self.manifest.workspace_id
+    }
+
+    pub(crate) const fn lineage_digest(&self) -> LineageDigest {
+        self.manifest.lineage_digest
     }
 
     pub(crate) fn manifest_bytes(&self) -> &[u8] {
@@ -415,6 +431,15 @@ impl LazyGenesisCandidate {
 
     pub(crate) fn page_ids(&self) -> impl Iterator<Item = PageId> + '_ {
         self.manifest.pages.iter().map(|page| page.page_id)
+    }
+
+    /// Resolve immutable page ownership without decoding its capsule or the
+    /// graph-wide catalog checkpoint. The sealed manifest has already proved
+    /// uniqueness of both page and home identities.
+    pub(crate) fn page_home_document_id(&self, page_id: PageId) -> Option<DocumentId> {
+        self.index
+            .get(&page_id)
+            .map(|index| self.manifest.pages[*index].home_document_id)
     }
 
     pub(crate) const fn block_count(&self) -> u64 {
@@ -472,6 +497,17 @@ impl LazyGenesisCandidate {
             return Err(invalid("lazy genesis catalog checkpoint bytes changed"));
         }
         Ok(bytes)
+    }
+
+    pub(crate) fn document_checkpoint(
+        &self,
+        document_id: DocumentId,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let Some(&index) = self.home_index.get(&document_id) else {
+            return Ok(None);
+        };
+        let page_id = self.manifest.pages[index].page_id;
+        Ok(self.page(page_id)?.map(|page| page.document_checkpoint))
     }
 
     pub(crate) fn stage_into(
@@ -550,12 +586,19 @@ impl LazyGenesisCandidate {
             .enumerate()
             .map(|(index, page)| (page.page_id, index))
             .collect();
+        let home_index = manifest
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, descriptor)| (descriptor.home_document_id, index))
+            .collect();
         Ok(Self {
             scratch: directory.to_path_buf(),
             manifest,
             manifest_bytes,
             root: commit.root,
             index,
+            home_index,
             cleanup_on_drop: false,
         })
     }
