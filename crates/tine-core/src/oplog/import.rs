@@ -79,6 +79,9 @@ thread_local! {
     static INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_SEAL:
         std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
             const { std::cell::RefCell::new(None) };
+    static INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_DETACHED_AUTHORING:
+        std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> =
+            const { std::cell::RefCell::new(None) };
 }
 
 /// Force the operations-per-part limit of exactly the next bootstrap
@@ -3560,10 +3563,10 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
     }
     let graph_resource = graph.canonical_resource_id()?;
 
-    // This is deliberately the final source action. Everything below owns only
-    // sealed spools and detached engine/scratch capabilities.
-    let final_capture = capture.verify_before_inactive_bootstrap_authoring(graph)?;
-    record_capture_instrumentation(&mut instrumentation, &final_capture);
+    // Everything below owns only sealed spools and detached engine/scratch
+    // capabilities. The one final live-source comparison happens immediately
+    // before promotion, after every pre-promotion construction phase.
+    inactive_bootstrap_preparation_before_detached_authoring_hook()?;
     let retained_reference_catalog_policy = reference_catalog_policy.clone();
     progress(BootstrapPreparationProgress::Subphase(
         BootstrapPreparationSubphase::DetachedAuthoring,
@@ -3692,6 +3695,21 @@ pub(crate) fn prepare_inactive_bootstrap_import_with_progress(
         terminal_construction,
         instrumentation,
     })
+}
+
+#[cfg(test)]
+fn inactive_bootstrap_preparation_before_detached_authoring_hook() -> io::Result<()> {
+    INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_DETACHED_AUTHORING.with(|hook| {
+        match hook.borrow_mut().take() {
+            Some(hook) => hook(),
+            None => Ok(()),
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn inactive_bootstrap_preparation_before_detached_authoring_hook() -> io::Result<()> {
+    Ok(())
 }
 
 /// Retain the process-only terminal construction capability, or `None` if the
@@ -11843,6 +11861,64 @@ mod tests {
             .commit()
             .validate_aggregate(prepared.aggregate())
             .unwrap();
+    }
+
+    #[test]
+    fn detached_authoring_uses_sealed_capture_and_final_source_proof_rejects_external_changes() {
+        for (ordinal, mutation) in ["modify", "add", "delete", "rename"]
+            .into_iter()
+            .enumerate()
+        {
+            let root = TestRoot::new(&format!("streaming-source-change-{mutation}"));
+            let graph_root = root.path().join("graph");
+            let source = graph_root.join("pages/source.md");
+            let added = graph_root.join("pages/added.md");
+            let renamed = graph_root.join("pages/renamed.md");
+            fs::write(&source, b"- captured source\n").unwrap();
+            let graph = Graph::open(&graph_root);
+            let capture_scratch = root.path().join("capture");
+            let preparation_scratch = root.path().join("preparation");
+            fs::create_dir(&capture_scratch).unwrap();
+            fs::create_dir(&preparation_scratch).unwrap();
+            let workspace = WorkspaceId::from_uuid(Uuid::from_u128(0x5c20 + ordinal as u128));
+            let catalog = target_catalog(&root.path().join("archive"), workspace);
+            let capture = graph
+                .capture_inactive_bootstrap_sources(&capture_scratch)
+                .unwrap();
+            INACTIVE_BOOTSTRAP_PREPARATION_BEFORE_DETACHED_AUTHORING.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let source = source.clone();
+                    let added = added.clone();
+                    let renamed = renamed.clone();
+                    move || match mutation {
+                        "modify" => fs::write(source, b"- modified externally\n"),
+                        "add" => fs::write(added, b"- added externally\n"),
+                        "delete" => fs::remove_file(source),
+                        "rename" => fs::rename(source, renamed),
+                        _ => unreachable!(),
+                    }
+                }));
+            });
+            let prepared = prepare_inactive_bootstrap_import(
+                &graph,
+                capture,
+                workspace,
+                LineageDigest::of(format!("streaming-source-change-{mutation}").as_bytes()),
+                DocumentId::from_uuid(Uuid::from_u128(0x5c30 + ordinal as u128)),
+                ReferenceCatalogPolicyV1::default(),
+                &catalog,
+                &preparation_scratch,
+            )
+            .unwrap();
+            assert_eq!(prepared.instrumentation().capture_passes, 1);
+            assert!(
+                prepared
+                    .source_capture()
+                    .verify_before_inactive_bootstrap_authoring(&graph)
+                    .is_err(),
+                "final source proof admitted an external {mutation} at the former mid-authoring boundary"
+            );
+        }
     }
 
     #[test]

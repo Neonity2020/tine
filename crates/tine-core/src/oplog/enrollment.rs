@@ -381,6 +381,10 @@ impl LocalActivationReservation {
     pub(crate) const fn archive_instance_id(&self) -> Uuid {
         self.record.archive_instance_id
     }
+
+    pub(crate) const fn source_inventory_digest(&self) -> ContentDigest {
+        self.record.binding.source_inventory_digest
+    }
 }
 
 /// Read one existing private reservation without creating the application

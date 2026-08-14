@@ -169,8 +169,19 @@ from that observation instead of completing under stale authority.
 
 1. **Direct / absent** — no private binding; startup opens Direct Files and
    does not inspect shared bytes.
-2. **ShadowImport** — explicit activation captures source files and prepares an
-   inactive immutable bootstrap. No managed graph writer exists.
+2. **ShadowImport** — explicit activation first remains Direct/absent while it
+   reads the live source once into a sealed private capture and prepares an
+   inactive immutable bootstrap from that capture only. One fresh complete
+   live-source scan must then match the sealed capture. Only after that proof
+   does Tine publish `ShadowImport`; a mismatch leaves durable enrollment
+   absent, refuses without changing Direct Files, and permits a clean retry
+   from the current Markdown/Org bytes. If the pre-enrollment reservation's
+   source digest differs on retry, Tine preserves and detaches that attempt's
+   archive, receipts, SQLite state, runtime, backup, preparation, enrollment,
+   and reservation as one reconstructible diagnostic episode before rebuilding.
+   The new sealed capture and the live graph are not moved. Archive detachment
+   happens first and enrollment last, so an interrupted reset retains the old
+   reservation and repeats safely. Active/shared enrollment is never retired.
 3. **VerifiedLocal** — bootstrap, backup, shadow projection, and SQLite proof
    agree. Authority is still inactive.
 4. **LocalActive** — promotion publishes the accepted runtime state; the actor

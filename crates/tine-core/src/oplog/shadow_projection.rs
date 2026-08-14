@@ -215,6 +215,15 @@ fn before_final_source_verify_hook() -> io::Result<()> {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn set_before_final_source_verify_hook_for_test(
+    hook: impl FnOnce() -> io::Result<()> + 'static,
+) {
+    SHADOW_BEFORE_FINAL_SOURCE_VERIFY.with(|pending| {
+        *pending.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
 #[cfg(not(test))]
 fn before_final_source_verify_hook() -> io::Result<()> {
     Ok(())

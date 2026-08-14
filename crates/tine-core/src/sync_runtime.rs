@@ -4855,28 +4855,12 @@ fn activate_non_active_local(
     });
     prepare_activation_private_paths(&request)
         .map_err(|error| format!("prepare private activation paths: {error}"))?;
-    let enrollment = EnrollmentApplicationRoot::open_explicit_private(&request.enrollment_root)
-        .map_err(|error| format!("open private enrollment state: {error}"))?;
-    let application_runtime_root =
-        ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
-            .map_err(|error| format!("open private application runtime: {error}"))?;
-
     let endpoint = ProjectionEndpointBinding::enroll_graph(
         &graph,
         request.identities.endpoint_id,
         request.identities.device_id,
     )
     .map_err(|error| format!("identify graph projection endpoint: {error}"))?;
-    let receipts = match existing_binding.as_ref() {
-        Some(binding) => ProjectionReceiptStore::open_existing_for_endpoint(
-            &request.receipt_root,
-            binding.workspace_id(),
-            endpoint,
-            binding.receipt_store_id(),
-        )
-        .map_err(|error| format!("open existing private projection receipts: {error}"))?,
-        None => open_reconstructible_activation_receipts(&request, endpoint)?,
-    };
 
     // Capture precedes every graph-local sparse archive write. The capture is
     // read-only and revalidated internally before bootstrap authoring.
@@ -4890,6 +4874,35 @@ fn activate_non_active_local(
         ContentDigest::from_bytes(*capture.inventory_description().sha256());
     let graph_resource_id = graph.canonical_resource_id().map_err(display)?;
     let graph_text_scope_binding = graph.graph_text_scope_binding().map_err(display)?;
+    let preparation_id = PreparationId::from_uuid(request.identities.preparation_id);
+    let stale_pre_promotion = inspect_local_activation_reservation_at(&request.enrollment_root)
+        .map_err(display)?
+        .is_some_and(|reservation| {
+            reservation.source_inventory_digest() != source_inventory_digest
+        });
+    let existing_binding = if stale_pre_promotion {
+        archive_stale_pre_promotion_construction(&request)?;
+        prepare_activation_private_paths(&request)
+            .map_err(|error| format!("recreate private activation paths: {error}"))?;
+        None
+    } else {
+        existing_binding
+    };
+    let enrollment = EnrollmentApplicationRoot::open_explicit_private(&request.enrollment_root)
+        .map_err(|error| format!("open private enrollment state: {error}"))?;
+    let application_runtime_root =
+        ApplicationRuntimeRoot::open_explicit_private(&request.application_runtime_root)
+            .map_err(|error| format!("open private application runtime: {error}"))?;
+    let receipts = match existing_binding.as_ref() {
+        Some(binding) => ProjectionReceiptStore::open_existing_for_endpoint(
+            &request.receipt_root,
+            binding.workspace_id(),
+            endpoint,
+            binding.receipt_store_id(),
+        )
+        .map_err(|error| format!("open existing private projection receipts: {error}"))?,
+        None => open_reconstructible_activation_receipts(&request, endpoint)?,
+    };
     let reservation = if existing_binding.is_none() {
         Some(
             begin_or_resume_local_activation_reservation(
@@ -4946,16 +4959,6 @@ fn activate_non_active_local(
     }
     drop(archive);
     activation_cut("after_archive_claim_before_enrollment_head")?;
-
-    let preparation_id = PreparationId::from_uuid(request.identities.preparation_id);
-    begin_or_resume_shadow_import(
-        &enrollment,
-        binding.clone(),
-        preparation_id,
-        source_inventory_digest,
-    )
-    .map_err(display)?;
-    activation_cut("after_shadow_import")?;
 
     let authoring_store =
         ObjectStore::open(&request.archive_root, binding.workspace_id()).map_err(display)?;
@@ -5058,6 +5061,18 @@ fn activate_non_active_local(
         sqlite_projection: inactive.sqlite_proof(),
         shadow_projection: &shadow,
     };
+    // Enrollment is the first durable statement that managed state has any
+    // authority. Keep it absent until the final complete comparison with the
+    // live Markdown/Org tree succeeds. Everything constructed above remains
+    // disposable and may be rebuilt from current Direct Files on retry.
+    begin_or_resume_shadow_import(
+        &enrollment,
+        binding.clone(),
+        preparation_id,
+        source_inventory_digest,
+    )
+    .map_err(display)?;
+    activation_cut("after_shadow_import")?;
     let verified_local = compose_verified_local_retaining_validation(
         &enrollment,
         binding.clone(),
@@ -6428,6 +6443,67 @@ fn prepare_activation_private_paths(request: &SyncLocalActivationRequest) -> Res
     fs::create_dir_all(database_parent)
         .map_err(|error| format!("cannot create private database parent: {error}"))?;
     Ok(())
+}
+
+/// Preserve and detach every downstream artifact from a pre-promotion attempt
+/// whose source inventory no longer matches Direct Files. The current sealed
+/// capture is intentionally excluded: it was created after the mismatch was
+/// observed and is the input to the replacement attempt. Archive first and
+/// enrollment last, so an interrupted reset always retains the old reservation
+/// which makes the next retry repeat and finish the same cleanup episode.
+fn archive_stale_pre_promotion_construction(
+    request: &SyncLocalActivationRequest,
+) -> Result<(), String> {
+    let episode = Uuid::new_v4();
+    let mut database_wal = request.database_path.as_os_str().to_os_string();
+    database_wal.push("-wal");
+    let mut database_shm = request.database_path.as_os_str().to_os_string();
+    database_shm.push("-shm");
+    let mut database_journal = request.database_path.as_os_str().to_os_string();
+    database_journal.push("-journal");
+    for (path, label) in [
+        (&request.archive_root, "archive"),
+        (&request.receipt_root, "projection receipts"),
+        (&request.database_path, "SQLite database"),
+        (&PathBuf::from(database_wal), "SQLite WAL"),
+        (&PathBuf::from(database_shm), "SQLite shared-memory file"),
+        (&PathBuf::from(database_journal), "SQLite rollback journal"),
+        (&request.application_runtime_root, "application runtime"),
+        (&request.migration_backup_root, "migration backup"),
+        (&request.preparation_root, "bootstrap preparation"),
+        (&request.enrollment_root, "enrollment and reservation"),
+    ] {
+        archive_stale_pre_promotion_entry(path, label, episode)?;
+    }
+    Ok(())
+}
+
+fn archive_stale_pre_promotion_entry(
+    path: &Path,
+    label: &str,
+    episode: Uuid,
+) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("inspect stale {label}: {error}")),
+    };
+    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+        return Err(format!("stale {label} is not a real file or directory"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("stale {label} has no parent directory"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("stale {label} has no UTF-8 filename"))?;
+    let destination = parent.join(format!("{name}.pre-promotion-source-changed-{episode}"));
+    fs::rename(path, &destination).map_err(|error| format!("archive stale {label}: {error}"))?;
+    let parent = Dir::open_ambient_dir(parent, ambient_authority())
+        .map_err(|error| format!("open stale {label} parent after archival: {error}"))?;
+    crate::filesystem_durability::sync_reconstructible_directory(&parent)
+        .map_err(|error| format!("record stale {label} archival: {error}"))
 }
 
 fn require_private_path_outside_graph(
@@ -24949,6 +25025,7 @@ mod tests {
     use crate::oplog::enrollment::EnrollmentDiscoveryHandoff;
     use crate::oplog::exact_external_feed::tests::RuntimeHostFixture;
     use crate::oplog::resume_point::RuntimeResumePointV2;
+    use crate::oplog::shadow_projection::set_before_final_source_verify_hook_for_test;
     use crate::oplog::{BlockLocation, LogicalPageName, PageRename};
     use std::collections::BTreeMap;
     use std::fs;
@@ -24994,6 +25071,31 @@ mod tests {
         assert!(contract.contains("Before an enrollment binding exists"));
         assert!(contract.contains("receipts.pre-promotion-failed"));
         assert!(contract.contains("Once enrollment has promoted"));
+    }
+
+    #[test]
+    fn activation_contract_publishes_shadow_import_only_after_final_source_proof() {
+        let source = include_str!("sync_runtime.rs");
+        let activation = source
+            .split_once("fn activate_non_active_local(")
+            .and_then(|(_, tail)| tail.split_once("fn open_reconstructible_activation_receipts("))
+            .map(|(body, _)| body)
+            .expect("activation composition body must remain identifiable");
+        let final_proof = activation
+            .find("verify_inactive_bootstrap_shadow_projection(")
+            .expect("activation must retain the final source/shadow proof");
+        let enrollment = activation
+            .find("begin_or_resume_shadow_import(")
+            .expect("activation must publish ShadowImport before VerifiedLocal");
+        assert!(
+            final_proof < enrollment,
+            "durable enrollment must remain absent until the final live-source proof succeeds"
+        );
+
+        let contract = include_str!("../../../docs/storage-sync-contract.md");
+        assert!(contract.contains("Only after that proof"));
+        assert!(contract.contains("Archive detachment"));
+        assert!(contract.contains("enrollment last"));
     }
 
     #[test]
@@ -47855,6 +47957,15 @@ mod tests {
             );
             assert_eq!(receipt.construction.preparation.huge_page_splits, 0);
             assert_eq!(
+                receipt.construction.preparation.capture_passes, 1,
+                "successful activation must capture the live source once before the final pre-promotion revalidation"
+            );
+            assert_eq!(
+                receipt.construction.preparation.source_bytes_read,
+                (receipt.source_bytes as u64).saturating_mul(2),
+                "preparation must account for one live capture read and one sealed-snapshot lowering read, with no later live-graph reread"
+            );
+            assert_eq!(
                 receipt.construction.preparation.external_sort_runs, 0,
                 "ordinary activation must remain on the in-memory sort path"
             );
@@ -52749,6 +52860,60 @@ mod tests {
             SyncLocalActivationStage::VerifiedLocal,
             0xa500,
         );
+    }
+
+    #[test]
+    fn activation_external_edit_before_promotion_refuses_then_retries_from_current_direct_files() {
+        let fixture = ActivationFixture::nested_unicode("source-change-before-promotion", 0xa580);
+        let source = fixture.graph_root.join("Root.md");
+        let changed = b"title:: Changed externally\n\n- retained Direct Files edit\n".to_vec();
+        set_before_final_source_verify_hook_for_test({
+            let source = source.clone();
+            let changed = changed.clone();
+            move || fs::write(source, changed)
+        });
+
+        let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert!(matches!(
+            interrupted.status,
+            SyncLocalActivationStatus::Retryable { .. }
+        ));
+        assert!(interrupted.handle.is_none());
+        assert_eq!(fs::read(&source).unwrap(), changed);
+
+        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
+        let handle = resumed
+            .handle
+            .expect("retry must activate from the current Direct Files bytes");
+        assert_eq!(fs::read(&source).unwrap(), changed);
+        drop(handle);
+    }
+
+    #[test]
+    fn activation_retires_older_shadow_import_when_direct_files_changed_before_retry() {
+        let fixture = ActivationFixture::nested_unicode("stale-shadow-import-retry", 0xa590);
+        let source = fixture.graph_root.join("Root.md");
+        let changed = b"title:: Changed after interruption\n\n- current Direct Files bytes\n";
+
+        fail_once_at_activation_cut(ActivationTestCut::AfterShadowImport);
+        let interrupted = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert!(matches!(
+            interrupted.status,
+            SyncLocalActivationStatus::Retryable {
+                durable_stage: SyncLocalActivationStage::ShadowImport,
+                ..
+            }
+        ));
+        fs::write(&source, changed).unwrap();
+
+        let resumed = SyncRuntimeHandle::activate_or_resume_local(fixture.request.clone());
+        assert_eq!(resumed.status, SyncLocalActivationStatus::Active);
+        let handle = resumed
+            .handle
+            .expect("changed Direct Files must rebuild rather than bind the stale import");
+        assert_eq!(fs::read(&source).unwrap(), changed);
+        drop(handle);
     }
 
     #[test]

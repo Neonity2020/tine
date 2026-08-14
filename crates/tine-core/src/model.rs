@@ -9388,7 +9388,8 @@ impl Graph {
     /// One physical census for the live exact-feed index. Discovery is not
     /// publication authority: reconciliation recaptures every affected path,
     /// and absences cross the durable confirmation boundary before admission.
-    /// Bootstrap source proof retains its separate two-pass capture above.
+    /// Bootstrap activation separately seals one initial capture and performs
+    /// one complete live-source comparison immediately before promotion.
     fn capture_live_graph_text_admission_with_limits(
         &self,
         limits: InitialShadowLimits,
@@ -25511,9 +25512,9 @@ impl BootstrapSourceCapture {
         bootstrap_source_capture_id(self)
     }
 
-    /// Final hash-only proof for the later author.  It rereads every source
-    /// through a fresh retained graph capability and compares the complete
-    /// canonical inventory, entry, and chunk spools to the sealed A/B result.
+    /// Final hash-only proof before promotion. It rereads every source through
+    /// a fresh retained graph capability and compares the complete canonical
+    /// inventory, entry, and chunk spools to the sealed initial capture.
     pub(crate) fn verify_before_inactive_bootstrap_authoring(
         &self,
         graph: &Graph,
@@ -25849,7 +25850,6 @@ impl BootstrapSourcePassPaths {
 }
 
 struct BootstrapSourcePass {
-    binding: BootstrapSourceCaptureBinding,
     paths: BootstrapSourcePassPaths,
     source_files: u64,
     source_chunks: u64,
@@ -26013,24 +26013,19 @@ fn capture_inactive_bootstrap_sources_inner(
     note_bootstrap_source_io_stage("create bootstrap source chunk directory");
     fs::create_dir(working.join(BOOTSTRAP_SOURCE_CHUNK_DIRECTORY))?;
 
-    note_bootstrap_source_io_stage("collect bootstrap source pass A");
-    let first = collect_bootstrap_source_pass(graph, &working, "capture-a", &binding, true)?;
-    bootstrap_source_capture_between_passes_hook()?;
-    note_bootstrap_source_io_stage("collect bootstrap source pass B");
-    let second = collect_bootstrap_source_pass(graph, &working, "capture-b", &binding, false)?;
-    note_bootstrap_source_io_stage("compare bootstrap source passes");
-    compare_bootstrap_source_passes(&first, &second)?;
+    note_bootstrap_source_io_stage("collect bootstrap source capture");
+    let captured = collect_bootstrap_source_pass(graph, &working, "capture-a", &binding, true)?;
+    bootstrap_source_capture_after_initial_pass_hook()?;
     note_bootstrap_source_io_stage("revalidate bootstrap source binding after capture");
     require_current_bootstrap_source_binding(graph, &binding)?;
 
-    let inventory =
-        describe_bootstrap_source_spool(&first.paths.sorted(BootstrapSourceSpoolKind::Inventory))?;
+    let inventory = describe_bootstrap_source_spool(
+        &captured.paths.sorted(BootstrapSourceSpoolKind::Inventory),
+    )?;
     let entries =
-        describe_bootstrap_source_spool(&first.paths.sorted(BootstrapSourceSpoolKind::Entries))?;
+        describe_bootstrap_source_spool(&captured.paths.sorted(BootstrapSourceSpoolKind::Entries))?;
     let chunks =
-        describe_bootstrap_source_spool(&first.paths.sorted(BootstrapSourceSpoolKind::Chunks))?;
-    let mut instrumentation = first.instrumentation.clone();
-    bootstrap_source_add_instrumentation(&mut instrumentation, &second.instrumentation)?;
+        describe_bootstrap_source_spool(&captured.paths.sorted(BootstrapSourceSpoolKind::Chunks))?;
     let capture = BootstrapSourceCapture {
         sealed_directory: PathBuf::new(),
         scratch_directory: scratch.clone(),
@@ -26038,9 +26033,9 @@ fn capture_inactive_bootstrap_sources_inner(
         inventory,
         entries,
         chunks,
-        source_files: first.source_files,
-        source_chunks: first.source_chunks,
-        instrumentation,
+        source_files: captured.source_files,
+        source_chunks: captured.source_chunks,
+        instrumentation: captured.instrumentation,
     };
     note_bootstrap_source_io_stage("seal bootstrap source capture");
     seal_bootstrap_source_capture(&working, capture)
@@ -26066,41 +26061,6 @@ fn prepare_bootstrap_source_scratch(scratch: &Path) -> io::Result<PathBuf> {
         Err(error) => return Err(error),
     }
     Ok(root)
-}
-
-fn bootstrap_source_add_instrumentation(
-    total: &mut BootstrapSourceCaptureInstrumentation,
-    pass: &BootstrapSourceCaptureInstrumentation,
-) -> io::Result<()> {
-    total.physical_bytes = total
-        .physical_bytes
-        .checked_add(pass.physical_bytes)
-        .ok_or_else(|| bootstrap_source_capture_error("source physical-byte counter overflow"))?;
-    total.files = total
-        .files
-        .checked_add(pass.files)
-        .ok_or_else(|| bootstrap_source_capture_error("source file counter overflow"))?;
-    total.passes = total
-        .passes
-        .checked_add(pass.passes)
-        .ok_or_else(|| bootstrap_source_capture_error("source pass counter overflow"))?;
-    total.chunks = total
-        .chunks
-        .checked_add(pass.chunks)
-        .ok_or_else(|| bootstrap_source_capture_error("source chunk counter overflow"))?;
-    total.spool_bytes = total
-        .spool_bytes
-        .checked_add(pass.spool_bytes)
-        .ok_or_else(|| bootstrap_source_capture_error("source spool-byte counter overflow"))?;
-    total.sort_runs = total
-        .sort_runs
-        .checked_add(pass.sort_runs)
-        .ok_or_else(|| bootstrap_source_capture_error("source sort-run counter overflow"))?;
-    total.peak_owned_buffer_bytes = total
-        .peak_owned_buffer_bytes
-        .max(pass.peak_owned_buffer_bytes);
-    total.peak_owned_rows = total.peak_owned_rows.max(pass.peak_owned_rows);
-    Ok(())
 }
 
 struct BootstrapSourceWalkState {
@@ -26231,7 +26191,6 @@ fn collect_bootstrap_source_pass(
     note_bootstrap_source_io_stage("revalidate bootstrap source binding after pass");
     require_current_bootstrap_source_binding(graph, binding)?;
     Ok(BootstrapSourcePass {
-        binding: binding.clone(),
         paths,
         source_files: state.source_files,
         source_chunks: state.source_chunks,
@@ -27461,33 +27420,6 @@ fn describe_bootstrap_source_file(
     ))
 }
 
-fn compare_bootstrap_source_passes(
-    first: &BootstrapSourcePass,
-    second: &BootstrapSourcePass,
-) -> io::Result<()> {
-    if first.binding != second.binding
-        || first.source_files != second.source_files
-        || first.source_chunks != second.source_chunks
-    {
-        return Err(bootstrap_source_capture_interrupted(
-            "source capture bindings or counts changed between A and B",
-        ));
-    }
-    for kind in [
-        BootstrapSourceSpoolKind::Inventory,
-        BootstrapSourceSpoolKind::Entries,
-        BootstrapSourceSpoolKind::Chunks,
-    ] {
-        if !bootstrap_source_files_equal(&first.paths.sorted(kind), &second.paths.sorted(kind))? {
-            return Err(bootstrap_source_capture_interrupted(format!(
-                "source capture A/B {} evidence differs",
-                kind.label()
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn bootstrap_source_files_equal(left: &Path, right: &Path) -> io::Result<bool> {
     if left.metadata()?.len() != right.metadata()?.len() {
         return Ok(false);
@@ -27759,7 +27691,7 @@ fn verify_bootstrap_source_capture(
 
 #[cfg(test)]
 thread_local! {
-    static BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
+    static BOOTSTRAP_SOURCE_CAPTURE_AFTER_INITIAL_PASS: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
     static BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
     static BOOTSTRAP_SOURCE_CAPTURE_BEFORE_SEAL_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
 }
@@ -27778,15 +27710,15 @@ fn bootstrap_source_capture_before_seal_rename_hook() -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn bootstrap_source_capture_between_passes_hook() -> io::Result<()> {
-    BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES.with(|hook| match hook.borrow_mut().take() {
+fn bootstrap_source_capture_after_initial_pass_hook() -> io::Result<()> {
+    BOOTSTRAP_SOURCE_CAPTURE_AFTER_INITIAL_PASS.with(|hook| match hook.borrow_mut().take() {
         Some(hook) => hook(),
         None => Ok(()),
     })
 }
 
 #[cfg(not(test))]
-fn bootstrap_source_capture_between_passes_hook() -> io::Result<()> {
+fn bootstrap_source_capture_after_initial_pass_hook() -> io::Result<()> {
     Ok(())
 }
 
@@ -48317,36 +48249,56 @@ mod tests {
     }
 
     #[test]
-    fn inactive_bootstrap_capture_rejects_between_pass_and_before_final_proof_mutations() {
-        let root = scratch("bootstrap-source-mutation");
+    fn inactive_bootstrap_capture_seals_one_pass_and_final_proof_rejects_later_mutations() {
+        for mutation in ["modify", "add", "delete", "rename"] {
+            let root = scratch(&format!("bootstrap-source-mutation-{mutation}"));
+            let source = root.join("pages/one.md");
+            let added = root.join("pages/added.md");
+            let renamed = root.join("pages/renamed.md");
+            fs::write(&source, b"title:: Before\n\n- body\n").unwrap();
+            let scratch = bootstrap_capture_scratch(&format!("mutation-{mutation}"));
+            let graph = Graph::open(&root);
+            BOOTSTRAP_SOURCE_CAPTURE_AFTER_INITIAL_PASS.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new({
+                    let source = source.clone();
+                    let added = added.clone();
+                    let renamed = renamed.clone();
+                    move || match mutation {
+                        "modify" => fs::write(source, b"title:: After\n\n- body\n"),
+                        "add" => fs::write(added, b"- added externally\n"),
+                        "delete" => fs::remove_file(source),
+                        "rename" => fs::rename(source, renamed),
+                        _ => unreachable!(),
+                    }
+                }));
+            });
+            let capture = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
+            assert_eq!(capture.instrumentation().passes, 1);
+            assert!(
+                capture
+                    .verify_before_inactive_bootstrap_authoring(&graph)
+                    .is_err(),
+                "final source proof admitted an external {mutation} after capture"
+            );
+            let _ = fs::remove_dir_all(&root);
+            let _ = fs::remove_dir_all(&scratch);
+        }
+
+        let root = scratch("bootstrap-source-final-proof-mutation");
         let source = root.join("pages/one.md");
-        fs::write(&source, b"title:: Before\n\n- body\n").unwrap();
-        let scratch = bootstrap_capture_scratch("mutation");
+        fs::write(&source, b"- before final proof\n").unwrap();
+        let scratch = bootstrap_capture_scratch("final-proof-mutation");
         let graph = Graph::open(&root);
-        BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new({
-                let source = source.clone();
-                move || fs::write(source, b"title:: After\n\n- body\n")
-            }));
-        });
-        assert!(graph.capture_inactive_bootstrap_sources(&scratch).is_err());
         let capture = graph.capture_inactive_bootstrap_sources(&scratch).unwrap();
         BOOTSTRAP_SOURCE_CAPTURE_BEFORE_FINAL_PROOF.with(|hook| {
             *hook.borrow_mut() = Some(Box::new({
                 let source = source.clone();
-                move || fs::write(source, b"title:: Changed before C\n\n- body\n")
+                move || fs::write(source, b"- changed immediately before final proof\n")
             }));
         });
         assert!(capture
             .verify_before_inactive_bootstrap_authoring(&graph)
             .is_err());
-        BOOTSTRAP_SOURCE_CAPTURE_BETWEEN_PASSES.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new({
-                let source = source.clone();
-                move || fs::remove_file(source)
-            }));
-        });
-        assert!(graph.capture_inactive_bootstrap_sources(&scratch).is_err());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&scratch);
     }
